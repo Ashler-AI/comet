@@ -1,15 +1,15 @@
 // Markdown block model — a port of crates/ui/src/markdown/parser.rs.
 //
-// The transcript renders one row per *top-level block*, so the model is
-// block-first: a parsed document is a flat list of `TopBlock`s whose content
-// hash doubles as the row-version key for the virtualizer. Inline content is a
-// run model (adjacent same-style runs merged) rather than an AST, which keeps
-// rendering a single pass over styled spans.
+// Mounted transcript rows parse into a flat list of `TopBlock`s. The
+// virtualizer itself holds raw Markdown source and calculates height without
+// constructing this model; off-screen history therefore never reaches this
+// parser. Inline content is a run model (adjacent same-style runs merged)
+// rather than an AST, which keeps rendering a single pass over styled spans.
 
 import Foundation
 import Markdown
 
-struct InlineStyle: Hashable {
+struct InlineStyle: Hashable, Sendable {
     var bold = false
     var italic = false
     var code = false
@@ -19,22 +19,22 @@ struct InlineStyle: Hashable {
     static let plain = InlineStyle()
 }
 
-struct InlineRun: Hashable {
+struct InlineRun: Hashable, Sendable {
     var text: String
     var style: InlineStyle
 }
 
-enum MDAlign: Hashable {
+enum MDAlign: Hashable, Sendable {
     case left, center, right, none
 }
 
-struct MDListItem: Hashable {
+struct MDListItem: Hashable, Sendable {
     /// Task-list checkbox state; nil for plain items.
     var checked: Bool?
     var children: [MDBlock]
 }
 
-indirect enum MDBlock: Hashable {
+indirect enum MDBlock: Hashable, Sendable {
     case paragraph([InlineRun])
     case heading(level: Int, [InlineRun])
     case codeBlock(language: String?, code: String)
@@ -46,7 +46,7 @@ indirect enum MDBlock: Hashable {
 
 /// A top-level block plus the 1-based source line it starts on (the stable
 /// re-parse anchor) and a content hash used as the row diff key.
-struct TopBlock: Hashable {
+struct TopBlock: Hashable, Sendable {
     var startLine: Int
     var block: MDBlock
 
@@ -189,15 +189,17 @@ enum MarkdownParser {
 
 /// Re-parses only the streaming tail: on append, parsing restarts from the
 /// start of the *second-to-last* top-level block (covers continuation merges),
-/// so per-append cost is O(delta + tail), never O(document). Link-reference
-/// definitions (`[label]: url`) break the locality assumption and force full
-/// re-parses.
-final class IncrementalMarkdownParser {
+/// so per-append cost is O(delta + tail), never O(document). Plain prose takes
+/// a stricter O(delta) path that appends directly to the last inline run.
+/// Link-reference definitions (`[label]: url`) break the locality assumption
+/// and force full re-parses.
+struct IncrementalMarkdownParser: Sendable {
     private(set) var source: String = ""
     private(set) var blocks: [TopBlock] = []
     private var fullOnly = false
+    private var plainTailEligible = false
 
-    func setText(_ text: String) {
+    mutating func setText(_ text: String) {
         if text == source { return }
         if !fullOnly, text.hasPrefix(source), !source.isEmpty {
             append(text)
@@ -206,22 +208,29 @@ final class IncrementalMarkdownParser {
         }
     }
 
-    private func reset(_ text: String) {
+    private mutating func reset(_ text: String) {
         source = text
         fullOnly = Self.hasLinkDefs(text)
         blocks = MarkdownParser.parse(text)
+        plainTailEligible = Self.hasPlainTail(source: text, blocks: blocks)
     }
 
-    private func append(_ text: String) {
+    private mutating func append(_ text: String) {
         let delta = String(text.dropFirst(source.count))
+        if appendPlainDelta(delta) {
+            source = text
+            return
+        }
         source = text
         if Self.hasLinkDefs(delta) {
             fullOnly = true
             blocks = MarkdownParser.parse(text)
+            plainTailEligible = false
             return
         }
         guard blocks.count >= 2 else {
             blocks = MarkdownParser.parse(text)
+            plainTailEligible = Self.hasPlainTail(source: text, blocks: blocks)
             return
         }
         // Stable boundary: the start line of the second-to-last block.
@@ -232,6 +241,47 @@ final class IncrementalMarkdownParser {
             TopBlock(startLine: top.startLine + boundaryLine - 1, block: top.block)
         }
         blocks = stable + tailBlocks
+        plainTailEligible = Self.hasPlainTail(source: text, blocks: blocks)
+    }
+
+    /// Most streamed tokens are ordinary paragraph text. If the current tail
+    /// has never contained Markdown control syntax, appending such a token
+    /// cannot alter block or inline structure, so bypass swift-markdown.
+    private mutating func appendPlainDelta(_ delta: String) -> Bool {
+        guard plainTailEligible, !delta.isEmpty,
+              !delta.contains(where: Self.isMarkdownControl),
+              let lastIndex = blocks.indices.last,
+              case .paragraph(var runs) = blocks[lastIndex].block,
+              !runs.isEmpty,
+              runs.allSatisfy({ $0.style == .plain }) else {
+            return false
+        }
+        runs[runs.count - 1].text += delta
+        blocks[lastIndex].block = .paragraph(runs)
+        return true
+    }
+
+    private static func hasPlainTail(source: String, blocks: [TopBlock]) -> Bool {
+        guard let top = blocks.last,
+              case .paragraph(let runs) = top.block,
+              !runs.isEmpty,
+              runs.allSatisfy({ $0.style == .plain }) else {
+            return false
+        }
+        let tail = suffix(of: source, fromLine: top.startLine)
+        return !tail.isEmpty && !tail.contains(where: isMarkdownControl)
+    }
+
+    /// Characters that may open/close inline syntax or introduce a new block
+    /// after a newline. Falling back is conservative; correctness wins for the
+    /// uncommon formatted token while normal prose remains allocation-light.
+    private static func isMarkdownControl(_ character: Character) -> Bool {
+        switch character {
+        case "\n", "\r", "\\", "*", "_", "~", "`", "[", "<", "&":
+            return true
+        default:
+            return false
+        }
     }
 
     /// The substring starting at the given 1-based line.

@@ -15,6 +15,9 @@ final class SessionStore {
     /// The chat's host device — nudge target for cold-host command drains.
     var hostDeviceId: String?
     private(set) var entries: [MessageEntry] = []
+    /// Monotonic input key for transcript row derivation. Scroll-only view
+    /// updates can return the already-built row array in O(1).
+    private(set) var transcriptRevision: UInt64 = 0
     private(set) var connected = false
     /// Client-minted ids of sends the host hasn't materialized yet.
     private(set) var pendingSends: [(messageId: String, text: String, at: Int64)] = []
@@ -38,6 +41,7 @@ final class SessionStore {
     /// Demo-mode injection point (also used by previews).
     func setEntries(_ new: [MessageEntry]) {
         entries = new
+        transcriptRevision &+= 1
     }
 
     @ObservationIgnored private var saver: DocSaver?
@@ -107,6 +111,7 @@ final class SessionStore {
         // Drop echoes the host has materialized.
         let ids = Set(entries.map(\.id))
         pendingSends.removeAll { ids.contains($0.messageId) }
+        transcriptRevision &+= 1
     }
 
     private static func entryFrom(_ value: LoroValue) -> MessageEntry? {
@@ -217,6 +222,7 @@ final class SessionStore {
             "messageId": messageId,
         ])
         pendingSends.append((messageId, prompt, nowMs()))
+        transcriptRevision &+= 1
     }
 
     func sendSteer(prompt: String) {
@@ -231,6 +237,7 @@ final class SessionStore {
             "messageId": messageId,
         ])
         pendingSends.append((messageId, prompt, nowMs()))
+        transcriptRevision &+= 1
     }
 
     func sendInterrupt() {

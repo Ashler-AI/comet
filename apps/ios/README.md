@@ -48,20 +48,24 @@ Sync/
   SessionStore.swift    session doc mirror: entries/parts (continuations
                         joined), command ledger appends (rule 1), host nudge
 Markdown/
-  MarkdownModel.swift   block model + incremental tail re-parser (re-parse
-                        from the 2nd-to-last top-level block; link-defs force
-                        full parses) — parser.rs port
+  MarkdownModel.swift   block model + incremental tail parser used only after
+                        a transcript row mounts; stable blocks are reused while
+                        streaming and off-screen history remains raw source
   Highlight.swift       line tokenizer with carry state, paint-only
   MarkdownBlockView.swift  desktop metrics: body 14/22, headings 19/27…14/22,
                         code 12.5/18 (analytic line rows), violet inline code,
                         accent blockquotes, hairline tables
 Transcript/
-  TranscriptRows.swift  rows_for_entry port: block-granularity rows, stable
-                        ids ({msg}#{part}.{block}, {msg}#g{n}), fingerprint
-                        versions, consecutive-tool grouping
-  TranscriptView.swift  lazy stack + stick-to-bottom (pin breaks only on user
-                        scroll, 70pt re-engage band, 320pt jump button),
-                        tool-group folds, error/input chips
+  TranscriptRows.swift  cheap part rows with stable ids ({msg}#{part},
+                        {msg}#g{n}), fingerprint versions, tool grouping; no
+                        Markdown parsing on the session-open path
+  TranscriptHeightCache.swift cached token widths + arithmetic line wrapping
+                        for the complete virtualizer offset model; mounted
+                        sizes correct cache
+  TranscriptView.swift  lazy mounted-only Markdown with per-row parser cache +
+                        stick-to-bottom (pin breaks only on user scroll, 70pt
+                        re-engage band, 320pt jump button), tool folds,
+                        error/input chips
   Veil.swift            paint-only streaming fade (EMA-tracked duration,
                         1−(1−p)^1.6 curve)
 Composer/               glass pill, Send→Steer→Stop morph, QuestionPanel

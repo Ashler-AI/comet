@@ -1,4 +1,5 @@
-// Transcript — virtualized block-granularity rows with stick-to-bottom.
+// Transcript — virtualized part rows with source-only height preparation and
+// mounted-only Markdown parsing.
 //
 // Desktop parity (transcript.rs): GAP_TURN 14 / GAP_BLOCK 8 / MD_BLOCK_GAP 12,
 // content column max 736, re-engage band 70, jump-button threshold 320,
@@ -26,14 +27,43 @@ struct TranscriptView: View {
     @State private var distanceFromBottom: CGFloat = 0
     @State private var userScrolling = false
     @State private var scrollPosition = ScrollPosition(edge: .bottom)
+    @State private var viewportWidth = UIScreen.main.bounds.width
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        let rows = builder.rows(entries: store.entries, pendingSends: store.pendingSends)
+        let rows = builder.rows(
+            chatId: chatId,
+            revision: store.transcriptRevision,
+            entries: store.entries,
+            pendingSends: store.pendingSends
+        )
+        let contentWidth = max(1, min(viewportWidth, Self.maxContentWidth) - 32)
+        let preparedHeights = builder.prepareHeights(
+            revision: store.transcriptRevision,
+            rows: rows,
+            width: contentWidth,
+            folds: folds
+        )
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
                 ForEach(Array(rows.enumerated()), id: \.element.id) { ix, row in
-                    rowView(row, previous: ix > 0 ? rows[ix - 1] : nil, isFirst: ix == 0)
+                    let gap = rowGap(row, isFirst: ix == 0)
+                    let expanded = builder.isExpanded(row, folds: folds)
+                    rowView(row, isFirst: ix == 0)
+                        .frame(
+                            minHeight: gap + preparedHeights[ix],
+                            alignment: .top
+                        )
+                        .onGeometryChange(for: CGFloat.self) { geo in
+                            geo.size.height
+                        } action: { _, actualHeight in
+                            builder.recordMeasuredHeight(
+                                max(0, actualHeight - gap),
+                                for: row,
+                                width: contentWidth,
+                                expanded: expanded
+                            )
+                        }
                         .id(row.id)
                 }
                 Color.clear.frame(height: 44)  // bottom pad clears the fade + floating status strip
@@ -50,6 +80,11 @@ struct TranscriptView: View {
             // anchor — snap once the first pass settles.
             try? await Task.sleep(nanoseconds: 80_000_000)
             scrollPosition.scrollTo(edge: .bottom)
+        }
+        .onGeometryChange(for: CGFloat.self) { geo in
+            geo.size.width
+        } action: { _, newWidth in
+            if newWidth > 0 { viewportWidth = newWidth }
         }
         .onScrollPhaseChange { _, newPhase in
             // Desktop rule: the pin breaks only on USER input (wheel-up/drag),
@@ -142,20 +177,20 @@ struct TranscriptView: View {
     // MARK: Row rendering
 
     @ViewBuilder
-    private func rowView(_ row: TranscriptRow, previous: TranscriptRow?, isFirst: Bool) -> some View {
-        let gap: CGFloat = isFirst
-            ? Self.gapTurn + 10
-            : row.turnStart ? Self.gapTurn
-            : sameMarkdownPart(row, previous) ? MD.blockGap
-            : Self.gapBlock
-
+    private func rowView(_ row: TranscriptRow, isFirst: Bool) -> some View {
         Group {
             switch row.kind {
             case .user(let text):
                 UserBubble(text: text, pending: row.timestamp == nil)
 
-            case .markdown(let block, let streaming):
-                MarkdownRowView(row: row, block: block, streaming: streaming, veils: veils)
+            case .markdown(let source, let streaming):
+                LazyMarkdownRowView(
+                    row: row,
+                    source: source,
+                    streaming: streaming,
+                    veils: veils,
+                    cache: builder.markdownCache
+                )
 
             case .toolGroup(let tools, let autoOpen):
                 ToolGroupView(tools: tools,
@@ -173,27 +208,93 @@ struct TranscriptView: View {
                 ErrorChipView(message: message)
             }
         }
-        .padding(.top, gap)
+        .padding(.top, rowGap(row, isFirst: isFirst))
         .padding(.horizontal, 16)
     }
 
-    private func sameMarkdownPart(_ row: TranscriptRow, _ previous: TranscriptRow?) -> Bool {
-        guard let previous, case .markdown = row.kind, case .markdown = previous.kind else { return false }
-        // Ids are "{entry}#{part}.{ix}" — same prefix ⇒ same part.
-        return row.id.split(separator: ".").dropLast().joined() ==
-            previous.id.split(separator: ".").dropLast().joined()
+    private func rowGap(_ row: TranscriptRow, isFirst: Bool) -> CGFloat {
+        isFirst
+            ? Self.gapTurn + 10
+            : row.turnStart ? Self.gapTurn
+            : Self.gapBlock
     }
+
 }
 
-/// Row-build cache: one incremental parser per streaming part, reused across
-/// body evaluations (a reference type, so building rows never mutates state
-/// mid-render).
+/// Prepared transcript state retained across body evaluations: cheap part rows,
+/// arithmetic heights, and parsed trees only for rows that have mounted.
 final class TranscriptBuilderCache {
-    private var parsers: [String: IncrementalMarkdownParser] = [:]
+    private let heights = TranscriptHeightCache()
+    let markdownCache = MarkdownRenderCache()
+    private var lastChatId: String?
+    private var lastRevision: UInt64?
+    private var lastRows: [TranscriptRow] = []
+    private var preparedRevision: UInt64?
+    private var preparedWidthPixels: Int?
+    private var preparedFoldFingerprint: Int?
+    private var preparedHeights: [CGFloat] = []
 
-    func rows(entries: [MessageEntry],
+    func rows(chatId: String,
+              revision: UInt64,
+              entries: [MessageEntry],
               pendingSends: [(messageId: String, text: String, at: Int64)]) -> [TranscriptRow] {
-        TranscriptRowBuilder.rows(entries: entries, pendingSends: pendingSends, parsers: &parsers)
+        if lastChatId == chatId, lastRevision == revision { return lastRows }
+        if lastChatId != chatId {
+            lastRows.removeAll(keepingCapacity: true)
+            preparedHeights.removeAll(keepingCapacity: true)
+            preparedRevision = nil
+            heights.clear()
+            markdownCache.clear()
+        }
+        let rows = TranscriptRowBuilder.rows(
+            entries: entries,
+            pendingSends: pendingSends
+        )
+        lastChatId = chatId
+        lastRevision = revision
+        lastRows = rows
+        return rows
+    }
+
+    func prepareHeights(revision: UInt64, rows: [TranscriptRow], width: CGFloat,
+                        folds: [String: Bool]) -> [CGFloat] {
+        let widthPixels = Int((width * UIScreen.main.scale).rounded())
+        var foldHasher = Hasher()
+        for (key, value) in folds.sorted(by: { $0.key < $1.key }) {
+            key.hash(into: &foldHasher)
+            value.hash(into: &foldHasher)
+        }
+        let foldFingerprint = foldHasher.finalize()
+        if preparedRevision == revision,
+           preparedWidthPixels == widthPixels,
+           preparedFoldFingerprint == foldFingerprint,
+           preparedHeights.count == rows.count {
+            return preparedHeights
+        }
+        let result = rows.map { row in
+            let expanded = isExpanded(row, folds: folds)
+            return heights.height(for: row, width: width, expanded: expanded)
+        }
+        preparedRevision = revision
+        preparedWidthPixels = widthPixels
+        preparedFoldFingerprint = foldFingerprint
+        preparedHeights = result
+        return result
+    }
+
+    func isExpanded(_ row: TranscriptRow, folds: [String: Bool]) -> Bool {
+        guard case .toolGroup(_, let autoOpen) = row.kind else { return false }
+        return folds[row.id] ?? autoOpen
+    }
+
+    func recordMeasuredHeight(_ height: CGFloat, for row: TranscriptRow,
+                              width: CGFloat, expanded: Bool) {
+        heights.storeMeasuredHeight(height, for: row, width: width, expanded: expanded)
+        if let index = lastRows.firstIndex(where: { $0.id == row.id }),
+           index < preparedHeights.count,
+           height > preparedHeights[index] {
+            preparedHeights[index] = ceil(height)
+        }
     }
 }
 
@@ -241,6 +342,110 @@ struct UserBubble: View {
                 }
         }
         .frame(maxWidth: .infinity, alignment: .trailing)
+    }
+}
+
+// MARK: - Lazy Markdown parsing
+
+/// Parsed trees for rows that have actually mounted. Stable row versions make
+/// scroll-back a cache hit without parsing the off-screen transcript on open.
+final class MarkdownRenderCache {
+    private struct Entry {
+        var version: UInt64
+        var parser: IncrementalMarkdownParser
+    }
+
+    private var entries: [String: Entry] = [:]
+    private var insertionOrder: [String] = []
+
+    func clear() {
+        entries.removeAll(keepingCapacity: true)
+        insertionOrder.removeAll(keepingCapacity: true)
+    }
+
+    func blocks(for rowId: String, version: UInt64) -> [TopBlock]? {
+        guard let entry = entries[rowId], entry.version == version else { return nil }
+        return entry.parser.blocks
+    }
+
+    /// Return a value snapshot so parsing can mutate it off the main thread
+    /// without racing cache reads. A streaming row therefore resumes from its
+    /// previous stable block prefix instead of parsing the whole message.
+    func parser(for rowId: String) -> IncrementalMarkdownParser {
+        entries[rowId]?.parser ?? IncrementalMarkdownParser()
+    }
+
+    func store(_ parser: IncrementalMarkdownParser, for rowId: String, version: UInt64) {
+        if entries[rowId] == nil {
+            insertionOrder.append(rowId)
+        }
+        entries[rowId] = Entry(version: version, parser: parser)
+        if insertionOrder.count > 2_048 {
+            let evicted = insertionOrder.prefix(512)
+            for key in evicted {
+                entries.removeValue(forKey: key)
+            }
+            insertionOrder.removeFirst(min(512, insertionOrder.count))
+        }
+    }
+}
+
+/// The virtual row exists from raw source + arithmetic height immediately.
+/// Only a mounted row pays for swift-markdown, and parsing runs after the
+/// navigation frame rather than blocking the session press. Streaming rows
+/// retain their incremental parser: plain tokens append directly, while
+/// structural Markdown reparses only the unstable tail.
+struct LazyMarkdownRowView: View {
+    let row: TranscriptRow
+    let source: String
+    let streaming: Bool
+    let veils: VeilStore
+    let cache: MarkdownRenderCache
+
+    @State private var blocks: [TopBlock] = []
+
+    var body: some View {
+        Group {
+            if blocks.isEmpty {
+                Color.clear
+            } else {
+                VStack(alignment: .leading, spacing: MD.blockGap) {
+                    ForEach(Array(blocks.enumerated()), id: \.offset) { ix, top in
+                        if streaming, ix == blocks.count - 1 {
+                            MarkdownRowView(
+                                row: row,
+                                block: top.block,
+                                streaming: true,
+                                veils: veils
+                            )
+                        } else {
+                            MarkdownBlockView(
+                                block: top.block,
+                                cacheKey: "\(row.id).\(ix)"
+                            )
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .task(id: row.version) {
+            if let cached = cache.blocks(for: row.id, version: row.version) {
+                blocks = cached
+                return
+            }
+            let text = source
+            let version = row.version
+            let parserSnapshot = cache.parser(for: row.id)
+            let updatedParser = await Task.detached(priority: .userInitiated) {
+                var updated = parserSnapshot
+                updated.setText(text)
+                return updated
+            }.value
+            guard !Task.isCancelled, version == row.version else { return }
+            cache.store(updatedParser, for: row.id, version: version)
+            blocks = updatedParser.blocks
+        }
     }
 }
 

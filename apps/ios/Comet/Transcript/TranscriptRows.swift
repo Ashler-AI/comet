@@ -1,17 +1,18 @@
-// Transcript row model — a port of crates/ui/src/shell/transcript.rs
-// rows_for_entry. One row = one markdown top-level block / tool group / chip,
-// never one message: streamed tokens re-render one row, and SwiftUI's lazy
-// stack only re-measures what changed.
+// Transcript row model. One row = one raw text part / tool group / chip.
+// Markdown parts stay as source until their virtual row mounts, so opening a
+// long session never parses off-screen history.
 //
-// Stable ids: markdown rows are "{entryId}#{partId}.{blockIx}", tool groups
-// "{entryId}#g{groupIx}", chips "{entryId}#{partId}". Live and completed parts
-// split identically, so the live→complete handoff never changes row identity.
+// Stable ids: markdown rows are "{entryId}#{partId}", tool groups
+// "{entryId}#g{groupIx}", chips "{entryId}#{partId}".
 
 import Foundation
 
 enum RowKind {
     case user(text: String)
-    case markdown(block: MDBlock, streaming: Bool)
+    /// Raw source stays unparsed until this row mounts. This is the
+    /// virtualization boundary: opening a long session never constructs
+    /// Markdown ASTs for off-screen history.
+    case markdown(source: String, streaming: Bool)
     case toolGroup(tools: [ToolItem], autoOpen: Bool)
     case inputChip(header: String, resolved: Bool)
     case errorChip(message: String)
@@ -35,21 +36,20 @@ struct TranscriptRow: Identifiable {
 }
 
 enum TranscriptRowBuilder {
-    /// Split entries into rows. `parsers` caches one incremental parser per
-    /// "{entryId}#{partId}" so the streaming tail re-parses O(delta + tail).
+    /// Convert entries to cheap part-level rows without parsing Markdown.
+    /// Text parts become one virtual row and are parsed only after mounting.
     static func rows(entries: [MessageEntry],
-                     pendingSends: [(messageId: String, text: String, at: Int64)],
-                     parsers: inout [String: IncrementalMarkdownParser]) -> [TranscriptRow] {
+                     pendingSends: [(messageId: String, text: String, at: Int64)]) -> [TranscriptRow] {
         var rows: [TranscriptRow] = []
         for entry in entries {
-            rowsForEntry(entry, into: &rows, parsers: &parsers)
+            rowsForEntry(entry, into: &rows)
         }
         // Optimistic echo: pending sends share their client-minted id, so the
         // host's real entry replaces them without a flicker.
         let ids = Set(entries.map(\.id))
         for pending in pendingSends where !ids.contains(pending.messageId) {
             rows.append(TranscriptRow(id: pending.messageId,
-                                      version: fnv1a(pending.text) | 1,
+                                      version: textLengthVersion(pending.text) | 1,
                                       turnStart: true,
                                       kind: .user(text: pending.text),
                                       entryId: pending.messageId,
@@ -59,8 +59,7 @@ enum TranscriptRowBuilder {
     }
 
     private static func rowsForEntry(_ entry: MessageEntry,
-                                     into rows: inout [TranscriptRow],
-                                     parsers: inout [String: IncrementalMarkdownParser]) {
+                                     into rows: inout [TranscriptRow]) {
         let streaming = entry.status == .streaming
         let settled = entry.status != nil && !streaming
 
@@ -71,7 +70,7 @@ enum TranscriptRowBuilder {
                 return nil
             }.joined(separator: "\n")
             guard !text.isEmpty else { return }
-            rows.append(TranscriptRow(id: entry.id, version: fnv1a(text),
+            rows.append(TranscriptRow(id: entry.id, version: textLengthVersion(text),
                                       turnStart: true, kind: .user(text: text),
                                       entryId: entry.id, timestamp: entry.createdAt))
             return
@@ -107,21 +106,19 @@ enum TranscriptRowBuilder {
                 guard !text.isEmpty else { continue }
                 let key = "\(entry.id)#\(partId)"
                 let isLiveTail = streaming && ix == lastPartIx
-                let blocks = parse(text: text, key: key, streaming: isLiveTail, parsers: &parsers)
-                for (blockIx, top) in blocks.enumerated() {
-                    var version = (top.fingerprint << 1) | (isLiveTail && blockIx == blocks.count - 1 ? 1 : 0)
-                    if settled, ix == lastPartIx, blockIx == blocks.count - 1 {
-                        version ^= 1 << 62  // timestamp attach keeps the diff key honest
-                    }
-                    rows.append(TranscriptRow(
-                        id: "\(key).\(blockIx)", version: version, turnStart: first,
-                        kind: .markdown(block: top.block,
-                                        streaming: isLiveTail && blockIx == blocks.count - 1),
-                        entryId: entry.id,
-                        timestamp: settled && ix == lastPartIx && blockIx == blocks.count - 1
-                            ? entry.createdAt : nil))
-                    first = false
+                var version = textLengthVersion(text) | (isLiveTail ? 1 : 0)
+                if settled, ix == lastPartIx {
+                    version ^= 1 << 62
                 }
+                rows.append(TranscriptRow(
+                    id: key,
+                    version: version,
+                    turnStart: first,
+                    kind: .markdown(source: text, streaming: isLiveTail),
+                    entryId: entry.id,
+                    timestamp: settled && ix == lastPartIx ? entry.createdAt : nil
+                ))
+                first = false
 
             case .input(let partId, _, let questions, let resolved):
                 flushTools(lastIx: ix - 1)
@@ -143,22 +140,6 @@ enum TranscriptRowBuilder {
             }
         }
         flushTools(lastIx: lastPartIx)
-    }
-
-    private static func parse(text: String, key: String, streaming: Bool,
-                              parsers: inout [String: IncrementalMarkdownParser]) -> [TopBlock] {
-        if streaming {
-            let parser = parsers[key] ?? IncrementalMarkdownParser()
-            parser.setText(text)
-            parsers[key] = parser
-            return parser.blocks
-        }
-        // Completed: adopt the live parser's tree when the flip happens
-        // (handoff), else parse fresh; drop the live parser either way.
-        if let live = parsers.removeValue(forKey: key), live.source == text {
-            return live.blocks
-        }
-        return MarkdownParser.parse(text)
     }
 
     private static func toolFingerprint(_ tools: [ToolItem]) -> UInt64 {
@@ -187,6 +168,13 @@ enum TranscriptRowBuilder {
             hash = hash &* 0x100000001b3
         }
         return hash << 1
+    }
+
+    /// Session text is append-only/immutable after settling, so byte length is
+    /// the same cheap version key used by desktop. This avoids hashing all
+    /// historical text whenever the streaming tail advances.
+    private static func textLengthVersion(_ text: String) -> UInt64 {
+        UInt64(text.utf8.count) << 1
     }
 }
 

@@ -276,7 +276,7 @@ final class DemoDataset {
         let reply = """
         Here's how the streamed reply renders on this device:
 
-        - Markdown re-parses **only the tail** — the last two top-level blocks
+        - Only mounted rows parse Markdown — off-screen history stays as raw text
         - New text fades in through the paint-only veil
         - The transcript stays glued to the bottom until you scroll up
 
