@@ -17,16 +17,11 @@ APP="$OUT_DIR/Comet.app"
 DMG="$OUT_DIR/comet-$VERSION-macos-$ARCH.dmg"
 
 cd "$ROOT"
-cargo build --release --bin comet --bin comet-tui
+cargo build --release -p comet
 
 rm -rf "$APP" "$DMG"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 install -m 755 "$ROOT/target/release/comet" "$APP/Contents/MacOS/comet"
-# The terminal viewport rides inside the bundle next to `comet`, so it resolves
-# the engine binary as a sibling when it needs to spawn one. The .app doesn't
-# put anything on PATH; users who want the `cometui` command run the standalone
-# `curl … /install-tui.sh` (or symlink Contents/MacOS/cometui themselves).
-install -m 755 "$ROOT/target/release/comet-tui" "$APP/Contents/MacOS/cometui"
 sed "s/__VERSION__/$VERSION/" "$ROOT/dist/macos/Info.plist" >"$APP/Contents/Info.plist"
 
 # Icon: iconset from dist/comet.png — the comet mark from the original app

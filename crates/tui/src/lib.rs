@@ -36,6 +36,7 @@
 //! streaming cost is bounded by the terminal size rather than by the transcript.
 
 pub mod app;
+pub mod cli;
 pub mod composer;
 pub mod daemon;
 pub mod keys;

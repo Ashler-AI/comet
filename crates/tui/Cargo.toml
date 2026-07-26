@@ -10,6 +10,7 @@ comet-proto.workspace = true
 comet-doc.workspace = true
 comet-rpc.workspace = true
 tokio.workspace = true
+clap.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true

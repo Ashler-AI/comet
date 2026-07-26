@@ -1190,6 +1190,7 @@ dependencies = [
  "anyhow",
  "clap",
  "comet-engine",
+ "comet-tui",
  "comet-ui",
  "tokio",
  "tracing",
@@ -1311,6 +1312,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "clap",
  "comet-doc",
  "comet-proto",
  "comet-rpc",
@@ -1335,8 +1337,6 @@ dependencies = [
  "anyhow",
  "clap",
  "comet-tui",
- "tokio",
- "tracing-subscriber",
 ]
 
 [[package]]

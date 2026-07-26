@@ -73,11 +73,12 @@ vibrancy) is untested on real macOS — see dist/README.md for bundling.
 curl -fsSL https://comet.zeron.sh/install.sh | sh
 ```
 
-Installs the self-contained binary to `~/.comet-native/app`, links `comet` (and
-`cometui`, the terminal viewport — see below) into `~/.local/bin`, and sets up a
-systemd user service. Production endpoints (`https://edge.comet.zeron.sh` +
-WorkOS auth) are baked in — no configuration needed. Sign in with `comet login`
-(paste-code flow), then `systemctl --user start comet-native`.
+Installs the self-contained binary to `~/.comet-native/app`, links `comet` into
+`~/.local/bin`, and sets up a systemd user service. The terminal viewport ships
+in that same binary as `comet tui` (see below). Production endpoints
+(`https://edge.comet.zeron.sh` + WorkOS auth) are baked in — no configuration
+needed. Sign in with `comet login` (paste-code flow), then
+`systemctl --user start comet-native`.
 
 ## Auth & daemon CLI
 
@@ -118,35 +119,30 @@ cargo run -p comet -- headless
 
 ## Terminal UI
 
-`cometui` is a second frontend — a ratatui terminal viewport, no gpui dependency
-(~12MB, no display libraries). It ships two ways:
+A ratatui terminal viewport, shipped as a subcommand of the same binary:
 
 ```bash
-# 1. Bundled with comet — every install above already put `cometui` on PATH:
-cometui
+comet tui        # attaches to whatever engine is running, or starts one
 
-# 2. Standalone, for a machine that already runs comet (desktop app or daemon)
-#    and just wants the terminal client. Linux and macOS:
-curl -fsSL https://comet.zeron.sh/install-tui.sh | sh   # then: cometui
-
-# From source:
-cargo run --bin comet-tui           # attaches to whatever is running, or starts a daemon
+# From source — a standalone dev binary with no gpui dependency, so it builds in
+# seconds. Same run path as `comet tui`:
+cargo run --bin comet-tui
 ```
 
 (From source, `-p comet-tui` selects the *library* in `crates/tui` and fails with
-"a bin target must be available"; the binary's package is `comet-tui-bin`.)
+"a bin target must be available"; the dev binary's package is `comet-tui-bin`. The
+shipped command is `comet tui`.)
 
-Because it never embeds an engine, `cometui` needs a `comet` engine to attach to or
-to spawn — bundling the two together is what guarantees that always works. It is a
-viewport, never an engine: it probes `COMET_IPC_PORT` and attaches
-to whatever answers — a `comet headless` daemon, or a running desktop app, which
-serves its embedded engine on that port for exactly this reason. Nothing needs to be
-launched in a particular order. If nothing is listening it starts `comet headless`
-in its own session (`setsid`, stdio to
-`~/.comet-native/daemon.log`) and attaches to that. So quitting is **detaching** —
-agents keep running, docs keep syncing, and the DeviceRoom stays joined. Closing the
-terminal (SIGHUP) does the same thing, because the engine has no controlling terminal
-to lose. Reattach by running it again; it prints how, on the way out.
+`comet tui` never embeds an engine — it needs a `comet` engine to attach to or to
+spawn, which is exactly why it lives in the `comet` binary: the engine is always
+right there. It probes `COMET_IPC_PORT` and attaches to whatever answers — a
+`comet headless` daemon, or a running desktop app, which serves its embedded engine
+on that port for exactly this reason. Nothing needs to be launched in a particular
+order. If nothing is listening it starts `comet headless` in its own session
+(`setsid`, stdio to `~/.comet-native/daemon.log`) and attaches to that. So quitting
+is **detaching** — agents keep running, docs keep syncing, and the DeviceRoom stays
+joined. Closing the terminal (SIGHUP) does the same thing, because the engine has no
+controlling terminal to lose. Reattach by running it again; it prints how, on the way out.
 
 ```
 q, Ctrl-C  detach          Tab  cycle panes       Ctrl-B  sidebar
