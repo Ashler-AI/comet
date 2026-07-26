@@ -119,11 +119,17 @@ cargo run -p comet -- headless
 ## Terminal UI
 
 ```bash
-cargo run -p comet-tui-bin          # attaches to a daemon, or starts one
+cargo run --bin comet-tui           # attaches to whatever is running, or starts a daemon
 ```
 
-`comet-tui` is a viewport, never an engine. It probes `COMET_IPC_PORT`; if nothing
-is listening it starts `comet headless` in its own session (`setsid`, stdio to
+(`-p comet-tui` selects the *library* in `crates/tui` and fails with "a bin target
+must be available"; the binary's package is `comet-tui-bin`.)
+
+`comet-tui` is a viewport, never an engine. It probes `COMET_IPC_PORT` and attaches
+to whatever answers — a `comet headless` daemon, or a running desktop app, which
+serves its embedded engine on that port for exactly this reason. Nothing needs to be
+launched in a particular order. If nothing is listening it starts `comet headless`
+in its own session (`setsid`, stdio to
 `~/.comet-native/daemon.log`) and attaches to that. So quitting is **detaching** —
 agents keep running, docs keep syncing, and the DeviceRoom stays joined. Closing the
 terminal (SIGHUP) does the same thing, because the engine has no controlling terminal
