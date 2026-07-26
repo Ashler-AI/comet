@@ -15,6 +15,17 @@ final class SessionStore {
     /// The chat's host device — nudge target for cold-host command drains.
     var hostDeviceId: String?
     private(set) var entries: [MessageEntry] = []
+    /// Bumped on every change to `entries` / `pendingSends`. The transcript's
+    /// row builder memoizes on it, so a body re-eval that was triggered by
+    /// something else (scrolling) costs O(1) instead of re-deriving every row.
+    private(set) var revision: UInt64 = 0
+    /// Whether this chat's transcript has already been revealed once.
+    ///
+    /// Lives on the store, not the view: the reveal gate is `@State`, so any
+    /// re-creation of TranscriptView reset it to "hidden" and blanked an
+    /// already-visible transcript until the settle loop finished. The store is
+    /// cached per chat, so it outlives that churn.
+    @ObservationIgnored var hasRevealed = false
     private(set) var connected = false
     /// Client-minted ids of sends the host hasn't materialized yet.
     private(set) var pendingSends: [(messageId: String, text: String, at: Int64)] = []
@@ -38,6 +49,7 @@ final class SessionStore {
     /// Demo-mode injection point (also used by previews).
     func setEntries(_ new: [MessageEntry]) {
         entries = new
+        revision &+= 1
     }
 
     @ObservationIgnored private var saver: DocSaver?
@@ -99,17 +111,62 @@ final class SessionStore {
 
     // MARK: Projection
 
+    /// In-flight guard + trailing re-run for the off-main projection below.
+    @ObservationIgnored private var projecting = false
+    @ObservationIgnored private var projectPending = false
+
+    /// Re-derive `entries` from the doc, off the main thread.
+    ///
+    /// `getDeepValue()` materializes the WHOLE doc and the decode walks every
+    /// message and every part, so this is O(transcript) — tens of ms on a big
+    /// session, and it runs on every remote update. On the main actor that
+    /// stalled the first frame of a cached session and janked streaming.
+    /// Reading the doc from a background task is the access class the design
+    /// already has: `RoomClient` is a non-main actor that imports into this
+    /// same doc, so it is concurrently read/written today regardless.
+    ///
+    /// Overlapping calls coalesce to a single trailing re-run — a streaming
+    /// burst must not queue one whole-doc projection per token.
     private func project() {
-        let value = doc.getDeepValue()
-        guard let root = value.mapValue else { return }
-        let raw = (root["messages"]?.listValue ?? []).compactMap(Self.entryFrom)
-        entries = Self.joinContinuations(raw)
+        guard !projecting else {
+            projectPending = true
+            return
+        }
+        projecting = true
+        let doc = self.doc
+        Task { @MainActor [weak self] in
+            let decoded = await Task.detached(priority: .userInitiated) {
+                Self.decodeEntries(from: doc)
+            }.value
+            guard let self else { return }
+            self.projecting = false
+            if let decoded {
+                self.apply(decoded)
+            }
+            if self.projectPending {
+                self.projectPending = false
+                self.project()
+            }
+        }
+    }
+
+    private func apply(_ decoded: [MessageEntry]) {
+        entries = decoded
         // Drop echoes the host has materialized.
         let ids = Set(entries.map(\.id))
         pendingSends.removeAll { ids.contains($0.messageId) }
+        revision &+= 1
     }
 
-    private static func entryFrom(_ value: LoroValue) -> MessageEntry? {
+    /// Whole-doc decode. `nil` means the doc has no map root yet — leave the
+    /// previous projection standing rather than blanking a live transcript.
+    nonisolated static func decodeEntries(from doc: LoroDoc) -> [MessageEntry]? {
+        guard let root = doc.getDeepValue().mapValue else { return nil }
+        let raw = (root["messages"]?.listValue ?? []).compactMap(entryFrom)
+        return joinContinuations(raw)
+    }
+
+    nonisolated private static func entryFrom(_ value: LoroValue) -> MessageEntry? {
         guard let m = value.mapValue,
               let id = m["id"]?.stringValue,
               let roleStr = m["role"]?.stringValue,
@@ -122,7 +179,7 @@ final class SessionStore {
                             continuationOf: m["continuationOf"]?.stringValue)
     }
 
-    private static func partFrom(_ value: LoroValue) -> MessagePart? {
+    nonisolated private static func partFrom(_ value: LoroValue) -> MessagePart? {
         guard let m = value.mapValue,
               let id = m["id"]?.stringValue,
               let kind = m["kind"]?.stringValue else { return nil }
@@ -164,7 +221,7 @@ final class SessionStore {
 
     /// schema.rs join_continuation_entries: concatenate continuation parts onto
     /// the root in list order; orphans surface standalone.
-    static func joinContinuations(_ raw: [MessageEntry]) -> [MessageEntry] {
+    nonisolated static func joinContinuations(_ raw: [MessageEntry]) -> [MessageEntry] {
         var roots: [MessageEntry] = []
         var index: [String: Int] = [:]
         for entry in raw {
@@ -190,7 +247,10 @@ final class SessionStore {
     var openInputRequest: (entryId: String, requestId: String, questions: [UserInputQuestion])? {
         for entry in entries.reversed() {
             for part in entry.parts.reversed() {
-                if case .input(_, let requestId, let questions, let resolved) = part, !resolved {
+                // An empty question list can't be answered, so it must not take
+                // the composer's place — leaving the user with no way to type.
+                if case .input(_, let requestId, let questions, let resolved) = part,
+                   !resolved, !questions.isEmpty {
                     return (entry.id, requestId, questions)
                 }
             }
@@ -217,6 +277,7 @@ final class SessionStore {
             "messageId": messageId,
         ])
         pendingSends.append((messageId, prompt, nowMs()))
+        revision &+= 1
     }
 
     func sendSteer(prompt: String) {
@@ -231,6 +292,7 @@ final class SessionStore {
             "messageId": messageId,
         ])
         pendingSends.append((messageId, prompt, nowMs()))
+        revision &+= 1
     }
 
     func sendInterrupt() {
