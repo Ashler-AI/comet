@@ -8,7 +8,9 @@ Each device runs an **engine** that executes agents and syncs state as **Loro CR
 a thin viewport over its local engine; a UI on one device can drive an agent on another through
 the device-room relay. One binary: headed by default, `comet headless` for VPS/remote devices.
 A second binary, `comet-tui`, is a [ratatui](https://ratatui.rs) viewport over the same RPC —
-it always attaches to a daemon, so closing the terminal detaches instead of stopping work.
+it never embeds an engine, so closing the terminal detaches instead of stopping work. Run it with
+no arguments and it attaches to whatever is already there: a running desktop app (which serves its
+embedded engine on the IPC port), a headless daemon, or one it starts itself.
 
 ```
 gpui UI  ─┐

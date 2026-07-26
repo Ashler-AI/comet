@@ -80,6 +80,9 @@ struct InProcessEngine {
     runtime: Arc<tokio::sync::Mutex<Option<EngineRuntime>>>,
     boot_task: tokio::task::JoinHandle<()>,
     refresh_task: tokio::task::JoinHandle<()>,
+    /// Serves this engine to other viewports over the IPC port. `None` when the
+    /// port was already taken — the window still works over its own transport.
+    ipc_task: Option<tokio::task::JoinHandle<()>>,
     client: RpcClient,
 }
 
@@ -93,6 +96,11 @@ impl EngineBackend for InProcessEngine {
     }
     async fn shutdown(&self) {
         self.boot_task.abort();
+        // Stop accepting first: a viewport must not connect midway through the
+        // drain and queue work against stores that are closing.
+        if let Some(ipc) = &self.ipc_task {
+            ipc.abort();
+        }
         if let Some(runtime) = self.runtime.lock().await.take() {
             runtime.shutdown().await;
         }
@@ -177,10 +185,17 @@ impl EngineHandle {
         .await;
         if matches!(probe, Ok(Ok(_))) {
             tracing::info!(%url, "engine daemon detected; connecting");
-            let client = connect_ws(&url).await?;
-            return Ok(EngineHandle {
-                inner: Arc::new(RemoteEngine { client, url }),
-            });
+            match connect_ws(&url).await {
+                Ok(client) => {
+                    return Ok(EngineHandle {
+                        inner: Arc::new(RemoteEngine { client, url }),
+                    });
+                }
+                // Something is on the port but it is not an engine (or it is
+                // wedged). Fall through and embed: a stranger holding 27654
+                // should cost other viewports, not this window.
+                Err(err) => tracing::warn!(%url, error = %err, "not an engine; embedding instead"),
+            }
         }
 
         tracing::info!(data_dir = %config.data_dir.display(), "no daemon on port; embedding engine");
@@ -196,10 +211,31 @@ impl EngineHandle {
         let auth = Engine::build_auth(&engine_config).await;
         let refresh_task = auth.spawn_refresh_loop();
         let (state_tx, state_rx) = tokio::sync::watch::channel(DeferredEngineState::Waiting);
-        let client = memory_client(Arc::new(DeferredEngineRpc {
+        let service: Arc<dyn RpcService> = Arc::new(DeferredEngineRpc {
             auth: AuthRpc::new(auth.clone()),
             state: state_rx,
-        }));
+        });
+        let client = memory_client(service.clone());
+
+        // Serve the same service on the IPC port so a terminal viewport can
+        // attach to this window's engine with no setup. Deliberately the
+        // *deferred* service, not the assembled one: a viewport that connects
+        // before sign-in gets AuthRpc (so it can show its own gate) and its
+        // data subscriptions wait exactly as this window's do.
+        //
+        // Best-effort — losing the bind race with another engine costs other
+        // viewports, not this one.
+        let ipc_task = match comet_engine::serve_ipc(engine_config.ipc_port, service).await {
+            Ok(task) => Some(task),
+            Err(err) => {
+                tracing::warn!(
+                    port = engine_config.ipc_port,
+                    error = %err,
+                    "IPC port unavailable; other viewports cannot attach to this window"
+                );
+                None
+            }
+        };
         let runtime = Arc::new(tokio::sync::Mutex::new(None));
         let runtime_for_boot = runtime.clone();
         let boot_task = tokio::spawn(async move {
@@ -230,6 +266,7 @@ impl EngineHandle {
                 runtime,
                 boot_task,
                 refresh_task,
+                ipc_task,
                 client,
             }),
         })
@@ -908,6 +945,82 @@ mod tests {
             .unwrap();
         assert!(harnesses.as_array().is_some_and(|h| !h.is_empty()));
         handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_embedded_engine_serves_the_ipc_port_for_other_viewports() {
+        // The whole point of embedding-and-serving: a second viewport (the
+        // terminal app) can attach to this window's engine with no setup, no
+        // separate daemon, and no launch ordering.
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_port().await;
+        let handle = EngineHandle::bootstrap(EngineBootConfig {
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: port,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None, // offline
+            org_id: None,
+            workos_client_id: None,
+            default_harness: HarnessId::Mock,
+        })
+        .await
+        .unwrap();
+        assert_eq!(handle.mode(), EngineMode::InProcess);
+
+        // Attach the way `comet-tui` does, and speak the same protocol.
+        let attached = connect_ws(&format!("ws://127.0.0.1:{port}"))
+            .await
+            .expect("a second viewport must be able to attach");
+        let harnesses = attached
+            .call(methods::LIST_HARNESSES, serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(harnesses.as_array().is_some_and(|h| !h.is_empty()));
+
+        // Shutting the window down stops accepting, so the next viewport
+        // starts its own engine rather than talking to closing stores.
+        handle.shutdown().await;
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_err(),
+            "the port must be released on shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stranger_on_the_ipc_port_does_not_wedge_the_window() {
+        // The port probe only proves *something* is listening. A process that
+        // accepts TCP and never speaks WebSocket used to hang the dial forever;
+        // now it times out and we embed instead, losing only the ability to
+        // serve other viewports.
+        let squatter = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = squatter.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let handle = EngineHandle::bootstrap(EngineBootConfig {
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: port,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: None,
+            default_harness: HarnessId::Mock,
+        })
+        .await
+        .expect("a taken port must not fail the boot");
+        assert_eq!(handle.mode(), EngineMode::InProcess);
+        assert!(
+            handle
+                .client()
+                .call(methods::LIST_HARNESSES, serde_json::json!({}))
+                .await
+                .is_ok(),
+            "the window still works over its own transport"
+        );
+        handle.shutdown().await;
+        drop(squatter);
     }
 
     #[tokio::test]

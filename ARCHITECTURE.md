@@ -38,7 +38,10 @@ gpui UI ─ in-proc/localhost RPC ─ engine A ══ DeviceRoom DO relay ══
 Single binary `comet`:
 - `comet` — headed. If a local engine daemon is already listening on the IPC port, connect to it;
   otherwise run the engine **in-process** (RPC over an in-memory duplex — same protocol, zero
-  serialization shortcuts, so the boundary stays honest).
+  serialization shortcuts, so the boundary stays honest) **and serve that same engine on the IPC
+  port**. The embedded engine is not private: any other viewport can attach to the running app
+  without it first being restarted as a daemon. Binding is best-effort — if the port is taken the
+  window still opens, having lost only the ability to host peers.
 - `comet headless` — engine only; prints sign-in URL on TTY (paste-code flow), serves IPC on
   localhost + hosts its DeviceRoom for remote control. A VPS runs this; a laptop's UI drives it.
 
@@ -50,9 +53,10 @@ dependency** (12MB vs 60MB, seconds to build).
 
 One deliberate difference: **the TUI never embeds an engine.** The headed app may, because a
 desktop window and the work it drives have the same lifetime; a terminal does not — it closes,
-the SSH session drops, the lid shuts. So `comet-tui` probes the IPC port and, finding nothing,
-starts `comet headless` in its own session (`setsid`, stdio to the daemon log) and attaches to
-that. Consequences, which are the point:
+the SSH session drops, the lid shuts. So `comet-tui` probes the IPC port and attaches to whatever
+answers — a headless daemon or a running desktop app, which serves the port from its embedded
+engine for exactly this reason. Finding nothing, it starts `comet headless` in its own session
+(`setsid`, stdio to the daemon log) and attaches to that. Consequences, which are the point:
 - quitting the viewport is **detaching** — runs continue, docs keep syncing, the DeviceRoom
   stays joined, and reattaching is instant because nothing was rebuilt;
 - SIGHUP from a closing terminal reaches the viewport and not the engine, because the engine has
