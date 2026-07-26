@@ -19,9 +19,10 @@
   "routes": [
     { "pattern": "edge.comet.zeron.sh", "custom_domain": true },
     { "pattern": "comet.zeron.sh/install.sh", "zone_name": "zeron.sh" },
+    { "pattern": "comet.zeron.sh/install-tui.sh", "zone_name": "zeron.sh" },
     { "pattern": "comet.zeron.sh/releases/*", "zone_name": "zeron.sh" }
   ],
-  // Serve src/install.sh as a string (the /install.sh route).
+  // Serve src/*.sh as strings (the /install.sh and /install-tui.sh routes).
   "rules": [{ "type": "Text", "globs": ["**/*.sh"], "fallthrough": true }],
   // loro-crdt's default entry loads its WASM via URL fetch, which workerd
   // cannot do at runtime; the base64 entry inlines the module instead.

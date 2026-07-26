@@ -19,17 +19,23 @@ STAGE="$OUT_DIR/comet-$VERSION-linux-$ARCH"
 TARBALL="$STAGE.tar.gz"
 
 cd "$ROOT"
+# Ship `cometui` in the same tarball as `comet`: the terminal viewport spawns
+# `comet headless` when nothing is listening, and finds it as a sibling (see
+# resolve_comet_bin) — so bundling them guarantees attach-or-spawn always works.
 if [[ "$PROFILE" == "release" ]]; then
-  cargo build --release -p comet
+  cargo build --release --bin comet --bin comet-tui
   BIN="$ROOT/target/release/comet"
+  TUI="$ROOT/target/release/comet-tui"
 else
-  cargo build -p comet
+  cargo build --bin comet --bin comet-tui
   BIN="$ROOT/target/debug/comet"
+  TUI="$ROOT/target/debug/comet-tui"
 fi
 
 rm -rf "$STAGE" "$TARBALL"
 mkdir -p "$STAGE"
 install -m 755 "$BIN" "$STAGE/comet"
+install -m 755 "$TUI" "$STAGE/cometui"
 install -m 644 "$ROOT/dist/comet.desktop" "$STAGE/comet.desktop"
 install -m 644 "$ROOT/dist/comet.png" "$STAGE/comet.png"
 
@@ -39,6 +45,7 @@ cat >"$STAGE/install.sh" <<'INSTALL'
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 install -Dm755 "$HERE/comet" "$HOME/.local/bin/comet"
+install -Dm755 "$HERE/cometui" "$HOME/.local/bin/cometui"
 install -Dm644 "$HERE/comet.desktop" "$HOME/.local/share/applications/comet.desktop"
 install -Dm644 "$HERE/comet.png" "$HOME/.local/share/icons/hicolor/1024x1024/apps/comet.png"
 command -v update-desktop-database >/dev/null 2>&1 \

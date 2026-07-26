@@ -73,11 +73,11 @@ vibrancy) is untested on real macOS — see dist/README.md for bundling.
 curl -fsSL https://comet.zeron.sh/install.sh | sh
 ```
 
-Installs the self-contained binary to `~/.comet-native/app`, links `comet` into
-`~/.local/bin`, and sets up a systemd user service. Production endpoints
-(`https://edge.comet.zeron.sh` + WorkOS auth) are baked in — no configuration
-needed. Sign in with `comet login` (paste-code flow), then
-`systemctl --user start comet-native`.
+Installs the self-contained binary to `~/.comet-native/app`, links `comet` (and
+`cometui`, the terminal viewport — see below) into `~/.local/bin`, and sets up a
+systemd user service. Production endpoints (`https://edge.comet.zeron.sh` +
+WorkOS auth) are baked in — no configuration needed. Sign in with `comet login`
+(paste-code flow), then `systemctl --user start comet-native`.
 
 ## Auth & daemon CLI
 
@@ -118,14 +118,27 @@ cargo run -p comet -- headless
 
 ## Terminal UI
 
+`cometui` is a second frontend — a ratatui terminal viewport, no gpui dependency
+(~12MB, no display libraries). It ships two ways:
+
 ```bash
+# 1. Bundled with comet — every install above already put `cometui` on PATH:
+cometui
+
+# 2. Standalone, for a machine that already runs comet (desktop app or daemon)
+#    and just wants the terminal client. Linux and macOS:
+curl -fsSL https://comet.zeron.sh/install-tui.sh | sh   # then: cometui
+
+# From source:
 cargo run --bin comet-tui           # attaches to whatever is running, or starts a daemon
 ```
 
-(`-p comet-tui` selects the *library* in `crates/tui` and fails with "a bin target
-must be available"; the binary's package is `comet-tui-bin`.)
+(From source, `-p comet-tui` selects the *library* in `crates/tui` and fails with
+"a bin target must be available"; the binary's package is `comet-tui-bin`.)
 
-`comet-tui` is a viewport, never an engine. It probes `COMET_IPC_PORT` and attaches
+Because it never embeds an engine, `cometui` needs a `comet` engine to attach to or
+to spawn — bundling the two together is what guarantees that always works. It is a
+viewport, never an engine: it probes `COMET_IPC_PORT` and attaches
 to whatever answers — a `comet headless` daemon, or a running desktop app, which
 serves its embedded engine on that port for exactly this reason. Nothing needs to be
 launched in a particular order. If nothing is listening it starts `comet headless`

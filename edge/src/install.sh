@@ -60,6 +60,10 @@ fi
 ln -sfn "$dest" "$app_root/current"
 mkdir -p "$HOME/.local/bin"
 ln -sf "$app_root/current/comet" "$HOME/.local/bin/comet"
+# The terminal viewport ships in the same tarball; link it too. `cometui`
+# attaches to the engine this install runs, or spawns `comet headless` (found
+# as its sibling here) when nothing is listening.
+[ -x "$dest/cometui" ] && ln -sf "$app_root/current/cometui" "$HOME/.local/bin/cometui"
 
 # --- service -----------------------------------------------------------------
 # Auth is decoupled from the daemon: `comet login` persists the session and a

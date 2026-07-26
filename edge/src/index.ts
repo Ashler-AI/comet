@@ -33,6 +33,7 @@ import { AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
 import { SessionRoom } from "./session-room";
 import { DeviceRoom } from "./device-room";
 import installSh from "./install.sh";
+import installTuiSh from "./install-tui.sh";
 
 export { SessionRoom, DeviceRoom };
 
@@ -84,6 +85,14 @@ export default {
     //    `curl | sh` installer and the release artifacts it downloads ───────
     if (url.pathname === "/install.sh" && (request.method === "GET" || request.method === "HEAD")) {
       return new Response(request.method === "HEAD" ? null : installSh, {
+        headers: {
+          "content-type": "application/x-sh",
+          "cache-control": "public, max-age=0, must-revalidate"
+        }
+      });
+    }
+    if (url.pathname === "/install-tui.sh" && (request.method === "GET" || request.method === "HEAD")) {
+      return new Response(request.method === "HEAD" ? null : installTuiSh, {
         headers: {
           "content-type": "application/x-sh",
           "cache-control": "public, max-age=0, must-revalidate"
