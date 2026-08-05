@@ -218,11 +218,11 @@ jobs:
       - name: Preflight exact storage permissions and privacy
         run: |
           set -euo pipefail
-          required='["storage.buckets.get","storage.buckets.getIamPolicy","storage.objects.create","storage.objects.delete","storage.objects.get"]'
+          required='["storage.buckets.get","storage.buckets.getIamPolicy","storage.objects.create","storage.objects.delete","storage.objects.get","storage.objects.list"]'
           access_token="$(gcloud auth print-access-token)"
           printf 'header = "Authorization: Bearer %s"\n' "$access_token" |
             curl --config - --fail-with-body --silent --show-error \
-              "https://storage.googleapis.com/storage/v1/b/$COMET_RELEASES_GCS_BUCKET/iam/testPermissions?permissions=storage.buckets.get&permissions=storage.buckets.getIamPolicy&permissions=storage.objects.create&permissions=storage.objects.delete&permissions=storage.objects.get" \
+              "https://storage.googleapis.com/storage/v1/b/$COMET_RELEASES_GCS_BUCKET/iam/testPermissions?permissions=storage.buckets.get&permissions=storage.buckets.getIamPolicy&permissions=storage.objects.create&permissions=storage.objects.delete&permissions=storage.objects.get&permissions=storage.objects.list" \
               > permitted.json
           unset access_token
           jq -e --argjson required "$required" \
@@ -313,11 +313,11 @@ jobs:
       - name: Preflight exact storage permissions and privacy
         run: |
           set -euo pipefail
-          required='["storage.buckets.get","storage.buckets.getIamPolicy","storage.objects.create","storage.objects.delete","storage.objects.get"]'
+          required='["storage.buckets.get","storage.buckets.getIamPolicy","storage.objects.create","storage.objects.delete","storage.objects.get","storage.objects.list"]'
           access_token="$(gcloud auth print-access-token)"
           printf 'header = "Authorization: Bearer %s"\n' "$access_token" |
             curl --config - --fail-with-body --silent --show-error \
-              "https://storage.googleapis.com/storage/v1/b/$COMET_RELEASES_GCS_BUCKET/iam/testPermissions?permissions=storage.buckets.get&permissions=storage.buckets.getIamPolicy&permissions=storage.objects.create&permissions=storage.objects.delete&permissions=storage.objects.get" \
+              "https://storage.googleapis.com/storage/v1/b/$COMET_RELEASES_GCS_BUCKET/iam/testPermissions?permissions=storage.buckets.get&permissions=storage.buckets.getIamPolicy&permissions=storage.objects.create&permissions=storage.objects.delete&permissions=storage.objects.get&permissions=storage.objects.list" \
               > permitted.json
           unset access_token
           jq -e --argjson required "$required" \
