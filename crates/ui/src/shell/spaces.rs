@@ -9,6 +9,7 @@
 use super::*;
 use crate::motion::TAB_SLIDE;
 use crate::pickers::{breadcrumbs, browser_rows, parent_path};
+use crate::popover::Loadable;
 use crate::terminal::panel::{drop_index, reorder_tabs, slide_offset};
 use comet_proto::{ChatIndicator, Device, FolderListing, Space};
 use gpui::FocusHandle;
@@ -178,17 +179,11 @@ impl Shell {
         if self.space_drag.is_some() && !cx.has_active_drag() {
             self.space_drag = None;
         }
-        let (spaces, selected, device_names, offline_devices, attention): (
-            Vec<Space>,
-            Option<String>,
-            std::collections::HashMap<String, String>,
-            std::collections::HashSet<String>,
-            std::collections::HashMap<String, ChatIndicator>,
-        ) = {
+        let (spaces, selected, device_names, offline_devices, attention) = {
             let now = Utc::now();
             let state = self.state.read(cx);
             let spaces = state.spaces.clone();
-            let device_names = spaces
+            let device_names: std::collections::HashMap<String, String> = spaces
                 .iter()
                 .map(|s| {
                     (
@@ -202,7 +197,7 @@ impl Shell {
                 .collect();
             // Host-presence (the revived "Remote" signal): a remote space whose
             // device heartbeat lapsed shows offline — a host outage, not slow sync.
-            let offline_devices = spaces
+            let offline_devices: std::collections::HashSet<String> = spaces
                 .iter()
                 .map(|s| s.device_id.clone())
                 .filter(|id| !state.device_online(id, now))
@@ -583,7 +578,13 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Vec<(String, f32, AnyElement)> {
         let now = Utc::now();
-        let rows: Vec<(ChatIndicator, comet_proto::Chat, String, Option<String>)> = {
+        let rows: Vec<(
+            ChatIndicator,
+            comet_proto::Chat,
+            String,
+            Option<String>,
+            super::SidebarSessionMeta,
+        )> = {
             let state = self.state.read(cx);
             state
                 .overview_chats(now)
@@ -591,32 +592,91 @@ impl Shell {
                 .map(|(status, chat)| {
                     let space = state.space_for_chat(chat);
                     let mut folder = space
-                        .map(|s| s.display_name().to_string())
+                        .map(|space| space.display_name().to_string())
                         .unwrap_or_else(|| "?".to_string());
-                    // Unknown device → no fragment, same as the archived list.
                     if let Some(device) = state.device_name(&chat.device_id) {
                         folder = format!("{folder}@{device}");
                     }
-                    // The branch shows whenever the engine has stamped one —
-                    // main-checkout sessions included, not just worktrees.
                     let branch = chat
                         .branch
                         .as_deref()
                         .map(str::trim)
-                        .filter(|b| !b.is_empty())
+                        .filter(|branch| !branch.is_empty())
                         .map(str::to_string);
-                    (status, chat.clone(), folder, branch)
+                    let agent_session = state.collaboration_sessions(&chat.id).next();
+                    let source = agent_session
+                        .map(|session| session.source)
+                        .unwrap_or_else(|| {
+                            if state.local_device_id.as_deref() == Some(chat.device_id.as_str()) {
+                                comet_proto::AgentSessionSource::Local
+                            } else {
+                                comet_proto::AgentSessionSource::Scaffold
+                            }
+                        });
+                    let runtime = chat
+                        .config
+                        .as_ref()
+                        .map(|config| crate::multiplayer::harness_label(config.harness));
+                    let model = agent_session
+                        .and_then(|session| session.model.as_deref())
+                        .or_else(|| {
+                            chat.config
+                                .as_ref()
+                                .and_then(|config| config.model.as_deref())
+                        });
+                    let runtime_model = crate::multiplayer::runtime_model(runtime, model).into();
+                    let mut participants: Vec<super::SidebarParticipant> =
+                        if state.selected_chat.as_deref() == Some(chat.id.as_str()) {
+                            state
+                                .participants()
+                                .iter()
+                                .map(|participant| super::SidebarParticipant {
+                                    name: participant
+                                        .display_name
+                                        .clone()
+                                        .unwrap_or_else(|| participant.principal_subject.clone())
+                                        .into(),
+                                    state: participant.state,
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                    if participants.is_empty() {
+                        participants.push(super::SidebarParticipant {
+                            name: state
+                                .device_name(&chat.device_id)
+                                .unwrap_or("Session owner")
+                                .to_string()
+                                .into(),
+                            state: if state.device_online(&chat.device_id, now) {
+                                comet_proto::ParticipantState::Active
+                            } else {
+                                comet_proto::ParticipantState::Disconnected
+                            },
+                        });
+                    }
+                    (
+                        status,
+                        chat.clone(),
+                        folder,
+                        branch,
+                        super::SidebarSessionMeta {
+                            source,
+                            runtime_model,
+                            participants,
+                        },
+                    )
                 })
                 .collect()
         };
         let selected = self.state.read(cx).selected_chat.clone();
         rows.into_iter()
-            .map(|(status, chat, folder, branch)| {
+            .map(|(status, chat, folder, branch, meta)| {
                 let time_ago: SharedString =
                     format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
                 let is_selected = selected.as_deref() == Some(chat.id.as_str());
-                let height = super::CHAT_ROW_HEIGHT;
-                let harness = chat.config.as_ref().map(|c| c.harness);
+                let height = super::chat_row_height(self.settings.density);
                 let element = self.render_chat_row(
                     chat.id.clone(),
                     transcript::single_line(
@@ -626,7 +686,7 @@ impl Shell {
                     time_ago,
                     folder.into(),
                     branch.map(SharedString::from),
-                    harness,
+                    meta,
                     status,
                     is_selected,
                     theme,

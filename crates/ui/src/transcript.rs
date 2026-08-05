@@ -22,18 +22,17 @@
 //! scroll handler fires exclusively from its wheel/touch path) and re-engages
 //! inside the 70px band; own-send re-engages with the same glide.
 
+use gpui::{
+    AnyElement, BorderStyle, ClipboardItem, Context, Entity, EventEmitter, ListAlignment,
+    ListScrollEvent, ListState, ObjectFit, SharedString, Styled, StyledImage as _, StyledText,
+    Subscription, Task, TextRun, Window, canvas, div, img, list, prelude::*, px, quad,
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-use gpui::{
-    AnyElement, BorderStyle, ClipboardItem, Context, Entity, ListAlignment, ListScrollEvent,
-    ListState, ObjectFit, SharedString, StyledImage as _, StyledText, Subscription, Task, TextRun,
-    Window, canvas, div, img, list, prelude::*, px, quad,
-};
 
 use comet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
 use comet_proto::ToolCall;
@@ -46,10 +45,56 @@ use crate::motion::{self, AnimationExt as _, RESIZE};
 use crate::state::AppState;
 use crate::theme::Theme;
 
+#[derive(Debug, Clone)]
+pub enum TranscriptEvent {
+    OpenAnnotations(comet_proto::SemanticAnchor),
+}
+
+impl EventEmitter<TranscriptEvent> for Transcript {}
 // ---------------------------------------------------------------------------
 // Constants (mugen ports)
 // ---------------------------------------------------------------------------
 
+fn block_annotation_text(block: &Block) -> String {
+    fn runs_text(runs: &[crate::markdown::parser::InlineRun]) -> String {
+        runs.iter().map(|run| run.text.as_str()).collect()
+    }
+    match block {
+        Block::Paragraph { runs } | Block::Heading { runs, .. } => runs_text(runs),
+        Block::CodeBlock { code, .. } => code.clone(),
+        Block::BlockQuote { children } => children
+            .iter()
+            .map(block_annotation_text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Block::List { items, .. } => items
+            .iter()
+            .map(|item| {
+                item.iter()
+                    .map(block_annotation_text)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Block::Table { header, rows, .. } => std::iter::once(
+            header
+                .iter()
+                .map(|cell| runs_text(cell))
+                .collect::<Vec<_>>()
+                .join(" | "),
+        )
+        .chain(rows.iter().map(|row| {
+            row.iter()
+                .map(|cell| runs_text(cell))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        }))
+        .collect::<Vec<_>>()
+        .join("\n"),
+        Block::Rule => "Section break".into(),
+    }
+}
 /// Re-engage the bottom pin when the user returns within this many px of the end.
 pub const STICK_THRESHOLD_PX: f32 = 70.0;
 /// List overdraw beyond the viewport.
@@ -1552,6 +1597,135 @@ impl Transcript {
             top_gap_for(ix.checked_sub(1).and_then(|i| self.rows.get(i)), &row)
         };
         let bottom_pad = if ix + 1 == self.rows.len() { 24.0 } else { 0.0 };
+        let annotation_anchor = match &row.kind {
+            RowKind::User { text, .. } => crate::multiplayer::quoted_anchor(
+                comet_proto::AnchorTargetKind::Message,
+                row.id.to_string(),
+                text,
+            ),
+            RowKind::Markdown { tree, block_ix } | RowKind::LiveMarkdown { tree, block_ix } => {
+                let exact = tree
+                    .blocks
+                    .get(*block_ix)
+                    .map(|block| block_annotation_text(&block.block))
+                    .unwrap_or_default();
+                crate::multiplayer::quoted_anchor(
+                    comet_proto::AnchorTargetKind::Message,
+                    row.id.to_string(),
+                    &exact,
+                )
+            }
+            RowKind::ToolGroup { tools, .. } => {
+                let exact = tools
+                    .first()
+                    .map(|tool| {
+                        let (label, detail) = tool_chip_content(&tool.call);
+                        format!("{label}: {detail}")
+                    })
+                    .unwrap_or_else(|| "Tool calls".into());
+                crate::multiplayer::quoted_anchor(
+                    comet_proto::AnchorTargetKind::ToolCall,
+                    row.id.to_string(),
+                    &exact,
+                )
+            }
+            RowKind::InputChip { header, .. } => crate::multiplayer::quoted_anchor(
+                comet_proto::AnchorTargetKind::Message,
+                row.id.to_string(),
+                header,
+            ),
+            RowKind::ErrorChip { message } => crate::multiplayer::quoted_anchor(
+                comet_proto::AnchorTargetKind::Message,
+                row.id.to_string(),
+                message,
+            ),
+        };
+        let (timeline_label, collaborator_cursors, annotation_count) = {
+            let state = self.state.read(cx);
+            let timeline_label = row
+                .turn_start
+                .then(|| state.message_provenance(row.entry_id.as_ref()))
+                .flatten()
+                .map(|provenance| {
+                    let actor = state.participant_name(&provenance.author_subject);
+                    let session = state.collaboration.as_ref().and_then(|snapshot| {
+                        snapshot
+                            .sessions
+                            .iter()
+                            .find(|session| session.session_id == provenance.session_id)
+                    });
+                    let source = session
+                        .map(|session| crate::multiplayer::source_label(session.source))
+                        .unwrap_or("Teammate");
+                    let runtime = session
+                        .and_then(|session| session.harness)
+                        .map(crate::multiplayer::harness_label);
+                    let runtime_model =
+                        crate::multiplayer::runtime_model(runtime, provenance.model.as_deref());
+                    SharedString::from(format!("{actor} · {source} · {runtime_model}"))
+                });
+            let cursors = state
+                .participants()
+                .iter()
+                .filter(|participant| {
+                    let targets_row =
+                        |target: &str| target == row.id.as_ref() || target == row.entry_id.as_ref();
+                    participant
+                        .cursor
+                        .as_ref()
+                        .is_some_and(|cursor| targets_row(&cursor.target_id))
+                        || participant
+                            .focused_target_id
+                            .as_deref()
+                            .is_some_and(targets_row)
+                })
+                .take(3)
+                .map(|participant| {
+                    let name = participant
+                        .display_name
+                        .as_deref()
+                        .unwrap_or(&participant.principal_subject);
+                    let location = participant
+                        .cursor
+                        .as_ref()
+                        .filter(|cursor| {
+                            cursor.target_id == row.id.as_ref()
+                                || cursor.target_id == row.entry_id.as_ref()
+                        })
+                        .map(crate::multiplayer::cursor_location)
+                        .map(SharedString::from);
+                    (
+                        SharedString::from(crate::multiplayer::initials(name)),
+                        participant.state,
+                        location,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let annotation_count = state
+                .collaboration
+                .as_ref()
+                .map(|snapshot| {
+                    let mut seen = std::collections::HashSet::new();
+                    snapshot
+                        .publications
+                        .iter()
+                        .rev()
+                        .filter_map(|publication| {
+                            let comet_proto::PublicationValue::Annotation(annotation) =
+                                &publication.value
+                            else {
+                                return None;
+                            };
+                            (annotation.anchor.target_id == annotation_anchor.target_id
+                                && seen.insert(annotation.id.clone()))
+                            .then_some(annotation)
+                        })
+                        .filter(|annotation| annotation.resolved_at.is_none())
+                        .count()
+                })
+                .unwrap_or_default();
+            (timeline_label, cursors, annotation_count)
+        };
 
         let inner: AnyElement = match &row.kind {
             RowKind::User {
@@ -1774,9 +1948,97 @@ impl Transcript {
             .px(px(48.0))
             .child(
                 div()
+                    .relative()
                     .w_full()
                     .max_w(px(MAX_CONTENT_WIDTH))
                     .min_w_0()
+                    .when(!collaborator_cursors.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .left(px(-(Theme::SPACE_LG * 2.0)))
+                                .top_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .children(collaborator_cursors.into_iter().map(
+                                    |(initials, state, location)| {
+                                        let tone = match state {
+                                            comet_proto::ParticipantState::Active => theme.success,
+                                            comet_proto::ParticipantState::Idle => theme.warning,
+                                            comet_proto::ParticipantState::Disconnected => {
+                                                theme.text_faint
+                                            }
+                                        };
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .items_center()
+                                            .child(
+                                                div()
+                                                    .size(px(20.0))
+                                                    .rounded_full()
+                                                    .border_1()
+                                                    .border_color(tone)
+                                                    .bg(theme.surface_raised)
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .text_size(px(8.0))
+                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                    .text_color(theme.text_muted)
+                                                    .child(initials),
+                                            )
+                                            .when_some(location, |el, location| {
+                                                el.child(
+                                                    div()
+                                                        .mt(px(2.0))
+                                                        .text_size(px(7.0))
+                                                        .text_color(tone)
+                                                        .child(location),
+                                                )
+                                            })
+                                    },
+                                )),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "annotations-{}",
+                                annotation_anchor.target_id
+                            )))
+                            .mb(px(Theme::SPACE_XS))
+                            .px(px(Theme::SPACE_SM))
+                            .py(px(2.0))
+                            .rounded(px(Theme::CONTROL_RADIUS))
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.surface_raised)
+                            .text_size(px(10.0))
+                            .text_color(theme.text_muted)
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme.surface_raised_hover))
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(TranscriptEvent::OpenAnnotations(
+                                    annotation_anchor.clone(),
+                                ));
+                            }))
+                            .child(SharedString::from(match annotation_count {
+                                0 => "Note".to_string(),
+                                1 => "1 note".to_string(),
+                                count => format!("{count} notes"),
+                            })),
+                    )
+                    .when_some(timeline_label, |el, label| {
+                        el.child(
+                            div()
+                                .mb(px(Theme::SPACE_XS))
+                                .text_size(px(10.0))
+                                .text_color(theme.text_faint)
+                                .child(label),
+                        )
+                    })
                     .child(inner)
                     .children(strip),
             )
@@ -1794,28 +2056,27 @@ impl Transcript {
             .map(|(_, ix)| *ix);
         let row_key = row_id.clone();
         let entity = cx.weak_entity();
-        let handler: Rc<dyn Fn(usize, SharedString, &mut Window, &mut gpui::App)> =
-            Rc::new(move |ix, code, _window, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(code.to_string()));
-                let row_key = row_key.clone();
-                entity
-                    .update(cx, |this, cx| {
-                        this.copied_code = Some((row_key, ix));
-                        this.copied_clear = Some(cx.spawn(async move |this, cx| {
-                            cx.background_executor()
-                                .timer(Duration::from_millis(1200))
-                                .await;
-                            this.update(cx, |this, cx| {
-                                this.copied_code = None;
-                                this.copied_clear = None;
-                                cx.notify();
-                            })
-                            .ok();
-                        }));
-                        cx.notify();
-                    })
-                    .ok();
-            });
+        let handler: Rc<render::CopyHandler> = Rc::new(move |ix, code, _window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(code.to_string()));
+            let row_key = row_key.clone();
+            entity
+                .update(cx, |this, cx| {
+                    this.copied_code = Some((row_key, ix));
+                    this.copied_clear = Some(cx.spawn(async move |this, cx| {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(1200))
+                            .await;
+                        this.update(cx, |this, cx| {
+                            this.copied_code = None;
+                            this.copied_clear = None;
+                            cx.notify();
+                        })
+                        .ok();
+                    }));
+                    cx.notify();
+                })
+                .ok();
+        });
         render::CopyUi { handler, copied_ix }
     }
 

@@ -32,6 +32,8 @@ use crate::{RpcClient, RpcError, RpcService, serve_connection};
 pub const RELAY_KIND: &str = " relay";
 /// Durable command nudge frames (§7 cold-chat delivery): payload `{chatId}`.
 pub const NUDGE_KIND: &str = "nudge";
+/// Edge-verified authority grant emitted only on the authenticated host socket.
+pub const GRANT_KIND: &str = "grant";
 /// The RPC stream over the relay: both `s` (stream id) and `k` (kind) are `"rpc"`.
 pub const RPC_KIND: &str = "rpc";
 
@@ -205,6 +207,12 @@ impl TokenSource for StaticToken {
 /// Called with the chat id of every nudge frame ("this chat's doc has pending commands —
 /// open it and drain"); the engine warms/opens the chat doc.
 pub type NudgeHandler = Arc<dyn Fn(String) + Send + Sync>;
+/// Called only for an edge-emitted [`GRANT_KIND`] frame. The stream id is the
+/// edge-verified session id and the bytes are the edge-derived grant envelope.
+pub type GrantHandler = Arc<dyn Fn(String, Vec<u8>) + Send + Sync>;
+/// Called after every authenticated host reconnect, before any grant frame is
+/// accepted, so previously cached edge authority can be invalidated.
+pub type GrantResetHandler = Arc<dyn Fn() + Send + Sync>;
 
 pub struct HostRelayConfig {
     /// Edge base URL (`http(s)://…`; rewritten to `ws(s)` for the socket).
@@ -245,6 +253,25 @@ impl HostRelay {
         service: Arc<dyn RpcService>,
         on_nudge: NudgeHandler,
     ) -> Self {
+        Self::spawn_with_grants(config, service, on_nudge, Arc::new(|_, _| {}))
+    }
+
+    pub fn spawn_with_grants(
+        config: HostRelayConfig,
+        service: Arc<dyn RpcService>,
+        on_nudge: NudgeHandler,
+        on_grant: GrantHandler,
+    ) -> Self {
+        Self::spawn_with_authority(config, service, on_nudge, Arc::new(|| {}), on_grant)
+    }
+
+    pub fn spawn_with_authority(
+        config: HostRelayConfig,
+        service: Arc<dyn RpcService>,
+        on_nudge: NudgeHandler,
+        on_grant_reset: GrantResetHandler,
+        on_grant: GrantHandler,
+    ) -> Self {
         let task = tokio::spawn(async move {
             let mut wake = comet_sync::wake::subscribe();
             // Fast-rejoin bookkeeping: the edge DO periodically ends healthy
@@ -264,7 +291,8 @@ impl HostRelay {
                         &token,
                     );
                     let started = tokio::time::Instant::now();
-                    let outcome = host_session(&url, &service, &on_nudge).await;
+                    let outcome =
+                        host_session(&url, &service, &on_nudge, &on_grant_reset, &on_grant).await;
                     let healthy = started.elapsed() >= HOST_HEALTHY_SESSION;
                     match outcome {
                         Ok(()) => {
@@ -362,10 +390,13 @@ async fn host_session(
     url: &str,
     service: &Arc<dyn RpcService>,
     on_nudge: &NudgeHandler,
+    on_grant_reset: &GrantResetHandler,
+    on_grant: &GrantHandler,
 ) -> Result<(), RpcError> {
     let (ws, _) = tokio_tungstenite::connect_async(url)
         .await
         .map_err(|e| RpcError::Transport(format!("device room unreachable: {e}")))?;
+    on_grant_reset();
     tracing::info!("device-room: host connected");
     let (mut sink, mut stream) = ws.split();
     // All writers (per-conn pumps) funnel through one outbound queue → one socket writer.
@@ -389,7 +420,14 @@ async fn host_session(
             message = stream.next() => match message {
                 Some(Ok(WsMessage::Binary(bytes))) => {
                     last_rx = tokio::time::Instant::now();
-                    handle_host_frame(&bytes, &mut conns, service, &out_tx, on_nudge).await;
+                    handle_host_frame(
+                        &bytes,
+                        &mut conns,
+                        service,
+                        &out_tx,
+                        on_nudge,
+                        on_grant,
+                    ).await;
                 }
                 Some(Ok(WsMessage::Close(frame))) => {
                     if let Some(frame) = frame {
@@ -427,6 +465,7 @@ async fn handle_host_frame(
     service: &Arc<dyn RpcService>,
     out_tx: &mpsc::Sender<Vec<u8>>,
     on_nudge: &NudgeHandler,
+    on_grant: &GrantHandler,
 ) {
     let (header, payload) = match decode_device_frame(bytes) {
         Ok(frame) => frame,
@@ -443,6 +482,10 @@ async fn handle_host_frame(
             tracing::debug!(conn = %conn_id, %code, "device-room: client conn torn down");
             conns.remove(conn_id);
         }
+        return;
+    }
+    if header.k == GRANT_KIND {
+        on_grant(header.s, payload);
         return;
     }
     if header.k == NUDGE_KIND {

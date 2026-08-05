@@ -146,10 +146,8 @@ pub enum GatePhase {
     Loading,
     /// Engine unreachable and embedding failed.
     Failed(String),
-    /// Engine up, but signed out — show the sign-in card.
+    /// Engine is signed out.
     SignIn,
-    /// Signed in but no organization selected — "Create your workspace".
-    OrgGate,
     /// Render the shell.
     Ready,
 }
@@ -162,41 +160,48 @@ pub fn gate_phase(connection: &ConnectionStatus, auth: Option<&AuthState>) -> Ga
         ConnectionStatus::Failed(err) => GatePhase::Failed(err.clone()),
         ConnectionStatus::Ready => match auth {
             Some(AuthState::SignedOut) => GatePhase::SignIn,
-            Some(AuthState::NeedsOrganization { .. }) => GatePhase::OrgGate,
             _ => GatePhase::Ready,
         },
     }
 }
 
-/// Parse an `AuthStatus` frame tolerantly. The engine currently serializes its
-/// own enum (`{"_tag": "SignedIn", ...}`) while the proto type expects
-/// `{"state": "signedIn", ...}` — accept both so either side can converge
-/// without breaking a viewport.
+/// Parse AuthStatus while accepting the previous organization-shaped frame as
+/// a migration input. New frames always carry `projectScope`.
 pub fn parse_auth_state(value: &serde_json::Value) -> Option<AuthState> {
     if let Ok(state) = serde_json::from_value::<AuthState>(value.clone()) {
         return Some(state);
     }
-    let tag = value.get("_tag").and_then(|t| t.as_str())?;
-    let user = || -> Option<crate::UserProfile> {
-        let u = value.get("user")?;
-        Some(crate::UserProfile {
-            id: u.get("id")?.as_str()?.to_string(),
-            email: u.get("email")?.as_str()?.to_string(),
-            name: u.get("name").and_then(|n| n.as_str()).map(str::to_string),
-        })
-    };
-    match tag {
-        "SignedOut" => Some(AuthState::SignedOut),
-        "NeedsOrganization" => Some(AuthState::NeedsOrganization { user: user()? }),
-        "SignedIn" => Some(AuthState::SignedIn {
-            user: user()?,
-            org_id: value
-                .get("orgId")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-        }),
-        _ => None,
+    let tag = value
+        .get("state")
+        .or_else(|| value.get("_tag"))
+        .and_then(|tag| tag.as_str())?;
+    if matches!(
+        tag,
+        "signedOut" | "SignedOut" | "needsOrganization" | "NeedsOrganization"
+    ) {
+        return Some(AuthState::SignedOut);
     }
+    if !matches!(tag, "signedIn" | "SignedIn") {
+        return None;
+    }
+    let user = value.get("user")?;
+    let profile = crate::UserProfile {
+        id: user.get("id")?.as_str()?.to_string(),
+        email: user.get("email")?.as_str()?.to_string(),
+        name: user
+            .get("name")
+            .and_then(|name| name.as_str())
+            .map(str::to_string),
+    };
+    let project_scope = value
+        .get("projectScope")
+        .or_else(|| value.get("orgId"))
+        .and_then(|scope| scope.as_str())?
+        .to_string();
+    Some(AuthState::SignedIn {
+        user: profile,
+        project_scope,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -449,7 +454,7 @@ pub mod dot {
 // Checkout selection (new sessions)
 // ---------------------------------------------------------------------------
 
-/// Where a new session runs (t3code's env-mode: `local | worktree`).
+/// Where a new session runs (`local | worktree`).
 ///
 /// "Current worktree" is deliberately **not** a third mode — it is `Local` when
 /// the picked ref already happens to be materialized as a worktree, in which
@@ -494,7 +499,7 @@ pub fn checkout_plan(kind: CheckoutKind, picked: Option<&crate::RepoRef>) -> Che
     }
 }
 
-/// Label of the checkout-kind trigger (t3code `resolveEnvModeLabel`).
+/// Label of the checkout-kind trigger.
 pub fn checkout_label(kind: CheckoutKind, picked: Option<&crate::RepoRef>) -> &'static str {
     match kind {
         CheckoutKind::NewWorktree => "New worktree",

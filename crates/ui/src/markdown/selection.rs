@@ -1,10 +1,9 @@
 //! Text selection for rendered markdown (round 18).
 //!
-//! gpui has no built-in selection for plain text elements. Zed's markdown
-//! selects continuously because its whole document is ONE element over one
-//! text model; comet renders a TREE of text elements inside a virtualized
-//! list, so this module rebuilds that continuity: every frame the renderer
-//! registers each painted text element in paint order (= document order),
+//! gpui has no built-in selection for plain text elements. A single text model
+//! selects continuously, while Ashler Comet renders a tree of text elements in
+//! a virtualized list. This module rebuilds that continuity: each frame the
+//! renderer registers every painted text element in document order,
 //! and a drag anchored in one element resolves against that registry into
 //! per-element SPANS — partial in the anchor/head elements, whole for every
 //! element between. The wash paints per element from its span; copy joins

@@ -21,6 +21,7 @@ pub mod registry;
 pub mod repos;
 pub mod rpc;
 pub mod run_journal;
+pub mod scaffold;
 pub mod sessions;
 pub mod spaces;
 pub mod terminals;
@@ -29,7 +30,7 @@ pub mod uploads;
 pub mod workspace_host;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
-pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
+pub use auth::{Auth, AuthConfig, AuthState, AuthUser};
 pub use diff_sync::{CheckoutDiffSync, DiffSidecar, DiffSnapshot, capture_diff};
 pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
 pub use instance_lock::InstanceLock;
@@ -37,13 +38,17 @@ pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
 pub use repos::{CheckoutIdentity, Repos, worktree_branch_from_title};
 pub use rpc::EngineRpc;
 pub use run_journal::{JournalError, RunJournal};
+pub use scaffold::{
+    DeviceJoinGrantProvider, EdgeDeviceJoinGrantClient, ScaffoldClient, ScaffoldError,
+    ScaffoldRuntime, UnavailableDeviceJoinGrantProvider,
+};
 pub use sessions::{JournaledEvent, SessionsEngine, SteerOutcome};
 pub use spaces::SpacesSync;
 pub use terminals::Terminals;
 pub use titles::TitleGenerator;
 pub use uploads::{AttachmentChunk, Uploads};
 pub use workspace_host::{
-    DEFAULT_ORG_ID, DEFAULT_USER_ID, WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig,
+    DEFAULT_PROJECT_SCOPE, DEFAULT_USER_ID, WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -83,11 +88,33 @@ pub struct EngineConfig {
     pub ipc_port: u16,
     /// Harness for doc-command runs on chats without a workspace `config` row.
     pub default_harness: HarnessId,
-    /// Workspace-doc org (`ws/{orgId}` room). `None` = `$COMET_ORG_ID` or the dev default.
-    /// In WorkOS mode the signed-in session's org wins.
-    pub org_id: Option<String>,
-    /// WorkOS client id — enables real auth; `None` = dev mode (bearer = `edge_token`).
-    pub workos_client_id: Option<String>,
+    /// Operator-configured Scaffold deployment/project scope.
+    pub project_scope: String,
+    /// Scaffold control-plane origin; `None` enables explicit dev bearer mode.
+    pub scaffold_url: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct DeviceBootstrapConfig {
+    pub device_join_grant: String,
+    pub project_id: String,
+    pub deployment_id: String,
+    pub session_id: String,
+    pub device_id: String,
+    pub sandbox_id: String,
+}
+
+impl std::fmt::Debug for DeviceBootstrapConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceBootstrapConfig")
+            .field("device_join_grant", &"<redacted>")
+            .field("project_id", &self.project_id)
+            .field("deployment_id", &self.deployment_id)
+            .field("session_id", &self.session_id)
+            .field("device_id", &self.device_id)
+            .field("sandbox_id", &self.sandbox_id)
+            .finish()
+    }
 }
 
 /// The assembled engine core — also constructible without the IPC server for tests
@@ -111,6 +138,8 @@ pub struct EngineCore {
     /// Release checker (attached by [`Engine::assemble_runtime`]) — the
     /// UpdateStatus stream + ApplyUpdate.
     updater: std::sync::Mutex<Option<comet_update::Updater>>,
+    /// Optional Scaffold control-plane integration, exposed over the native RPC service.
+    scaffold: std::sync::Mutex<Option<ScaffoldRuntime>>,
     /// Exclusive data-dir lock — held for the engine's lifetime (single-instance).
     _instance_lock: InstanceLock,
 }
@@ -118,17 +147,24 @@ pub struct EngineCore {
 impl EngineCore {
     /// Open stores under `data_dir`, wire sessions ⇄ doc host ⇄ workspace host, and
     /// recover stale journals from a previous crash. Identity comes from
-    /// `$COMET_ORG_ID` / `$COMET_USER_ID` (dev defaults `dev-org` / `dev-user`);
-    /// use [`Self::assemble_with_identity`] to pass one explicitly.
+    /// `$COMET_PROJECT_SCOPE` / `$COMET_USER_ID`; use
+    /// [`Self::assemble_with_identity`] to pass one explicitly.
     pub fn assemble(
         data_dir: &Path,
         registry: Arc<HarnessRegistry>,
         default_harness: HarnessId,
         edge: Option<EdgeConfig>,
     ) -> Result<Self, EngineError> {
-        let org_id = env_or("COMET_ORG_ID", DEFAULT_ORG_ID);
+        let project_scope = env_or("COMET_PROJECT_SCOPE", "ashler-local");
         let user_id = env_or("COMET_USER_ID", DEFAULT_USER_ID);
-        Self::assemble_with_identity(data_dir, registry, default_harness, edge, &org_id, &user_id)
+        Self::assemble_with_identity(
+            data_dir,
+            registry,
+            default_harness,
+            edge,
+            &project_scope,
+            &user_id,
+        )
     }
 
     pub fn assemble_with_identity(
@@ -136,7 +172,7 @@ impl EngineCore {
         registry: Arc<HarnessRegistry>,
         default_harness: HarnessId,
         edge: Option<EdgeConfig>,
-        org_id: &str,
+        project_scope: &str,
         user_id: &str,
     ) -> Result<Self, EngineError> {
         std::fs::create_dir_all(data_dir)?;
@@ -145,15 +181,14 @@ impl EngineCore {
         // port binds; held (and kernel-released on crash) for the engine's life.
         let lock = InstanceLock::acquire(data_dir)?;
         let device_id = load_or_create_device_id(data_dir)?;
-        // Identity-scoped storage: snapshots, the command ledger, and run
-        // journals live under `orgs/{orgId}/{userId}/` so switching accounts or
-        // orgs on one machine never reuses another identity's cached docs.
-        let org_dir = data_dir
-            .join("orgs")
-            .join(sanitize_path_id(org_id))
+        // Identity-scoped storage. `projects/` is a clean boundary from the
+        // removed application-organization layout.
+        let project_dir = data_dir
+            .join("projects")
+            .join(sanitize_path_id(project_scope))
             .join(sanitize_path_id(user_id));
-        let store = Arc::new(DocsStore::open(&org_dir)?);
-        let journal = Arc::new(RunJournal::open(org_dir.join("journals"))?);
+        let store = Arc::new(DocsStore::open(&project_dir)?);
+        let journal = Arc::new(RunJournal::open(project_dir.join("journals"))?);
         let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone());
         let doc_host = DocHost::new(
             store.clone(),
@@ -169,7 +204,7 @@ impl EngineCore {
                 device_id: device_id.clone(),
                 device_name: local_device_name(),
                 platform: std::env::consts::OS.to_string(),
-                org_id: org_id.to_string(),
+                project_scope: project_scope.to_string(),
                 user_id: user_id.to_string(),
                 edge: edge.clone(),
             },
@@ -208,6 +243,7 @@ impl EngineCore {
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
             updater: std::sync::Mutex::new(None),
+            scaffold: std::sync::Mutex::new(None),
             _instance_lock: lock,
         })
     }
@@ -220,8 +256,7 @@ impl EngineCore {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(auth);
     }
 
-    /// The attached auth service, or a lazily-created dev-mode one (in-process embeds
-    /// that never wired WorkOS still answer AuthStatus honestly).
+    /// The attached auth service, or a lazily-created explicit dev-mode one.
     pub fn auth(&self) -> Auth {
         let mut slot = self
             .auth
@@ -233,6 +268,7 @@ impl EngineCore {
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "dev-user".into());
             let mut config = AuthConfig::new("http://localhost:27640", std::env::temp_dir());
+            config.project_scope = self.workspace.project_scope().to_string();
             config.dev_user_id = dev_user;
             Auth::new(config)
         })
@@ -269,6 +305,20 @@ impl EngineCore {
             .clone()
     }
 
+    pub fn set_scaffold_runtime(&self, scaffold: ScaffoldRuntime) {
+        *self
+            .scaffold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(scaffold);
+    }
+
+    pub fn scaffold_runtime(&self) -> Option<ScaffoldRuntime> {
+        self.scaffold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// A live RPC client to another device's engine through its relay DO (the router's
     /// dial seam). Cached per device; invalidated + re-dialed on failure.
     pub async fn dial_device(
@@ -291,18 +341,33 @@ impl EngineCore {
         let auth = self.auth();
         let config =
             comet_rpc::HostRelayConfig::new(edge_url, self.device_id.clone(), Arc::new(auth));
-        let doc_host = self.doc_host.clone();
+        let nudge_host = self.doc_host.clone();
         let on_nudge: comet_rpc::NudgeHandler = Arc::new(move |chat_id: String| {
             // Opening the doc joins its room + syncs; drain fires on the change
             // subscription — the command executes with no standing per-chat socket.
-            match doc_host.open(&chat_id) {
+            match nudge_host.open(&chat_id) {
                 Ok(_) => tracing::info!(chat = %chat_id, "nudge: chat doc opened"),
                 Err(err) => {
                     tracing::warn!(chat = %chat_id, error = %err, "nudge: open failed")
                 }
             }
         });
-        comet_rpc::HostRelay::spawn(config, self.rpc_service(), on_nudge)
+        let reset_host = self.doc_host.clone();
+        let on_grant_reset: comet_rpc::GrantResetHandler =
+            Arc::new(move || reset_host.reset_edge_grants());
+        let grant_host = self.doc_host.clone();
+        let on_grant: comet_rpc::GrantHandler = Arc::new(move |session_id, payload| {
+            if let Err(reason) = grant_host.ingest_verified_grant(&session_id, &payload) {
+                tracing::warn!(reason, "device-room: rejected authority grant frame");
+            }
+        });
+        comet_rpc::HostRelay::spawn_with_authority(
+            config,
+            self.rpc_service(),
+            on_nudge,
+            on_grant_reset,
+            on_grant,
+        )
     }
 
     pub fn rpc_service(&self) -> Arc<EngineRpc> {
@@ -324,6 +389,9 @@ impl EngineCore {
         if let Some(updater) = self.updater() {
             rpc = rpc.with_updater(updater);
         }
+        if let Some(scaffold) = self.scaffold_runtime() {
+            rpc = rpc.with_scaffold(scaffold);
+        }
         Arc::new(rpc)
     }
 
@@ -341,6 +409,7 @@ impl EngineCore {
 
 pub struct Engine {
     pub config: EngineConfig,
+    device_bootstrap: Option<DeviceBootstrapConfig>,
 }
 
 /// A fully assembled identity-scoped engine plus the relay handle whose lifetime
@@ -363,19 +432,42 @@ impl EngineRuntime {
 
 impl Engine {
     pub fn new(config: EngineConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            device_bootstrap: None,
+        }
     }
 
-    /// Resolve the shared dev/WorkOS auth configuration for headed and headless
-    /// modes. Production callers pass the baked WorkOS client id; explicit dev
-    /// bearers still opt into the local dev identity.
+    pub fn with_device_bootstrap(mut self, bootstrap: DeviceBootstrapConfig) -> Self {
+        self.device_bootstrap = Some(bootstrap);
+        self
+    }
+
+    /// Resolve Scaffold OAuth or explicit local development authentication.
     pub async fn build_auth(config: &EngineConfig) -> Auth {
+        Self::build_auth_for(config, None).await
+    }
+
+    async fn build_auth_for(
+        config: &EngineConfig,
+        bootstrap: Option<&DeviceBootstrapConfig>,
+    ) -> Auth {
         let mut auth_config = AuthConfig::new(config.edge_url.clone(), config.data_dir.clone());
-        auth_config.workos_client_id = config.workos_client_id.clone();
-        if let Ok(base) = std::env::var("COMET_WORKOS_API_BASE")
-            && !base.trim().is_empty()
+        auth_config.scaffold_url = config.scaffold_url.clone();
+        auth_config.project_scope = bootstrap
+            .map(|value| value.project_id.clone())
+            .unwrap_or_else(|| config.project_scope.clone());
+        if let Some(bootstrap) = bootstrap {
+            auth_config.device_join_grant = Some(bootstrap.device_join_grant.clone());
+            auth_config.expected_device_id = Some(bootstrap.device_id.clone());
+            auth_config.expected_session_id = Some(bootstrap.session_id.clone());
+            auth_config.expected_deployment_id = Some(bootstrap.deployment_id.clone());
+            auth_config.expected_sandbox_id = Some(bootstrap.sandbox_id.clone());
+        }
+        if let Ok(scopes) = std::env::var("COMET_OAUTH_SCOPES")
+            && !scopes.trim().is_empty()
         {
-            auth_config.workos_api_base = base;
+            auth_config.oauth_scopes = scopes;
         }
         auth_config.callback_port = Some(
             std::env::var("COMET_CALLBACK_PORT")
@@ -396,26 +488,18 @@ impl Engine {
         config: &EngineConfig,
         auth: Auth,
     ) -> anyhow::Result<EngineRuntime> {
-        let online = (auth.workos_enabled() || config.edge_token.is_some())
+        let online = (auth.oauth_enabled() || auth.device_mode() || config.edge_token.is_some())
             && auth.access_token().await.is_some();
         let device_id = load_or_create_device_id(&config.data_dir)?;
         let edge = online.then(|| {
             EdgeConfig::new(config.edge_url.clone(), Arc::new(auth.clone())).with_device(device_id)
         });
 
-        let dev_token_org = config
-            .edge_token
-            .as_deref()
-            .and_then(|t| t.split_once('@'))
-            .map(|(_, org)| org.to_string())
-            .filter(|s| !s.is_empty());
-        let org_id = auth
+        let project_scope = auth
             .state()
-            .org_id()
+            .project_scope()
             .map(str::to_string)
-            .or(dev_token_org)
-            .or(config.org_id.clone())
-            .unwrap_or_else(|| env_or("COMET_ORG_ID", DEFAULT_ORG_ID));
+            .unwrap_or_else(|| config.project_scope.clone());
         let user_id = auth
             .user_id()
             .unwrap_or_else(|| env_or("COMET_USER_ID", DEFAULT_USER_ID));
@@ -424,10 +508,22 @@ impl Engine {
             Arc::new(default_registry()),
             config.default_harness,
             edge.clone(),
-            &org_id,
+            &project_scope,
             &user_id,
         )?;
         core.set_auth(auth.clone());
+        if let Some(scaffold_url) = config.scaffold_url.as_deref()
+            && !auth.device_mode()
+        {
+            let bearer: Arc<dyn comet_rpc::TokenSource> = Arc::new(auth.clone());
+            let client = ScaffoldClient::new(scaffold_url, project_scope.clone(), bearer.clone())?;
+            let grants = Arc::new(EdgeDeviceJoinGrantClient::new(&config.edge_url, bearer)?);
+            core.set_scaffold_runtime(ScaffoldRuntime::new(
+                client,
+                config.edge_url.clone(),
+                grants,
+            ));
+        }
         // Release checker: polls {edge}/releases on a 6h cadence; headless
         // installs with COMET_AUTO_UPDATE=1 apply + restart themselves — gated
         // on quiescence so a restart never lands under a live run or open PTY.
@@ -436,9 +532,18 @@ impl Engine {
             let terminals = core.terminals.clone();
             Arc::new(move || !sessions.any_active() && !terminals.any_open())
         };
+        let update_access_token: comet_update::AccessTokenSource = {
+            let auth = auth.clone();
+            Arc::new(move || {
+                let auth = auth.clone();
+                Box::pin(async move { auth.access_token().await })
+            })
+        };
         core.set_updater(comet_update::Updater::spawn(
             config.edge_url.clone(),
+            config.data_dir.clone(),
             Some(quiescent),
+            update_access_token,
         ));
         tracing::info!(device_id = %core.device_id, "engine core assembled");
 
@@ -462,21 +567,26 @@ impl Engine {
         })
     }
 
-    /// Run until ctrl-c: auth (dev or WorkOS), sessions engine + doc host + command
-    /// executor, IPC server, and — when edge+auth are ready — the device-room host
-    /// relay + peer link cache (targetDeviceId routing).
+    /// Run until ctrl-c: auth, sessions engine + doc host + command executor,
+    /// IPC server, and, when edge+auth are ready, device routing.
     pub async fn run(self) -> anyhow::Result<()> {
         let config = self.config;
+        let bootstrap = self.device_bootstrap;
         tracing::info!(data_dir = %config.data_dir.display(), "engine starting");
 
         std::fs::create_dir_all(&config.data_dir)?;
-        let auth = Self::build_auth(&config).await;
-        let _refresh_loop = auth.spawn_refresh_loop();
+        if let Some(bootstrap) = &bootstrap {
+            validate_device_bootstrap(&config, bootstrap)?;
+            persist_expected_device_id(&config.data_dir, &bootstrap.device_id)?;
+        }
+        let auth = Self::build_auth_for(&config, bootstrap.as_ref()).await;
+        if auth.device_mode() && auth.access_token().await.is_none() {
+            anyhow::bail!("device_join_grant_unavailable");
+        }
+        let _auth_task = auth.spawn_refresh_loop();
 
-        // WorkOS mode: gate edge features on a signed-in, org-scoped session. A TTY
-        // gets the interactive paste-code flow; a service manager (systemd/launchd)
-        // fails fast with a "run `comet login`" error instead of hanging on a prompt.
-        if auth.workos_enabled() {
+        // Service managers fail fast instead of waiting on an invisible prompt.
+        if auth.oauth_enabled() {
             terminal_sign_in(&auth).await?;
         }
 
@@ -535,52 +645,34 @@ pub async fn serve_ipc(
     )))
 }
 
-/// Block until the WorkOS session is signed in AND org-scoped. On a TTY, print the
-/// headless (paste-code) sign-in URL, read the pasted `state.code` from stdin, and
-/// run workspace onboarding (create / auto-join / numbered picker). Off a TTY this
-/// errors immediately — a daemon under systemd/launchd must load the session that
-/// `comet login` persisted, never wait on a prompt nobody can see.
+/// Block until the Scaffold OAuth session is signed in. A TTY prints the
+/// browser URL and accepts either the loopback callback URL or `state.code`.
 pub async fn terminal_sign_in(auth: &Auth) -> Result<(), EngineError> {
     use std::io::IsTerminal;
     let interactive = std::io::stdin().is_terminal();
     let mut state_rx = auth.watch_state();
     let mut stdin_reader: Option<tokio::task::JoinHandle<()>> = None;
-    let mut org_reader: Option<tokio::task::JoinHandle<()>> = None;
     loop {
-        let state = state_rx.borrow().clone();
-        match state {
-            AuthState::SignedIn { user, org_id } => {
-                tracing::info!(email = %user.email, org = org_id.as_deref().unwrap_or("<none>"),
-                    "auth: session ready");
+        match state_rx.borrow().clone() {
+            AuthState::SignedIn {
+                user,
+                project_scope,
+            } => {
+                tracing::info!(email = %user.email, project = %project_scope, "auth: session ready");
                 break;
-            }
-            AuthState::NeedsOrganization { user } => {
-                if !interactive {
-                    // No reader tasks have been spawned on this path (both spawns
-                    // are TTY-gated), so an early return leaks nothing.
-                    return Err(EngineError::Other(format!(
-                        "signed in as {} but no workspace is selected — run `comet login` on this machine to pick one",
-                        user.email
-                    )));
-                }
-                if org_reader.is_none() {
-                    // Workspace onboarding on the TTY (old comet's
-                    // `backend login` flow): create if none, auto-join a
-                    // single membership, numbered picker otherwise.
-                    println!("Signed in as {}.", user.email);
-                    org_reader = Some(tokio::spawn(run_org_onboarding(auth.clone())));
-                }
             }
             AuthState::SignedOut => {
                 if !interactive {
                     return Err(EngineError::Other(
-                        "not signed in — run `comet login` on this machine first".into(),
+                        "not signed in; run `comet login` on this machine first".into(),
                     ));
                 }
                 if stdin_reader.is_none() {
-                    let url = auth.start_headless_sign_in();
-                    println!("Sign in to Comet:\n\n  {url}\n");
-                    println!("Then paste the code shown in the browser here and press enter.");
+                    let url = auth.start_headless_sign_in().await?;
+                    println!("Sign in to Ashler Comet:\n\n  {url}\n");
+                    println!(
+                        "If the browser cannot reach this machine, paste its final localhost URL here."
+                    );
                     let auth = auth.clone();
                     stdin_reader = Some(tokio::spawn(async move {
                         loop {
@@ -607,9 +699,6 @@ pub async fn terminal_sign_in(auth: &Auth) -> Result<(), EngineError> {
     if let Some(reader) = stdin_reader {
         reader.abort();
     }
-    if let Some(reader) = org_reader {
-        reader.abort();
-    }
     Ok(())
 }
 
@@ -625,73 +714,6 @@ async fn read_stdin_line() -> Option<String> {
     .await
     .ok()
     .flatten()
-}
-
-/// TTY workspace onboarding for an org-less session (ports old comet's
-/// `backend login` flow): no memberships → prompt a name and create; exactly
-/// one → auto-join; several → numbered picker. Success flips the auth state to
-/// `SignedIn`, which ends [`wait_for_sign_in`]'s wait (and aborts this task).
-async fn run_org_onboarding(auth: Auth) {
-    let orgs = match auth.list_orgs().await {
-        Ok(orgs) => orgs,
-        Err(err) => {
-            println!(
-                "Could not list workspaces ({err}) — create or select one from the Comet UI to continue."
-            );
-            return;
-        }
-    };
-    match orgs.len() {
-        0 => {
-            println!("No workspaces yet — name your new workspace and press enter:");
-            loop {
-                let Some(line) = read_stdin_line().await else {
-                    return;
-                };
-                let name = line.trim();
-                if name.is_empty() {
-                    continue;
-                }
-                match auth.create_org(name).await {
-                    Ok(()) => return,
-                    Err(err) => println!("Creating workspace failed: {err}"),
-                }
-            }
-        }
-        1 => {
-            let only = &orgs[0];
-            println!("Joining workspace \"{}\"…", only.name);
-            if let Err(err) = auth.select_org(&only.organization_id).await {
-                println!("Joining workspace failed: {err}");
-            }
-        }
-        _ => {
-            println!("\nYour workspaces:");
-            for (index, org) in orgs.iter().enumerate() {
-                println!("  {}. {}", index + 1, org.name);
-            }
-            println!("Pick a workspace [1-{}]:", orgs.len());
-            loop {
-                let Some(line) = read_stdin_line().await else {
-                    return;
-                };
-                let choice = line
-                    .trim()
-                    .parse::<usize>()
-                    .ok()
-                    .and_then(|n| n.checked_sub(1))
-                    .and_then(|index| orgs.get(index));
-                let Some(org) = choice else {
-                    println!("Pick a workspace [1-{}]:", orgs.len());
-                    continue;
-                };
-                match auth.select_org(&org.organization_id).await {
-                    Ok(()) => return,
-                    Err(err) => println!("Joining workspace failed: {err}"),
-                }
-            }
-        }
-    }
 }
 
 /// Best-effort human name for this device's registry row (hostname).
@@ -714,7 +736,7 @@ fn env_or(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-/// Filesystem-safe form of an org/user id (path segments for `orgs/{org}/{user}/`).
+/// Filesystem-safe project/principal path segment.
 fn sanitize_path_id(id: &str) -> String {
     id.chars()
         .map(|c| {
@@ -725,6 +747,50 @@ fn sanitize_path_id(id: &str) -> String {
             }
         })
         .collect()
+}
+
+fn validate_device_bootstrap(
+    config: &EngineConfig,
+    bootstrap: &DeviceBootstrapConfig,
+) -> Result<(), EngineError> {
+    let valid_id = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    };
+    if !bootstrap.device_join_grant.starts_with("cg1.")
+        || bootstrap.project_id != config.project_scope
+        || !valid_id(&bootstrap.project_id)
+        || !valid_id(&bootstrap.deployment_id)
+        || !valid_id(&bootstrap.session_id)
+        || !valid_id(&bootstrap.device_id)
+        || !valid_id(&bootstrap.sandbox_id)
+        || bootstrap.device_id != format!("comet-scaffold-{}", bootstrap.sandbox_id)
+    {
+        return Err(EngineError::Other("device_join_grant_unavailable".into()));
+    }
+    Ok(())
+}
+
+fn persist_expected_device_id(data_dir: &Path, expected: &str) -> Result<(), EngineError> {
+    let path = data_dir.join("device-id");
+    match std::fs::read_to_string(&path) {
+        Ok(existing) if existing.trim() == expected => Ok(()),
+        Ok(existing) if existing.trim().is_empty() => {
+            std::fs::write(path, expected)?;
+            Ok(())
+        }
+        Ok(_) => Err(EngineError::Other(
+            "sandbox device id does not match its join grant".into(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::write(path, expected)?;
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Stable per-installation device id, persisted at `{data_dir}/device-id`.

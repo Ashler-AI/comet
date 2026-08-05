@@ -81,12 +81,14 @@ pub struct RenderOptions {
     pub copy: Option<CopyUi>,
 }
 
+pub type CopyHandler = dyn Fn(usize, SharedString, &mut Window, &mut gpui::App);
+
 /// Copy-button wiring for one row's code blocks: the handler writes the code
 /// to the clipboard and flips a transient per-row "Copied" state owned by the
 /// transcript entity; `copied_ix` is the block currently showing feedback.
 #[derive(Clone)]
 pub struct CopyUi {
-    pub handler: Rc<dyn Fn(usize, SharedString, &mut Window, &mut gpui::App)>,
+    pub handler: Rc<CopyHandler>,
     pub copied_ix: Option<usize>,
 }
 
@@ -488,8 +490,8 @@ fn render_table(
 
 /// Flattened inline runs: one string + gpui `TextRun`s + clickable link ranges
 /// + inline-code ranges (their rounded washes are painted by a canvas UNDER
-/// the text — `TextRun::background_color` can only paint square boxes).
-/// `text` is a `SharedString` so cached reuse across frames is an Arc clone.
+///   the text — `TextRun::background_color` can only paint square boxes).
+///   `text` is a `SharedString` so cached reuse across frames is an Arc clone.
 pub struct FlatText {
     pub text: SharedString,
     pub runs: Vec<TextRun>,

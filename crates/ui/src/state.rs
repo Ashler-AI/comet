@@ -29,7 +29,10 @@ use serde::de::DeserializeOwned;
 
 use comet_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
 use comet_engine::{Engine, EngineConfig, EngineRuntime, rpc::AuthRpc};
-use comet_proto::{AuthState, Chat, ChatIndicator, Device, HarnessId, Session, Space};
+use comet_proto::{
+    AuthState, Chat, ChatIndicator, CollaborationSnapshot, Device, HarnessId, MessageProvenance,
+    ParticipantPresence, Session, Space,
+};
 use comet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
 
 // ---------------------------------------------------------------------------
@@ -47,10 +50,10 @@ pub struct EngineBootConfig {
     pub edge_url: String,
     /// Bearer for edge room joins; `None` runs offline.
     pub edge_token: Option<String>,
-    /// Workspace org override for explicit dev-mode runs.
-    pub org_id: Option<String>,
-    /// WorkOS client id for production authentication.
-    pub workos_client_id: Option<String>,
+    /// Operator-configured Scaffold project/deployment boundary.
+    pub project_scope: String,
+    /// Scaffold control-plane origin; `None` keeps explicit local mode.
+    pub scaffold_url: Option<String>,
     /// Harness for doc-command runs until per-chat config lands (M4).
     pub default_harness: HarnessId,
 }
@@ -205,8 +208,8 @@ impl EngineHandle {
             edge_token: config.edge_token,
             ipc_port: config.ipc_port,
             default_harness: config.default_harness,
-            org_id: config.org_id,
-            workos_client_id: config.workos_client_id,
+            project_scope: config.project_scope,
+            scaffold_url: config.scaffold_url,
         };
         let auth = Engine::build_auth(&engine_config).await;
         let refresh_task = auth.spawn_refresh_loop();
@@ -300,43 +303,6 @@ pub use comet_proto::view::{
 };
 
 // ---------------------------------------------------------------------------
-// Org gate (pure)
-// ---------------------------------------------------------------------------
-
-/// One org membership row (tolerant local mirror of the engine's ListOrgs
-/// reply — `{orgs: [{id, organizationId, name}]}`).
-#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OrgRow {
-    pub organization_id: String,
-    pub name: String,
-}
-
-/// Parse a ListOrgs reply tolerantly (accepts a bare array too).
-pub fn parse_orgs(value: &serde_json::Value) -> Vec<OrgRow> {
-    let list = value.get("orgs").unwrap_or(value);
-    serde_json::from_value(list.clone()).unwrap_or_default()
-}
-
-/// Workspace names must be non-empty (trimmed) and reasonably short.
-pub fn org_name_valid(name: &str) -> bool {
-    let trimmed = name.trim();
-    !trimmed.is_empty() && trimmed.chars().count() <= 64
-}
-
-/// Memberships sorted by name (case-insensitive), deduped by organization id.
-pub fn sort_memberships(mut orgs: Vec<OrgRow>) -> Vec<OrgRow> {
-    orgs.sort_by(|a, b| {
-        a.name
-            .to_lowercase()
-            .cmp(&b.name.to_lowercase())
-            .then_with(|| a.name.cmp(&b.name))
-    });
-    orgs.dedup_by(|a, b| a.organization_id == b.organization_id);
-    orgs
-}
-
-// ---------------------------------------------------------------------------
 // AppState entity
 // ---------------------------------------------------------------------------
 
@@ -361,6 +327,17 @@ pub struct AppState {
     pub auto_selected: bool,
     /// Joined transcript of the selected chat (continuations folded engine-side).
     pub transcript: Vec<SessionMessageEntry>,
+    /// Multiplayer projection for the selected shared thread. The last good
+    /// snapshot remains visible while its watch reconnects or a model hands off.
+    pub collaboration: Option<CollaborationSnapshot>,
+    /// Independently-owned agent session targeted by pause/resume/steer/stop.
+    /// It is UI selection only; authority still comes from the verified grant.
+    pub selected_agent_session: Option<String>,
+    /// Installed-app invitation awaiting the exact session/grant projection.
+    pending_invitation: Option<comet_proto::CometInvitation>,
+    /// Grant named by the accepted deep link. It remains a routing identity;
+    /// command authority is still checked against the verified projection.
+    pub selected_invitation_grant: Option<String>,
     /// Optimistic user echoes per chat id, shown until the doc frame carrying
     /// the same message id arrives (client-minted ids make dedup exact).
     echoes: HashMap<String, Vec<SessionMessageEntry>>,
@@ -375,6 +352,7 @@ pub struct AppState {
     engine: Option<EngineHandle>,
     watch_tasks: Vec<Task<()>>,
     transcript_task: Option<Task<()>>,
+    collaboration_task: Option<Task<()>>,
 }
 
 impl Default for AppState {
@@ -395,6 +373,10 @@ impl AppState {
             selected_space: None,
             selected_chat: None,
             transcript: Vec::new(),
+            collaboration: None,
+            selected_agent_session: None,
+            pending_invitation: None,
+            selected_invitation_grant: None,
             echoes: HashMap::new(),
             local_device_id: None,
             update: None,
@@ -402,6 +384,7 @@ impl AppState {
             engine: None,
             watch_tasks: Vec::new(),
             transcript_task: None,
+            collaboration_task: None,
             auto_selected: false,
         }
     }
@@ -413,11 +396,17 @@ impl AppState {
         self.chats = chats;
         if let Some(selected) = &self.selected_chat
             && !self.chats.iter().any(|c| &c.id == selected)
+            && self
+                .pending_invitation
+                .as_ref()
+                .is_none_or(|invitation| invitation.chat_id != *selected)
         {
             // Selected chat vanished (deleted elsewhere): drop selection + transcript.
             self.selected_chat = None;
             self.transcript.clear();
             self.transcript_task = None;
+            self.collaboration = None;
+            self.collaboration_task = None;
         }
     }
 
@@ -475,7 +464,7 @@ impl AppState {
     /// The signed-in user, if the engine reports one.
     pub fn auth_user(&self) -> Option<&comet_proto::UserProfile> {
         match self.auth.as_ref()? {
-            AuthState::SignedIn { user, .. } | AuthState::NeedsOrganization { user } => Some(user),
+            AuthState::SignedIn { user, .. } => Some(user),
             AuthState::SignedOut => None,
         }
     }
@@ -488,6 +477,73 @@ impl AppState {
             echoes.retain(|echo| !entries.iter().any(|e| e.id == echo.id));
         }
         self.transcript = entries;
+    }
+
+    pub fn apply_collaboration(&mut self, snapshot: CollaborationSnapshot) {
+        if self.apply_pending_invitation(&snapshot) {
+            self.collaboration = Some(snapshot);
+            return;
+        }
+        let selected_still_exists = self.selected_agent_session.as_deref().is_some_and(|id| {
+            snapshot
+                .sessions
+                .iter()
+                .any(|session| session.session_id == id)
+        });
+        if !selected_still_exists {
+            let principal = snapshot
+                .principal
+                .as_ref()
+                .map(|principal| principal.subject.as_str());
+            self.selected_agent_session = snapshot
+                .sessions
+                .iter()
+                .find(|session| {
+                    principal == Some(session.owner_subject.as_str())
+                        && self.local_device_id.as_deref() == Some(session.owner_device_id.as_str())
+                })
+                .or_else(|| snapshot.sessions.first())
+                .map(|session| session.session_id.clone());
+        }
+        self.collaboration = Some(snapshot);
+    }
+
+    fn apply_pending_invitation(&mut self, snapshot: &CollaborationSnapshot) -> bool {
+        let Some(invitation) = self.pending_invitation.as_ref() else {
+            return false;
+        };
+        if self.selected_chat.as_deref() != Some(invitation.chat_id.as_str()) {
+            return false;
+        }
+        let Some(session) = snapshot.sessions.iter().find(|session| {
+            session.chat_id == invitation.chat_id && session.session_id == invitation.session_id
+        }) else {
+            return true;
+        };
+        // Navigation may select the named session immediately; this is display
+        // state only. The grant remains unavailable until the authenticated
+        // projection below proves the exact id and scope.
+        self.selected_agent_session = Some(session.session_id.clone());
+        let now = Utc::now().timestamp_millis();
+        let Some(principal) = snapshot.principal.as_ref() else {
+            return true;
+        };
+        let exact_grant = snapshot.grants.iter().find(|grant| {
+            grant.id == invitation.grant_id
+                && grant.principal_subject == principal.subject
+                && grant.scope.project_id == principal.project_id
+                && grant.scope.session_id.as_deref() == Some(session.session_id.as_str())
+                && grant.device_id.as_deref() == Some(session.owner_device_id.as_str())
+                && grant.granted_at <= now
+                && grant.expires_at.is_some_and(|expires| now < expires)
+                && grant.revoked_at.is_none()
+        });
+        let Some(grant) = exact_grant else {
+            return true;
+        };
+        self.selected_invitation_grant = Some(grant.id.clone());
+        self.pending_invitation = None;
+        true
     }
 
     /// Apply a `WatchDocMessages` delta frame in place. `Err` = this copy has
@@ -528,6 +584,92 @@ impl AppState {
             .and_then(|id| self.echoes.get(id))
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    pub fn collaboration_sessions(
+        &self,
+        chat_id: &str,
+    ) -> impl Iterator<Item = &comet_proto::AgentSessionRecord> {
+        self.collaboration
+            .iter()
+            .flat_map(|snapshot| snapshot.sessions.iter())
+            .filter(move |session| session.chat_id == chat_id)
+    }
+
+    pub fn message_provenance(&self, message_id: &str) -> Option<&MessageProvenance> {
+        self.collaboration
+            .as_ref()?
+            .message_provenance
+            .iter()
+            .find(|provenance| provenance.message_id == message_id)
+    }
+
+    pub fn participants(&self) -> &[ParticipantPresence] {
+        self.collaboration
+            .as_ref()
+            .map(|snapshot| snapshot.participants.as_slice())
+            .unwrap_or_default()
+    }
+
+    pub fn participant_name<'a>(&'a self, subject: &'a str) -> &'a str {
+        self.participants()
+            .iter()
+            .find(|participant| participant.principal_subject == subject)
+            .and_then(|participant| participant.display_name.as_deref())
+            .unwrap_or(subject)
+    }
+
+    pub fn principal_subject(&self) -> Option<&str> {
+        self.collaboration
+            .as_ref()?
+            .principal
+            .as_ref()
+            .map(|principal| principal.subject.as_str())
+    }
+
+    pub fn has_collaboration_capability(&self, capability: &str) -> bool {
+        self.collaboration
+            .as_ref()
+            .and_then(|snapshot| snapshot.principal.as_ref())
+            .is_some_and(|principal| principal.has_capability(capability))
+    }
+
+    pub fn selected_agent_session(&self) -> Option<&comet_proto::AgentSessionRecord> {
+        let selected = self.selected_agent_session.as_deref()?;
+        self.collaboration
+            .as_ref()?
+            .sessions
+            .iter()
+            .find(|session| session.session_id == selected)
+    }
+
+    pub fn select_agent_session(&mut self, session_id: Option<String>) {
+        self.selected_agent_session = session_id.filter(|id| {
+            self.collaboration.as_ref().is_some_and(|snapshot| {
+                snapshot
+                    .sessions
+                    .iter()
+                    .any(|session| &session.session_id == id)
+            })
+        });
+    }
+
+    pub fn open_invitation(
+        &mut self,
+        invitation: comet_proto::CometInvitation,
+        cx: &mut Context<Self>,
+    ) {
+        let chat_id = invitation.chat_id.clone();
+        self.pending_invitation = Some(invitation);
+        self.selected_invitation_grant = None;
+        if self.selected_chat.as_deref() == Some(chat_id.as_str()) {
+            if let Some(snapshot) = self.collaboration.clone() {
+                self.apply_pending_invitation(&snapshot);
+            }
+            cx.notify();
+        } else {
+            self.select_chat(Some(chat_id), cx);
+        }
     }
 
     // ---- queries ----
@@ -706,9 +848,12 @@ impl AppState {
             ),
             spawn_local_device_probe(cx, handle.clone()),
         ];
-        // Re-subscribe the transcript if a chat was already selected (reconnect path).
+        // Re-subscribe selected-room projections after an engine reconnect.
+        // Both retain their last good content until replacement frames arrive.
         if let Some(chat_id) = self.selected_chat.clone() {
-            self.transcript_task = Some(spawn_transcript_watch(cx, handle, chat_id));
+            self.transcript_task =
+                Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
+            self.collaboration_task = Some(spawn_collaboration_watch(cx, handle, chat_id));
         }
         cx.notify();
     }
@@ -729,6 +874,17 @@ impl AppState {
         self.auto_selected = true;
         self.transcript.clear();
         self.transcript_task = None;
+        self.collaboration = None;
+        self.collaboration_task = None;
+        self.selected_agent_session = None;
+        self.selected_invitation_grant = None;
+        if self
+            .pending_invitation
+            .as_ref()
+            .is_some_and(|invitation| Some(invitation.chat_id.as_str()) != chat_id.as_deref())
+        {
+            self.pending_invitation = None;
+        }
         if let Some(id) = chat_id.as_deref() {
             // A chat implies its space; `select_chat(None)` (the new-session
             // canvas) stays within the current space.
@@ -743,7 +899,9 @@ impl AppState {
             self.mark_chat_seen(id, cx);
         }
         if let (Some(chat_id), Some(handle)) = (chat_id, self.engine.clone()) {
-            self.transcript_task = Some(spawn_transcript_watch(cx, handle, chat_id));
+            self.transcript_task =
+                Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
+            self.collaboration_task = Some(spawn_collaboration_watch(cx, handle, chat_id));
         }
         cx.notify();
     }
@@ -984,6 +1142,58 @@ fn spawn_transcript_watch(
         }
     })
 }
+fn spawn_collaboration_watch(
+    cx: &mut Context<AppState>,
+    handle: EngineHandle,
+    chat_id: String,
+) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+        loop {
+            let params = serde_json::json!({ "chatId": chat_id });
+            let mut rx = match handle
+                .client()
+                .subscribe("WatchCollaboration", params)
+                .await
+            {
+                Ok(rx) => rx,
+                Err(err) => {
+                    tracing::warn!(%chat_id, error = %err, "collaboration watch failed; retrying");
+                    if this.update(cx, |_, _| {}).is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(RETRY_DELAY).await;
+                    continue;
+                }
+            };
+            while let Some(value) = rx.recv().await {
+                let snapshot: CollaborationSnapshot = match serde_json::from_value(value) {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        tracing::warn!(%chat_id, error = %err, "malformed collaboration snapshot");
+                        continue;
+                    }
+                };
+                if this
+                    .update(cx, |state, cx| {
+                        if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
+                            state.apply_collaboration(snapshot);
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            // Keep the last good snapshot on screen while the room reconnects.
+            if this.update(cx, |_, _| {}).is_err() {
+                return;
+            }
+            cx.background_executor().timer(RETRY_DELAY).await;
+        }
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -1008,8 +1218,8 @@ mod tests {
             ipc_port: free_port().await,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None, // offline
-            org_id: None,
-            workos_client_id: None,
+            project_scope: "test".into(),
+            scaffold_url: None,
             default_harness: HarnessId::Mock,
         })
         .await
@@ -1037,8 +1247,8 @@ mod tests {
             ipc_port: port,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None, // offline
-            org_id: None,
-            workos_client_id: None,
+            project_scope: "test".into(),
+            scaffold_url: None,
             default_harness: HarnessId::Mock,
         })
         .await
@@ -1082,8 +1292,8 @@ mod tests {
             ipc_port: port,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
-            org_id: None,
-            workos_client_id: None,
+            project_scope: "test".into(),
+            scaffold_url: None,
             default_harness: HarnessId::Mock,
         })
         .await
@@ -1099,48 +1309,6 @@ mod tests {
         );
         handle.shutdown().await;
         drop(squatter);
-    }
-
-    #[tokio::test]
-    async fn production_bootstrap_requires_sign_in_before_opening_engine_data() {
-        let dir = tempfile::tempdir().unwrap();
-        let handle = EngineHandle::bootstrap(EngineBootConfig {
-            data_dir: dir.path().to_path_buf(),
-            ipc_port: free_port().await,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None,
-            org_id: None,
-            workos_client_id: Some("client_test".into()),
-            default_harness: HarnessId::Mock,
-        })
-        .await
-        .unwrap();
-
-        let mut auth = handle
-            .client()
-            .subscribe(methods::AUTH_STATUS, serde_json::json!({}))
-            .await
-            .unwrap();
-        assert_eq!(
-            parse_auth_state(&auth.recv().await.unwrap()),
-            Some(AuthState::SignedOut)
-        );
-        assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                handle
-                    .client()
-                    .call(methods::LIST_HARNESSES, serde_json::json!({})),
-            )
-            .await
-            .is_err(),
-            "data RPC must wait behind the production sign-in gate"
-        );
-        assert!(
-            !dir.path().join("orgs/dev-org/dev-user").exists(),
-            "production boot must not create dev-user data"
-        );
-        handle.shutdown().await;
     }
 
     #[tokio::test]
@@ -1164,8 +1332,8 @@ mod tests {
             ipc_port: port,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
-            org_id: None,
-            workos_client_id: None,
+            project_scope: "test".into(),
+            scaffold_url: None,
             default_harness: HarnessId::Mock,
         })
         .await
@@ -1566,47 +1734,33 @@ mod tests {
             gate_phase(
                 &ConnectionStatus::Ready,
                 Some(&AuthState::SignedIn {
-                    user: user.clone(),
-                    org_id: None
+                    user,
+                    project_scope: "project-test".into(),
                 })
             ),
             GatePhase::Ready
         );
-        // No org yet → org gate.
-        assert_eq!(
-            gate_phase(
-                &ConnectionStatus::Ready,
-                Some(&AuthState::NeedsOrganization { user })
-            ),
-            GatePhase::OrgGate
-        );
     }
 
     #[test]
-    fn auth_frames_parse_both_wire_shapes() {
-        // Proto shape.
+    fn auth_frames_parse_current_wire_shape() {
         let proto = serde_json::json!({ "state": "signedOut" });
         assert_eq!(parse_auth_state(&proto), Some(AuthState::SignedOut));
-        // Engine shape (`_tag`, PascalCase, orgId).
         let engine = serde_json::json!({
             "_tag": "SignedIn",
             "user": { "id": "u1", "email": "w@example.com" },
-            "orgId": "org-1",
+            "projectScope": "project-test",
         });
-        let Some(AuthState::SignedIn { user, org_id }) = parse_auth_state(&engine) else {
+        let Some(AuthState::SignedIn {
+            user,
+            project_scope,
+        }) = parse_auth_state(&engine)
+        else {
             panic!("expected SignedIn");
         };
         assert_eq!(user.email, "w@example.com");
-        assert_eq!(org_id.as_deref(), Some("org-1"));
-        let needs = serde_json::json!({
-            "_tag": "NeedsOrganization",
-            "user": { "id": "u1", "email": "w@example.com", "name": "W" },
-        });
-        assert!(matches!(
-            parse_auth_state(&needs),
-            Some(AuthState::NeedsOrganization { .. })
-        ));
-        // Garbage → None (frame dropped, not a crash).
+        assert_eq!(project_scope, "project-test");
+        // Garbage is dropped rather than crashing the auth stream.
         assert_eq!(
             parse_auth_state(&serde_json::json!({ "_tag": "Wat" })),
             None
@@ -1690,32 +1844,66 @@ mod tests {
     }
 
     #[test]
-    fn org_gate_reducers() {
-        assert!(org_name_valid("Acme"));
-        assert!(org_name_valid("  padded  "));
-        assert!(!org_name_valid(""));
-        assert!(!org_name_valid("   "));
-        assert!(!org_name_valid(&"x".repeat(65)));
+    fn invitation_routes_to_exact_session_and_verified_grant() {
+        let now = Utc::now().timestamp_millis();
+        let snapshot: CollaborationSnapshot = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 2,
+            "sessions": [
+                {
+                    "sessionId": "session-other",
+                    "chatId": "chat-a",
+                    "ownerSubject": "iap:other@example.com",
+                    "ownerDeviceId": "device-other",
+                    "source": "local",
+                    "createdAt": now
+                },
+                {
+                    "sessionId": "session-invited",
+                    "chatId": "chat-a",
+                    "ownerSubject": "iap:owner@example.com",
+                    "ownerDeviceId": "device-owner",
+                    "source": "local",
+                    "createdAt": now
+                }
+            ],
+            "principal": {
+                "subject": "iap:invitee@example.com",
+                "projectId": "project-a",
+                "deploymentId": "deployment-a",
+                "sessionId": "session-invited",
+                "capabilities": ["session.read"]
+            },
+            "grants": [{
+                "id": "grant-invited",
+                "principalSubject": "iap:invitee@example.com",
+                "scope": {
+                    "projectId": "project-a",
+                    "deploymentId": "deployment-a",
+                    "sessionId": "session-invited"
+                },
+                "capabilities": ["session.read"],
+                "deviceId": "device-owner",
+                "grantedBy": "iap:owner@example.com",
+                "grantedAt": now - 1,
+                "expiresAt": now + 60_000
+            }]
+        }))
+        .unwrap();
+        let mut state = AppState::new();
+        state.selected_chat = Some("chat-a".into());
+        state.pending_invitation =
+            comet_proto::CometInvitation::new("chat-a", "session-invited", "grant-invited");
 
-        let rows = parse_orgs(&serde_json::json!({ "orgs": [
-            { "id": "m2", "organizationId": "o2", "name": "beta" },
-            { "id": "m1", "organizationId": "o1", "name": "Alpha" },
-            { "id": "m3", "organizationId": "o1", "name": "Alpha" },
-        ]}));
-        assert_eq!(rows.len(), 3);
-        let sorted = sort_memberships(rows);
-        let names: Vec<&str> = sorted.iter().map(|o| o.name.as_str()).collect();
+        state.apply_collaboration(snapshot);
+
         assert_eq!(
-            names,
-            ["Alpha", "beta"],
-            "case-insensitive sort + dedupe by org id"
+            state.selected_agent_session.as_deref(),
+            Some("session-invited")
         );
-        // Bare-array replies parse too; garbage yields empty.
         assert_eq!(
-            parse_orgs(&serde_json::json!([{ "id": "m", "organizationId": "o", "name": "n" }]))
-                .len(),
-            1
+            state.selected_invitation_grant.as_deref(),
+            Some("grant-invited")
         );
-        assert!(parse_orgs(&serde_json::json!("nope")).is_empty());
+        assert!(state.pending_invitation.is_none());
     }
 }

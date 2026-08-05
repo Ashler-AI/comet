@@ -1,6 +1,6 @@
 //! Model catalog + effort mapping for Claude Code, ported from comet's
 //! `packages/harness/src/claude.ts` (which itself mirrors Claude Code's own
-//! picker via t3code's catalog).
+//! picker behavior).
 //!
 //! The TS harness discovers models at runtime through the SDK's
 //! `supportedModels()` control request and then OVERLAYS these static effort

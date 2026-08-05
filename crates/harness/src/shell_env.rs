@@ -135,10 +135,11 @@ mod unix {
         }
     }
 
-    /// Run `<shell> <flags> 'echo BEGIN; env; echo END'` per flag set until one
-    /// yields a parseable PATH.
+    /// Run `<shell> <flags> 'echo BEGIN; echo PATH="$PATH"; echo END'` per flag
+    /// set until one yields a parseable PATH. Shell built-ins only: a valid
+    /// user PATH is not required to contain an external `env` binary.
     pub(super) fn snapshot_path(shell: &Path, timeout: Duration) -> Option<OsString> {
-        let script = format!("echo {BEGIN_MARKER}; env; echo {END_MARKER}");
+        let script = format!("echo {BEGIN_MARKER}; echo PATH=\"$PATH\"; echo {END_MARKER}");
         for flags in attempt_flag_sets(shell) {
             let output = run_and_capture(shell, &flags, &script, timeout);
             if let Some(path) = parse_snapshot_path(&output) {

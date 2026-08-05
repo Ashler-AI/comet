@@ -1,69 +1,152 @@
 /**
- * Edge auth: verify WorkOS AuthKit access-token JWTs (jose against the WorkOS
- * JWKS) before any DO forwarding or R2 access. WebSocket upgrades carry the
- * token as `?token=` (WS clients cannot always set headers); plain requests
- * use `Authorization: Bearer`.
- *
- * Workspace rooms (`ws/{orgId}`) authorize on the token's WorkOS organization
- * claim (`org_id`, present when the session was refreshed scoped to an org):
- * membership = claim equals the room's orgId.
+ * Authenticates Scaffold control-plane bearers without handling Google/IAP
+ * assertions in Comet. Scaffold's IAP-protected OAuth authorize route binds a
+ * bearer to an internal principal; this Worker validates it on every request
+ * through `/api/code-sandboxes/auth/session` so revocation is fail-closed.
  */
-import { createRemoteJWKSet, jwtVerify } from "jose";
 import type { Env } from "./env";
+
+export type ScaffoldAuthEnv = Omit<
+  Pick<
+    Env,
+    | "AUTH_MODE"
+    | "ENVIRONMENT"
+    | "SCAFFOLD_CONTROL_PLANE_URL"
+    | "SCAFFOLD_PROJECT_SCOPE"
+    | "SCAFFOLD_REQUIRED_CAPABILITIES"
+  >,
+  "SCAFFOLD_REQUIRED_CAPABILITIES"
+> & {
+  readonly SCAFFOLD_REQUIRED_CAPABILITIES: string;
+};
 
 export interface Verified {
   readonly userId: string;
-  readonly sessionId?: string;
-  /** WorkOS `org_id` claim — the org the caller's session is scoped to. */
-  readonly orgId?: string;
+  readonly email: string;
+  readonly projectScope: string;
+  readonly capabilities: readonly string[];
+  readonly credential: "scaffold" | "device" | "dev";
 }
 
-const jwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
+interface ScaffoldSession {
+  readonly ok?: unknown;
+  readonly resource?: unknown;
+  readonly actor?: {
+    readonly sub?: unknown;
+    readonly auth?: unknown;
+  };
+  readonly scopes?: unknown;
+}
 
-const getJwks = (url: string) => {
-  let jwks = jwksCache.get(url);
-  if (!jwks) {
-    jwks = createRemoteJWKSet(new URL(url));
-    jwksCache.set(url, jwks);
-  }
-  return jwks;
+const LOOPBACK_HOSTS: Record<string, true> = {
+  localhost: true,
+  "127.0.0.1": true,
+  "::1": true,
+  "[::1]": true
 };
 
-export const bearerFromRequest = (request: Request): string | undefined => {
-  const header = request.headers.get("authorization");
-  if (header?.toLowerCase().startsWith("bearer ")) return header.slice(7).trim();
-  const url = new URL(request.url);
-  return url.searchParams.get("token") ?? undefined;
-};
-
-export const verifyToken = async (env: Env, token: string): Promise<Verified | undefined> => {
-  if (env.AUTH_MODE === "dev") {
-    // Dev mode mirrors the old apps/server: the bearer string IS the user id.
-    // `userId@orgId` additionally carries a fake org claim so workspace-room
-    // membership is exercisable locally (smoke tests).
-    if (!token) return undefined;
-    const at = token.indexOf("@");
-    if (at > 0) return { userId: token.slice(0, at), orgId: token.slice(at + 1) };
-    return { userId: token };
-  }
-  const issuer =
-    env.WORKOS_ISSUER ?? `https://api.workos.com/user_management/${env.WORKOS_CLIENT_ID}`;
-  const jwksUrl = env.WORKOS_JWKS_URL ?? `https://api.workos.com/sso/jwks/${env.WORKOS_CLIENT_ID}`;
+/** Credential-bearing traffic is encrypted except for explicit loopback development. */
+export const credentialTransportAllowed = (value: string | URL): boolean => {
   try {
-    const { payload } = await jwtVerify(token, getJwks(jwksUrl), { issuer });
-    if (typeof payload.sub !== "string" || payload.sub.length === 0) return undefined;
-    return {
-      userId: payload.sub,
-      sessionId: typeof payload.sid === "string" ? payload.sid : undefined,
-      orgId: typeof payload.org_id === "string" ? payload.org_id : undefined
-    };
+    const url = typeof value === "string" ? new URL(value) : value;
+    if (url.username || url.password) return false;
+    if (url.protocol === "https:" || url.protocol === "wss:") return true;
+    return LOOPBACK_HOSTS[url.hostname] === true && (url.protocol === "http:" || url.protocol === "ws:");
+  } catch {
+    return false;
+  }
+};
+
+const normalizedOrigin = (value: string): string | undefined => {
+  try {
+    const url = new URL(value);
+    if (
+      !credentialTransportAllowed(url) ||
+      !["http:", "https:"].includes(url.protocol) ||
+      !["", "/"].includes(url.pathname) ||
+      url.search ||
+      url.hash
+    ) {
+      return undefined;
+    }
+    return url.origin;
   } catch {
     return undefined;
   }
 };
 
-export const authenticate = async (env: Env, request: Request): Promise<Verified | undefined> => {
+export const requiredCapabilities = (env: ScaffoldAuthEnv): readonly string[] =>
+  [...new Set(env.SCAFFOLD_REQUIRED_CAPABILITIES.split(/\s+/).map((value) => value.trim()).filter(Boolean))];
+
+export const bearerFromRequest = (request: Request): string | undefined => {
+  const header = request.headers.get("authorization");
+  if (header?.toLowerCase().startsWith("bearer ")) return header.slice(7).trim() || undefined;
+  const url = new URL(request.url);
+  return url.searchParams.get("token")?.trim() || undefined;
+};
+
+export const verifyScaffoldToken = async (env: ScaffoldAuthEnv, token: string): Promise<Verified | undefined> => {
+  if (!token.startsWith("sc_rc_")) return undefined;
+  const resource = normalizedOrigin(env.SCAFFOLD_CONTROL_PLANE_URL);
+  const projectScope = env.SCAFFOLD_PROJECT_SCOPE.trim();
+  const required = requiredCapabilities(env);
+  if (!resource || !projectScope || required.length === 0) return undefined;
+
+  let response: Response;
+  try {
+    response = await fetch(`${resource}/api/code-sandboxes/auth/session`, {
+      headers: { authorization: `Bearer ${token}`, accept: "application/json" }
+    });
+  } catch {
+    return undefined;
+  }
+  if (!response.ok) return undefined;
+
+  let session: ScaffoldSession;
+  try {
+    session = (await response.json()) as ScaffoldSession;
+  } catch {
+    return undefined;
+  }
+  const subject = typeof session.actor?.sub === "string" ? session.actor.sub.trim().toLowerCase() : "";
+  const scopes = Array.isArray(session.scopes)
+    ? [...new Set(session.scopes.filter((scope): scope is string => typeof scope === "string" && scope.length > 0))]
+    : [];
+  if (
+    session.ok !== true ||
+    session.actor?.auth !== "iap" ||
+    !subject ||
+    normalizedOrigin(typeof session.resource === "string" ? session.resource : "") !== resource ||
+    !required.every((capability) => scopes.includes(capability))
+  ) {
+    return undefined;
+  }
+  return {
+    userId: subject,
+    email: subject,
+    projectScope,
+    capabilities: scopes,
+    credential: "scaffold"
+  };
+};
+
+export const authenticateScaffold = async (env: ScaffoldAuthEnv, request: Request): Promise<Verified | undefined> => {
+  if (!credentialTransportAllowed(request.url)) return undefined;
   const token = bearerFromRequest(request);
   if (!token) return undefined;
-  return verifyToken(env, token);
+  if (env.AUTH_MODE === "dev") {
+    if (env.ENVIRONMENT !== "local") return undefined;
+    const [userId, requestedProject] = token.split("@", 2);
+    if (!userId || (requestedProject && requestedProject !== env.SCAFFOLD_PROJECT_SCOPE)) return undefined;
+    const capabilities = requiredCapabilities(env);
+    if (capabilities.length === 0) return undefined;
+    return {
+      userId,
+      email: `${userId}@dev.local`,
+      projectScope: env.SCAFFOLD_PROJECT_SCOPE,
+      capabilities,
+      credential: "dev"
+    };
+  }
+  return verifyScaffoldToken(env, token);
 };

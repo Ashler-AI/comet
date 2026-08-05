@@ -178,9 +178,10 @@ display EXCLUDED. File paths refer to the reference repo.
   checkoutIdentity; CheckoutDiffSync: fs watchers + 2min repair, git diff (name-status + numstat +
   patch incl untracked), 3MiB cap, sha256; publishes DiffSidecar to chat DOs; GitMetadataSync
   watches HEAD -> chat.branch; folder listing in disposable worker w/ 6s timeout.
-- 3.7 Auth: WorkOS auth-code + loopback callback; headless paste-code; refresh persisted; org
-  gate; dev mode bearer. Uploads: chunked staging -> durable file. Agent accounts: claude-swap
-  (Keychain "Claude Code-credentials" / ~/.claude/.credentials.json + ~/.claude.json; Codex
+- 3.7 Auth: verified Google Cloud IAP principal through Scaffold's existing access path;
+  capabilities bound to explicit project/deployment/session scope; explicit local mock principal
+  mode. Uploads: chunked staging -> durable file. Agent accounts: claude-swap (Keychain
+  "Claude Code-credentials" / ~/.claude/.credentials.json + ~/.claude.json; Codex
   $CODEX_HOME/auth.json); detect live, swap to activate, plan labels, usage probes, OAuth flows.
   Device-room host: one wss to device DO; serves full ControlRpc via virtual sockets over
   {s,k,to,from} frames; nudges. Peers: dials other devices' relay DOs, link caching.
@@ -222,9 +223,9 @@ display EXCLUDED. File paths refer to the reference repo.
 - Worker routes: /health; /session/:chatId/ws (loro room); /tail/:chatId; /stats/:chatId;
   /diff/:chatId GET/POST; /snapshot/:chatId; /append/:chatId; /seed/:chatId;
   /device/:deviceId/ws?role=host|client&connId=; /device/:id/sidecar/:name; /device/:id/status;
-  /device/:id/nudge; /attachments/:sha256 PUT/GET/HEAD (content-addressed R2 att/{user}/{sha},
-  32MB, server-side hash verify).
-- Auth: WorkOS JWKS at edge; DOs see only Worker-stamped identity; ownership claim-on-first-join.
+  /device/:id/nudge; /attachments/:sha256 PUT/GET/HEAD (content-addressed R2
+  `att/{projectScope}/{verifiedPrincipal}/{sha}`, 32MB, server-side hash verify).
+- Auth: Scaffold control-plane bearer introspection at edge; DOs see only Worker-stamped verified principal, authorized scope, and capabilities; participant grants bind principals to capabilities.
 - SessionRoom DO: hibernatable WS, updates log (5s flush), snapshot blob, lazy tail, diff blob,
   %EPH presence; two-level compaction (log-fold @8MB lossless; history-trim shallow snapshot at
   daily frontier checkpoints >= RETAIN_DAYS); daily alarm -> checkpoint + trim + R2
@@ -234,9 +235,10 @@ display EXCLUDED. File paths refer to the reference repo.
   socket; relay control frames; durable nudges (replayed on host join, dedup, cap 256); sidecar
   slots (repos snapshot); /status /nudge.
 
-## 7. Server -> folded into edge for native
-- Keep: WorkOS code exchange/refresh, org list/create (move to edge Worker routes).
-- Drop: entity push/query, Postgres, signaling, Fly deploy of separate server.
+## 7. Scaffold control-plane access at the edge
+- Keep: IAP session introspection and project/deployment/session-scoped participant grants.
+- Drop from the historical upstream design: legacy code exchange/refresh, organization APIs,
+  entity push/query, application databases, signaling, and the separate server deployment.
 
 ## 8. EXCLUDED (token usage display)
 - WatchUsage RPC, UsageStats/UsageDay, backend usage aggregation, profile heatmap/hero/stats,

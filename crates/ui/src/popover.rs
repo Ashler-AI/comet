@@ -243,9 +243,8 @@ pub fn anchored_menu_above_at(
         .into_any_element()
 }
 
-/// [`anchored_menu_above`] right-aligned to the trigger's right edge (t3code
-/// ComboboxPopup `align="end"` — right-side triggers like the composer's ref
-/// picker open leftward instead of running off the window).
+/// [`anchored_menu_above`] right-aligns the menu so right-side triggers open
+/// leftward instead of overflowing the window.
 pub fn anchored_menu_above_end(id: impl Into<ElementId>, content: AnyElement) -> AnyElement {
     let content = crate::frost::frosted(12.0, 16.0, content).into_any_element();
     div()

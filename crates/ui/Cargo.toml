@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+[features]
+cargo-clippy = []
+
 
 [dependencies]
 comet-proto.workspace = true

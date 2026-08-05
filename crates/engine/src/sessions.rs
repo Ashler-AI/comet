@@ -22,13 +22,14 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use chrono::Utc;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use comet_doc::{
     DocError, MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, SegmentWriter, SessionDoc,
     fold_event_into_parts, sanitize_tool_call,
 };
-use comet_harness::{CancellationToken, Harness, RunControls, SteerMessage};
+use comet_harness::{CancellationToken, Harness, HarnessError, RunControls, SteerMessage};
 use comet_proto::{
     AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, UserInputAnswer,
     UserInputQuestion,
@@ -341,6 +342,35 @@ impl SessionsEngine {
         if let Some(titles) = self.inner.titles.get() {
             titles.maybe_generate(chat_id, harness_id, &request.prompt, &request.cwd);
         }
+        // Starting the harness is part of dispatch, not background run
+        // consumption. A spawn/transport error must return to the durable
+        // command executor so it can write Rejected + an audit reason instead
+        // of first reporting Applied and failing moments later.
+        let stream = match harness.run(request.clone(), controls).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                let message = err.to_string();
+                self.inner.publish(
+                    chat_id,
+                    &AgentEvent::Error {
+                        message: message.clone(),
+                    },
+                );
+                self.inner.publish(
+                    chat_id,
+                    &AgentEvent::Done {
+                        status: DoneStatus::Errored,
+                        result: None,
+                        error: Some(message),
+                        session_id: None,
+                    },
+                );
+                self.inner.remove_run(chat_id, &run_id);
+                self.inner
+                    .set_status(chat_id, SessionStatus::Errored, false);
+                return Err(err.into());
+            }
+        };
 
         tokio::spawn(drive_run(
             self.inner.clone(),
@@ -349,7 +379,7 @@ impl SessionsEngine {
             harness,
             request,
             handle.doc_arc(),
-            controls,
+            stream,
             engine_rx,
             cancel_rx,
             RunResumeState {
@@ -891,13 +921,13 @@ async fn drive_run(
     harness: Arc<dyn Harness>,
     request: RunRequest,
     doc: Arc<SessionDoc>,
-    controls: RunControls,
+    mut stream: BoxStream<'static, Result<AgentEvent, HarnessError>>,
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
     mut cancel_rx: watch::Receiver<bool>,
     resume_state: RunResumeState,
 ) {
     let device_id = inner.device_id.clone();
-    // Captured for post-run auto-titling (the request moves into the harness).
+    // Retained for post-run auto-titling and the one-shot failed-resume retry.
     let harness_id = harness.id();
     let user_prompt = request.prompt.clone();
     let run_cwd = request.cwd.clone();
@@ -907,30 +937,6 @@ async fn drive_run(
         resume: None,
         ..request.clone()
     });
-    let mut stream = match harness.run(request, controls).await {
-        Ok(stream) => stream,
-        Err(err) => {
-            let message = err.to_string();
-            inner.publish(
-                &chat_id,
-                &AgentEvent::Error {
-                    message: message.clone(),
-                },
-            );
-            inner.publish(
-                &chat_id,
-                &AgentEvent::Done {
-                    status: DoneStatus::Errored,
-                    result: None,
-                    error: Some(message),
-                    session_id: None,
-                },
-            );
-            inner.remove_run(&chat_id, &run_id);
-            inner.set_status(&chat_id, SessionStatus::Errored, false);
-            return;
-        }
-    };
 
     let doc_ref: &SessionDoc = &doc;
     let mut folded: Vec<MessagePart> = Vec::new();

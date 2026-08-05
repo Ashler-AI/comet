@@ -1,98 +1,71 @@
-//! Auth — the engine owns the WorkOS session for its device (feature-inventory §3.7,
-//! ARCHITECTURE §5). Port of comet's `apps/backend/src/auth.ts`.
+//! Ashler Comet authentication.
 //!
-//! The engine is a public client: it builds the AuthKit authorize URL itself but
-//! delegates the secret-bearing **code exchange** and **refresh** to the edge Worker
-//! (`/auth/exchange`, `/auth/refresh` — the WorkOS API key lives only there).
-//!
-//! Two modes:
-//! - **Dev** (no WorkOS client id configured, or the edge reports `auth: "dev"`): always
-//!   signed in; the bearer IS the configured user id (current M2/M3 behavior).
-//! - **WorkOS**: authorization-code flow. Headed devices use a loopback callback server
-//!   on an ephemeral port; headless devices use the paste-code flow (the redirect is the
-//!   edge's hosted `/auth/cli/callback` page, which shows `state.code` to paste back via
-//!   stdin or the `CompleteSignIn` RPC). The refresh token is persisted 0600 in the data
-//!   dir; access tokens are cached with dual-clock expiry (monotonic AND wall, whichever
-//!   aged more — see [`AccessEntry`]) and refreshed on demand plus by a background loop,
-//!   so the device-room relay and room clients always dial with a live `?token=`, even
-//!   on the first redial after a laptop wakes from sleep. Org onboarding: an org-less session is `NeedsOrganization`; `SelectOrg`
-//!   runs an org-scoped refresh and the state follows the returned token's `org_id`.
+//! Comet is a public OAuth client of Scaffold's IAP-protected control plane. It
+//! discovers OAuth metadata, dynamically registers an exact loopback redirect,
+//! and uses authorization code + PKCE S256. The resulting permanent, revocable
+//! `sc_rc_…` bearer is stored mode 0600 and is never copied into a sandbox.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 
 use crate::EngineError;
 
 const SIGN_IN_TTL: Duration = Duration::from_secs(15 * 60);
-/// Refresh when the cached token has less than this much life left.
-const TOKEN_SLACK: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
+const DEFAULT_SCOPES: &str = "session.read session.chat session.control session.annotate session.invite session.files session.environment";
+const DEVICE_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const DEVICE_REFRESH_RETRY: Duration = Duration::from_secs(5 * 60);
+const STAGING_EDGE_HOST: &str = "comet-staging.internal.ashler.com";
+const PRODUCTION_EDGE_HOST: &str = "comet.internal.ashler.com";
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-// ---------------------------------------------------------------------------
-// Wire types (feature-inventory §2 AuthRpc)
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AuthUser {
     pub id: String,
     pub email: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OrgMembership {
-    pub id: String,
-    pub organization_id: String,
-    pub name: String,
-}
-
-/// AuthStatus stream payload (`SignedOut | NeedsOrganization{user} |
-/// SignedIn{user, orgId?}`). Serializes as the canonical [`comet_proto::AuthState`]
-/// wire shape (`{"state": "signedIn", …}`) so every client parses one form.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AuthState {
     SignedOut,
-    NeedsOrganization {
-        user: AuthUser,
-    },
     SignedIn {
         user: AuthUser,
-        org_id: Option<String>,
+        project_scope: String,
     },
 }
 
 impl AuthState {
     pub fn is_signed_in(&self) -> bool {
-        matches!(self, AuthState::SignedIn { .. })
+        matches!(self, Self::SignedIn { .. })
     }
 
-    pub fn org_id(&self) -> Option<&str> {
+    pub fn project_scope(&self) -> Option<&str> {
         match self {
-            AuthState::SignedIn { org_id, .. } => org_id.as_deref(),
-            _ => None,
+            Self::SignedIn { project_scope, .. } => Some(project_scope),
+            Self::SignedOut => None,
         }
     }
 
     pub fn user(&self) -> Option<&AuthUser> {
         match self {
-            AuthState::SignedIn { user, .. } | AuthState::NeedsOrganization { user } => Some(user),
-            AuthState::SignedOut => None,
+            Self::SignedIn { user, .. } => Some(user),
+            Self::SignedOut => None,
         }
     }
 
-    /// The proto wire twin — the one shape the engine emits over AuthStatus.
     pub fn to_proto(&self) -> comet_proto::AuthState {
         let profile = |user: &AuthUser| comet_proto::UserProfile {
             id: user.id.clone(),
@@ -100,13 +73,13 @@ impl AuthState {
             name: user.name.clone(),
         };
         match self {
-            AuthState::SignedOut => comet_proto::AuthState::SignedOut,
-            AuthState::NeedsOrganization { user } => comet_proto::AuthState::NeedsOrganization {
+            Self::SignedOut => comet_proto::AuthState::SignedOut,
+            Self::SignedIn {
+                user,
+                project_scope,
+            } => comet_proto::AuthState::SignedIn {
                 user: profile(user),
-            },
-            AuthState::SignedIn { user, org_id } => comet_proto::AuthState::SignedIn {
-                user: profile(user),
-                org_id: org_id.clone(),
+                project_scope: project_scope.clone(),
             },
         }
     }
@@ -118,24 +91,47 @@ impl Serialize for AuthState {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Config + construction
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AuthConfig {
-    /// Edge base URL (`/auth/*` routes).
     pub edge_url: String,
-    /// Data dir for the persisted session (`session.json`, 0600).
     pub data_dir: PathBuf,
-    /// WorkOS client id; `None` = dev mode.
-    pub workos_client_id: Option<String>,
-    /// WorkOS API base (authorize URL host).
-    pub workos_api_base: String,
-    /// Dev-mode bearer/user id (mirrors the old `COMET_EDGE_TOKEN` behavior).
+    /// Scaffold control-plane origin. `None` selects explicit local dev mode.
+    pub scaffold_url: Option<String>,
+    /// Operator-configured deployment/project boundary, never caller input.
+    pub project_scope: String,
+    pub oauth_scopes: String,
     pub dev_user_id: String,
-    /// Loopback callback port; `None` = ephemeral.
     pub callback_port: Option<u16>,
+    /// One-time `cg1` enrollment credential for a sandbox device. It is exchanged
+    /// into a renewable, in-memory `cs1` session, never persisted, and never
+    /// included in `Debug`.
+    pub device_join_grant: Option<String>,
+    pub expected_device_id: Option<String>,
+    pub expected_session_id: Option<String>,
+    pub expected_deployment_id: Option<String>,
+    pub expected_sandbox_id: Option<String>,
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthConfig")
+            .field("edge_url", &self.edge_url)
+            .field("data_dir", &self.data_dir)
+            .field("scaffold_url", &self.scaffold_url)
+            .field("project_scope", &self.project_scope)
+            .field("oauth_scopes", &self.oauth_scopes)
+            .field("dev_user_id", &"<redacted>")
+            .field("callback_port", &self.callback_port)
+            .field(
+                "device_join_grant",
+                &self.device_join_grant.as_ref().map(|_| "<redacted>"),
+            )
+            .field("expected_device_id", &self.expected_device_id)
+            .field("expected_session_id", &self.expected_session_id)
+            .field("expected_deployment_id", &self.expected_deployment_id)
+            .field("expected_sandbox_id", &self.expected_sandbox_id)
+            .finish()
+    }
 }
 
 impl AuthConfig {
@@ -143,173 +139,238 @@ impl AuthConfig {
         Self {
             edge_url: edge_url.into(),
             data_dir: data_dir.into(),
-            workos_client_id: None,
-            workos_api_base: "https://api.workos.com".into(),
+            scaffold_url: None,
+            project_scope: "ashler-staging".into(),
+            oauth_scopes: DEFAULT_SCOPES.into(),
             dev_user_id: "dev-user".into(),
             callback_port: None,
+            device_join_grant: None,
+            expected_device_id: None,
+            expected_session_id: None,
+            expected_deployment_id: None,
+            expected_sandbox_id: None,
         }
     }
 }
 
-/// The persisted session (refresh token + user + last org scope).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredSession {
-    refresh_token: String,
+    access_token: String,
     user: AuthUser,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    org_id: Option<String>,
+    project_scope: String,
+    #[serde(default)]
+    capabilities: Vec<String>,
 }
 
-/// Access-token cache. Expiry ages the token's own lifetime (`exp - iat`) by
-/// BOTH clocks, pessimistically. Monotonic alone (`Instant`) freezes across
-/// system sleep (macOS `mach_absolute_time` and Linux `CLOCK_MONOTONIC` both
-/// exclude suspend), so a laptop waking from hours of sleep presented a
-/// wall-expired token that still read "fresh" — every room/relay redial got a
-/// 401 with the same stale bearer and sync never recovered (user report).
-/// Wall clock alone breaks under skewed device clocks (`exp` vs local time);
-/// the elapsed-since-issue reading is skew-immune, and a BACKWARD wall step
-/// (NTP correction) degrades harmlessly to the monotonic reading.
-struct AccessEntry {
-    token: String,
-    ttl: Duration,
-    got_at: Instant,
-    got_wall: std::time::SystemTime,
-}
-
-impl AccessEntry {
-    fn fresh(token: String) -> Self {
-        let ttl = jwt_claims(&token)
-            .and_then(|c| match (c.exp, c.iat) {
-                (Some(exp), Some(iat)) if exp > iat => {
-                    Some(Duration::from_secs((exp - iat) as u64))
-                }
-                _ => None,
-            })
-            .unwrap_or(Duration::from_secs(240));
-        Self {
-            token,
-            ttl,
-            got_at: Instant::now(),
-            got_wall: std::time::SystemTime::now(),
-        }
-    }
-
-    fn remaining(&self) -> Duration {
-        let monotonic = self.got_at.elapsed();
-        let wall = std::time::SystemTime::now()
-            .duration_since(self.got_wall)
-            .unwrap_or(Duration::ZERO);
-        self.ttl.saturating_sub(monotonic.max(wall))
-    }
+#[derive(Debug, Clone)]
+struct PendingSignIn {
+    created_at: Instant,
+    client_id: String,
+    redirect_uri: String,
+    code_verifier: String,
+    token_endpoint: String,
+    resource: String,
 }
 
 struct AuthInner {
     config: AuthConfig,
-    /// `Some(client_id)` = WorkOS mode; `None` = dev mode.
-    workos: Option<String>,
+    scaffold: Option<String>,
     http: reqwest::Client,
     state_tx: watch::Sender<AuthState>,
     stored: Mutex<Option<StoredSession>>,
-    access: Mutex<Option<AccessEntry>>,
-    /// Pending sign-in `state` values (CSRF), stamped so abandoned attempts expire.
-    pending: Mutex<HashMap<String, Instant>>,
-    /// Single-flight refresh: WorkOS refresh tokens are single-use (rotated per
-    /// exchange); two concurrent refreshes would race and could revoke the session.
-    refresh_gate: tokio::sync::Mutex<()>,
-    /// Loopback callback listener port, bound lazily on the first headed sign-in.
+    pending: Mutex<HashMap<String, PendingSignIn>>,
     loopback: tokio::sync::Mutex<Option<u16>>,
+    device_mode: bool,
 }
 
-/// The auth service — cheap to clone by `Arc`.
 #[derive(Clone)]
 pub struct Auth {
     inner: Arc<AuthInner>,
 }
 
 impl Auth {
-    /// Build from config: dev mode unless a WorkOS client id is configured.
     pub fn new(config: AuthConfig) -> Self {
-        let workos = config
-            .workos_client_id
-            .clone()
-            .filter(|s| !s.trim().is_empty());
-        let session_file = config.data_dir.join("session.json");
-        let stored: Option<StoredSession> = if workos.is_some() {
-            std::fs::read_to_string(&session_file)
+        Self::new_with_mode(config, false)
+    }
+
+    fn new_with_mode(config: AuthConfig, device_mode: bool) -> Self {
+        let scaffold = if device_mode {
+            None
+        } else {
+            config
+                .scaffold_url
+                .clone()
+                .map(|value| value.trim_end_matches('/').to_string())
+                .filter(|value| !value.is_empty())
+        };
+        let stored = if scaffold.is_some() {
+            std::fs::read_to_string(config.data_dir.join("session.json"))
                 .ok()
-                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .and_then(|raw| serde_json::from_str::<StoredSession>(&raw).ok())
+                .filter(|session| {
+                    session.project_scope == config.project_scope
+                        && session.access_token.starts_with("sc_rc_")
+                })
         } else {
             None
         };
-        let initial = match (&workos, &stored) {
-            (None, _) => AuthState::SignedIn {
-                user: AuthUser {
-                    id: config.dev_user_id.clone(),
-                    email: config.dev_user_id.clone(),
-                    name: None,
+        let initial = if device_mode {
+            AuthState::SignedOut
+        } else {
+            match (&scaffold, &stored) {
+                (None, _) => AuthState::SignedIn {
+                    user: AuthUser {
+                        id: config.dev_user_id.clone(),
+                        email: format!("{}@dev.local", config.dev_user_id),
+                        name: None,
+                    },
+                    project_scope: config.project_scope.clone(),
                 },
-                org_id: None,
-            },
-            (Some(_), Some(session)) => state_for(session.user.clone(), session.org_id.clone()),
-            (Some(_), None) => AuthState::SignedOut,
+                (Some(_), Some(session)) => {
+                    signed_in_state(session.user.clone(), &session.project_scope)
+                }
+                (Some(_), None) => AuthState::SignedOut,
+            }
         };
         let (state_tx, _) = watch::channel(initial);
         let http = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_default();
         Self {
             inner: Arc::new(AuthInner {
                 config,
-                workos,
+                scaffold,
                 http,
                 state_tx,
                 stored: Mutex::new(stored),
-                access: Mutex::new(None),
                 pending: Mutex::new(HashMap::new()),
-                refresh_gate: tokio::sync::Mutex::new(()),
                 loopback: tokio::sync::Mutex::new(None),
+                device_mode,
             }),
         }
     }
 
-    /// Like [`Auth::new`], but additionally probes `{edge}/health`: an edge running in
-    /// dev auth mode forces dev mode even when a client id is configured (matching the
-    /// edge's "bearer = user id" verification).
     pub async fn detect(mut config: AuthConfig) -> Self {
-        if config.workos_client_id.is_some() {
+        if let Some(grant) = config.device_join_grant.take() {
+            let auth = Self::new_with_mode(config, true);
+            if let Ok(session) = auth.exchange_device_grant(&grant).await {
+                auth.inner.state_tx.send_replace(signed_in_state(
+                    session.user.clone(),
+                    &session.project_scope,
+                ));
+                *lock(&auth.inner.stored) = Some(session);
+            }
+            return auth;
+        }
+        if config.scaffold_url.is_some() {
             #[derive(Deserialize)]
             struct Health {
                 auth: Option<String>,
             }
             let url = format!("{}/health", config.edge_url.trim_end_matches('/'));
-            let probe = async {
-                reqwest::Client::new()
-                    .get(&url)
-                    .timeout(Duration::from_secs(3))
-                    .send()
-                    .await
-                    .ok()?
-                    .json::<Health>()
-                    .await
-                    .ok()
-            };
-            if let Some(health) = probe.await
+            if let Ok(response) = reqwest::Client::new()
+                .get(url)
+                .timeout(HTTP_TIMEOUT)
+                .send()
+                .await
+                && let Ok(health) = response.json::<Health>().await
                 && health.auth.as_deref() == Some("dev")
             {
-                tracing::info!("auth: edge is in dev mode — using dev bearer");
-                config.workos_client_id = None;
+                config.scaffold_url = None;
             }
         }
         Self::new(config)
     }
 
-    pub fn workos_enabled(&self) -> bool {
-        self.inner.workos.is_some()
+    async fn exchange_device_grant(&self, grant: &str) -> Result<StoredSession, EngineError> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Exchange {
+            access_token: String,
+            expires_at: i64,
+            user_id: String,
+            email: String,
+            project_id: String,
+            deployment_id: String,
+            sandbox_id: String,
+            target_device_id: String,
+            session_id: String,
+            #[serde(default)]
+            capabilities: Vec<String>,
+        }
+
+        if !grant.starts_with("cg1.") {
+            return Err(EngineError::Other("device_join_grant_unavailable".into()));
+        }
+        let exchange_url = device_grant_exchange_url(&self.inner.config.edge_url)?;
+        let response = self
+            .inner
+            .http
+            .post(exchange_url)
+            .json(&serde_json::json!({ "grant": grant }))
+            .send()
+            .await
+            .map_err(|_| EngineError::Other("device_join_grant_unavailable".into()))?;
+        if !response.status().is_success() {
+            return Err(EngineError::Other("device_join_grant_unavailable".into()));
+        }
+        let exchange: Exchange = response
+            .json()
+            .await
+            .map_err(|_| EngineError::Other("device_join_grant_unavailable".into()))?;
+        if !exchange.access_token.starts_with("cs1.")
+            || exchange.expires_at <= chrono::Utc::now().timestamp_millis()
+            || exchange.project_id != self.inner.config.project_scope
+            || self
+                .inner
+                .config
+                .expected_device_id
+                .as_deref()
+                .is_some_and(|expected| expected != exchange.target_device_id)
+            || self
+                .inner
+                .config
+                .expected_session_id
+                .as_deref()
+                .is_some_and(|expected| expected != exchange.session_id)
+            || self
+                .inner
+                .config
+                .expected_deployment_id
+                .as_deref()
+                .is_some_and(|expected| expected != exchange.deployment_id)
+            || self
+                .inner
+                .config
+                .expected_sandbox_id
+                .as_deref()
+                .is_some_and(|expected| expected != exchange.sandbox_id)
+        {
+            return Err(EngineError::Other("device_join_grant_unavailable".into()));
+        }
+        Ok(StoredSession {
+            access_token: exchange.access_token,
+            user: AuthUser {
+                id: exchange.user_id,
+                email: exchange.email,
+                name: None,
+            },
+            project_scope: exchange.project_id,
+            capabilities: exchange.capabilities,
+        })
     }
 
-    /// Live auth status (current value + changes).
+    pub fn oauth_enabled(&self) -> bool {
+        self.inner.scaffold.is_some()
+    }
+
+    pub fn device_mode(&self) -> bool {
+        self.inner.device_mode
+    }
+
     pub fn watch_state(&self) -> watch::Receiver<AuthState> {
         self.inner.state_tx.subscribe()
     }
@@ -318,468 +379,539 @@ impl Auth {
         self.inner.state_tx.borrow().clone()
     }
 
-    /// The signed-in user id — the identity that scopes workspace rooms
-    /// (`ws3/{orgId}/{userId}`) and local storage (`orgs/{org}/{user}/`).
-    /// Dev mode mirrors the edge's dev-bearer parsing (`user@org` → `user`,
-    /// a bare token IS the user id). `None` = signed out (WorkOS only).
+    /// Capabilities verified with the current control-plane session. Local
+    /// development uses the configured scope list; authenticated modes expose
+    /// only the exact scopes returned by Scaffold.
+    pub fn capabilities(&self) -> Vec<String> {
+        if self.inner.scaffold.is_none() && !self.inner.device_mode {
+            return self
+                .inner
+                .config
+                .oauth_scopes
+                .split_whitespace()
+                .map(str::to_string)
+                .collect();
+        }
+        lock(&self.inner.stored)
+            .as_ref()
+            .map(|session| session.capabilities.clone())
+            .unwrap_or_default()
+    }
+
     pub fn user_id(&self) -> Option<String> {
-        if self.inner.workos.is_none() {
+        if self.inner.device_mode {
+            return lock(&self.inner.stored)
+                .as_ref()
+                .map(|session| session.user.id.clone());
+        }
+        if self.inner.scaffold.is_none() {
             let dev = &self.inner.config.dev_user_id;
             return Some(dev.split('@').next().unwrap_or(dev).to_string());
         }
-        self.state().user().map(|u| u.id.clone())
+        self.state().user().map(|user| user.id.clone())
     }
 
-    /// Current bearer for edge rooms / the device relay — `None` when signed out.
-    /// Dev mode: the configured user id. WorkOS: cached access token, refreshed when
-    /// it has under 30s left.
     pub async fn access_token(&self) -> Option<String> {
-        if self.inner.workos.is_none() {
+        if self.inner.device_mode {
+            return lock(&self.inner.stored)
+                .as_ref()
+                .map(|session| session.access_token.clone());
+        }
+        if self.inner.scaffold.is_none() {
             return Some(self.inner.config.dev_user_id.clone());
         }
-        if let Some(entry) = &*lock(&self.inner.access)
-            && entry.remaining() > TOKEN_SLACK
-        {
-            return Some(entry.token.clone());
-        }
-        match self.refresh(None).await {
-            Ok(token) => token,
-            Err(err) => {
-                tracing::warn!(error = %err, "auth: refresh failed");
-                None
-            }
-        }
+        lock(&self.inner.stored)
+            .as_ref()
+            .map(|session| session.access_token.clone())
     }
 
-    /// Sleep-until-near-expiry refresh loop so long-lived dials (relay, rooms) always
-    /// have a live token to present on reconnect. No-op task in dev mode.
+    /// Device access tokens rotate before their twelve-hour expiry. Scaffold
+    /// user bearers remain permanent and do not need a refresh task.
     pub fn spawn_refresh_loop(&self) -> tokio::task::JoinHandle<()> {
         let auth = self.clone();
         tokio::spawn(async move {
-            if auth.inner.workos.is_none() {
+            if !auth.inner.device_mode {
                 return;
             }
-            let mut state_rx = auth.watch_state();
-            let mut wake = comet_sync::wake::subscribe();
+            let mut delay = DEVICE_REFRESH_INTERVAL;
             loop {
-                if !state_rx.borrow().is_signed_in() {
-                    if state_rx.changed().await.is_err() {
-                        return;
+                tokio::time::sleep(delay).await;
+                delay = match auth.refresh_device_token().await {
+                    Ok(()) => DEVICE_REFRESH_INTERVAL,
+                    Err(error) => {
+                        tracing::warn!(%error, "auth: device token refresh failed");
+                        DEVICE_REFRESH_RETRY
                     }
-                    continue;
-                }
-                let remaining = lock(&auth.inner.access)
-                    .as_ref()
-                    .map(AccessEntry::remaining)
-                    .unwrap_or(Duration::ZERO);
-                let wait = remaining.saturating_sub(Duration::from_secs(60));
-                if wait > Duration::ZERO {
-                    // Re-evaluate at least once a minute rather than parking
-                    // on one long timer: tokio timers ride the monotonic
-                    // clock, which excludes system suspend — a laptop waking
-                    // from sleep would otherwise wait the WHOLE original
-                    // duration again before noticing the (wall-expired) token.
-                    let wait = wait.min(Duration::from_secs(60));
-                    tokio::select! {
-                        _ = tokio::time::sleep(wait) => { continue; }
-                        changed = state_rx.changed() => {
-                            if changed.is_err() { return; }
-                            continue;
-                        }
-                        // Wake: the cached token is almost certainly
-                        // wall-expired — refresh NOW so the reconnecting
-                        // rooms/relays dial with live credentials instead of
-                        // discovering staleness one 401 at a time.
-                        _ = wake.recv() => {}
-                    }
-                }
-                if let Err(err) = auth.refresh(None).await {
-                    tracing::warn!(error = %err, "auth: background refresh failed");
-                    tokio::time::sleep(Duration::from_secs(30)).await;
-                }
+                };
             }
         })
     }
 
-    // -- sign-in flows ------------------------------------------------------
+    async fn refresh_device_token(&self) -> Result<(), EngineError> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Refresh {
+            access_token: String,
+            expires_at: i64,
+            grant_id: String,
+            user_id: String,
+            email: String,
+            project_id: String,
+            deployment_id: String,
+            sandbox_id: String,
+            target_device_id: String,
+            session_id: String,
+            #[serde(default)]
+            capabilities: Vec<String>,
+        }
 
-    /// Begin a headed sign-in: returns the AuthKit authorize URL redirecting to our
-    /// loopback callback server (bound lazily on an ephemeral port).
+        let current_session = lock(&self.inner.stored)
+            .clone()
+            .ok_or_else(|| EngineError::Other("device_token_unavailable".into()))?;
+        let current = current_session.access_token.clone();
+        let response = self
+            .inner
+            .http
+            .post(format!(
+                "{}/auth/device-token/refresh",
+                self.inner.config.edge_url.trim_end_matches('/')
+            ))
+            .bearer_auth(&current)
+            .send()
+            .await
+            .map_err(|error| EngineError::Other(format!("device token refresh failed: {error}")))?;
+        if !response.status().is_success() {
+            return Err(EngineError::Other(format!(
+                "device token refresh rejected ({})",
+                response.status().as_u16()
+            )));
+        }
+        let refreshed: Refresh = response.json().await.map_err(|error| {
+            EngineError::Other(format!("malformed device token refresh: {error}"))
+        })?;
+        if !refreshed.access_token.starts_with("cs1.")
+            || refreshed.expires_at <= chrono::Utc::now().timestamp_millis()
+            || refreshed.grant_id.trim().is_empty()
+            || refreshed.user_id != current_session.user.id
+            || refreshed.email != current_session.user.email
+            || refreshed.project_id != current_session.project_scope
+            || refreshed.capabilities != current_session.capabilities
+            || self
+                .inner
+                .config
+                .expected_device_id
+                .as_deref()
+                .is_none_or(|expected| expected != refreshed.target_device_id)
+            || self
+                .inner
+                .config
+                .expected_session_id
+                .as_deref()
+                .is_none_or(|expected| expected != refreshed.session_id)
+            || self
+                .inner
+                .config
+                .expected_deployment_id
+                .as_deref()
+                .is_none_or(|expected| expected != refreshed.deployment_id)
+            || self
+                .inner
+                .config
+                .expected_sandbox_id
+                .as_deref()
+                .is_none_or(|expected| expected != refreshed.sandbox_id)
+        {
+            return Err(EngineError::Other(
+                "device token refresh violated the edge contract".into(),
+            ));
+        }
+        let mut stored = lock(&self.inner.stored);
+        let session = stored
+            .as_mut()
+            .filter(|session| session.access_token == current)
+            .ok_or_else(|| EngineError::Other("device token changed during refresh".into()))?;
+        session.access_token = refreshed.access_token;
+        Ok(())
+    }
+
     pub async fn start_sign_in(&self) -> Result<String, EngineError> {
-        if self.inner.workos.is_none() {
-            return Ok(String::new()); // dev mode: nothing to do (TS parity)
+        if self.inner.scaffold.is_none() {
+            return Ok(String::new());
         }
         let port = self.ensure_loopback().await?;
-        Ok(self.begin_sign_in(&format!("http://127.0.0.1:{port}/callback")))
+        self.begin_sign_in(&format!("http://127.0.0.1:{port}/callback"))
+            .await
     }
 
-    /// Begin a headless sign-in: the redirect is the edge's hosted paste-code page —
-    /// nothing ever redirects to this machine, so the browser can be anywhere.
-    pub fn start_headless_sign_in(&self) -> String {
-        if self.inner.workos.is_none() {
-            return String::new();
-        }
-        let edge = self.inner.config.edge_url.trim_end_matches('/');
-        self.begin_sign_in(&format!("{edge}/auth/cli/callback"))
+    /// A remote browser may fail to reach this machine's loopback callback. In
+    /// that case the user pastes its final localhost URL into the terminal.
+    pub async fn start_headless_sign_in(&self) -> Result<String, EngineError> {
+        self.start_sign_in().await
     }
 
-    /// Finish a headless sign-in with the pasted `state.code` string. The state half
-    /// must match a sign-in started HERE (same CSRF discipline as the loopback flow).
     pub async fn complete_sign_in(&self, pasted: &str) -> Result<(), EngineError> {
-        if self.inner.workos.is_none() {
+        if self.inner.scaffold.is_none() {
             return Ok(());
         }
         let trimmed = pasted.trim();
-        let (state, code) = trimmed.split_once('.').unwrap_or(("", ""));
-        if state.is_empty() || code.is_empty() || !self.take_pending(state) {
-            return Err(EngineError::Other(
-                "invalid or expired sign-in code — start sign-in again and paste the full code"
-                    .into(),
-            ));
-        }
-        let result = self.exchange_code(code).await?;
+        let (state, code) = if trimmed.starts_with("http://127.0.0.1:")
+            || trimmed.starts_with("http://localhost:")
+        {
+            let url = reqwest::Url::parse(trimmed)
+                .map_err(|_| EngineError::Other("invalid sign-in callback URL".into()))?;
+            let value = |key: &str| {
+                url.query_pairs()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, value)| value.into_owned())
+            };
+            (
+                value("state")
+                    .ok_or_else(|| EngineError::Other("callback is missing state".into()))?,
+                value("code")
+                    .ok_or_else(|| EngineError::Other("callback is missing code".into()))?,
+            )
+        } else {
+            let (state, code) = trimmed.split_once('.').ok_or_else(|| {
+                EngineError::Other("paste the full callback URL or state.code".into())
+            })?;
+            (state.to_string(), code.to_string())
+        };
+        let pending = self.take_pending(&state).ok_or_else(|| {
+            EngineError::Other("sign-in code does not match this device or has expired".into())
+        })?;
+        let result = self.exchange_code(&pending, &code).await?;
         self.finish_sign_in(result);
         Ok(())
     }
 
     pub fn sign_out(&self) {
         *lock(&self.inner.stored) = None;
-        *lock(&self.inner.access) = None;
-        self.persist::<&StoredSession>(None);
+        if !self.inner.device_mode {
+            self.persist::<&StoredSession>(None);
+        }
         self.inner.state_tx.send_replace(AuthState::SignedOut);
     }
 
-    // -- organizations ------------------------------------------------------
-
-    pub async fn list_orgs(&self) -> Result<Vec<OrgMembership>, EngineError> {
-        if self.inner.workos.is_none() {
-            return Ok(Vec::new());
-        }
+    async fn begin_sign_in(&self, redirect_uri: &str) -> Result<String, EngineError> {
         #[derive(Deserialize)]
-        struct Orgs {
+        struct ProtectedResource {
+            resource: String,
+            authorization_servers: Vec<String>,
             #[serde(default)]
-            orgs: Vec<OrgMembership>,
-        }
-        let body: Orgs = self
-            .authed_json(reqwest::Method::GET, "/auth/orgs", None)
-            .await?;
-        Ok(body.orgs)
-    }
-
-    /// Create an org (the edge makes us its first admin member) and scope to it.
-    pub async fn create_org(&self, name: &str) -> Result<(), EngineError> {
-        if self.inner.workos.is_none() {
-            return Ok(());
+            scopes_supported: Vec<String>,
         }
         #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Created {
-            organization_id: String,
+        struct AuthorizationServer {
+            issuer: String,
+            authorization_endpoint: String,
+            token_endpoint: String,
+            registration_endpoint: String,
+            code_challenge_methods_supported: Vec<String>,
         }
-        let created: Created = self
-            .authed_json(
-                reqwest::Method::POST,
-                "/auth/orgs",
-                Some(serde_json::json!({ "name": name })),
+        #[derive(Deserialize)]
+        struct Registration {
+            client_id: String,
+        }
+
+        let scaffold = self.inner.scaffold.as_deref().unwrap_or_default();
+        let protected: ProtectedResource = self
+            .get_json(
+                &format!("{scaffold}/.well-known/oauth-protected-resource"),
+                "OAuth resource metadata",
             )
             .await?;
-        self.select_org(&created.organization_id).await
-    }
-
-    /// Scope the session to an org: one refresh with `organizationId`; the state follows
-    /// the returned token's `org_id` claim.
-    pub async fn select_org(&self, organization_id: &str) -> Result<(), EngineError> {
-        if self.inner.workos.is_none() {
-            return Ok(());
+        require_same_origin(scaffold, &protected.resource, "OAuth resource")?;
+        let issuer = protected.authorization_servers.first().ok_or_else(|| {
+            EngineError::Other("OAuth metadata has no authorization server".into())
+        })?;
+        require_same_origin(scaffold, issuer, "OAuth issuer")?;
+        let server: AuthorizationServer = self
+            .get_json(
+                &format!(
+                    "{}/.well-known/oauth-authorization-server",
+                    issuer.trim_end_matches('/')
+                ),
+                "OAuth authorization metadata",
+            )
+            .await?;
+        require_same_origin(scaffold, &server.issuer, "OAuth issuer")?;
+        for (label, endpoint) in [
+            (
+                "authorization endpoint",
+                server.authorization_endpoint.as_str(),
+            ),
+            ("token endpoint", server.token_endpoint.as_str()),
+            (
+                "registration endpoint",
+                server.registration_endpoint.as_str(),
+            ),
+        ] {
+            require_same_origin(scaffold, endpoint, label)?;
         }
-        let token = self.refresh(Some(organization_id)).await?;
-        let scoped = token
-            .as_deref()
-            .and_then(jwt_claims)
-            .and_then(|c| c.org_id)
-            .is_some_and(|org| org == organization_id);
-        if !scoped {
+        if !server
+            .code_challenge_methods_supported
+            .iter()
+            .any(|method| method == "S256")
+        {
             return Err(EngineError::Other(
-                "could not switch to that workspace — you may no longer be a member".into(),
+                "OAuth server does not support PKCE S256".into(),
             ));
         }
-        Ok(())
-    }
-
-    // -- internals ----------------------------------------------------------
-
-    fn begin_sign_in(&self, redirect_uri: &str) -> String {
-        let state = uuid::Uuid::new_v4().to_string();
-        {
-            let mut pending = lock(&self.inner.pending);
-            let cutoff = Instant::now();
-            pending.retain(|_, at| cutoff.duration_since(*at) < SIGN_IN_TTL);
-            pending.insert(state.clone(), cutoff);
+        if !required_scopes_present(&self.inner.config.oauth_scopes, &protected.scopes_supported) {
+            return Err(EngineError::Other(
+                "Scaffold does not advertise the required Ashler Comet capabilities".into(),
+            ));
         }
-        let client_id = self.inner.workos.clone().unwrap_or_default();
-        format!(
-            "{}/user_management/authorize?response_type=code&client_id={}&redirect_uri={}&provider=authkit&state={}",
-            self.inner.config.workos_api_base.trim_end_matches('/'),
-            url_encode(&client_id),
-            url_encode(redirect_uri),
-            state
-        )
-    }
 
-    /// Consume a pending sign-in state; false when unknown/expired (CSRF check).
-    fn take_pending(&self, state: &str) -> bool {
-        let mut pending = lock(&self.inner.pending);
-        let now = Instant::now();
-        pending.retain(|_, at| now.duration_since(*at) < SIGN_IN_TTL);
-        pending.remove(state).is_some()
-    }
-
-    async fn exchange_code(&self, code: &str) -> Result<SignInResult, EngineError> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct WireUser {
-            id: String,
-            email: String,
-            #[serde(default)]
-            first_name: Option<String>,
-            #[serde(default)]
-            last_name: Option<String>,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Exchange {
-            user: WireUser,
-            access_token: String,
-            refresh_token: String,
-        }
-        let url = format!(
-            "{}/auth/exchange",
-            self.inner.config.edge_url.trim_end_matches('/')
-        );
-        let res = self
+        let response = self
             .inner
             .http
-            .post(&url)
-            .json(&serde_json::json!({ "code": code }))
+            .post(&server.registration_endpoint)
+            .json(&serde_json::json!({
+                "redirect_uris": [redirect_uri],
+                "token_endpoint_auth_method": "none",
+                "grant_types": ["authorization_code"],
+                "response_types": ["code"]
+            }))
             .send()
             .await
-            .map_err(|e| EngineError::Other(format!("the edge is unreachable: {e}")))?;
-        if !res.status().is_success() {
+            .map_err(|error| EngineError::Other(format!("OAuth registration failed: {error}")))?;
+        if !response.status().is_success() {
             return Err(EngineError::Other(format!(
-                "sign-in failed during token exchange ({}) — the code may have expired; start again",
-                res.status().as_u16()
+                "OAuth registration failed ({})",
+                response.status().as_u16()
             )));
         }
-        let body: Exchange = res
+        let registration: Registration = response.json().await.map_err(|error| {
+            EngineError::Other(format!("malformed OAuth registration: {error}"))
+        })?;
+        if registration.client_id.trim().is_empty() {
+            return Err(EngineError::Other(
+                "OAuth registration returned no client id".into(),
+            ));
+        }
+
+        let verifier = pkce_verifier();
+        let state = uuid::Uuid::new_v4().to_string();
+        lock(&self.inner.pending).insert(
+            state.clone(),
+            PendingSignIn {
+                created_at: Instant::now(),
+                client_id: registration.client_id.clone(),
+                redirect_uri: redirect_uri.to_string(),
+                code_verifier: verifier.clone(),
+                token_endpoint: server.token_endpoint,
+                resource: protected.resource.clone(),
+            },
+        );
+        let mut authorize = reqwest::Url::parse(&server.authorization_endpoint)
+            .map_err(|_| EngineError::Other("OAuth authorization endpoint is invalid".into()))?;
+        authorize
+            .query_pairs_mut()
+            .append_pair("response_type", "code")
+            .append_pair("client_id", &registration.client_id)
+            .append_pair("redirect_uri", redirect_uri)
+            .append_pair("state", &state)
+            .append_pair("code_challenge", &pkce_challenge(&verifier))
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("resource", &protected.resource)
+            .append_pair("scope", &self.inner.config.oauth_scopes);
+        Ok(authorize.to_string())
+    }
+
+    fn take_pending(&self, state: &str) -> Option<PendingSignIn> {
+        let mut pending = lock(&self.inner.pending);
+        let now = Instant::now();
+        pending.retain(|_, value| now.duration_since(value.created_at) < SIGN_IN_TTL);
+        pending.remove(state)
+    }
+
+    async fn exchange_code(
+        &self,
+        pending: &PendingSignIn,
+        code: &str,
+    ) -> Result<SignInResult, EngineError> {
+        #[derive(Deserialize)]
+        struct Tokens {
+            access_token: String,
+            token_type: String,
+            scope: String,
+            resource: String,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct SessionActor {
+            sub: String,
+            auth: String,
+            #[serde(default)]
+            display_name: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct Session {
+            ok: bool,
+            resource: String,
+            actor: SessionActor,
+            scopes: Vec<String>,
+        }
+
+        let response = self
+            .inner
+            .http
+            .post(&pending.token_endpoint)
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", code),
+                ("client_id", pending.client_id.as_str()),
+                ("redirect_uri", pending.redirect_uri.as_str()),
+                ("code_verifier", pending.code_verifier.as_str()),
+                ("resource", pending.resource.as_str()),
+            ])
+            .send()
+            .await
+            .map_err(|error| EngineError::Other(format!("token exchange failed: {error}")))?;
+        if !response.status().is_success() {
+            return Err(EngineError::Other(format!(
+                "token exchange failed ({})",
+                response.status().as_u16()
+            )));
+        }
+        let tokens: Tokens = response
             .json()
             .await
-            .map_err(|e| EngineError::Other(format!("malformed exchange response: {e}")))?;
-        let name = [body.user.first_name, body.user.last_name]
-            .into_iter()
-            .flatten()
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+            .map_err(|error| EngineError::Other(format!("malformed token response: {error}")))?;
+        let granted: Vec<String> = tokens
+            .scope
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        if tokens.token_type != "Bearer"
+            || !tokens.access_token.starts_with("sc_rc_")
+            || tokens.resource != pending.resource
+            || !required_scopes_present(&self.inner.config.oauth_scopes, &granted)
+        {
+            return Err(EngineError::Other(
+                "OAuth token response violated the Scaffold contract".into(),
+            ));
+        }
+
+        let response = self
+            .inner
+            .http
+            .get(format!(
+                "{}/api/code-sandboxes/auth/session",
+                pending.resource.trim_end_matches('/')
+            ))
+            .bearer_auth(&tokens.access_token)
+            .send()
+            .await
+            .map_err(|error| EngineError::Other(format!("identity validation failed: {error}")))?;
+        if !response.status().is_success() {
+            return Err(EngineError::Other(
+                "Scaffold rejected the issued bearer".into(),
+            ));
+        }
+        let session: Session = response
+            .json()
+            .await
+            .map_err(|error| EngineError::Other(format!("malformed identity response: {error}")))?;
+        if !session.ok
+            || session.resource != pending.resource
+            || session.actor.auth != "iap"
+            || session.actor.sub.trim().is_empty()
+            || !required_scopes_present(&self.inner.config.oauth_scopes, &session.scopes)
+        {
+            return Err(EngineError::Other(
+                "Scaffold identity response was not authorized".into(),
+            ));
+        }
         Ok(SignInResult {
+            access_token: tokens.access_token,
             user: AuthUser {
-                id: body.user.id,
-                email: body.user.email,
-                name: (!name.is_empty()).then_some(name),
+                id: session.actor.sub.clone(),
+                email: session.actor.sub,
+                name: session.actor.display_name,
             },
-            access_token: body.access_token,
-            refresh_token: body.refresh_token,
+            capabilities: session.scopes,
         })
     }
 
     fn finish_sign_in(&self, result: SignInResult) {
-        let org_id = jwt_claims(&result.access_token).and_then(|c| c.org_id);
-        *lock(&self.inner.access) = Some(AccessEntry::fresh(result.access_token));
         let session = StoredSession {
-            refresh_token: result.refresh_token,
+            access_token: result.access_token,
             user: result.user.clone(),
-            org_id: org_id.clone(),
+            project_scope: self.inner.config.project_scope.clone(),
+            capabilities: result.capabilities,
         };
         self.persist(Some(&session));
         *lock(&self.inner.stored) = Some(session);
-        tracing::info!(email = %result.user.email, org = org_id.as_deref().unwrap_or("<none>"),
-            "auth: signed in");
-        self.inner
-            .state_tx
-            .send_replace(state_for(result.user, org_id));
+        self.inner.state_tx.send_replace(signed_in_state(
+            result.user,
+            &self.inner.config.project_scope,
+        ));
     }
 
-    /// Refresh the session (single-flight). `organization_id` migrates the WorkOS
-    /// session to that org; routine refreshes keep the current scope. Returns the new
-    /// access token, `None` when signed out / the refresh could not run.
-    async fn refresh(&self, organization_id: Option<&str>) -> Result<Option<String>, EngineError> {
-        let _gate = self.inner.refresh_gate.lock().await;
-        // Re-check under the gate: the refresh we queued behind may have done the work.
-        if organization_id.is_none()
-            && let Some(entry) = &*lock(&self.inner.access)
-            && entry.remaining() > TOKEN_SLACK
-        {
-            return Ok(Some(entry.token.clone()));
-        }
-        let Some(refresh_token) = lock(&self.inner.stored)
-            .as_ref()
-            .map(|s| s.refresh_token.clone())
-        else {
-            return Ok(None);
-        };
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct RefreshBody<'a> {
-            refresh_token: &'a str,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            organization_id: Option<&'a str>,
-        }
-        let url = format!(
-            "{}/auth/refresh",
-            self.inner.config.edge_url.trim_end_matches('/')
-        );
-        let res = self
-            .inner
-            .http
-            .post(&url)
-            .json(&RefreshBody {
-                refresh_token: &refresh_token,
-                organization_id,
-            })
-            .send()
-            .await;
-        let res = match res {
-            Ok(res) => res,
-            Err(err) => {
-                // Network failure is transient: keep the session, caller retries later.
-                tracing::warn!(error = %err, "auth: refresh could not reach the edge");
-                return Ok(None);
-            }
-        };
-        let status = res.status().as_u16();
-        if (400..500).contains(&status) && organization_id.is_none() {
-            // A definitive 4xx means the refresh token itself is dead (revoked session,
-            // deleted user) — it can NEVER succeed again. Degrade to SignedOut so every
-            // downstream retry loop quiets down. (Org-switch refreshes are exempt: a 4xx
-            // there means "not a member", not a dead session.)
-            tracing::warn!(
-                status,
-                "auth: refresh rejected — session revoked; signing out"
-            );
-            self.sign_out();
-            return Ok(None);
-        }
-        if !res.status().is_success() {
-            return Err(EngineError::Other(format!("refresh failed ({status})")));
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Tokens {
-            access_token: String,
-            refresh_token: String,
-        }
-        let tokens: Tokens = res
-            .json()
-            .await
-            .map_err(|e| EngineError::Other(format!("malformed refresh response: {e}")))?;
-        let org_id = jwt_claims(&tokens.access_token).and_then(|c| c.org_id);
-        let entry = AccessEntry::fresh(tokens.access_token.clone());
-        tracing::info!(ttl_s = entry.ttl.as_secs(), "auth: access token refreshed");
-        *lock(&self.inner.access) = Some(entry);
-        let (user, org_changed) = {
-            let mut stored = lock(&self.inner.stored);
-            match stored.as_mut() {
-                Some(session) => {
-                    let changed = session.org_id != org_id;
-                    session.refresh_token = tokens.refresh_token;
-                    session.org_id = org_id.clone();
-                    (session.user.clone(), changed)
-                }
-                None => return Ok(None), // signed out mid-refresh
-            }
-        };
-        self.persist(lock(&self.inner.stored).as_ref());
-        if org_changed {
-            self.inner.state_tx.send_replace(state_for(user, org_id));
-        }
-        Ok(Some(tokens.access_token))
-    }
-
-    fn session_file(&self) -> PathBuf {
-        self.inner.config.data_dir.join("session.json")
-    }
-
-    /// Persist (0600) or remove the stored session. Never panics: a disk error degrades
-    /// to a logged warning, not a crash mid-refresh.
     fn persist<S: std::borrow::Borrow<StoredSession>>(&self, session: Option<S>) {
-        let path = self.session_file();
+        let path = self.inner.config.data_dir.join("session.json");
         let outcome = match session {
-            Some(session) => serde_json::to_vec(session.borrow())
-                .map_err(std::io::Error::other)
-                .and_then(|bytes| write_private(&path, &bytes)),
+            Some(session) => std::fs::create_dir_all(&self.inner.config.data_dir).and_then(|()| {
+                serde_json::to_vec(session.borrow())
+                    .map_err(std::io::Error::other)
+                    .and_then(|bytes| write_private(&path, &bytes))
+            }),
             None => match std::fs::remove_file(&path) {
-                Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
-                _ => Ok(()),
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
             },
         };
-        if let Err(err) = outcome {
-            tracing::warn!(error = %err, "auth: failed to persist session");
+        if let Err(error) = outcome {
+            tracing::warn!(%error, path = %path.display(), "auth: could not persist session");
         }
     }
 
-    async fn authed_json<T: serde::de::DeserializeOwned>(
+    async fn get_json<T: serde::de::DeserializeOwned>(
         &self,
-        method: reqwest::Method,
-        path: &str,
-        body: Option<serde_json::Value>,
+        url: &str,
+        label: &str,
     ) -> Result<T, EngineError> {
-        let token = self
-            .access_token()
-            .await
-            .ok_or_else(|| EngineError::Other("not signed in".into()))?;
-        let url = format!(
-            "{}{}",
-            self.inner.config.edge_url.trim_end_matches('/'),
-            path
-        );
-        let mut req = self.inner.http.request(method, &url).bearer_auth(token);
-        if let Some(body) = body {
-            req = req.json(&body);
-        }
-        let res = req
+        let response = self
+            .inner
+            .http
+            .get(url)
             .send()
             .await
-            .map_err(|e| EngineError::Other(format!("the edge is unreachable: {e}")))?;
-        if !res.status().is_success() {
+            .map_err(|error| EngineError::Other(format!("{label} failed: {error}")))?;
+        if !response.status().is_success() {
             return Err(EngineError::Other(format!(
-                "workspace request failed ({})",
-                res.status().as_u16()
+                "{label} failed ({})",
+                response.status().as_u16()
             )));
         }
-        res.json::<T>()
+        response
+            .json()
             .await
-            .map_err(|e| EngineError::Other(format!("malformed response: {e}")))
+            .map_err(|error| EngineError::Other(format!("malformed {label}: {error}")))
     }
 
-    // -- loopback callback server ------------------------------------------
-
-    /// Bind the loopback callback listener (idempotent); returns its port.
     async fn ensure_loopback(&self) -> Result<u16, EngineError> {
         let mut slot = self.inner.loopback.lock().await;
         if let Some(port) = *slot {
             return Ok(port);
         }
-        let requested = self.inner.config.callback_port.unwrap_or(0);
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", requested))
-            .await
-            .map_err(|e| EngineError::Other(format!("sign-in callback bind failed: {e}")))?;
+        let listener = tokio::net::TcpListener::bind(format!(
+            "127.0.0.1:{}",
+            self.inner.config.callback_port.unwrap_or(0)
+        ))
+        .await
+        .map_err(|error| EngineError::Other(format!("could not bind sign-in callback: {error}")))?;
         let port = listener
             .local_addr()
-            .map_err(|e| EngineError::Other(format!("sign-in callback addr: {e}")))?
+            .map_err(|error| {
+                EngineError::Other(format!("could not inspect sign-in callback: {error}"))
+            })?
             .port();
         *slot = Some(port);
-        let weak = Arc::downgrade(&self.inner);
-        tokio::spawn(loopback_loop(listener, weak));
-        tracing::info!(port, "auth: sign-in callback listening");
+        tokio::spawn(loopback_loop(listener, Arc::downgrade(&self.inner)));
         Ok(port)
     }
 }
@@ -787,47 +919,110 @@ impl Auth {
 struct SignInResult {
     user: AuthUser,
     access_token: String,
-    refresh_token: String,
+    capabilities: Vec<String>,
 }
 
-fn state_for(user: AuthUser, org_id: Option<String>) -> AuthState {
-    // Every user must belong to an organization before the product opens up; an org-less
-    // session is `NeedsOrganization`, which the UI gates on.
-    match org_id {
-        Some(org_id) => AuthState::SignedIn {
-            user,
-            org_id: Some(org_id),
-        },
-        None => AuthState::NeedsOrganization { user },
+fn signed_in_state(user: AuthUser, project_scope: &str) -> AuthState {
+    AuthState::SignedIn {
+        user,
+        project_scope: project_scope.to_string(),
     }
 }
 
-/// The relay/room token seam: `Auth` IS a [`comet_rpc::TokenSource`], so the host relay
-/// and link cache always dial with a fresh bearer after refreshes.
+fn required_scopes_present(required: &str, granted: &[String]) -> bool {
+    required
+        .split_whitespace()
+        .all(|scope| granted.iter().any(|candidate| candidate == scope))
+}
+
+fn device_grant_exchange_url(edge_url: &str) -> Result<reqwest::Url, EngineError> {
+    let mut url = reqwest::Url::parse(edge_url).map_err(|_| {
+        EngineError::Other(
+            "Comet edge URL must be an approved exact origin (HTTP is loopback-only)".into(),
+        )
+    })?;
+    let approved_remote = url.scheme() == "https"
+        && url.port().is_none()
+        && url
+            .host_str()
+            .is_some_and(|host| host == STAGING_EDGE_HOST || host == PRODUCTION_EDGE_HOST);
+    let approved_local = url.scheme() == "http"
+        && matches!(
+            url.host_str(),
+            Some("127.0.0.1" | "localhost" | "::1" | "[::1]")
+        );
+    let exact_origin = matches!(url.path(), "" | "/")
+        && (edge_url == url.as_str()
+            || url
+                .as_str()
+                .strip_suffix('/')
+                .is_some_and(|without_slash| edge_url == without_slash));
+    if (!approved_remote && !approved_local)
+        || !exact_origin
+        || url.username() != ""
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(EngineError::Other(
+            "Comet edge URL must be an approved exact origin (HTTP is loopback-only)".into(),
+        ));
+    }
+    url.set_path("/auth/device-grants/exchange");
+    Ok(url)
+}
+
+fn require_same_origin(base: &str, candidate: &str, label: &str) -> Result<(), EngineError> {
+    let base = reqwest::Url::parse(base)
+        .map_err(|_| EngineError::Other("Scaffold control-plane URL is invalid".into()))?;
+    let candidate = reqwest::Url::parse(candidate)
+        .map_err(|_| EngineError::Other(format!("{label} is invalid")))?;
+    let local = matches!(base.host_str(), Some("127.0.0.1" | "localhost"));
+    if (!local && candidate.scheme() != "https")
+        || base.scheme() != candidate.scheme()
+        || base.host_str() != candidate.host_str()
+        || base.port_or_known_default() != candidate.port_or_known_default()
+    {
+        return Err(EngineError::Other(format!(
+            "{label} crossed the configured origin"
+        )));
+    }
+    Ok(())
+}
+
+fn pkce_verifier() -> String {
+    let random = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random.as_bytes())
+}
+
+fn pkce_challenge(verifier: &str) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
 #[async_trait::async_trait]
 impl comet_rpc::TokenSource for Auth {
     async fn token(&self) -> Option<String> {
-        if self.inner.workos.is_some() && !self.state().is_signed_in() {
+        if self.inner.scaffold.is_some() && !self.state().is_signed_in() {
             return None;
         }
         self.access_token().await
     }
 }
 
-// ---------------------------------------------------------------------------
-// Loopback HTTP (hand-rolled: no HTTP server dependency in the engine)
-// ---------------------------------------------------------------------------
-
 async fn loopback_loop(listener: tokio::net::TcpListener, inner: Weak<AuthInner>) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             break;
         };
-        let Some(inner) = inner.upgrade() else { break };
+        let Some(inner) = inner.upgrade() else {
+            break;
+        };
         tokio::spawn(async move {
-            if let Err(err) = handle_loopback_conn(stream, Auth { inner }).await {
-                tracing::debug!(error = %err, "auth: callback connection failed");
-            }
+            let _ = handle_loopback_conn(stream, Auth { inner }).await;
         });
     }
 }
@@ -836,63 +1031,52 @@ async fn handle_loopback_conn(
     mut stream: tokio::net::TcpStream,
     auth: Auth,
 ) -> Result<(), std::io::Error> {
-    // Read the request head (bounded; we only need the request line).
-    let mut buf = Vec::with_capacity(2048);
-    let mut chunk = [0u8; 1024];
-    loop {
-        let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut chunk))
-            .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "header read"))??;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 16 * 1024 {
-            break;
-        }
-    }
-    let head = String::from_utf8_lossy(&buf);
-    let request_line = head.lines().next().unwrap_or_default();
-    let target = request_line.split_whitespace().nth(1).unwrap_or("");
-    let (path, query) = target.split_once('?').unwrap_or((target, ""));
-
-    let (status, body) = if path != "/callback" {
-        ("404 Not Found", page("Not found."))
-    } else {
-        let params: HashMap<String, String> = query
-            .split('&')
-            .filter_map(|kv| kv.split_once('='))
-            .map(|(k, v)| (k.to_string(), url_decode(v)))
-            .collect();
-        let code = params.get("code");
-        let state = params.get("state");
-        match (code, state) {
-            (Some(code), Some(state)) if auth.take_pending(state) => {
-                match auth.exchange_code(code).await {
-                    Ok(result) => {
-                        auth.finish_sign_in(result);
-                        (
-                            "200 OK",
-                            page("Signed in. You can close this tab and return to Comet."),
-                        )
-                    }
-                    Err(err) => {
-                        tracing::warn!(error = %err, "auth: loopback code exchange failed");
-                        (
-                            "502 Bad Gateway",
-                            page("Sign-in failed during token exchange — check the Comet logs."),
-                        )
-                    }
+    let mut buffer = [0u8; 8192];
+    let read = stream.read(&mut buffer).await?;
+    let request = String::from_utf8_lossy(&buffer[..read]);
+    let target = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("/");
+    let url = reqwest::Url::parse(&format!("http://127.0.0.1{target}")).ok();
+    let query = |key: &str| {
+        url.as_ref().and_then(|url| {
+            url.query_pairs()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.into_owned())
+        })
+    };
+    let (status, body) = match (query("code"), query("state")) {
+        (Some(code), Some(state)) => match auth.take_pending(&state) {
+            Some(pending) => match auth.exchange_code(&pending, &code).await {
+                Ok(result) => {
+                    auth.finish_sign_in(result);
+                    (
+                        "200 OK",
+                        page("Signed in to Ashler Comet. You can close this window."),
+                    )
                 }
-            }
-            _ => (
+                Err(error) => {
+                    tracing::warn!(%error, "auth: loopback token exchange failed");
+                    (
+                        "502 Bad Gateway",
+                        page("Sign-in failed. Return to Ashler Comet and try again."),
+                    )
+                }
+            },
+            None => (
                 "400 Bad Request",
-                page("Invalid or expired sign-in link. Start again from Comet."),
+                page("This sign-in link is invalid or expired."),
             ),
-        }
+        },
+        _ => (
+            "400 Bad Request",
+            page("This callback is missing its sign-in code."),
+        ),
     };
     let response = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes()).await?;
@@ -900,101 +1084,11 @@ async fn handle_loopback_conn(
 }
 
 fn page(message: &str) -> String {
-    format!("<html><body style='font-family:sans-serif;padding:2rem'>{message}</body></html>")
+    format!(
+        "<!doctype html><html><head><meta charset='utf-8'><title>Ashler Comet sign in</title></head><body style='font-family:sans-serif;padding:2rem'>{message}</body></html>"
+    )
 }
 
-// ---------------------------------------------------------------------------
-// Small utilities (JWT claims, base64url, URL encoding, 0600 writes)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Default, Deserialize)]
-struct JwtClaims {
-    #[serde(default)]
-    exp: Option<i64>,
-    #[serde(default)]
-    iat: Option<i64>,
-    #[serde(default)]
-    org_id: Option<String>,
-}
-
-/// Decode (without verifying — the edge verifies) the JWT payload claims. Total: a
-/// malformed token yields `None`, never a panic.
-fn jwt_claims(token: &str) -> Option<JwtClaims> {
-    let payload = token.split('.').nth(1)?;
-    let bytes = base64url_decode(payload)?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-fn base64url_decode(input: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(input.len() * 3 / 4 + 3);
-    let mut acc: u32 = 0;
-    let mut bits = 0u32;
-    for byte in input.bytes() {
-        let value = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'-' | b'+' => 62,
-            b'_' | b'/' => 63,
-            b'=' => continue,
-            _ => return None,
-        };
-        acc = (acc << 6) | u32::from(value);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
-    }
-    Some(out)
-}
-
-fn url_encode(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for byte in input.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char)
-            }
-            other => out.push_str(&format!("%{other:02X}")),
-        }
-    }
-    out
-}
-
-fn url_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
-                match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
-                    Some(byte) => {
-                        out.push(byte);
-                        i += 3;
-                    }
-                    None => {
-                        out.push(b'%');
-                        i += 1;
-                    }
-                }
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            byte => {
-                out.push(byte);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// Write a file readable only by the owner (0600). On non-unix targets a plain write.
 fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -1006,9 +1100,8 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
             .truncate(true)
             .mode(0o600)
             .open(path)?;
-        // An existing file keeps its old mode through OpenOptions — enforce 0600 anyway.
-        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
-        file.write_all(bytes)
+        file.write_all(bytes)?;
+        file.sync_all()
     }
     #[cfg(not(unix))]
     {
@@ -1021,82 +1114,108 @@ mod tests {
     use super::*;
 
     #[test]
-    fn base64url_round_trips_jwt_payload() {
-        let payload = br#"{"exp":100,"iat":40,"org_id":"org_1"}"#;
-        // Standard base64url without padding (as JWTs use).
-        let encoded = {
-            const ALPHABET: &[u8] =
-                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-            let mut out = String::new();
-            for chunk in payload.chunks(3) {
-                let b = [
-                    chunk[0],
-                    *chunk.get(1).unwrap_or(&0),
-                    *chunk.get(2).unwrap_or(&0),
-                ];
-                let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-                out.push(ALPHABET[(n >> 18) as usize & 63] as char);
-                out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-                if chunk.len() > 1 {
-                    out.push(ALPHABET[(n >> 6) as usize & 63] as char);
-                }
-                if chunk.len() > 2 {
-                    out.push(ALPHABET[n as usize & 63] as char);
-                }
-            }
-            out
-        };
-        assert_eq!(
-            base64url_decode(&encoded).as_deref(),
-            Some(payload.as_slice())
-        );
-        let token = format!("h.{encoded}.sig");
-        let claims = jwt_claims(&token).expect("claims decode");
-        assert_eq!(claims.exp, Some(100));
-        assert_eq!(claims.iat, Some(40));
-        assert_eq!(claims.org_id.as_deref(), Some("org_1"));
+    fn pkce_uses_url_safe_s256() {
+        let verifier = pkce_verifier();
+        assert!(verifier.len() >= 43);
+        assert!(!verifier.contains('='));
+        assert_eq!(pkce_challenge(&verifier).len(), 43);
     }
 
     #[test]
-    fn url_coding_round_trips() {
-        let raw = "http://127.0.0.1:1234/callback?x=a b&y=%";
-        assert_eq!(url_decode(&url_encode(raw)), raw);
-        assert_eq!(url_encode("a b"), "a%20b");
+    fn capabilities_fail_closed() {
+        let granted = vec!["session.read".to_string(), "session.chat".to_string()];
+        assert!(required_scopes_present("session.read", &granted));
+        assert!(!required_scopes_present(
+            "session.read session.control",
+            &granted
+        ));
     }
 
     #[test]
-    fn auth_state_serializes_as_proto_shape() {
-        let user = AuthUser {
-            id: "u1".into(),
-            email: "u@x".into(),
-            name: None,
-        };
-        let signed_in = AuthState::SignedIn {
-            user: user.clone(),
-            org_id: Some("org_1".into()),
-        };
-        let value = serde_json::to_value(&signed_in).expect("json");
+    fn device_grant_exchange_uses_only_approved_edge_origins() {
         assert_eq!(
-            value,
-            serde_json::json!({
-                "state": "signedIn",
-                "user": {"id": "u1", "email": "u@x", "name": null},
-                "orgId": "org_1",
-            })
-        );
-        // The proto type itself round-trips the emitted value.
-        let parsed: comet_proto::AuthState = serde_json::from_value(value).expect("proto parse");
-        assert!(matches!(parsed, comet_proto::AuthState::SignedIn { .. }));
-        assert_eq!(
-            serde_json::to_value(AuthState::SignedOut).expect("json"),
-            serde_json::json!({"state": "signedOut"})
+            device_grant_exchange_url("https://comet.internal.ashler.com")
+                .unwrap()
+                .as_str(),
+            "https://comet.internal.ashler.com/auth/device-grants/exchange"
         );
         assert_eq!(
-            serde_json::to_value(AuthState::NeedsOrganization { user }).expect("json"),
-            serde_json::json!({
-                "state": "needsOrganization",
-                "user": {"id": "u1", "email": "u@x", "name": null},
-            })
+            device_grant_exchange_url("https://comet-staging.internal.ashler.com")
+                .unwrap()
+                .as_str(),
+            "https://comet-staging.internal.ashler.com/auth/device-grants/exchange"
+        );
+        assert_eq!(
+            device_grant_exchange_url("http://127.0.0.1:8787")
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:8787/auth/device-grants/exchange"
+        );
+        assert_eq!(
+            device_grant_exchange_url("http://localhost:8787/")
+                .unwrap()
+                .as_str(),
+            "http://localhost:8787/auth/device-grants/exchange"
+        );
+        assert_eq!(
+            device_grant_exchange_url("http://[::1]:8787")
+                .unwrap()
+                .as_str(),
+            "http://[::1]:8787/auth/device-grants/exchange"
+        );
+    }
+
+    #[test]
+    fn device_grant_exchange_rejects_unapproved_edge_origins() {
+        for edge_url in [
+            "https://attacker.example",
+            "https://comet.internal.ashler.com.attacker.example",
+            "http://comet.internal.ashler.com",
+            "http://192.0.2.1:8787",
+            "https://user@comet.internal.ashler.com",
+            "https://comet.internal.ashler.com/unexpected",
+            "https://comet.internal.ashler.com/unexpected/../",
+            "https://comet.internal.ashler.com:444/",
+            "https://comet.internal.ashler.com?redirect=https://attacker.example",
+            "https://comet.internal.ashler.com#unexpected",
+            "ftp://comet.internal.ashler.com",
+            "https://localhost:8787",
+        ] {
+            assert!(
+                device_grant_exchange_url(edge_url).is_err(),
+                "{edge_url} must not receive a device grant"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_edge_origin_error_does_not_expose_device_grant() {
+        let auth = Auth::new_with_mode(AuthConfig::new("not a URL", PathBuf::new()), true);
+        let grant = "cg1.must-not-appear";
+
+        let error = auth.exchange_device_grant(grant).await.unwrap_err();
+
+        assert!(!error.to_string().contains(grant));
+        assert!(!auth.watch_state().borrow().is_signed_in());
+    }
+
+    #[test]
+    fn discovery_cannot_cross_origin() {
+        assert!(
+            require_same_origin(
+                "https://scaffold-staging.internal.ashler.com",
+                "https://scaffold-staging.internal.ashler.com/api/oauth/token",
+                "token endpoint"
+            )
+            .is_ok()
+        );
+        assert!(
+            require_same_origin(
+                "https://scaffold-staging.internal.ashler.com",
+                "https://evil.example/api/oauth/token",
+                "token endpoint"
+            )
+            .is_err()
         );
     }
 }

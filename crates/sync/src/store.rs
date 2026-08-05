@@ -30,6 +30,11 @@ const MIGRATIONS: &[&str] = &[
         command_id   TEXT PRIMARY KEY,
         processed_at INTEGER NOT NULL
      ) STRICT;",
+    // v2 — durable local provenance for commands that do not carry a remote grant.
+    "CREATE TABLE trusted_local_commands (
+        command_id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL
+     ) STRICT;",
 ];
 
 /// SQLite-backed store under a data directory (`{data_dir}/docs.sqlite3`).
@@ -109,6 +114,36 @@ impl DocsStore {
             params![command_id, now_ms()],
         )?;
         Ok(changed > 0)
+    }
+
+    /// Persist that this command was authored through this device's local API.
+    /// Remote CRDT peers cannot create rows in this device-local database.
+    pub fn trust_local_command(&self, command_id: &str) -> Result<(), StoreError> {
+        self.conn().execute(
+            "INSERT OR IGNORE INTO trusted_local_commands (command_id, created_at) VALUES (?1, ?2)",
+            params![command_id, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_trusted_local_command(&self, command_id: &str) -> Result<bool, StoreError> {
+        let hit = self
+            .conn()
+            .query_row(
+                "SELECT 1 FROM trusted_local_commands WHERE command_id = ?1",
+                params![command_id],
+                |_| Ok(()),
+            )
+            .optional()?;
+        Ok(hit.is_some())
+    }
+
+    pub fn forget_local_command(&self, command_id: &str) -> Result<(), StoreError> {
+        self.conn().execute(
+            "DELETE FROM trusted_local_commands WHERE command_id = ?1",
+            params![command_id],
+        )?;
+        Ok(())
     }
 
     fn conn(&self) -> MutexGuard<'_, Connection> {
@@ -193,6 +228,22 @@ mod tests {
             !store.mark_processed("cmd-1").unwrap(),
             "second mark must not re-claim"
         );
+    }
+
+    #[test]
+    fn local_command_trust_is_durable_and_revocable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DocsStore::open(dir.path()).unwrap();
+
+        assert!(!store.is_trusted_local_command("cmd-local").unwrap());
+        store.trust_local_command("cmd-local").unwrap();
+        assert!(store.is_trusted_local_command("cmd-local").unwrap());
+        drop(store);
+
+        let store = DocsStore::open(dir.path()).unwrap();
+        assert!(store.is_trusted_local_command("cmd-local").unwrap());
+        store.forget_local_command("cmd-local").unwrap();
+        assert!(!store.is_trusted_local_command("cmd-local").unwrap());
     }
 
     #[test]

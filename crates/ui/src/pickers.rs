@@ -26,9 +26,8 @@ use comet_proto::{
 };
 use comet_rpc::methods;
 
-/// Display cap for the ref list (t3code shows pages of 100 with a status
-/// footer; a flat cap + "Showing X of Y refs" reads the same without
-/// pagination plumbing).
+/// Display cap for the ref list. A status footer states how many refs are
+/// visible when the list is capped.
 const MAX_REF_ROWS: usize = 300;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
@@ -55,11 +54,11 @@ pub struct DraftConfig {
     /// The picked ref (base branch in NewWorktree mode; a worktree's branch
     /// when reusing one). `None` = the repo's current branch.
     pub branch: Option<String>,
-    /// Where the new session runs (the t3code env-mode).
+    /// Where the new session runs.
     pub checkout: CheckoutKind,
 }
 
-/// Where a new session runs (t3code's env-mode: `local | worktree`). "Current
+/// Where a new session runs (`local | worktree`). "Current
 /// worktree" is NOT a third mode — it's `Local` when the picked ref is already
 /// materialized as a worktree (the session reuses that checkout's path).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -796,15 +795,14 @@ impl Pickers {
     // ---- selections ----
 
     fn pick_ref(&mut self, row: RepoRef, cx: &mut Context<Self>) {
-        // Existing session: the pick SWITCHES the session's checkout (the
-        // t3code mid-session `switchRef`) instead of updating the draft.
+        // Existing-session ref picks switch its checkout instead of updating
+        // the draft.
         if self.state.read(cx).selected_chat_row().is_some() {
             self.switch_session_ref(row, cx);
             return;
         }
         if row.worktree_path.is_some() {
-            // Reuse the ref's existing worktree ("Current worktree") — the
-            // t3code `reuseExistingWorktree` path.
+            // Reuse the ref's existing worktree ("Current worktree").
             self.config.branch = Some(row.name.clone());
             self.config.checkout = CheckoutKind::Local;
         } else if self.config.checkout == CheckoutKind::NewWorktree || row.current {
@@ -812,7 +810,7 @@ impl Pickers {
             self.config.branch = Some(row.name.clone());
         } else {
             // Local mode + a plain non-current ref: CHECK OUT the space
-            // folder (full t3code `switchRef` — picking `main` means "put my
+            // folder. Picking `main` means "put my
             // local checkout on main", it must never flip the mode).
             self.switch_draft_ref(row, cx);
             return;
@@ -875,13 +873,13 @@ impl Pickers {
         cx.notify();
     }
 
-    /// Mid-session ref switch, two shapes (both t3code):
+    /// Mid-session ref switch, two shapes:
     ///
     /// - The picked ref already lives in ANOTHER worktree → RETARGET the
     ///   session onto that worktree (`reuseExistingWorktree`): a `setChatCwd`
     ///   + `setChatBranch` mutate, no git. Resume is cwd-scoped, so the next
-    ///   run there starts a fresh harness conversation — the transcript
-    ///   itself carries on.
+    ///     run there starts a fresh harness conversation — the transcript
+    ///     itself carries on.
     /// - Otherwise → `git checkout` in the SESSION's own cwd (`SwitchRef`,
     ///   relay-forwarded to the host device). The host's HEAD watcher
     ///   reconciles `chat.branch` to every device. Errors (dirty tree, ref
@@ -1184,7 +1182,7 @@ impl Pickers {
             .collect()
     }
 
-    // ---- checkout resolution (the t3code env-mode semantics) ----
+    // ---- checkout resolution ----
 
     /// Index of the highlighted-by-default row in the (filtered) ref list:
     /// the session's branch on an existing chat, the draft pick on a new one,
@@ -1244,8 +1242,7 @@ impl Pickers {
         }
     }
 
-    /// Label of the checkout-kind trigger (t3code `resolveEnvModeLabel` /
-    /// `resolveCurrentWorkspaceLabel`).
+    /// Label of the checkout-kind trigger.
     fn checkout_label(&self) -> &'static str {
         match self.config.checkout {
             CheckoutKind::NewWorktree => "New worktree",
@@ -1260,7 +1257,7 @@ impl Pickers {
     }
 
     /// Label of the ref trigger: `From <ref>` only when a NEW worktree will be
-    /// created off it (t3code `getBranchTriggerLabel`); the bare name otherwise.
+    /// created off it; the bare name otherwise.
     fn ref_label(&self) -> SharedString {
         match (self.config.checkout, self.effective_ref_name()) {
             (_, None) => SharedString::from("Select ref"),
@@ -1337,7 +1334,6 @@ impl Pickers {
         &self,
         kind: PickerKind,
         label: SharedString,
-        set: bool,
         chip_icon: Option<(&'static str, Option<gpui::Hsla>)>,
         suffix: Option<SharedString>,
         theme: &Theme,
@@ -1368,15 +1364,7 @@ impl Pickers {
             .font_weight(gpui::FontWeight::MEDIUM)
             // comet composer/styles.tsx `pill`: `transition-colors` — the wash
             // and text brighten fade over 150ms.
-            .text_color(motion::hover_blend(
-                id,
-                if set {
-                    theme.text.opacity(0.9)
-                } else {
-                    theme.text_muted
-                },
-                theme.text,
-            ))
+            .text_color(motion::hover_blend(id, theme.text.opacity(0.9), theme.text))
             .bg(if open {
                 theme.element_hover
             } else {
@@ -1405,7 +1393,7 @@ impl Pickers {
             })
     }
 
-    /// A footer-row trigger (t3code ghost `Button size="xs"`): leading icon,
+    /// A compact footer-row trigger: leading icon,
     /// truncating label, trailing chevron — smaller and quieter than the
     /// in-pill chips.
     fn footer_chip(
@@ -1456,8 +1444,7 @@ impl Pickers {
             )
     }
 
-    /// A read-only footer label (locked sessions — t3code's
-    /// `resolveLockedWorkspaceLabel` span).
+    /// A read-only footer label for locked sessions.
     fn footer_label(icon_path: &'static str, label: SharedString, theme: &Theme) -> gpui::Div {
         div()
             .h(px(20.0))
@@ -1478,7 +1465,7 @@ impl Pickers {
             .child(div().min_w_0().truncate().child(label))
     }
 
-    /// The composer footer row (t3code BranchToolbar): checkout-kind on the
+    /// The composer footer row: checkout-kind on the
     /// left, the ref selector right-aligned. `None` for non-git spaces. On an
     /// existing session both sides are read-only labels ("Worktree" /
     /// "Local checkout" + the chat's branch).
@@ -1518,9 +1505,8 @@ impl Pickers {
             .px(px(10.0))
             .mb(px(-8.0));
 
-        // The ref side is LIVE in both modes: draft pick on a new chat,
-        // checkout switch on an existing session (t3code keeps its branch
-        // selector interactive mid-session too).
+        // The ref side stays live for both draft picks and existing-session
+        // checkout switches.
         let ref_label = match &session {
             Some(chat) => chat
                 .branch
@@ -1666,7 +1652,7 @@ impl Pickers {
             .into_any_element()
     }
 
-    /// The ref picker (t3code BranchToolbarBranchSelector): search on top,
+    /// The ref picker: search on top,
     /// rows with right-aligned muted `current`/`worktree` tags, and a
     /// "Showing X of Y refs" footer when the list is capped.
     fn render_branch_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -1720,8 +1706,7 @@ impl Pickers {
                             |(ix, row)| {
                                 let label: SharedString = row.name.clone().into();
                                 let is_selected = selected.as_deref() == Some(row.name.as_str());
-                                // Right-aligned muted tag (t3code `text-[10px]
-                                // text-muted-foreground/45`): current beats worktree.
+                                // Right-aligned muted tag: current beats worktree.
                                 let tag: Option<&'static str> = if row.current {
                                     Some("current")
                                 } else if row.worktree_path.is_some() {
@@ -1802,7 +1787,7 @@ impl Pickers {
         popover.into_any_element()
     }
 
-    /// The checkout-kind dropdown (t3code BranchToolbarEnvModeSelector): two
+    /// The checkout-kind dropdown: two
     /// rows — "Current checkout"/"Current worktree" (local) and "New worktree".
     fn render_checkout_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
@@ -2370,8 +2355,7 @@ fn attach_overlay(
     chip
 }
 
-/// [`attach_overlay`] with the menu RIGHT-ALIGNED to the trigger (t3code
-/// `align="end"` — right-edge triggers like the ref picker open leftward).
+/// [`attach_overlay`] with the menu right-aligned to the trigger.
 fn attach_overlay_end(
     chip: gpui::Stateful<gpui::Div>,
     overlay: &mut Option<(PickerKind, AnyElement)>,
@@ -2506,7 +2490,6 @@ impl Render for Pickers {
         let combined_chip = self.trigger_chip(
             PickerKind::HarnessModel,
             model_label,
-            true,
             Some(harness_icon),
             Some(traits_label),
             &theme,

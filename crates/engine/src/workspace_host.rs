@@ -25,16 +25,13 @@ use comet_sync::{DocsStore, RoomClient};
 use crate::doc_host::EdgeConfig;
 use crate::{EngineError, now_ms};
 
-/// Snapshot row id in the local `DocsStore` (chat ids never collide with it).
-/// `workspace2` = the spaces-overhaul destructive break: the legacy `workspace`
-/// row is simply never read again. (The per-user room break — `ws2/{orgId}` →
-/// `ws3/{orgId}/{userId}` — needed no row-id bump: the local store itself moved
-/// to `orgs/{org}/{user}/`, so the old snapshot is unreachable anyway.)
-pub const WORKSPACE_DOC_ID: &str = "workspace2";
-/// Legacy (pre-spaces) snapshot row — best-effort deleted on open.
-const LEGACY_WORKSPACE_DOC_ID: &str = "workspace";
-/// Org used when none is configured (matches the edge's dev-mode `user@org` bearers).
-pub const DEFAULT_ORG_ID: &str = "dev-org";
+/// Snapshot row id in the local `DocsStore`. `workspace3` marks the cutover to
+/// a Scaffold project-scoped shared workspace room; old private snapshots stay
+/// isolated in the prior identity layout.
+pub const WORKSPACE_DOC_ID: &str = "workspace3";
+/// Legacy snapshot row removed on open.
+const LEGACY_WORKSPACE_DOC_ID: &str = "workspace2";
+pub const DEFAULT_PROJECT_SCOPE: &str = "ashler-local";
 /// User used when none is configured (dev mode without a bearer).
 pub const DEFAULT_USER_ID: &str = "dev-user";
 /// Ephemeral presence refresh cadence.
@@ -110,12 +107,10 @@ pub struct WorkspaceHostConfig {
     pub device_name: String,
     /// `std::env::consts::OS`-style platform string.
     pub platform: String,
-    pub org_id: String,
-    /// The signed-in user — workspace docs are per-user (`ws3/{orgId}/{userId}`):
-    /// spaces/sessions are private to their owner, never org-visible.
+    pub project_scope: String,
+    /// Verified principal used for provenance inside the shared project room.
     pub user_id: String,
-    /// When present, the host joins `/workspace/{orgId}/ws`. `None` = fully offline
-    /// (local snapshots only; the doc still drives everything device-side).
+    /// When present, the host joins `/workspace/{projectScope}/ws`.
     pub edge: Option<EdgeConfig>,
 }
 
@@ -234,18 +229,20 @@ impl WorkspaceHost {
         Ok(host)
     }
 
+    pub fn project_scope(&self) -> &str {
+        &self.inner.config.project_scope
+    }
+
     /// Edge room join — offline-tolerant: a failed join logs and stays local-first.
     fn join_room(&self) {
         let Some(edge) = &self.inner.config.edge else {
             return;
         };
-        let org_id = self.inner.config.org_id.clone();
-        // Per-dial URL provider: the bearer is re-read on every (re)connect.
-        let url = edge.room_url(format!("/workspace/{org_id}/ws"));
-        // `ws3/{orgId}/{userId}` = the per-user privacy room (must match the
-        // edge's join id, which it derives from the caller's own auth claim —
-        // a mismatched user can never join).
-        let room_id = format!("ws3/{}/{}", org_id, self.inner.config.user_id);
+        let project_scope = self.inner.config.project_scope.clone();
+        // Per-dial URL provider: the bearer is re-read on every reconnect.
+        let url = edge.room_url(format!("/workspace/{project_scope}/ws"));
+        // Must match the edge's project-authorized shared workspace namespace.
+        let room_id = format!("ws4/{project_scope}");
         let room_doc = self.inner.doc.doc().clone();
         let device_id = self.inner.config.device_id.clone();
         let weak = Arc::downgrade(&self.inner);
@@ -729,6 +726,17 @@ impl WorkspaceHost {
     /// HEAD-watcher reconciliation: the branch checked out at the chat's cwd.
     pub fn set_chat_branch(&self, chat_id: &str, branch: &str) -> Result<bool, EngineError> {
         Ok(self.inner.doc.set_chat_branch(chat_id, branch)?)
+    }
+    pub fn compare_and_set_chat_branch(
+        &self,
+        chat_id: &str,
+        expected: Option<&str>,
+        branch: &str,
+    ) -> Result<bool, EngineError> {
+        Ok(self
+            .inner
+            .doc
+            .compare_and_set_chat_branch(chat_id, expected, branch)?)
     }
 
     /// Retarget a chat onto another folder (mid-session switch to an existing

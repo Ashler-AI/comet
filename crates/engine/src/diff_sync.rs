@@ -356,6 +356,9 @@ async fn entry_task(
 // ---------------------------------------------------------------------------
 
 async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
+    // Capture the expected metadata before the async git read. A title-driven
+    // branch rename may complete while capture is in flight.
+    let chats = lock(&entry.chats).clone();
     let snapshot = match capture_diff(&inner.repos, &entry.identity.root).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
@@ -366,12 +369,17 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
     };
 
     // chat.branch upkeep — the git-dir watcher covers HEAD, so every snapshot
-    // reconciles mismatched rows (repair tick covers dropped events).
-    let chats = lock(&entry.chats).clone();
+    // reconciles mismatched rows (repair tick covers dropped events). The CAS
+    // prevents this capture from overwriting a newer title-driven branch.
     for chat in &chats {
-        if chat.branch.as_deref() != Some(snapshot.branch.as_str())
-            && let Err(err) = inner.workspace.set_chat_branch(&chat.id, &snapshot.branch)
-        {
+        if chat.branch.as_deref() == Some(snapshot.branch.as_str()) {
+            continue;
+        }
+        if let Err(err) = inner.workspace.compare_and_set_chat_branch(
+            &chat.id,
+            chat.branch.as_deref(),
+            &snapshot.branch,
+        ) {
             tracing::debug!(chat = %chat.id, error = %err, "diff-sync: branch write failed");
         }
     }

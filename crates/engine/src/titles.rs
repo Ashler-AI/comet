@@ -16,7 +16,8 @@
 //!    branch from the title and update the chat's branch row;
 //! 6. `rename_chat` in the workspace doc.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use futures::StreamExt;
 
@@ -35,10 +36,15 @@ use crate::workspace_host::WorkspaceHost;
 /// couple of times with a short backoff before falling back (comet's ladder).
 const RETRY_DELAYS_MS: &[u64] = &[250, 1_000];
 
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 struct Inner {
     workspace: WorkspaceHost,
     registry: Arc<HarnessRegistry>,
     repos: Repos,
+    in_flight: Mutex<HashSet<String>>,
 }
 
 #[derive(Clone)]
@@ -53,13 +59,18 @@ impl TitleGenerator {
                 workspace,
                 registry,
                 repos,
+                in_flight: Mutex::new(HashSet::new()),
             }),
         }
     }
 
     /// Fire-and-forget: title `chat_id` if it's still untitled. Called by the run
     /// task after a completed exchange; runs detached so it never delays anything.
+    /// Duplicate completion signals for the same chat share one generation.
     pub fn maybe_generate(&self, chat_id: &str, harness: HarnessId, prompt: &str, cwd: &str) {
+        if !lock(&self.inner.in_flight).insert(chat_id.to_string()) {
+            return;
+        }
         let this = self.clone();
         let chat_id = chat_id.to_string();
         let prompt = prompt.to_string();
@@ -68,6 +79,7 @@ impl TitleGenerator {
             if let Err(err) = this.generate(&chat_id, harness, &prompt, &cwd).await {
                 tracing::debug!(chat = %chat_id, error = %err, "chat auto-titling skipped");
             }
+            lock(&this.inner.in_flight).remove(&chat_id);
         });
     }
 

@@ -24,8 +24,13 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use comet_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
-use comet_proto::{FileSearchMatch, RunRequest, SandboxLevel, UserInputAnswer, UserInputQuestion};
+use comet_doc::{
+    MessagePart, MessageRole, SessionCommandPayload, SessionControlAction, SessionMessageEntry,
+};
+use comet_proto::{
+    AgentSessionSource, FileSearchMatch, RunRequest, SandboxLevel, UserInputAnswer,
+    UserInputQuestion,
+};
 use comet_rpc::{RpcError, methods};
 
 use crate::attachments::{self, StagedAttachment};
@@ -119,7 +124,7 @@ pub const CARET_BLINK_MS: u64 = 500;
 /// through the first half-period (typing bursts never blink — each keystroke
 /// resets the phase), then alternating.
 pub fn caret_visible(ms_since_activity: u64) -> bool {
-    (ms_since_activity / CARET_BLINK_MS) % 2 == 0
+    (ms_since_activity / CARET_BLINK_MS).is_multiple_of(2)
 }
 
 /// Auto-grow: content height for a wrapped-line count.
@@ -2497,16 +2502,16 @@ impl ComposerInput {
     /// Keep the cursor visible when content exceeds the element height.
     fn clamp_scroll(&mut self, element_height: f32) -> bool {
         let previous = self.scroll_top;
-        if self.follow_cursor {
-            if let Some(cursor) = self.point_for_index(self.cursor_offset()) {
-                self.scroll_top = input_scroll_offset_for_cursor(
-                    self.scroll_top,
-                    f32::from(cursor.y),
-                    f32::from(self.line_height),
-                    self.content_height,
-                    element_height,
-                );
-            }
+        if self.follow_cursor
+            && let Some(cursor) = self.point_for_index(self.cursor_offset())
+        {
+            self.scroll_top = input_scroll_offset_for_cursor(
+                self.scroll_top,
+                f32::from(cursor.y),
+                f32::from(self.line_height),
+                self.content_height,
+                element_height,
+            );
         }
         self.scroll_top = self
             .scroll_top
@@ -3063,6 +3068,40 @@ struct MentionToken {
     query: String,
 }
 
+#[derive(Debug, Clone)]
+struct ControlRoute {
+    session_id: String,
+    owner_device_id: String,
+    actor_device_id: String,
+    actor_subject: String,
+    grant_id: String,
+    source: AgentSessionSource,
+}
+
+fn control_route_grant_id(
+    snapshot: &comet_proto::CollaborationSnapshot,
+    session: &comet_proto::AgentSessionRecord,
+    required_capability: &str,
+    preferred_grant_id: Option<&str>,
+    now: i64,
+) -> Option<String> {
+    crate::multiplayer::session_grant_id(
+        snapshot,
+        session,
+        required_capability,
+        preferred_grant_id,
+        now,
+    )
+}
+
+fn respond_input_route_capability() -> &'static str {
+    SessionControlAction::RespondInput {
+        request_id: String::new(),
+        answers: Vec::new(),
+    }
+    .required_capability()
+}
+
 /// The `@` must begin a token. This intentionally excludes `name@example.com`
 /// and ordinary words while allowing punctuation such as `(@src`.
 fn mention_token(text: &str, cursor: usize) -> Option<MentionToken> {
@@ -3074,9 +3113,7 @@ fn mention_token(text: &str, cursor: usize) -> Option<MentionToken> {
         .rev()
         .find_map(|(at, ch)| ch.is_whitespace().then_some(at + ch.len_utf8()))
         .unwrap_or(0);
-    let Some(relative_at) = text[token_start..cursor].rfind('@') else {
-        return None;
-    };
+    let relative_at = text[token_start..cursor].rfind('@')?;
     let at = token_start + relative_at;
     let valid_boundary = at == 0
         || text[..at]
@@ -3148,6 +3185,10 @@ pub struct Composer {
     mention_task: Option<Task<()>>,
     mention: FileMentionState,
     current_key: String,
+    /// Explicit independently-owned agent target. `start_agent` keeps the
+    /// composer in start mode even while a teammate's session is working.
+    agent_target: Option<String>,
+    start_agent: bool,
     sending: bool,
     failure: Option<SharedString>,
     wizard: Option<Wizard>,
@@ -3236,6 +3277,8 @@ impl Composer {
             mention_task: None,
             mention: FileMentionState::default(),
             current_key,
+            agent_target: None,
+            start_agent: false,
             sending: false,
             failure: None,
             wizard: None,
@@ -3756,13 +3799,113 @@ impl Composer {
             .child(self.input.clone())
             .children(self.render_file_mention_popup(theme, cx))
     }
+    pub fn select_agent_target(&mut self, session_id: Option<String>, cx: &mut Context<Self>) {
+        self.agent_target = session_id;
+        self.start_agent = false;
+        self.input.update(cx, |input, cx| {
+            input.set_placeholder("Steer this agent…", cx)
+        });
+        cx.notify();
+    }
+
+    pub fn begin_start_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.agent_target = None;
+        self.start_agent = true;
+        self.input.update(cx, |input, cx| {
+            input.set_placeholder("Start this agent…", cx)
+        });
+        window.focus(&self.input.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    pub fn begin_steer(&mut self, session_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_agent_target(Some(session_id), cx);
+        window.focus(&self.input.focus_handle(cx), cx);
+    }
+
+    fn control_route(
+        &self,
+        required_capability: &str,
+        cx: &App,
+    ) -> Result<Option<ControlRoute>, SharedString> {
+        if !self.start_agent && self.agent_target.is_none() {
+            return Ok(None);
+        }
+        let state = self.state.read(cx);
+        let snapshot = state
+            .collaboration
+            .as_ref()
+            .ok_or_else(|| SharedString::from("Collaboration unavailable"))?;
+        let principal = snapshot
+            .principal
+            .as_ref()
+            .ok_or_else(|| SharedString::from("Identity unavailable"))?;
+        let actor_device_id = state
+            .local_device_id
+            .clone()
+            .ok_or_else(|| SharedString::from("Device unavailable"))?;
+        if !principal.has_capability(required_capability) {
+            return Err(SharedString::from("Agent control not allowed"));
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let (session_id, owner_device_id, source, grant_id) = if self.start_agent {
+            (
+                uuid::Uuid::new_v4().to_string(),
+                actor_device_id.clone(),
+                AgentSessionSource::Local,
+                uuid::Uuid::new_v4().to_string(),
+            )
+        } else {
+            let target = self
+                .agent_target
+                .as_deref()
+                .and_then(|id| {
+                    snapshot
+                        .sessions
+                        .iter()
+                        .find(|session| session.session_id == id)
+                })
+                .ok_or_else(|| SharedString::from("Agent session unavailable"))?;
+            let grant_id = if target.source == AgentSessionSource::Local
+                && target.owner_device_id == actor_device_id
+            {
+                // The local engine derives and installs this single-action grant
+                // from its authenticated identity before queueing the command.
+                uuid::Uuid::new_v4().to_string()
+            } else {
+                control_route_grant_id(
+                    snapshot,
+                    target,
+                    required_capability,
+                    state.selected_invitation_grant.as_deref(),
+                    now,
+                )
+                .ok_or_else(|| SharedString::from("Agent control not allowed"))?
+            };
+            (
+                target.session_id.clone(),
+                target.owner_device_id.clone(),
+                target.source,
+                grant_id,
+            )
+        };
+        Ok(Some(ControlRoute {
+            session_id,
+            owner_device_id,
+            actor_device_id,
+            actor_subject: principal.subject.clone(),
+            grant_id,
+            source,
+        }))
+    }
 
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
-        let (key, pending) = {
-            let s = self.state.read(cx);
+        let (key, pending, selected_agent_session) = {
+            let state = self.state.read(cx);
             (
-                s.selected_chat.clone().unwrap_or_default(),
-                pending_input_request(&s.transcript),
+                state.selected_chat.clone().unwrap_or_default(),
+                pending_input_request(&state.transcript),
+                state.selected_agent_session.clone(),
             )
         };
 
@@ -3777,6 +3920,8 @@ impl Composer {
             let draft = self.drafts.get(&key).cloned().unwrap_or_default();
             self.current_key = key;
             self.failure = None;
+            self.start_agent = false;
+            self.agent_target = selected_agent_session.clone();
             self.wizard = None;
             // Attachments stay stashed under their chat key (the map swap IS
             // the navigation); only the transient chrome resets.
@@ -3792,6 +3937,8 @@ impl Composer {
             self.last_rendered_height = 0.0;
             self.route_snap_until = Some(Instant::now() + Duration::from_millis(ROUTE_SNAP_MS));
             self.input.update(cx, |input, cx| input.set_text(draft, cx));
+        } else if !self.start_agent {
+            self.agent_target = selected_agent_session;
         }
 
         // Question panel lifecycle (wizard state cached per request id).
@@ -3839,12 +3986,34 @@ impl Composer {
     }
 
     fn run_live(&self, cx: &App) -> bool {
-        let s = self.state.read(cx);
-        let Some(chat_id) = s.selected_chat.as_deref() else {
+        let state = self.state.read(cx);
+        if self.start_agent {
+            return false;
+        }
+        if let Some(target) = self.agent_target.as_deref() {
+            return state
+                .collaboration
+                .as_ref()
+                .and_then(|snapshot| {
+                    snapshot
+                        .sessions
+                        .iter()
+                        .find(|session| session.session_id == target)
+                })
+                .and_then(|session| session.status)
+                .is_some_and(|status| {
+                    matches!(
+                        status,
+                        comet_proto::SessionStatus::Working
+                            | comet_proto::SessionStatus::AwaitingInput
+                    )
+                });
+        }
+        let Some(chat_id) = state.selected_chat.as_deref() else {
             return false;
         };
         matches!(
-            s.indicator_for(chat_id, chrono::Utc::now()),
+            state.indicator_for(chat_id, chrono::Utc::now()),
             Indicator::Working | Indicator::AwaitingInput
         )
     }
@@ -3886,6 +4055,15 @@ impl Composer {
             return;
         };
         // Chat id: existing selection, or client-minted for the new-chat canvas
+        let control_route = match self.control_route(comet_proto::CAPABILITY_SESSION_CHAT, cx) {
+            Ok(route) => route,
+            Err(message) => {
+                self.failure = Some(message);
+                cx.notify();
+                return;
+            }
+        };
+        let start_agent_mode = self.start_agent;
         // (the chat then appears from the doc host once the doc materializes).
         let (chat_id, is_new) = match self.state.read(cx).selected_chat.clone() {
             Some(id) => (id, false),
@@ -3926,24 +4104,27 @@ impl Composer {
                 .or_else(|| local_device_id.clone())
                 .unwrap_or_else(|| "local".to_string())
         };
-        // Uploads/read-backs target the chat's HOST device (forwardable RPCs);
-        // for a new chat that's the space's device (None when it's local).
-        let host_device_id = if is_new {
+        // Uploads/read-backs target the selected independently-owned session.
+        // Legacy/new-thread sends keep their existing chat-host routing.
+        let mut host_device_id = if is_new {
             space
                 .as_ref()
-                .map(|s| s.device_id.clone())
+                .map(|space| space.device_id.clone())
                 .filter(|id| local_device_id.as_deref() != Some(id.as_str()))
         } else {
             self.state
                 .read(cx)
                 .selected_chat_row()
-                .map(|c| c.device_id.clone())
+                .map(|chat| chat.device_id.clone())
         };
-        let space_id = space.as_ref().map(|s| s.id.clone());
-        let space_path = space.as_ref().map(|s| s.path.clone());
+        if let Some(route) = &control_route {
+            host_device_id = Some(route.owner_device_id.clone());
+        }
+        let space_id = space.as_ref().map(|space| space.id.clone());
+        let space_path = space.as_ref().map(|space| space.path.clone());
         let space_remote = space
             .as_ref()
-            .is_some_and(|s| local_device_id.as_deref() != Some(s.device_id.as_str()));
+            .is_some_and(|space| local_device_id.as_deref() != Some(space.device_id.as_str()));
         // Snapshot-and-clear NOW (use-attachments.ts takeAttachments): the
         // strip empties the instant you hit send; a failure hands the files
         // back into the chat's stash.
@@ -3998,10 +4179,23 @@ impl Composer {
         let restore_text = text.clone();
         let err_chat_id = chat_id.clone();
         let err_message_id = message_id.clone();
+        if control_route.is_some() {
+            self.start_agent = false;
+            self.input.update(cx, |input, cx| {
+                input.set_placeholder(
+                    if self.agent_target.is_some() {
+                        "Steer this agent…"
+                    } else {
+                        "Do anything…"
+                    },
+                    cx,
+                )
+            });
+        }
         self.send_task = Some(cx.spawn(async move |this, cx| {
             let result: Result<(), String> = async {
                 // Resolve the working directory: existing chats keep theirs;
-                // new chats run per the checkout plan (t3code env-mode): the
+                // new chats run per the checkout plan: the
                 // space's folder as-is, an EXISTING worktree of the picked ref
                 // (a plain cwd override — multiple sessions share one
                 // worktree), or a fresh isolated worktree created off the
@@ -4154,29 +4348,49 @@ impl Composer {
                     .ok();
                 }
 
-                let command = if steer_cmd {
+                let run_request = || RunRequest {
+                    prompt: content.clone(),
+                    model: resolved.model.clone(),
+                    reasoning: resolved.reasoning,
+                    model_options: resolved.model_options.clone(),
+                    cwd: cwd.clone(),
+                    sandbox: SandboxLevel::WorkspaceWrite,
+                    auto_approve: false,
+                    resume: None,
+                    attachments: attachment_paths.clone(),
+                };
+                let command = if let Some(route) = control_route {
+                    let action = if start_agent_mode {
+                        SessionControlAction::Start {
+                            request: run_request(),
+                            message_id: message_id.clone(),
+                        }
+                    } else {
+                        SessionControlAction::Steer {
+                            prompt: content.clone(),
+                            message_id: Some(message_id.clone()),
+                        }
+                    };
+                    SessionCommandPayload::Control {
+                        session_id: route.session_id,
+                        owner_device_id: route.owner_device_id,
+                        actor_device_id: route.actor_device_id,
+                        actor_subject: route.actor_subject,
+                        grant_id: route.grant_id,
+                        source: route.source,
+                        action: Box::new(action),
+                    }
+                } else if steer_cmd {
                     SessionCommandPayload::Steer {
                         prompt: content.clone(),
                         message_id: Some(message_id.clone()),
                     }
                 } else {
                     SessionCommandPayload::Run {
-                        request: RunRequest {
-                            prompt: content.clone(),
-                            model: resolved.model.clone(),
-                            reasoning: resolved.reasoning,
-                            model_options: resolved.model_options.clone(),
-                            cwd,
-                            sandbox: SandboxLevel::WorkspaceWrite,
-                            auto_approve: false,
-                            resume: None,
-                            attachments: attachment_paths,
-                        },
+                        request: run_request(),
                         message_id: message_id.clone(),
                     }
                 };
-                let command = serde_json::to_value(&command)
-                    .map_err(|e| format!("Send failed: {e}"))?;
                 let params = serde_json::json!({ "chatId": chat_id, "command": command });
                 engine
                     .client()
@@ -4222,10 +4436,30 @@ impl Composer {
         let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
             return;
         };
-        let params = serde_json::json!({
-            "chatId": chat_id,
-            "command": { "kind": "interrupt" },
-        });
+        let action = Box::new(SessionControlAction::Stop {});
+        let params = match self.control_route(action.required_capability(), cx) {
+            Ok(Some(route)) => serde_json::json!({
+                "chatId": chat_id,
+                "command": SessionCommandPayload::Control {
+                    session_id: route.session_id,
+                    owner_device_id: route.owner_device_id,
+                    actor_device_id: route.actor_device_id,
+                    actor_subject: route.actor_subject,
+                    grant_id: route.grant_id,
+                    source: route.source,
+                    action,
+                },
+            }),
+            Ok(None) => serde_json::json!({
+                "chatId": chat_id,
+                "command": { "kind": "interrupt" },
+            }),
+            Err(message) => {
+                self.failure = Some(message);
+                cx.notify();
+                return;
+            }
+        };
         self.send_task = Some(cx.spawn(async move |this, cx| {
             let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
             if let Err(err) = result {
@@ -4301,7 +4535,8 @@ impl Composer {
             return;
         };
         self.advance_task = None;
-        self.answered_requests.insert(wizard.request_id.clone());
+        let request_id = wizard.request_id;
+        self.answered_requests.insert(request_id.clone());
         self.input.update(cx, |input, cx| {
             input.set_text("", cx);
             // The panel borrowed the composer input; hand back its identity.
@@ -4313,14 +4548,35 @@ impl Composer {
         let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
             return;
         };
-        let request_id = wizard.request_id.clone();
-        let command = SessionCommandPayload::RespondInput {
-            request_id: request_id.clone(),
-            answers,
-        };
-        let params = match serde_json::to_value(&command) {
-            Ok(value) => serde_json::json!({ "chatId": chat_id, "command": value }),
-            Err(_) => return,
+        let params = match self.control_route(respond_input_route_capability(), cx) {
+            Ok(Some(route)) => serde_json::json!({
+                "chatId": chat_id,
+                "command": SessionCommandPayload::Control {
+                    session_id: route.session_id,
+                    owner_device_id: route.owner_device_id,
+                    actor_device_id: route.actor_device_id,
+                    actor_subject: route.actor_subject,
+                    grant_id: route.grant_id,
+                    source: route.source,
+                    action: Box::new(SessionControlAction::RespondInput {
+                        request_id: request_id.clone(),
+                        answers,
+                    }),
+                },
+            }),
+            Ok(None) => serde_json::json!({
+                "chatId": chat_id,
+                "command": SessionCommandPayload::RespondInput {
+                    request_id: request_id.clone(),
+                    answers,
+                },
+            }),
+            Err(message) => {
+                self.failure = Some(message);
+                self.answered_requests.remove(&request_id);
+                cx.notify();
+                return;
+            }
         };
         self.send_task = Some(cx.spawn(async move |this, cx| {
             let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
@@ -5019,7 +5275,7 @@ impl Render for Composer {
         // not just the pill — shell.rs `chat-dropzone`); drops land back here
         // via `add_paths`.
         let container = container.child(motion::fade_quick("composer-input", body));
-        // Branch/worktree toolbar under the pill (t3code BranchToolbar): the
+        // Branch/worktree toolbar under the pill: the
         // checkout-kind selector + ref picker for new sessions, read-only
         // labels once the session exists. Git spaces only.
         let footer = self
@@ -5789,5 +6045,99 @@ mod tests {
         let t = vec![entry(Some(MessageStatus::Streaming), vec![resolved])];
         assert!(input_request_resolved(&t, "r1"));
         assert!(!input_request_resolved(&t, "other"));
+    }
+
+    fn route_snapshot(principal_capabilities: &[&str]) -> comet_proto::CollaborationSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "schemaVersion": 2,
+            "sessions": [{
+                "sessionId": "session-a",
+                "chatId": "chat-a",
+                "ownerSubject": "iap:owner@example.com",
+                "ownerDeviceId": "device-owner",
+                "source": "scaffold",
+                "createdAt": 1
+            }],
+            "principal": {
+                "subject": "iap:teammate@example.com",
+                "projectId": "project-a",
+                "capabilities": principal_capabilities
+            },
+            "grants": [
+                {
+                    "id": "grant-chat",
+                    "principalSubject": "iap:teammate@example.com",
+                    "scope": {"projectId": "project-a", "sessionId": "session-a"},
+                    "capabilities": ["session.chat"],
+                    "deviceId": "device-owner",
+                    "grantedBy": "iap:owner@example.com",
+                    "grantedAt": 1,
+                    "expiresAt": 60_000
+                },
+                {
+                    "id": "grant-control",
+                    "principalSubject": "iap:teammate@example.com",
+                    "scope": {"projectId": "project-a", "sessionId": "session-a"},
+                    "capabilities": ["session.control"],
+                    "deviceId": "device-owner",
+                    "grantedBy": "iap:owner@example.com",
+                    "grantedAt": 1,
+                    "expiresAt": 60_000
+                }
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn stop_route_selects_session_control_grant() {
+        let snapshot = route_snapshot(&[
+            comet_proto::CAPABILITY_SESSION_CHAT,
+            comet_proto::CAPABILITY_SESSION_CONTROL,
+        ]);
+        let action = SessionControlAction::Stop {};
+        assert_eq!(
+            control_route_grant_id(
+                &snapshot,
+                &snapshot.sessions[0],
+                action.required_capability(),
+                None,
+                10_000,
+            )
+            .as_deref(),
+            Some("grant-control")
+        );
+    }
+
+    #[test]
+    fn chat_only_authority_cannot_route_stop() {
+        let snapshot = route_snapshot(&[comet_proto::CAPABILITY_SESSION_CHAT]);
+        let action = SessionControlAction::Stop {};
+        assert!(
+            control_route_grant_id(
+                &snapshot,
+                &snapshot.sessions[0],
+                action.required_capability(),
+                None,
+                10_000,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn respond_input_route_retains_session_chat_grant() {
+        let snapshot = route_snapshot(&[comet_proto::CAPABILITY_SESSION_CHAT]);
+        assert_eq!(
+            control_route_grant_id(
+                &snapshot,
+                &snapshot.sessions[0],
+                respond_input_route_capability(),
+                None,
+                10_000,
+            )
+            .as_deref(),
+            Some("grant-chat")
+        );
     }
 }

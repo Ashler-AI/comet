@@ -288,9 +288,8 @@ impl Shell {
                             )
                             .into_any_element()
                     } else {
-                        // Working animates (the sidebar's miniaturized gradient
-                        // spinner) instead of a static pink dot; every other
-                        // non-idle status stays a dot.
+                        // A stable status dot keeps tab geometry unchanged
+                        // while the labeled transcript strip carries progress.
                         let dot = spaces::status_dot_color(status, &theme);
                         div()
                             .size(px(20.0))
@@ -298,18 +297,9 @@ impl Shell {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .when(status == ChatIndicator::Working, |el| {
-                                el.child(loaders::mini_gradient_spinner(
-                                    format!("tab-working-{id}"),
-                                    2.0,
-                                    cx.entity_id(),
-                                    cx,
-                                ))
+                            .when(status != ChatIndicator::Idle, |el| {
+                                el.child(div().size(px(6.0)).rounded_full().bg(dot))
                             })
-                            .when(
-                                !matches!(status, ChatIndicator::Idle | ChatIndicator::Working),
-                                |el| el.child(div().size(px(6.0)).rounded_full().bg(dot)),
-                            )
                             .into_any_element()
                     };
                     let tab_el = div()

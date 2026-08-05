@@ -289,13 +289,10 @@ pub struct UserProfile {
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum AuthState {
     SignedOut,
-    NeedsOrganization {
-        user: UserProfile,
-    },
     #[serde(rename_all = "camelCase")]
     SignedIn {
         user: UserProfile,
-        org_id: Option<String>,
+        project_scope: String,
     },
 }
 

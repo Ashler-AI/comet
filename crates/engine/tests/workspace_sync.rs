@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
-use comet_doc::{CommandBasedOn, SessionCommandEntry, SessionCommandPayload, SessionCommandStatus};
+use comet_doc::{SessionCommandPayload, SessionCommandStatus};
 use comet_engine::{EngineCore, HarnessRegistry};
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
@@ -22,8 +22,6 @@ use comet_proto::{
     SessionStatus, SteeringMode,
 };
 use comet_rpc::methods;
-
-const VIEWER: &str = "viewer-device";
 
 /// Scripted harness: emits SessionStarted + text + Done with a per-event delay (so
 /// `Working` is observable across the bridge).
@@ -164,25 +162,17 @@ fn run_request(prompt: &str) -> RunRequest {
     }
 }
 
-/// Queue a run command into a chat doc the way a remote viewer would (ledger rule 1).
-fn queue_run(core: &EngineCore, chat_id: &str, command_id: &str, message_id: &str) {
-    let handle = core.doc_host.open(chat_id).expect("open chat");
-    let now = chrono::Utc::now().timestamp_millis();
-    handle
-        .doc()
-        .queue_command(&SessionCommandEntry {
-            id: command_id.into(),
-            payload: SessionCommandPayload::Run {
+/// Queue a run through the device-local API. This persists local provenance;
+/// remotely authored commands use the grant-bearing `Control::Start` path.
+fn queue_run(core: &EngineCore, chat_id: &str, message_id: &str) {
+    core.doc_host
+        .queue_command(
+            chat_id,
+            SessionCommandPayload::Run {
                 request: run_request("go do it"),
                 message_id: message_id.into(),
             },
-            issued_by: VIEWER.into(),
-            issued_at: now,
-            based_on: None::<CommandBasedOn>,
-            expires_at: None,
-            status: SessionCommandStatus::Pending,
-            resolution: None,
-        })
+        )
         .expect("queue command");
 }
 
@@ -254,7 +244,7 @@ async fn two_engines_share_a_workspace() {
     .await;
 
     // Run on A: B's workspace view shows the session Working, then Idle.
-    queue_run(&a, "chat-1", "cmd-run-1", "m-1");
+    queue_run(&a, "chat-1", "m-1");
     let b_status = |wanted: SessionStatus| {
         let doc = b.workspace.doc_arc();
         move || {
@@ -347,7 +337,7 @@ async fn claim_on_first_command_creates_the_chat_row() {
     let link = bridge(&a, &b);
 
     // No CreateChat: the first run command claims the chat under A's device id.
-    queue_run(&a, "chat-claimed", "cmd-claim-1", "m-1");
+    queue_run(&a, "chat-claimed", "m-1");
     wait_for(
         || {
             b.workspace
@@ -380,7 +370,7 @@ async fn non_host_engine_leaves_remote_chats_commands_alone() {
     a.workspace
         .create_chat("chat-remote", "space-remote", None, None)
         .expect("create remote-hosted chat row");
-    queue_run(&a, "chat-remote", "cmd-remote-1", "m-1");
+    queue_run(&a, "chat-remote", "m-1");
 
     tokio::time::sleep(Duration::from_millis(400)).await;
     let handle = a.doc_host.open("chat-remote").expect("open chat");
@@ -423,7 +413,7 @@ async fn chat_config_selects_the_run_harness() {
             None,
         )
         .expect("create configured chat");
-    queue_run(&a, "chat-cfg", "cmd-cfg-1", "m-1");
+    queue_run(&a, "chat-cfg", "m-1");
 
     // The configured harness (Cursor, "From cursor") ran — not the default Mock.
     let handle = a.doc_host.open("chat-cfg").expect("open chat");

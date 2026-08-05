@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.18"
+version = "0.1.19"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -91,6 +91,11 @@ pulldown-cmark = "0.12"
 unicode-segmentation = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 ignore = "0.4"
+
+# `sum_tree` only needs `ztracing::instrument`. Keep that API on the standard
+# Apache-licensed `tracing` crate rather than linking Zed's GPL wrapper crates.
+[patch."https://github.com/wingleeio/zed"]
+ztracing = { path = "vendor/ztracing" }
 
 [profile.release]
 # Distribution profile (scripts/package-linux.sh): thin LTO buys most of fat

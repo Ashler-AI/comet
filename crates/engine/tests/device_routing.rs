@@ -295,7 +295,10 @@ async fn target_device_id_routes_over_the_relay() {
         }
     }
 
-    // Unary forward with side effects: QueueCommand lands (and executes) on B.
+    // Durable commands are the exception to device-addressed forwarding. They
+    // enter the caller's shared session document first so an offline target can
+    // receive them through document sync after reconnect. A stale
+    // targetDeviceId must not bypass that durability boundary.
     let command = serde_json::to_value(SessionCommandPayload::Run {
         request: RunRequest {
             prompt: "run remotely".into(),
@@ -321,15 +324,21 @@ async fn target_device_id_routes_over_the_relay() {
             }),
         )
         .await
-        .expect("queue on B");
+        .expect("queue in shared local document");
     let command_id = queued["commandId"]
         .as_str()
         .expect("command id")
         .to_string();
-    let commands = handle_b.doc().read_commands().expect("read B commands");
+    let handle_a = core_a.doc_host.open("chat-remote").expect("open chat on A");
+    let commands_a = handle_a.doc().read_commands().expect("read A commands");
     assert!(
-        commands.iter().any(|c| c.id == command_id),
-        "command must live in B's doc"
+        commands_a.iter().any(|command| command.id == command_id),
+        "command must enter A's shared doc before remote delivery"
+    );
+    let commands_b = handle_b.doc().read_commands().expect("read B commands");
+    assert!(
+        commands_b.iter().all(|command| command.id != command_id),
+        "targetDeviceId must not relay-forward durable commands"
     );
 
     core_a.shutdown().await;

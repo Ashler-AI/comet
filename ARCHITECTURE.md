@@ -29,10 +29,7 @@ gpui UI ─ in-proc/localhost RPC ─ engine A ══ DeviceRoom DO relay ══
   (device, folder) pairs: the sidebar lists spaces plus a global attention-sorted Active list;
   the main area shows the selected space's sessions as horizontal tabs (closing a tab archives);
   new sessions are minted onto the space's device via relay-forwardable RPCs.
-- **Edge (TypeScript, ported from comet `apps/edge`)**: Worker + SessionRoom DO (per chat) +
-  DeviceRoom DO (per device) + R2 attachments + WorkOS JWKS auth. Absorbs the old `apps/server`
-  responsibilities (WorkOS code exchange/refresh, orgs) so **Postgres, the Hono server, and
-  the WebRTC/signaling stack are all gone**.
+- **Edge (TypeScript)**: Worker + SessionRoom DO (per shared thread) + DeviceRoom DO (per device) + R2 attachments. It verifies Google Cloud IAP principals through Scaffold's existing access path and binds capabilities to explicit Scaffold project/deployment/session scope. No Ashler application database or application-auth flow participates.
 
 ### Headed / headless
 Single binary `comet`:
@@ -115,7 +112,7 @@ comet-native/
     engine/       comet-engine   # sessions engine (pub/sub, run journal, recovery, stall
                                  # watchdog), doc host + command executor, repos/worktrees,
                                  # checkout-diff sync, terminals (portable-pty), uploads,
-                                 # agent accounts (cred swap), auth (WorkOS via edge),
+                                 # agent accounts (cred swap), Scaffold IAP identity,
                                  # device-room host/peers, identity
     rpc/          comet-rpc      # UiRpc/ControlRpc: typed req/resp/stream over WS (tokio-
                                  # tungstenite) + in-memory transport; device-room virtual
@@ -200,20 +197,29 @@ Direct ports of comet behaviors (spec: feature-inventory §3):
   sidecar.
 - **Agent accounts**: credential-slot swap (macOS Keychain via `security-framework`, files
   elsewhere), plan labels, usage probes, paste-code/browser-poll OAuth flows.
-- **Auth**: WorkOS through edge routes (`/auth/exchange`, `/auth/refresh`, orgs); loopback
-  callback server headed, paste-code headless; dev mode (no key ⇒ bearer = configured user id).
+- **Auth**: verified Google Cloud IAP principals and Scaffold-scoped grants; local development uses an explicit mock principal and never production credentials.
 
-## 6. Edge plan (TypeScript, `edge/`)
+## 6. Edge and deployment
 
-Port `comet/apps/edge` nearly verbatim (it is already Loro-native and smoke-tested: session room
-w/ hibernation + two-level compaction + daily alarm backups, device room byte relay + nudges +
-sidecar slots, R2 attachments, JWKS auth). Additions:
-1. Workspace-doc rooms (`ws/{orgId}`) — same DO class, org-membership authz instead of
-   claim-on-first-join.
-2. `/auth/*` routes absorbed from `apps/server` (WorkOS API key in Worker secret).
-3. Drop `/seed` migration path and legacy sync anything (fresh app).
-Hibernation hygiene: no idle timers (flush timer only while dirty), auto-response ping/pong —
-per `docs/research/durable-objects-language.md`.
+The TypeScript edge hosts SessionRoom and DeviceRoom Durable Objects plus the R2 attachment seam. Release artifacts are promoted separately to private, environment-isolated GCS buckets. Room authority comes from Scaffold's existing Google Cloud IAP access path. Deterministic room keys bind the authorized Scaffold project, deployment, and thread/session scope; caller-supplied organization identifiers never grant access.
+
+`edge/wrangler.jsonc` is the source of truth for two isolated environments:
+
+- `staging`: staging Worker, Durable Objects, blobs, releases, Scaffold control-plane URL, and project scope.
+- `production`: production Worker, Durable Objects, blobs, releases, Scaffold control-plane URL, and project scope.
+
+No Cloudflare account ID is checked in. `.github/workflows/deploy.yml` builds one candidate, records its SHA-256 and source provenance, deploys it to the `comet-staging` GitHub environment, then permits a manual production path only when the downloaded candidate, build output, and staged digest are equal. The `comet-production` environment supplies separate Cloudflare and GCP IAP credentials and required-reviewer approval. A staging job cannot read production environment secrets.
+
+The required deployment secrets are `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `GCP_WORKLOAD_IDENTITY_PROVIDER`, and `GCP_SERVICE_ACCOUNT`; required variables are `GCP_PROJECT_ID` and `GCP_IAP_AUDIENCE`. Each value is scoped separately in `comet-staging` and `comet-production`. Release promotion likewise uses `comet-release-staging` and `comet-release-production`, each with `GCP_WORKLOAD_IDENTITY_PROVIDER`, `GCP_SERVICE_ACCOUNT`, and `COMET_RELEASES_GCS_BUCKET`, plus the `GCP_PROJECT_ID` variable. Release buckets are private; trusted downloaders use environment-specific Workload Identity.
+
+Run staging or the staging-to-production path with:
+
+```bash
+gh workflow run deploy.yml -f target=staging
+gh workflow run deploy.yml -f target=production
+```
+
+The local two-device contract smoke is `node scripts/headless-collaboration-smoke.mjs`; it needs no Cloudflare, GCP, Scaffold, or agent credentials.
 
 ## 7. Parity exclusions & deliberate changes
 
@@ -239,18 +245,14 @@ Status legend: ✅ shipped · 🟡 shipped with named gaps (see `docs/PARITY.md`
   turn, journal + doc writes, recovery test.
 - ✅ **M3 UI core** — shell (sidebar/panes/header), transcript (virtualized, markdown, streaming,
   stick-to-bottom), composer (send/steer/stop, question panel); local chat fully usable headed.
-- ✅ **M4 Multi-device** — device-room host/client virtual sockets, remote device control, workspace
-  doc entity sync, WorkOS auth + org gate, presence. Proven live by `scripts/e2e-smoke.sh`:
-  two headless engines against a real edge — B queues a run into the chat doc, the durable
-  nudge wakes host A, A executes (mock harness), transcript + session status sync back to B.
+- ✅ **M4 Multi-device** — device-room host/client virtual sockets, remote device control, scoped workspace sync, participant capabilities, and presence. `scripts/headless-collaboration-smoke.mjs` deterministically covers two headless devices, concurrent agent sessions, owner-only commands, merged publications, and reconnect.
 - 🟡 **M5 Full surface** — terminals, diff pane, repo/branch/folder pickers + worktrees,
   agent accounts UI, settings (devices/shortcuts/archived), Codex harness. Gaps: composer
   attachment UI (engine upload RPCs exist), Cursor harness.
 - 🟡 **M6 Polish** — wire reconciliation (proto AuthState on the wire, `LocalDevice`),
   two-device e2e smoke, keyboard map, clippy/fmt sweep, Linux packaging
   (`scripts/package-linux.sh` + release profile), macOS bundling config (`dist/macos/`,
-  not executed — needs a Mac). Gaps: prefers-reduced-motion, engine hardening
-  (instance lock, watchdogs), edge production deploy.
+  not executed — needs a Mac). Gaps: prefers-reduced-motion and engine hardening (instance lock, watchdogs).
 
 ## 9. Open questions (tracked, non-blocking)
 

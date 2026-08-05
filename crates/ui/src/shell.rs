@@ -7,29 +7,30 @@
 //! shifts; right pane scaffold (360–760px, default 520), hidden by default.
 //! Widths/collapsed state persist to `ui-settings.json` (debounced).
 //!
-//! Resize handles use gpui's drag-and-drop pattern (an `on_drag` with an empty
-//! ghost view + `on_drag_move::<Marker>` on the root), the same idiom as Zed's
-//! dock. Double-clicking a handle resets that pane to its default width.
+//! Resize handles use GPUI drag-and-drop (`on_drag` with an empty ghost view
+//! plus `on_drag_move::<Marker>` on the root). Double-clicking a handle resets
+//! that pane to its default width.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::Utc;
 use gpui::{
-    AnyElement, App, Context, Empty, Entity, Focusable as _, IntoElement, KeyBinding, Keystroke,
-    MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render, SharedString, Subscription,
-    Task, Window, WindowControlArea, actions, div, prelude::*, px,
+    AnyElement, App, ClipboardItem, Context, Empty, Entity, Focusable as _, IntoElement,
+    KeyBinding, Keystroke, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render,
+    SharedString, Subscription, Task, Window, WindowControlArea, actions, div, prelude::*, px,
 };
 
+use comet_doc::{SessionCommandPayload, SessionControlAction};
 use comet_rpc::methods;
 use gpui_tokio::Tokio;
 
-use crate::changes::Changes;
+use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
 use crate::icons::{self, icon};
 use crate::loaders;
-use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT};
-use crate::popover::{self, Loadable};
+use crate::motion::{self, AnimationExt as _, COMET_PULSE, MotionSpec, RESIZE, SPLASH_OUT};
+use crate::popover::{self};
 use crate::rail;
 use crate::settings::accounts::AccountsPage;
 use crate::settings::appearance::AppearancePage;
@@ -37,23 +38,33 @@ use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
-    KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
+    Density, KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
     SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
 };
 use crate::state::{
-    AppState, ConnectionStatus, EngineBootConfig, GatePhase, Indicator, OrgRow, format_time_ago,
-    org_name_valid, parse_orgs, sort_memberships,
+    AppState, ConnectionStatus, EngineBootConfig, GatePhase, Indicator, format_time_ago,
 };
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
-use crate::transcript::{self, Transcript};
+use crate::transcript::{self, Transcript, TranscriptEvent};
 
 mod spaces;
 mod tabs;
 
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
-actions!(shell, [ToggleSidebar, ToggleChanges, AddSpacePalette]);
+actions!(
+    shell,
+    [
+        ToggleSidebar,
+        ToggleChanges,
+        AddSpacePalette,
+        ToggleCommandPalette,
+        ToggleActivity,
+        ToggleFocusMode,
+        OpenInvite
+    ]
+);
 
 // ---------------------------------------------------------------------------
 // Traffic-light-aware titlebar layout (feature-inventory §1.1)
@@ -132,9 +143,10 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
             ToggleTerminal,
             None,
         ),
-        // Fixed: ⌘K summons the add-space palette (the ⌘K chip in its search
-        // bar); pressing it again dismisses.
-        KeyBinding::new(&platform_combo("mod-k"), AddSpacePalette, None),
+        KeyBinding::new(&platform_combo("mod-k"), ToggleCommandPalette, None),
+        KeyBinding::new(&platform_combo("mod-shift-a"), ToggleActivity, None),
+        KeyBinding::new(&platform_combo("mod-shift-f"), ToggleFocusMode, None),
+        KeyBinding::new(&platform_combo("mod-shift-i"), OpenInvite, None),
     ]);
 }
 
@@ -292,6 +304,10 @@ impl NavHistory {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// Sidebar resort glide (feature-inventory §1.6): 260ms
@@ -328,12 +344,27 @@ pub fn resort_offsets(
     offsets
 }
 
-/// Estimated sidebar row height for the resort diff (title line 17px inside
-/// 6px vertical padding + the location subline's 14px line + 2px gap — Active
-/// rows always carry the folder · device subline).
-/// Session row height (FLIP estimate): space line + title + meta line
-/// (harness mark, plus branch for worktrees).
-const CHAT_ROW_HEIGHT: f32 = 61.0;
+/// Rich rows keep four compact information bands. Density changes surrounding
+/// chrome only, never the type scale or the information shown.
+fn chat_row_height(density: Density) -> f32 {
+    match density {
+        Density::Compact => 76.0,
+        Density::Comfortable => 88.0,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SidebarParticipant {
+    name: SharedString,
+    state: comet_proto::ParticipantState,
+}
+
+#[derive(Debug, Clone)]
+struct SidebarSessionMeta {
+    source: comet_proto::AgentSessionSource,
+    runtime_model: SharedString,
+    participants: Vec<SidebarParticipant>,
+}
 /// Flex gap between sidebar list items.
 const SIDEBAR_LIST_GAP: f32 = 2.0;
 
@@ -397,6 +428,25 @@ struct RenameChatDialog {
     _events: Subscription,
 }
 
+/// Optimistic audit row for a remotely-owned control. The collaboration
+/// publication reconciles this to Applied/Rejected without hiding it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ControlFeedbackState {
+    Pending,
+    Applied,
+    Rejected,
+}
+
+#[derive(Debug, Clone)]
+struct ControlFeedback {
+    command_id: String,
+    actor: SharedString,
+    action: SharedString,
+    occurred_at: i64,
+    state: ControlFeedbackState,
+    detail: Option<SharedString>,
+}
+
 /// In-app update lifecycle (macOS bundle installs; see `render_update_strip`).
 enum UpdateFlow {
     Idle,
@@ -406,16 +456,15 @@ enum UpdateFlow {
     Failed(SharedString),
 }
 
-/// The "Create your workspace" gate (feature-inventory §1.2 OrgGate).
-struct OrgGateUi {
-    name_input: Entity<ComposerInput>,
-    orgs: Loadable<Vec<OrgRow>>,
-    submitting: bool,
+struct AnnotationInspector {
+    annotation: comet_proto::SemanticAnnotation,
+    /// Captured when the inspector opens; mutations never retarget when the
+    /// user selects another session row.
+    session_id: Option<String>,
+    is_new: bool,
+    input: Entity<ComposerInput>,
     error: Option<SharedString>,
-    task: Option<Task<()>>,
-    _events: Subscription,
 }
-
 pub struct Shell {
     state: Entity<AppState>,
     transcript: Entity<Transcript>,
@@ -423,6 +472,7 @@ pub struct Shell {
     /// External file drag hovering the conversation column — shows the
     /// "Drop images to attach" veil over the whole chat area; a drop stages
     /// the files in the composer.
+    changes_sub: Option<Subscription>,
     file_drag_active: bool,
     /// Lazy panes: no entity (and no RPC) until first opened.
     terminal: Option<Entity<TerminalPanel>>,
@@ -469,10 +519,23 @@ pub struct Shell {
     sidebar_scroll: gpui::ScrollHandle,
     /// `settings.last_space_id` applied once after the first spaces frame.
     space_boot_applied: bool,
+    /// `settings.last_room_id` applied once after the first chat frame.
+    room_boot_applied: bool,
     /// Last seen session status per chat — the chime trigger compares against
     /// it (a row's FIRST appearance never chimes, so boot stays silent).
     sound_prev: std::collections::HashMap<String, comet_proto::SessionStatus>,
     user_menu_open: bool,
+    /// Session-scoped multiplayer surfaces.
+    command_palette_open: bool,
+    activity_open: bool,
+    invite_open: bool,
+    /// Brief copy/open feedback inside the invite surface.
+    link_feedback: Option<SharedString>,
+    control_feedback: Vec<ControlFeedback>,
+    annotation_inspector: Option<AnnotationInspector>,
+    /// Participant whose remote focus/cursor is mirrored in the transcript.
+    following_subject: Option<String>,
+    control_tasks: Vec<Task<()>>,
     /// Outside-click dismissal instant — suppresses the trigger click that
     /// follows the same mouse-down from instantly reopening the menu.
     user_menu_dismissed_at: Option<std::time::Instant>,
@@ -489,7 +552,6 @@ pub struct Shell {
     /// How this binary was installed — decides the strip's click behavior.
     /// Cached: `detect_install` stats `current_exe` and this renders per frame.
     install: comet_update::InstallKind,
-    org: Option<OrgGateUi>,
     mutate_task: Option<Task<()>>,
     auth_task: Option<Task<()>>,
     /// Kept for the failed-gate "Retry" action.
@@ -526,7 +588,7 @@ pub struct Shell {
     /// 200ms ease-out tween of the cluster start on fullscreen toggles.
     titlebar_tween: Option<WidthTween>,
     /// Armed by mouse-down on a titlebar strip; the next mouse-move hands the
-    /// drag to the compositor (zed's platform-titlebar pattern).
+    /// drag to the compositor.
     titlebar_should_move: bool,
     /// Clears the height tween once it completes (so a closed panel unmounts).
     terminal_tween_task: Option<Task<()>>,
@@ -551,6 +613,7 @@ pub struct Shell {
     _ticker: Task<()>,
     _state_observation: Subscription,
     _composer_events: Subscription,
+    _transcript_events: Subscription,
 }
 
 impl Shell {
@@ -570,6 +633,14 @@ impl Shell {
                 }
             }
         });
+        let transcript_events = cx.subscribe(
+            &transcript,
+            |this: &mut Shell, _, event: &TranscriptEvent, cx| match event {
+                TranscriptEvent::OpenAnnotations(anchor) => {
+                    this.open_annotation_anchor(anchor.clone(), cx)
+                }
+            },
+        );
         // Working-indicator heartbeat: notify once a second while a session is
         // live so elapsed time and the flavour word stay fresh.
         let ticker = cx.spawn(async move |this, cx| {
@@ -613,17 +684,12 @@ impl Shell {
             }
             _ => Route::Chat,
         };
-        // More capture knobs of the same kind: `COMET_OPEN_DIALOG=rename|delete`
-        // opens that dialog for the first chat once chats land; `=model` pops
-        // the combined harness/model menu once the shell is Ready;
-        // `COMET_FORCE_GATE=signin|org|failed` renders that gate regardless of
-        // real auth state (display-only — for styling passes).
+        // Capture knobs for deterministic styling passes.
         let debug_dialog = std::env::var("COMET_OPEN_DIALOG").ok();
         let debug_gate = match std::env::var("COMET_FORCE_GATE").ok().as_deref() {
             Some("signin") => Some(GatePhase::SignIn),
-            Some("org") => Some(GatePhase::OrgGate),
             Some("failed") => Some(GatePhase::Failed(
-                "Could not reach the comet engine on port 27901".into(),
+                "Could not reach the Ashler Comet engine".into(),
             )),
             _ => None,
         };
@@ -640,6 +706,7 @@ impl Shell {
             changes: None,
             route,
             nav,
+            changes_sub: None,
             devices_page: None,
             archived_page: None,
             appearance_page: None,
@@ -661,15 +728,23 @@ impl Shell {
             tabs_scrolled_to: None,
             sidebar_scroll: gpui::ScrollHandle::new(),
             space_boot_applied: false,
+            room_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
             user_menu_open: false,
+            command_palette_open: false,
+            activity_open: false,
+            invite_open: false,
+            link_feedback: None,
+            control_feedback: Vec::new(),
+            annotation_inspector: None,
+            following_subject: None,
+            control_tasks: Vec::new(),
             user_menu_dismissed_at: None,
             sidebar_notice: None,
             update_flow: UpdateFlow::Idle,
             update_task: None,
             update_dismissed: None,
             install: comet_update::detect_install(),
-            org: None,
             mutate_task: None,
             auth_task: None,
             boot,
@@ -701,10 +776,31 @@ impl Shell {
             _ticker: ticker,
             _state_observation: observation,
             _composer_events: composer_events,
+            _transcript_events: transcript_events,
         }
     }
 
     // ---- splash ----
+
+    fn reconcile_control_feedback(
+        feedback_rows: &mut [ControlFeedback],
+        audits: &[comet_proto::AuditEvent],
+    ) {
+        for feedback in feedback_rows {
+            if feedback.state != ControlFeedbackState::Pending {
+                continue;
+            }
+            let Some(audit) = crate::multiplayer::command_audit(&feedback.command_id, audits)
+            else {
+                continue;
+            };
+            feedback.state = match audit.result {
+                comet_proto::AuditResult::Applied => ControlFeedbackState::Applied,
+                _ => ControlFeedbackState::Rejected,
+            };
+            feedback.detail = audit.reason.clone().map(SharedString::from);
+        }
+    }
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
         // Capture knob: the add-space palette needs only the device registry.
@@ -766,10 +862,21 @@ impl Shell {
                 }
             }
         }
-        // Boot: restore the last selected space once the first spaces frame
-        // lands (a still-existing row wins over the auto-selected first one;
-        // the boot-auto-selected chat's own space wins over both — selecting a
-        // chat implies its space, which `select_chat` already applied).
+        // Reconcile optimistic controls with immutable audit publications.
+        // Feedback remains visible after resolution so actor and result are
+        // never hidden behind a transient toast.
+        let audits: Vec<comet_proto::AuditEvent> = state
+            .read(cx)
+            .collaboration
+            .iter()
+            .flat_map(|snapshot| snapshot.publications.iter())
+            .filter_map(|publication| match &publication.value {
+                comet_proto::PublicationValue::Audit(audit) => Some(audit.clone()),
+                _ => None,
+            })
+            .collect();
+        Self::reconcile_control_feedback(&mut self.control_feedback, &audits);
+        // Restore the last selected space once the first spaces frame lands.
         if !self.space_boot_applied && !state.read(cx).spaces.is_empty() {
             self.space_boot_applied = true;
             if state.read(cx).selected_chat.is_none()
@@ -779,7 +886,18 @@ impl Shell {
                 state.update(cx, |s, cx| s.select_space(Some(last), cx));
             }
         }
-        // Track the per-space last chat + persist the selected space.
+        // Restore the last shared thread after the first chat frame. A missing
+        // room is ignored; the normal auto-selection remains visible.
+        if !self.room_boot_applied && !state.read(cx).chats.is_empty() {
+            self.room_boot_applied = true;
+            if let Some(last) = self.settings.last_room_id.clone()
+                && state.read(cx).chats.iter().any(|chat| chat.id == last)
+                && state.read(cx).selected_chat.as_deref() != Some(last.as_str())
+            {
+                state.update(cx, |s, cx| s.select_chat(Some(last), cx));
+            }
+        }
+        // Track the per-space last chat and persist navigation preferences.
         {
             let (selected_space, selected_chat, chat_space) = {
                 let s = state.read(cx);
@@ -790,6 +908,10 @@ impl Shell {
                     chat_space,
                 )
             };
+            if selected_chat != self.settings.last_room_id {
+                self.settings.last_room_id = selected_chat.clone();
+                self.schedule_save(cx);
+            }
             if let (Some(space), Some(chat)) = (chat_space, selected_chat) {
                 self.space_last_chat.insert(space, chat);
             }
@@ -852,13 +974,12 @@ impl Shell {
     // ---- layout state ----
 
     fn sidebar_target(&self) -> f32 {
-        if self.settings.sidebar_collapsed {
+        if self.settings.sidebar_collapsed || self.settings.focus_mode {
             0.0
         } else {
             self.settings.sidebar_width
         }
     }
-
     /// Does the selected space's folder have git? Owner-stamped and synced —
     /// gates the Changes pane, its toggle, and Cmd-B with zero RPCs.
     fn space_git_detected(&self, cx: &App) -> bool {
@@ -895,13 +1016,14 @@ impl Shell {
     }
 
     fn right_target(&self, cx: &App) -> f32 {
-        if self.right_pane_open(cx) {
+        if self.settings.focus_mode {
+            0.0
+        } else if self.right_pane_open(cx) {
             self.settings.right_pane_width
         } else {
             0.0
         }
     }
-
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         let from = self.sidebar_target();
         self.settings.sidebar_collapsed = !self.settings.sidebar_collapsed;
@@ -933,8 +1055,425 @@ impl Shell {
             return changes.clone();
         }
         let changes = cx.new(|cx| Changes::new(self.state.clone(), cx));
+        let subscription = cx.subscribe(
+            &changes,
+            |this: &mut Shell, _, event: &ChangesEvent, cx| match event {
+                ChangesEvent::OpenAnnotations(anchor) => {
+                    this.open_annotation_anchor(anchor.clone(), cx)
+                }
+            },
+        );
+        self.changes_sub = Some(subscription);
         self.changes = Some(changes.clone());
         changes
+    }
+
+    fn toggle_focus_mode(&mut self, cx: &mut Context<Self>) {
+        let sidebar_from = self.sidebar_target();
+        let right_from = self.right_target(cx);
+        self.settings.focus_mode = !self.settings.focus_mode;
+        self.sidebar_tween = Some(WidthTween::new(sidebar_from, self.sidebar_target()));
+        self.right_tween = Some(WidthTween::new(right_from, self.right_target(cx)));
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    fn toggle_activity(&mut self, cx: &mut Context<Self>) {
+        self.activity_open = !self.activity_open;
+        self.invite_open = false;
+        self.command_palette_open = false;
+        cx.notify();
+    }
+
+    fn open_invite(&mut self, cx: &mut Context<Self>) {
+        self.invite_open = true;
+        self.activity_open = false;
+        self.command_palette_open = false;
+        self.link_feedback = None;
+        cx.notify();
+    }
+
+    fn toggle_command_palette(&mut self, cx: &mut Context<Self>) {
+        self.command_palette_open = !self.command_palette_open;
+        if self.command_palette_open {
+            self.activity_open = false;
+            self.invite_open = false;
+        }
+        cx.notify();
+    }
+
+    fn open_annotation_target(&mut self, target_id: String, cx: &mut Context<Self>) {
+        let anchor = self
+            .state
+            .read(cx)
+            .collaboration
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot.publications.iter().rev().find_map(|publication| {
+                    let comet_proto::PublicationValue::Annotation(annotation) = &publication.value
+                    else {
+                        return None;
+                    };
+                    (annotation.anchor.target_id == target_id).then(|| annotation.anchor.clone())
+                })
+            });
+        if let Some(anchor) = anchor {
+            self.open_annotation_anchor(anchor, cx);
+        }
+    }
+
+    fn open_annotation_anchor(
+        &mut self,
+        anchor: comet_proto::SemanticAnchor,
+        cx: &mut Context<Self>,
+    ) {
+        let state = self.state.read(cx);
+        let existing = state.collaboration.as_ref().and_then(|snapshot| {
+            snapshot.publications.iter().rev().find_map(|publication| {
+                let comet_proto::PublicationValue::Annotation(annotation) = &publication.value
+                else {
+                    return None;
+                };
+                (annotation.anchor.target_id == anchor.target_id).then(|| annotation.clone())
+            })
+        });
+        let author_subject = state
+            .collaboration
+            .as_ref()
+            .and_then(|snapshot| snapshot.principal.as_ref())
+            .map(|principal| principal.subject.clone())
+            .unwrap_or_default();
+        let session_id = state
+            .collaboration
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot
+                    .message_provenance
+                    .iter()
+                    .rev()
+                    .find(|provenance| provenance.message_id == anchor.target_id)
+                    .map(|provenance| provenance.session_id.clone())
+            })
+            .or_else(|| state.selected_agent_session.clone());
+        let is_new = existing.is_none();
+        let annotation = existing.unwrap_or_else(|| comet_proto::SemanticAnnotation {
+            id: uuid::Uuid::new_v4().to_string(),
+            author_subject,
+            body: String::new(),
+            anchor,
+            state: comet_proto::AnnotationState::Anchored,
+            created_at: Utc::now().timestamp_millis(),
+            resolved_at: None,
+            unknown: Default::default(),
+        });
+        let input = cx.new(|cx| ComposerInput::new("Add a note…", cx));
+        input.update(cx, |input, cx| input.set_text(annotation.body.clone(), cx));
+        self.annotation_inspector = Some(AnnotationInspector {
+            annotation,
+            session_id,
+            is_new,
+            input,
+            error: None,
+        });
+        self.activity_open = false;
+        self.invite_open = false;
+        self.command_palette_open = false;
+        cx.notify();
+    }
+
+    fn annotation_session(&self, cx: &App) -> Option<comet_proto::AgentSessionRecord> {
+        let session_id = self.annotation_inspector.as_ref()?.session_id.as_deref()?;
+        self.state
+            .read(cx)
+            .collaboration
+            .as_ref()?
+            .sessions
+            .iter()
+            .find(|session| session.session_id == session_id)
+            .cloned()
+    }
+
+    fn save_annotation(&mut self, cx: &mut Context<Self>) {
+        let Some(inspector) = self.annotation_inspector.as_ref() else {
+            return;
+        };
+        let body = inspector.input.read(cx).text().trim().to_string();
+        if body.is_empty() {
+            if let Some(inspector) = self.annotation_inspector.as_mut() {
+                inspector.error = Some("Enter a note".into());
+            }
+            cx.notify();
+            return;
+        }
+        let is_new = inspector.is_new;
+        let mut annotation = inspector.annotation.clone();
+        annotation.body = body.clone();
+        let Some(session) = self.annotation_session(cx) else {
+            if let Some(inspector) = self.annotation_inspector.as_mut() {
+                inspector.error = Some("No agent session".into());
+            }
+            cx.notify();
+            return;
+        };
+        let (action, label) = if is_new {
+            (
+                SessionControlAction::AnnotationCreate { annotation },
+                "Add note",
+            )
+        } else {
+            (
+                SessionControlAction::AnnotationEdit {
+                    annotation_id: annotation.id,
+                    body: Some(body),
+                    anchor: None,
+                },
+                "Edit note",
+            )
+        };
+        self.queue_control(session, action, label, cx);
+        self.annotation_inspector = None;
+    }
+
+    fn set_annotation_resolved(&mut self, resolved: bool, cx: &mut Context<Self>) {
+        let Some(inspector) = self.annotation_inspector.as_ref() else {
+            return;
+        };
+        let Some(session) = self.annotation_session(cx) else {
+            if let Some(inspector) = self.annotation_inspector.as_mut() {
+                inspector.error = Some("No agent session".into());
+            }
+            cx.notify();
+            return;
+        };
+        let annotation_id = inspector.annotation.id.clone();
+        self.queue_control(
+            session,
+            SessionControlAction::AnnotationResolve {
+                annotation_id,
+                resolved,
+            },
+            if resolved {
+                "Resolve note"
+            } else {
+                "Reopen note"
+            },
+            cx,
+        );
+        self.annotation_inspector = None;
+    }
+
+    fn session_link(&self, cx: &App) -> Option<String> {
+        let state = self.state.read(cx);
+        let chat_id = state.selected_chat.as_deref()?;
+        let snapshot = state.collaboration.as_ref()?;
+        let principal = snapshot.principal.as_ref()?;
+        let session = state.selected_agent_session().or_else(|| {
+            snapshot
+                .sessions
+                .iter()
+                .find(|session| session.chat_id == chat_id)
+        })?;
+        let now = Utc::now().timestamp_millis();
+        let valid_for_session = |grant: &&comet_proto::CapabilityGrant| {
+            grant.principal_subject == principal.subject
+                && grant.scope.project_id == principal.project_id
+                && grant.scope.session_id.as_deref() == Some(session.session_id.as_str())
+                && grant.device_id.as_deref() == Some(session.owner_device_id.as_str())
+                && grant.granted_at <= now
+                && grant.expires_at.is_some_and(|expires| now < expires)
+                && grant.revoked_at.is_none()
+        };
+        let grant = state
+            .selected_invitation_grant
+            .as_deref()
+            .and_then(|preferred| {
+                snapshot
+                    .grants
+                    .iter()
+                    .find(|grant| grant.id == preferred && valid_for_session(grant))
+            })
+            .or_else(|| snapshot.grants.iter().find(valid_for_session))?;
+        comet_proto::CometInvitation::new(chat_id, &session.session_id, &grant.id)
+            .map(|invitation| invitation.deep_link())
+    }
+
+    fn copy_session_link(&mut self, cx: &mut Context<Self>) {
+        let Some(link) = self.session_link(cx) else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(link));
+        self.link_feedback = Some("Link copied".into());
+        cx.notify();
+    }
+
+    fn open_session_link(&mut self, cx: &mut Context<Self>) {
+        let Some(link) = self.session_link(cx) else {
+            return;
+        };
+        cx.open_url(&link);
+        self.link_feedback = Some("Link opened".into());
+        cx.notify();
+    }
+
+    fn reject_control(
+        &mut self,
+        action: &'static str,
+        actor: SharedString,
+        detail: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.control_feedback.push(ControlFeedback {
+            command_id: format!("rejected-{}", uuid::Uuid::new_v4()),
+            actor,
+            action: action.into(),
+            occurred_at: Utc::now().timestamp_millis(),
+            state: ControlFeedbackState::Rejected,
+            detail: Some(detail.into()),
+        });
+        self.activity_open = true;
+        cx.notify();
+    }
+
+    fn queue_control(
+        &mut self,
+        session: comet_proto::AgentSessionRecord,
+        action: SessionControlAction,
+        action_label: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        let now = Utc::now().timestamp_millis();
+        let required = action.required_capability();
+        let resolved = {
+            let state = self.state.read(cx);
+            let snapshot = state.collaboration.as_ref();
+            let principal = snapshot.and_then(|snapshot| snapshot.principal.clone());
+            let actor_device_id = state.local_device_id.clone();
+            let grant_id = match (snapshot, principal.as_ref(), actor_device_id.as_deref()) {
+                (Some(_), Some(principal), Some(actor_device_id))
+                    if session.source == comet_proto::AgentSessionSource::Local
+                        && session.owner_device_id == actor_device_id
+                        && principal.has_capability(required) =>
+                {
+                    Some(uuid::Uuid::new_v4().to_string())
+                }
+                (Some(snapshot), Some(_), _) => crate::multiplayer::session_grant_id(
+                    snapshot,
+                    &session,
+                    required,
+                    state.selected_invitation_grant.as_deref(),
+                    now,
+                ),
+                _ => None,
+            };
+            let actor = principal
+                .as_ref()
+                .map(|principal| state.participant_name(&principal.subject).to_string())
+                .unwrap_or_else(|| "You".into());
+            let engine = state.engine().cloned();
+            (
+                principal,
+                actor_device_id,
+                grant_id,
+                actor,
+                engine,
+                state.selected_chat.clone(),
+            )
+        };
+        let (principal, actor_device_id, grant_id, actor, engine, chat_id) = resolved;
+        let actor_label: SharedString = actor.into();
+        let Some(principal) = principal else {
+            self.reject_control(action_label, actor_label, "Identity unavailable", cx);
+            return;
+        };
+        let Some(actor_device_id) = actor_device_id else {
+            self.reject_control(action_label, actor_label, "Device unavailable", cx);
+            return;
+        };
+        let Some(grant_id) = grant_id else {
+            self.reject_control(action_label, actor_label, "Control not allowed", cx);
+            return;
+        };
+        let (Some(engine), Some(chat_id)) = (engine, chat_id) else {
+            self.reject_control(action_label, actor_label, "Session unavailable", cx);
+            return;
+        };
+        let local_id = format!("pending-{}", uuid::Uuid::new_v4());
+        self.control_feedback.push(ControlFeedback {
+            command_id: local_id.clone(),
+            actor: actor_label,
+            action: action_label.into(),
+            occurred_at: now,
+            state: ControlFeedbackState::Pending,
+            detail: None,
+        });
+        self.activity_open = true;
+        let command = SessionCommandPayload::Control {
+            session_id: session.session_id.clone(),
+            owner_device_id: session.owner_device_id.clone(),
+            actor_device_id,
+            actor_subject: principal.subject,
+            grant_id,
+            source: session.source,
+            action: Box::new(action),
+        };
+        let task = cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::QUEUE_COMMAND,
+                    serde_json::json!({
+                        "chatId": chat_id,
+                        "command": command,
+                    }),
+                )
+                .await;
+            this.update(cx, |shell, cx| {
+                if let Some(feedback) = shell
+                    .control_feedback
+                    .iter_mut()
+                    .find(|feedback| feedback.command_id == local_id)
+                {
+                    match result {
+                        Ok(value) => {
+                            if let Some(command_id) =
+                                value.get("commandId").and_then(|value| value.as_str())
+                            {
+                                feedback.command_id = command_id.to_string();
+                            }
+                        }
+                        Err(error) => {
+                            feedback.state = ControlFeedbackState::Rejected;
+                            feedback.detail = Some(error.to_string().into());
+                        }
+                    }
+                }
+                let audits = shell
+                    .state
+                    .read(cx)
+                    .collaboration
+                    .iter()
+                    .flat_map(|snapshot| snapshot.publications.iter())
+                    .filter_map(|publication| match &publication.value {
+                        comet_proto::PublicationValue::Audit(audit) => Some(audit.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                Self::reconcile_control_feedback(&mut shell.control_feedback, &audits);
+                cx.notify();
+            })
+            .ok();
+        });
+        self.control_tasks.push(task);
+        cx.notify();
+    }
+
+    fn toggle_follow(&mut self, subject: String, cx: &mut Context<Self>) {
+        if self.following_subject.as_deref() == Some(subject.as_str()) {
+            self.following_subject = None;
+        } else {
+            self.following_subject = Some(subject);
+        }
+        cx.notify();
     }
 
     fn terminal_panel(&mut self, cx: &mut Context<Self>) -> Entity<TerminalPanel> {
@@ -1320,120 +1859,6 @@ impl Shell {
         }));
     }
 
-    // ---- org gate ----
-
-    fn ensure_org_ui(&mut self, cx: &mut Context<Self>) {
-        if self.org.is_some() {
-            return;
-        }
-        let name_input = cx.new(|cx| ComposerInput::new("Workspace name", cx));
-        let events = cx.subscribe(&name_input, |this: &mut Shell, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Submitted) {
-                this.create_org(cx);
-            }
-        });
-        self.org = Some(OrgGateUi {
-            name_input,
-            orgs: Loadable::Idle,
-            submitting: false,
-            error: None,
-            task: None,
-            _events: events,
-        });
-        self.load_orgs(cx);
-    }
-
-    fn load_orgs(&mut self, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        let Some(org) = self.org.as_mut() else { return };
-        org.orgs = Loadable::Loading;
-        org.task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::LIST_ORGS, serde_json::json!({}))
-                .await;
-            this.update(cx, |shell, cx| {
-                if let Some(org) = shell.org.as_mut() {
-                    org.orgs = match result {
-                        Ok(value) => Loadable::Ready(sort_memberships(parse_orgs(&value))),
-                        Err(err) => Loadable::Error(err.to_string()),
-                    };
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
-    fn create_org(&mut self, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        let Some(org) = self.org.as_mut() else { return };
-        if org.submitting {
-            return;
-        }
-        let name = org.name_input.read(cx).text().trim().to_string();
-        if !org_name_valid(&name) {
-            org.error = Some("Enter a workspace name".into());
-            cx.notify();
-            return;
-        }
-        org.submitting = true;
-        org.error = None;
-        org.task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::CREATE_ORG, serde_json::json!({ "name": name }))
-                .await;
-            this.update(cx, |shell, cx| {
-                if let Some(org) = shell.org.as_mut() {
-                    org.submitting = false;
-                    if let Err(err) = result {
-                        org.error = Some(format!("{err}").into());
-                    }
-                    // Success: the AuthStatus stream flips to SignedIn and the
-                    // gate falls away on its own.
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
-    fn select_org(&mut self, organization_id: String, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        let Some(org) = self.org.as_mut() else { return };
-        org.submitting = true;
-        org.error = None;
-        org.task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(
-                    methods::SELECT_ORG,
-                    serde_json::json!({ "organizationId": organization_id }),
-                )
-                .await;
-            this.update(cx, |shell, cx| {
-                if let Some(org) = shell.org.as_mut() {
-                    org.submitting = false;
-                    if let Err(err) = result {
-                        org.error = Some(format!("{err}").into());
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
     // ---- render pieces ----
 
     /// Evaluate a width tween at "now" (manual drive — see [`WidthTween`]).
@@ -1532,10 +1957,9 @@ impl Shell {
         }
     }
 
-    /// Make a titlebar strip drag the window — zed's platform-titlebar
-    /// pattern (comet's `.drag` region): mark it a [`WindowControlArea::Drag`]
-    /// (macOS app-owned titlebar), hand the drag to the compositor once the
-    /// pointer moves with the button down, and double-click zooms.
+    /// Make a titlebar strip drag the window: mark it a
+    /// [`WindowControlArea::Drag`] target, hand the drag to the compositor once
+    /// the pointer moves with the button down, and double-click to zoom.
     fn titlebar_drag_region(
         &self,
         id: &'static str,
@@ -1804,10 +2228,9 @@ impl Shell {
             .into_any_element()
     }
 
-    /// One session row (comet session-row.tsx): status rail on the left
-    /// (a live 2×3 mini spinner while working, a dot otherwise), title +
-    /// relative time on the first line, "folder · device" underneath aligned
-    /// to the title. Click selects; right-click opens the context menu.
+    /// Rich session row: room context, title, source/runtime/model, participant
+    /// presence, status, and recent activity. The row retains the same content
+    /// at both density settings; compact only tightens the vertical insets.
     #[allow(clippy::too_many_arguments)]
     fn render_chat_row(
         &self,
@@ -1816,65 +2239,102 @@ impl Shell {
         time_ago: SharedString,
         space_name: SharedString,
         branch: Option<SharedString>,
-        harness: Option<comet_proto::HarnessId>,
+        meta: SidebarSessionMeta,
         status: comet_proto::ChatIndicator,
         selected: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // Status is a rail, not a word (comet session-row.tsx): always present
-        // so rows align and state changes read in place. Working animates (the
-        // composer-strip spinner, miniaturized); every other status is a dot.
         let dot_color = spaces::status_dot_color(status, theme);
-        let status_rail: AnyElement = if status == comet_proto::ChatIndicator::Working {
-            div()
-                .w(px(6.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(loaders::mini_gradient_spinner(
-                    format!("chat-working-{id}"),
-                    2.0,
-                    cx.entity_id(),
-                    cx,
-                ))
-                .into_any_element()
-        } else {
-            div()
-                .size(px(6.0))
-                .rounded_full()
-                .flex_none()
-                .bg(dot_color)
-                .into_any_element()
-        };
+        let subline = theme.text_muted.opacity(0.66);
+        let status_label = crate::multiplayer::chat_status_label(status);
+        let source_label = crate::multiplayer::source_label(meta.source);
+        let participant_count = meta.participants.len();
+        let compact = self.settings.density == Density::Compact;
+        let avatar_size = if compact { 18.0 } else { 20.0 };
+        let avatars = meta
+            .participants
+            .iter()
+            .take(3)
+            .enumerate()
+            .map(|(ix, participant)| {
+                let initials = crate::multiplayer::initials(participant.name.as_ref());
+                let presence = match participant.state {
+                    comet_proto::ParticipantState::Active => theme.success,
+                    comet_proto::ParticipantState::Idle => theme.warning,
+                    comet_proto::ParticipantState::Disconnected => theme.text_faint,
+                };
+                div()
+                    .id(SharedString::from(format!("chat-{id}-participant-{ix}")))
+                    .relative()
+                    .when(ix > 0, |el| el.ml(px(-4.0)))
+                    .size(px(avatar_size))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(theme.surface)
+                    .bg(theme.surface_raised)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(8.5))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(initials))
+                    .child(
+                        div()
+                            .absolute()
+                            .right(px(-1.0))
+                            .bottom(px(-1.0))
+                            .size(px(5.0))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(theme.surface)
+                            .bg(presence),
+                    )
+            });
         let (hover, text) = (theme.glass_hover(), theme.text);
         let selected_wash = crate::theme::glass_selected_bg();
-        let subline = theme.text_muted.opacity(0.5);
         let select_id = id.clone();
         let menu_id = id.clone();
-        // Hover fades over transition-colors (comet session-row.tsx) — both
-        // the wash and the title brighten ride the same 150ms blend.
         let fade_key = format!("chat-row-{id}");
         let rest_bg = if selected {
             selected_wash
         } else {
             crate::theme::wash(0.0)
         };
-        // A selected row must NOT drift toward the hover wash: in dark the two
-        // fills are identical so the blend is a no-op, but light's hover sits
-        // below its near-opaque selected fill, and blending toward it visibly
-        // dimmed the active row under the pointer (user report).
         let hover_bg = if selected { selected_wash } else { hover };
         let rest_text = if selected { text } else { text.opacity(0.8) };
+        let status_text = div()
+            .text_size(px(10.0))
+            .text_color(if status == comet_proto::ChatIndicator::Errored {
+                theme.danger
+            } else {
+                subline
+            })
+            .child(SharedString::from(status_label));
+        let status_text = if status == comet_proto::ChatIndicator::Working {
+            status_text
+                .with_animation(
+                    SharedString::from(format!("chat-working-text-{id}")),
+                    motion::COMET_PULSE.animation().repeat(),
+                    |el, t| el.opacity(0.66 + 0.34 * t),
+                )
+                .into_any_element()
+        } else {
+            status_text.into_any_element()
+        };
         div()
             .id(SharedString::from(format!("chat-{id}")))
             .flex()
             .flex_col()
-            .gap(px(2.0))
-            .rounded(px(8.0))
+            .gap(px(if compact { 1.0 } else { 2.0 }))
+            .rounded(px(Theme::CONTROL_RADIUS))
             .px(px(Theme::SPACE_SM))
-            .py(px(6.0))
+            .py(px(if compact {
+                Theme::SPACE_XS
+            } else {
+                Theme::SPACE_SM
+            }))
             .text_color(motion::hover_blend(&fade_key, rest_text, text))
             .bg(motion::hover_blend(&fade_key, rest_bg, hover_bg))
             .when(selected, |el| {
@@ -1884,7 +2344,8 @@ impl Shell {
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
                 let id = select_id.clone();
-                this.state.update(cx, |s, cx| s.select_chat(Some(id), cx));
+                this.state
+                    .update(cx, |state, cx| state.select_chat(Some(id), cx));
             }))
             .on_mouse_down(
                 MouseButton::Right,
@@ -1893,82 +2354,108 @@ impl Shell {
                     cx.notify();
                 }),
             )
-            // Line 1: status rail, space name, time-ago.
             .child(
                 div()
                     .w_full()
                     .flex()
-                    .flex_row()
                     .items_center()
                     .gap(px(Theme::SPACE_SM))
-                    .child(status_rail)
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(11.0))
-                            .line_height(px(14.0))
+                            .text_size(px(10.5))
+                            .line_height(px(13.0))
                             .text_color(subline)
                             .child(space_name),
                     )
                     .child(
                         div()
                             .flex_none()
-                            .text_size(px(11.0))
+                            .text_size(px(10.5))
                             .text_color(subline)
                             .child(time_ago),
                     ),
             )
-            // Line 2: the session title, aligned under the folder icon
-            // (rail 6 + gap 8).
             .child(
                 div()
                     .w_full()
-                    .pl(px(14.0))
                     .truncate()
                     .text_size(px(13.0))
                     .line_height(px(17.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
                     .child(title),
             )
-            // Line 3 (always): harness brand mark; worktree sessions append
-            // the branch icon + name.
             .child(
                 div()
                     .w_full()
-                    .pl(px(14.0))
+                    .min_w_0()
                     .flex()
-                    .flex_row()
                     .items_center()
-                    .gap(px(4.0))
-                    .when_some(
-                        harness.map(crate::pickers::harness_brand_icon),
-                        |el, (path, tint)| {
-                            el.child(
-                                icon(path)
-                                    .size(px(11.0))
-                                    .flex_none()
-                                    .text_color(tint.unwrap_or(subline).opacity(0.8)),
-                            )
-                        },
+                    .gap(px(Theme::SPACE_XS))
+                    .child(
+                        div()
+                            .h(px(17.0))
+                            .px(px(5.0))
+                            .rounded(px(Theme::CONTROL_RADIUS))
+                            .bg(crate::theme::ink(0.07))
+                            .flex()
+                            .items_center()
+                            .text_size(px(9.5))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(source_label)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(10.5))
+                            .text_color(subline)
+                            .child(meta.runtime_model),
                     )
                     .when_some(branch, |el, branch| {
-                        el.child(
-                            icon(icons::GIT_BRANCH)
-                                .size(px(11.0))
-                                .flex_none()
-                                .text_color(subline),
-                        )
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(px(11.0))
-                                .line_height(px(14.0))
-                                .text_color(subline)
-                                .child(branch),
-                        )
+                        el.child(icon(icons::GIT_BRANCH).size(px(10.0)).text_color(subline))
+                            .child(
+                                div()
+                                    .max_w(px(72.0))
+                                    .truncate()
+                                    .text_size(px(10.0))
+                                    .text_color(subline)
+                                    .child(branch),
+                            )
                     }),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .child(div().flex().items_center().children(avatars))
+                    .child(
+                        div()
+                            .ml(px(Theme::SPACE_XS))
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(10.0))
+                            .text_color(subline)
+                            .child(SharedString::from(match participant_count {
+                                0 => "No one here".into(),
+                                1 => "1 participant".into(),
+                                count => format!("{count} participants"),
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(Theme::SPACE_XS))
+                            .child(div().size(px(6.0)).rounded_full().bg(dot_color))
+                            .child(status_text),
+                    ),
             )
             .into_any_element()
     }
@@ -2269,15 +2756,27 @@ impl Shell {
         }
     }
 
-    /// Fetch the manifest and stage the new `Comet.app` under the data dir
-    /// (tokio — reqwest); the strip flips to "restart to apply" when done.
+    /// Ask the local engine to fetch and verify the app bundle with the current
+    /// short-lived Comet access token. The strip flips to "restart to apply"
+    /// when staging completes.
     fn begin_update_download(&mut self, cx: &mut Context<Self>) {
-        let edge_url = self.boot.edge_url.clone();
-        let data_dir = self.data_dir.clone();
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.update_flow = UpdateFlow::Failed("Update unavailable".into());
+            cx.notify();
+            return;
+        };
         self.update_flow = UpdateFlow::Downloading;
         let download = Tokio::spawn(cx, async move {
-            let manifest = comet_update::fetch_latest(&edge_url).await?;
-            comet_update::stage_mac_app(&edge_url, &manifest, &data_dir).await
+            let value = engine
+                .client()
+                .call(methods::STAGE_UPDATE, serde_json::json!({}))
+                .await
+                .map_err(|error| error.to_string())?;
+            value
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(PathBuf::from)
+                .ok_or_else(|| "Could not stage update".to_string())
         });
         self.update_task = Some(cx.spawn(async move |this, cx| {
             let outcome = match download.await {
@@ -2470,6 +2969,665 @@ impl Shell {
         trigger.into_any_element()
     }
 
+    fn render_activity_drawer(
+        &mut self,
+        viewport: gpui::Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let mut items = self
+            .state
+            .read(cx)
+            .collaboration
+            .as_ref()
+            .map(crate::multiplayer::activity_items)
+            .unwrap_or_default();
+        for feedback in &self.control_feedback {
+            if items.iter().any(|item| item.id == feedback.command_id) {
+                continue;
+            }
+            let (result, tone) = match feedback.state {
+                ControlFeedbackState::Pending => {
+                    ("pending", crate::multiplayer::ActivityTone::Pending)
+                }
+                ControlFeedbackState::Applied => {
+                    ("applied", crate::multiplayer::ActivityTone::Success)
+                }
+                ControlFeedbackState::Rejected => {
+                    ("rejected", crate::multiplayer::ActivityTone::Danger)
+                }
+            };
+            items.push(crate::multiplayer::ActivityItem {
+                id: feedback.command_id.clone(),
+                actor: feedback.actor.to_string(),
+                label: format!("{} {result}", feedback.action),
+                detail: feedback.detail.as_ref().map(ToString::to_string),
+                target_id: None,
+                occurred_at: feedback.occurred_at,
+                tone,
+            });
+        }
+        items.sort_by_key(|item| std::cmp::Reverse(item.occurred_at));
+        let now = Utc::now();
+        let rows = items.into_iter().map(|item| {
+            let actor = {
+                let state = self.state.read(cx);
+                let resolved = state.participant_name(&item.actor);
+                if resolved == "Teammate" {
+                    item.actor.clone()
+                } else {
+                    resolved.to_string()
+                }
+            };
+            let tone = match item.tone {
+                crate::multiplayer::ActivityTone::Neutral => theme.text_faint,
+                crate::multiplayer::ActivityTone::Pending => theme.warning,
+                crate::multiplayer::ActivityTone::Success => theme.success,
+                crate::multiplayer::ActivityTone::Danger => theme.danger,
+            };
+            let ago = chrono::DateTime::<Utc>::from_timestamp_millis(item.occurred_at)
+                .map(|at| format_time_ago(at, now))
+                .unwrap_or_default();
+            let target_id = item.target_id.clone();
+            let row_id = item.id.clone();
+            div()
+                .id(SharedString::from(format!("activity-{row_id}")))
+                .py(px(Theme::SPACE_SM))
+                .border_b_1()
+                .border_color(theme.border)
+                .flex()
+                .gap(px(Theme::SPACE_SM))
+                .when_some(target_id, |el, target_id| {
+                    el.cursor_pointer()
+                        .hover(|style| style.bg(theme.surface_raised_hover))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_annotation_target(target_id.clone(), cx);
+                        }))
+                })
+                .child(
+                    div()
+                        .mt(px(Theme::SPACE_XS))
+                        .size(px(6.0))
+                        .rounded_full()
+                        .bg(tone),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(Theme::SPACE_XS))
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .child(SharedString::from(item.label)),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .text_color(theme.text_faint)
+                                        .child(SharedString::from(ago)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .mt(px(2.0))
+                                .text_size(px(11.0))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(actor)),
+                        )
+                        .when_some(item.detail.map(SharedString::from), |el, detail| {
+                            el.child(
+                                div()
+                                    .mt(px(Theme::SPACE_XS))
+                                    .text_size(px(11.0))
+                                    .text_color(theme.text_faint)
+                                    .child(detail),
+                            )
+                        }),
+                )
+        });
+        let width = if f32::from(viewport.width) < RIGHT_PANE_MIN * 2.0 {
+            viewport.width
+        } else {
+            px(RIGHT_PANE_MIN)
+        };
+        let drawer = div()
+            .id("activity-drawer")
+            .w(width)
+            .h(viewport.height)
+            .bg(theme.surface_dialog)
+            .border_l_1()
+            .border_color(theme.border)
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.activity_open = false;
+                cx.notify();
+            }))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" {
+                    this.activity_open = false;
+                    cx.notify();
+                }
+            }))
+            .child(
+                div()
+                    .h(px(48.0))
+                    .flex_none()
+                    .px(px(Theme::SPACE_LG))
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(14.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(SharedString::from("Activity")),
+                    )
+                    .child(
+                        popover::btn_ghost(&theme, "Close", "close-activity")
+                            .id("close-activity")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.activity_open = false;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .id("activity-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px(px(Theme::SPACE_LG))
+                    .when(
+                        self.control_feedback.is_empty()
+                            && self
+                                .state
+                                .read(cx)
+                                .collaboration
+                                .as_ref()
+                                .is_none_or(|snapshot| snapshot.publications.is_empty()),
+                        |el| {
+                            el.child(
+                                div()
+                                    .py(px(Theme::SPACE_LG))
+                                    .text_size(px(12.0))
+                                    .text_color(theme.text_muted)
+                                    .child(SharedString::from(
+                                        "Team actions and shared files appear here.",
+                                    )),
+                            )
+                        },
+                    )
+                    .children(rows),
+            );
+        gpui::deferred(
+            gpui::anchored()
+                .position(gpui::point(px(0.0), px(0.0)))
+                .child(
+                    div()
+                        .occlude()
+                        .w(viewport.width)
+                        .h(viewport.height)
+                        .bg(crate::theme::scrim(0.45))
+                        .flex()
+                        .justify_end()
+                        .child(drawer),
+                ),
+        )
+        .priority(2)
+        .into_any_element()
+    }
+
+    fn render_invite_dialog(
+        &mut self,
+        viewport: gpui::Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let link = self.session_link(cx)?;
+        let theme = Theme::of(cx).clone();
+        let card = popover::dialog_card(&theme)
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" {
+                    this.invite_open = false;
+                    cx.notify();
+                }
+            }))
+            .child(popover::dialog_title(&theme, "Invite teammate"))
+            .child(div().mt(px(Theme::SPACE_SM)).child(popover::dialog_body(
+                &theme,
+                "Share this link with someone who can access this Scaffold session.",
+            )))
+            .child(
+                div()
+                    .mt(px(Theme::SPACE_MD))
+                    .px(px(Theme::SPACE_SM))
+                    .py(px(Theme::SPACE_SM))
+                    .rounded(px(Theme::CONTROL_RADIUS))
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.bg)
+                    .text_size(px(11.0))
+                    .text_color(theme.text_muted)
+                    .overflow_hidden()
+                    .child(SharedString::from(link)),
+            )
+            .when_some(self.link_feedback.clone(), |el, feedback| {
+                el.child(
+                    div()
+                        .mt(px(Theme::SPACE_SM))
+                        .text_size(px(11.0))
+                        .text_color(theme.success)
+                        .child(feedback),
+                )
+            })
+            .child(
+                div()
+                    .mt(px(Theme::SPACE_LG))
+                    .flex()
+                    .justify_end()
+                    .gap(px(Theme::SPACE_SM))
+                    .child(
+                        popover::btn_ghost(&theme, "Cancel", "close-invite")
+                            .id("close-invite")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.invite_open = false;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        popover::btn_ghost(&theme, "Open", "open-session-link")
+                            .id("open-session-link")
+                            .on_click(cx.listener(|this, _, _, cx| this.open_session_link(cx))),
+                    )
+                    .child(
+                        popover::btn_primary(&theme, "Copy link")
+                            .id("copy-session-link")
+                            .on_click(cx.listener(|this, _, _, cx| this.copy_session_link(cx))),
+                    ),
+            )
+            .into_any_element();
+        Some(popover::modal("invite-dialog", viewport, card))
+    }
+
+    fn render_command_palette(
+        &mut self,
+        viewport: gpui::Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let row = |label: &'static str, hint: &'static str, id: &'static str| {
+            popover::menu_row(&theme, false, id)
+                .id(id)
+                .child(div().flex_1().child(SharedString::from(label)))
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(hint)),
+                )
+        };
+        let card = popover::popover_card(&theme)
+            .w(px(RIGHT_PANE_MIN))
+            .p(px(Theme::SPACE_SM))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                match event.keystroke.key.as_str() {
+                    "escape" => this.command_palette_open = false,
+                    "n" => {
+                        this.command_palette_open = false;
+                        this.composer
+                            .update(cx, |composer, cx| composer.begin_start_agent(window, cx));
+                    }
+                    "a" => {
+                        this.command_palette_open = false;
+                        this.activity_open = true;
+                    }
+                    "i" => {
+                        this.command_palette_open = false;
+                        this.invite_open = true;
+                    }
+                    "f" => {
+                        this.command_palette_open = false;
+                        this.toggle_focus_mode(cx);
+                    }
+                    _ => return,
+                }
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .px(px(Theme::SPACE_SM))
+                    .py(px(Theme::SPACE_SM))
+                    .text_size(px(13.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(SharedString::from("Commands")),
+            )
+            .child(
+                row("Start agent", "N", "command-start-agent").on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.command_palette_open = false;
+                        this.composer
+                            .update(cx, |composer, cx| composer.begin_start_agent(window, cx));
+                    },
+                )),
+            )
+            .child(
+                row("Open activity", "A", "command-activity").on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.command_palette_open = false;
+                        this.activity_open = true;
+                        cx.notify();
+                    },
+                )),
+            )
+            .child(
+                row("Invite teammate", "I", "command-invite").on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.command_palette_open = false;
+                        this.invite_open = true;
+                        cx.notify();
+                    },
+                )),
+            )
+            .child(
+                row("Toggle focus", "F", "command-focus").on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.command_palette_open = false;
+                        this.toggle_focus_mode(cx);
+                    },
+                )),
+            )
+            .into_any_element();
+        popover::modal("command-palette", viewport, card)
+    }
+
+    fn render_annotation_inspector(
+        &mut self,
+        viewport: gpui::Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let theme = Theme::of(cx).clone();
+        let inspector = self.annotation_inspector.as_ref()?;
+        let selected = inspector.annotation.clone();
+        let is_new = inspector.is_new;
+        let target_id = selected.anchor.target_id.clone();
+        let input = inspector.input.clone();
+        let error = inspector.error.clone();
+        let can_annotate = self
+            .state
+            .read(cx)
+            .has_collaboration_capability(comet_proto::CAPABILITY_SESSION_ANNOTATE);
+        let actor_name = self
+            .state
+            .read(cx)
+            .participant_name(&selected.author_subject)
+            .to_string();
+        let source =
+            (selected.anchor.target_kind == comet_proto::AnchorTargetKind::File).then(|| {
+                format!(
+                    "{} · {}",
+                    crate::multiplayer::file_target_source_label(
+                        crate::multiplayer::file_target_source(selected.anchor.file.as_ref()),
+                    ),
+                    crate::multiplayer::file_target_label(selected.anchor.file.as_ref()),
+                )
+            });
+        let range = selected
+            .anchor
+            .byte_range
+            .as_ref()
+            .map(|range| format!("Bytes {}–{}", range.start, range.end));
+        let annotations = {
+            let state = self.state.read(cx);
+            let mut seen = std::collections::HashSet::new();
+            state
+                .collaboration
+                .as_ref()
+                .map(|snapshot| {
+                    snapshot
+                        .publications
+                        .iter()
+                        .rev()
+                        .filter_map(|publication| {
+                            let comet_proto::PublicationValue::Annotation(annotation) =
+                                &publication.value
+                            else {
+                                return None;
+                            };
+                            (annotation.anchor.target_id == target_id
+                                && seen.insert(annotation.id.clone()))
+                            .then(|| annotation.clone())
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let width = if f32::from(viewport.width) < RIGHT_PANE_MIN * 2.0 {
+            viewport.width
+        } else {
+            px(RIGHT_PANE_MIN)
+        };
+        let rows = annotations.into_iter().map(|annotation| {
+            let author = self
+                .state
+                .read(cx)
+                .participant_name(&annotation.author_subject)
+                .to_string();
+            let resolved = annotation.resolved_at.is_some();
+            div()
+                .px(px(Theme::SPACE_LG))
+                .py(px(Theme::SPACE_MD))
+                .border_b_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(Theme::SPACE_SM))
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(author)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(if resolved {
+                                    theme.success
+                                } else {
+                                    theme.text_faint
+                                })
+                                .child(SharedString::from(if resolved {
+                                    "Resolved"
+                                } else {
+                                    crate::multiplayer::annotation_state_label(annotation.state)
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .mt(px(Theme::SPACE_XS))
+                        .text_size(px(12.0))
+                        .line_height(px(18.0))
+                        .text_color(theme.text)
+                        .child(SharedString::from(annotation.body)),
+                )
+        });
+        Some(
+            div()
+                .id("annotation-inspector")
+                .w(width)
+                .h(viewport.height)
+                .bg(theme.surface_dialog)
+                .border_l_1()
+                .border_color(theme.border)
+                .shadow_lg()
+                .flex()
+                .flex_col()
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.annotation_inspector = None;
+                    cx.notify();
+                }))
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "escape" {
+                        this.annotation_inspector = None;
+                        cx.notify();
+                    }
+                }))
+                .child(
+                    div()
+                        .h(px(48.0))
+                        .flex_none()
+                        .px(px(Theme::SPACE_LG))
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .flex()
+                        .items_center()
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(13.0))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .child(SharedString::from("Notes")),
+                        )
+                        .child(
+                            popover::btn_ghost(&theme, "Close", "close-annotations")
+                                .id("close-annotations")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.annotation_inspector = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("annotation-scroll")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .child(
+                            div()
+                                .px(px(Theme::SPACE_LG))
+                                .py(px(Theme::SPACE_MD))
+                                .border_b_1()
+                                .border_color(theme.border)
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(theme.text_faint)
+                                        .child(SharedString::from(format!(
+                                            "{} · {}",
+                                            actor_name,
+                                            crate::multiplayer::annotation_state_label(
+                                                selected.state,
+                                            )
+                                        ))),
+                                )
+                                .when_some(source.map(SharedString::from), |el, source| {
+                                    el.child(
+                                        div()
+                                            .mt(px(Theme::SPACE_XS))
+                                            .text_size(px(11.0))
+                                            .text_color(theme.text_muted)
+                                            .child(source),
+                                    )
+                                })
+                                .when_some(range.map(SharedString::from), |el, range| {
+                                    el.child(
+                                        div()
+                                            .mt(px(2.0))
+                                            .text_size(px(10.0))
+                                            .text_color(theme.text_faint)
+                                            .child(range),
+                                    )
+                                }),
+                        )
+                        .children(rows),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .px(px(Theme::SPACE_LG))
+                        .py(px(Theme::SPACE_MD))
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .child(
+                            div()
+                                .mb(px(Theme::SPACE_SM))
+                                .text_size(px(11.0))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .child(SharedString::from(if !can_annotate {
+                                    "View only"
+                                } else if is_new {
+                                    "Add note"
+                                } else {
+                                    "Edit note"
+                                })),
+                        )
+                        .when(can_annotate, |el| el.child(input))
+                        .when_some(error, |el, error| {
+                            el.child(
+                                div()
+                                    .mt(px(Theme::SPACE_XS))
+                                    .text_size(px(11.0))
+                                    .text_color(theme.danger)
+                                    .child(error),
+                            )
+                        })
+                        .when(can_annotate, |el| {
+                            el.child(
+                                div()
+                                    .mt(px(Theme::SPACE_SM))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(Theme::SPACE_SM))
+                                    .child(
+                                        popover::btn_primary(&theme, "Save")
+                                            .id("annotation-save")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.save_annotation(cx)
+                                            })),
+                                    )
+                                    .when(!is_new, |actions| {
+                                        actions.child(
+                                            popover::btn_ghost(
+                                                &theme,
+                                                if selected.resolved_at.is_some() {
+                                                    "Reopen"
+                                                } else {
+                                                    "Resolve"
+                                                },
+                                                "resolve-annotation",
+                                            )
+                                            .id("annotation-resolve")
+                                            .on_click(
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.set_annotation_resolved(
+                                                        selected.resolved_at.is_none(),
+                                                        cx,
+                                                    )
+                                                }),
+                                            ),
+                                        )
+                                    }),
+                            )
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// Floating layers owned by the shell: the session context menu and the
     /// rename / delete-confirm dialogs.
     fn render_overlays(
@@ -2586,6 +3744,21 @@ impl Shell {
             overlays.push(overlay);
         }
 
+        if self.activity_open {
+            overlays.push(self.render_activity_drawer(viewport, cx));
+        }
+        if self.invite_open
+            && let Some(invite) = self.render_invite_dialog(viewport, cx)
+        {
+            overlays.push(invite);
+        }
+        if self.command_palette_open {
+            overlays.push(self.render_command_palette(viewport, cx));
+        }
+        if let Some(inspector) = self.render_annotation_inspector(viewport, cx) {
+            overlays.push(inspector);
+        }
+
         if let Some(chat_id) = self.delete_confirm.clone() {
             let title = transcript::single_line(
                 &self
@@ -2667,6 +3840,333 @@ impl Shell {
             )
     }
 
+    fn render_session_toolbar(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = Theme::of(cx).clone();
+        let (sessions, participants, selected_session_id, can_control, can_start, can_invite) = {
+            let state = self.state.read(cx);
+            let chat_id = state.selected_chat.clone()?;
+            (
+                state
+                    .collaboration_sessions(&chat_id)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                state.participants().to_vec(),
+                state.selected_agent_session.clone(),
+                state.has_collaboration_capability(comet_proto::CAPABILITY_SESSION_CONTROL),
+                state.has_collaboration_capability(comet_proto::CAPABILITY_SESSION_CHAT)
+                    && state.local_device_id.is_some(),
+                state.has_collaboration_capability(comet_proto::CAPABILITY_SESSION_INVITE),
+            )
+        };
+        let participant_elements = participants.into_iter().take(5).map(|participant| {
+            let name: SharedString = participant
+                .display_name
+                .clone()
+                .unwrap_or_else(|| participant.principal_subject.clone())
+                .into();
+            let initials = crate::multiplayer::initials(name.as_ref());
+            let subject = participant.principal_subject.clone();
+            let following = self.following_subject.as_deref() == Some(subject.as_str());
+            let presence = match participant.state {
+                comet_proto::ParticipantState::Active => theme.success,
+                comet_proto::ParticipantState::Idle => theme.warning,
+                comet_proto::ParticipantState::Disconnected => theme.text_faint,
+            };
+            div()
+                .id(SharedString::from(format!("participant-{subject}")))
+                .relative()
+                .size(px(24.0))
+                .rounded_full()
+                .border_1()
+                .border_color(if following {
+                    theme.accent
+                } else {
+                    theme.border
+                })
+                .bg(theme.surface_raised)
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(9.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.text_muted)
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.surface_raised_hover))
+                .on_click(
+                    cx.listener(move |this, _, _, cx| this.toggle_follow(subject.clone(), cx)),
+                )
+                .child(SharedString::from(initials))
+                .child(
+                    div()
+                        .absolute()
+                        .right(px(-1.0))
+                        .bottom(px(-1.0))
+                        .size(px(6.0))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(theme.bg)
+                        .bg(presence),
+                )
+        });
+        let session_elements = sessions.iter().map(|session| {
+            let selected = selected_session_id.as_deref() == Some(session.session_id.as_str());
+            let owner: SharedString = {
+                let state = self.state.read(cx);
+                state
+                    .participant_name(&session.owner_subject)
+                    .to_string()
+                    .into()
+            };
+            let initials = crate::multiplayer::initials(owner.as_ref());
+            let device: SharedString = self
+                .state
+                .read(cx)
+                .device_name(&session.owner_device_id)
+                .unwrap_or("Remote device")
+                .to_string()
+                .into();
+            let runtime = session.harness.map(crate::multiplayer::harness_label);
+            let runtime_model =
+                crate::multiplayer::runtime_model(runtime, session.model.as_deref());
+            let source = crate::multiplayer::source_label(session.source);
+            let (status, status_tone) = match session.status {
+                Some(comet_proto::SessionStatus::Working) => ("Working", theme.busy),
+                Some(comet_proto::SessionStatus::AwaitingInput) => ("Needs input", theme.warning),
+                Some(comet_proto::SessionStatus::Errored) => ("Failed", theme.danger),
+                Some(comet_proto::SessionStatus::Idle) | None => ("Idle", theme.text_faint),
+            };
+            let session_id = session.session_id.clone();
+            div()
+                .id(SharedString::from(format!("agent-session-{session_id}")))
+                .h(px(30.0))
+                .max_w(px(220.0))
+                .px(px(Theme::SPACE_SM))
+                .rounded(px(Theme::CONTROL_RADIUS))
+                .border_1()
+                .border_color(if selected {
+                    theme.border_strong
+                } else {
+                    theme.border
+                })
+                .bg(if selected {
+                    crate::theme::card_selected_bg()
+                } else {
+                    crate::theme::ink(0.03)
+                })
+                .flex()
+                .items_center()
+                .gap(px(Theme::SPACE_XS))
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.element_hover))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.state.update(cx, |state, cx| {
+                        state.select_agent_session(Some(session_id.clone()));
+                        cx.notify();
+                    });
+                    this.composer.update(cx, |composer, cx| {
+                        composer.select_agent_target(Some(session_id.clone()), cx)
+                    });
+                }))
+                .child(
+                    div()
+                        .size(px(18.0))
+                        .rounded_full()
+                        .bg(theme.surface_raised)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(8.0))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .child(SharedString::from(initials)),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(10.5))
+                                .line_height(px(12.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .child(owner),
+                        )
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(9.0))
+                                .line_height(px(10.0))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(format!(
+                                    "{device} · {runtime_model} · {source}"
+                                ))),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(3.0))
+                        .child(div().size(px(5.0)).rounded_full().bg(status_tone))
+                        .child(
+                            div()
+                                .text_size(px(9.0))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(status)),
+                        ),
+                )
+        });
+        let selected_session = sessions
+            .iter()
+            .find(|session| selected_session_id.as_deref() == Some(session.session_id.as_str()))
+            .cloned();
+        let mut controls = div().flex().items_center().gap(px(Theme::SPACE_XS));
+        if can_start {
+            controls = controls.child(
+                popover::btn_primary(&theme, "Start agent")
+                    .id("start-agent")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.composer
+                            .update(cx, |composer, cx| composer.begin_start_agent(window, cx));
+                    })),
+            );
+        }
+        if let Some(session) = selected_session
+            && can_control
+        {
+            let steer_session = session.session_id.clone();
+            controls = controls.child(
+                popover::btn_ghost(&theme, "Steer", "steer-agent")
+                    .id("steer-agent")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.composer.update(cx, |composer, cx| {
+                            composer.begin_steer(steer_session.clone(), window, cx)
+                        });
+                    })),
+            );
+            match session.status {
+                Some(comet_proto::SessionStatus::Working)
+                | Some(comet_proto::SessionStatus::AwaitingInput) => {
+                    let pause = session.clone();
+                    let stop = session.clone();
+                    controls = controls
+                        .child(
+                            popover::btn_ghost(&theme, "Pause", "pause-agent")
+                                .id("pause-agent")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.queue_control(
+                                        pause.clone(),
+                                        SessionControlAction::Pause {},
+                                        "Pause",
+                                        cx,
+                                    )
+                                })),
+                        )
+                        .child(
+                            popover::btn_danger(&theme, "Stop")
+                                .id("stop-agent")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.queue_control(
+                                        stop.clone(),
+                                        SessionControlAction::Stop {},
+                                        "Stop",
+                                        cx,
+                                    )
+                                })),
+                        );
+                }
+                _ => {
+                    let resume = session.clone();
+                    controls = controls.child(
+                        popover::btn_ghost(&theme, "Resume", "resume-agent")
+                            .id("resume-agent")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.queue_control(
+                                    resume.clone(),
+                                    SessionControlAction::Resume {},
+                                    "Resume",
+                                    cx,
+                                )
+                            })),
+                    );
+                }
+            }
+        }
+        let focus_label = if self.settings.focus_mode {
+            "Exit focus"
+        } else {
+            "Focus"
+        };
+        Some(
+            div()
+                .id("session-toolbar")
+                .h(px(42.0))
+                .w_full()
+                .flex_none()
+                .border_b_1()
+                .border_color(theme.border)
+                .overflow_x_scroll()
+                .px(px(Theme::SPACE_MD))
+                .flex()
+                .items_center()
+                .gap(px(Theme::SPACE_SM))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(2.0))
+                        .children(participant_elements),
+                )
+                .when_some(self.following_subject.clone(), |el, subject| {
+                    let name = self.state.read(cx).participant_name(&subject).to_string();
+                    el.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(10.0))
+                            .text_color(theme.accent)
+                            .child(SharedString::from(format!("Following {name}"))),
+                    )
+                })
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(Theme::SPACE_XS))
+                        .children(session_elements),
+                )
+                .when(sessions.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from("No agent running")),
+                    )
+                })
+                .child(div().flex_1())
+                .child(controls)
+                .child(
+                    popover::btn_ghost(&theme, "Activity", "open-activity")
+                        .id("open-activity")
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_activity(cx))),
+                )
+                .when(can_invite, |el| {
+                    el.child(
+                        popover::btn_ghost(&theme, "Invite", "open-invite")
+                            .id("open-invite")
+                            .on_click(cx.listener(|this, _, _, cx| this.open_invite(cx))),
+                    )
+                })
+                .child(
+                    popover::btn_ghost(&theme, focus_label, "toggle-focus")
+                        .id("toggle-focus")
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_focus_mode(cx))),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_main(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme_owned = Theme::of(cx).clone();
         let theme = &theme_owned;
@@ -2690,6 +4190,11 @@ impl Shell {
         let _ = (text, border);
         let has_selection = self.state.read(cx).selected_chat.is_some();
         let has_spaces = !self.state.read(cx).spaces.is_empty();
+        let session_toolbar = if has_selection {
+            self.render_session_toolbar(cx)
+        } else {
+            None
+        };
         let space_name: SharedString = self
             .state
             .read(cx)
@@ -2820,6 +4325,7 @@ impl Shell {
                     .update(cx, |composer, cx| composer.add_paths(paths, cx));
                 cx.notify();
             }))
+            .children(session_toolbar)
             .child(
                 // The conversation fades out at its bottom edge instead of
                 // hard-cutting against the composer — a gradient overlay from
@@ -3005,9 +4511,9 @@ impl Shell {
             .into_any_element()
     }
 
-    /// Working indicator strip: gradient spinner + rotating flavour word (7s,
-    /// seeded per chat) + elapsed, staleness-gated via [`Indicator`]; falls back
-    /// to a "Sending…" bridge and then the engine mode line.
+    /// Working indicator strip: animated activity text + elapsed time,
+    /// staleness-gated via [`Indicator`]; falls back to a sending bridge and
+    /// then the engine mode line.
     fn render_status_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let now = Utc::now();
@@ -3043,18 +4549,16 @@ impl Shell {
                 let word =
                     transcript::flavour_word(transcript::flavour_seed(&chat_id), elapsed_secs);
                 strip
-                    .child(loaders::gradient_spinner(
-                        "working-indicator",
-                        &theme,
-                        2.5,
-                        cx.entity_id(),
-                        cx,
-                    ))
                     .child(
                         div()
                             .text_size(px(12.0))
                             .text_color(theme.text_muted)
-                            .child(SharedString::from(format!("{word}…"))),
+                            .child(SharedString::from(format!("{word}…")))
+                            .with_animation(
+                                SharedString::from(format!("working-text-{chat_id}")),
+                                COMET_PULSE.animation().repeat(),
+                                |label, delta| label.opacity(0.6 + 0.35 * delta),
+                            ),
                     )
                     .child(
                         div()
@@ -3071,18 +4575,16 @@ impl Shell {
                 .child(SharedString::from("Run failed"))
                 .into_any_element(),
             Indicator::None if sending => strip
-                .child(loaders::gradient_spinner(
-                    "sending-indicator",
-                    &theme,
-                    2.5,
-                    cx.entity_id(),
-                    cx,
-                ))
                 .child(
                     div()
                         .text_size(px(12.0))
                         .text_color(theme.text_muted)
-                        .child(SharedString::from("Sending…")),
+                        .child(SharedString::from("Sending…"))
+                        .with_animation(
+                            "sending-text",
+                            COMET_PULSE.animation().repeat(),
+                            |label, delta| label.opacity(0.6 + 0.35 * delta),
+                        ),
                 )
                 .into_any_element(),
             Indicator::None => strip.into_any_element(),
@@ -3178,8 +4680,8 @@ impl Shell {
                         .child(SharedString::from("Retry")),
                 )
                 .into_any_element(),
-            // Login card (comet App.tsx Gate): centered card on the grid —
-            // logo, "Log in to Comet", copy, full-width white Log in button.
+            // Login card: centered on the grid with the Ashler Comet mark and
+            // one full-width sign-in action.
             _ => div()
                 .w(px(360.0))
                 .px(px(32.0))
@@ -3205,7 +4707,7 @@ impl Shell {
                         .text_size(px(18.0))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(theme.text)
-                        .child(SharedString::from("Log in to Comet")),
+                        .child(SharedString::from("Log in to Ashler Comet")),
                 )
                 .child(
                     div()
@@ -3260,227 +4762,6 @@ impl Shell {
                         },
                         div().child(content),
                     )),
-            )
-            .into_any_element()
-    }
-
-    /// The OrgGate ("Create your workspace"): name form + existing memberships
-    /// + "Use a different account" (feature-inventory §1.2).
-    fn render_org_gate(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        self.ensure_org_ui(cx);
-        let theme = Theme::of(cx).clone();
-        let Some(org) = self.org.as_ref() else {
-            return Empty.into_any_element();
-        };
-        let submitting = org.submitting;
-        let error = org.error.clone();
-        let name_input = org.name_input.clone();
-        let orgs = org.orgs.clone();
-
-        let email: Option<SharedString> = self
-            .state
-            .read(cx)
-            .auth_user()
-            .map(|u| u.email.clone().into());
-
-        let memberships: AnyElement =
-            match &orgs {
-                Loadable::Idle | Loadable::Loading => div()
-                    .mt(px(24.0))
-                    .child(popover::skeleton_rows(
-                        "org-skeleton",
-                        &theme,
-                        2,
-                        cx.entity_id(),
-                        cx,
-                    ))
-                    .into_any_element(),
-                Loadable::Error(message) => div()
-                    .mt(px(24.0))
-                    .child(
-                        popover::error_row(&theme, message).child(
-                            div()
-                                .id("orgs-retry")
-                                .px(px(Theme::SPACE_SM))
-                                .py(px(3.0))
-                                .rounded(px(Theme::CONTROL_RADIUS))
-                                .border_1()
-                                .border_color(theme.border)
-                                .text_color(theme.text)
-                                .cursor_pointer()
-                                .hover(|s| s.bg(theme.glass_hover()))
-                                .on_click(cx.listener(|this, _, _, cx| this.load_orgs(cx)))
-                                .child(SharedString::from("Retry")),
-                        ),
-                    )
-                    .into_any_element(),
-                Loadable::Ready(rows) if rows.is_empty() => Empty.into_any_element(),
-                Loadable::Ready(rows) => div()
-                    .mt(px(24.0))
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .pb(px(8.0))
-                            .text_size(px(11.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text_muted.opacity(0.6))
-                            .child(SharedString::from(
-                                "Or continue in a workspace you belong to",
-                            )),
-                    )
-                    .child(div().flex().flex_col().gap(px(4.0)).children(
-                        rows.iter().enumerate().map(|(ix, row)| {
-                            let org_id = row.organization_id.clone();
-                            div()
-                                .id(("org-row", ix))
-                                .px(px(12.0))
-                                .py(px(8.0))
-                                .rounded(px(8.0))
-                                .border_1()
-                                .border_color(theme.border)
-                                .bg(theme.bg)
-                                .text_size(px(13.0))
-                                .text_color(theme.text)
-                                .when(submitting, |el| el.opacity(0.5))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(crate::theme::wash(0.11)))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.select_org(org_id.clone(), cx);
-                                }))
-                                .child(SharedString::from(row.name.clone()))
-                        }),
-                    ))
-                    .into_any_element(),
-            };
-
-        // comet App.tsx OrgGate: w-400 card on the grid — logo, headline,
-        // explainer (+ signed-in email), name form with a white Create button,
-        // then existing memberships and the account escape hatch.
-        let blurb: SharedString = match email {
-            Some(email) => format!(
-                "Comet is organized around workspaces — create one for yourself or your team. Signed in as {email}."
-            )
-            .into(),
-            None => {
-                "Comet is organized around workspaces — create one for yourself or your team."
-                    .into()
-            }
-        };
-        let card = div()
-            .w(px(400.0))
-            .px(px(32.0))
-            .py(px(36.0))
-            .rounded(px(12.0))
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.surface_card)
-            .shadow_lg()
-            .flex()
-            .flex_col()
-            .child(
-                icon(icons::COMET_LOGO)
-                    .w(px(24.4))
-                    .h(px(28.0))
-                    .text_color(theme.text),
-            )
-            .child(
-                div()
-                    .mt(px(20.0))
-                    .text_size(px(18.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.text)
-                    .child(SharedString::from("Create your workspace")),
-            )
-            .child(
-                div()
-                    .mt(px(6.0))
-                    .mb(px(24.0))
-                    .text_size(px(13.0))
-                    .line_height(px(19.0))
-                    .text_color(theme.text_muted)
-                    .child(blurb),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .h(px(36.0))
-                            .flex()
-                            .items_center()
-                            .px(px(12.0))
-                            .rounded(px(8.0))
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.bg)
-                            .text_size(px(13.0))
-                            .child(name_input),
-                    )
-                    .child(
-                        div()
-                            .id("create-org")
-                            .h(px(36.0))
-                            .px(px(16.0))
-                            .flex()
-                            .items_center()
-                            .rounded(px(6.0))
-                            .bg(theme.text)
-                            .text_size(px(14.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.on_solid)
-                            .when(submitting, |el| el.opacity(0.5))
-                            .cursor_pointer()
-                            .hover(|s| s.opacity(0.9))
-                            .on_click(cx.listener(|this, _, _, cx| this.create_org(cx)))
-                            .child(SharedString::from(if submitting {
-                                "Creating…"
-                            } else {
-                                "Create"
-                            })),
-                    ),
-            )
-            .child(memberships)
-            .when_some(error, |el, message| {
-                el.child(
-                    div()
-                        .mt(px(16.0))
-                        .text_size(px(12.0))
-                        .line_height(px(17.0))
-                        .text_color(theme.danger_muted.opacity(0.9)) // red-300
-                        .child(message),
-                )
-            })
-            .child(
-                div().mt(px(24.0)).flex().flex_row().child(
-                    div()
-                        .id("org-signout")
-                        .text_size(px(12.0))
-                        .text_color(theme.text_muted.opacity(0.6))
-                        .cursor_pointer()
-                        .hover(|s| s.text_color(theme.text))
-                        .on_click(cx.listener(|this, _, _, cx| this.sign_out(cx)))
-                        .child(SharedString::from("Use a different account")),
-                ),
-            );
-
-        div()
-            .size_full()
-            .relative()
-            .bg(theme.bg)
-            .child(grid_backdrop(&theme))
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(motion::fade_in("org-gate-card", card)),
             )
             .into_any_element()
     }
@@ -3610,9 +4891,8 @@ fn window_control_button(
         // quick click zooms NATIVELY on macOS), and the `click_count == 2`
         // zoom handler — never fires with the pointer over a button. It also
         // removes the button's rect from the native Drag control-area
-        // hit-test on Windows/Linux. The click-level stop_propagation is
-        // zed's ButtonLike belt on top. Double-click on EMPTY strip space
-        // still zooms — nothing occludes it there.
+        // hit-test on Windows/Linux. Click-level propagation is also stopped.
+        // Double-click on empty strip space still zooms.
         .occlude()
         .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
         .on_click(move |event, window, cx| {
@@ -3633,8 +4913,8 @@ fn titlebar_right_padding(is_windows: bool, base: f32) -> f32 {
     }
 }
 
-/// A Windows-owned caption target using the same system glyphs and native
-/// non-client hit-test areas as GPUI/Zed's platform titlebar.
+/// A Windows-owned caption target using GPUI's native non-client hit-test
+/// areas and the platform's system glyphs.
 fn windows_caption_button(
     id: &'static str,
     glyph: &'static str,
@@ -3832,7 +5112,15 @@ impl Render for Shell {
                 } else {
                     this.open_add_space(cx);
                 }
-            }));
+            }))
+            .on_action(
+                cx.listener(|this, _: &ToggleCommandPalette, _, cx| {
+                    this.toggle_command_palette(cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &ToggleActivity, _, cx| this.toggle_activity(cx)))
+            .on_action(cx.listener(|this, _: &ToggleFocusMode, _, cx| this.toggle_focus_mode(cx)))
+            .on_action(cx.listener(|this, _: &OpenInvite, _, cx| this.open_invite(cx)));
 
         let root = match &gate {
             GatePhase::Ready => {
@@ -4003,10 +5291,6 @@ impl Render for Shell {
                     .child(motion::fade_in("phase-app", page))
             }
             GatePhase::Loading => root, // splash overlay covers boot
-            GatePhase::OrgGate => {
-                let card = self.render_org_gate(cx);
-                root.child(card)
-            }
             phase @ (GatePhase::Failed(_) | GatePhase::SignIn) => {
                 let card = self.render_gate_card(phase, cx);
                 root.child(card)
@@ -4036,10 +5320,8 @@ impl Render for Shell {
             SplashPhase::Gone => root,
         };
 
-        // Caption controls are shell-level chrome, not Ready-page content:
-        // keep them above the splash and every auth/org/error gate as well as
-        // the full application. Gate pages also need a native drag surface
-        // because they do not render the unified tabs/settings titlebar.
+        // Caption controls are shell-level chrome, above the splash and auth
+        // or connection-error gates as well as the full application.
         let root = if matches!(gate, GatePhase::Ready) || !cfg!(target_os = "windows") {
             root
         } else {

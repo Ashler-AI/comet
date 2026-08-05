@@ -9,6 +9,20 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use super::*;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+#[test]
+fn fragment_headers_are_bounded_before_allocation() {
+    assert!(fragment_batch_within_limits(1, 1));
+    assert!(fragment_batch_within_limits(
+        MAX_FRAGMENT_COUNT,
+        MAX_REASSEMBLED_BYTES as u64
+    ));
+    assert!(!fragment_batch_within_limits(0, 1));
+    assert!(!fragment_batch_within_limits(MAX_FRAGMENT_COUNT + 1, 1));
+    assert!(!fragment_batch_within_limits(
+        1,
+        MAX_REASSEMBLED_BYTES as u64 + 1
+    ));
+}
 
 async fn wait_until(mut condition: impl FnMut() -> bool) {
     tokio::time::timeout(TEST_TIMEOUT, async {
