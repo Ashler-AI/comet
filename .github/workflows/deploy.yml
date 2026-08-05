@@ -154,7 +154,7 @@ jobs:
         run: test -n "$IAP_ID_TOKEN"
       - name: Deploy exact candidate with checked-in staging resources
         working-directory: edge
-        run: npx wrangler deploy "${{ steps.verify.outputs.entry }}" --no-bundle --env staging
+        run: npx wrangler deploy "${{ steps.verify.outputs.entry }}" --no-bundle --config wrangler.jsonc --env staging
 
   production:
     if: github.repository_owner == 'Ashler-AI' && github.event_name == 'workflow_dispatch' && inputs.target == 'production'
@@ -208,4 +208,4 @@ jobs:
         run: test -n "$IAP_ID_TOKEN"
       - name: Deploy exact staged candidate with checked-in production resources
         working-directory: edge
-        run: npx wrangler deploy "${{ steps.verify.outputs.entry }}" --no-bundle --env production
+        run: npx wrangler deploy "${{ steps.verify.outputs.entry }}" --no-bundle --config wrangler.jsonc --env production
