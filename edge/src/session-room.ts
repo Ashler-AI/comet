@@ -183,7 +183,7 @@ export const enforceDeviceGrantAuthority = async (
       valid = false;
     } else {
       try {
-        valid = await validate(grantId);
+        valid = (await validate(grantId)) === true;
       } catch {
         valid = false;
       }
@@ -523,14 +523,14 @@ export class SessionRoom implements DurableObject {
           headers: { [GRANT_EVENT_HEADER]: "status" }
         })
       );
-      return response.ok;
+      return response.ok && !this.revokedGrants.has(grantId);
     });
   }
 
   async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): Promise<void> {
-    if (typeof message === "string") return; // ping/pong handled by auto-response
     const attached = ws.deserializeAttachment() as SocketState | null;
     if (!(await this.authorizeSocket(ws, attached))) return;
+    if (typeof message === "string") return; // ping/pong handled by auto-response
     const state = attached as SocketState;
     let decoded: ProtocolMessage;
     try {

@@ -62,9 +62,10 @@ describe("Scaffold bearer validation", () => {
     });
   });
 
-  it("fails closed on resource, principal, capability, and upstream failures", async () => {
+  it("fails closed on resource, actor schema, principal, capability, and upstream failures", async () => {
     const invalid = [
       { ok: true, resource: "https://other.example", actor: { sub: "dev@ashler.ai", auth: "iap" }, scopes: ["session.read", "session.control"] },
+      { ok: true, resource: env.SCAFFOLD_CONTROL_PLANE_URL, user: { sub: "dev@ashler.ai" }, scopes: ["session.read", "session.control"] },
       { ok: true, resource: env.SCAFFOLD_CONTROL_PLANE_URL, actor: { sub: "", auth: "iap" }, scopes: ["session.read", "session.control"] },
       { ok: true, resource: env.SCAFFOLD_CONTROL_PLANE_URL, actor: { sub: "dev@ashler.ai", auth: "iap" }, scopes: ["session.read"] }
     ];

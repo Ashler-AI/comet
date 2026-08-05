@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { AuthGrant } from "./grant-authority";
-import { enforceDeviceGrantAuthority } from "./session-room";
+import { enforceDeviceGrantAuthority, SessionRoom } from "./session-room";
 import { GRANT_EVENT_HEADER, type Env } from "./env";
 
 const NOW = 1_000_000;
@@ -62,6 +62,54 @@ describe("open session socket grant authority", () => {
     ).resolves.toBe(false);
     expect(ws.close).toHaveBeenCalledWith(4403, "device grant invalid");
   });
+
+  it.each([
+    ["missing grant id", { grantExpiresAt: NOW + 60_000 }],
+    ["missing expiry", { grantId: "grant-1" }],
+    ["invalid grant id", { grantId: "../grant-1", grantExpiresAt: NOW + 60_000 }],
+    ["unsafe expiry", { grantId: "grant-1", grantExpiresAt: Number.MAX_VALUE }]
+  ])("fails closed for malformed attached grant state: %s", async (_label, state) => {
+    const ws = socket();
+    const validate = vi.fn(async () => true);
+
+    await expect(
+      enforceDeviceGrantAuthority(ws, state, NOW, validate)
+    ).resolves.toBe(false);
+    expect(validate).not.toHaveBeenCalled();
+    expect(ws.close).toHaveBeenCalledWith(4403, "device grant invalid");
+  });
+
+  it("fails closed when the socket attachment cannot be restored", async () => {
+    const ws = socket();
+
+    await expect(
+      enforceDeviceGrantAuthority(ws, null, NOW, async () => true)
+    ).resolves.toBe(false);
+    expect(ws.close).toHaveBeenCalledWith(4403, "device grant invalid");
+  });
+
+  it("closes only live sockets attached to the revoked grant", async () => {
+    const matching = {
+      deserializeAttachment: () => attachedGrant,
+      close: vi.fn()
+    };
+    const other = {
+      deserializeAttachment: () => ({
+        grantId: "grant-2",
+        grantExpiresAt: NOW + 60_000
+      }),
+      close: vi.fn()
+    };
+    const room = {
+      revokedGrants: new Set<string>(),
+      ctx: { getWebSockets: () => [matching, other] }
+    } as unknown as SessionRoom;
+
+    await SessionRoom.prototype.revokeGrant.call(room, "grant-1");
+
+    expect(matching.close).toHaveBeenCalledWith(4403, "device grant revoked");
+    expect(other.close).not.toHaveBeenCalled();
+  });
 });
 
 describe("grant revocation delivery", () => {
@@ -89,6 +137,9 @@ describe("grant revocation delivery", () => {
 
     expect((await authority.fetch(statusRequest.clone())).status).toBe(204);
     record.revokedAt = Date.now();
+    expect((await authority.fetch(statusRequest.clone())).status).toBe(401);
+    delete record.revokedAt;
+    record.accessExpiresAt = Number.NaN;
     expect((await authority.fetch(statusRequest)).status).toBe(401);
   });
 
@@ -110,7 +161,8 @@ describe("grant revocation delivery", () => {
       accessHash: "unused",
       accessExpiresAt: Date.now() + 60_000
     });
-    const notifyRoom = vi.fn(async () => new Response(null, { status: 204 }));
+    const notifyRoom = vi.fn(async (_request: Request) => new Response(null, { status: 204 }));
+    const roomIdFromName = vi.fn((name: string) => name);
     const ctx = {
       storage: {
         get: async (key: string) => records.get(key),
@@ -119,8 +171,8 @@ describe("grant revocation delivery", () => {
     } as unknown as DurableObjectState;
     const env = {
       SESSION_ROOMS: {
-        idFromName: (name: string) => name,
-        get: () => ({ fetch: notifyRoom })
+        idFromName: roomIdFromName,
+        get: (_id: string) => ({ fetch: notifyRoom })
       }
     } as unknown as Env;
     const authority = new AuthGrant(ctx, env);
@@ -135,5 +187,9 @@ describe("grant revocation delivery", () => {
     expect(response.status).toBe(200);
     expect(records.get("grant")).toMatchObject({ revokedAt: expect.any(Number) });
     expect(notifyRoom).toHaveBeenCalledOnce();
+    expect(roomIdFromName).toHaveBeenCalledWith("s3/ashler-staging/session-1");
+    const notification = notifyRoom.mock.calls[0]?.[0];
+    expect(notification?.headers.get(GRANT_EVENT_HEADER)).toBe("revoke");
+    await expect(notification?.json()).resolves.toEqual({ grantId: "grant-1" });
   });
 });

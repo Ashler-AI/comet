@@ -2061,6 +2061,42 @@ mod authority_tests {
             "the durable proof must bind the complete immutable payload"
         );
 
+        let mut remote = command.clone();
+        let SessionCommandPayload::Control {
+            owner_device_id,
+            actor_device_id,
+            source,
+            ..
+        } = &mut remote.payload
+        else {
+            unreachable!();
+        };
+        *owner_device_id = "device-remote".into();
+        *actor_device_id = "device-remote".into();
+        *source = AgentSessionSource::Scaffold;
+        restarted_host
+            .inner
+            .store
+            .trust_local_command(&local_owner_authority_key(&remote).unwrap())
+            .unwrap();
+        assert!(
+            !restarted_host.command_grant_authorized(&remote),
+            "even a poisoned local ledger cannot reconstruct remote authority"
+        );
+
+        let mut persisted_stale = command.clone();
+        persisted_stale.issued_at = now - LOCAL_OWNER_GRANT_TTL_MS;
+        persisted_stale.expires_at = Some(now + 60_000);
+        restarted_host
+            .inner
+            .store
+            .trust_local_command(&local_owner_authority_key(&persisted_stale).unwrap())
+            .unwrap();
+        assert!(
+            !restarted_host.command_grant_authorized(&persisted_stale),
+            "an exact persisted fingerprint cannot outlive the local-owner authority TTL"
+        );
+
         let mut revoked = grant.clone();
         revoked.revoked_at = Some(now_ms());
         lock(&restarted_host.inner.trusted_grants).insert(

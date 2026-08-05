@@ -9,6 +9,32 @@ interface GrantAuthorityRecord {
   revokedAt?: number;
 }
 
+const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+const hasGrantScope = (value: unknown): value is GrantAuthorityRecord => {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Partial<GrantAuthorityRecord>;
+  return (
+    typeof record.grantId === "string" &&
+    ID_RE.test(record.grantId) &&
+    typeof record.projectId === "string" &&
+    ID_RE.test(record.projectId) &&
+    typeof record.sessionId === "string" &&
+    ID_RE.test(record.sessionId)
+  );
+};
+
+const isActiveGrant = (
+  value: unknown,
+  expectedGrantId: string | null,
+  now: number
+): value is GrantAuthorityRecord =>
+  hasGrantScope(value) &&
+  value.grantId === expectedGrantId &&
+  Number.isSafeInteger(value.accessExpiresAt) &&
+  (value.accessExpiresAt as number) > now &&
+  value.revokedAt === undefined;
+
 /**
  * Adds capability-state checks and revocation delivery without exposing a new
  * public route. The grant DO remains the source of truth; room attachments only
@@ -29,19 +55,16 @@ export class AuthGrant extends StoredAuthGrant {
       if (request.headers.get(GRANT_EVENT_HEADER) !== "status") {
         return new Response(null, { status: 403 });
       }
-      const record = await this.authorityCtx.storage.get<GrantAuthorityRecord>("grant");
-      const active =
-        record?.grantId === url.searchParams.get("grantId") &&
-        !record.revokedAt &&
-        typeof record.accessExpiresAt === "number" &&
-        record.accessExpiresAt > Date.now();
+      const record = await this.authorityCtx.storage.get<unknown>("grant");
+      const active = isActiveGrant(record, url.searchParams.get("grantId"), Date.now());
       return new Response(null, { status: active ? 204 : 401 });
     }
 
     const isRevocation = request.method === "POST" && url.pathname === "/revoke";
-    const record = isRevocation
-      ? await this.authorityCtx.storage.get<GrantAuthorityRecord>("grant")
+    const stored = isRevocation
+      ? await this.authorityCtx.storage.get<unknown>("grant")
       : undefined;
+    const record = hasGrantScope(stored) ? stored : undefined;
     const response = await super.fetch(request);
 
     if (isRevocation && response.ok && record) {

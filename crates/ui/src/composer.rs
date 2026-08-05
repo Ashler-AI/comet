@@ -6110,6 +6110,25 @@ mod tests {
     }
 
     #[test]
+    fn start_and_steer_routes_select_session_chat_grant() {
+        let snapshot = route_snapshot(&[
+            comet_proto::CAPABILITY_SESSION_CHAT,
+            comet_proto::CAPABILITY_SESSION_CONTROL,
+        ]);
+        assert_eq!(
+            control_route_grant_id(
+                &snapshot,
+                &snapshot.sessions[0],
+                comet_proto::CAPABILITY_SESSION_CHAT,
+                None,
+                10_000,
+            )
+            .as_deref(),
+            Some("grant-chat")
+        );
+    }
+
+    #[test]
     fn chat_only_authority_cannot_route_stop() {
         let snapshot = route_snapshot(&[comet_proto::CAPABILITY_SESSION_CHAT]);
         let action = SessionControlAction::Stop {};

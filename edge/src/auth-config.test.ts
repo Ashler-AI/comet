@@ -231,6 +231,41 @@ describe("device grant issuance", () => {
     expect(response?.status).toBe(403);
     expect(records).toHaveLength(0);
   });
+
+  it.each([
+    [
+      "an unknown Scaffold target",
+      404,
+      { error: "remote_code_sandbox_not_found" }
+    ],
+    [
+      "a target proof with the wrong actor schema",
+      200,
+      {
+        ok: true,
+        profile: {
+          version: "scaffold.comet-runtime.v1",
+          projectId: identity.projectScope,
+          deploymentId: identity.projectScope,
+          sandboxId: "sandbox-789",
+          targetDeviceId: "comet-scaffold-sandbox-789",
+          sessionId: "session-456",
+          user: { sub: identity.userId }
+        }
+      }
+    ]
+  ] as const)("denies %s before mutating grant state", async (_name, status, proof) => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json(proof, { status }));
+    const { env, records } = envAndRecords();
+    const response = await handleAuthenticatedAuthRoute(
+      request(),
+      env,
+      new URL("https://comet.example/auth/device-grants"),
+      identity
+    );
+    expect(response?.status).toBe(403);
+    expect(records).toHaveLength(0);
+  });
 });
 
 describe("Wrangler environments", () => {
