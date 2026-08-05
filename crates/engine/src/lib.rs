@@ -469,6 +469,11 @@ impl Engine {
         {
             auth_config.oauth_scopes = scopes;
         }
+        if let Ok(capabilities) = std::env::var("COMET_SESSION_CAPABILITIES")
+            && !capabilities.trim().is_empty()
+        {
+            auth_config.internal_capabilities = capabilities;
+        }
         auth_config.callback_port = Some(
             std::env::var("COMET_CALLBACK_PORT")
                 .ok()

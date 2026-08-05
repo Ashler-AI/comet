@@ -20,7 +20,9 @@ use crate::EngineError;
 
 const SIGN_IN_TTL: Duration = Duration::from_secs(15 * 60);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
-const DEFAULT_SCOPES: &str = "session.read session.chat session.control session.annotate session.invite session.files session.environment";
+const DEFAULT_OAUTH_SCOPES: &str =
+    "remote_code:create remote_code:read remote_code:write remote_code:exec remote_code:lifecycle";
+const DEFAULT_INTERNAL_CAPABILITIES: &str = "session.read session.chat session.control session.annotate session.invite session.files session.environment";
 const DEVICE_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const DEVICE_REFRESH_RETRY: Duration = Duration::from_secs(5 * 60);
 const STAGING_EDGE_HOST: &str = "comet-staging.internal.ashler.com";
@@ -99,7 +101,10 @@ pub struct AuthConfig {
     pub scaffold_url: Option<String>,
     /// Operator-configured deployment/project boundary, never caller input.
     pub project_scope: String,
+    /// Platform remote-code scopes requested during Scaffold OAuth.
     pub oauth_scopes: String,
+    /// Internal Comet capabilities used by explicit local development auth.
+    pub internal_capabilities: String,
     pub dev_user_id: String,
     pub callback_port: Option<u16>,
     /// One-time `cg1` enrollment credential for a sandbox device. It is exchanged
@@ -120,6 +125,7 @@ impl std::fmt::Debug for AuthConfig {
             .field("scaffold_url", &self.scaffold_url)
             .field("project_scope", &self.project_scope)
             .field("oauth_scopes", &self.oauth_scopes)
+            .field("internal_capabilities", &self.internal_capabilities)
             .field("dev_user_id", &"<redacted>")
             .field("callback_port", &self.callback_port)
             .field(
@@ -141,7 +147,8 @@ impl AuthConfig {
             data_dir: data_dir.into(),
             scaffold_url: None,
             project_scope: "ashler-staging".into(),
-            oauth_scopes: DEFAULT_SCOPES.into(),
+            oauth_scopes: DEFAULT_OAUTH_SCOPES.into(),
+            internal_capabilities: DEFAULT_INTERNAL_CAPABILITIES.into(),
             dev_user_id: "dev-user".into(),
             callback_port: None,
             device_join_grant: None,
@@ -379,15 +386,15 @@ impl Auth {
         self.inner.state_tx.borrow().clone()
     }
 
-    /// Capabilities verified with the current control-plane session. Local
-    /// development uses the configured scope list; authenticated modes expose
-    /// only the exact scopes returned by Scaffold.
+    /// Internal Comet capabilities available to the current principal. Local
+    /// development uses the configured internal capability list; authenticated
+    /// Scaffold scopes are translated into the corresponding internal vocabulary.
     pub fn capabilities(&self) -> Vec<String> {
         if self.inner.scaffold.is_none() && !self.inner.device_mode {
             return self
                 .inner
                 .config
-                .oauth_scopes
+                .internal_capabilities
                 .split_whitespace()
                 .map(str::to_string)
                 .collect();
@@ -659,7 +666,7 @@ impl Auth {
         }
         if !required_scopes_present(&self.inner.config.oauth_scopes, &protected.scopes_supported) {
             return Err(EngineError::Other(
-                "Scaffold does not advertise the required Ashler Comet capabilities".into(),
+                "Scaffold does not advertise the required remote-code OAuth scopes".into(),
             ));
         }
 
@@ -831,7 +838,7 @@ impl Auth {
                 email: session.actor.sub,
                 name: session.actor.display_name,
             },
-            capabilities: session.scopes,
+            capabilities: capabilities_from_remote_code_scopes(&session.scopes),
         })
     }
 
@@ -933,6 +940,29 @@ fn required_scopes_present(required: &str, granted: &[String]) -> bool {
     required
         .split_whitespace()
         .all(|scope| granted.iter().any(|candidate| candidate == scope))
+}
+
+fn capabilities_from_remote_code_scopes(scopes: &[String]) -> Vec<String> {
+    let has_scope = |required: &str| scopes.iter().any(|scope| scope == required);
+    [
+        ("session.read", has_scope("remote_code:read")),
+        ("session.chat", has_scope("remote_code:write")),
+        (
+            "session.control",
+            has_scope("remote_code:exec") || has_scope("remote_code:lifecycle"),
+        ),
+        ("session.annotate", has_scope("remote_code:write")),
+        ("session.invite", has_scope("remote_code:create")),
+        ("session.files", has_scope("remote_code:write")),
+        (
+            "session.environment",
+            has_scope("remote_code:exec") || has_scope("remote_code:lifecycle"),
+        ),
+    ]
+    .into_iter()
+    .filter(|&(_, granted)| granted)
+    .map(|(capability, _)| capability.to_string())
+    .collect()
 }
 
 fn device_grant_exchange_url(edge_url: &str) -> Result<reqwest::Url, EngineError> {
@@ -1129,6 +1159,35 @@ mod tests {
             "session.read session.control",
             &granted
         ));
+    }
+
+    #[test]
+    fn oauth_defaults_use_platform_scopes_while_dev_keeps_internal_capabilities() {
+        let mut config = AuthConfig::new("http://localhost:27640", PathBuf::new());
+        assert_eq!(
+            config.oauth_scopes,
+            "remote_code:create remote_code:read remote_code:write remote_code:exec remote_code:lifecycle"
+        );
+        config.internal_capabilities = "session.read session.files".into();
+
+        let auth = Auth::new(config);
+        assert_eq!(auth.capabilities().join(" "), "session.read session.files");
+    }
+
+    #[test]
+    fn platform_scopes_map_to_least_privilege_internal_capabilities() {
+        let all_scopes = DEFAULT_OAUTH_SCOPES
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            capabilities_from_remote_code_scopes(&all_scopes).join(" "),
+            "session.read session.chat session.control session.annotate session.invite session.files session.environment"
+        );
+        assert_eq!(
+            capabilities_from_remote_code_scopes(&["remote_code:read".into()]).join(" "),
+            "session.read"
+        );
     }
 
     #[test]

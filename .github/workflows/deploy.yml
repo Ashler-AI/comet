@@ -5,6 +5,13 @@ on:
     branches: [main]
     paths:
       - edge/**
+      - apps/comet/**
+      - crates/**
+      - scripts/**
+      - vendor/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
       - .github/workflows/deploy.yml
   workflow_dispatch:
     inputs:
@@ -38,7 +45,22 @@ jobs:
       - name: Install locked edge dependencies
         working-directory: edge
         run: npm ci
-      - name: Headless two-device collaboration smoke
+      - name: Install native Rust build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcb1-dev libx11-xcb-dev \
+            libfontconfig1-dev libfreetype-dev libasound2-dev \
+            libvulkan-dev pkg-config cmake
+      - name: Select checked-in Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Build real headless host
+        run: cargo build --locked --package comet --bin comet
+      - name: Real local Edge and Rust collaboration smoke
+        env:
+          COMET_BIN: ${{ github.workspace }}/target/debug/comet
         run: node scripts/headless-collaboration-smoke.mjs
       - name: Generate Worker binding types
         working-directory: edge

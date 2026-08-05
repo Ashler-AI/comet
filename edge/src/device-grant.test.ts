@@ -1,11 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   authorizedDeviceSocketRole,
   canonicalGrantEnvelope,
   deviceGrantTargetsRoom,
+  DeviceRoom,
+  enforceDeviceHostGrantAuthority,
   parseTrustedDeviceGrant,
   rpcAllowedForScopedHost
 } from "./device-room";
+import { DEVICE_HOST_AUTH_HEADER, stripTrustedAuthHeaders } from "./env";
 
 const now = 1_800_000_000_000;
 const rawGrant = {
@@ -66,13 +69,126 @@ describe("trusted device grants", () => {
 });
 
 describe("device host authentication", () => {
-  it("derives host role only from a verified device grant", () => {
-    expect(authorizedDeviceSocketRole("host", true)).toBe("host");
+  it("allows trusted local engines to host while keeping clients grantless", () => {
+    expect(authorizedDeviceSocketRole("host", false, "local")).toBe("host");
+    expect(authorizedDeviceSocketRole("host", false)).toBeUndefined();
+    expect(authorizedDeviceSocketRole("client", false)).toBe("client");
+    expect(authorizedDeviceSocketRole("client", false, "local")).toBeUndefined();
+  });
+
+  it("requires sandbox host grants and rejects device grants as clients", () => {
+    expect(authorizedDeviceSocketRole("host", true, "sandbox")).toBe("host");
+    expect(authorizedDeviceSocketRole("host", true, "local")).toBeUndefined();
+    expect(authorizedDeviceSocketRole("host", false, "sandbox")).toBeUndefined();
+    expect(authorizedDeviceSocketRole("client", true)).toBeUndefined();
     expect(deviceGrantTargetsRoom(rawGrant.targetDeviceId, rawGrant.targetDeviceId)).toBe(true);
     expect(deviceGrantTargetsRoom(rawGrant.targetDeviceId, "another-device")).toBe(false);
-    expect(authorizedDeviceSocketRole("host", false)).toBeUndefined();
-    expect(authorizedDeviceSocketRole("client", true)).toBeUndefined();
-    expect(authorizedDeviceSocketRole("client", false)).toBe("client");
+  });
+
+  it("strips spoofed host authority from public input", () => {
+    const headers = new Headers({ [DEVICE_HOST_AUTH_HEADER]: "sandbox" });
+    stripTrustedAuthHeaders(headers);
+    expect(headers.get(DEVICE_HOST_AUTH_HEADER)).toBeNull();
+  });
+});
+
+describe("device host startup", () => {
+  it("delivers verified authority before replaying queued work", () => {
+    const grant = parseTrustedDeviceGrant(
+      JSON.stringify(rawGrant),
+      rawGrant.subject,
+      rawGrant.scope.projectId,
+      now
+    )!;
+    const delivered: string[] = [];
+    const room = {
+      deliver: vi.fn(() => delivered.push("grant")),
+      replayNudges: vi.fn(() => delivered.push("nudge"))
+    } as unknown as DeviceRoom;
+    DeviceRoom.prototype.deliverHostStartup.call(
+      room,
+      {} as WebSocket,
+      grant
+    );
+    expect(delivered).toEqual(["grant", "nudge"]);
+  });
+});
+
+describe("open device host grant authority", () => {
+  it("keeps local hosts outside grant status checks", async () => {
+    const ws = { close: vi.fn() };
+    const validate = vi.fn(async () => false);
+
+    await expect(
+      enforceDeviceHostGrantAuthority(
+        ws,
+        { hostAuthorization: "local" },
+        now,
+        validate
+      )
+    ).resolves.toBe(true);
+    expect(validate).not.toHaveBeenCalled();
+    expect(ws.close).not.toHaveBeenCalled();
+  });
+
+  it("revalidates an active sandbox grant on every routing decision", async () => {
+    const ws = { close: vi.fn() };
+    let active = true;
+    const validate = vi.fn(async () => active);
+    const state = {
+      hostAuthorization: "sandbox" as const,
+      grant: { grantId: rawGrant.grantId, expiresAt: rawGrant.expiresAt }
+    };
+
+    await expect(enforceDeviceHostGrantAuthority(ws, state, now, validate)).resolves.toBe(true);
+    await expect(enforceDeviceHostGrantAuthority(ws, state, now, validate)).resolves.toBe(true);
+    expect(validate).toHaveBeenCalledTimes(2);
+
+    active = false;
+    await expect(enforceDeviceHostGrantAuthority(ws, state, now, validate)).resolves.toBe(false);
+    expect(ws.close).toHaveBeenCalledWith(4403, "device grant invalid");
+  });
+
+  it("fails closed at cached expiry without consulting status", async () => {
+    const ws = { close: vi.fn() };
+    const validate = vi.fn(async () => true);
+
+    await expect(
+      enforceDeviceHostGrantAuthority(
+        ws,
+        {
+          hostAuthorization: "sandbox",
+          grant: { grantId: rawGrant.grantId, expiresAt: now }
+        },
+        now,
+        validate
+      )
+    ).resolves.toBe(false);
+    expect(validate).not.toHaveBeenCalled();
+    expect(ws.close).toHaveBeenCalledWith(4403, "device grant invalid");
+  });
+
+  it("closes only the sandbox host attached to an immediately revoked grant", async () => {
+    const matching = {
+      deserializeAttachment: () => ({
+        hostAuthorization: "sandbox",
+        grant: { grantId: rawGrant.grantId, expiresAt: rawGrant.expiresAt }
+      }),
+      close: vi.fn()
+    };
+    const local = {
+      deserializeAttachment: () => ({ hostAuthorization: "local" }),
+      close: vi.fn()
+    };
+    const room = {
+      revokedGrants: new Set<string>(),
+      ctx: { getWebSockets: () => [matching, local] }
+    } as unknown as DeviceRoom;
+
+    await DeviceRoom.prototype.revokeGrant.call(room, rawGrant.grantId);
+
+    expect(matching.close).toHaveBeenCalledWith(4403, "device grant revoked");
+    expect(local.close).not.toHaveBeenCalled();
   });
 });
 

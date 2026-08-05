@@ -118,12 +118,14 @@ describe("grant revocation delivery", () => {
       grantId: string;
       projectId: string;
       sessionId: string;
+      targetDeviceId: string;
       accessExpiresAt: number;
       revokedAt?: number;
     } = {
       grantId: "grant-1",
       projectId: "ashler-staging",
       sessionId: "session-1",
+      targetDeviceId: "device-1",
       accessExpiresAt: Date.now() + 60_000
     };
     const ctx = {
@@ -143,7 +145,7 @@ describe("grant revocation delivery", () => {
     expect((await authority.fetch(statusRequest)).status).toBe(401);
   });
 
-  it("notifies the scoped active session room after revocation is durable", async () => {
+  it("notifies the exact session and device rooms after revocation is durable", async () => {
     const records = new Map<string, unknown>();
     records.set("grant", {
       grantId: "grant-1",
@@ -161,8 +163,10 @@ describe("grant revocation delivery", () => {
       accessHash: "unused",
       accessExpiresAt: Date.now() + 60_000
     });
-    const notifyRoom = vi.fn(async (_request: Request) => new Response(null, { status: 204 }));
-    const roomIdFromName = vi.fn((name: string) => name);
+    const notifySession = vi.fn(async (_request: Request) => new Response(null, { status: 204 }));
+    const notifyDevice = vi.fn(async (_request: Request) => new Response(null, { status: 204 }));
+    const sessionIdFromName = vi.fn((name: string) => name);
+    const deviceIdFromName = vi.fn((name: string) => name);
     const ctx = {
       storage: {
         get: async (key: string) => records.get(key),
@@ -171,8 +175,12 @@ describe("grant revocation delivery", () => {
     } as unknown as DurableObjectState;
     const env = {
       SESSION_ROOMS: {
-        idFromName: roomIdFromName,
-        get: (_id: string) => ({ fetch: notifyRoom })
+        idFromName: sessionIdFromName,
+        get: (_id: string) => ({ fetch: notifySession })
+      },
+      DEVICE_ROOMS: {
+        idFromName: deviceIdFromName,
+        get: (_id: string) => ({ fetch: notifyDevice })
       }
     } as unknown as Env;
     const authority = new AuthGrant(ctx, env);
@@ -186,10 +194,15 @@ describe("grant revocation delivery", () => {
 
     expect(response.status).toBe(200);
     expect(records.get("grant")).toMatchObject({ revokedAt: expect.any(Number) });
-    expect(notifyRoom).toHaveBeenCalledOnce();
-    expect(roomIdFromName).toHaveBeenCalledWith("s3/ashler-staging/session-1");
-    const notification = notifyRoom.mock.calls[0]?.[0];
-    expect(notification?.headers.get(GRANT_EVENT_HEADER)).toBe("revoke");
-    await expect(notification?.json()).resolves.toEqual({ grantId: "grant-1" });
+    expect(notifySession).toHaveBeenCalledOnce();
+    expect(notifyDevice).toHaveBeenCalledOnce();
+    expect(sessionIdFromName).toHaveBeenCalledWith("s3/ashler-staging/session-1");
+    expect(deviceIdFromName).toHaveBeenCalledWith("d3/ashler-staging/device-1");
+    const sessionNotification = notifySession.mock.calls[0]?.[0];
+    const deviceNotification = notifyDevice.mock.calls[0]?.[0];
+    expect(sessionNotification?.headers.get(GRANT_EVENT_HEADER)).toBe("revoke");
+    expect(deviceNotification?.headers.get(GRANT_EVENT_HEADER)).toBe("revoke");
+    await expect(sessionNotification?.json()).resolves.toEqual({ grantId: "grant-1" });
+    await expect(deviceNotification?.json()).resolves.toEqual({ grantId: "grant-1" });
   });
 });

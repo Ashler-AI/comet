@@ -15,6 +15,7 @@ import {
   AUTH_GRANT_HEADER,
   AUTH_PROJECT_HEADER,
   AUTH_USER_HEADER,
+  DEVICE_HOST_AUTH_HEADER,
   ROOM_KIND_HEADER,
   stripTrustedAuthHeaders,
   type Env
@@ -25,7 +26,8 @@ import { SessionRoom } from "./session-room";
 import {
   authorizedDeviceSocketRole,
   deviceGrantTargetsRoom,
-  DeviceRoom
+  DeviceRoom,
+  type DeviceHostAuthorization
 } from "./device-room";
 
 export { SessionRoom, DeviceRoom, AuthGrant };
@@ -33,6 +35,7 @@ export { SessionRoom, DeviceRoom, AuthGrant };
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const SHA256_RE = /^[a-f0-9]{64}$/;
 const MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024;
+const SANDBOX_DEVICE_PREFIX = "comet-scaffold-";
 const RELEASE_FILE_RE = /^[A-Za-z0-9._-]{1,200}$/;
 
 const json = (value: unknown, status = 200): Response =>
@@ -53,7 +56,8 @@ const forward = (
   identity: Verified,
   path: string,
   search = "",
-  roomKind?: "workspace"
+  roomKind?: "workspace",
+  deviceHostAuthorization?: DeviceHostAuthorization
 ): Promise<Response> => {
   const stub = ns.get(ns.idFromName(name));
   const url = new URL(request.url);
@@ -97,6 +101,9 @@ const forward = (
     );
   }
   if (roomKind) headers.set(ROOM_KIND_HEADER, roomKind);
+  if (deviceHostAuthorization) {
+    headers.set(DEVICE_HOST_AUTH_HEADER, deviceHostAuthorization);
+  }
   return stub.fetch(new Request(url.toString(), { ...requestInit(request), headers }));
 };
 
@@ -240,7 +247,20 @@ export default {
       const room = `d3/${identity.projectScope}/${deviceId}`;
       if (parts[2] === "ws") {
         if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") return json({ error: "expected_websocket" }, 426);
-        const role = authorizedDeviceSocketRole(url.searchParams.get("role"), deviceCredential);
+        const requestedRole = url.searchParams.get("role");
+        let hostAuthorization: DeviceHostAuthorization | undefined;
+        if (requestedRole === "host") {
+          if (deviceCredential) {
+            hostAuthorization = "sandbox";
+          } else if (!deviceId.startsWith(SANDBOX_DEVICE_PREFIX)) {
+            hostAuthorization = "local";
+          }
+        }
+        const role = authorizedDeviceSocketRole(
+          requestedRole,
+          deviceCredential,
+          hostAuthorization
+        );
         if (!role) return json({ error: "forbidden" }, 403);
         if (
           role === "host"
@@ -251,7 +271,16 @@ export default {
           return json({ error: "forbidden" }, 403);
         }
         const connId = url.searchParams.get("connId") ?? crypto.randomUUID();
-        return forward(env.DEVICE_ROOMS, room, request, identity, "/ws", `?role=${role}&connId=${encodeURIComponent(connId)}`);
+        return forward(
+          env.DEVICE_ROOMS,
+          room,
+          request,
+          identity,
+          "/ws",
+          `?role=${role}&connId=${encodeURIComponent(connId)}`,
+          undefined,
+          hostAuthorization
+        );
       }
       if (deviceCredential) return json({ error: "forbidden" }, 403);
       if (parts[2] === "sidecar" && parts[3] && /^[a-z0-9-]{1,64}$/.test(parts[3])) {

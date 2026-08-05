@@ -1062,7 +1062,7 @@ impl ScaffoldRuntime {
                 &ExecBody {
                     argv: &argv,
                     mode: "background",
-                    timeout_ms: 24 * 60 * 60 * 1_000,
+                    timeout_ms: 0,
                 },
                 cancellation,
             )
@@ -1358,6 +1358,8 @@ mod tests {
         assert!(exec_bodies[1].contains(r#""chmod","600""#));
         assert!(exec_bodies[2].contains(r#""--device-bootstrap-file""#));
         assert!(!exec_bodies[2].contains("--device-join-grant"));
+        assert!(exec_bodies[2].contains(r#""mode":"background""#));
+        assert!(exec_bodies[2].contains(r#""timeoutMs":0"#));
         let bootstrap_request = requests
             .iter()
             .find(|request| request.starts_with("PUT /api/code-sandboxes/sandbox-a/files?"))

@@ -16,12 +16,17 @@
  */
 import { BytesReader, BytesWriter } from "loro-protocol";
 import { createBlobStore, getJsonBlob, putJsonBlob, type BlobStore } from "./blobs";
-import { AUTH_USER_HEADER, type Env } from "./env";
+import {
+  AUTH_CAPABILITIES_HEADER,
+  AUTH_GRANT_HEADER,
+  AUTH_PROJECT_HEADER,
+  AUTH_USER_HEADER,
+  DEVICE_HOST_AUTH_HEADER,
+  GRANT_EVENT_HEADER,
+  type Env
+} from "./env";
 
-const AUTH_PROJECT_HEADER = "x-comet-auth-project";
-const AUTH_CAPABILITIES_HEADER = "x-comet-auth-capabilities";
 const SESSION_READ = "session.read";
-const AUTH_GRANT_HEADER = "x-comet-auth-grant";
 
 export interface TrustedDeviceGrant {
   grantId: string;
@@ -144,28 +149,71 @@ interface SocketState {
   role: "host" | "client";
   connId: string;
   grant?: TrustedDeviceGrant;
+  hostAuthorization?: DeviceHostAuthorization;
   /** Accept time — the liveness floor until the socket's first auto-pong. */
   joinedAt?: number;
+  /** A newer socket claimed this logical connection id. */
+  superseded?: boolean;
 }
 
 const HOST_TAG = "host";
 const clientTag = (connId: string) => `client:${connId}`;
+export type DeviceHostAuthorization = "local" | "sandbox";
+
 export const authorizedDeviceSocketRole = (
   requestedRole: string | null,
-  hasDeviceGrant: boolean
+  hasDeviceGrant: boolean,
+  hostAuthorization?: DeviceHostAuthorization
 ): "host" | "client" | undefined => {
-  if (requestedRole === "host") return hasDeviceGrant ? "host" : undefined;
+  if (requestedRole === "host") {
+    const requiredAuthorization = hasDeviceGrant ? "sandbox" : "local";
+    return hostAuthorization === requiredAuthorization ? "host" : undefined;
+  }
   if (requestedRole === null || requestedRole === "client") {
-    return hasDeviceGrant ? undefined : "client";
+    return hasDeviceGrant || hostAuthorization !== undefined ? undefined : "client";
   }
   return undefined;
 };
+
+export interface DeviceHostAuthorityState {
+  readonly hostAuthorization?: DeviceHostAuthorization;
+  readonly grant?: Pick<TrustedDeviceGrant, "grantId" | "expiresAt">;
+}
+
+export const enforceDeviceHostGrantAuthority = async (
+  ws: Pick<WebSocket, "close">,
+  state: DeviceHostAuthorityState | null,
+  now: number,
+  validate: (grantId: string) => Promise<boolean>
+): Promise<boolean> => {
+  let authorized = state?.hostAuthorization === "local" && state.grant === undefined;
+  if (state?.hostAuthorization === "sandbox" && state.grant) {
+    const { grantId, expiresAt } = state.grant;
+    if (
+      GRANT_ID_RE.test(grantId) &&
+      Number.isSafeInteger(expiresAt) &&
+      expiresAt > now
+    ) {
+      try {
+        authorized = (await validate(grantId)) === true;
+      } catch {
+        authorized = false;
+      }
+    }
+  }
+  if (authorized) return true;
+  try {
+    ws.close(4403, "device grant invalid");
+  } catch {
+    /* already gone */
+  }
+  return false;
+};
+
 export const deviceGrantTargetsRoom = (
   credentialTargetDeviceId: string | undefined,
   roomTargetDeviceId: string
 ): boolean => credentialTargetDeviceId === roomTargetDeviceId;
-
-
 
 /** How long a host socket may go without proving liveness before the relay
  * stops routing to it.
@@ -201,11 +249,13 @@ const CHAT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
 export class DeviceRoom implements DurableObject {
   private readonly ctx: DurableObjectState;
+  private readonly env: Env;
   private readonly blobs: BlobStore;
+  private readonly revokedGrants = new Set<string>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
-    void env;
+    this.env = env;
     ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     );
@@ -253,8 +303,71 @@ export class DeviceRoom implements DurableObject {
     );
   }
 
+  /** Most recent non-superseded client for a logical connection id.
+   * Some runtimes retain a closing WebSocket, so array order is not a
+   * sufficient reconnect policy. */
+  private liveClient(connId: string): WebSocket | undefined {
+    let latest: { ws: WebSocket; joinedAt: number } | undefined;
+    for (const ws of this.ctx.getWebSockets(clientTag(connId))) {
+      const state = ws.deserializeAttachment() as SocketState | null;
+      if (state?.role !== "client" || state.superseded) continue;
+      const joinedAt = state.joinedAt ?? 0;
+      if (!latest || joinedAt > latest.joinedAt) latest = { ws, joinedAt };
+    }
+    return latest?.ws;
+  }
+
+  async revokeGrant(grantId: string): Promise<void> {
+    this.revokedGrants.add(grantId);
+    for (const ws of this.ctx.getWebSockets(HOST_TAG)) {
+      const state = ws.deserializeAttachment() as SocketState | null;
+      if (state?.grant?.grantId !== grantId) continue;
+      try {
+        ws.close(4403, "device grant revoked");
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+
+  private async authorizeHost(ws: WebSocket): Promise<boolean> {
+    const state = ws.deserializeAttachment() as SocketState | null;
+    return enforceDeviceHostGrantAuthority(ws, state, Date.now(), async (grantId) => {
+      if (this.revokedGrants.has(grantId)) return false;
+      const stub = this.env.AUTH_GRANTS.get(this.env.AUTH_GRANTS.idFromName(grantId));
+      const response = await stub.fetch(
+        new Request(`https://grant.internal/status?grantId=${encodeURIComponent(grantId)}`, {
+          headers: { [GRANT_EVENT_HEADER]: "status" }
+        })
+      );
+      return response.status === 204 && !this.revokedGrants.has(grantId);
+    });
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    if (url.pathname === "/grant-revoked" && request.method === "POST") {
+      if (request.headers.get(GRANT_EVENT_HEADER) !== "revoke") {
+        return new Response("forbidden", { status: 403 });
+      }
+      let body: unknown;
+      try {
+        body = await request.json();
+      } catch {
+        return new Response("invalid request", { status: 400 });
+      }
+      if (
+        !body ||
+        typeof body !== "object" ||
+        !("grantId" in body) ||
+        typeof body.grantId !== "string" ||
+        !GRANT_ID_RE.test(body.grantId)
+      ) {
+        return new Response("invalid request", { status: 400 });
+      }
+      await this.revokeGrant(body.grantId);
+      return new Response(null, { status: 204 });
+    }
     const userId = request.headers.get(AUTH_USER_HEADER);
     if (!userId) return new Response("unauthenticated", { status: 401 });
     const projectScope = request.headers.get(AUTH_PROJECT_HEADER);
@@ -268,6 +381,14 @@ export class DeviceRoom implements DurableObject {
     const encodedGrant = request.headers.get(AUTH_GRANT_HEADER);
     const grant = parseTrustedDeviceGrant(encodedGrant, userId, projectScope, Date.now());
     if (encodedGrant && !grant) return new Response("invalid grant", { status: 403 });
+    const encodedHostAuthorization = request.headers.get(DEVICE_HOST_AUTH_HEADER);
+    const hostAuthorization =
+      encodedHostAuthorization === "local" || encodedHostAuthorization === "sandbox"
+        ? encodedHostAuthorization
+        : undefined;
+    if (encodedHostAuthorization && !hostAuthorization) {
+      return new Response("forbidden", { status: 403 });
+    }
     if (grant) {
       if (grant.capabilities.some((capability) => !capabilities.includes(capability))) {
         return new Response("forbidden", { status: 403 });
@@ -281,10 +402,17 @@ export class DeviceRoom implements DurableObject {
     const owner = this.getMeta("owner");
 
     if (url.pathname === "/ws") {
-      const role = authorizedDeviceSocketRole(url.searchParams.get("role"), grant !== undefined);
+      const role = authorizedDeviceSocketRole(
+        url.searchParams.get("role"),
+        grant !== undefined,
+        hostAuthorization
+      );
       if (!role) return new Response("forbidden", { status: 403 });
       if (role === "host") {
         if (!hasCapability(capabilities, "session.environment")) {
+          return new Response("forbidden", { status: 403 });
+        }
+        if (hostAuthorization === "local" && this.getMeta("targetDeviceId")) {
           return new Response("forbidden", { status: 403 });
         }
         if (!owner) this.setMeta("owner", projectScope);
@@ -293,18 +421,11 @@ export class DeviceRoom implements DurableObject {
         return new Response("forbidden", { status: 403 });
       }
       const connId = url.searchParams.get("connId") ?? crypto.randomUUID();
+      const staleClients =
+        role === "client" ? this.ctx.getWebSockets(clientTag(connId)) : [];
       const pair = new WebSocketPair();
       if (role === "host") {
-        // One live host socket: close any predecessor (backend restart).
-        for (const stale of this.ctx.getWebSockets(HOST_TAG)) {
-          try {
-            stale.close(4409, "superseded by new host connection");
-          } catch {
-            /* already gone */
-          }
-        }
         this.ctx.acceptWebSocket(pair[1], [HOST_TAG]);
-        this.replayNudges(pair[1]);
       } else {
         this.ctx.acceptWebSocket(pair[1], [clientTag(connId)]);
       }
@@ -315,17 +436,35 @@ export class DeviceRoom implements DurableObject {
         role,
         connId,
         joinedAt: Date.now(),
+        ...(role === "host" ? { hostAuthorization } : {}),
         ...(grant ? { grant } : {})
       };
       pair[1].serializeAttachment(state);
-      if (role === "host" && grant) {
-        this.deliver(
-          pair[1],
-          { s: grant.scope.sessionId, k: GRANT_KIND },
-          new TextEncoder().encode(
-            JSON.stringify(canonicalGrantEnvelope(grant))
-          )
-        );
+      if (role === "client") {
+        for (const stale of staleClients) {
+          const staleState = stale.deserializeAttachment() as SocketState | null;
+          if (staleState) stale.serializeAttachment({ ...staleState, superseded: true });
+          try {
+            stale.close(4409, "superseded by new client connection");
+          } catch {
+            /* already gone */
+          }
+        }
+      }
+      if (role === "host") {
+        if (!(await this.authorizeHost(pair[1]))) {
+          return new Response(null, { status: 101, webSocket: pair[0] });
+        }
+        // Only an authorized successor may evict the previous host.
+        for (const stale of this.ctx.getWebSockets(HOST_TAG)) {
+          if (stale === pair[1]) continue;
+          try {
+            stale.close(4409, "superseded by new host connection");
+          } catch {
+            /* already gone */
+          }
+        }
+        this.deliverHostStartup(pair[1], grant);
       }
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
@@ -378,7 +517,7 @@ export class DeviceRoom implements DurableObject {
       const chatId = body?.chatId;
       if (!chatId || !CHAT_ID_RE.test(chatId)) return json({ error: "bad_chat_id" }, 400);
       const host = this.liveHost();
-      if (host) {
+      if (host && (await this.authorizeHost(host))) {
         this.deliver(host, { s: chatId, k: NUDGE_KIND }, new TextEncoder().encode(JSON.stringify({ chatId })));
         return json({ delivered: true });
       }
@@ -415,9 +554,26 @@ export class DeviceRoom implements DurableObject {
     this.ctx.storage.sql.exec("DELETE FROM pending_nudges");
   }
 
-  webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): void {
+  deliverHostStartup(host: WebSocket, grant?: TrustedDeviceGrant): void {
+    if (grant) {
+      this.deliver(
+        host,
+        { s: grant.scope.sessionId, k: GRANT_KIND },
+        new TextEncoder().encode(JSON.stringify(canonicalGrantEnvelope(grant)))
+      );
+    }
+    this.replayNudges(host);
+  }
+
+  async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): Promise<void> {
+    const state = ws.deserializeAttachment() as SocketState | null;
+    if (!state) {
+      ws.close(1008, "Missing socket authority");
+      return;
+    }
+    if (state.superseded) return;
+    if (state.role === "host" && !(await this.authorizeHost(ws))) return;
     if (typeof message === "string") return; // ping/pong auto-response
-    const state = ws.deserializeAttachment() as SocketState;
     let frame: { header: DeviceFrameHeader; payload: Uint8Array };
     try {
       frame = decodeDeviceFrame(new Uint8Array(message));
@@ -446,9 +602,13 @@ export class DeviceRoom implements DurableObject {
         return;
       }
       const host = this.liveHost();
-      const hostGrant = host
-        ? (host.deserializeAttachment() as SocketState | null)?.grant
-        : undefined;
+      if (!host || !(await this.authorizeHost(host))) {
+        // Host offline or unauthorized: bounce a relay-level error so the
+        // client can surface "device is asleep" instead of hanging.
+        this.deliver(ws, { s: frame.header.s, k: RELAY_KIND }, encodeRelayError("host_offline"));
+        return;
+      }
+      const hostGrant = (host.deserializeAttachment() as SocketState | null)?.grant;
       if (hostGrant && !rpcAllowedForScopedHost(frame.header, frame.payload, hostGrant)) {
         this.deliver(
           ws,
@@ -457,19 +617,13 @@ export class DeviceRoom implements DurableObject {
         );
         return;
       }
-      if (!host) {
-        // Host offline: bounce a relay-level error so the client can surface
-        // "device is asleep" instead of hanging.
-        this.deliver(ws, { s: frame.header.s, k: RELAY_KIND }, encodeRelayError("host_offline"));
-        return;
-      }
       this.deliver(host, { s: frame.header.s, k: frame.header.k, from: state.connId }, frame.payload);
       return;
     }
     // Host frame: route by `to`.
     const to = frame.header.to;
     if (!to) return;
-    const target = this.ctx.getWebSockets(clientTag(to))[0];
+    const target = this.liveClient(to);
     if (!target) {
       this.deliver(ws, { s: frame.header.s, k: RELAY_KIND, to }, encodeRelayError("client_gone"));
       return;
@@ -477,13 +631,14 @@ export class DeviceRoom implements DurableObject {
     this.deliver(target, { s: frame.header.s, k: frame.header.k }, frame.payload);
   }
 
-  webSocketClose(ws: WebSocket): void {
+  async webSocketClose(ws: WebSocket): Promise<void> {
     const state = ws.deserializeAttachment() as SocketState | null;
     if (!state) return;
+    if (state.superseded) return;
     if (state.role === "client") {
       // Tell the host so it can tear down any per-client streams (ptys etc.).
       const host = this.liveHost();
-      if (host) {
+      if (host && (await this.authorizeHost(host))) {
         this.deliver(host, { s: "", k: RELAY_KIND, from: state.connId }, encodeRelayError("client_closed"));
       }
       return;
@@ -501,8 +656,8 @@ export class DeviceRoom implements DurableObject {
     }
   }
 
-  webSocketError(ws: WebSocket): void {
-    this.webSocketClose(ws);
+  async webSocketError(ws: WebSocket): Promise<void> {
+    await this.webSocketClose(ws);
   }
 
   private deliver(ws: WebSocket, header: DeviceFrameHeader, payload: Uint8Array): void {

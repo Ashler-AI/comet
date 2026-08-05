@@ -38,6 +38,22 @@ interface ScaffoldSession {
   readonly scopes?: unknown;
 }
 
+const REMOTE_CODE_CAPABILITIES: Readonly<Record<string, readonly string[]>> = {
+  "remote_code:create": ["session.invite"],
+  "remote_code:read": ["session.read"],
+  "remote_code:write": ["session.chat", "session.annotate", "session.files"],
+  "remote_code:exec": ["session.control", "session.environment"],
+  "remote_code:lifecycle": ["session.control", "session.environment"]
+};
+
+const capabilitiesFromRemoteCodeScopes = (scopes: readonly string[]): readonly string[] => [
+  ...new Set(
+    scopes.flatMap((scope) =>
+      Object.hasOwn(REMOTE_CODE_CAPABILITIES, scope) ? REMOTE_CODE_CAPABILITIES[scope] : []
+    )
+  )
+];
+
 const LOOPBACK_HOSTS: Record<string, true> = {
   localhost: true,
   "127.0.0.1": true,
@@ -112,12 +128,13 @@ export const verifyScaffoldToken = async (env: ScaffoldAuthEnv, token: string): 
   const scopes = Array.isArray(session.scopes)
     ? [...new Set(session.scopes.filter((scope): scope is string => typeof scope === "string" && scope.length > 0))]
     : [];
+  const capabilities = capabilitiesFromRemoteCodeScopes(scopes);
   if (
     session.ok !== true ||
     session.actor?.auth !== "iap" ||
     !subject ||
     normalizedOrigin(typeof session.resource === "string" ? session.resource : "") !== resource ||
-    !required.every((capability) => scopes.includes(capability))
+    !required.every((capability) => capabilities.includes(capability))
   ) {
     return undefined;
   }
@@ -125,7 +142,7 @@ export const verifyScaffoldToken = async (env: ScaffoldAuthEnv, token: string): 
     userId: subject,
     email: subject,
     projectScope,
-    capabilities: scopes,
+    capabilities,
     credential: "scaffold"
   };
 };

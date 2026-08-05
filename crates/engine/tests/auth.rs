@@ -113,7 +113,7 @@ async fn handle(mut stream: tokio::net::TcpStream, origin: String, state: Arc<Re
             serde_json::json!({
                 "resource": origin,
                 "authorization_servers": [origin],
-                "scopes_supported": ["session.read", "session.chat", "session.control", "session.annotate", "session.invite", "session.files", "session.environment"]
+                "scopes_supported": ["remote_code:create", "remote_code:read", "remote_code:write", "remote_code:exec", "remote_code:lifecycle"]
             }),
         )
         .await,
@@ -143,7 +143,7 @@ async fn handle(mut stream: tokio::net::TcpStream, origin: String, state: Arc<Re
                 serde_json::json!({
                     "access_token": "sc_rc_test_bearer",
                     "token_type": "Bearer",
-                    "scope": "session.read session.chat session.control session.annotate session.invite session.files session.environment",
+                    "scope": "remote_code:create remote_code:read remote_code:write remote_code:exec remote_code:lifecycle",
                     "resource": origin
                 }),
             )
@@ -156,7 +156,7 @@ async fn handle(mut stream: tokio::net::TcpStream, origin: String, state: Arc<Re
                 "ok": true,
                 "resource": origin,
                 "actor": {"sub": "developer@ashler.ai", "auth": "iap", "displayName": "Developer"},
-                "scopes": ["session.read", "session.chat", "session.control", "session.annotate", "session.invite", "session.files", "session.environment"]
+                "scopes": ["remote_code:create", "remote_code:read", "remote_code:write", "remote_code:exec", "remote_code:lifecycle"]
             }),
         )
         .await,
@@ -173,7 +173,7 @@ fn config(origin: &str, data_dir: &std::path::Path) -> AuthConfig {
 }
 
 #[tokio::test]
-async fn dcr_pkce_exchange_maps_iap_principal_and_persists_bearer() {
+async fn dcr_pkce_exchange_uses_remote_code_scopes_and_persists_internal_capabilities() {
     let stub = StubControlPlane::start().await;
     let directory = tempfile::tempdir().expect("tempdir");
     let auth = Auth::new(config(&stub.origin, directory.path()));
@@ -188,6 +188,16 @@ async fn dcr_pkce_exchange_maps_iap_principal_and_persists_bearer() {
             .map(|(_, value)| value.into_owned())
             .as_deref(),
         Some("S256")
+    );
+    assert_eq!(
+        parsed
+            .query_pairs()
+            .find(|(key, _)| key == "scope")
+            .map(|(_, value)| value.into_owned())
+            .as_deref(),
+        Some(
+            "remote_code:create remote_code:read remote_code:write remote_code:exec remote_code:lifecycle"
+        )
     );
     let state = parsed
         .query_pairs()
@@ -207,6 +217,10 @@ async fn dcr_pkce_exchange_maps_iap_principal_and_persists_bearer() {
         AuthState::SignedIn { user, project_scope }
             if user.id == "developer@ashler.ai" && project_scope == "ashler-staging"
     ));
+    assert_eq!(
+        auth.capabilities().join(" "),
+        "session.read session.chat session.control session.annotate session.invite session.files session.environment"
+    );
     let token_body = stub.requests.token_body.lock().expect("token body").clone();
     assert!(token_body.contains("code_verifier="));
     assert!(token_body.contains("resource="));
@@ -216,6 +230,10 @@ async fn dcr_pkce_exchange_maps_iap_principal_and_persists_bearer() {
         reloaded.access_token().await.as_deref(),
         Some("sc_rc_test_bearer")
     );
+    assert_eq!(
+        reloaded.capabilities().join(" "),
+        "session.read session.chat session.control session.annotate session.invite session.files session.environment"
+    );
 }
 
 #[tokio::test]
@@ -224,6 +242,7 @@ async fn explicit_dev_mode_never_contacts_scaffold() {
     let mut config = AuthConfig::new("http://127.0.0.1:9", directory.path());
     config.dev_user_id = "local-developer".into();
     config.project_scope = "ashler-local".into();
+    config.internal_capabilities = "session.read session.files".into();
     let auth = Auth::new(config);
     assert!(!auth.oauth_enabled());
     assert_eq!(
@@ -233,4 +252,5 @@ async fn explicit_dev_mode_never_contacts_scaffold() {
     assert!(
         matches!(auth.state(), AuthState::SignedIn { project_scope, .. } if project_scope == "ashler-local")
     );
+    assert_eq!(auth.capabilities().join(" "), "session.read session.files");
 }

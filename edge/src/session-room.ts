@@ -52,6 +52,7 @@ import {
   AUTH_USER_HEADER,
   GRANT_EVENT_HEADER,
   ROOM_KIND_HEADER,
+  SESSION_OWNER_AUTH_HEADER,
   type Env
 } from "./env";
 import { parseTrustedDeviceGrant } from "./device-room";
@@ -70,6 +71,16 @@ const parseCapabilities = (request: Request): string[] =>
   (request.headers.get(AUTH_CAPABILITIES_HEADER) ?? "").split(/\s+/).filter(Boolean);
 const canPublish = (capabilities: readonly string[]): boolean =>
   capabilities.some((capability) => PUBLISH_CAPABILITIES[capability] === true);
+
+const SESSION_OWNER_AUTH_VALUE = "verify";
+
+export const sessionOwnerForConnection = (
+  currentOwnerUserId: string | undefined,
+  userId: string,
+  workspace: boolean,
+  device: boolean
+): string | undefined =>
+  currentOwnerUserId ?? (!workspace && !device ? userId : undefined);
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RETAIN_MS = RETAIN_DAYS * DAY_MS;
@@ -304,6 +315,23 @@ export class SessionRoom implements DurableObject {
       await this.revokeGrant(body.grantId);
       return new Response(null, { status: 204 });
     }
+    if (url.pathname === "/authorize-owner") {
+      if (request.headers.get(SESSION_OWNER_AUTH_HEADER) !== SESSION_OWNER_AUTH_VALUE) {
+        return new Response("forbidden", { status: 403 });
+      }
+      if (request.method !== "GET") {
+        return new Response("method not allowed", { status: 405 });
+      }
+      const candidateUserId = request.headers.get(AUTH_USER_HEADER);
+      const candidateProjectScope = request.headers.get(AUTH_PROJECT_HEADER);
+      if (!candidateUserId || !candidateProjectScope) {
+        return new Response("unauthenticated", { status: 401 });
+      }
+      const ownsSession =
+        this.getMeta("projectScope") === candidateProjectScope &&
+        this.getMeta("ownerUserId") === candidateUserId;
+      return json({ ownsSession });
+    }
     const userId = request.headers.get(AUTH_USER_HEADER);
     if (!userId) return new Response("unauthenticated", { status: 401 });
     const projectScope = request.headers.get(AUTH_PROJECT_HEADER);
@@ -328,6 +356,14 @@ export class SessionRoom implements DurableObject {
       if (encodedGrant !== null && (!grant || grant.scope.sessionId !== chatId)) {
         return new Response("forbidden", { status: 403 });
       }
+      const currentOwnerUserId = this.getMeta("ownerUserId");
+      const ownerUserId = sessionOwnerForConnection(
+        currentOwnerUserId,
+        userId,
+        workspace,
+        grant !== undefined
+      );
+      if (!currentOwnerUserId && ownerUserId) this.setMeta("ownerUserId", ownerUserId);
       if (chatId && !this.getMeta("chatId")) this.setMeta("chatId", chatId);
       const deviceId = url.searchParams.get("device") ?? undefined;
       const pair = new WebSocketPair();

@@ -5,6 +5,7 @@ interface GrantAuthorityRecord {
   grantId: string;
   projectId: string;
   sessionId: string;
+  targetDeviceId: string;
   accessExpiresAt?: number;
   revokedAt?: number;
 }
@@ -20,7 +21,9 @@ const hasGrantScope = (value: unknown): value is GrantAuthorityRecord => {
     typeof record.projectId === "string" &&
     ID_RE.test(record.projectId) &&
     typeof record.sessionId === "string" &&
-    ID_RE.test(record.sessionId)
+    ID_RE.test(record.sessionId) &&
+    typeof record.targetDeviceId === "string" &&
+    ID_RE.test(record.targetDeviceId)
   );
 };
 
@@ -48,7 +51,6 @@ export class AuthGrant extends StoredAuthGrant {
     super(authorityCtx, authorityEnv);
   }
 
-
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/status") {
@@ -68,28 +70,47 @@ export class AuthGrant extends StoredAuthGrant {
     const response = await super.fetch(request);
 
     if (isRevocation && response.ok && record) {
-      const room = this.authorityEnv.SESSION_ROOMS.get(
-        this.authorityEnv.SESSION_ROOMS.idFromName(
-          `s3/${record.projectId}/${record.sessionId}`
-        )
+      const rooms = [
+        {
+          kind: "session",
+          stub: this.authorityEnv.SESSION_ROOMS.get(
+            this.authorityEnv.SESSION_ROOMS.idFromName(
+              `s3/${record.projectId}/${record.sessionId}`
+            )
+          )
+        },
+        {
+          kind: "device",
+          stub: this.authorityEnv.DEVICE_ROOMS.get(
+            this.authorityEnv.DEVICE_ROOMS.idFromName(
+              `d3/${record.projectId}/${record.targetDeviceId}`
+            )
+          )
+        }
+      ] as const;
+      await Promise.all(
+        rooms.map(async ({ kind, stub }) => {
+          try {
+            const notification = await stub.fetch(
+              new Request(`https://${kind}.internal/grant-revoked`, {
+                method: "POST",
+                headers: {
+                  [GRANT_EVENT_HEADER]: "revoke",
+                  "content-type": "application/json"
+                },
+                body: JSON.stringify({ grantId: record.grantId })
+              })
+            );
+            if (!notification.ok) {
+              throw new Error(`${kind} room returned ${notification.status}`);
+            }
+          } catch (error) {
+            // Authority is already revoked durably. Rooms fail closed before
+            // their next inbound or outbound frame if this immediate signal fails.
+            console.error("grant revocation delivery failed", kind, String(error));
+          }
+        })
       );
-      try {
-        const notification = await room.fetch(
-          new Request("https://session.internal/grant-revoked", {
-            method: "POST",
-            headers: {
-              [GRANT_EVENT_HEADER]: "revoke",
-              "content-type": "application/json"
-            },
-            body: JSON.stringify({ grantId: record.grantId })
-          })
-        );
-        if (!notification.ok) throw new Error(`room returned ${notification.status}`);
-      } catch (error) {
-        // Authority is already revoked durably. Rooms fail closed on their next
-        // inbound or outbound frame if this best-effort immediate signal fails.
-        console.error("grant revocation delivery failed", String(error));
-      }
     }
 
     return response;

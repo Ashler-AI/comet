@@ -1718,6 +1718,7 @@ mod tests {
             scaffold_url: None,
             project_scope: "project-a".into(),
             oauth_scopes: String::new(),
+            internal_capabilities: String::new(),
             dev_user_id: "accounts.google.com:subject-alice".into(),
             callback_port: None,
             device_join_grant: None,

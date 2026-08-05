@@ -175,6 +175,9 @@ struct DocHostInner {
     /// Host-local authority populated only by authenticated relay frames or the
     /// authenticated local identity path. Never imported from Loro.
     trusted_grants: Mutex<HashMap<String, TrustedGrant>>,
+    /// False between relay reconnect and the first verified grant frame.
+    /// Remote commands remain pending while authority is being refreshed.
+    edge_grants_ready: AtomicBool,
     /// Invalidates collaboration projections when host-local grants change.
     authority_tx: watch::Sender<u64>,
 }
@@ -434,6 +437,7 @@ impl DocHost {
                 workspace: OnceLock::new(),
                 handles: Mutex::new(HashMap::new()),
                 trusted_grants: Mutex::new(HashMap::new()),
+                edge_grants_ready: AtomicBool::new(false),
                 authority_tx,
             }),
         }
@@ -544,13 +548,18 @@ impl DocHost {
         {
             return Err("grant_envelope_scope_rejected");
         }
-        lock(&self.inner.trusted_grants).insert(
-            grant.id.clone(),
-            TrustedGrant {
-                grant: grant.clone(),
-                edge_derived: true,
-            },
-        );
+        {
+            let mut grants = lock(&self.inner.trusted_grants);
+            grants.retain(|_, trusted| !trusted.edge_derived);
+            grants.insert(
+                grant.id.clone(),
+                TrustedGrant {
+                    grant: grant.clone(),
+                    edge_derived: true,
+                },
+            );
+            self.inner.edge_grants_ready.store(true, Ordering::Release);
+        }
         self.inner
             .authority_tx
             .send_modify(|version| *version = version.wrapping_add(1));
@@ -602,8 +611,9 @@ impl DocHost {
     pub(crate) fn reset_edge_grants(&self) {
         let mut grants = lock(&self.inner.trusted_grants);
         let previous = grants.len();
+        let was_ready = self.inner.edge_grants_ready.swap(false, Ordering::AcqRel);
         grants.retain(|_, grant| !grant.edge_derived);
-        if grants.len() != previous {
+        if grants.len() != previous || was_ready {
             self.inner
                 .authority_tx
                 .send_modify(|version| *version = version.wrapping_add(1));
@@ -1076,7 +1086,8 @@ impl DocHost {
 
     /// Validate against a grant previously ingested from the control plane. Command-carried
     /// actor/scope strings are lookup inputs only and never confer authority themselves.
-    fn command_grant_authorized(&self, entry: &SessionCommandEntry) -> bool {
+    /// `None` means relay authority is refreshing, so the command must remain pending.
+    fn command_grant_authorization(&self, entry: &SessionCommandEntry) -> Option<bool> {
         let SessionCommandPayload::Control {
             actor_device_id,
             owner_device_id,
@@ -1088,43 +1099,60 @@ impl DocHost {
             // Run/steer/input commands authored by this device's local API carry
             // durable device-local provenance. A synced peer can copy `issuedBy`
             // in Loro, but cannot write this host's SQLite trust ledger.
-            return entry.issued_by == self.device_id()
-                && self
-                    .inner
-                    .store
-                    .is_trusted_local_command(&entry.id)
-                    .unwrap_or(false);
+            return Some(
+                entry.issued_by == self.device_id()
+                    && self
+                        .inner
+                        .store
+                        .is_trusted_local_command(&entry.id)
+                        .unwrap_or(false),
+            );
         };
         let Some(workspace) = self.workspace() else {
-            return false;
+            return Some(false);
         };
-        // A present grant is authoritative even when it is stale or revoked:
-        // never fall through to restart reconstruction and bypass that state.
-        if let Some(trusted) = lock(&self.inner.trusted_grants).get(grant_id).cloned() {
-            return grant_authorizes_control_entry(
-                &trusted.grant,
-                entry,
-                workspace.project_scope(),
-                now_ms(),
-            );
+        {
+            let grants = lock(&self.inner.trusted_grants);
+            if matches!(source, comet_proto::AgentSessionSource::Scaffold)
+                && !self.inner.edge_grants_ready.load(Ordering::Acquire)
+            {
+                return None;
+            }
+            // A present grant is authoritative even when it is stale or revoked:
+            // never fall through to restart reconstruction and bypass that state.
+            if let Some(trusted) = grants.get(grant_id) {
+                return Some(grant_authorizes_control_entry(
+                    &trusted.grant,
+                    entry,
+                    workspace.project_scope(),
+                    now_ms(),
+                ));
+            }
         }
         // Only authenticated local-owner commands receive this exact immutable
         // fingerprint at queue time. The bounded reconstruction window matches
         // the local grant TTL; remote grants always fail closed after restart.
         let now = now_ms();
-        entry.issued_by == self.device_id()
-            && owner_device_id == self.device_id()
-            && actor_device_id == self.device_id()
-            && matches!(source, comet_proto::AgentSessionSource::Local)
-            && entry.issued_at <= now
-            && now < entry.issued_at.saturating_add(LOCAL_OWNER_GRANT_TTL_MS)
-            && entry.expires_at.is_none_or(|expires_at| now < expires_at)
-            && local_owner_authority_key(entry).is_ok_and(|key| {
-                self.inner
-                    .store
-                    .is_trusted_local_command(&key)
-                    .unwrap_or(false)
-            })
+        Some(
+            entry.issued_by == self.device_id()
+                && owner_device_id == self.device_id()
+                && actor_device_id == self.device_id()
+                && matches!(source, comet_proto::AgentSessionSource::Local)
+                && entry.issued_at <= now
+                && now < entry.issued_at.saturating_add(LOCAL_OWNER_GRANT_TTL_MS)
+                && entry.expires_at.is_none_or(|expires_at| now < expires_at)
+                && local_owner_authority_key(entry).is_ok_and(|key| {
+                    self.inner
+                        .store
+                        .is_trusted_local_command(&key)
+                        .unwrap_or(false)
+                }),
+        )
+    }
+
+    #[cfg(test)]
+    fn command_grant_authorized(&self, entry: &SessionCommandEntry) -> bool {
+        self.command_grant_authorization(entry) == Some(true)
     }
 
     /// Drain only commands owned by this device. Other owners drain their own session
@@ -1168,6 +1196,14 @@ impl DocHost {
                     turn_is_past: &turn_is_past,
                 },
             );
+            let grant_authorization = match disposition {
+                CommandDisposition::Execute => self.command_grant_authorization(&entry),
+                _ => Some(true),
+            };
+            if grant_authorization.is_none() {
+                skipped.insert(entry.id.clone());
+                continue;
+            }
             if let Err(err) = self.inner.store.mark_processed(&entry.id) {
                 tracing::error!(chat = %handle.chat_id, error = %err,
                     "processed-ledger write failed; halting drain");
@@ -1184,7 +1220,7 @@ impl DocHost {
                     self.resolve_command(handle, &entry, SessionCommandStatus::Superseded, None);
                 }
                 CommandDisposition::Execute => {
-                    let (status, resolution) = if !self.command_grant_authorized(&entry) {
+                    let (status, resolution) = if grant_authorization != Some(true) {
                         (
                             SessionCommandStatus::Rejected,
                             Some("verified capability grant does not authorize command".into()),
@@ -1851,10 +1887,11 @@ pub fn respond_input_prompt(
     lines.join("\n")
 }
 
-/// Per-chat background task: reacts to doc changes (local commits and remote imports)
-/// by re-publishing the transcript watch, draining commands, and debouncing snapshots.
-/// Holds only a weak handle so a dropped host tears the task down.
+/// Per-chat background task: reacts to doc and authority changes by re-publishing
+/// the transcript watch, draining commands, and debouncing snapshots. Holds only
+/// a weak handle so a dropped host tears the task down.
 async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: watch::Receiver<u64>) {
+    let mut authority_rx = host.watch_authority();
     // Initial pass: the snapshot may already carry pending commands. The
     // mirror stays lazy — it materializes on the first watch attach.
     {
@@ -1878,6 +1915,13 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
                             + std::time::Duration::from_millis(SNAPSHOT_DEBOUNCE_MS),
                     );
                 }
+            }
+            authority = authority_rx.changed() => {
+                if authority.is_err() {
+                    break;
+                }
+                let Some(handle) = weak.upgrade() else { break };
+                host.drain_commands(&handle).await;
             }
             _ = tokio::time::sleep_until(sleep_until), if save_deadline.is_some() => {
                 save_deadline = None;
@@ -1975,6 +2019,87 @@ mod authority_tests {
             .trust_local_command(&local_command.id)
             .unwrap();
         assert!(host.command_grant_authorized(&local_command));
+
+        let edge_grant = CapabilityGrant {
+            id: "edge-grant".into(),
+            principal_subject: "accounts.google.com:alice@example.com".into(),
+            scope: comet_proto::CollaborationScope {
+                project_id: "project-a".into(),
+                deployment_id: Some("project-a".into()),
+                session_id: Some("session-a".into()),
+                unknown: Default::default(),
+            },
+            capabilities: vec![comet_proto::CAPABILITY_SESSION_CONTROL.into()],
+            device_id: Some("device-a".into()),
+            sandbox_id: None,
+            granted_by: "scaffold-control-plane".into(),
+            granted_at: now - 1,
+            expires_at: Some(now + 60_000),
+            revoked_at: None,
+            unknown: Default::default(),
+        };
+        let edge_command = SessionCommandEntry {
+            id: "command-edge".into(),
+            payload: SessionCommandPayload::Control {
+                session_id: "session-a".into(),
+                owner_device_id: "device-a".into(),
+                actor_device_id: "device-peer".into(),
+                actor_subject: edge_grant.principal_subject.clone(),
+                grant_id: edge_grant.id.clone(),
+                source: AgentSessionSource::Scaffold,
+                action: Box::new(SessionControlAction::Pause {}),
+            },
+            issued_by: "device-peer".into(),
+            issued_at: now,
+            based_on: None,
+            expires_at: Some(now + 60_000),
+            status: SessionCommandStatus::Pending,
+            resolution: None,
+        };
+        let envelope = VerifiedCapabilityGrantEnvelope {
+            grant: edge_grant,
+            room_id: "s4/project-a/project-a/session-a".into(),
+            target_device_id: "device-a".into(),
+            target_session_id: "session-a".into(),
+            unknown: Default::default(),
+        };
+        host.ingest_verified_grant("session-a", &serde_json::to_vec(&envelope).unwrap())
+            .unwrap();
+        assert_eq!(host.command_grant_authorization(&edge_command), Some(true));
+
+        host.reset_edge_grants();
+        assert_eq!(
+            host.command_grant_authorization(&edge_command),
+            None,
+            "a remote command must remain pending during relay authority refresh"
+        );
+        let handle = host.open("chat-edge").unwrap();
+        handle.doc.queue_command(&edge_command).unwrap();
+        let sessions = SessionsEngine::new(
+            "device-a".into(),
+            Arc::new(crate::RunJournal::open(dir.path().join("edge-journal")).unwrap()),
+            Arc::new(crate::HarnessRegistry::new()),
+        );
+        assert!(host.inner.sessions.set(sessions).is_ok());
+        host.drain_commands(&handle).await;
+        assert!(!host.inner.store.is_processed(&edge_command.id).unwrap());
+        assert_eq!(
+            handle
+                .doc
+                .read_commands()
+                .unwrap()
+                .into_iter()
+                .find(|command| command.id == edge_command.id)
+                .unwrap()
+                .status,
+            SessionCommandStatus::Pending
+        );
+
+        host.ingest_verified_grant("session-a", &serde_json::to_vec(&envelope).unwrap())
+            .unwrap();
+        assert_eq!(host.command_grant_authorization(&edge_command), Some(true));
+        host.drain_commands(&handle).await;
+        assert!(host.inner.store.is_processed(&edge_command.id).unwrap());
     }
 
     #[tokio::test]

@@ -2,6 +2,11 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath, URL as NodeUrl } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AuthGrant, handleAuthenticatedAuthRoute, parseGrantToken } from "./auth-routes";
+import {
+  AUTH_PROJECT_HEADER,
+  AUTH_USER_HEADER,
+  SESSION_OWNER_AUTH_HEADER
+} from "./env";
 import type { Verified } from "./auth";
 
 describe("device grant tokens", () => {
@@ -134,8 +139,14 @@ describe("device grant issuance", () => {
       })
     });
 
-  const envAndRecords = () => {
+  const envAndRecords = (sessionOwnerUserId: string | null = identity.userId) => {
     const records: unknown[] = [];
+    const sessionChecks: Array<{
+      roomName: string;
+      userId: string | null;
+      projectScope: string | null;
+      authorization: string | null;
+    }> = [];
     const env = {
       AUTH_MODE: "scaffold",
       ENVIRONMENT: "staging",
@@ -150,9 +161,26 @@ describe("device grant issuance", () => {
             return new Response(JSON.stringify({ ok: true }));
           }
         })
+      },
+      SESSION_ROOMS: {
+        idFromName: (roomName: string) => roomName,
+        get: (roomName: string) => ({
+          fetch: async (ownerRequest: Request) => {
+            const userId = ownerRequest.headers.get(AUTH_USER_HEADER);
+            sessionChecks.push({
+              roomName,
+              userId,
+              projectScope: ownerRequest.headers.get(AUTH_PROJECT_HEADER),
+              authorization: ownerRequest.headers.get(SESSION_OWNER_AUTH_HEADER)
+            });
+            return Response.json({
+              ownsSession: sessionOwnerUserId !== null && sessionOwnerUserId === userId
+            });
+          }
+        })
       }
     } as unknown as Env;
-    return { env, records };
+    return { env, records, sessionChecks };
   };
 
   it("derives every grant target field from Scaffold's authenticated runtime profile", async () => {
@@ -170,7 +198,7 @@ describe("device grant issuance", () => {
         }
       })
     );
-    const { env, records } = envAndRecords();
+    const { env, records, sessionChecks } = envAndRecords();
     const response = await handleAuthenticatedAuthRoute(
       request(),
       env,
@@ -200,6 +228,14 @@ describe("device grant issuance", () => {
       targetDeviceId: "comet-scaffold-sandbox-789",
       sessionId: "session-456"
     });
+    expect(sessionChecks).toEqual([
+      {
+        roomName: "s3/ashler-staging/session-456",
+        userId: identity.userId,
+        projectScope: identity.projectScope,
+        authorization: "verify"
+      }
+    ]);
   });
 
   it("rejects a caller-selected stale or foreign sandbox/session tuple", async () => {
@@ -224,6 +260,35 @@ describe("device grant issuance", () => {
         targetDeviceId: "comet-scaffold-foreign-sandbox",
         sessionId: "stale-session"
       }),
+      env,
+      new URL("https://comet.example/auth/device-grants"),
+      identity
+    );
+    expect(response?.status).toBe(403);
+    expect(records).toHaveLength(0);
+  });
+
+  it.each([
+    ["a session owned by another user", "teammate@ashler.ai"],
+    ["an unbound session", null]
+  ])("denies attachment to %s after target proof succeeds", async (_name, sessionOwnerUserId) => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      Response.json({
+        ok: true,
+        profile: {
+          version: "scaffold.comet-runtime.v1",
+          projectId: identity.projectScope,
+          deploymentId: identity.projectScope,
+          sandboxId: "sandbox-789",
+          targetDeviceId: "comet-scaffold-sandbox-789",
+          sessionId: "session-456",
+          actor: { sub: identity.userId }
+        }
+      })
+    );
+    const { env, records } = envAndRecords(sessionOwnerUserId);
+    const response = await handleAuthenticatedAuthRoute(
+      request(),
       env,
       new URL("https://comet.example/auth/device-grants"),
       identity

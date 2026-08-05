@@ -1,5 +1,10 @@
 import { bearerFromRequest, credentialTransportAllowed, type Verified } from "./auth";
-import type { Env } from "./env";
+import {
+  AUTH_PROJECT_HEADER,
+  AUTH_USER_HEADER,
+  SESSION_OWNER_AUTH_HEADER,
+  type Env
+} from "./env";
 
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const GRANT_TTL_MS = 15 * 60 * 1000;
@@ -366,6 +371,32 @@ const verifiedSandboxTarget = async (
   };
 };
 
+const requesterOwnsSession = async (
+  env: Env,
+  target: Pick<SandboxTarget, "projectId" | "sessionId">,
+  userId: string
+): Promise<boolean> => {
+  try {
+    const roomName = `s3/${target.projectId}/${target.sessionId}`;
+    const room = env.SESSION_ROOMS.get(env.SESSION_ROOMS.idFromName(roomName));
+    const response = await room.fetch(
+      new Request("https://session.internal/authorize-owner", {
+        method: "GET",
+        headers: {
+          [AUTH_USER_HEADER]: userId,
+          [AUTH_PROJECT_HEADER]: target.projectId,
+          [SESSION_OWNER_AUTH_HEADER]: "verify"
+        }
+      })
+    );
+    if (!response.ok) return false;
+    const body = await bodyJson<{ ownsSession?: unknown }>(response);
+    return body?.ownsSession === true;
+  } catch {
+    return false;
+  }
+};
+
 export const handleAuthenticatedAuthRoute = async (
   request: Request,
   env: Env,
@@ -427,6 +458,9 @@ export const handleAuthenticatedAuthRoute = async (
       sessionId: body.sessionId
     });
     if (!target) return json({ error: "grant_target_forbidden" }, 403);
+    if (!(await requesterOwnsSession(env, target, identity.userId))) {
+      return json({ error: "grant_target_forbidden" }, 403);
+    }
     const id = crypto.randomUUID().replaceAll("-", "");
     const secret = randomSecret();
     const ttl = Math.min(
