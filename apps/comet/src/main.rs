@@ -227,7 +227,7 @@ fn main() -> anyhow::Result<()> {
             }
             let bootstrap = args.into_bootstrap()?;
             if let Some(bootstrap) = bootstrap.as_ref() {
-                config.project_scope = bootstrap.project_id.clone();
+                apply_device_bootstrap_policy(&mut config, bootstrap);
             }
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(async {
@@ -291,14 +291,43 @@ fn run_headed(initial_url: Option<String>) {
         edge_token,
         project_scope: std::env::var("COMET_PROJECT_SCOPE")
             .unwrap_or_else(|_| release_defaults().2.into()),
+        deployment_id: None,
         initial_url,
         default_harness: comet_ui::HarnessId::ClaudeCode,
+        runtime_profile: comet_ui::RuntimeProfile::LocalController,
     });
 }
 
 /// The env-resolved engine configuration shared by `headless`, `login`,
 /// `logout`, and `status` — one resolution so the CLI auth commands always
 /// operate on the exact session the daemon will load.
+
+/// Local installs select either the production-local or deterministic mock
+/// profile. Scaffold-host authority is forced only by a validated bootstrap.
+fn runtime_profile_from_env() -> comet_engine::RuntimeProfile {
+    if matches!(
+        std::env::var("COMET_HARNESS").as_deref().map(str::trim),
+        Ok("mock")
+    ) {
+        comet_engine::RuntimeProfile::Mock
+    } else {
+        comet_engine::RuntimeProfile::LocalController
+    }
+}
+
+fn apply_device_bootstrap_policy(
+    config: &mut comet_engine::EngineConfig,
+    bootstrap: &comet_engine::DeviceBootstrapConfig,
+) {
+    config.project_scope = bootstrap.project_id.clone();
+    config.deployment_id = Some(bootstrap.deployment_id.clone());
+    config.runtime_profile = comet_engine::RuntimeProfile::ScaffoldHost;
+    config.default_harness = comet_engine::HarnessId::Omp;
+    // Device-mode auth already prevents constructing ScaffoldRuntime. Keep the
+    // endpoint absent as defense in depth against recursive sandbox control.
+    config.scaffold_url = None;
+}
+
 fn engine_config_from_env() -> comet_engine::EngineConfig {
     // An explicit local bearer opts out of Scaffold OAuth.
     let edge_token = std::env::var("COMET_EDGE_TOKEN").ok();
@@ -312,8 +341,12 @@ fn engine_config_from_env() -> comet_engine::EngineConfig {
             .and_then(|p| p.parse().ok())
             .unwrap_or(27654),
         default_harness: harness_from_env(),
+        runtime_profile: runtime_profile_from_env(),
         project_scope: std::env::var("COMET_PROJECT_SCOPE")
             .unwrap_or_else(|_| release_defaults().2.into()),
+        // Ordinary environment/config input cannot select a trusted deployment
+        // room. Only validated device bootstrap populates this field.
+        deployment_id: None,
         scaffold_url: scaffold_url_from_env(&edge_token),
         edge_token,
     }
@@ -480,7 +513,7 @@ fn open_log_file_in(dir: &std::path::Path, mode: &str) -> Option<std::fs::File> 
 
 #[cfg(all(test, unix))]
 mod device_bootstrap_tests {
-    use super::{Cli, HeadlessArgs};
+    use super::{Cli, HeadlessArgs, apply_device_bootstrap_policy};
     use clap::Parser as _;
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -516,6 +549,29 @@ mod device_bootstrap_tests {
                 .is_err(),
             "join credentials must never be accepted in process argv"
         );
+    }
+
+    #[test]
+    fn validated_bootstrap_forces_omp_only_scaffold_host_policy() {
+        let mut config = super::engine_config_from_env();
+        config.scaffold_url = Some("https://scaffold.invalid".into());
+        let bootstrap = comet_engine::DeviceBootstrapConfig {
+            device_join_grant: "cg1.redacted".into(),
+            project_id: "ashler-staging".into(),
+            deployment_id: "deployment-a".into(),
+            session_id: "session-a".into(),
+            device_id: "comet-scaffold-sandbox-a".into(),
+            sandbox_id: "sandbox-a".into(),
+        };
+        apply_device_bootstrap_policy(&mut config, &bootstrap);
+        assert_eq!(
+            config.runtime_profile,
+            comet_engine::RuntimeProfile::ScaffoldHost
+        );
+        assert_eq!(config.default_harness, comet_engine::HarnessId::Omp);
+        assert_eq!(config.project_scope, "ashler-staging");
+        assert_eq!(config.deployment_id.as_deref(), Some("deployment-a"));
+        assert!(config.scaffold_url.is_none());
     }
 }
 

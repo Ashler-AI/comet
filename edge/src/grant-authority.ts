@@ -1,9 +1,11 @@
 import { AuthGrant as StoredAuthGrant } from "./auth-routes";
 import { GRANT_EVENT_HEADER, type Env } from "./env";
+import { scopedSessionRoomKey } from "./room-key";
 
 interface GrantAuthorityRecord {
   grantId: string;
   projectId: string;
+  deploymentId: string;
   sessionId: string;
   targetDeviceId: string;
   accessExpiresAt?: number;
@@ -20,6 +22,8 @@ const hasGrantScope = (value: unknown): value is GrantAuthorityRecord => {
     ID_RE.test(record.grantId) &&
     typeof record.projectId === "string" &&
     ID_RE.test(record.projectId) &&
+    typeof record.deploymentId === "string" &&
+    ID_RE.test(record.deploymentId) &&
     typeof record.sessionId === "string" &&
     ID_RE.test(record.sessionId) &&
     typeof record.targetDeviceId === "string" &&
@@ -75,7 +79,7 @@ export class AuthGrant extends StoredAuthGrant {
           kind: "session",
           stub: this.authorityEnv.SESSION_ROOMS.get(
             this.authorityEnv.SESSION_ROOMS.idFromName(
-              `s3/${record.projectId}/${record.sessionId}`
+              scopedSessionRoomKey(record.projectId, record.deploymentId, record.sessionId)
             )
           )
         },

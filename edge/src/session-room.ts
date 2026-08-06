@@ -356,6 +356,18 @@ export class SessionRoom implements DurableObject {
       if (encodedGrant !== null && (!grant || grant.scope.sessionId !== chatId)) {
         return new Response("forbidden", { status: 403 });
       }
+      if (grant) {
+        const boundDeploymentId = this.getMeta("deploymentId");
+        const boundSessionId = this.getMeta("scopedSessionId");
+        if (
+          (boundDeploymentId && boundDeploymentId !== grant.scope.deploymentId) ||
+          (boundSessionId && boundSessionId !== grant.scope.sessionId)
+        ) {
+          return new Response("forbidden", { status: 403 });
+        }
+        if (!boundDeploymentId) this.setMeta("deploymentId", grant.scope.deploymentId);
+        if (!boundSessionId) this.setMeta("scopedSessionId", grant.scope.sessionId);
+      }
       const currentOwnerUserId = this.getMeta("ownerUserId");
       const ownerUserId = sessionOwnerForConnection(
         currentOwnerUserId,

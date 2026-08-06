@@ -117,6 +117,7 @@ describe("grant revocation delivery", () => {
     const record: {
       grantId: string;
       projectId: string;
+      deploymentId: string;
       sessionId: string;
       targetDeviceId: string;
       accessExpiresAt: number;
@@ -124,6 +125,7 @@ describe("grant revocation delivery", () => {
     } = {
       grantId: "grant-1",
       projectId: "ashler-staging",
+      deploymentId: "candidate",
       sessionId: "session-1",
       targetDeviceId: "device-1",
       accessExpiresAt: Date.now() + 60_000
@@ -138,6 +140,10 @@ describe("grant revocation delivery", () => {
     );
 
     expect((await authority.fetch(statusRequest.clone())).status).toBe(204);
+    const deploymentId = record.deploymentId;
+    (record as Partial<typeof record>).deploymentId = undefined;
+    expect((await authority.fetch(statusRequest.clone())).status).toBe(401);
+    record.deploymentId = deploymentId;
     record.revokedAt = Date.now();
     expect((await authority.fetch(statusRequest.clone())).status).toBe(401);
     delete record.revokedAt;
@@ -196,7 +202,7 @@ describe("grant revocation delivery", () => {
     expect(records.get("grant")).toMatchObject({ revokedAt: expect.any(Number) });
     expect(notifySession).toHaveBeenCalledOnce();
     expect(notifyDevice).toHaveBeenCalledOnce();
-    expect(sessionIdFromName).toHaveBeenCalledWith("s3/ashler-staging/session-1");
+    expect(sessionIdFromName).toHaveBeenCalledWith("s4/ashler-staging/candidate/session-1");
     expect(deviceIdFromName).toHaveBeenCalledWith("d3/ashler-staging/device-1");
     const sessionNotification = notifySession.mock.calls[0]?.[0];
     const deviceNotification = notifyDevice.mock.calls[0]?.[0];

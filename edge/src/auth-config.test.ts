@@ -230,7 +230,7 @@ describe("device grant issuance", () => {
     });
     expect(sessionChecks).toEqual([
       {
-        roomName: "s3/ashler-staging/session-456",
+        roomName: "s4/ashler-staging/ashler-staging/session-456",
         userId: identity.userId,
         projectScope: identity.projectScope,
         authorization: "verify"

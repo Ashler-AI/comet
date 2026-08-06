@@ -78,6 +78,9 @@ pub struct EdgeConfig {
     /// socket meant reverse-engineering devices from rotating IPv6 privacy
     /// addresses; never again. Empty = omitted (tests).
     pub device_id: String,
+    /// Deployment namespace for a scoped sandbox session room. Empty keeps
+    /// legacy local-controller rooms on the project/session namespace.
+    pub deployment_id: String,
 }
 
 impl std::fmt::Debug for EdgeConfig {
@@ -85,6 +88,7 @@ impl std::fmt::Debug for EdgeConfig {
         f.debug_struct("EdgeConfig")
             .field("url", &self.url)
             .field("token", &"<provider>")
+            .field("deployment_id", &self.deployment_id)
             .finish()
     }
 }
@@ -95,12 +99,19 @@ impl EdgeConfig {
             url: url.into(),
             token,
             device_id: String::new(),
+            deployment_id: String::new(),
         }
     }
 
     /// Attribute this engine's room sockets in edge logs.
     pub fn with_device(mut self, device_id: impl Into<String>) -> Self {
         self.device_id = device_id.into();
+        self
+    }
+
+    /// Select the deployment-scoped physical SessionRoom namespace.
+    pub fn with_deployment(mut self, deployment_id: impl Into<String>) -> Self {
+        self.deployment_id = deployment_id.into();
         self
     }
 
@@ -123,6 +134,7 @@ impl EdgeConfig {
             base: format!("{}{}", ws_base.trim_end_matches('/'), path.into()),
             token: self.token.clone(),
             device_id: self.device_id.clone(),
+            deployment_id: self.deployment_id.clone(),
         })
     }
 }
@@ -131,6 +143,7 @@ struct EdgeRoomUrl {
     base: String,
     token: Arc<dyn comet_rpc::TokenSource>,
     device_id: String,
+    deployment_id: String,
 }
 
 impl comet_sync::UrlProvider for EdgeRoomUrl {
@@ -138,6 +151,7 @@ impl comet_sync::UrlProvider for EdgeRoomUrl {
         let token = self.token.clone();
         let base = self.base.clone();
         let device = self.device_id.clone();
+        let deployment = self.deployment_id.clone();
         Box::pin(async move {
             let token = token.token().await.ok_or_else(|| {
                 comet_sync::SyncError::Auth("no access token (signed out)".into())
@@ -145,6 +159,9 @@ impl comet_sync::UrlProvider for EdgeRoomUrl {
             let mut url = format!("{base}?token={token}");
             if !device.is_empty() {
                 url.push_str(&format!("&device={device}"));
+            }
+            if !deployment.is_empty() {
+                url.push_str(&format!("&deploymentId={deployment}"));
             }
             Ok(url)
         })
@@ -2454,6 +2471,24 @@ mod authority_tests {
                 .map(|grant| grant.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["live"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod edge_url_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn deployment_scoped_room_url_carries_trusted_namespace() {
+        let edge = EdgeConfig::with_static_token("https://edge.example", "secret")
+            .with_device("device-a")
+            .with_deployment("deployment-a");
+        let provider = edge.room_url("/session/session-a/ws");
+        let url = provider.url().await.unwrap();
+        assert_eq!(
+            url,
+            "wss://edge.example/session/session-a/ws?token=secret&device=device-a&deploymentId=deployment-a"
         );
     }
 }

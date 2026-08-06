@@ -2274,6 +2274,7 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
             Some(crate::icons::claude_brand()),
         ),
         HarnessId::Codex => (crate::icons::OPENAI_MARK, None),
+        HarnessId::Omp => (crate::icons::COMET_LOGO, None),
         HarnessId::Cursor => (crate::icons::CURSOR_MARK, None),
     }
 }

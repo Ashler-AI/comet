@@ -46,7 +46,7 @@ use crate::state::{
 };
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
-use crate::transcript::{self, Transcript, TranscriptEvent};
+use crate::transcript::{self, Transcript};
 
 mod spaces;
 mod tabs;
@@ -613,7 +613,6 @@ pub struct Shell {
     _ticker: Task<()>,
     _state_observation: Subscription,
     _composer_events: Subscription,
-    _transcript_events: Subscription,
 }
 
 impl Shell {
@@ -633,14 +632,6 @@ impl Shell {
                 }
             }
         });
-        let transcript_events = cx.subscribe(
-            &transcript,
-            |this: &mut Shell, _, event: &TranscriptEvent, cx| match event {
-                TranscriptEvent::OpenAnnotations(anchor) => {
-                    this.open_annotation_anchor(anchor.clone(), cx)
-                }
-            },
-        );
         // Working-indicator heartbeat: notify once a second while a session is
         // live so elapsed time and the flavour word stay fresh.
         let ticker = cx.spawn(async move |this, cx| {
@@ -776,7 +767,6 @@ impl Shell {
             _ticker: ticker,
             _state_observation: observation,
             _composer_events: composer_events,
-            _transcript_events: transcript_events,
         }
     }
 
@@ -2460,6 +2450,87 @@ impl Shell {
             .into_any_element()
     }
 
+    /// Harness-native histories available on this device. A click imports the
+    /// text transcript once and then selects the resulting Comet chat.
+    fn render_local_session_rows(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let (candidates, chats, attaching) = {
+            let state = self.state.read(cx);
+            (
+                state.local_sessions.clone(),
+                state.chats.clone(),
+                state.attaching_local_session.clone(),
+            )
+        };
+        let now = Utc::now();
+        candidates
+            .into_iter()
+            .filter(|candidate| !chats.iter().any(|chat| chat.id == candidate.chat_id))
+            .take(8)
+            .map(|candidate| {
+                let candidate_id = candidate.id.clone();
+                let opening = attaching.as_deref() == Some(candidate.id.as_str());
+                let disabled = attaching.is_some();
+                let harness = crate::multiplayer::harness_label(candidate.harness);
+                let runtime_model =
+                    crate::multiplayer::runtime_model(Some(harness), candidate.model.as_deref());
+                let time = chrono::DateTime::<Utc>::from_timestamp_millis(candidate.updated_at)
+                    .map(|at| format_time_ago(at, now))
+                    .unwrap_or_default();
+                let detail: SharedString = if time.is_empty() {
+                    runtime_model.into()
+                } else {
+                    format!("{runtime_model} · {time}").into()
+                };
+                let row_key = format!("local-session-{}", candidate.id);
+                let title: SharedString = transcript::single_line(&candidate.title).into();
+                let hover_key = row_key.clone();
+                let hover = theme.glass_hover();
+                let rest = crate::theme::wash(0.0);
+                div()
+                    .id(SharedString::from(row_key))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .rounded(px(Theme::CONTROL_RADIUS))
+                    .px(px(Theme::SPACE_SM))
+                    .py(px(Theme::SPACE_XS))
+                    .bg(motion::hover_blend(&hover_key, rest, hover))
+                    .on_hover(motion::hover_listener(hover_key))
+                    .when(!disabled, |el| el.cursor_pointer())
+                    .when(!disabled, |el| {
+                        el.on_click(cx.listener(move |this, _, _, cx| {
+                            this.state.update(cx, |state, cx| {
+                                state.attach_local_session(candidate_id.clone(), cx);
+                            });
+                        }))
+                    })
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme.text.opacity(if disabled && !opening {
+                                0.48
+                            } else {
+                                0.84
+                            }))
+                            .truncate()
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(theme.text_muted.opacity(0.68))
+                            .opacity(if opening { 0.72 } else { 1.0 })
+                            .child(if opening {
+                                SharedString::from("Opening…")
+                            } else {
+                                detail
+                            }),
+                    )
+                    .into_any_element()
+            })
+            .collect()
+    }
+
     /// Which sidebar-list edges have hidden overflow (offset from the LAST
     /// frame — the invisible one-frame lag every fade here rides).
     pub(super) fn sidebar_fade_zones(&self) -> (bool, bool) {
@@ -2549,6 +2620,67 @@ impl Shell {
         let user_menu = self.render_user_menu(user_line.clone(), user_email.clone(), theme, cx);
 
         let spaces_section = self.render_spaces_section(theme, cx);
+        let local_session_rows = self.render_local_session_rows(theme, cx);
+        let (local_sessions_loading, local_sessions_error) = {
+            let state = self.state.read(cx);
+            (
+                state.local_sessions_loading,
+                state.local_sessions_error.clone(),
+            )
+        };
+        let local_sessions_section = (!local_session_rows.is_empty()
+            || local_sessions_loading
+            || local_sessions_error.is_some())
+        .then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .px(px(Theme::SPACE_SM))
+                        .pt(px(12.0))
+                        .pb(px(4.0))
+                        .text_size(px(11.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text_muted.opacity(0.6))
+                        .child(SharedString::from("Recent local sessions")),
+                )
+                .when(!local_session_rows.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .children(local_session_rows),
+                    )
+                })
+                .when(local_sessions_loading, |el| {
+                    el.child(
+                        div()
+                            .px(px(Theme::SPACE_SM))
+                            .py(px(Theme::SPACE_XS))
+                            .text_size(px(11.0))
+                            .text_color(theme.text_faint)
+                            .with_animation(
+                                "local-session-scan",
+                                motion::COMET_PULSE.animation().repeat(),
+                                |el, t| el.opacity(0.56 + 0.44 * t),
+                            )
+                            .child(SharedString::from("Finding local sessions…")),
+                    )
+                })
+                .when_some(local_sessions_error, |el, error| {
+                    el.child(
+                        div()
+                            .px(px(Theme::SPACE_SM))
+                            .py(px(Theme::SPACE_XS))
+                            .text_size(px(11.0))
+                            .text_color(theme.danger)
+                            .child(SharedString::from(error)),
+                    )
+                })
+                .into_any_element()
+        });
 
         div()
             .w(px(self.settings.sidebar_width))
@@ -2578,6 +2710,7 @@ impl Shell {
                             .flex()
                             .flex_col()
                             .child(spaces_section)
+                            .when_some(local_sessions_section, |el, section| el.child(section))
                             .child(
                                 div()
                                     .px(px(Theme::SPACE_SM))

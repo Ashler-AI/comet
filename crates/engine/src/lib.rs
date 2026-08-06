@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub use comet_proto::HarnessId;
+pub use comet_proto::{HarnessId, RuntimeProfile};
 
 use comet_sync::DocsStore;
 
@@ -17,6 +17,7 @@ pub mod auth;
 pub mod diff_sync;
 pub mod doc_host;
 pub mod instance_lock;
+pub mod local_sessions;
 pub mod registry;
 pub mod repos;
 pub mod rpc;
@@ -88,8 +89,12 @@ pub struct EngineConfig {
     pub ipc_port: u16,
     /// Harness for doc-command runs on chats without a workspace `config` row.
     pub default_harness: HarnessId,
+    /// Server-enforced capabilities for this engine process.
+    pub runtime_profile: RuntimeProfile,
     /// Operator-configured Scaffold deployment/project scope.
     pub project_scope: String,
+    /// Trusted deployment namespace for a Scaffold-host SessionRoom.
+    pub deployment_id: Option<String>,
     /// Scaffold control-plane origin; `None` enables explicit dev bearer mode.
     pub scaffold_url: Option<String>,
 }
@@ -131,6 +136,7 @@ pub struct EngineCore {
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
     pub device_id: String,
+    pub runtime_profile: RuntimeProfile,
     /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
     auth: std::sync::Mutex<Option<Auth>>,
     /// Peer link cache for `targetDeviceId` routing (attached when edge+auth are ready).
@@ -164,6 +170,11 @@ impl EngineCore {
             edge,
             &project_scope,
             &user_id,
+            if default_harness == HarnessId::Mock {
+                RuntimeProfile::Mock
+            } else {
+                RuntimeProfile::LocalController
+            },
         )
     }
 
@@ -174,6 +185,7 @@ impl EngineCore {
         edge: Option<EdgeConfig>,
         project_scope: &str,
         user_id: &str,
+        runtime_profile: RuntimeProfile,
     ) -> Result<Self, EngineError> {
         std::fs::create_dir_all(data_dir)?;
         // Single-instance guard: two engines on one data dir would race the
@@ -240,6 +252,7 @@ impl EngineCore {
             uploads,
             agent_accounts,
             device_id,
+            runtime_profile,
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
             updater: std::sync::Mutex::new(None),
@@ -381,6 +394,7 @@ impl EngineCore {
             self.diff_sync.clone(),
             self.uploads.clone(),
             self.agent_accounts.clone(),
+            self.runtime_profile,
         )
         .with_auth(self.auth());
         if let Some(links) = self.links() {
@@ -497,7 +511,12 @@ impl Engine {
             && auth.access_token().await.is_some();
         let device_id = load_or_create_device_id(&config.data_dir)?;
         let edge = online.then(|| {
-            EdgeConfig::new(config.edge_url.clone(), Arc::new(auth.clone())).with_device(device_id)
+            let edge = EdgeConfig::new(config.edge_url.clone(), Arc::new(auth.clone()))
+                .with_device(device_id);
+            match config.deployment_id.as_deref() {
+                Some(deployment_id) => edge.with_deployment(deployment_id),
+                None => edge,
+            }
         });
 
         let project_scope = auth
@@ -510,15 +529,17 @@ impl Engine {
             .unwrap_or_else(|| env_or("COMET_USER_ID", DEFAULT_USER_ID));
         let core = EngineCore::assemble_with_identity(
             &config.data_dir,
-            Arc::new(default_registry()),
+            Arc::new(default_registry(config.runtime_profile)),
             config.default_harness,
             edge.clone(),
             &project_scope,
             &user_id,
+            config.runtime_profile,
         )?;
         core.set_auth(auth.clone());
         if let Some(scaffold_url) = config.scaffold_url.as_deref()
             && !auth.device_mode()
+            && config.runtime_profile.allows_scaffold_control()
         {
             let bearer: Arc<dyn comet_rpc::TokenSource> = Arc::new(auth.clone());
             let client = ScaffoldClient::new(scaffold_url, project_scope.clone(), bearer.clone())?;

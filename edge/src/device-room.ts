@@ -715,7 +715,6 @@ export const rpcAllowedForScopedHost = (
       method?: string;
       params?: { command?: { sessionId?: string } };
     };
-    if (value.method === "ListHarnesses" || value.method === "ListModels") return true;
     return (
       value.method === "QueueCommand" &&
       value.params?.command?.sessionId === grant.scope.sessionId

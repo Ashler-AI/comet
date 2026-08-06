@@ -5,6 +5,7 @@ import {
   SESSION_OWNER_AUTH_HEADER,
   type Env
 } from "./env";
+import { scopedSessionRoomKey } from "./room-key";
 
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const GRANT_TTL_MS = 15 * 60 * 1000;
@@ -373,11 +374,11 @@ const verifiedSandboxTarget = async (
 
 const requesterOwnsSession = async (
   env: Env,
-  target: Pick<SandboxTarget, "projectId" | "sessionId">,
+  target: Pick<SandboxTarget, "projectId" | "deploymentId" | "sessionId">,
   userId: string
 ): Promise<boolean> => {
   try {
-    const roomName = `s3/${target.projectId}/${target.sessionId}`;
+    const roomName = scopedSessionRoomKey(target.projectId, target.deploymentId, target.sessionId);
     const room = env.SESSION_ROOMS.get(env.SESSION_ROOMS.idFromName(roomName));
     const response = await room.fetch(
       new Request("https://session.internal/authorize-owner", {

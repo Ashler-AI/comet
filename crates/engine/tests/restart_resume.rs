@@ -794,7 +794,9 @@ async fn real_claude_remembers_codeword_across_engine_restart() {
     let assemble_real = || {
         EngineCore::assemble(
             &dir,
-            Arc::new(comet_engine::default_registry()),
+            Arc::new(comet_engine::default_registry(
+                comet_proto::RuntimeProfile::LocalController,
+            )),
             HarnessId::ClaudeCode,
             None,
         )

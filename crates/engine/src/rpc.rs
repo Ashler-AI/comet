@@ -7,6 +7,8 @@
 //! - `QueueCommand {chatId, command}` → `{commandId}` (durable doc command)
 //! - `WatchDocMessages {chatId}` → stream of joined `SessionMessageEntry[]`,
 //!   re-emitted on every doc change
+//! - `ListLocalSessions` → recent Claude Code, Codex, and OMP histories on this
+//!   device; `AttachLocalSession {candidateId}` imports one history idempotently
 //! - `WatchCollaboration {chatId}` → typed versioned sessions, provenance,
 //!   publications, participants, principal, and verified grants
 //! - `WatchChats` / `WatchDevices` → streams of the workspace doc's entity rows
@@ -58,7 +60,8 @@ use tokio::sync::watch;
 use comet_doc::{MessagePart, SessionCommandPayload};
 use comet_proto::{
     ChatConfig, CollaborationPrincipal, CollaborationScope, CollaborationSnapshot, HarnessId,
-    ParticipantPresence, ParticipantState, ScaffoldEnvironmentControl, SessionStatus, ToolCall,
+    ParticipantPresence, ParticipantState, RuntimeProfile, ScaffoldEnvironmentControl,
+    SessionStatus, ToolCall,
 };
 use comet_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
@@ -87,6 +90,17 @@ struct ChatParams {
 #[serde(rename_all = "camelCase")]
 struct ListModelsParams {
     harness: HarnessId,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AttachLocalSessionParams {
+    candidate_id: String,
+}
+
+fn generic_catalog_allowed(profile: RuntimeProfile, method: &str) -> bool {
+    profile != RuntimeProfile::ScaffoldHost
+        || (method != methods::LIST_HARNESSES && method != methods::LIST_MODELS)
 }
 
 #[derive(Debug, Deserialize)]
@@ -371,6 +385,7 @@ pub struct EngineRpc {
     links: Option<std::sync::Arc<LinkCache>>,
     updater: Option<comet_update::Updater>,
     scaffold: Option<ScaffoldRuntime>,
+    runtime_profile: RuntimeProfile,
 }
 
 impl EngineRpc {
@@ -385,6 +400,7 @@ impl EngineRpc {
         diff_sync: CheckoutDiffSync,
         uploads: Uploads,
         agent_accounts: AgentAccounts,
+        runtime_profile: RuntimeProfile,
     ) -> Self {
         Self {
             sessions,
@@ -400,6 +416,7 @@ impl EngineRpc {
             links: None,
             updater: None,
             scaffold: None,
+            runtime_profile,
         }
     }
 
@@ -440,9 +457,34 @@ impl EngineRpc {
     }
 
     fn scaffold(&self) -> Result<&ScaffoldRuntime, RpcError> {
+        if !self.runtime_profile.allows_scaffold_control() {
+            return Err(RpcError::Failed(
+                "scaffold_control_disabled_by_runtime_profile".into(),
+            ));
+        }
         self.scaffold
             .as_ref()
             .ok_or_else(|| RpcError::Failed("scaffold_control_plane_unavailable".into()))
+    }
+
+    fn require_agent_accounts(&self) -> Result<(), RpcError> {
+        if self.runtime_profile.allows_agent_accounts() {
+            Ok(())
+        } else {
+            Err(RpcError::Failed(
+                "agent_accounts_disabled_by_runtime_profile".into(),
+            ))
+        }
+    }
+
+    fn require_session_import(&self) -> Result<(), RpcError> {
+        if self.runtime_profile.allows_session_import() {
+            Ok(())
+        } else {
+            Err(RpcError::Failed(
+                "local_session_import_disabled_by_runtime_profile".into(),
+            ))
+        }
     }
 
     /// Local owner authority is derived from the attached authenticated identity.
@@ -1151,7 +1193,15 @@ impl RpcService for EngineRpc {
                 .await;
         }
         match method {
+            methods::LIST_HARNESSES if !generic_catalog_allowed(self.runtime_profile, method) => {
+                Err(RpcError::Failed(
+                    "generic_harness_discovery_disabled_by_runtime_profile".into(),
+                ))
+            }
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
+            methods::LIST_MODELS if !generic_catalog_allowed(self.runtime_profile, method) => Err(
+                RpcError::Failed("generic_model_discovery_disabled_by_runtime_profile".into()),
+            ),
             methods::LIST_MODELS => {
                 let p: ListModelsParams = parse_params(params)?;
                 let harness = self
@@ -1163,6 +1213,26 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&models)
+            }
+            methods::LIST_LOCAL_SESSIONS => {
+                self.require_session_import()?;
+                let candidates = tokio::task::spawn_blocking(crate::local_sessions::discover)
+                    .await
+                    .map_err(|err| RpcError::Failed(format!("local session scan failed: {err}")))?;
+                RpcReply::value(&candidates)
+            }
+            methods::ATTACH_LOCAL_SESSION => {
+                self.require_session_import()?;
+                let p: AttachLocalSessionParams = parse_params(params)?;
+                let workspace = self.workspace.clone();
+                let doc_host = self.doc_host.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::local_sessions::attach(&p.candidate_id, &workspace, &doc_host)
+                })
+                .await
+                .map_err(|err| RpcError::Failed(format!("local session import failed: {err}")))?
+                .map_err(|err| RpcError::Failed(err.to_string()))?;
+                RpcReply::value(&result)
             }
             methods::QUEUE_COMMAND => {
                 let p: QueueCommandParams = parse_params(params)?;
@@ -1474,6 +1544,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::LIST_AGENT_ACCOUNTS => {
+                self.require_agent_accounts()?;
                 let p: ListAgentAccountsParams = parse_params(params)?;
                 let snapshot = self
                     .agent_accounts
@@ -1483,6 +1554,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&snapshot)
             }
             methods::ACTIVATE_AGENT_ACCOUNT => {
+                self.require_agent_accounts()?;
                 let p: AgentAccountParams = parse_params(params)?;
                 let snapshot = self
                     .agent_accounts
@@ -1492,6 +1564,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&snapshot)
             }
             methods::FORGET_AGENT_ACCOUNT => {
+                self.require_agent_accounts()?;
                 let p: AgentAccountParams = parse_params(params)?;
                 let snapshot = self
                     .agent_accounts
@@ -1501,6 +1574,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&snapshot)
             }
             methods::START_AGENT_LOGIN => {
+                self.require_agent_accounts()?;
                 let p: StartAgentLoginParams = parse_params(params)?;
                 let start = self
                     .agent_accounts
@@ -1510,6 +1584,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&start)
             }
             methods::COMPLETE_AGENT_LOGIN => {
+                self.require_agent_accounts()?;
                 let p: CompleteAgentLoginParams = parse_params(params)?;
                 let snapshot = self
                     .agent_accounts
@@ -1519,6 +1594,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&snapshot)
             }
             methods::POLL_AGENT_LOGIN => {
+                self.require_agent_accounts()?;
                 let p: LoginIdParams = parse_params(params)?;
                 let poll = self
                     .agent_accounts
@@ -1528,6 +1604,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&poll)
             }
             methods::CANCEL_AGENT_LOGIN => {
+                self.require_agent_accounts()?;
                 let p: LoginIdParams = parse_params(params)?;
                 self.agent_accounts.cancel_login(&p.login_id);
                 RpcReply::value(&serde_json::json!({ "ok": true }))
@@ -1587,6 +1664,21 @@ mod tests {
         .expect("ui param shape");
         assert_eq!(p.account_id, "acct-1");
         assert_eq!(p.harness, HarnessId::ClaudeCode);
+    }
+
+    #[test]
+    fn scaffold_host_server_denies_generic_harness_and_model_catalogs() {
+        for method in [methods::LIST_HARNESSES, methods::LIST_MODELS] {
+            assert!(!generic_catalog_allowed(
+                RuntimeProfile::ScaffoldHost,
+                method
+            ));
+            assert!(generic_catalog_allowed(
+                RuntimeProfile::LocalController,
+                method
+            ));
+            assert!(generic_catalog_allowed(RuntimeProfile::Mock, method));
+        }
     }
 
     #[test]

@@ -220,9 +220,10 @@ describe("session-scoped host RPC", () => {
     ).toBe(false);
   });
 
-  it("denies unrelated document RPCs and allows device-local discovery", () => {
+  it("denies unrelated document RPCs and generic harness/model discovery", () => {
     expect(rpcAllowedForScopedHost(rpc, payload({ method: "WatchDocMessages" }), grant)).toBe(false);
-    expect(rpcAllowedForScopedHost(rpc, payload({ method: "ListHarnesses" }), grant)).toBe(true);
+    expect(rpcAllowedForScopedHost(rpc, payload({ method: "ListHarnesses" }), grant)).toBe(false);
+    expect(rpcAllowedForScopedHost(rpc, payload({ method: "ListModels", params: { harness: "omp" } }), grant)).toBe(false);
     expect(rpcAllowedForScopedHost(term, new Uint8Array(), grant)).toBe(false);
   });
 });

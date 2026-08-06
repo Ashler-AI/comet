@@ -37,6 +37,10 @@ pub mod methods {
     pub const LIST_MODELS: &str = "ListModels";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
+    /// Harness-native session candidates stored on this device.
+    pub const LIST_LOCAL_SESSIONS: &str = "ListLocalSessions";
+    /// Import one history-only local candidate into a Comet chat.
+    pub const ATTACH_LOCAL_SESSION: &str = "AttachLocalSession";
     /// Nudge every open room client to verify liveness NOW (window focus,
     /// app foregrounded). No params; IPC-only. Each room ignores the hint
     /// unless it has been broadcast-quiet ≥30s, so this is cheap to spam.

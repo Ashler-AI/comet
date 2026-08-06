@@ -455,8 +455,16 @@ async fn two_engines_converge_through_a_real_workspace_room() {
             base.clone(),
             format!("{user}@{org}"),
         ));
-        EngineCore::assemble_with_identity(dir, registry(), HarnessId::Mock, edge, &org, user)
-            .expect("engine core assembles")
+        EngineCore::assemble_with_identity(
+            dir,
+            registry(),
+            HarnessId::Mock,
+            edge,
+            &org,
+            user,
+            comet_proto::RuntimeProfile::Mock,
+        )
+        .expect("engine core assembles")
     };
 
     // Workspace docs are per-user (`ws3/{org}/{user}`): convergence is across

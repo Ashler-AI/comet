@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 pub enum HarnessId {
     ClaudeCode,
     Codex,
+    Omp,
     Cursor,
     /// Test harness; never shown in production pickers.
     Mock,

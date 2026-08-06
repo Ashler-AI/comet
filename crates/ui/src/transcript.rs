@@ -23,9 +23,9 @@
 //! inside the 70px band; own-send re-engages with the same glide.
 
 use gpui::{
-    AnyElement, BorderStyle, ClipboardItem, Context, Entity, EventEmitter, ListAlignment,
-    ListScrollEvent, ListState, ObjectFit, SharedString, Styled, StyledImage as _, StyledText,
-    Subscription, Task, TextRun, Window, canvas, div, img, list, prelude::*, px, quad,
+    AnyElement, BorderStyle, ClipboardItem, Context, Entity, ListAlignment, ListScrollEvent,
+    ListState, ObjectFit, SharedString, Styled, StyledImage as _, StyledText, Subscription, Task,
+    TextRun, Window, canvas, div, img, list, prelude::*, px, quad,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -45,56 +45,10 @@ use crate::motion::{self, AnimationExt as _, RESIZE};
 use crate::state::AppState;
 use crate::theme::Theme;
 
-#[derive(Debug, Clone)]
-pub enum TranscriptEvent {
-    OpenAnnotations(comet_proto::SemanticAnchor),
-}
-
-impl EventEmitter<TranscriptEvent> for Transcript {}
 // ---------------------------------------------------------------------------
 // Constants (mugen ports)
 // ---------------------------------------------------------------------------
 
-fn block_annotation_text(block: &Block) -> String {
-    fn runs_text(runs: &[crate::markdown::parser::InlineRun]) -> String {
-        runs.iter().map(|run| run.text.as_str()).collect()
-    }
-    match block {
-        Block::Paragraph { runs } | Block::Heading { runs, .. } => runs_text(runs),
-        Block::CodeBlock { code, .. } => code.clone(),
-        Block::BlockQuote { children } => children
-            .iter()
-            .map(block_annotation_text)
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Block::List { items, .. } => items
-            .iter()
-            .map(|item| {
-                item.iter()
-                    .map(block_annotation_text)
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Block::Table { header, rows, .. } => std::iter::once(
-            header
-                .iter()
-                .map(|cell| runs_text(cell))
-                .collect::<Vec<_>>()
-                .join(" | "),
-        )
-        .chain(rows.iter().map(|row| {
-            row.iter()
-                .map(|cell| runs_text(cell))
-                .collect::<Vec<_>>()
-                .join(" | ")
-        }))
-        .collect::<Vec<_>>()
-        .join("\n"),
-        Block::Rule => "Section break".into(),
-    }
-}
 /// Re-engage the bottom pin when the user returns within this many px of the end.
 pub const STICK_THRESHOLD_PX: f32 = 70.0;
 /// List overdraw beyond the viewport.
@@ -1597,50 +1551,7 @@ impl Transcript {
             top_gap_for(ix.checked_sub(1).and_then(|i| self.rows.get(i)), &row)
         };
         let bottom_pad = if ix + 1 == self.rows.len() { 24.0 } else { 0.0 };
-        let annotation_anchor = match &row.kind {
-            RowKind::User { text, .. } => crate::multiplayer::quoted_anchor(
-                comet_proto::AnchorTargetKind::Message,
-                row.id.to_string(),
-                text,
-            ),
-            RowKind::Markdown { tree, block_ix } | RowKind::LiveMarkdown { tree, block_ix } => {
-                let exact = tree
-                    .blocks
-                    .get(*block_ix)
-                    .map(|block| block_annotation_text(&block.block))
-                    .unwrap_or_default();
-                crate::multiplayer::quoted_anchor(
-                    comet_proto::AnchorTargetKind::Message,
-                    row.id.to_string(),
-                    &exact,
-                )
-            }
-            RowKind::ToolGroup { tools, .. } => {
-                let exact = tools
-                    .first()
-                    .map(|tool| {
-                        let (label, detail) = tool_chip_content(&tool.call);
-                        format!("{label}: {detail}")
-                    })
-                    .unwrap_or_else(|| "Tool calls".into());
-                crate::multiplayer::quoted_anchor(
-                    comet_proto::AnchorTargetKind::ToolCall,
-                    row.id.to_string(),
-                    &exact,
-                )
-            }
-            RowKind::InputChip { header, .. } => crate::multiplayer::quoted_anchor(
-                comet_proto::AnchorTargetKind::Message,
-                row.id.to_string(),
-                header,
-            ),
-            RowKind::ErrorChip { message } => crate::multiplayer::quoted_anchor(
-                comet_proto::AnchorTargetKind::Message,
-                row.id.to_string(),
-                message,
-            ),
-        };
-        let (timeline_label, collaborator_cursors, annotation_count) = {
+        let (timeline_label, collaborator_cursors) = {
             let state = self.state.read(cx);
             let timeline_label = row
                 .turn_start
@@ -1701,30 +1612,7 @@ impl Transcript {
                     )
                 })
                 .collect::<Vec<_>>();
-            let annotation_count = state
-                .collaboration
-                .as_ref()
-                .map(|snapshot| {
-                    let mut seen = std::collections::HashSet::new();
-                    snapshot
-                        .publications
-                        .iter()
-                        .rev()
-                        .filter_map(|publication| {
-                            let comet_proto::PublicationValue::Annotation(annotation) =
-                                &publication.value
-                            else {
-                                return None;
-                            };
-                            (annotation.anchor.target_id == annotation_anchor.target_id
-                                && seen.insert(annotation.id.clone()))
-                            .then_some(annotation)
-                        })
-                        .filter(|annotation| annotation.resolved_at.is_none())
-                        .count()
-                })
-                .unwrap_or_default();
-            (timeline_label, cursors, annotation_count)
+            (timeline_label, cursors)
         };
 
         let inner: AnyElement = match &row.kind {
@@ -2002,34 +1890,6 @@ impl Transcript {
                                 )),
                         )
                     })
-                    .child(
-                        div()
-                            .id(SharedString::from(format!(
-                                "annotations-{}",
-                                annotation_anchor.target_id
-                            )))
-                            .mb(px(Theme::SPACE_XS))
-                            .px(px(Theme::SPACE_SM))
-                            .py(px(2.0))
-                            .rounded(px(Theme::CONTROL_RADIUS))
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.surface_raised)
-                            .text_size(px(10.0))
-                            .text_color(theme.text_muted)
-                            .cursor_pointer()
-                            .hover(|style| style.bg(theme.surface_raised_hover))
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                cx.emit(TranscriptEvent::OpenAnnotations(
-                                    annotation_anchor.clone(),
-                                ));
-                            }))
-                            .child(SharedString::from(match annotation_count {
-                                0 => "Note".to_string(),
-                                1 => "1 note".to_string(),
-                                count => format!("{count} notes"),
-                            })),
-                    )
                     .when_some(timeline_label, |el, label| {
                         el.child(
                             div()

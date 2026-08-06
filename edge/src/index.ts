@@ -21,6 +21,7 @@ import {
   type Env
 } from "./env";
 import { AuthGrant } from "./grant-authority";
+import { scopedSessionRoomKey } from "./room-key";
 import { fetchReleaseObject, type ReleaseFeedEnv } from "./release-feed";
 import { SessionRoom } from "./session-room";
 import {
@@ -133,6 +134,31 @@ const deviceCredentialAllows = (
   return kind === "session" ? scoped.sessionId === id : deviceGrantTargetsRoom(scoped.targetDeviceId, id);
 };
 
+export const sessionRoomKey = (
+  identity: Verified,
+  sessionId: string,
+  requestedDeploymentId?: string | null
+): string => {
+  if (identity.credential !== "device") {
+    return requestedDeploymentId
+      ? scopedSessionRoomKey(identity.projectScope, requestedDeploymentId, sessionId)
+      : `s3/${identity.projectScope}/${sessionId}`;
+  }
+  const scoped = identity as Verified & { projectId?: string; deploymentId?: string; sessionId?: string };
+  if (
+    scoped.projectId !== identity.projectScope ||
+    scoped.sessionId !== sessionId ||
+    typeof scoped.deploymentId !== "string" ||
+    !ID_RE.test(scoped.deploymentId) ||
+    (requestedDeploymentId !== null &&
+      requestedDeploymentId !== undefined &&
+      requestedDeploymentId !== scoped.deploymentId)
+  ) {
+    throw new Error("device_session_scope_invalid");
+  }
+  return scopedSessionRoomKey(scoped.projectId, scoped.deploymentId, sessionId);
+};
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -191,7 +217,7 @@ export default {
       }
       return forward(
         env.SESSION_ROOMS,
-        `s3/${identity.projectScope}/${sessionId}`,
+        sessionRoomKey(identity, sessionId, url.searchParams.get("deploymentId")),
         request,
         identity,
         "/ws",
@@ -200,24 +226,24 @@ export default {
     }
     if (parts[0] === "tail" && sessionId && ID_RE.test(sessionId) && request.method === "GET") {
       if (!hasCapability(identity, "session.read") || !deviceCredentialAllows(identity, "session", sessionId)) return json({ error: "forbidden" }, 403);
-      return forward(env.SESSION_ROOMS, `s3/${identity.projectScope}/${sessionId}`, request, identity, "/tail");
+      return forward(env.SESSION_ROOMS, sessionRoomKey(identity, sessionId, url.searchParams.get("deploymentId")), request, identity, "/tail");
     }
     if (parts[0] === "stats" && sessionId && ID_RE.test(sessionId) && request.method === "GET") {
       if (!hasCapability(identity, "session.read") || !deviceCredentialAllows(identity, "session", sessionId)) return json({ error: "forbidden" }, 403);
-      return forward(env.SESSION_ROOMS, `s3/${identity.projectScope}/${sessionId}`, request, identity, "/stats");
+      return forward(env.SESSION_ROOMS, sessionRoomKey(identity, sessionId, url.searchParams.get("deploymentId")), request, identity, "/stats");
     }
     if (parts[0] === "diff" && sessionId && ID_RE.test(sessionId)) {
       const capability = request.method === "GET" ? "session.read" : "session.environment";
       if (!hasCapability(identity, capability) || !deviceCredentialAllows(identity, "session", sessionId)) return json({ error: "forbidden" }, 403);
-      return forward(env.SESSION_ROOMS, `s3/${identity.projectScope}/${sessionId}`, request, identity, "/diff");
+      return forward(env.SESSION_ROOMS, sessionRoomKey(identity, sessionId, url.searchParams.get("deploymentId")), request, identity, "/diff");
     }
     if (parts[0] === "snapshot" && sessionId && ID_RE.test(sessionId) && request.method === "GET") {
       if (!hasCapability(identity, "session.read") || !deviceCredentialAllows(identity, "session", sessionId)) return json({ error: "forbidden" }, 403);
-      return forward(env.SESSION_ROOMS, `s3/${identity.projectScope}/${sessionId}`, request, identity, "/snapshot");
+      return forward(env.SESSION_ROOMS, sessionRoomKey(identity, sessionId, url.searchParams.get("deploymentId")), request, identity, "/snapshot");
     }
     if (parts[0] === "append" && sessionId && ID_RE.test(sessionId) && request.method === "POST") {
       if (!hasCapability(identity, "session.chat") || !deviceCredentialAllows(identity, "session", sessionId)) return json({ error: "forbidden" }, 403);
-      return forward(env.SESSION_ROOMS, `s3/${identity.projectScope}/${sessionId}`, request, identity, "/append");
+      return forward(env.SESSION_ROOMS, sessionRoomKey(identity, sessionId, url.searchParams.get("deploymentId")), request, identity, "/append");
     }
 
     if (parts[0] === "workspace" && parts[1] && ID_RE.test(parts[1])) {

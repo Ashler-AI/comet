@@ -30,8 +30,9 @@ use serde::de::DeserializeOwned;
 use comet_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
 use comet_engine::{Engine, EngineConfig, EngineRuntime, rpc::AuthRpc};
 use comet_proto::{
-    AuthState, Chat, ChatIndicator, CollaborationSnapshot, Device, HarnessId, MessageProvenance,
-    ParticipantPresence, Session, Space,
+    AuthState, Chat, ChatIndicator, CollaborationSnapshot, Device, HarnessId,
+    LocalSessionAttachResult, LocalSessionCandidate, MessageProvenance, ParticipantPresence,
+    RuntimeProfile, Session, Space,
 };
 use comet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
 
@@ -52,10 +53,14 @@ pub struct EngineBootConfig {
     pub edge_token: Option<String>,
     /// Operator-configured Scaffold project/deployment boundary.
     pub project_scope: String,
+    /// Trusted deployment namespace for a Scaffold-host SessionRoom.
+    pub deployment_id: Option<String>,
     /// Scaffold control-plane origin; `None` keeps explicit local mode.
     pub scaffold_url: Option<String>,
     /// Harness for doc-command runs until per-chat config lands (M4).
     pub default_harness: HarnessId,
+    /// Server-enforced capabilities for the engine process.
+    pub runtime_profile: RuntimeProfile,
 }
 
 /// How this UI reached its engine.
@@ -208,7 +213,9 @@ impl EngineHandle {
             edge_token: config.edge_token,
             ipc_port: config.ipc_port,
             default_harness: config.default_harness,
+            runtime_profile: config.runtime_profile,
             project_scope: config.project_scope,
+            deployment_id: config.deployment_id,
             scaffold_url: config.scaffold_url,
         };
         let auth = Engine::build_auth(&engine_config).await;
@@ -318,6 +325,12 @@ pub struct AppState {
     pub spaces: Vec<Space>,
     /// Sorted (see [`sort_chats`]); includes archived rows — views filter.
     pub chats: Vec<Chat>,
+    /// Harness-native sessions discovered on this device but not yet imported.
+    pub local_sessions: Vec<LocalSessionCandidate>,
+    pub local_sessions_loading: bool,
+    pub attaching_local_session: Option<String>,
+    pub local_sessions_error: Option<String>,
+    local_sessions_refreshed_at: Option<std::time::Instant>,
     pub sessions: Vec<Session>,
     /// The space whose tabs fill the main area. Healed by [`Self::apply_spaces`]
     /// when the row vanishes; selecting a chat implies its space.
@@ -349,6 +362,7 @@ pub struct AppState {
     /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
+    runtime_profile: RuntimeProfile,
     engine: Option<EngineHandle>,
     watch_tasks: Vec<Task<()>>,
     transcript_task: Option<Task<()>>,
@@ -374,6 +388,11 @@ impl AppState {
             selected_chat: None,
             transcript: Vec::new(),
             collaboration: None,
+            local_sessions: Vec::new(),
+            local_sessions_loading: false,
+            attaching_local_session: None,
+            local_sessions_error: None,
+            local_sessions_refreshed_at: None,
             selected_agent_session: None,
             pending_invitation: None,
             selected_invitation_grant: None,
@@ -381,6 +400,7 @@ impl AppState {
             local_device_id: None,
             update: None,
             data_dir: None,
+            runtime_profile: RuntimeProfile::LocalController,
             engine: None,
             watch_tasks: Vec::new(),
             transcript_task: None,
@@ -780,9 +800,11 @@ impl AppState {
     /// tokio, then attach subscriptions. Safe to call again after `Failed`.
     pub fn bootstrap(state: Entity<AppState>, config: EngineBootConfig, cx: &mut App) {
         let data_dir = config.data_dir.clone();
+        let runtime_profile = config.runtime_profile;
         state.update(cx, |s, cx| {
             s.connection = ConnectionStatus::Connecting;
             s.data_dir = Some(data_dir);
+            s.runtime_profile = runtime_profile;
             cx.notify();
         });
         let boot = Tokio::spawn(cx, EngineHandle::bootstrap(config));
@@ -855,7 +877,103 @@ impl AppState {
                 Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
             self.collaboration_task = Some(spawn_collaboration_watch(cx, handle, chat_id));
         }
+        self.refresh_local_sessions(cx);
         cx.notify();
+    }
+
+    /// Refresh this device's Claude Code, Codex, and OMP session candidates.
+    /// Discovery is filesystem-bound, so the engine runs it off the UI thread.
+    pub fn refresh_local_sessions(&mut self, cx: &mut Context<Self>) {
+        if !self.runtime_profile.allows_session_import() {
+            return;
+        }
+        if self.local_sessions_loading
+            || self
+                .local_sessions_refreshed_at
+                .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(30))
+        {
+            return;
+        }
+        let Some(handle) = self.engine.clone() else {
+            return;
+        };
+        self.local_sessions_loading = true;
+        self.local_sessions_refreshed_at = Some(std::time::Instant::now());
+        self.local_sessions_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = handle
+                .client()
+                .call(methods::LIST_LOCAL_SESSIONS, serde_json::json!({}))
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                state.local_sessions_loading = false;
+                match result {
+                    Ok(value) => {
+                        match serde_json::from_value::<Vec<LocalSessionCandidate>>(value) {
+                            Ok(candidates) => state.local_sessions = candidates,
+                            Err(err) => {
+                                tracing::warn!(error = %err, "invalid local session candidates");
+                                state.local_sessions_error =
+                                    Some("Could not read local sessions".into());
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "local session discovery failed");
+                        state.local_sessions_error = Some("Could not read local sessions".into());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Import a native transcript once, then select the resulting Comet chat.
+    pub fn attach_local_session(&mut self, candidate_id: String, cx: &mut Context<Self>) {
+        if self.attaching_local_session.is_some() {
+            return;
+        }
+        let Some(handle) = self.engine.clone() else {
+            return;
+        };
+        self.attaching_local_session = Some(candidate_id.clone());
+        self.local_sessions_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = handle
+                .client()
+                .call(
+                    methods::ATTACH_LOCAL_SESSION,
+                    serde_json::json!({ "candidateId": candidate_id }),
+                )
+                .await
+                .and_then(|value| {
+                    serde_json::from_value::<LocalSessionAttachResult>(value)
+                        .map_err(|err| RpcError::Failed(err.to_string()))
+                });
+            let _ = this.update(cx, |state, cx| {
+                let attached_id = state.attaching_local_session.take();
+                match result {
+                    Ok(attached) => {
+                        if let Some(candidate_id) = attached_id {
+                            state
+                                .local_sessions
+                                .retain(|candidate| candidate.id != candidate_id);
+                        }
+                        state.selected_space = Some(attached.space_id);
+                        state.select_chat(Some(attached.chat_id), cx);
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "local session import failed");
+                        state.local_sessions_error = Some("Could not open local session".into());
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
     }
 
     /// Select a chat (or clear). Swaps the per-chat doc-transcript subscription:
@@ -915,13 +1033,10 @@ impl AppState {
         cx.notify();
     }
 
-    /// Synced seen marker: only fires when the chat is currently unseen
-    /// (idempotence — no mutate spam), stamps the local row optimistically so
-    /// the LWW round-trip is invisible, and fire-and-forgets the mutate.
-    /// Window-focus liveness sweep: ask the engine to probe every open room
-    /// (workspace + chat docs). Fire-and-forget; each room ignores the hint
-    /// unless it has been broadcast-quiet ≥30s, so spamming is harmless.
+    /// Window-focus liveness sweep: refresh local harness histories and ask the
+    /// engine to probe every open room. Both paths are throttled.
     pub fn probe_sync(&mut self, cx: &mut Context<Self>) {
+        self.refresh_local_sessions(cx);
         let Some(handle) = self.engine.clone() else {
             return;
         };
@@ -934,6 +1049,9 @@ impl AppState {
         .detach();
     }
 
+    /// Synced seen marker: only fires when the chat is currently unseen
+    /// (idempotence — no mutate spam), stamps the local row optimistically so
+    /// the LWW round-trip is invisible, and fire-and-forgets the mutate.
     pub fn mark_chat_seen(&mut self, chat_id: &str, cx: &mut Context<Self>) {
         let Some(chat) = self.chats.iter_mut().find(|c| c.id == chat_id) else {
             return;
@@ -1219,8 +1337,10 @@ mod tests {
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None, // offline
             project_scope: "test".into(),
+            deployment_id: None,
             scaffold_url: None,
             default_harness: HarnessId::Mock,
+            runtime_profile: RuntimeProfile::Mock,
         })
         .await
         .unwrap();
@@ -1248,8 +1368,10 @@ mod tests {
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None, // offline
             project_scope: "test".into(),
+            deployment_id: None,
             scaffold_url: None,
             default_harness: HarnessId::Mock,
+            runtime_profile: RuntimeProfile::Mock,
         })
         .await
         .unwrap();
@@ -1293,8 +1415,10 @@ mod tests {
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
             project_scope: "test".into(),
+            deployment_id: None,
             scaffold_url: None,
             default_harness: HarnessId::Mock,
+            runtime_profile: RuntimeProfile::Mock,
         })
         .await
         .expect("a taken port must not fail the boot");
@@ -1317,7 +1441,9 @@ mod tests {
         let daemon_dir = tempfile::tempdir().unwrap();
         let core = EngineCore::assemble(
             daemon_dir.path(),
-            Arc::new(default_registry()),
+            Arc::new(default_registry(
+                comet_proto::RuntimeProfile::LocalController,
+            )),
             HarnessId::Mock,
             None,
         )
@@ -1333,8 +1459,10 @@ mod tests {
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
             project_scope: "test".into(),
+            deployment_id: None,
             scaffold_url: None,
             default_harness: HarnessId::Mock,
+            runtime_profile: RuntimeProfile::Mock,
         })
         .await
         .unwrap();

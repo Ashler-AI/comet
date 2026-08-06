@@ -70,7 +70,7 @@ fn register_fonts(cx: &App) {
     }
 }
 
-pub use comet_proto::HarnessId;
+pub use comet_proto::{HarnessId, RuntimeProfile};
 pub use state::EngineBootConfig;
 
 /// Everything the headed binary passes in (config/env resolution lives in
@@ -87,12 +87,16 @@ pub struct UiConfig {
     pub edge_token: Option<String>,
     /// Operator-configured Scaffold project/deployment boundary.
     pub project_scope: String,
+    /// Trusted deployment namespace for a Scaffold-host SessionRoom.
+    pub deployment_id: Option<String>,
     /// Scaffold control-plane origin; `None` keeps explicit local mode.
     pub scaffold_url: Option<String>,
     /// Optional deep link supplied by an installed-app launcher.
     pub initial_url: Option<String>,
     /// Harness for doc-command runs until per-chat config lands (M4).
     pub default_harness: HarnessId,
+    /// Server-enforced capabilities for the embedded engine.
+    pub runtime_profile: RuntimeProfile,
 }
 
 impl UiConfig {
@@ -103,8 +107,10 @@ impl UiConfig {
             edge_url: self.edge_url.clone(),
             edge_token: self.edge_token.clone(),
             project_scope: self.project_scope.clone(),
+            deployment_id: self.deployment_id.clone(),
             scaffold_url: self.scaffold_url.clone(),
             default_harness: self.default_harness,
+            runtime_profile: self.runtime_profile,
         }
     }
 }

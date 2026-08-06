@@ -83,6 +83,50 @@ pub struct ChatConfig {
     pub sandbox: SandboxLevel,
 }
 
+/// A harness-native session found in this device's local CLI stores.
+///
+/// The source path stays engine-private. The opaque `id` is passed back to
+/// `AttachLocalSession`, which re-resolves it against the current local scan.
+/// Current file-based discovery is history-only: it never claims live control or
+/// automatic resume without an exclusive native ownership probe.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalSessionCandidate {
+    pub id: String,
+    /// Deterministic Comet chat id used for idempotent imports.
+    pub chat_id: String,
+    pub harness: HarnessId,
+    pub session_id: String,
+    pub cwd: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningLevel>,
+    /// Epoch milliseconds.
+    pub created_at: i64,
+    /// Epoch milliseconds.
+    pub updated_at: i64,
+    /// Transcript files do not prove control of an already-running writer.
+    pub live_attachable: bool,
+    /// The native session id can be resumed by a new process when no writer owns it.
+    pub resumable: bool,
+    /// True when Comet can import history but has no supported native resume path.
+    pub history_only: bool,
+    /// Writer ownership when a supported probe exists; `None` means unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy_elsewhere: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalSessionAttachResult {
+    pub chat_id: String,
+    pub space_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Chat {

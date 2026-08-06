@@ -126,6 +126,7 @@ gh workflow run release.yml -f version="$version" -f publish=false
 Manual publication still requires both private release environments and the production approval. It does not create a GitHub Release or public object. Cargo workspace packages keep `publish = false`, so the workflow cannot publish crates.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the runtime design.
+The required local/Scaffold cutover and multi-client acceptance contract is in [docs/ASHLER-SCAFFOLD-END-STATE.md](docs/ASHLER-SCAFFOLD-END-STATE.md).
 
 ## Provenance and licensing
 

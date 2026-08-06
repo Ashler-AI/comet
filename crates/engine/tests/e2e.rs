@@ -1818,7 +1818,9 @@ async fn real_claude_sees_uploaded_image_inline() {
 
     let core = EngineCore::assemble(
         &dir,
-        Arc::new(comet_engine::default_registry()),
+        Arc::new(comet_engine::default_registry(
+            comet_proto::RuntimeProfile::LocalController,
+        )),
         HarnessId::ClaudeCode,
         None,
     )
