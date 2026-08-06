@@ -4359,9 +4359,8 @@ impl Shell {
                         .flex_col()
                         .items_center()
                         .child(
-                            icon(icons::COMET_LOGO)
-                                .w(px(41.9))
-                                .h(px(48.0))
+                            icon(icons::CREW_MARK)
+                                .size(px(48.0))
                                 .text_color(theme.text.opacity(0.09)),
                         )
                         .child(
@@ -4411,9 +4410,8 @@ impl Shell {
                         .flex_col()
                         .items_center()
                         .child(
-                            icon(icons::COMET_LOGO)
-                                .w(px(41.9))
-                                .h(px(48.0))
+                            icon(icons::CREW_MARK)
+                                .size(px(48.0))
                                 .text_color(theme.text.opacity(0.09)),
                         )
                         .child(
@@ -4829,9 +4827,8 @@ impl Shell {
                 .items_center()
                 .text_center()
                 .child(
-                    icon(icons::COMET_LOGO)
-                        .w(px(31.4))
-                        .h(px(36.0))
+                    icon(icons::CREW_MARK)
+                        .size(px(36.0))
                         .text_color(theme.text),
                 )
                 .child(

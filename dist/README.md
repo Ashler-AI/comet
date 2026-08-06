@@ -1,5 +1,14 @@
 # Packaging
 
+App icons come from `assets/brand` — see its README for the mark, the module
+grid it is built on, and the rules for regenerating the rasters. Nothing in
+`dist/` duplicates them; the packaging scripts read the brand files directly:
+
+| Target | Source | Why |
+| --- | --- | --- |
+| macOS `.icns` | `assets/brand/png/crew-icon-macos-1024.png` | Apple squircle radius, so the Dock icon sits correctly beside native apps |
+| Linux hicolor | `assets/brand/png/crew-icon-1024.png` + `crew-icon.svg` | Ashler tile radius, the product's own shape |
+
 ## Linux (implemented)
 
 ```sh
@@ -11,9 +20,9 @@ Produces `target/package/comet-<version>-linux-<arch>.tar.gz` containing:
 
 - `comet` — the binary (headed by default; `comet headless` runs the engine alone)
 - `comet.desktop` — XDG desktop entry
-- `comet.png` — 1024×1024 app icon (the comet mark from the original app;
-  vector source `comet.svg`)
-- `install.sh` — installs into `~/.local/{bin,share/applications,share/icons}`
+- `comet.png` / `comet.svg` — 1024×1024 and scalable app icon (the brand mark)
+- `install.sh` — installs into `~/.local/{bin,share/applications,share/icons}`,
+  the icon into both the `1024x1024` and `scalable` hicolor directories
 
 The release profile in the root `Cargo.toml` sets `lto = "thin"` and
 `strip = "symbols"` for distribution builds.
@@ -45,10 +54,12 @@ cross-build from Linux):
    sed "s/__VERSION__/$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')/" \
      dist/macos/Info.plist > Comet.app/Contents/Info.plist
    ```
-3. Icon: generate `comet.icns` from `dist/comet.png` (`iconutil`) and place it at
-   `Comet.app/Contents/Resources/comet.icns`:
+3. Icon: generate `comet.icns` from the squircle brand raster (`iconutil`) and
+   place it at `Comet.app/Contents/Resources/comet.icns`:
    ```sh
-   mkdir comet.iconset && sips -z 256 256 dist/comet.png --out comet.iconset/icon_256x256.png
+   mkdir comet.iconset
+   sips -z 256 256 assets/brand/png/crew-icon-macos-1024.png \
+     --out comet.iconset/icon_256x256.png
    iconutil -c icns comet.iconset -o Comet.app/Contents/Resources/comet.icns
    ```
 4. Sign + notarize (required for distribution):

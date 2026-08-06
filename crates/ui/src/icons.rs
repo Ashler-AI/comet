@@ -111,7 +111,10 @@ icon_assets![
     (STOP, "stop"),
     (CHECK, "check"),
     (COPY, "copy"),
-    (COMET_LOGO, "comet-logo"),
+    // The product's own mark — four ashlar stones laid in bond around a live
+    // core, square on a 46-unit artboard. The mono cut of `assets/brand`, since
+    // gpui tints the whole SVG one colour and the green core cannot survive it.
+    (CREW_MARK, "crew-mark"),
     // Harness brand marks (icons.tsx).
     (CLAUDE_MARK, "claude-mark"),
     (OPENAI_MARK, "openai-mark"),
