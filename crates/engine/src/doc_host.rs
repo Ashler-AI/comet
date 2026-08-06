@@ -23,8 +23,8 @@ use comet_doc::{
 use comet_proto::{
     AgentSessionRecord, AuditEvent, AuditResult, COLLABORATION_SCHEMA_VERSION, CapabilityGrant,
     FileTargetReference, HarnessId, MessageProvenance, ModelHandoff, PublicationRecord,
-    PublicationValue, SemanticAnchor, SemanticAnnotation, UserInputAnswer, UserInputQuestion,
-    VerifiedCapabilityGrantEnvelope,
+    PublicationValue, SemanticAnchor, SemanticAnnotation, SessionRoomProjection, UserInputAnswer,
+    UserInputQuestion, VerifiedCapabilityGrantEnvelope,
 };
 use comet_sync::{DocsStore, RoomClient};
 
@@ -129,12 +129,22 @@ impl EdgeConfig {
     /// the bearer is re-fetched before every connect, so reconnects after a
     /// token expiry present a fresh `?token=` instead of the boot-time one.
     pub fn room_url(&self, path: impl Into<String>) -> Arc<dyn comet_sync::UrlProvider> {
+        self.room_url_for(path, None)
+    }
+
+    fn room_url_for(
+        &self,
+        path: impl Into<String>,
+        projection: Option<&SessionRoomProjection>,
+    ) -> Arc<dyn comet_sync::UrlProvider> {
         let ws_base = self.url.replacen("http", "ws", 1);
         Arc::new(EdgeRoomUrl {
             base: format!("{}{}", ws_base.trim_end_matches('/'), path.into()),
             token: self.token.clone(),
             device_id: self.device_id.clone(),
-            deployment_id: self.deployment_id.clone(),
+            deployment_id: projection
+                .map(|scope| scope.deployment_id.clone())
+                .unwrap_or_else(|| self.deployment_id.clone()),
         })
     }
 }
@@ -305,6 +315,7 @@ pub struct ChatDocHandle {
     last_access: AtomicI64,
     /// Last known snapshot blob size — the eviction budget estimate's input.
     snapshot_bytes: AtomicUsize,
+    room_projection: Option<SessionRoomProjection>,
     room: Mutex<Option<RoomClient>>,
     /// Doc subscription (drop = unsubscribe) — bumps the change watch on every commit.
     _sub: loro::Subscription,
@@ -704,7 +715,32 @@ impl DocHost {
     /// Open (or return) the chat's doc handle: load the local snapshot (or init fresh),
     /// start the change-driven task, and join the edge room when configured.
     pub fn open(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
+        self.open_projection(chat_id, None)
+    }
+
+    /// Open a chat against an exact Scaffold room selected by the control-plane
+    /// attach result. Scope is allowed only when its session id is this document's
+    /// id; unscoped callers retain the ordinary local s3 projection.
+    pub fn open_projection(
+        &self,
+        chat_id: &str,
+        projection: Option<&SessionRoomProjection>,
+    ) -> Result<Arc<ChatDocHandle>, EngineError> {
+        if let Some(projection) = projection
+            && (projection.project_id != self.workspace().map_or("", WorkspaceHost::project_scope)
+                || projection.session_id != chat_id
+                || projection.deployment_id.trim().is_empty())
+        {
+            return Err(EngineError::Other(
+                "session room projection does not match local project/chat".into(),
+            ));
+        }
         if let Some(handle) = lock(&self.inner.handles).get(chat_id) {
+            if handle.room_projection.as_ref() != projection {
+                return Err(EngineError::Other(
+                    "chat is already open with a different session room projection".into(),
+                ));
+            }
             handle.touch();
             return Ok(handle.clone());
         }
@@ -738,12 +774,18 @@ impl DocHost {
             mirror_dirty: AtomicBool::new(true),
             last_access: AtomicI64::new(now_ms()),
             snapshot_bytes: AtomicUsize::new(snapshot_len),
+            room_projection: projection.cloned(),
             room: Mutex::new(None),
             _sub: sub,
         });
         {
             let mut handles = lock(&self.inner.handles);
             if let Some(existing) = handles.get(chat_id) {
+                if existing.room_projection.as_ref() != projection {
+                    return Err(EngineError::Other(
+                        "chat raced open with a different session room projection".into(),
+                    ));
+                }
                 return Ok(existing.clone()); // racing open — keep the first
             }
             handles.insert(chat_id.to_string(), handle.clone());
@@ -760,7 +802,7 @@ impl DocHost {
         // Retry on the workspace host's capped, jittered backoff; a system
         // wake redials immediately; eviction/purge ends the loop via `weak`.
         if let Some(edge) = &self.inner.config.edge {
-            let url = edge.room_url(format!("/session/{chat_id}/ws"));
+            let url = edge.room_url_for(format!("/session/{chat_id}/ws"), projection);
             let room_doc = doc.doc().clone();
             let chat = chat_id.to_string();
             let weak = Arc::downgrade(&handle);

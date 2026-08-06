@@ -8,13 +8,18 @@ while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$method" in
     initialize)
-      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"sessionCapabilities\":{\"resume\":{}}}}}"
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":true,\"sessionCapabilities\":{\"resume\":{}}}}}"
       ;;
     session/new)
-      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"sessionId\":\"omp-session-1\"}}"
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"sessionId\":\"omp-session-1\",\"configOptions\":[{\"id\":\"model\",\"currentValue\":\"openai-codex/gpt-5.6-sol\"},{\"id\":\"thinking\",\"currentValue\":\"high\"}]}}"
       ;;
-    session/resume)
+    session/load|session/resume)
+      [ -z "${OMP_METHOD_LOG:-}" ] || printf '%s\n' "$method" >> "$OMP_METHOD_LOG"
       printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{}}"
+      ;;
+    session/set_config_option)
+      [ -z "${OMP_CONFIG_LOG:-}" ] || printf '%s\n' "$line" >> "$OMP_CONFIG_LOG"
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"configOptions\":[]}}"
       ;;
     session/prompt)
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"omp-session-1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"thinking"}}}}'

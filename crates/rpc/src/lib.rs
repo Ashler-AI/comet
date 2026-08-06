@@ -41,6 +41,9 @@ pub mod methods {
     pub const LIST_LOCAL_SESSIONS: &str = "ListLocalSessions";
     /// Import one history-only local candidate into a Comet chat.
     pub const ATTACH_LOCAL_SESSION: &str = "AttachLocalSession";
+    /// Capture exact bytes for a discovered OMP native session. Local-controller
+    /// only; the opaque candidate id is re-resolved server-side.
+    pub const CAPTURE_OMP_SESSION_ARTIFACT: &str = "CaptureOmpSessionArtifact";
     /// Nudge every open room client to verify liveness NOW (window focus,
     /// app foregrounded). No params; IPC-only. Each room ignores the hint
     /// unless it has been broadcast-quiet ≥30s, so this is cheap to spam.

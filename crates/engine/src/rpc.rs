@@ -61,7 +61,7 @@ use comet_doc::{MessagePart, SessionCommandPayload};
 use comet_proto::{
     ChatConfig, CollaborationPrincipal, CollaborationScope, CollaborationSnapshot, HarnessId,
     ParticipantPresence, ParticipantState, RuntimeProfile, ScaffoldEnvironmentControl,
-    SessionStatus, ToolCall,
+    SessionRoomProjection, SessionStatus, ToolCall,
 };
 use comet_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
@@ -84,6 +84,8 @@ const FILE_SEARCH_FEATURED_PATHS: usize = 32;
 #[serde(rename_all = "camelCase")]
 struct ChatParams {
     chat_id: String,
+    #[serde(default)]
+    room_projection: Option<SessionRoomProjection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +97,12 @@ struct ListModelsParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AttachLocalSessionParams {
+    candidate_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CaptureOmpSessionArtifactParams {
     candidate_id: String,
 }
 
@@ -1221,6 +1229,17 @@ impl RpcService for EngineRpc {
                     .map_err(|err| RpcError::Failed(format!("local session scan failed: {err}")))?;
                 RpcReply::value(&candidates)
             }
+            methods::CAPTURE_OMP_SESSION_ARTIFACT => {
+                self.require_session_import()?;
+                let p: CaptureOmpSessionArtifactParams = parse_params(params)?;
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::local_sessions::capture_omp_artifact(&p.candidate_id)
+                })
+                .await
+                .map_err(|err| RpcError::Failed(format!("OMP session capture failed: {err}")))?
+                .map_err(|err| RpcError::Failed(err.to_string()))?;
+                RpcReply::value(&result)
+            }
             methods::ATTACH_LOCAL_SESSION => {
                 self.require_session_import()?;
                 let p: AttachLocalSessionParams = parse_params(params)?;
@@ -1247,7 +1266,7 @@ impl RpcService for EngineRpc {
                 let p: ChatParams = parse_params(params)?;
                 let handle = self
                     .doc_host
-                    .open(&p.chat_id)
+                    .open_projection(&p.chat_id, p.room_projection.as_ref())
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 Ok(RpcReply::Stream(doc_messages_stream(
                     handle.watch_messages(),
@@ -1257,7 +1276,7 @@ impl RpcService for EngineRpc {
                 let p: ChatParams = parse_params(params)?;
                 let handle = self
                     .doc_host
-                    .open(&p.chat_id)
+                    .open_projection(&p.chat_id, p.room_projection.as_ref())
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 let doc = handle.doc_arc();
                 Ok(RpcReply::Stream(collaboration_stream(

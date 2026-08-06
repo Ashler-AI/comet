@@ -120,6 +120,26 @@ pub struct LocalSessionCandidate {
     pub busy_elsewhere: Option<bool>,
 }
 
+/// Exact, content-addressed capture of an OMP native session file.
+///
+/// This is a local-controller handoff payload: the platform uploads `bytes`
+/// under `sha256`, preserves `native_session_id` and `cwd` as trusted metadata,
+/// and materializes the bytes in the destination OMP session store before ACP
+/// continuation. The source filesystem path is deliberately not exposed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OmpSessionArtifact {
+    pub native_session_id: String,
+    pub cwd: String,
+    /// Slash-separated path below the configured OMP `sessions` directory.
+    /// The receiver materializes `bytes` at this exact relative path.
+    pub storage_relative_path: String,
+    /// Lowercase SHA-256 of `bytes`.
+    pub sha256: String,
+    pub byte_count: u64,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalSessionAttachResult {

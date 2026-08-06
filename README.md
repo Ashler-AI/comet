@@ -25,7 +25,16 @@ comet update
 comet daemon start|stop|restart|status
 ```
 
-Download the macOS Apple-silicon DMG from the same release feed.
+Download the macOS DMG from the same release feed. Comet uses OMP over ACP. On macOS, bootstrap or validate the exact supported upstream binary explicitly (the installer never silently replaces an existing `omp`):
+
+```bash
+# Run the same private install.sh downloaded above:
+sh install.sh --install-omp
+```
+
+This installs the official [oh-my-pi v17.2.9](https://github.com/can1357/oh-my-pi/releases/tag/v17.2.9) artifact to `~/.local/bin/omp` after SHA-256 verification. The pins are `omp-darwin-arm64` = `3f9c44c465da8428b5a81a0c9cdac22ced982319fe93d534914cb61838a63118` and `omp-darwin-x64` = `35c36f893a68feb6df3a61ff9359bb6ad13a5534687bb0396508aabc69c5f347`. Linux OMP distribution is managed separately and must not reuse these pins.
+
+To use a remote OMP auth broker, launch Comet with `OMP_AUTH_BROKER_URL` and either `OMP_AUTH_BROKER_TOKEN` or `OMP_AUTH_BROKER_TOKEN_FILE`. The token-file form is preferred for service managers: it must be mode `0600`, is removed before parsing/spawn on every outcome, and Comet passes the bearer only in the OMP child environment, never argv or logs. Do not print or interpolate the token in shell commands. Scaffold-host OMP launches remain isolated with `--profile scaffold-host --no-extensions --no-skills --no-rules`.
 
 ## Local collaboration smoke
 

@@ -14,6 +14,84 @@
 # `comet` on PATH, and — once signed in — runs it as a systemd user service.
 set -eu
 
+# OMP is an independently released ACP runtime. Its macOS bootstrap is explicit
+# because it downloads an executable from the official upstream GitHub release.
+OMP_VERSION=17.2.9
+OMP_RELEASE_BASE="https://github.com/can1357/oh-my-pi/releases/download/v$OMP_VERSION"
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    echo "ashler comet install: sha256sum or shasum is required" >&2
+    exit 1
+  fi
+}
+
+install_omp_macos() {
+  [ "$(uname -s)" = Darwin ] || {
+    echo "ashler comet install: --install-omp is currently for macOS only" >&2
+    exit 1
+  }
+  case "$(uname -m)" in
+    arm64 | aarch64)
+      asset=omp-darwin-arm64
+      expected=3f9c44c465da8428b5a81a0c9cdac22ced982319fe93d534914cb61838a63118
+      ;;
+    x86_64 | amd64)
+      asset=omp-darwin-x64
+      expected=35c36f893a68feb6df3a61ff9359bb6ad13a5534687bb0396508aabc69c5f347
+      ;;
+    *)
+      echo "ashler comet install: unsupported macOS architecture '$(uname -m)'" >&2
+      exit 1
+      ;;
+  esac
+
+  destination="${OMP_INSTALL_PATH:-$HOME/.local/bin/omp}"
+  if [ -e "$destination" ]; then
+    actual="$(sha256_file "$destination")"
+    [ "$actual" = "$expected" ] || {
+      echo "ashler comet install: existing $destination is not the pinned official OMP $OMP_VERSION artifact" >&2
+      echo "remove or relocate it, then rerun this explicit bootstrap" >&2
+      exit 1
+    }
+    echo "OMP $OMP_VERSION is already installed and verified at $destination"
+    return
+  fi
+
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  echo "downloading official OMP $OMP_VERSION ($asset)…"
+  curl -fL --proto '=https' --tlsv1.2 "$OMP_RELEASE_BASE/$asset" -o "$tmp/omp"
+  actual="$(sha256_file "$tmp/omp")"
+  [ "$actual" = "$expected" ] || {
+    echo "ashler comet install: checksum mismatch for official OMP $OMP_VERSION $asset" >&2
+    exit 1
+  }
+  mkdir -p "$(dirname "$destination")"
+  chmod 0755 "$tmp/omp"
+  mv "$tmp/omp" "$destination"
+  echo "OMP $OMP_VERSION installed and verified at $destination"
+}
+
+case "${1:-}" in
+  --install-omp)
+    [ "$#" -eq 1 ] || { echo "usage: install.sh --install-omp" >&2; exit 2; }
+    install_omp_macos
+    exit 0
+    ;;
+  --help|-h)
+    echo "usage: install.sh [--install-omp]"
+    echo "  --install-omp  explicitly install/validate pinned official OMP on macOS"
+    exit 0
+    ;;
+  "") ;;
+  *) echo "usage: install.sh [--install-omp]" >&2; exit 2 ;;
+esac
+
 RELEASES="${COMET_RELEASES_URL:?set COMET_RELEASES_URL to the private Ashler Comet GCS HTTPS prefix}"
 RELEASE_AUTHORIZATION="${COMET_RELEASES_AUTHORIZATION:-}"
 unset COMET_RELEASES_AUTHORIZATION
@@ -80,14 +158,7 @@ else
   release_fetch -fsSL "$RELEASES/SHA256SUMS" -o "$tmp/SHA256SUMS"
   expected="$(awk -v file="$file" '$2 == file || $2 == "*" file { print $1; exit }' "$tmp/SHA256SUMS")"
   [ -n "$expected" ] || { echo "ashler comet install: $file is missing from SHA256SUMS" >&2; exit 1; }
-  if command -v sha256sum >/dev/null 2>&1; then
-    actual="$(sha256sum "$tmp/$file" | awk '{print $1}')"
-  elif command -v shasum >/dev/null 2>&1; then
-    actual="$(shasum -a 256 "$tmp/$file" | awk '{print $1}')"
-  else
-    echo "ashler comet install: sha256sum or shasum is required" >&2
-    exit 1
-  fi
+  actual="$(sha256_file "$tmp/$file")"
   [ "$actual" = "$expected" ] || { echo "ashler comet install: checksum mismatch for $file" >&2; exit 1; }
   mkdir -p "$dest"
   tar -xzf "$tmp/$file" -C "$dest" --strip-components=1

@@ -30,9 +30,10 @@ use serde::de::DeserializeOwned;
 use comet_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
 use comet_engine::{Engine, EngineConfig, EngineRuntime, rpc::AuthRpc};
 use comet_proto::{
-    AuthState, Chat, ChatIndicator, CollaborationSnapshot, Device, HarnessId,
+    AuthState, Chat, ChatIndicator, CollaborationScope, CollaborationSnapshot, Device, HarnessId,
     LocalSessionAttachResult, LocalSessionCandidate, MessageProvenance, ParticipantPresence,
-    RuntimeProfile, Session, Space,
+    RuntimeProfile, ScaffoldEnvironmentControl, ScaffoldEnvironmentControlResult,
+    ScaffoldRuntimeMode, Session, SessionEnvironmentSource, SessionRoomProjection, Space,
 };
 use comet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
 
@@ -327,6 +328,7 @@ pub struct AppState {
     pub chats: Vec<Chat>,
     /// Harness-native sessions discovered on this device but not yet imported.
     pub local_sessions: Vec<LocalSessionCandidate>,
+    /// Automatic local-history hydration shown inline with the Sessions list.
     pub local_sessions_loading: bool,
     pub attaching_local_session: Option<String>,
     pub local_sessions_error: Option<String>,
@@ -351,6 +353,13 @@ pub struct AppState {
     /// Grant named by the accepted deep link. It remains a routing identity;
     /// command authority is still checked against the verified projection.
     pub selected_invitation_grant: Option<String>,
+    /// Trusted per-chat room scopes returned by Scaffold Attach. Absence is
+    /// intentional: ordinary local sessions continue to use legacy s3 rooms.
+    room_projections: HashMap<String, SessionRoomProjection>,
+    /// Configured local-controller boundary for creating Scaffold sessions.
+    scaffold_scope: Option<(String, String)>,
+    pub starting_scaffold_session: bool,
+    pub scaffold_session_error: Option<String>,
     /// Optimistic user echoes per chat id, shown until the doc frame carrying
     /// the same message id arrives (client-minted ids make dedup exact).
     echoes: HashMap<String, Vec<SessionMessageEntry>>,
@@ -396,6 +405,10 @@ impl AppState {
             selected_agent_session: None,
             pending_invitation: None,
             selected_invitation_grant: None,
+            room_projections: HashMap::new(),
+            scaffold_scope: None,
+            starting_scaffold_session: false,
+            scaffold_session_error: None,
             echoes: HashMap::new(),
             local_device_id: None,
             update: None,
@@ -801,10 +814,16 @@ impl AppState {
     pub fn bootstrap(state: Entity<AppState>, config: EngineBootConfig, cx: &mut App) {
         let data_dir = config.data_dir.clone();
         let runtime_profile = config.runtime_profile;
+        let scaffold_scope = config
+            .scaffold_url
+            .as_ref()
+            .zip(config.deployment_id.as_ref())
+            .map(|(_, deployment)| (config.project_scope.clone(), deployment.clone()));
         state.update(cx, |s, cx| {
             s.connection = ConnectionStatus::Connecting;
             s.data_dir = Some(data_dir);
             s.runtime_profile = runtime_profile;
+            s.scaffold_scope = scaffold_scope;
             cx.notify();
         });
         let boot = Tokio::spawn(cx, EngineHandle::bootstrap(config));
@@ -873,16 +892,148 @@ impl AppState {
         // Re-subscribe selected-room projections after an engine reconnect.
         // Both retain their last good content until replacement frames arrive.
         if let Some(chat_id) = self.selected_chat.clone() {
-            self.transcript_task =
-                Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
-            self.collaboration_task = Some(spawn_collaboration_watch(cx, handle, chat_id));
+            let projection = self.room_projections.get(&chat_id).cloned();
+            self.transcript_task = Some(spawn_transcript_watch(
+                cx,
+                handle.clone(),
+                chat_id.clone(),
+                projection.clone(),
+            ));
+            self.collaboration_task =
+                Some(spawn_collaboration_watch(cx, handle, chat_id, projection));
         }
         self.refresh_local_sessions(cx);
         cx.notify();
     }
 
-    /// Refresh this device's Claude Code, Codex, and OMP session candidates.
-    /// Discovery is filesystem-bound, so the engine runs it off the UI thread.
+    /// Run a typed Scaffold operation. Attach is special: its trusted control-
+    /// plane room projection is installed before navigation, so both document
+    /// watches dial the sandbox host's exact s4 room instead of local s3.
+    pub fn control_scaffold_environment(
+        &mut self,
+        control: ScaffoldEnvironmentControl,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(handle) = self.engine.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = handle
+                .client()
+                .call(
+                    methods::CONTROL_SCAFFOLD_ENVIRONMENT,
+                    serde_json::to_value(control).unwrap_or_default(),
+                )
+                .await
+                .and_then(|value| {
+                    serde_json::from_value::<ScaffoldEnvironmentControlResult>(value)
+                        .map_err(|err| RpcError::Failed(err.to_string()))
+                });
+            let _ = this.update(cx, |state, cx| match result {
+                Ok(result) => {
+                    if let Some(projection) = result.room_projection {
+                        let chat_id = projection.session_id.clone();
+                        state.room_projections.insert(chat_id.clone(), projection);
+                        state.select_chat(Some(chat_id), cx);
+                    } else {
+                        cx.notify();
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "Scaffold environment control failed");
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub fn can_start_scaffold_session(&self) -> bool {
+        self.scaffold_scope.is_some() && self.runtime_profile.allows_session_import()
+    }
+
+    /// Create and attach one Scaffold-hosted session in the configured project.
+    pub fn start_scaffold_session(&mut self, cx: &mut Context<Self>) {
+        if self.starting_scaffold_session {
+            return;
+        }
+        let Some((project_id, deployment_id)) = self.scaffold_scope.clone() else {
+            self.scaffold_session_error = Some("Scaffold is not configured".into());
+            cx.notify();
+            return;
+        };
+        let Some(handle) = self.engine.clone() else {
+            return;
+        };
+        let scope = CollaborationScope {
+            project_id,
+            deployment_id: Some(deployment_id),
+            session_id: Some(uuid::Uuid::new_v4().to_string()),
+            unknown: Default::default(),
+        };
+        self.starting_scaffold_session = true;
+        self.scaffold_session_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result: Result<SessionRoomProjection, RpcError> = async {
+                let create = ScaffoldEnvironmentControl::Create {
+                    scope: scope.clone(),
+                    name: None,
+                    source_ref: None,
+                    region: None,
+                    runtime_mode: Some(ScaffoldRuntimeMode::Compose),
+                };
+                let value = handle
+                    .client()
+                    .call(
+                        methods::CONTROL_SCAFFOLD_ENVIRONMENT,
+                        serde_json::to_value(create).unwrap_or_default(),
+                    )
+                    .await?;
+                let created: ScaffoldEnvironmentControlResult = serde_json::from_value(value)
+                    .map_err(|err| RpcError::Failed(err.to_string()))?;
+                let SessionEnvironmentSource::Scaffold { sandbox_id, .. } =
+                    created.environment.source
+                else {
+                    return Err(RpcError::Failed(
+                        "Scaffold returned a local environment".into(),
+                    ));
+                };
+                let attach = ScaffoldEnvironmentControl::Attach { sandbox_id, scope };
+                let value = handle
+                    .client()
+                    .call(
+                        methods::CONTROL_SCAFFOLD_ENVIRONMENT,
+                        serde_json::to_value(attach).unwrap_or_default(),
+                    )
+                    .await?;
+                let attached: ScaffoldEnvironmentControlResult = serde_json::from_value(value)
+                    .map_err(|err| RpcError::Failed(err.to_string()))?;
+                attached.room_projection.ok_or_else(|| {
+                    RpcError::Failed("Scaffold attach returned no session room".into())
+                })
+            }
+            .await;
+            let _ = this.update(cx, |state, cx| {
+                state.starting_scaffold_session = false;
+                match result {
+                    Ok(projection) => {
+                        let chat_id = projection.session_id.clone();
+                        state.room_projections.insert(chat_id.clone(), projection);
+                        state.select_chat(Some(chat_id), cx);
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "Scaffold session start failed");
+                        state.scaffold_session_error =
+                            Some("Could not start Scaffold session".into());
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
     pub fn refresh_local_sessions(&mut self, cx: &mut Context<Self>) {
         if !self.runtime_profile.allows_session_import() {
             return;
@@ -1017,9 +1168,15 @@ impl AppState {
             self.mark_chat_seen(id, cx);
         }
         if let (Some(chat_id), Some(handle)) = (chat_id, self.engine.clone()) {
-            self.transcript_task =
-                Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
-            self.collaboration_task = Some(spawn_collaboration_watch(cx, handle, chat_id));
+            let projection = self.room_projections.get(&chat_id).cloned();
+            self.transcript_task = Some(spawn_transcript_watch(
+                cx,
+                handle.clone(),
+                chat_id.clone(),
+                projection.clone(),
+            ));
+            self.collaboration_task =
+                Some(spawn_collaboration_watch(cx, handle, chat_id, projection));
         }
         cx.notify();
     }
@@ -1191,6 +1348,7 @@ fn spawn_transcript_watch(
     cx: &mut Context<AppState>,
     handle: EngineHandle,
     chat_id: String,
+    room_projection: Option<SessionRoomProjection>,
 ) -> Task<()> {
     cx.spawn(async move |this, cx| {
         // Outer loop: a delta desync (missed frame) resubscribes immediately
@@ -1203,7 +1361,10 @@ fn spawn_transcript_watch(
         // deselected or deleted, so retrying can't outlive relevance.
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
         'resubscribe: loop {
-            let params = serde_json::json!({ "chatId": chat_id });
+            let params = serde_json::json!({
+                "chatId": chat_id,
+                "roomProjection": room_projection,
+            });
             let mut rx = match handle
                 .client()
                 .subscribe(methods::WATCH_DOC_MESSAGES, params)
@@ -1264,11 +1425,15 @@ fn spawn_collaboration_watch(
     cx: &mut Context<AppState>,
     handle: EngineHandle,
     chat_id: String,
+    room_projection: Option<SessionRoomProjection>,
 ) -> Task<()> {
     cx.spawn(async move |this, cx| {
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
         loop {
-            let params = serde_json::json!({ "chatId": chat_id });
+            let params = serde_json::json!({
+                "chatId": chat_id,
+                "roomProjection": room_projection,
+            });
             let mut rx = match handle
                 .client()
                 .subscribe("WatchCollaboration", params)

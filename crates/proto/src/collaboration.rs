@@ -404,6 +404,27 @@ pub enum ScaffoldEnvironmentControl {
         sandbox_id: String,
         scope: CollaborationScope,
     },
+    /// Copy an exact local OMP session into a Scaffold host. This only
+    /// materializes and verifies the native store; the first remote run performs
+    /// ACP `session/load` through its ordinary `RunRequest.resume` path.
+    HandoffOmpSession {
+        #[serde(rename = "sandboxId")]
+        sandbox_id: String,
+        scope: CollaborationScope,
+        #[serde(rename = "localCandidateId")]
+        local_candidate_id: String,
+    },
+}
+
+/// Exact physical SessionRoom selected by a Scaffold attach. The local controller
+/// must carry this trusted result into its document watch; ordinary local watches
+/// omit it and remain on the legacy project/session namespace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRoomProjection {
+    pub project_id: String,
+    pub deployment_id: String,
+    pub session_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -414,6 +435,14 @@ pub struct ScaffoldEnvironmentControlResult {
     pub attached_device_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_projection: Option<SessionRoomProjection>,
+    /// Native OMP id to put on the first remote `RunRequest.resume`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_native_session_id: Option<String>,
+    /// Sandbox working directory to use for that first remote run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_cwd: Option<String>,
 }
 
 /// One independently-owned agent session contributing to a shared thread.
@@ -712,7 +741,26 @@ pub struct CollaborationSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use super::CometInvitation;
+    use super::{CollaborationScope, CometInvitation, ScaffoldEnvironmentControl};
+
+    #[test]
+    fn omp_handoff_control_uses_additive_camel_case_wire_shape() {
+        let control = ScaffoldEnvironmentControl::HandoffOmpSession {
+            sandbox_id: "sandbox-a".into(),
+            scope: CollaborationScope {
+                project_id: "project-a".into(),
+                deployment_id: Some("deployment-a".into()),
+                session_id: Some("session-a".into()),
+                unknown: Default::default(),
+            },
+            local_candidate_id: "opaque-local-id".into(),
+        };
+        let value = serde_json::to_value(control).unwrap();
+        assert_eq!(value["operation"], "handoffOmpSession");
+        assert_eq!(value["sandboxId"], "sandbox-a");
+        assert_eq!(value["localCandidateId"], "opaque-local-id");
+        assert_eq!(value["scope"]["sessionId"], "session-a");
+    }
 
     #[test]
     fn invitation_deep_link_round_trips_exact_route() {

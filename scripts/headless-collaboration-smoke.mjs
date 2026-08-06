@@ -465,7 +465,7 @@ const main = async () => {
   const ipcPort = await reservePort();
 
   const ownerSession = await openWebSocket(
-    `${edgeOrigin.replace("http:", "ws:")}/session/${SESSION_ID}/ws?device=owner-ui&token=${OWNER_TOKEN}`,
+    `${edgeOrigin.replace("http:", "ws:")}/session/${SESSION_ID}/ws?device=owner-ui&token=${OWNER_TOKEN}&deploymentId=${encodeURIComponent(DEPLOYMENT_ID)}`,
     "owner session room"
   );
   console.log("PASS Edge authenticated the verified owner and routed its real session WebSocket");
@@ -556,17 +556,43 @@ const main = async () => {
   });
   assert.equal(actorDenial, "actor_mismatch");
   console.log("PASS Edge rejected a forged command actor from a different authenticated principal");
-  const harnesses = await rpcCall(clientB, 1, "ListHarnesses");
-  assert.ok(Array.isArray(harnesses) && harnesses.length > 0, "Rust must answer an actual relay RPC");
-  console.log("PASS two authenticated client WebSockets attached and relayed an actual RPC through Rust");
+  const pauseCommand = {
+    chatId: SESSION_ID,
+    command: {
+      kind: "control",
+      sessionId: SESSION_ID,
+      ownerDeviceId: DEVICE_ID,
+      actorDeviceId: "client-b",
+      actorSubject: CLIENT_B_SUBJECT,
+      grantId,
+      source: "scaffold",
+      action: { action: "pause" }
+    }
+  };
+  const pauseResult = await rpcCall(clientB, 1, "QueueCommand", pauseCommand);
+  assert.ok(pauseResult && typeof pauseResult === "object", "Rust must answer an actual exact-session relay RPC");
+  console.log("PASS two authenticated client WebSockets attached and relayed an actual exact-session RPC through Rust");
 
   await closeWebSocket(clientA, "reconnect client A");
   const reconnectedA = await openWebSocket(
     `${edgeOrigin.replace("http:", "ws:")}/device/${DEVICE_ID}/ws?role=client&connId=client-a&token=${CLIENT_A_TOKEN}`,
     "reconnected relay client A"
   );
-  const reconnectedHarnesses = await rpcCall(reconnectedA, 2, "ListHarnesses");
-  assert.deepEqual(reconnectedHarnesses, harnesses);
+  const reconnectPause = {
+    chatId: SESSION_ID,
+    command: {
+      kind: "control",
+      sessionId: SESSION_ID,
+      ownerDeviceId: DEVICE_ID,
+      actorDeviceId: "client-a",
+      actorSubject: CLIENT_A_SUBJECT,
+      grantId,
+      source: "scaffold",
+      action: { action: "pause" }
+    }
+  };
+  const reconnectedResult = await rpcCall(reconnectedA, 2, "QueueCommand", reconnectPause);
+  assert.ok(reconnectedResult && typeof reconnectedResult === "object");
   console.log("PASS a disconnected client reconnected and relayed again through the same Rust host");
 
   const revoked = await ownerFetch(edgeOrigin, `/auth/device-grants?id=${grantId}`, {
@@ -579,7 +605,7 @@ const main = async () => {
     const result = await ownerFetch(edgeOrigin, `/device/${DEVICE_ID}/status`);
     return result.response.ok && result.body?.hostConnected === false;
   });
-  const relayDenial = await expectRelayDenial(clientB, 3, "ListHarnesses");
+  const relayDenial = await expectRelayDenial(clientB, 3, "QueueCommand", pauseCommand);
   assert.ok(
     ["host_offline", "host_closed", "socket_closed:4403"].includes(relayDenial),
     `unexpected revocation relay result: ${relayDenial}`

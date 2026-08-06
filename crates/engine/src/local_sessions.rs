@@ -1,8 +1,8 @@
-//! Discovery and one-time import of harness-native local session transcripts.
+//! Discovery and automatic hydration of harness-native local session transcripts.
 //!
-//! Local CLI stores remain the source of truth until the user explicitly imports a
-//! candidate. Import copies user/assistant text into a history-only Comet chat;
-//! file discovery alone never claims control of a native session writer.
+//! Local CLI stores remain the transcript source of truth. Comet materializes
+//! deterministic chat rows for discovered sessions, then imports their text
+//! idempotently without claiming control of a native session writer.
 
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -13,8 +13,8 @@ use std::time::UNIX_EPOCH;
 use chrono::{DateTime, Utc};
 use comet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
 use comet_proto::{
-    ChatConfig, HarnessId, LocalSessionAttachResult, LocalSessionCandidate, ReasoningLevel,
-    SandboxLevel,
+    ChatConfig, HarnessId, LocalSessionAttachResult, LocalSessionCandidate, OmpSessionArtifact,
+    ReasoningLevel, SandboxLevel,
 };
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
@@ -50,6 +50,40 @@ pub fn discover() -> Vec<LocalSessionCandidate> {
 
 /// Resolve an opaque candidate id again, import its transcript idempotently, and
 /// return the Comet chat/space selected by the UI.
+/// Re-resolve an opaque local candidate and capture its exact OMP session file.
+///
+/// This local-controller API does not accept arbitrary filesystem paths. The
+/// discovery id must still resolve to an OMP candidate, and capture revalidates
+/// the native id/cwd against the bytes under a stable no-follow file handle.
+pub fn capture_omp_artifact(candidate_id: &str) -> Result<OmpSessionArtifact, EngineError> {
+    capture_omp_artifact_with_roots(candidate_id, &session_roots())
+}
+
+fn capture_omp_artifact_with_roots(
+    candidate_id: &str,
+    roots: &SessionRoots,
+) -> Result<OmpSessionArtifact, EngineError> {
+    let session = discover_with_roots(roots)
+        .into_iter()
+        .find(|session| session.candidate.id == candidate_id)
+        .ok_or_else(|| EngineError::Other("local session is no longer available".into()))?;
+    if session.candidate.harness != HarnessId::Omp {
+        return Err(EngineError::Other(
+            "only OMP native sessions support exact artifact capture".into(),
+        ));
+    }
+    let sessions_root = roots.omp.join("sessions");
+    let storage_relative_path = session.path.strip_prefix(&sessions_root).map_err(|_| {
+        EngineError::Other("OMP session path escaped the configured sessions root".into())
+    })?;
+    crate::omp_session_artifact::capture_omp_session_artifact(
+        &session.path,
+        storage_relative_path,
+        &session.candidate.session_id,
+        &session.candidate.cwd,
+    )
+}
+
 pub fn attach(
     candidate_id: &str,
     workspace: &WorkspaceHost,
@@ -59,35 +93,155 @@ pub fn attach(
         .into_iter()
         .find(|session| session.candidate.id == candidate_id)
         .ok_or_else(|| EngineError::Other("local session is no longer available".into()))?;
-    attach_discovered(session, workspace, doc_host)
+    let (attached, needs_import) = materialize_discovered(&session, workspace, doc_host)?;
+    if needs_import {
+        import_transcript(&session, workspace, doc_host)?;
+    }
+    Ok(attached)
 }
 
-fn attach_discovered(
-    session: DiscoveredSession,
+/// Materialize every unowned local history as a normal Comet session.
+///
+/// Metadata is written in a first pass so all sidebar rows appear before a
+/// large native transcript finishes parsing. Native ids already owned by a
+/// Comet chat are skipped; continuing a hydrated session must not create a
+/// second sidebar row for the continuation process.
+pub fn hydrate(
     workspace: &WorkspaceHost,
     doc_host: &DocHost,
-) -> Result<LocalSessionAttachResult, EngineError> {
+) -> Result<Vec<LocalSessionAttachResult>, EngineError> {
+    let mut sessions = discover_with_roots(&session_roots());
+    sessions.sort_by(|a, b| {
+        b.candidate
+            .updated_at
+            .cmp(&a.candidate.updated_at)
+            .then_with(|| a.candidate.id.cmp(&b.candidate.id))
+    });
+    let owned_native_ids: HashSet<String> = workspace
+        .doc()
+        .read_chats()?
+        .into_iter()
+        .filter_map(|chat| chat.harness_session_id)
+        .filter(|id| !id.is_empty())
+        .collect();
+    sessions.retain(|session| !owned_native_ids.contains(&session.candidate.session_id));
+
+    let mut attached = Vec::with_capacity(sessions.len());
+    let mut pending_imports = Vec::new();
+    for session in sessions {
+        match materialize_discovered(&session, workspace, doc_host) {
+            Ok((result, needs_import)) => {
+                attached.push(result);
+                if needs_import {
+                    pending_imports.push(session);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    candidate = %session.candidate.id,
+                    error = %err,
+                    "local session metadata hydration failed"
+                );
+            }
+        }
+    }
+    for session in pending_imports {
+        if let Err(err) = import_transcript(&session, workspace, doc_host) {
+            tracing::warn!(
+                candidate = %session.candidate.id,
+                error = %err,
+                "local session transcript hydration failed"
+            );
+        }
+    }
+    Ok(attached)
+}
+
+fn materialize_discovered(
+    session: &DiscoveredSession,
+    workspace: &WorkspaceHost,
+    doc_host: &DocHost,
+) -> Result<(LocalSessionAttachResult, bool), EngineError> {
     let candidate = &session.candidate;
     let device_id = doc_host.device_id();
-    let space_id = workspace
-        .read_spaces()?
-        .into_iter()
-        .find(|space| space.device_id == device_id && space.path == candidate.cwd)
-        .map(|space| space.id)
-        .unwrap_or_else(|| format!("local-space-{}", short_hash(&candidate.cwd)));
-
-    if !workspace
-        .read_spaces()?
+    let spaces = workspace.read_spaces()?;
+    let space_id = spaces
         .iter()
-        .any(|space| space.id == space_id)
-    {
+        .find(|space| space.device_id == device_id && space.path == candidate.cwd)
+        .map(|space| space.id.clone())
+        .unwrap_or_else(|| format!("local-space-{}", short_hash(&candidate.cwd)));
+    if !spaces.iter().any(|space| space.id == space_id) {
         let git_detected = Path::new(&candidate.cwd).join(".git").exists();
         workspace.create_space(&space_id, device_id, &candidate.cwd, None, git_detected)?;
     }
 
     let chat_id = candidate.chat_id.clone();
-    let entries = load_transcript(&session, device_id)?;
-    let doc = doc_host.open(&chat_id)?;
+    let existing = workspace.doc().chat(&chat_id)?;
+    let needs_import = existing
+        .as_ref()
+        .and_then(|chat| chat.last_message_at)
+        .is_none_or(|at| at.timestamp_millis() < candidate.updated_at);
+    let config = ChatConfig {
+        harness: candidate.harness,
+        model: candidate.model.clone(),
+        reasoning: candidate.reasoning,
+        model_options: serde_json::Map::new(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+    };
+    let metadata_matches = existing.as_ref().is_some_and(|chat| {
+        chat.title.as_deref() == Some(candidate.title.as_str())
+            && chat.cwd.as_deref() == Some(candidate.cwd.as_str())
+            && chat.space_id.as_deref() == Some(space_id.as_str())
+            && chat.config.as_ref() == Some(&config)
+    });
+    if metadata_matches && !needs_import {
+        return Ok((LocalSessionAttachResult { chat_id, space_id }, false));
+    }
+
+    if existing.is_none() {
+        workspace.create_chat(
+            &chat_id,
+            &space_id,
+            Some(config.clone()),
+            Some(candidate.cwd.clone()),
+        )?;
+        workspace.set_chat_activity(&chat_id, None, Some(candidate.created_at))?;
+    }
+    if existing
+        .as_ref()
+        .is_some_and(|chat| chat.cwd.as_deref() != Some(candidate.cwd.as_str()))
+    {
+        workspace.set_chat_cwd(&chat_id, &candidate.cwd)?;
+    }
+    if existing
+        .as_ref()
+        .is_some_and(|chat| chat.space_id.as_deref() != Some(space_id.as_str()))
+    {
+        workspace.set_chat_space(&chat_id, &space_id)?;
+    }
+    if existing
+        .as_ref()
+        .is_none_or(|chat| chat.title.as_deref() != Some(candidate.title.as_str()))
+    {
+        workspace.rename_chat(&chat_id, &candidate.title)?;
+    }
+    if existing
+        .as_ref()
+        .is_none_or(|chat| chat.config.as_ref() != Some(&config))
+    {
+        workspace.set_chat_config(&chat_id, &config)?;
+    }
+    Ok((LocalSessionAttachResult { chat_id, space_id }, needs_import))
+}
+
+fn import_transcript(
+    session: &DiscoveredSession,
+    workspace: &WorkspaceHost,
+    doc_host: &DocHost,
+) -> Result<(), EngineError> {
+    let candidate = &session.candidate;
+    let entries = load_transcript(session, doc_host.device_id())?;
+    let doc = doc_host.open(&candidate.chat_id)?;
     let session_doc = doc.doc_arc();
     let existing: HashSet<String> = session_doc
         .read_entries()?
@@ -99,38 +253,19 @@ fn attach_discovered(
             session_doc.push_message(entry)?;
         }
     }
-
-    let config = ChatConfig {
-        harness: candidate.harness,
-        model: candidate.model.clone(),
-        reasoning: candidate.reasoning,
-        model_options: serde_json::Map::new(),
-        sandbox: SandboxLevel::WorkspaceWrite,
-    };
-    workspace.create_chat(
-        &chat_id,
-        &space_id,
-        Some(config.clone()),
-        Some(candidate.cwd.clone()),
-    )?;
-    workspace.rename_chat(&chat_id, &candidate.title)?;
-    workspace.set_chat_config(&chat_id, &config)?;
-    // Discovery proves history only. It does not prove exclusive writer ownership,
-    // so never seed automatic native resume from files alone.
     if let Some(preview) = entries
         .last()
         .and_then(|entry| entry.parts.iter().find_map(text_part))
         .or(candidate.preview.as_deref())
     {
-        workspace.note_message(&chat_id, preview);
+        workspace.note_message(&candidate.chat_id, preview);
     }
     workspace.set_chat_activity(
-        &chat_id,
+        &candidate.chat_id,
         Some(candidate.updated_at),
         Some(candidate.created_at),
     )?;
-
-    Ok(LocalSessionAttachResult { chat_id, space_id })
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -358,8 +493,10 @@ fn candidate_from_omp(path: &Path) -> Option<DiscoveredSession> {
     let mut session_id = None;
     let mut cwd = None;
     let mut title = None;
+    let mut has_title_record = false;
     let mut preview = None;
     let mut model = None;
+    let mut reasoning = None;
     let mut created_at = None;
     let mut updated_at = file_modified_ms(path);
 
@@ -370,11 +507,35 @@ fn candidate_from_omp(path: &Path) -> Option<DiscoveredSession> {
                     .map(str::to_string)
                     .or(session_id);
                 cwd = string_at(&value, &["cwd"]).map(str::to_string).or(cwd);
+                if !has_title_record {
+                    title = string_at(&value, &["title"]).map(str::to_string).or(title);
+                }
+            }
+            Some("title") => {
+                if let Some(value) = string_at(&value, &["title"])
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    title = Some(value.to_string());
+                    has_title_record = true;
+                }
             }
             Some("custom-title") => {
-                title = string_at(&value, &["customTitle"])
-                    .map(str::to_string)
-                    .or(title);
+                if let Some(value) = string_at(&value, &["customTitle"])
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    title = Some(value.to_string());
+                    has_title_record = true;
+                }
+            }
+            Some("model_change") => {
+                model = string_at(&value, &["model"]).map(str::to_string).or(model);
+            }
+            Some("thinking_level_change") => {
+                reasoning = string_at(&value, &["thinkingLevel"])
+                    .and_then(parse_reasoning)
+                    .or(reasoning);
             }
             Some("message") => {
                 let message = value.get("message");
@@ -403,7 +564,7 @@ fn candidate_from_omp(path: &Path) -> Option<DiscoveredSession> {
         title,
         preview,
         model,
-        None,
+        reasoning,
         created_at,
         updated_at,
         path,
@@ -825,6 +986,53 @@ mod tests {
         assert!(sessions.iter().any(|session| {
             session.candidate.harness == HarnessId::Omp && session.candidate.title == "OMP review"
         }));
+    }
+
+    #[test]
+    fn ignores_omp_placeholder_title_before_session_metadata() {
+        let temp = TempDir::new().unwrap();
+        let path = fixture(
+            temp.path(),
+            "omp-placeholder.jsonl",
+            &[
+                serde_json::json!({"type":"title","v":1,"title":"","pad":"reserved"}),
+                serde_json::json!({"type":"session","id":"omp-placeholder","cwd":"/repo","title":"Graceful staging restart","timestamp":"2026-08-05T12:00:00Z"}),
+                serde_json::json!({"type":"message","id":"m1","message":{"role":"user","content":[{"type":"text","text":"Investigate staging"}]}}),
+            ],
+        );
+
+        let session = candidate_from_omp(&path).unwrap();
+        assert_eq!(session.candidate.title, "Graceful staging restart");
+    }
+
+    #[test]
+    fn captures_omp_candidate_with_sessions_root_relative_path() {
+        let temp = TempDir::new().unwrap();
+        let roots = SessionRoots {
+            claude: temp.path().join("claude"),
+            codex: temp.path().join("codex"),
+            omp: temp.path().join("omp"),
+        };
+        let path = fixture(
+            &roots.omp,
+            "sessions/by-cwd/omp-1.jsonl",
+            &[
+                serde_json::json!({"type":"session","id":"omp-1","cwd":"/repo","timestamp":"2026-08-05T12:00:00Z"}),
+                serde_json::json!({"type":"message","id":"m1","message":{"role":"user","content":"hello"}}),
+            ],
+        );
+        let candidate = candidate_from_omp(&path).unwrap();
+        let expected_bytes = std::fs::read(&path).unwrap();
+        let artifact = capture_omp_artifact_with_roots(&candidate.candidate.id, &roots).unwrap();
+        assert_eq!(artifact.native_session_id, "omp-1");
+        assert_eq!(artifact.cwd, "/repo");
+        assert_eq!(artifact.storage_relative_path, "by-cwd/omp-1.jsonl");
+        assert_eq!(artifact.byte_count, expected_bytes.len() as u64);
+        assert_eq!(artifact.bytes, expected_bytes);
+        assert_eq!(
+            artifact.sha256,
+            format!("{:x}", Sha256::digest(&artifact.bytes))
+        );
     }
 
     #[test]

@@ -745,6 +745,10 @@ impl WorkspaceHost {
         Ok(self.inner.doc.set_chat_cwd(chat_id, cwd)?)
     }
 
+    pub fn set_chat_space(&self, chat_id: &str, space_id: &str) -> Result<bool, EngineError> {
+        Ok(self.inner.doc.set_chat_space(chat_id, space_id)?)
+    }
+
     /// Canonical checkout identity for the chat's cwd (diff grouping key).
     pub fn set_chat_checkout(&self, chat_id: &str, checkout_id: &str) -> Result<bool, EngineError> {
         Ok(self.inner.doc.set_chat_checkout(chat_id, checkout_id)?)

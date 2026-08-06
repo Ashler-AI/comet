@@ -371,6 +371,16 @@ impl WorkspaceDoc {
         Ok(true)
     }
 
+    /// Move a chat row to another synced folder. `false` when no such row.
+    pub fn set_chat_space(&self, chat_id: &str, space_id: &str) -> Result<bool, DocError> {
+        let Some(row) = self.existing_row("chats", chat_id) else {
+            return Ok(false);
+        };
+        row.insert("spaceId", space_id)?;
+        self.doc.commit();
+        Ok(true)
+    }
+
     /// Host-side checkout identity for the chat's cwd (diff grouping key).
     /// `false` when no such row.
     pub fn set_chat_checkout(&self, chat_id: &str, checkout_id: &str) -> Result<bool, DocError> {
