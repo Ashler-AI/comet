@@ -29,30 +29,19 @@ This document defines the required product boundary for Ashler Comet. A partial
    surface. It can create/inspect, pause, resume, stop, and attach to a running
    Scaffold OMP session without creating a parallel session backend.
 
-### Comet web viewport
+### Future web and mobile viewports
 
-1. An internal web viewport behind Google Cloud IAP is an authorized Comet
-   client for both local-hosted and Scaffold-hosted sessions.
-2. It reuses the existing Workspace/SessionRoom/DeviceRoom Durable Objects and
-   typed command ledger. It must not introduce another transcript store,
-   executor, session backend, or browser-only room namespace.
-3. IAP admits the human to a same-origin web backend. Browser code receives no
-   long-lived Scaffold bearer, provider credential, Comet device credential, or
-   token in a URL; the backend uses short-lived, audience-bound authority and
-   proxies Edge HTTP/WebSocket traffic.
-4. The web viewport can render durable history while a host is offline, but only
-   the owning local machine or Scaffold sandbox executes harness commands.
-5. Scaffold lifecycle controls continue through the control plane; agent turns,
-   approvals, diffs, and collaboration continue through Comet rooms.
-6. Exact actor, project, deployment, session, device, lifecycle epoch, model,
-   capability, expiry, replay, revocation, and host-ownership checks remain
-   server-enforced. The browser never constructs a trusted room key itself.
-7. The terminal fallback and native client remain rollback paths until the web
-   acceptance matrix passes.
+Web and mobile clients are explicitly out of scope for the initial Comet/OMP
+Scaffold rollout. The initial implementation must remain compatible with adding
+them later as authorized Comet clients: keep existing Durable Objects and typed
+commands as the shared data/control plane, keep execution on the owning local or
+Scaffold host, preserve exact deployment/session/device/epoch authority, and do
+not expose host, bootstrap, provider, or OMP credentials to observer clients.
 
-Detailed architecture, delivery slices, threat boundaries, acceptance tests,
-and blocking questions live in
+The saved future architecture, mobile alternative, delivery slices, acceptance
+matrix, and open questions live in
 `internal/scaffold/docs/comet-web-viewport.md` in the platform repository.
+They do not gate Comet 0.1.23 or the initial no-webview staging acceptance.
 
 ### Scaffold Comet
 
@@ -166,16 +155,6 @@ Deploy in dependency order: Comet edge staging; pinned Comet and OMP artifacts;
 Scaffold image/template; provider/Worker; staging default profile; live
 multi-client proof. Production remains gated on the full acceptance matrix.
 
-### G. IAP web viewport
-
-Add an independently deployable same-origin web app and backend-for-frontend
-behind IAP. Share the Loro workspace/session schemas and WebSocket envelopes in
-a versioned TypeScript client, issue only short-lived web authority, and connect
-to the existing DOs. Start read-only, then add typed session commands, then
-Scaffold lifecycle controls. Resolve workspace catalog privacy and local-room
-scope before exposing local sessions. Do not replace the terminal fallback until
-cross-client, revocation, isolation, and credential-leakage acceptance passes.
-
 ## Acceptance tests
 
 ### Local harnesses
@@ -226,24 +205,6 @@ Run the same scenario once with a local host and once with a Scaffold host:
    fails;
 7. create two deployments with the same session id and prove their Durable
    Object state is isolated.
-
-### IAP web viewport
-
-Run once against a local host and once against a Scaffold host:
-
-1. native Comet and two IAP-authenticated browser tabs open the exact same room;
-2. all clients converge on one ordered transcript, tools, input requests, and
-   lifecycle state;
-3. a unique browser turn executes exactly once across reconnect and retry;
-4. a second tab answers an approval/input and both tabs receive one receipt;
-5. offline durable history remains readable while execution fails honestly;
-6. revoking the web session closes its HTTP/WebSocket authority immediately;
-7. wrong actor, project, deployment, session, device, epoch, model, expired
-   descriptor, replay, and forged IAP headers fail closed;
-8. two deployments with the same session id remain isolated;
-9. long-lived or provider credentials appear in no browser storage, URL, HTML,
-   log, telemetry record, Durable Object, or sandbox file;
-10. terminal fallback and native access continue to work during rollback.
 
 ### Scaffold release gate
 
