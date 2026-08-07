@@ -298,10 +298,6 @@ fn run_headed(initial_url: Option<String>) {
     });
 }
 
-/// The env-resolved engine configuration shared by `headless`, `login`,
-/// `logout`, and `status` — one resolution so the CLI auth commands always
-/// operate on the exact session the daemon will load.
-
 /// Local installs select either the production-local or deterministic mock
 /// profile. Scaffold-host authority is forced only by a validated bootstrap.
 fn runtime_profile_from_env() -> comet_engine::RuntimeProfile {
@@ -328,6 +324,9 @@ fn apply_device_bootstrap_policy(
     config.scaffold_url = None;
 }
 
+/// The env-resolved engine configuration shared by `headless`, `login`,
+/// `logout`, and `status` — one resolution so the CLI auth commands always
+/// operate on the exact session the daemon will load.
 fn engine_config_from_env() -> comet_engine::EngineConfig {
     // An explicit local bearer opts out of Scaffold OAuth.
     let edge_token = std::env::var("COMET_EDGE_TOKEN").ok();

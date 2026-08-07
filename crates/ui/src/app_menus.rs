@@ -8,6 +8,7 @@ use gpui::{App, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType, Window, ac
 
 use crate::appearance::{self, AppearanceMode};
 use crate::composer;
+use crate::shell;
 
 actions!(
     ashler_comet,
@@ -60,7 +61,7 @@ fn macos_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-h", Hide, None),
         KeyBinding::new("alt-cmd-h", HideOthers, None),
         KeyBinding::new("cmd-m", Minimize, None),
-        KeyBinding::new("cmd-w", CloseWindow, None),
+        KeyBinding::new("cmd-shift-w", CloseWindow, None),
     ]
 }
 
@@ -81,6 +82,14 @@ fn application_menu(macos: bool) -> Menu {
     }
     items.push(MenuItem::action("Quit Ashler Comet", Quit));
     Menu::new("Ashler Comet").items(items)
+}
+
+fn file_menu() -> Menu {
+    Menu::new("File").items([
+        MenuItem::action("New Session", shell::NewSession),
+        MenuItem::separator(),
+        MenuItem::action("Close Session", shell::CloseSession),
+    ])
 }
 
 fn edit_menu() -> Menu {
@@ -117,7 +126,12 @@ fn window_menu() -> Menu {
 /// host operating system does not provide matching application behavior.
 pub fn app_menus() -> Vec<Menu> {
     let macos = cfg!(target_os = "macos");
-    let mut menus = vec![application_menu(macos), edit_menu(), view_menu()];
+    let mut menus = vec![
+        application_menu(macos),
+        file_menu(),
+        edit_menu(),
+        view_menu(),
+    ];
     if macos {
         menus.push(window_menu());
     }

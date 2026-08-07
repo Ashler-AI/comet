@@ -489,7 +489,11 @@ export const handleAuthenticatedAuthRoute = async (
       body: JSON.stringify(record)
     });
     if (!response.ok) return json({ error: "grant_store_unavailable" }, 503);
-    return json({ grant: `cg1.${id}.${secret}`, expiresAt });
+    return json({
+      grant: `cg1.${id}.${secret}`,
+      expiresAt,
+      accessExpiresAt: issuedAt + ACCESS_TTL_MS
+    });
   }
 
   if (request.method === "DELETE") {

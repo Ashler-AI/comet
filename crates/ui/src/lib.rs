@@ -115,7 +115,7 @@ impl UiConfig {
     }
 }
 
-/// What a dock-icon reopen needs to rebuild the main window after ⌘W closes it.
+/// What a dock-icon reopen needs to rebuild the main window after it closes.
 struct ReopenState {
     state: gpui::Entity<state::AppState>,
     boot: EngineBootConfig,
@@ -214,7 +214,7 @@ pub fn run_app(config: UiConfig) {
         open_main_window(state, config.boot(), cx);
         // Native menu bar — macOS gets the standard app menu (About/Services/
         // Hide/Quit ⌘Q), Edit clipboard verbs routed to the focused input, and
-        // a Window menu (⌘M/⌘W). Without this, `NSApp.mainMenu` stays nil: no
+        // a Window menu (⌘M/⇧⌘W). Without this, `NSApp.mainMenu` stays nil: no
         // Cmd+Q, and nothing for the system menu bar to show. Set after
         // `open_main_window` because `Shell::new` ran `apply_keymap`
         // synchronously, so `set_menus` reads the final bindings for the ⌘-key
@@ -226,7 +226,7 @@ pub fn run_app(config: UiConfig) {
 
 /// Open the 1320×880 main window (min 900×600) with [`shell::Shell`] as the
 /// root view. Called at boot and again from `on_reopen` if the dock icon is
-/// clicked after ⌘W closed the window.
+/// clicked after the window closed.
 fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig, cx: &mut App) {
     // comet window geometry: 1320×880, min 900×600 (feature-inventory §1.1).
     let bounds = Bounds::centered(None, size(px(1320.), px(880.)), cx);

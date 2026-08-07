@@ -15,7 +15,7 @@ use comet_harness::CancellationToken;
 use comet_proto::{
     CAPABILITY_SESSION_ANNOTATE, CAPABILITY_SESSION_CHAT, CAPABILITY_SESSION_CONTROL,
     CAPABILITY_SESSION_ENVIRONMENT, CAPABILITY_SESSION_FILES, CAPABILITY_SESSION_READ,
-    CollaborationScope, OmpSessionArtifact, ScaffoldEnvironmentControl,
+    CollaborationScope, OmpSessionArtifact, ScaffoldControlGrant, ScaffoldEnvironmentControl,
     ScaffoldEnvironmentControlResult, ScaffoldEnvironmentLinks, ScaffoldEnvironmentSnapshot,
     ScaffoldRuntimeMode, SessionEnvironment, SessionEnvironmentSource, SessionRoomProjection,
 };
@@ -29,6 +29,7 @@ use crate::now_ms;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const JOIN_GRANT_TTL_SECONDS: u32 = 15 * 60;
+const DEVICE_ACCESS_TTL_MS: i64 = 12 * 60 * 60 * 1000;
 const JOIN_GRANT_PATH: [&str; 2] = ["auth", "device-grants"];
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -951,6 +952,22 @@ finally:
     except FileNotFoundError: pass
 "#;
 
+fn device_join_grant_id(credential: &str) -> Option<String> {
+    let mut parts = credential.split('.');
+    let prefix = parts.next()?;
+    let grant_id = parts.next()?;
+    let secret = parts.next()?;
+    if prefix != "cg1"
+        || grant_id.len() != 32
+        || !grant_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || secret.is_empty()
+        || parts.next().is_some()
+    {
+        return None;
+    }
+    Some(grant_id.to_string())
+}
+
 #[derive(Debug, Clone)]
 pub struct DeviceJoinGrantRequest {
     pub principal_subject: String,
@@ -963,14 +980,18 @@ pub struct DeviceJoinGrantRequest {
 
 pub struct DeviceJoinCredential {
     credential: String,
-    expires_at: i64,
+    grant_id: String,
+    join_expires_at: i64,
+    control_expires_at: i64,
 }
 
 impl fmt::Debug for DeviceJoinCredential {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DeviceJoinCredential")
             .field("credential", &"<redacted>")
-            .field("expires_at", &self.expires_at)
+            .field("grant_id", &self.grant_id)
+            .field("join_expires_at", &self.join_expires_at)
+            .field("control_expires_at", &self.control_expires_at)
             .finish()
     }
 }
@@ -1019,6 +1040,7 @@ impl DeviceJoinGrantProvider for EdgeDeviceJoinGrantClient {
         struct Response {
             grant: String,
             expires_at: i64,
+            access_expires_at: Option<i64>,
         }
 
         #[derive(Serialize)]
@@ -1087,16 +1109,24 @@ impl DeviceJoinGrantProvider for EdgeDeviceJoinGrantClient {
             .json()
             .await
             .map_err(|_| ScaffoldError::DeviceJoinGrantUnavailable)?;
-        if !response.grant.starts_with("cg1.")
-            || response.expires_at <= now_ms()
-            || request.principal_subject.trim().is_empty()
-            || request.sandbox_id.trim().is_empty()
-        {
-            return Err(ScaffoldError::DeviceJoinGrantUnavailable);
-        }
+        let now = now_ms();
+        let control_expires_at = response.access_expires_at.unwrap_or_else(|| {
+            response
+                .expires_at
+                .saturating_sub(i64::from(request.expires_in_seconds) * 1000)
+                .saturating_add(DEVICE_ACCESS_TTL_MS)
+        });
+        let grant_id = device_join_grant_id(&response.grant)
+            .filter(|_| response.expires_at > now)
+            .filter(|_| control_expires_at > response.expires_at)
+            .filter(|_| !request.principal_subject.trim().is_empty())
+            .filter(|_| !request.sandbox_id.trim().is_empty())
+            .ok_or(ScaffoldError::DeviceJoinGrantUnavailable)?;
         Ok(DeviceJoinCredential {
             credential: response.grant,
-            expires_at: response.expires_at,
+            grant_id,
+            join_expires_at: response.expires_at,
+            control_expires_at,
         })
     }
 }
@@ -1178,6 +1208,7 @@ impl ScaffoldRuntime {
         control: ScaffoldEnvironmentControl,
         cancellation: &CancellationToken,
     ) -> Result<ScaffoldEnvironmentControlResult, ScaffoldError> {
+        let mut control_grant = None;
         let (environment, attached_device_id, run_id, handoff) = match control {
             ScaffoldEnvironmentControl::Inspect { sandbox_id, scope } => (
                 self.inner
@@ -1243,9 +1274,10 @@ impl ScaffoldRuntime {
                     .client
                     .inspect(&sandbox_id, &scope, cancellation)
                     .await?;
-                let (device_id, run_id) = self
+                let (device_id, run_id, grant) = self
                     .attach(&sandbox_id, &scope, &environment, cancellation)
                     .await?;
+                control_grant = Some(grant);
                 (environment, Some(device_id), Some(run_id), None)
             }
             ScaffoldEnvironmentControl::HandoffOmpSession {
@@ -1296,6 +1328,7 @@ impl ScaffoldRuntime {
             attached_device_id,
             run_id,
             room_projection,
+            control_grant,
             handoff_native_session_id,
             handoff_cwd,
         })
@@ -1307,7 +1340,7 @@ impl ScaffoldRuntime {
         scope: &CollaborationScope,
         environment: &SessionEnvironment,
         cancellation: &CancellationToken,
-    ) -> Result<(String, String), ScaffoldError> {
+    ) -> Result<(String, String, ScaffoldControlGrant), ScaffoldError> {
         let (lifecycle, _) = scaffold_source(environment)?;
         if !matches!(
             lifecycle,
@@ -1372,6 +1405,11 @@ impl ScaffoldRuntime {
             expires_in_seconds: JOIN_GRANT_TTL_SECONDS,
         };
         let join = self.inner.grants.mint(&request, cancellation).await?;
+        let control_grant = ScaffoldControlGrant {
+            id: join.grant_id.clone(),
+            expires_at: join.control_expires_at,
+            capabilities: request.capabilities.clone(),
+        };
 
         // Deliver the one-time credential as a mode-0600 file, never as argv.
         // Comet consumes and removes this file before making the exchange.
@@ -1475,7 +1513,7 @@ impl ScaffoldRuntime {
         let run_id = started.run_id.ok_or_else(|| {
             ScaffoldError::InvalidResponse("sandbox exec returned no runId".into())
         })?;
-        Ok((device_id, run_id))
+        Ok((device_id, run_id, control_grant))
     }
 
     fn publish(&self) -> ScaffoldEnvironmentSnapshot {
@@ -1707,11 +1745,15 @@ mod tests {
 
     #[tokio::test]
     async fn attach_keeps_credentials_out_of_process_arguments() {
-        let expires_at = now_ms() + 60_000;
+        let join_expires_at = now_ms() + 60_000;
+        let access_expires_at =
+            join_expires_at - i64::from(JOIN_GRANT_TTL_SECONDS) * 1000 + DEVICE_ACCESS_TTL_MS;
         let responses = vec![
             sandbox("ready"),
             r#"{"ok":true,"exitCode":0}"#.into(),
-            format!(r#"{{"grant":"cg1.narrow_secret","expiresAt":{expires_at}}}"#),
+            format!(
+                r#"{{"grant":"cg1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narrow_secret","expiresAt":{join_expires_at}}}"#
+            ),
             r#"{"ok":true}"#.into(),
             r#"{"ok":true,"exitCode":0}"#.into(),
             r#"{"ok":true,"runId":"run-a"}"#.into(),
@@ -1746,6 +1788,24 @@ mod tests {
                 session_id: "session-a".into(),
             })
         );
+        assert_eq!(
+            result.control_grant,
+            Some(ScaffoldControlGrant {
+                id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                expires_at: access_expires_at,
+                capabilities: vec![
+                    CAPABILITY_SESSION_READ.into(),
+                    CAPABILITY_SESSION_CHAT.into(),
+                    CAPABILITY_SESSION_CONTROL.into(),
+                    CAPABILITY_SESSION_ANNOTATE.into(),
+                    CAPABILITY_SESSION_FILES.into(),
+                    CAPABILITY_SESSION_ENVIRONMENT.into(),
+                ],
+            })
+        );
+        let serialized_result = serde_json::to_string(&result).unwrap();
+        assert!(serialized_result.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(!serialized_result.contains("narrow_secret"));
 
         let requests = captured.await.unwrap();
         let exec_bodies: Vec<_> = requests
@@ -1772,7 +1832,10 @@ mod tests {
         let bootstrap_envelope: Value = serde_json::from_str(bootstrap_body).unwrap();
         let bootstrap: Value =
             serde_json::from_str(bootstrap_envelope["content"].as_str().unwrap()).unwrap();
-        assert_eq!(bootstrap["deviceJoinGrant"], "cg1.narrow_secret");
+        assert_eq!(
+            bootstrap["deviceJoinGrant"],
+            "cg1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narrow_secret"
+        );
         assert_eq!(bootstrap["deploymentId"], "deployment-a");
         let grant_body = requests[2].split_once("\r\n\r\n").unwrap().1;
         assert!(grant_body.contains(r#""sandboxId":"sandbox-a""#));

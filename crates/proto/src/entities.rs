@@ -87,8 +87,8 @@ pub struct ChatConfig {
 ///
 /// The source path stays engine-private. The opaque `id` is passed back to
 /// `AttachLocalSession`, which re-resolves it against the current local scan.
-/// Current file-based discovery is history-only: it never claims live control or
-/// automatic resume without an exclusive native ownership probe.
+/// Capability flags distinguish resumable native sessions (currently OMP and
+/// Prime Agent) from history-only imports (Claude Code, Codex, and OpenCode).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalSessionCandidate {
@@ -109,13 +109,14 @@ pub struct LocalSessionCandidate {
     pub created_at: i64,
     /// Epoch milliseconds.
     pub updated_at: i64,
-    /// Transcript files do not prove control of an already-running writer.
+    /// False for metadata-only candidates: attach is an explicit ownership action.
     pub live_attachable: bool,
-    /// The native session id can be resumed by a new process when no writer owns it.
+    /// A new controlled process can load/resume the exact native session id.
     pub resumable: bool,
-    /// True when Comet can import history but has no supported native resume path.
+    /// Comet can import history but cannot resume this source directly.
     pub history_only: bool,
-    /// Writer ownership when a supported probe exists; `None` means unknown.
+    /// Concurrent writer ownership when a source supports a reliable probe;
+    /// `None` means unknown or not applicable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub busy_elsewhere: Option<bool>,
 }

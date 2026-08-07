@@ -427,6 +427,16 @@ pub struct SessionRoomProjection {
     pub session_id: String,
 }
 
+/// Non-secret authority metadata returned by a successful Scaffold attach.
+/// The opaque device bootstrap credential is consumed only by the sandbox.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScaffoldControlGrant {
+    pub id: String,
+    pub expires_at: i64,
+    pub capabilities: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScaffoldEnvironmentControlResult {
@@ -437,6 +447,8 @@ pub struct ScaffoldEnvironmentControlResult {
     pub run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub room_projection: Option<SessionRoomProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_grant: Option<ScaffoldControlGrant>,
     /// Native OMP id to put on the first remote `RunRequest.resume`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff_native_session_id: Option<String>,

@@ -41,6 +41,15 @@ const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
 pub(crate) const LOCAL_OWNER_GRANT_TTL_MS: i64 = 5 * 60 * 1_000;
 
 const LOCAL_OWNER_AUTHORITY_KEY_PREFIX: &str = "local-control-authority/v1/";
+const EDGE_GRANT_CAPABILITIES: &[&str] = &[
+    comet_proto::CAPABILITY_SESSION_READ,
+    comet_proto::CAPABILITY_SESSION_CHAT,
+    comet_proto::CAPABILITY_SESSION_CONTROL,
+    comet_proto::CAPABILITY_SESSION_ANNOTATE,
+    "session.invite",
+    comet_proto::CAPABILITY_SESSION_FILES,
+    comet_proto::CAPABILITY_SESSION_ENVIRONMENT,
+];
 
 /// Warm-doc LRU: how many unwatched, run-less docs stay fully open. Everything
 /// beyond this (and beyond [`comet_doc::DOC_LRU_BYTE_BUDGET`]) is evicted
@@ -193,6 +202,13 @@ struct TrustedGrant {
     grant: CapabilityGrant,
     edge_derived: bool,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CommandNudgeRoute {
+    None,
+    WorkspaceHost,
+    ExactDevice(String),
+}
 struct DocHostInner {
     store: Arc<DocsStore>,
     config: DocHostConfig,
@@ -268,6 +284,20 @@ fn grant_authorizes_control_entry(
             .any(|capability| capability == action.required_capability())
 }
 
+fn grant_matches_projected_scaffold_room(
+    grant: &CapabilityGrant,
+    chat_id: &str,
+    projection: Option<&SessionRoomProjection>,
+) -> bool {
+    let Some(projection) = projection else {
+        return false;
+    };
+    grant.scope.session_id.as_deref() == Some(chat_id)
+        && projection.session_id == chat_id
+        && grant.scope.project_id == projection.project_id
+        && grant.scope.deployment_id.as_deref() == Some(projection.deployment_id.as_str())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnnotationMutationError {
     NotFound,
@@ -317,6 +347,7 @@ pub struct ChatDocHandle {
     snapshot_bytes: AtomicUsize,
     room_projection: Option<SessionRoomProjection>,
     room: Mutex<Option<RoomClient>>,
+    room_join_started: AtomicBool,
     /// Doc subscription (drop = unsubscribe) — bumps the change watch on every commit.
     _sub: loro::Subscription,
 }
@@ -527,15 +558,7 @@ impl DocHost {
         stream_session_id: &str,
         payload: &[u8],
     ) -> Result<(), &'static str> {
-        const ALLOWED_CAPABILITIES: &[&str] = &[
-            comet_proto::CAPABILITY_SESSION_READ,
-            comet_proto::CAPABILITY_SESSION_CHAT,
-            comet_proto::CAPABILITY_SESSION_CONTROL,
-            comet_proto::CAPABILITY_SESSION_ANNOTATE,
-            "session.invite",
-            comet_proto::CAPABILITY_SESSION_FILES,
-            comet_proto::CAPABILITY_SESSION_ENVIRONMENT,
-        ];
+        let allowed_capabilities = EDGE_GRANT_CAPABILITIES;
         let envelope: VerifiedCapabilityGrantEnvelope =
             serde_json::from_slice(payload).map_err(|_| "grant_envelope_invalid")?;
         let workspace = self.workspace().ok_or("workspace_unavailable")?;
@@ -569,7 +592,7 @@ impl DocHost {
             || grant
                 .capabilities
                 .iter()
-                .any(|capability| !ALLOWED_CAPABILITIES.contains(&capability.as_str()))
+                .any(|capability| !allowed_capabilities.contains(&capability.as_str()))
             || grant.granted_at > now
             || !grant.expires_at.is_some_and(|expires| now < expires)
             || grant.revoked_at.is_some()
@@ -595,6 +618,57 @@ impl DocHost {
             grant.id.clone(),
             grant.expires_at.expect("validated expiry"),
         );
+        Ok(())
+    }
+
+    /// Install the non-secret half of a control-plane device grant on the
+    /// attaching viewport. Execution authority remains on the target device;
+    /// this copy is only a trusted route selector for commands sent there.
+    pub(crate) fn install_scaffold_control_grant(
+        &self,
+        grant: CapabilityGrant,
+    ) -> Result<(), &'static str> {
+        let workspace = self.workspace().ok_or("workspace_unavailable")?;
+        let now = now_ms();
+        let device_id = grant.device_id.as_deref().unwrap_or_default();
+        let expected_sandbox_id = device_id.strip_prefix("comet-scaffold-");
+        if grant.id.trim().is_empty()
+            || grant.principal_subject.trim().is_empty()
+            || grant.granted_by != "comet-edge-device-room"
+            || grant.scope.project_id != workspace.project_scope()
+            || grant
+                .scope
+                .deployment_id
+                .as_deref()
+                .is_none_or(str::is_empty)
+            || grant.scope.session_id.as_deref().is_none_or(str::is_empty)
+            || expected_sandbox_id.is_none_or(str::is_empty)
+            || expected_sandbox_id
+                .is_some_and(|sandbox| grant.sandbox_id.as_deref() != Some(sandbox))
+            || grant.capabilities.is_empty()
+            || grant
+                .capabilities
+                .iter()
+                .any(|capability| !EDGE_GRANT_CAPABILITIES.contains(&capability.as_str()))
+            || grant.granted_at > now
+            || !grant.expires_at.is_some_and(|expires| now < expires)
+            || grant.revoked_at.is_some()
+        {
+            return Err("scaffold_control_grant_scope_rejected");
+        }
+        let grant_id = grant.id.clone();
+        let expires_at = grant.expires_at.expect("validated expiry");
+        lock(&self.inner.trusted_grants).insert(
+            grant.id.clone(),
+            TrustedGrant {
+                grant,
+                edge_derived: false,
+            },
+        );
+        self.inner
+            .authority_tx
+            .send_modify(|version| *version = version.wrapping_add(1));
+        self.expire_grant_at(grant_id, expires_at);
         Ok(())
     }
 
@@ -712,8 +786,85 @@ impl DocHost {
         &self.inner.config.device_id
     }
 
-    /// Open (or return) the chat's doc handle: load the local snapshot (or init fresh),
-    /// start the change-driven task, and join the edge room when configured.
+    fn chat_allows_room_join(&self, chat_id: &str) -> bool {
+        if !chat_id.starts_with("local-chat-") {
+            return true;
+        }
+        self.workspace()
+            .and_then(|workspace| workspace.doc().chat(chat_id).ok().flatten())
+            .and_then(|chat| chat.harness_session_id)
+            .is_some_and(|session_id| !session_id.trim().is_empty())
+    }
+
+    fn start_room_join(&self, handle: Arc<ChatDocHandle>) {
+        let Some(edge) = &self.inner.config.edge else {
+            return;
+        };
+        if !self.chat_allows_room_join(&handle.chat_id)
+            || lock(&handle.room).is_some()
+            || handle
+                .room_join_started
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+
+        let url = edge.room_url_for(
+            format!("/session/{}/ws", handle.chat_id),
+            handle.room_projection.as_ref(),
+        );
+        let room_doc = handle.doc.doc().clone();
+        let chat = handle.chat_id.clone();
+        let weak = Arc::downgrade(&handle);
+        tokio::spawn(async move {
+            let mut wake = comet_sync::wake::subscribe();
+            let mut backoff = crate::workspace_host::JOIN_RETRY_BASE;
+            loop {
+                if weak.upgrade().is_none() {
+                    return;
+                }
+                match RoomClient::connect_via(url.clone(), &chat, room_doc.clone()).await {
+                    Ok(client) => {
+                        let Some(handle) = weak.upgrade() else {
+                            return;
+                        };
+                        *lock(&handle.room) = Some(client);
+                        tracing::info!(chat = %chat, "session room joined");
+                        return;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            chat = %chat,
+                            error = %err,
+                            backoff_ms = backoff.as_millis() as u64,
+                            "session room join failed; retrying"
+                        );
+                    }
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff + crate::workspace_host::join_retry_jitter()) => {
+                        backoff = (backoff * 2).min(crate::workspace_host::JOIN_RETRY_CAP);
+                    }
+                    _ = wake.recv() => {
+                        backoff = crate::workspace_host::JOIN_RETRY_BASE;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Start room supervision for an already-open chat after it acquires a
+    /// native controller. History-only local imports remain local until then.
+    pub(crate) fn ensure_room_for_chat(&self, chat_id: &str) {
+        let handle = lock(&self.inner.handles).get(chat_id).cloned();
+        if let Some(handle) = handle {
+            self.start_room_join(handle);
+        }
+    }
+
+    /// Open (or return) the chat's doc handle: load the local snapshot (or init
+    /// fresh), start the change-driven task, and join an eligible edge room.
     pub fn open(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
         self.open_projection(chat_id, None)
     }
@@ -742,6 +893,7 @@ impl DocHost {
                 ));
             }
             handle.touch();
+            self.start_room_join(handle.clone());
             return Ok(handle.clone());
         }
         let mut snapshot_len = 0usize;
@@ -776,9 +928,10 @@ impl DocHost {
             snapshot_bytes: AtomicUsize::new(snapshot_len),
             room_projection: projection.cloned(),
             room: Mutex::new(None),
+            room_join_started: AtomicBool::new(false),
             _sub: sub,
         });
-        {
+        let racing = {
             let mut handles = lock(&self.inner.handles);
             if let Some(existing) = handles.get(chat_id) {
                 if existing.room_projection.as_ref() != projection {
@@ -786,62 +939,18 @@ impl DocHost {
                         "chat raced open with a different session room projection".into(),
                     ));
                 }
-                return Ok(existing.clone()); // racing open — keep the first
+                Some(existing.clone())
+            } else {
+                handles.insert(chat_id.to_string(), handle.clone());
+                None
             }
-            handles.insert(chat_id.to_string(), handle.clone());
+        };
+        if let Some(existing) = racing {
+            self.start_room_join(existing.clone());
+            return Ok(existing);
         }
 
-        // Edge room join — offline-tolerant AND supervised. `RoomClient` only
-        // self-reconnects AFTER a first successful join; a one-shot attempt
-        // here (the pre-LRU design) left the doc silently local-only until
-        // app restart whenever the dial hit a transient gap — a post-wake
-        // network, `Auth::token()` momentarily `None` around a refresh, an
-        // edge deploy. The LRU made that dice-roll constant (every reopen),
-        // and a watched doc is pinned against eviction, so nothing ever
-        // retried: the exact "transcript frozen until restart" report.
-        // Retry on the workspace host's capped, jittered backoff; a system
-        // wake redials immediately; eviction/purge ends the loop via `weak`.
-        if let Some(edge) = &self.inner.config.edge {
-            let url = edge.room_url_for(format!("/session/{chat_id}/ws"), projection);
-            let room_doc = doc.doc().clone();
-            let chat = chat_id.to_string();
-            let weak = Arc::downgrade(&handle);
-            tokio::spawn(async move {
-                let mut wake = comet_sync::wake::subscribe();
-                let mut backoff = crate::workspace_host::JOIN_RETRY_BASE;
-                loop {
-                    if weak.upgrade().is_none() {
-                        return; // evicted or purged while dialing
-                    }
-                    match RoomClient::connect_via(url.clone(), &chat, room_doc.clone()).await {
-                        Ok(client) => {
-                            let Some(handle) = weak.upgrade() else {
-                                return; // evicted mid-dial: drop leaves the room
-                            };
-                            *lock(&handle.room) = Some(client);
-                            tracing::info!(chat = %chat, "session room joined");
-                            return;
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                chat = %chat,
-                                error = %err,
-                                backoff_ms = backoff.as_millis() as u64,
-                                "session room join failed; retrying"
-                            );
-                        }
-                    }
-                    tokio::select! {
-                        _ = tokio::time::sleep(backoff + crate::workspace_host::join_retry_jitter()) => {
-                            backoff = (backoff * 2).min(crate::workspace_host::JOIN_RETRY_CAP);
-                        }
-                        _ = wake.recv() => {
-                            backoff = crate::workspace_host::JOIN_RETRY_BASE;
-                        }
-                    }
-                }
-            });
-        }
+        self.start_room_join(handle.clone());
 
         tokio::spawn(chat_task(self.clone(), Arc::downgrade(&handle), changed_rx));
         self.evict_over_budget();
@@ -1015,6 +1124,58 @@ impl DocHost {
             })
     }
 
+    fn command_nudge_route(
+        &self,
+        chat_id: &str,
+        projection: Option<&SessionRoomProjection>,
+        entry: &SessionCommandEntry,
+    ) -> CommandNudgeRoute {
+        let SessionCommandPayload::Control {
+            actor_device_id,
+            owner_device_id,
+            grant_id,
+            source,
+            ..
+        } = &entry.payload
+        else {
+            return CommandNudgeRoute::WorkspaceHost;
+        };
+        if entry.issued_by != self.device_id()
+            || actor_device_id != self.device_id()
+            || owner_device_id == self.device_id()
+        {
+            return CommandNudgeRoute::None;
+        }
+        if !matches!(source, comet_proto::AgentSessionSource::Scaffold) {
+            return CommandNudgeRoute::WorkspaceHost;
+        }
+        let Some(workspace) = self.workspace() else {
+            return CommandNudgeRoute::None;
+        };
+        let grants = lock(&self.inner.trusted_grants);
+        let Some(trusted) = grants.get(grant_id) else {
+            return CommandNudgeRoute::None;
+        };
+        if trusted.edge_derived
+            || trusted.grant.granted_by != "comet-edge-device-room"
+            || !grant_authorizes_control_entry(
+                &trusted.grant,
+                entry,
+                workspace.project_scope(),
+                now_ms(),
+            )
+            || !grant_matches_projected_scaffold_room(&trusted.grant, chat_id, projection)
+        {
+            return CommandNudgeRoute::None;
+        }
+        trusted
+            .grant
+            .device_id
+            .clone()
+            .map(CommandNudgeRoute::ExactDevice)
+            .unwrap_or(CommandNudgeRoute::None)
+    }
+
     /// Composer path: append an immutable pending command entry (rule 1). Durable by
     /// construction — the change subscription kicks the drain, so a local host executes
     /// immediately and an offline doc simply holds the entry until it syncs.
@@ -1023,7 +1184,14 @@ impl DocHost {
         chat_id: &str,
         payload: SessionCommandPayload,
     ) -> Result<String, EngineError> {
-        let handle = self.open(chat_id)?;
+        let existing = { lock(&self.inner.handles).get(chat_id).cloned() };
+        let handle = match existing {
+            Some(handle) => {
+                handle.touch();
+                handle
+            }
+            None => self.open(chat_id)?,
+        };
         let id = new_id();
         let now = now_ms();
         let based_on = handle.doc.read_entries()?.last().map(|m| CommandBasedOn {
@@ -1040,6 +1208,20 @@ impl DocHost {
             status: SessionCommandStatus::Pending,
             resolution: None,
         };
+        let nudge_route =
+            self.command_nudge_route(chat_id, handle.room_projection.as_ref(), &entry);
+        if matches!(
+            &entry.payload,
+            SessionCommandPayload::Control {
+                source: comet_proto::AgentSessionSource::Scaffold,
+                ..
+            }
+        ) && !matches!(nudge_route, CommandNudgeRoute::ExactDevice(_))
+        {
+            return Err(EngineError::Other(
+                "Scaffold control command does not match its attached room".into(),
+            ));
+        }
         let locally_authorized_control = self.local_owner_grant_authorizes(&entry);
         let trust_key = if matches!(&entry.payload, SessionCommandPayload::Control { .. }) {
             locally_authorized_control
@@ -1052,7 +1234,6 @@ impl DocHost {
             Some(id.clone())
         };
         if let Some(trust_key) = trust_key.as_deref() {
-            // Provenance is device-local and durable; synced peers cannot forge it.
             self.inner.store.trust_local_command(trust_key)?;
         }
         if let Err(err) = handle.doc.queue_command(&entry) {
@@ -1061,27 +1242,32 @@ impl DocHost {
             }
             return Err(err.into());
         }
-        // §7 durable delivery: when another device hosts this chat, nudge its device
-        // room so a cold host opens the doc and drains the queue. Fire-and-forget —
-        // the command is durable in the doc either way (a host that opens the chat
-        // for any other reason still executes it).
-        self.nudge_remote_host(chat_id);
+        let explicit_host = match nudge_route {
+            CommandNudgeRoute::None => None,
+            CommandNudgeRoute::WorkspaceHost => None,
+            CommandNudgeRoute::ExactDevice(device_id) => Some(device_id),
+        };
+        self.nudge_remote_host(chat_id, explicit_host.as_deref());
         Ok(id)
     }
 
-    /// POST `{edge}/device/{host}/nudge {chatId}` when the chat's workspace row names
-    /// another device as host. Best-effort: offline/edge-less engines skip silently.
-    fn nudge_remote_host(&self, chat_id: &str) {
+    /// POST `{edge}/device/{host}/nudge {chatId}`. Versioned control commands
+    /// carry the remote owner explicitly; legacy commands fall back to the
+    /// workspace chat row. Offline and edge-less engines skip silently.
+    fn nudge_remote_host(&self, chat_id: &str, explicit_host: Option<&str>) {
         let Some(edge) = self.inner.config.edge.clone() else {
             return;
         };
-        let Some(workspace) = self.workspace() else {
+        let host_device = explicit_host
+            .filter(|device| !device.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                self.workspace()
+                    .and_then(|workspace| workspace.doc().chat(chat_id).ok().flatten())
+                    .map(|chat| chat.device_id)
+            });
+        let Some(host_device) = host_device else {
             return;
-        };
-        let host_device = match workspace.doc().chat(chat_id) {
-            Ok(Some(chat)) => chat.device_id,
-            // Unclaimed chat: whoever drains first claims it — nobody to nudge.
-            _ => return,
         };
         if host_device == self.inner.config.device_id {
             return;
@@ -1098,26 +1284,53 @@ impl DocHost {
         );
         let chat = chat_id.to_string();
         runtime.spawn(async move {
-            // Fresh bearer per request — never the boot-time snapshot.
-            let Some(bearer) = edge.bearer().await else {
-                tracing::warn!(chat = %chat, "nudge skipped: signed out");
-                return;
-            };
-            let send = reqwest::Client::new()
-                .post(&url)
-                .bearer_auth(&bearer)
-                .json(&serde_json::json!({ "chatId": chat }))
-                .timeout(std::time::Duration::from_secs(10))
-                .send()
-                .await;
-            match send {
-                Ok(res) if res.status().is_success() => {
-                    tracing::info!(chat = %chat, device = %host_device, "host nudged");
+            const RETRY_DELAYS_MS: [u64; 5] = [0, 250, 1_000, 3_000, 7_000];
+            let http = reqwest::Client::new();
+            for (attempt, delay_ms) in RETRY_DELAYS_MS.into_iter().enumerate() {
+                if delay_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 }
-                Ok(res) => tracing::warn!(chat = %chat, device = %host_device,
-                    status = res.status().as_u16(), "nudge rejected"),
-                Err(err) => {
-                    tracing::warn!(chat = %chat, error = %err, "nudge failed (best-effort)")
+                // Fresh bearer per attempt — never the boot-time snapshot.
+                let Some(bearer) = edge.bearer().await else {
+                    if attempt + 1 == RETRY_DELAYS_MS.len() {
+                        tracing::warn!(chat = %chat, "nudge skipped: signed out");
+                    }
+                    continue;
+                };
+                let send = http
+                    .post(&url)
+                    .bearer_auth(&bearer)
+                    .json(&serde_json::json!({ "chatId": chat }))
+                    .timeout(std::time::Duration::from_secs(10))
+                    .send()
+                    .await;
+                match send {
+                    Ok(response) if response.status().is_success() => {
+                        tracing::info!(
+                            chat = %chat,
+                            device = %host_device,
+                            attempts = attempt + 1,
+                            "host nudged"
+                        );
+                        return;
+                    }
+                    Ok(response) if attempt + 1 == RETRY_DELAYS_MS.len() => {
+                        tracing::warn!(
+                            chat = %chat,
+                            device = %host_device,
+                            status = response.status().as_u16(),
+                            "nudge rejected after retries"
+                        );
+                    }
+                    Err(err) if attempt + 1 == RETRY_DELAYS_MS.len() => {
+                        tracing::warn!(
+                            chat = %chat,
+                            device = %host_device,
+                            error = %err,
+                            "nudge failed after retries"
+                        );
+                    }
+                    _ => {}
                 }
             }
         });
@@ -1416,6 +1629,23 @@ impl DocHost {
         entry: &SessionCommandEntry,
     ) -> Result<(SessionCommandStatus, Option<String>), EngineError> {
         let chat_id = &handle.chat_id;
+        let carries_user_input = match &entry.payload {
+            SessionCommandPayload::Run { .. } | SessionCommandPayload::Steer { .. } => true,
+            SessionCommandPayload::Control { action, .. } => matches!(
+                action.as_ref(),
+                SessionControlAction::Start { .. } | SessionControlAction::Steer { .. }
+            ),
+            _ => false,
+        };
+        if carries_user_input
+            && let Some(workspace) = self.workspace()
+            && workspace
+                .doc()
+                .chat(chat_id)?
+                .is_some_and(|chat| chat.archived)
+        {
+            workspace.set_chat_archived(chat_id, false)?;
+        }
         match &entry.payload {
             SessionCommandPayload::Run {
                 request,
@@ -1894,7 +2124,7 @@ impl DocHost {
                 .as_ref()
                 .map(|c| c.sandbox)
                 .unwrap_or(comet_proto::SandboxLevel::WorkspaceWrite),
-            auto_approve: false,
+            auto_approve: true,
             attachments: Vec::new(),
             resume: None,
         })
@@ -1962,6 +2192,7 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
         let sleep_until = save_deadline.unwrap_or_else(tokio::time::Instant::now);
         tokio::select! {
             changed = changed_rx.changed() => {
+
                 if changed.is_err() {
                     break; // doc handle (and its change sender) is gone
                 }
@@ -1998,6 +2229,55 @@ mod authority_tests {
     use super::*;
     use comet_proto::AgentSessionSource;
     use loro::LoroMap;
+
+    #[tokio::test]
+    async fn history_only_local_chat_requires_native_controller_for_room_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let workspace = WorkspaceHost::open(
+            store.clone(),
+            crate::workspace_host::WorkspaceHostConfig {
+                device_id: "device-a".into(),
+                device_name: "test".into(),
+                platform: "test".into(),
+                project_scope: "project-a".into(),
+                user_id: "accounts.google.com:alice@example.com".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        workspace
+            .create_space("space-a", "device-a", "/tmp", None, false)
+            .unwrap();
+        workspace
+            .create_chat("local-chat-history", "space-a", None, Some("/tmp".into()))
+            .unwrap();
+        let host = DocHost::new(
+            store.clone(),
+            DocHostConfig {
+                device_id: "device-a".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        host.set_workspace(workspace.clone());
+
+        assert!(!host.chat_allows_room_join("local-chat-history"));
+        let restarted_host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "device-a".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        restarted_host.set_workspace(workspace.clone());
+        assert!(!restarted_host.chat_allows_room_join("local-chat-history"));
+        workspace.set_chat_harness_session("local-chat-history", "native-a", "/tmp");
+        assert!(host.chat_allows_room_join("local-chat-history"));
+        assert!(restarted_host.chat_allows_room_join("local-chat-history"));
+        assert!(host.chat_allows_room_join("ordinary-chat"));
+    }
 
     #[tokio::test]
     async fn forged_synced_grant_row_cannot_authorize_a_command() {

@@ -95,13 +95,13 @@ impl Harness for ScriptedHarness {
 fn registry() -> Arc<HarnessRegistry> {
     let registry = HarnessRegistry::new();
     registry.register(Arc::new(ScriptedHarness {
-        id: HarnessId::Mock,
+        id: HarnessId::ClaudeCode,
         text: "Hello",
         step_delay: Duration::from_millis(60),
     }));
     registry.register(Arc::new(ScriptedHarness {
-        id: HarnessId::Cursor,
-        text: "From cursor",
+        id: HarnessId::Codex,
+        text: "From codex",
         step_delay: Duration::from_millis(10),
     }));
     Arc::new(registry)
@@ -111,7 +111,8 @@ fn registry() -> Arc<HarnessRegistry> {
 fn assemble(dir: &std::path::Path, device_id: &str) -> EngineCore {
     std::fs::create_dir_all(dir).expect("create data dir");
     std::fs::write(dir.join("device-id"), device_id).expect("write device id");
-    EngineCore::assemble(dir, registry(), HarnessId::Mock, None).expect("engine core assembles")
+    EngineCore::assemble(dir, registry(), HarnessId::ClaudeCode, None)
+        .expect("engine core assembles")
 }
 
 /// The in-memory room: cross-import workspace-doc updates between two engines on a
@@ -394,7 +395,7 @@ async fn non_host_engine_leaves_remote_chats_commands_alone() {
 #[tokio::test]
 async fn chat_config_selects_the_run_harness() {
     let dir_a = tempfile::tempdir().unwrap();
-    let a = assemble(dir_a.path(), "dev-a"); // default harness = Mock ("Hello")
+    let a = assemble(dir_a.path(), "dev-a"); // default harness = Claude Code ("Hello")
 
     a.workspace
         .create_space("space-cfg", "dev-a", "/tmp/cfg", None, false)
@@ -404,7 +405,7 @@ async fn chat_config_selects_the_run_harness() {
             "chat-cfg",
             "space-cfg",
             Some(ChatConfig {
-                harness: HarnessId::Cursor,
+                harness: HarnessId::Codex,
                 model: None,
                 reasoning: None,
                 model_options: Default::default(),
@@ -415,13 +416,13 @@ async fn chat_config_selects_the_run_harness() {
         .expect("create configured chat");
     queue_run(&a, "chat-cfg", "m-1");
 
-    // The configured harness (Cursor, "From cursor") ran — not the default Mock.
+    // The configured harness (Codex, "From codex") ran — not the default Claude Code.
     let handle = a.doc_host.open("chat-cfg").expect("open chat");
     wait_for(
         || {
             handle.doc().read_entries().unwrap_or_default().iter().any(|e| {
                 e.parts.iter().any(
-                    |p| matches!(p, comet_doc::MessagePart::Text { text, .. } if text == "From cursor"),
+                    |p| matches!(p, comet_doc::MessagePart::Text { text, .. } if text == "From codex"),
                 )
             })
         },
@@ -458,7 +459,7 @@ async fn two_engines_converge_through_a_real_workspace_room() {
         EngineCore::assemble_with_identity(
             dir,
             registry(),
-            HarnessId::Mock,
+            HarnessId::ClaudeCode,
             edge,
             &org,
             user,

@@ -25,8 +25,8 @@ use comet_doc::{
 use comet_engine::{EngineCore, HarnessRegistry, RunJournal};
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
-    SteeringMode,
+    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, RuntimeProfile,
+    SandboxLevel, SteeringMode,
 };
 use comet_sync::DocsStore;
 
@@ -122,7 +122,7 @@ impl Harness for RecordingHarness {
 }
 
 fn assemble(dir: &std::path::Path, harness: RecordingHarness) -> EngineCore {
-    let registry = HarnessRegistry::new();
+    let registry = HarnessRegistry::for_profile(RuntimeProfile::Mock);
     registry.register(Arc::new(harness));
     EngineCore::assemble(dir, Arc::new(registry), HarnessId::Mock, None)
         .expect("engine core assembles")
@@ -188,9 +188,8 @@ fn stored_harness_session(core: &EngineCore) -> Option<(String, Option<String>)>
         .map(|id| (id, chat.harness_session_cwd))
 }
 
-/// Create + name the chat row up front so the auto-titler (which runs its own
-/// harness request after a completed exchange on an UNTITLED chat) stays out
-/// of the recorded request log.
+/// Create + name the chat row up front so recorded state stays focused on
+/// restart/resume behavior rather than deterministic local titling.
 fn pre_title(core: &EngineCore) {
     core.workspace
         .create_space("space-restart", &core.device_id, "/tmp", None, false)
@@ -513,7 +512,7 @@ async fn persistent_session_serves_multiple_turns_on_one_child() {
     std::fs::create_dir_all(&dir).unwrap();
 
     let runs_started = Arc::new(Mutex::new(0usize));
-    let registry = HarnessRegistry::new();
+    let registry = HarnessRegistry::for_profile(RuntimeProfile::Mock);
     registry.register(Arc::new(PersistentHarness {
         runs_started: runs_started.clone(),
     }));
@@ -665,7 +664,6 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
         1
     );
     // The revived run continues the journal-recovered harness conversation.
-    // (An auto-title request may precede it — titling fires at dispatch.)
     let recorded = requests.lock().unwrap().clone();
     let revived = recorded
         .iter()
@@ -804,7 +802,7 @@ async fn real_claude_remembers_codeword_across_engine_restart() {
     };
 
     let core = assemble_real();
-    pre_title(&core); // keep the auto-titler from spending a second model call
+    pre_title(&core); // keep title changes out of this restart-focused scenario
     core.doc_host
         .queue_command(
             CHAT,

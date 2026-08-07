@@ -47,6 +47,29 @@ pub(crate) struct RpcClient {
     writer: mpsc::UnboundedSender<String>,
 }
 
+fn rpc_error_message(error: &Value) -> String {
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty());
+    let details = error
+        .pointer("/data/details")
+        .filter(|details| !details.is_null())
+        .map(|details| match details {
+            Value::String(details) => details.trim().to_owned(),
+            details => details.to_string(),
+        })
+        .filter(|details| !details.is_empty());
+
+    match (message, details) {
+        (Some("Internal error"), Some(details)) | (None, Some(details)) => details,
+        (Some(message), Some(details)) if message != details => format!("{message}: {details}"),
+        (Some(message), _) => message.to_owned(),
+        (None, None) => error.to_string(),
+    }
+}
+
 impl RpcClient {
     /// Spawn the writer + reader tasks over the child's stdio; returns the
     /// client and the incoming (notification/request) channel.
@@ -156,11 +179,7 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
                     continue;
                 };
                 let outcome = match msg.get("error") {
-                    Some(err) => Err(err
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| err.to_string())),
+                    Some(error) => Err(rpc_error_message(error)),
                     None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
                 };
                 let _ = sender.send(outcome);
@@ -192,4 +211,43 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
     // EOF/read error: fail every awaiting request, then signal the loop.
     pending.lock().expect("pending lock").clear();
     let _ = tx.send(Incoming::Eof).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detailed_internal_errors_preserve_provider_failure() {
+        let error = json!({
+            "code": -32603,
+            "message": "Internal error",
+            "data": {
+                "details": "openai-codex/gpt-5.6-sol: billing limit reached"
+            }
+        });
+
+        assert_eq!(
+            rpc_error_message(&error),
+            "openai-codex/gpt-5.6-sol: billing limit reached"
+        );
+    }
+
+    #[test]
+    fn structured_error_details_are_not_discarded() {
+        let error = json!({
+            "code": -32603,
+            "message": "Internal error",
+            "data": {
+                "details": {
+                    "provider": "anthropic",
+                    "kind": "rate_limit"
+                }
+            }
+        });
+
+        let message = rpc_error_message(&error);
+        assert!(message.contains("\"provider\":\"anthropic\""));
+        assert!(message.contains("\"kind\":\"rate_limit\""));
+    }
 }

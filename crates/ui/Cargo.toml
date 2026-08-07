@@ -36,3 +36,4 @@ objc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true
+gpui = { workspace = true, features = ["test-support"] }

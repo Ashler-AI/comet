@@ -35,11 +35,12 @@ pub use server::{serve_connection, serve_ws_listener};
 pub mod methods {
     pub const LIST_HARNESSES: &str = "ListHarnesses";
     pub const LIST_MODELS: &str = "ListModels";
+    pub const LIST_HARNESS_COMMANDS: &str = "ListHarnessCommands";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
-    /// Harness-native session candidates stored on this device.
+    /// Metadata-only harness-native session candidates stored on this device.
     pub const LIST_LOCAL_SESSIONS: &str = "ListLocalSessions";
-    /// Import one history-only local candidate into a Comet chat.
+    /// Re-resolve and import one local candidate into a Comet chat.
     pub const ATTACH_LOCAL_SESSION: &str = "AttachLocalSession";
     /// Capture exact bytes for a discovered OMP native session. Local-controller
     /// only; the opaque candidate id is re-resolved server-side.
@@ -107,6 +108,9 @@ pub mod methods {
     pub const COMPLETE_AGENT_LOGIN: &str = "CompleteAgentLogin";
     pub const POLL_AGENT_LOGIN: &str = "PollAgentLogin";
     pub const CANCEL_AGENT_LOGIN: &str = "CancelAgentLogin";
+    /// Read and update OMP's device-local advisor settings.
+    pub const GET_OMP_ADVISOR_CONFIG: &str = "GetOmpAdvisorConfig";
+    pub const SET_OMP_ADVISOR_CONFIG: &str = "SetOmpAdvisorConfig";
     // Uploads / attachments (ControlRpc, relay-forwardable — target the chat's host device).
     pub const UPLOAD_CHUNK: &str = "UploadChunk";
     pub const UPLOAD_COMMIT: &str = "UploadCommit";

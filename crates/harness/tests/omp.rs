@@ -1,20 +1,39 @@
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard};
+use tokio::sync::{Mutex, MutexGuard};
 
-static ENV_LOCK: Mutex<()> = Mutex::new(());
+static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
-fn env_lock() -> MutexGuard<'static, ()> {
-    ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner())
+async fn env_lock() -> MutexGuard<'static, ()> {
+    ENV_LOCK.lock().await
 }
 use std::time::Duration;
 
-use comet_harness::{CancellationToken, Harness, OmpHarness, RunControls};
+use comet_harness::{CancellationToken, Harness, OmpHarness, RunControls, SteerMessage};
 use comet_proto::{AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel};
 use futures::StreamExt as _;
 use tokio::sync::{mpsc, oneshot};
 
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-omp.sh")
+}
+
+fn write_omp_session(session_dir: &std::path::Path, session_id: &str) -> PathBuf {
+    let project_dir = session_dir.join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let path = project_dir.join("session.jsonl");
+    std::fs::write(
+        &path,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "session",
+                "id": session_id,
+                "cwd": "/tmp",
+            })
+        ),
+    )
+    .unwrap();
+    path
 }
 
 fn controls() -> RunControls {
@@ -45,8 +64,35 @@ fn request(resume: Option<&str>) -> RunRequest {
 }
 
 #[tokio::test]
+async fn model_and_command_catalogs_come_from_omp() {
+    let _env = env_lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("OMP_ARGV_LOG", temp.path().join("argv"));
+    }
+    let harness = OmpHarness::new().with_executable(fixture_path());
+    let models = harness.models().await.expect("model catalog");
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].id, "openai-codex/gpt-5.6-sol");
+    assert_eq!(
+        models[0].reasoning_levels,
+        vec![
+            ReasoningLevel::Low,
+            ReasoningLevel::High,
+            ReasoningLevel::XHigh,
+        ]
+    );
+
+    let commands = harness.commands("").await.expect("command catalog");
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[0].name, "ralplan");
+    assert_eq!(commands[0].input_hint.as_deref(), Some("goal"));
+    assert_eq!(commands[1].name, "security");
+}
+
+#[tokio::test]
 async fn fake_omp_proves_acp_only_execution_and_event_mapping() {
-    let _env = env_lock();
+    let _env = env_lock().await;
     let temp = tempfile::tempdir().unwrap();
     let argv_log = temp.path().join("argv");
     unsafe {
@@ -68,6 +114,10 @@ async fn fake_omp_proves_acp_only_execution_and_event_mapping() {
 
     let argv = std::fs::read_to_string(argv_log).unwrap();
     assert_eq!(argv.lines().next(), Some("acp"));
+    assert!(
+        argv.contains("--approval-mode\nyolo\n"),
+        "Comet OMP runs must explicitly select yolo approval mode: {argv}"
+    );
     for forbidden in ["claude", "codex", "opencode"] {
         assert!(
             !argv.lines().any(|arg| arg == forbidden),
@@ -111,7 +161,7 @@ async fn fake_omp_proves_acp_only_execution_and_event_mapping() {
 
 #[tokio::test]
 async fn selected_model_and_reasoning_are_applied_before_prompting() {
-    let _env = env_lock();
+    let _env = env_lock().await;
     let temp = tempfile::tempdir().unwrap();
     let config_log = temp.path().join("config");
     unsafe {
@@ -150,14 +200,21 @@ async fn selected_model_and_reasoning_are_applied_before_prompting() {
 
 #[tokio::test]
 async fn resume_uses_the_requested_acp_session_id() {
-    let _env = env_lock();
+    let _env = env_lock().await;
     let temp = tempfile::tempdir().unwrap();
     let method_log = temp.path().join("method");
+    let argv_log = temp.path().join("argv");
+    let session_dir = temp.path().join("sessions");
+    write_omp_session(&session_dir, "resume-session");
     unsafe {
-        std::env::set_var("OMP_ARGV_LOG", temp.path().join("argv"));
+        std::env::set_var("OMP_ARGV_LOG", &argv_log);
         std::env::set_var("OMP_METHOD_LOG", &method_log);
+        std::env::set_var("OMP_WRITER_STATE", "inactive");
     }
-    let harness = OmpHarness::new().with_executable(fixture_path());
+    let harness = OmpHarness::new()
+        .with_executable(fixture_path())
+        .with_session_dir(session_dir)
+        .with_session_writer_probe(fixture_path());
     let stream = harness
         .run(request(Some("resume-session")), controls())
         .await
@@ -181,5 +238,240 @@ async fn resume_uses_the_requested_acp_session_id() {
         "session/load",
         "OMP's advertised stable load path must be used for a materialized handoff"
     );
-    unsafe { std::env::remove_var("OMP_METHOD_LOG") };
+    unsafe {
+        std::env::remove_var("OMP_METHOD_LOG");
+        std::env::remove_var("OMP_WRITER_STATE");
+    }
+}
+
+#[tokio::test]
+async fn active_resume_is_rejected_before_a_second_omp_process_starts() {
+    let _env = env_lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let argv_log = temp.path().join("argv");
+    let session_dir = temp.path().join("sessions");
+    write_omp_session(&session_dir, "active-session");
+    unsafe {
+        std::env::set_var("OMP_ARGV_LOG", &argv_log);
+        std::env::set_var("OMP_WRITER_STATE", "active");
+    }
+    let harness = OmpHarness::new()
+        .with_executable(fixture_path())
+        .with_session_dir(session_dir)
+        .with_session_writer_probe(fixture_path());
+    let error = match harness
+        .run(request(Some("active-session")), controls())
+        .await
+    {
+        Ok(_) => panic!("active OMP session started a second writer"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("already running"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        !argv_log.exists(),
+        "the OMP executable must not start while another writer is active"
+    );
+    unsafe {
+        std::env::remove_var("OMP_WRITER_STATE");
+    }
+}
+
+#[tokio::test]
+async fn unknown_writer_state_fails_closed_before_spawning_omp() {
+    let _env = env_lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let argv_log = temp.path().join("argv");
+    let session_dir = temp.path().join("sessions");
+    write_omp_session(&session_dir, "unknown-session");
+    unsafe {
+        std::env::set_var("OMP_ARGV_LOG", &argv_log);
+        std::env::set_var("OMP_WRITER_STATE", "unknown");
+    }
+    let harness = OmpHarness::new()
+        .with_executable(fixture_path())
+        .with_session_dir(session_dir)
+        .with_session_writer_probe(fixture_path());
+    let error = match harness
+        .run(request(Some("unknown-session")), controls())
+        .await
+    {
+        Ok(_) => panic!("unverified OMP session started a second writer"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("Could not verify"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        !argv_log.exists(),
+        "OMP must not start when ownership is unknown"
+    );
+    unsafe {
+        std::env::remove_var("OMP_WRITER_STATE");
+    }
+}
+
+#[tokio::test]
+async fn missing_writer_probe_fails_closed_before_spawning_omp() {
+    let _env = env_lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let argv_log = temp.path().join("argv");
+    let session_dir = temp.path().join("sessions");
+    write_omp_session(&session_dir, "missing-probe-session");
+    unsafe {
+        std::env::set_var("OMP_ARGV_LOG", &argv_log);
+    }
+    let harness = OmpHarness::new()
+        .with_executable(fixture_path())
+        .with_session_dir(session_dir)
+        .with_session_writer_probe(temp.path().join("does-not-exist"));
+    let error = match harness
+        .run(request(Some("missing-probe-session")), controls())
+        .await
+    {
+        Ok(_) => panic!("OMP started without an ownership probe"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("Could not verify"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        !argv_log.exists(),
+        "OMP must not start when the ownership probe is unavailable"
+    );
+}
+
+#[tokio::test]
+async fn persistent_run_reuses_one_acp_session_for_sequential_prompts() {
+    let _env = env_lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let prompt_log = temp.path().join("prompts");
+    let session_log = temp.path().join("sessions");
+    unsafe {
+        std::env::set_var("OMP_ARGV_LOG", temp.path().join("argv"));
+        std::env::set_var("OMP_PROMPT_LOG", &prompt_log);
+        std::env::set_var("OMP_SESSION_LOG", &session_log);
+    }
+    let harness = OmpHarness::new().with_executable(fixture_path());
+    assert!(harness.supports_steering());
+    let (steer_tx, steer_rx) = mpsc::channel(4);
+    let controls = RunControls {
+        request_input: Box::new(|_| {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(Vec::new());
+            rx
+        }),
+        steering: steer_rx,
+        interrupt: CancellationToken::new(),
+    };
+    let mut stream = harness
+        .run(request(None), controls)
+        .await
+        .expect("persistent run starts");
+    let mut events = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("first turn completes")
+            .expect("stream remains open")
+            .expect("valid first-turn event");
+        let done = matches!(event, AgentEvent::Done { .. });
+        events.push(event);
+        if done {
+            break;
+        }
+    }
+
+    steer_tx
+        .send(SteerMessage {
+            prompt: "follow up".into(),
+            message_id: Some("user-follow-up".into()),
+        })
+        .await
+        .unwrap();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("second turn completes")
+            .expect("stream remains open for second turn")
+            .expect("valid second-turn event");
+        let done = matches!(event, AgentEvent::Done { .. });
+        events.push(event);
+        if done {
+            break;
+        }
+    }
+    drop(steer_tx);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("mailbox closure reaps ACP child")
+            .is_none()
+    );
+
+    let first_done = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::Done { .. }))
+        .unwrap();
+    let boundary = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::Steered { .. }))
+        .unwrap();
+    let second_done = events
+        .iter()
+        .rposition(|event| matches!(event, AgentEvent::Done { .. }))
+        .unwrap();
+    assert!(
+        first_done < boundary && boundary < second_done,
+        "events: {events:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(session_log).unwrap(),
+        "session/new\n",
+        "one ACP session must serve both turns"
+    );
+    let prompts = std::fs::read_to_string(prompt_log).unwrap();
+    assert_eq!(prompts.lines().count(), 2);
+    assert!(prompts.lines().nth(1).unwrap().contains("follow up"));
+    unsafe {
+        std::env::remove_var("OMP_PROMPT_LOG");
+        std::env::remove_var("OMP_SESSION_LOG");
+    }
+}
+
+#[tokio::test]
+async fn acp_error_details_reach_the_harness_error() {
+    let _env = env_lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("OMP_ARGV_LOG", temp.path().join("argv"));
+        std::env::set_var(
+            "OMP_PROMPT_ERROR_DETAILS",
+            "openai-codex/gpt-5.6-sol billing limit reached",
+        );
+    }
+    let harness = OmpHarness::new().with_executable(fixture_path());
+    let mut stream = harness
+        .run(request(None), controls())
+        .await
+        .expect("run starts");
+    let error = loop {
+        match tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("ACP error arrives")
+        {
+            Some(Err(error)) => break error,
+            Some(Ok(_)) => {}
+            None => panic!("stream closed without the ACP error"),
+        }
+    };
+    let message = error.to_string();
+    assert!(message.contains("openai-codex/gpt-5.6-sol"));
+    assert!(message.contains("billing limit reached"));
+    assert!(!message.ends_with("Internal error"));
+    unsafe { std::env::remove_var("OMP_PROMPT_ERROR_DETAILS") };
 }

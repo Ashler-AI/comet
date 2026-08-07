@@ -7,8 +7,9 @@
 //! - `QueueCommand {chatId, command}` → `{commandId}` (durable doc command)
 //! - `WatchDocMessages {chatId}` → stream of joined `SessionMessageEntry[]`,
 //!   re-emitted on every doc change
-//! - `ListLocalSessions` → recent Claude Code, Codex, and OMP histories on this
-//!   device; `AttachLocalSession {candidateId}` imports one history idempotently
+//! - `ListLocalSessions` → metadata-only recent Claude Code, Codex, OMP,
+//!   Prime Agent, and OpenCode histories; `AttachLocalSession {candidateId}`
+//!   imports one transcript idempotently
 //! - `WatchCollaboration {chatId}` → typed versioned sessions, provenance,
 //!   publications, participants, principal, and verified grants
 //! - `WatchChats` / `WatchDevices` → streams of the workspace doc's entity rows
@@ -60,7 +61,8 @@ use tokio::sync::watch;
 use comet_doc::{MessagePart, SessionCommandPayload};
 use comet_proto::{
     ChatConfig, CollaborationPrincipal, CollaborationScope, CollaborationSnapshot, HarnessId,
-    ParticipantPresence, ParticipantState, RuntimeProfile, ScaffoldEnvironmentControl,
+    OmpAdvisorSyncBacklog, ParticipantPresence, ParticipantState, RuntimeProfile,
+    ScaffoldEnvironmentControl, ScaffoldEnvironmentControlResult, SessionEnvironmentSource,
     SessionRoomProjection, SessionStatus, ToolCall,
 };
 use comet_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
@@ -78,6 +80,7 @@ use crate::uploads::Uploads;
 use crate::workspace_host::WorkspaceHost;
 
 const FILE_SEARCH_RPC_TIMEOUT: Duration = Duration::from_secs(6);
+const SCAFFOLD_OWNER_ROOM_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const FILE_SEARCH_FEATURED_PATHS: usize = 32;
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +99,14 @@ struct ListModelsParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ListHarnessCommandsParams {
+    harness: HarnessId,
+    #[serde(default)]
+    cwd: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AttachLocalSessionParams {
     candidate_id: String,
 }
@@ -106,9 +117,38 @@ struct CaptureOmpSessionArtifactParams {
     candidate_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OmpAdvisorConfigParams {
+    #[serde(default)]
+    cwd: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "setting", content = "value", rename_all = "camelCase")]
+enum OmpAdvisorConfigSetting {
+    Enabled(bool),
+    Model(String),
+    Subagents(bool),
+    SyncBacklog(OmpAdvisorSyncBacklog),
+    ImmuneTurns(u32),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetOmpAdvisorConfigParams {
+    #[serde(default)]
+    cwd: String,
+    #[serde(flatten)]
+    setting: OmpAdvisorConfigSetting,
+}
+
 fn generic_catalog_allowed(profile: RuntimeProfile, method: &str) -> bool {
     profile != RuntimeProfile::ScaffoldHost
-        || (method != methods::LIST_HARNESSES && method != methods::LIST_MODELS)
+        || !matches!(
+            method,
+            methods::LIST_HARNESSES | methods::LIST_MODELS | methods::LIST_HARNESS_COMMANDS
+        )
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,6 +228,7 @@ fn tool_file_path(call: &ToolCall) -> Option<&str> {
         | ToolCall::WebFetch { .. }
         | ToolCall::WebSearch { .. }
         | ToolCall::Todo { .. }
+        | ToolCall::Agent { .. }
         | ToolCall::Mcp { .. }
         | ToolCall::Unknown { .. } => None,
     }
@@ -475,6 +516,59 @@ impl EngineRpc {
             .ok_or_else(|| RpcError::Failed("scaffold_control_plane_unavailable".into()))
     }
 
+    async fn prepare_scaffold_attach(
+        &self,
+        control: &ScaffoldEnvironmentControl,
+        cancellation: &comet_harness::CancellationToken,
+    ) -> Result<(), RpcError> {
+        let ScaffoldEnvironmentControl::Attach { scope, .. } = control else {
+            return Ok(());
+        };
+        let auth_state = self.auth()?.state();
+        let project_scope = auth_state
+            .project_scope()
+            .ok_or_else(|| RpcError::Failed("authenticated project scope unavailable".into()))?;
+        if scope.project_id != project_scope || scope.project_id != self.workspace.project_scope() {
+            return Err(RpcError::Failed("Scaffold attach project mismatch".into()));
+        }
+        let Some(deployment_id) = scope
+            .deployment_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return Ok(());
+        };
+        let Some(session_id) = scope
+            .session_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return Ok(());
+        };
+        let projection = SessionRoomProjection {
+            project_id: scope.project_id.clone(),
+            deployment_id: deployment_id.to_string(),
+            session_id: session_id.to_string(),
+        };
+        let handle = self
+            .doc_host
+            .open_projection(session_id, Some(&projection))
+            .map_err(|error| RpcError::Failed(error.to_string()))?;
+        tokio::time::timeout(SCAFFOLD_OWNER_ROOM_READY_TIMEOUT, async {
+            while !handle.connected() {
+                tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        return Err(RpcError::Failed("scaffold_request_cancelled".into()));
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| RpcError::Failed("scaffold_session_owner_room_unavailable".into()))?
+    }
+
     fn require_agent_accounts(&self) -> Result<(), RpcError> {
         if self.runtime_profile.allows_agent_accounts() {
             Ok(())
@@ -556,6 +650,56 @@ impl EngineRpc {
         };
         self.doc_host
             .install_local_owner_grant(grant)
+            .map_err(|error| RpcError::Failed(error.to_string()))
+    }
+    /// Project the identifier half of the exact device grant into this
+    /// authenticated viewport. The bootstrap secret remains sandbox-only.
+    fn install_scaffold_control_grant(
+        &self,
+        result: &ScaffoldEnvironmentControlResult,
+    ) -> Result<(), RpcError> {
+        let Some(control_grant) = result.control_grant.as_ref() else {
+            return Ok(());
+        };
+        let Some(attached_device_id) = result.attached_device_id.as_ref() else {
+            return Err(RpcError::Failed(
+                "Scaffold control grant has no attached device".into(),
+            ));
+        };
+        let SessionEnvironmentSource::Scaffold { sandbox_id, .. } = &result.environment.source
+        else {
+            return Err(RpcError::Failed(
+                "Scaffold control grant has no sandbox".into(),
+            ));
+        };
+        let auth = self.auth()?;
+        let state = auth.state();
+        let user = state
+            .user()
+            .ok_or_else(|| RpcError::Failed("authenticated local identity unavailable".into()))?;
+        let project_scope = state
+            .project_scope()
+            .ok_or_else(|| RpcError::Failed("authenticated project scope unavailable".into()))?;
+        if result.environment.scope.project_id != project_scope {
+            return Err(RpcError::Failed(
+                "Scaffold control grant project mismatch".into(),
+            ));
+        }
+        let grant = comet_proto::CapabilityGrant {
+            id: control_grant.id.clone(),
+            principal_subject: user.id.clone(),
+            scope: result.environment.scope.clone(),
+            capabilities: control_grant.capabilities.clone(),
+            sandbox_id: Some(sandbox_id.clone()),
+            device_id: Some(attached_device_id.clone()),
+            granted_by: "comet-edge-device-room".into(),
+            granted_at: crate::now_ms(),
+            expires_at: Some(control_grant.expires_at),
+            revoked_at: None,
+            unknown: Default::default(),
+        };
+        self.doc_host
+            .install_scaffold_control_grant(grant)
             .map_err(|error| RpcError::Failed(error.to_string()))
     }
 
@@ -860,6 +1004,7 @@ fn forwardable(method: &str) -> bool {
         method,
         methods::LIST_HARNESSES
             | methods::LIST_MODELS
+            | methods::LIST_HARNESS_COMMANDS
             | methods::WATCH_DOC_MESSAGES
             | "WatchCollaboration"
             // Repos/worktrees/folders are device-local filesystem state.
@@ -970,6 +1115,7 @@ fn project_collaboration_snapshot(
     doc: &comet_doc::SessionDoc,
     doc_host: &DocHost,
     auth: Option<&Auth>,
+    room_projection: Option<&SessionRoomProjection>,
 ) -> Option<CollaborationSnapshot> {
     let mut snapshot = doc.collaboration_snapshot().ok()?;
     let chat_id = doc.chat_id()?;
@@ -984,18 +1130,30 @@ fn project_collaboration_snapshot(
         return Some(snapshot);
     };
     let project_id = state.project_scope()?.to_string();
-    let session_ids = snapshot
+    let mut session_ids = snapshot
         .sessions
         .iter()
         .map(|session| session.session_id.clone())
         .collect::<Vec<_>>();
+    if let Some(projection) = room_projection
+        && !session_ids.contains(&projection.session_id)
+    {
+        session_ids.push(projection.session_id.clone());
+    }
     snapshot.grants = doc_host.collaboration_grants(&user.id, &session_ids);
+    if let Some(projection) = room_projection {
+        snapshot.grants.retain(|grant| {
+            grant.scope.project_id == projection.project_id
+                && grant.scope.deployment_id.as_deref() == Some(&projection.deployment_id)
+                && grant.scope.session_id.as_deref() == Some(&projection.session_id)
+        });
+    }
     snapshot.principal = Some(CollaborationPrincipal {
         subject: user.id.clone(),
         email: Some(user.email.clone()),
         project_id,
-        deployment_id: None,
-        session_id: None,
+        deployment_id: room_projection.map(|projection| projection.deployment_id.clone()),
+        session_id: room_projection.map(|projection| projection.session_id.clone()),
         capabilities: auth.capabilities(),
         unknown: Default::default(),
     });
@@ -1059,6 +1217,7 @@ fn collaboration_stream(
     doc: std::sync::Arc<comet_doc::SessionDoc>,
     doc_host: DocHost,
     auth: Option<Auth>,
+    room_projection: Option<SessionRoomProjection>,
 ) -> BoxStream<'static, serde_json::Value> {
     let auth_rx = auth.as_ref().map(Auth::watch_state);
     futures::stream::unfold(
@@ -1069,6 +1228,7 @@ fn collaboration_stream(
             doc,
             doc_host,
             auth,
+            room_projection,
             false,
         ),
         |(
@@ -1078,6 +1238,7 @@ fn collaboration_stream(
             doc,
             doc_host,
             auth,
+            room_projection,
             emitted,
         )| async move {
             if emitted {
@@ -1098,7 +1259,12 @@ fn collaboration_stream(
             if let Some(rx) = auth_rx.as_mut() {
                 let _ = rx.borrow_and_update();
             }
-            let snapshot = project_collaboration_snapshot(&doc, &doc_host, auth.as_ref())?;
+            let snapshot = project_collaboration_snapshot(
+                &doc,
+                &doc_host,
+                auth.as_ref(),
+                room_projection.as_ref(),
+            )?;
             let value = serde_json::to_value(snapshot).ok()?;
             Some((
                 value,
@@ -1109,6 +1275,7 @@ fn collaboration_stream(
                     doc,
                     doc_host,
                     auth,
+                    room_projection,
                     true,
                 ),
             ))
@@ -1211,6 +1378,8 @@ impl RpcService for EngineRpc {
                 RpcError::Failed("generic_model_discovery_disabled_by_runtime_profile".into()),
             ),
             methods::LIST_MODELS => {
+                // Catalog discovery is a transient RPC against the harness;
+                // it never allocates or enters SessionsEngine state.
                 let p: ListModelsParams = parse_params(params)?;
                 let harness = self
                     .registry
@@ -1222,11 +1391,76 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&models)
             }
+            methods::LIST_HARNESS_COMMANDS
+                if !generic_catalog_allowed(self.runtime_profile, method) =>
+            {
+                Err(RpcError::Failed(
+                    "generic_command_discovery_disabled_by_runtime_profile".into(),
+                ))
+            }
+            methods::LIST_HARNESS_COMMANDS => {
+                let p: ListHarnessCommandsParams = parse_params(params)?;
+                let harness = self
+                    .registry
+                    .resolve(p.harness)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let commands = harness
+                    .commands(&p.cwd)
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&commands)
+            }
+            methods::GET_OMP_ADVISOR_CONFIG => {
+                if self.runtime_profile != RuntimeProfile::LocalController {
+                    return Err(RpcError::Failed(
+                        "omp_advisor_config_disabled_by_runtime_profile".into(),
+                    ));
+                }
+                let p: OmpAdvisorConfigParams = parse_params(params)?;
+                let config = comet_harness::omp::read_advisor_config(&p.cwd)
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&config)
+            }
+            methods::SET_OMP_ADVISOR_CONFIG => {
+                if self.runtime_profile != RuntimeProfile::LocalController {
+                    return Err(RpcError::Failed(
+                        "omp_advisor_config_disabled_by_runtime_profile".into(),
+                    ));
+                }
+                let p: SetOmpAdvisorConfigParams = parse_params(params)?;
+                let update = match p.setting {
+                    OmpAdvisorConfigSetting::Enabled(value) => {
+                        comet_harness::omp::AdvisorConfigUpdate::Enabled(value)
+                    }
+                    OmpAdvisorConfigSetting::Model(value) => {
+                        comet_harness::omp::AdvisorConfigUpdate::Model(value)
+                    }
+                    OmpAdvisorConfigSetting::Subagents(value) => {
+                        comet_harness::omp::AdvisorConfigUpdate::Subagents(value)
+                    }
+                    OmpAdvisorConfigSetting::SyncBacklog(value) => {
+                        comet_harness::omp::AdvisorConfigUpdate::SyncBacklog(value)
+                    }
+                    OmpAdvisorConfigSetting::ImmuneTurns(value) => {
+                        comet_harness::omp::AdvisorConfigUpdate::ImmuneTurns(value)
+                    }
+                };
+                let config = comet_harness::omp::update_advisor_config(&p.cwd, update)
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&config)
+            }
             methods::LIST_LOCAL_SESSIONS => {
                 self.require_session_import()?;
-                let candidates = tokio::task::spawn_blocking(crate::local_sessions::discover)
-                    .await
-                    .map_err(|err| RpcError::Failed(format!("local session scan failed: {err}")))?;
+                let workspace = self.workspace.clone();
+                let candidates =
+                    tokio::task::spawn_blocking(move || crate::local_sessions::list(&workspace))
+                        .await
+                        .map_err(|err| {
+                            RpcError::Failed(format!("local session scan failed: {err}"))
+                        })?
+                        .map_err(|err| RpcError::Failed(err.to_string()))?;
                 RpcReply::value(&candidates)
             }
             methods::CAPTURE_OMP_SESSION_ARTIFACT => {
@@ -1285,6 +1519,7 @@ impl RpcService for EngineRpc {
                     doc,
                     self.doc_host.clone(),
                     self.auth.clone(),
+                    p.room_projection,
                 )))
             }
             methods::PROBE_SYNC => {
@@ -1348,11 +1583,19 @@ impl RpcService for EngineRpc {
             methods::CONTROL_SCAFFOLD_ENVIRONMENT => {
                 let control: ScaffoldEnvironmentControl = parse_params(params)?;
                 let cancellation = comet_harness::CancellationToken::new();
-                let result = self
-                    .scaffold()?
+                let scaffold = self.scaffold()?;
+                self.prepare_scaffold_attach(&control, &cancellation)
+                    .await?;
+                let result = scaffold
                     .control(control, &cancellation)
                     .await
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
+                if let Err(error) = self.install_scaffold_control_grant(&result) {
+                    tracing::warn!(
+                        error = %error,
+                        "Scaffold attached without local control grant projection"
+                    );
+                }
                 RpcReply::value(&result)
             }
             methods::WATCH_SESSIONS => {
@@ -1686,8 +1929,12 @@ mod tests {
     }
 
     #[test]
-    fn scaffold_host_server_denies_generic_harness_and_model_catalogs() {
-        for method in [methods::LIST_HARNESSES, methods::LIST_MODELS] {
+    fn scaffold_host_server_denies_generic_harness_model_and_command_catalogs() {
+        for method in [
+            methods::LIST_HARNESSES,
+            methods::LIST_MODELS,
+            methods::LIST_HARNESS_COMMANDS,
+        ] {
             assert!(!generic_catalog_allowed(
                 RuntimeProfile::ScaffoldHost,
                 method
@@ -1838,7 +2085,7 @@ mod tests {
             expected_deployment_id: None,
             expected_sandbox_id: None,
         });
-        let projection = project_collaboration_snapshot(&doc, &host, Some(&auth)).unwrap();
+        let projection = project_collaboration_snapshot(&doc, &host, Some(&auth), None).unwrap();
         assert_eq!(
             projection
                 .principal
@@ -1848,6 +2095,41 @@ mod tests {
         );
         assert_eq!(projection.grants.len(), 1);
         assert_eq!(projection.grants[0].id, "verified-local-grant");
+        host.install_scaffold_control_grant(comet_proto::CapabilityGrant {
+            id: "attached-scaffold-grant".into(),
+            principal_subject: "accounts.google.com:subject-alice".into(),
+            scope: CollaborationScope {
+                project_id: "project-a".into(),
+                deployment_id: Some("deployment-a".into()),
+                session_id: Some("chat-file".into()),
+                unknown: Default::default(),
+            },
+            capabilities: vec![comet_proto::CAPABILITY_SESSION_CHAT.into()],
+            sandbox_id: Some("sandbox-a".into()),
+            device_id: Some("comet-scaffold-sandbox-a".into()),
+            granted_by: "comet-edge-device-room".into(),
+            granted_at: now,
+            expires_at: Some(now + 60_000),
+            revoked_at: None,
+            unknown: Default::default(),
+        })
+        .unwrap();
+        let room_projection = SessionRoomProjection {
+            project_id: "project-a".into(),
+            deployment_id: "deployment-a".into(),
+            session_id: "chat-file".into(),
+        };
+        let attached_projection =
+            project_collaboration_snapshot(&doc, &host, Some(&auth), Some(&room_projection))
+                .unwrap();
+        let attached_principal = attached_projection.principal.as_ref().unwrap();
+        assert_eq!(
+            attached_principal.deployment_id.as_deref(),
+            Some("deployment-a")
+        );
+        assert_eq!(attached_principal.session_id.as_deref(), Some("chat-file"));
+        assert_eq!(attached_projection.grants.len(), 1);
+        assert_eq!(attached_projection.grants[0].id, "attached-scaffold-grant");
         let projected = projection
             .publications
             .iter()

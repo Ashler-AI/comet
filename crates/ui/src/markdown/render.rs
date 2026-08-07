@@ -217,6 +217,15 @@ pub fn render_block(
             let (size, line) = heading_metrics(*level);
             text_element(runs, size, line, true, top_ix, ix, opts, theme)
         }
+        Block::DisplayMath { runs } => div()
+            .w_full()
+            .flex()
+            .justify_center()
+            .py(px(2.0))
+            .child(text_element(
+                runs, 16.0, 26.0, false, top_ix, ix, opts, theme,
+            ))
+            .into_any_element(),
         Block::CodeBlock { language, code } => render_code_block(
             language.as_deref(),
             code,
@@ -514,6 +523,339 @@ pub const INLINE_CODE_RADIUS: f32 = 4.5;
 pub const INLINE_CODE_PAD_X: f32 = 2.0;
 pub const INLINE_CODE_INSET_Y: f32 = 2.0;
 
+/// Render the TeX subset emitted in ordinary agent prose as readable Unicode.
+/// Pulldown-cmark supplies math boundaries; this keeps Comet dependency-free
+/// while covering operators, Greek symbols, scripts, fractions, and roots.
+fn math_to_text(source: &str) -> String {
+    MathText::new(source.trim()).render_until(None)
+}
+
+struct MathText<'a> {
+    source: &'a str,
+    pos: usize,
+}
+
+impl<'a> MathText<'a> {
+    fn new(source: &'a str) -> Self {
+        Self { source, pos: 0 }
+    }
+
+    fn render_until(&mut self, end: Option<char>) -> String {
+        let mut out = String::with_capacity(self.source.len());
+        while let Some(ch) = self.peek() {
+            if Some(ch) == end {
+                self.next();
+                break;
+            }
+            match ch {
+                '\\' => {
+                    self.next();
+                    self.render_command(&mut out);
+                }
+                '{' => {
+                    self.next();
+                    out.push_str(&self.render_until(Some('}')));
+                }
+                '}' => {
+                    self.next();
+                    out.push('}');
+                }
+                '^' | '_' => {
+                    self.next();
+                    self.render_script(ch, &mut out);
+                }
+                '&' => {
+                    self.next();
+                    Self::push_space(&mut out);
+                }
+                c if c.is_whitespace() => {
+                    self.next();
+                    Self::push_space(&mut out);
+                }
+                _ => {
+                    out.push(self.next().expect("peeked character"));
+                }
+            }
+        }
+        out
+    }
+
+    fn render_command(&mut self, out: &mut String) {
+        let Some(next) = self.peek() else {
+            out.push('\\');
+            return;
+        };
+        if !next.is_ascii_alphabetic() {
+            self.next();
+            match next {
+                ',' => out.push('\u{2009}'),
+                ':' | ';' => Self::push_space(out),
+                '!' => {}
+                '\\' => out.push('\n'),
+                '{' | '}' | '$' | '%' | '_' | '#' | '&' => out.push(next),
+                _ => {
+                    out.push('\\');
+                    out.push(next);
+                }
+            }
+            return;
+        }
+
+        let start = self.pos;
+        while self.peek().is_some_and(|ch| ch.is_ascii_alphabetic()) {
+            self.next();
+        }
+        let command = &self.source[start..self.pos];
+        match command {
+            "frac" => {
+                let checkpoint = self.pos;
+                if let (Some(numerator), Some(denominator)) = (self.group(), self.group()) {
+                    Self::push_fraction(out, &numerator, &denominator);
+                } else {
+                    self.pos = checkpoint;
+                    out.push_str("\\frac");
+                }
+            }
+            "sqrt" => {
+                if let Some(value) = self.group() {
+                    out.push('√');
+                    if value.chars().count() == 1 {
+                        out.push_str(&value);
+                    } else {
+                        out.push('(');
+                        out.push_str(&value);
+                        out.push(')');
+                    }
+                } else {
+                    out.push('√');
+                }
+            }
+            "text" | "textrm" | "mathrm" | "mathbf" | "mathit" | "mathsf" | "mathtt"
+            | "operatorname" => {
+                if let Some(value) = self.group() {
+                    out.push_str(&value);
+                }
+            }
+            "begin" | "end" => {
+                let _ = self.group();
+            }
+            "left" | "right" => {}
+            "quad" => out.push_str("  "),
+            "qquad" => out.push_str("    "),
+            _ => {
+                if let Some(symbol) = math_symbol(command) {
+                    out.push_str(symbol);
+                } else {
+                    out.push('\\');
+                    out.push_str(command);
+                }
+            }
+        }
+    }
+
+    fn render_script(&mut self, marker: char, out: &mut String) {
+        let value = self.group().or_else(|| self.next().map(String::from));
+        let Some(value) = value else {
+            out.push(marker);
+            return;
+        };
+        let mapped: Option<String> = value.chars().map(|ch| script_char(marker, ch)).collect();
+        if let Some(mapped) = mapped {
+            out.push_str(&mapped);
+        } else {
+            out.push(marker);
+            if value.chars().count() > 1 {
+                out.push('(');
+                out.push_str(&value);
+                out.push(')');
+            } else {
+                out.push_str(&value);
+            }
+        }
+    }
+
+    fn group(&mut self) -> Option<String> {
+        let checkpoint = self.pos;
+        while self.peek().is_some_and(char::is_whitespace) {
+            self.next();
+        }
+        if self.peek() != Some('{') {
+            self.pos = checkpoint;
+            return None;
+        }
+        self.next();
+        Some(self.render_until(Some('}')))
+    }
+
+    fn push_fraction(out: &mut String, numerator: &str, denominator: &str) {
+        let grouped = |value: &str, out: &mut String| {
+            if value.chars().count() == 1 {
+                out.push_str(value);
+            } else {
+                out.push('(');
+                out.push_str(value);
+                out.push(')');
+            }
+        };
+        grouped(numerator, out);
+        out.push('⁄');
+        grouped(denominator, out);
+    }
+
+    fn push_space(out: &mut String) {
+        if !out.ends_with([' ', '\n', '\u{2009}']) {
+            out.push(' ');
+        }
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.source[self.pos..].chars().next()
+    }
+
+    fn next(&mut self) -> Option<char> {
+        let ch = self.peek()?;
+        self.pos += ch.len_utf8();
+        Some(ch)
+    }
+}
+
+fn math_symbol(command: &str) -> Option<&'static str> {
+    Some(match command {
+        "times" => "×",
+        "cdot" => "·",
+        "div" => "÷",
+        "pm" => "±",
+        "mp" => "∓",
+        "le" | "leq" => "≤",
+        "ge" | "geq" => "≥",
+        "ne" | "neq" => "≠",
+        "approx" => "≈",
+        "equiv" => "≡",
+        "infty" => "∞",
+        "sum" => "∑",
+        "prod" => "∏",
+        "int" => "∫",
+        "partial" => "∂",
+        "nabla" => "∇",
+        "to" | "rightarrow" => "→",
+        "leftarrow" => "←",
+        "leftrightarrow" => "↔",
+        "Rightarrow" => "⇒",
+        "Leftarrow" => "⇐",
+        "Leftrightarrow" => "⇔",
+        "in" => "∈",
+        "notin" => "∉",
+        "subset" => "⊂",
+        "subseteq" => "⊆",
+        "supset" => "⊃",
+        "supseteq" => "⊇",
+        "cup" => "∪",
+        "cap" => "∩",
+        "land" | "wedge" => "∧",
+        "lor" | "vee" => "∨",
+        "neg" => "¬",
+        "forall" => "∀",
+        "exists" => "∃",
+        "alpha" => "α",
+        "beta" => "β",
+        "gamma" => "γ",
+        "delta" => "δ",
+        "epsilon" | "varepsilon" => "ε",
+        "zeta" => "ζ",
+        "eta" => "η",
+        "theta" | "vartheta" => "θ",
+        "iota" => "ι",
+        "kappa" => "κ",
+        "lambda" => "λ",
+        "mu" => "μ",
+        "nu" => "ν",
+        "xi" => "ξ",
+        "omicron" => "ο",
+        "pi" | "varpi" => "π",
+        "rho" | "varrho" => "ρ",
+        "sigma" | "varsigma" => "σ",
+        "tau" => "τ",
+        "upsilon" => "υ",
+        "phi" | "varphi" => "φ",
+        "chi" => "χ",
+        "psi" => "ψ",
+        "omega" => "ω",
+        "Gamma" => "Γ",
+        "Delta" => "Δ",
+        "Theta" => "Θ",
+        "Lambda" => "Λ",
+        "Xi" => "Ξ",
+        "Pi" => "Π",
+        "Sigma" => "Σ",
+        "Upsilon" => "Υ",
+        "Phi" => "Φ",
+        "Psi" => "Ψ",
+        "Omega" => "Ω",
+        _ => return None,
+    })
+}
+
+fn script_char(marker: char, ch: char) -> Option<char> {
+    match marker {
+        '^' => Some(match ch {
+            '0' => '⁰',
+            '1' => '¹',
+            '2' => '²',
+            '3' => '³',
+            '4' => '⁴',
+            '5' => '⁵',
+            '6' => '⁶',
+            '7' => '⁷',
+            '8' => '⁸',
+            '9' => '⁹',
+            '+' => '⁺',
+            '-' => '⁻',
+            '=' => '⁼',
+            '(' => '⁽',
+            ')' => '⁾',
+            'i' => 'ⁱ',
+            'n' => 'ⁿ',
+            _ => return None,
+        }),
+        '_' => Some(match ch {
+            '0' => '₀',
+            '1' => '₁',
+            '2' => '₂',
+            '3' => '₃',
+            '4' => '₄',
+            '5' => '₅',
+            '6' => '₆',
+            '7' => '₇',
+            '8' => '₈',
+            '9' => '₉',
+            '+' => '₊',
+            '-' => '₋',
+            '=' => '₌',
+            '(' => '₍',
+            ')' => '₎',
+            'a' => 'ₐ',
+            'e' => 'ₑ',
+            'h' => 'ₕ',
+            'i' => 'ᵢ',
+            'j' => 'ⱼ',
+            'k' => 'ₖ',
+            'l' => 'ₗ',
+            'm' => 'ₘ',
+            'n' => 'ₙ',
+            'o' => 'ₒ',
+            'p' => 'ₚ',
+            'r' => 'ᵣ',
+            's' => 'ₛ',
+            't' => 'ₜ',
+            'u' => 'ᵤ',
+            'v' => 'ᵥ',
+            'x' => 'ₓ',
+            _ => return None,
+        }),
+        _ => None,
+    }
+}
+
 /// Flatten inline runs into shaped-text inputs. Pure given a theme.
 pub fn flatten_runs(runs: &[InlineRun], theme: &Theme, bold_default: bool) -> FlatText {
     flatten_runs_weighted(
@@ -538,8 +880,10 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
         if run.text.is_empty() {
             continue;
         }
+        let rendered_math = run.style.math.map(|_| math_to_text(&run.text));
+        let run_text = rendered_math.as_deref().unwrap_or(&run.text);
         let start = text.len();
-        text.push_str(&run.text);
+        text.push_str(run_text);
         let mut f = if run.style.code {
             font(theme.font_mono.clone())
         } else {
@@ -588,7 +932,7 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
             }
         }
         out.push(TextRun {
-            len: run.text.len(),
+            len: run_text.len(),
             font: f,
             color,
             // Inline code's wash is painted as ROUNDED quads by the canvas
@@ -671,29 +1015,67 @@ fn flat_text_element(
             })
             .into_any_element()
     };
+    selectable_layout_element(
+        format!("{}:{ix}", opts.row_key).into(),
+        flat.text.clone(),
+        layout,
+        text_el,
+        flat.code_ranges.clone(),
+        Some(inline_code_wash(theme)),
+        theme,
+    )
+}
+
+/// Make an already-styled plain text element participate in transcript-wide
+/// selection. Callers keep their own non-selection underlays, such as mention
+/// chip washes, around the returned element.
+pub(crate) fn selectable_styled_text(
+    selection_key: SharedString,
+    text: SharedString,
+    styled: StyledText,
+    theme: &Theme,
+) -> AnyElement {
+    let layout = styled.layout().clone();
+    selectable_layout_element(
+        selection_key.as_ref().into(),
+        text,
+        layout,
+        styled.into_any_element(),
+        Vec::new(),
+        None,
+        theme,
+    )
+}
+
+fn selectable_layout_element(
+    sel_key: std::sync::Arc<str>,
+    flat_text: SharedString,
+    layout: gpui::TextLayout,
+    text_el: AnyElement,
+    code_ranges: Vec<Range<usize>>,
+    code_wash: Option<Hsla>,
+    theme: &Theme,
+) -> AnyElement {
     // Underlay canvas: inline-code washes + the selection wash, painted
     // BEFORE the text (earlier sibling ⇒ underneath), reading glyph geometry
-    // from the text's own layout handle. Pure paint — never in layout. The
-    // same paint pass re-registers the frame-scoped window mouse listeners
-    // that drive text selection (round 18; see markdown/selection.rs).
-    let sel_key: std::sync::Arc<str> = format!("{}:{ix}", opts.row_key).into();
-    let code_ranges = flat.code_ranges.clone();
-    let flat_text = flat.text.clone();
-    let wash = inline_code_wash(theme);
+    // from the text's own layout handle. Pure paint — never in layout.
     let sel_wash = selection_wash(theme);
     let underlay = canvas(
         |_, _, _| (),
         move |_, _, window, _| {
-            for range in &code_ranges {
-                for rect in range_rects(&layout, range, INLINE_CODE_PAD_X, INLINE_CODE_INSET_Y) {
-                    window.paint_quad(quad(
-                        rect,
-                        px(INLINE_CODE_RADIUS),
-                        wash,
-                        px(0.0),
-                        gpui::transparent_black(),
-                        BorderStyle::default(),
-                    ));
+            if let Some(wash) = code_wash {
+                for range in &code_ranges {
+                    for rect in range_rects(&layout, range, INLINE_CODE_PAD_X, INLINE_CODE_INSET_Y)
+                    {
+                        window.paint_quad(quad(
+                            rect,
+                            px(INLINE_CODE_RADIUS),
+                            wash,
+                            px(0.0),
+                            gpui::transparent_black(),
+                            BorderStyle::default(),
+                        ));
+                    }
                 }
             }
             if let Some(range) = super::selection::wash_range(&sel_key) {
@@ -708,17 +1090,15 @@ fn flat_text_element(
                     ));
                 }
             }
-            // Register this element into the frame's document-ordered
-            // registry (paint order IS document order), then the frame's
-            // mouse listeners.
-            REGISTRY.with(|r| {
-                r.borrow_mut().push(RegEntry {
+            // Paint order is document order. The transcript root owns the
+            // pointer handlers and resolves drags against this registry.
+            REGISTRY.with(|registry| {
+                registry.borrow_mut().push(RegEntry {
                     key: sel_key.clone(),
                     text: flat_text.clone(),
                     layout: layout.clone(),
                 })
             });
-            register_selection_listeners(window, &sel_key, &flat_text, &layout);
         },
     )
     .absolute()
@@ -809,73 +1189,56 @@ fn resolve_drag(anchor_key: &str, anchor_ix: usize, head: (usize, usize)) -> boo
     })
 }
 
-/// Register this frame's window-level mouse listeners for one text element's
-/// selection (Zed-markdown mechanics: window-level so a drag keeps tracking
-/// outside the element's bounds; frame-scoped, so paint re-registers).
-fn register_selection_listeners(
-    window: &mut Window,
-    key: &std::sync::Arc<str>,
-    text: &SharedString,
-    layout: &gpui::TextLayout,
-) {
-    use gpui::{DispatchPhase, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
-    {
-        let (key, text, layout) = (key.clone(), text.clone(), layout.clone());
-        window.on_mouse_event(move |e: &MouseDownEvent, phase, window, _cx| {
-            if phase != DispatchPhase::Bubble || e.button != MouseButton::Left {
-                return;
-            }
-            if layout.bounds().contains(&e.position) {
-                let ix = match layout.index_for_position(e.position) {
+/// Start or clear transcript selection from a root-level pointer down.
+pub(crate) fn selection_mouse_down(
+    position: gpui::Point<gpui::Pixels>,
+    click_count: usize,
+) -> bool {
+    let hit = REGISTRY.with(|registry| {
+        registry.borrow().iter().find_map(|entry| {
+            entry.layout.bounds().contains(&position).then(|| {
+                let ix = match entry.layout.index_for_position(position) {
                     Ok(ix) | Err(ix) => ix,
                 };
-                match e.click_count {
-                    2 => {
-                        let range = super::selection::word_range(&text, ix);
-                        super::selection::begin_with_span(&key, &text, range);
-                    }
-                    n if n >= 3 => {
-                        super::selection::begin_with_span(&key, &text, 0..text.len());
-                    }
-                    _ => super::selection::begin(&key, ix),
-                }
-                window.refresh();
-            } else if super::selection::clear_if_owner(&key) {
-                window.refresh();
+                (entry.key.clone(), entry.text.clone(), ix)
+            })
+        })
+    });
+    if let Some((key, text, ix)) = hit {
+        match click_count {
+            2 => {
+                let range = super::selection::word_range(&text, ix);
+                super::selection::begin_with_span(&key, &text, range);
             }
-        });
+            n if n >= 3 => {
+                super::selection::begin_with_span(&key, &text, 0..text.len());
+            }
+            _ => super::selection::begin(&key, ix),
+        }
+        true
+    } else {
+        super::selection::clear()
     }
-    {
-        let key = key.clone();
-        window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, _cx| {
-            if phase != DispatchPhase::Bubble || !e.dragging() {
-                return;
-            }
-            // Only the anchor element's listener drives the drag.
-            let Some(anchor_ix) = super::selection::drag_anchor(&key) else {
-                return;
-            };
-            let Some(head) = registry_point(e.position) else {
-                return;
-            };
-            if resolve_drag(&key, anchor_ix, head) {
-                window.refresh();
-            }
-        });
-    }
-    {
-        let key = key.clone();
-        window.on_mouse_event(move |_: &MouseUpEvent, phase, _window, _cx| {
-            if phase != DispatchPhase::Bubble {
-                return;
-            }
-            if let Some(_text) = super::selection::end_drag(&key) {
-                // X11 middle-click paste parity (Zed does the same).
-                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-                _cx.write_to_primary(gpui::ClipboardItem::new_string(_text));
-            }
-        });
-    }
+}
+
+/// Extend the active transcript selection to the nearest painted text point.
+pub(crate) fn selection_mouse_move(position: gpui::Point<gpui::Pixels>) -> bool {
+    let Some((anchor_key, anchor_ix)) = super::selection::drag_anchor() else {
+        return false;
+    };
+    let Some(head) = registry_point(position) else {
+        return false;
+    };
+    resolve_drag(&anchor_key, anchor_ix, head)
+}
+
+/// Settle the active transcript selection.
+pub(crate) fn selection_mouse_up(position: gpui::Point<gpui::Pixels>) -> Option<String> {
+    let (anchor_key, _) = super::selection::drag_anchor()?;
+    super::selection::end_drag(
+        &anchor_key,
+        Some((f32::from(position.x), f32::from(position.y))),
+    )
 }
 
 /// The wash boxes for one byte range: one box per visual line the range
@@ -1183,7 +1546,7 @@ pub fn runs_with_palette(
 mod tests {
     use super::*;
     use crate::markdown::highlight::{Lang, tokenize_line};
-    use crate::markdown::parser::InlineStyle;
+    use crate::markdown::parser::{InlineStyle, MathStyle};
 
     #[test]
     fn code_line_runs_cover_exactly() {
@@ -1243,6 +1606,32 @@ mod tests {
         assert_eq!(flat.runs[1].color, inline_code_text(&theme));
         assert_eq!(flat.runs[1].background_color, None);
         assert_eq!(flat.runs[0].color, theme.text);
+    }
+
+    #[test]
+    fn math_runs_render_common_tex_without_delimiters() {
+        let theme = Theme::dark();
+        let display = InlineRun {
+            text: "6 \\times 7 + 6 \\times 5 = 72".into(),
+            style: InlineStyle {
+                math: Some(MathStyle::Display),
+                ..Default::default()
+            },
+        };
+        let flat = flatten_runs(&[display], &theme, false);
+        assert_eq!(flat.text, "6 × 7 + 6 × 5 = 72");
+        assert_eq!(
+            flat.runs.iter().map(|run| run.len).sum::<usize>(),
+            flat.text.len()
+        );
+    }
+
+    #[test]
+    fn math_runs_render_scripts_fractions_roots_and_greek() {
+        assert_eq!(
+            math_to_text("x^2 + a_{10} + \\frac{1}{2} + \\sqrt{x} + \\alpha"),
+            "x² + a₁₀ + 1⁄2 + √x + α"
+        );
     }
 
     #[test]

@@ -19,7 +19,7 @@ use comet_harness::mock::MockHarness;
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
     AgentEvent, AgentSessionSource, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest,
-    SandboxLevel, SessionStatus, SteeringMode, ToolCall,
+    RuntimeProfile, SandboxLevel, SessionStatus, SteeringMode, ToolCall,
 };
 use comet_sync::DocsStore;
 
@@ -175,7 +175,7 @@ impl Harness for FailingDispatchHarness {
 }
 
 fn registry_with(harness: Arc<dyn Harness>) -> Arc<HarnessRegistry> {
-    let registry = HarnessRegistry::new();
+    let registry = HarnessRegistry::for_profile(RuntimeProfile::Mock);
     registry.register(harness);
     Arc::new(registry)
 }
@@ -436,6 +436,53 @@ async fn queued_run_command_executes_end_to_end() {
 }
 
 #[tokio::test]
+async fn new_input_unsettles_an_archived_chat() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(MockHarness {
+            script: mock_script(),
+        }),
+    );
+    core.workspace.claim_chat(CHAT, Some("/tmp")).unwrap();
+    assert!(core.workspace.set_chat_archived(CHAT, true).unwrap());
+    assert!(
+        core.workspace
+            .doc()
+            .chat(CHAT)
+            .unwrap()
+            .is_some_and(|chat| chat.archived)
+    );
+
+    let command_id = queue_as_controller(
+        &core,
+        "cmd-unsettle",
+        SessionCommandPayload::Run {
+            request: run_request("continue this session"),
+            message_id: "msg-unsettle".into(),
+        },
+    )
+    .await;
+    wait_for(
+        || {
+            command_status(&core, &command_id)
+                .is_some_and(|(status, _)| status != SessionCommandStatus::Pending)
+        },
+        "unsettled session command",
+    )
+    .await;
+
+    assert!(
+        core.workspace
+            .doc()
+            .chat(CHAT)
+            .unwrap()
+            .is_some_and(|chat| !chat.archived),
+        "new input must return a settled session to the active list"
+    );
+}
+
+#[tokio::test]
 async fn dispatch_failure_resolves_durable_command_and_audit() {
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(dir.path(), Arc::new(FailingDispatchHarness));
@@ -465,6 +512,20 @@ async fn dispatch_failure_resolves_durable_command_and_audit() {
         resolution
             .as_deref()
             .is_some_and(|reason| reason.contains("dispatch transport unavailable"))
+    );
+    let transcript = entries(&core);
+    assert!(
+        transcript.iter().any(|entry| {
+            entry.role == MessageRole::Assistant
+                && entry.parts.iter().any(|part| {
+                    matches!(
+                        part,
+                        MessagePart::Error { message, .. }
+                            if message.contains("dispatch transport unavailable")
+                    )
+                })
+        }),
+        "pre-stream dispatch failure must be visible in the transcript"
     );
     let audit_id = format!("audit/{command_id}");
     let snapshot = handle.doc().collaboration_snapshot().unwrap();
@@ -1651,9 +1712,9 @@ async fn harness_emitted_input_twin_is_dropped_and_answer_resumes() {
 // the prompt-embedded refs (the persisted transport) and the staged paths.
 // ---------------------------------------------------------------------------
 
-/// Delegates to a scripted mock but records every RunRequest the engine hands
-/// over (the chat run AND the auto-title run share the harness) — proves
-/// `attachments` survives doc-queue → executor → harness.
+/// Delegates to a scripted mock and records every RunRequest the engine hands
+/// over, proving attachments survive doc-queue → executor → harness without an
+/// auxiliary title-generation run.
 struct CapturingHarness {
     script: Vec<AgentEvent>,
     seen: Arc<std::sync::Mutex<Vec<RunRequest>>>,
@@ -1776,14 +1837,11 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
         other => panic!("unexpected user part {other:?}"),
     }
 
-    // The harness saw the staged paths on the request itself (the chat run —
-    // NOT the auto-title run, which fires at dispatch now, embeds the user
-    // prompt in its wrapper, and legitimately carries no attachments).
+    // Local deterministic titling never allocates a second harness request.
     let requests = seen.lock().unwrap().clone();
-    let chat_run = requests
-        .iter()
-        .find(|r| r.prompt.contains("what color is this?") && !r.prompt.contains("word title"))
-        .expect("chat run reached the harness");
+    assert_eq!(requests.len(), 1);
+    let chat_run = &requests[0];
+    assert!(chat_run.prompt.contains("what color is this?"));
     assert_eq!(chat_run.attachments, vec![path.clone()]);
     assert!(chat_run.prompt.contains(&path));
 
@@ -1825,7 +1883,7 @@ async fn real_claude_sees_uploaded_image_inline() {
         None,
     )
     .expect("engine core assembles");
-    // Pre-title the chat so the auto-titler doesn't spend a second model call.
+    // Pin the title so this test remains focused on the production harness path.
     core.workspace
         .create_chat(CHAT, &core.device_id, None, Some("/tmp".into()))
         .expect("create chat row");

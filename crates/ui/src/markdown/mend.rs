@@ -11,9 +11,9 @@
 //! untouched, so a marker that genuinely never closes settles honestly — one
 //! flip when the row completes — instead of jittering throughout.
 //!
-//! Repairs, in the spirit of remend's handler set (its katex/html/comparison
-//! handlers don't apply here — comet renders raw HTML literally and has no
-//! math):
+//! Repairs, in the spirit of remend's handler set (raw HTML stays literal):
+//! - inline/display math parity: `$x`→`$x$`, `$$x`→`$$x$$`; TeX markers
+//!   inside the formula are shielded from Markdown emphasis repair;
 //! - emphasis parity: `**a`→`**a**`, `*a`→`*a*`, `_a`/`__a`, `~~a`, nested
 //!   closers innermost-first (`**a *b` → `**a *b***`), half-streamed closers
 //!   completed (`**a*` → `**a**`);
@@ -66,6 +66,8 @@ pub fn close_hanging(text: &str) -> Option<String> {
     let mut brackets: Vec<usize> = Vec::new();
     // Open inline code span: (backtick run length, content char index).
     let mut code: Option<(usize, usize)> = None;
+    // Open TeX math span: (`$` run length, content char index).
+    let mut math: Option<(usize, usize)> = None;
     // Char index of the last substantive character — content that justifies
     // closing an opener (not whitespace, not a bare marker).
     let mut last_content: Option<usize> = None;
@@ -83,7 +85,7 @@ pub fn close_hanging(text: &str) -> Option<String> {
             i += 2;
             continue;
         }
-        if c == '`' {
+        if math.is_none() && c == '`' {
             let run = run_len(&cs, i);
             match code {
                 // A span closes only on a run of the opening length.
@@ -97,6 +99,31 @@ pub fn close_hanging(text: &str) -> Option<String> {
         if code.is_some() {
             last_content = Some(i);
             i += 1;
+            continue;
+        }
+        if let Some((open, _)) = math {
+            if c == '$' {
+                let run = run_len(&cs, i);
+                if run == open {
+                    math = None;
+                } else {
+                    last_content = Some(i + run - 1);
+                }
+                i += run;
+            } else {
+                last_content = Some(i);
+                i += 1;
+            }
+            continue;
+        }
+        if c == '$' {
+            let run = run_len(&cs, i);
+            if run <= 2 && at(i + run).is_some_and(|next| !next.is_whitespace()) {
+                math = Some((run, i + run));
+            } else {
+                last_content = Some(i + run - 1);
+            }
+            i += run;
             continue;
         }
         match c {
@@ -165,6 +192,11 @@ pub fn close_hanging(text: &str) -> Option<String> {
         && last_content.is_some_and(|lc| lc >= cpos)
     {
         pending.push((cpos, "`".repeat(ticks)));
+    }
+    if let Some((dollars, cpos)) = math
+        && last_content.is_some_and(|lc| lc >= cpos)
+    {
+        pending.push((cpos, "$".repeat(dollars)));
     }
     for d in &delims {
         if last_content.is_some_and(|lc| lc >= d.pos) {
@@ -301,6 +333,7 @@ mod tests {
         stays("a **b** and *c* and `d` and ~~e~~");
         stays("[docs](https://x.dev) done");
         stays("");
+        stays("inline $x^2$ and $$y = 3$$");
     }
 
     #[test]
@@ -371,6 +404,13 @@ mod tests {
         mends("call `a ** b", "call `a ** b`");
         mends("``a`", "``a```"); // shorter run is span content, not a closer
         stays("`done` after");
+    }
+
+    #[test]
+    fn math_closes_and_shields_markdown_markers() {
+        mends("Inline $x^2", "Inline $x^2$");
+        mends("$$6 \\times 7", "$$6 \\times 7$$");
+        mends("$$a * b_1", "$$a * b_1$$");
     }
 
     #[test]

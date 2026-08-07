@@ -22,7 +22,8 @@ use gpui::{
 
 use comet_engine::registry::HarnessDescriptor;
 use comet_proto::{
-    ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel,
+    ChatConfig, FolderListing, HarnessCommand, HarnessId, Model, ReasoningLevel, RepoRef,
+    SandboxLevel,
 };
 use comet_rpc::methods;
 
@@ -274,6 +275,7 @@ pub struct Pickers {
     open: Option<PickerKind>,
     harnesses: Loadable<Vec<HarnessDescriptor>>,
     models: HashMap<HarnessId, Loadable<Vec<Model>>>,
+    commands: HashMap<HarnessId, Loadable<Vec<HarnessCommand>>>,
     refs: Loadable<Vec<RepoRef>>,
     /// Space id the `refs` slot belongs to (invalidated on space change).
     refs_space: Option<String>,
@@ -315,8 +317,9 @@ impl Pickers {
                 cx.notify();
             }
             ComposerInputEvent::Submitted => this.on_search_submit(cx),
-            // Pasted images/files don't apply to a search box.
+            // Attachment events don't apply to a generic search box.
             ComposerInputEvent::PastedImages(_)
+            | ComposerInputEvent::PastedText(_)
             | ComposerInputEvent::PastedPaths(_)
             | ComposerInputEvent::CursorMoved
             | ComposerInputEvent::ViewportChanged
@@ -350,6 +353,7 @@ impl Pickers {
                 // a space switch may land on another device, so refetch.
                 this.harnesses = Loadable::Idle;
                 this.models.clear();
+                this.commands.clear();
             }
             cx.notify();
         });
@@ -382,6 +386,7 @@ impl Pickers {
             open,
             harnesses: Loadable::Idle,
             models: HashMap::new(),
+            commands: HashMap::new(),
             refs: Loadable::Idle,
             refs_space: None,
             active: 0,
@@ -434,18 +439,14 @@ impl Pickers {
         (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device)
     }
 
-    /// Effective harness: picked, or the chat's config, or the first listed.
+    /// Effective harness: the selected chat owns its harness; otherwise use the
+    /// new-chat draft, remembered default, or first listed harness.
     fn effective_harness(&self, cx: &App) -> Option<HarnessId> {
+        if let Some(chat) = self.state.read(cx).selected_chat_row() {
+            return chat.config.as_ref().map(|config| config.harness);
+        }
         if let Some(harness) = self.config.harness {
             return Some(harness);
-        }
-        if let Some(config) = self
-            .state
-            .read(cx)
-            .selected_chat_row()
-            .and_then(|c| c.config.as_ref())
-        {
-            return Some(config.harness);
         }
         // New-chat canvas: the remembered last-used harness (sticky defaults),
         // when the loaded catalog still offers it.
@@ -467,30 +468,32 @@ impl Pickers {
             .and_then(|list| visible_harnesses(list).first().map(|d| d.id))
     }
 
-    /// Effective model id: the draft pick, the selected chat's config, or (on
-    /// the new-chat canvas) the remembered last-used model for the harness.
+    /// Effective model id: the selected chat owns its persisted model; the
+    /// draft and remembered defaults apply only to the new-chat canvas.
     fn effective_model_id<'a>(&'a self, cx: &'a App) -> Option<&'a str> {
+        if let Some(chat) = self.state.read(cx).selected_chat_row() {
+            return chat
+                .config
+                .as_ref()
+                .and_then(|config| config.model.as_deref());
+        }
         if let Some(id) = self.config.model.as_deref() {
             return Some(id);
         }
-        if let Some(chat) = self.state.read(cx).selected_chat_row() {
-            return chat.config.as_ref().and_then(|c| c.model.as_deref());
-        }
         let harness = self.effective_harness(cx)?;
-        self.defaults.model_for(harness).map(|m| m.id.as_str())
+        self.defaults
+            .model_for(harness)
+            .map(|model| model.id.as_str())
     }
 
     /// Effective reasoning — always concrete once the model is known: the
     /// draft pick / chat config / remembered default, clamped to the selected
     /// model's ladder, falling back to the model's default level.
     fn effective_reasoning(&self, cx: &App) -> Option<ReasoningLevel> {
-        let explicit = self.config.reasoning.or_else(|| {
-            match self.state.read(cx).selected_chat_row() {
-                Some(chat) => chat.config.as_ref().and_then(|c| c.reasoning),
-                // New chat: the remembered last-used level.
-                None => self.defaults.reasoning,
-            }
-        });
+        let explicit = match self.state.read(cx).selected_chat_row() {
+            Some(chat) => chat.config.as_ref().and_then(|config| config.reasoning),
+            None => self.config.reasoning.or(self.defaults.reasoning),
+        };
         if self.selected_model(cx).is_none() {
             // Catalog not loaded yet: show the explicit value as-is (nothing
             // to clamp against); it resolves to a concrete level on load.
@@ -551,6 +554,15 @@ impl Pickers {
             self.suppressed = Some((kind, Instant::now()));
         }
         cx.notify();
+    }
+
+    /// Close the active composer picker. Returns whether a picker was open.
+    pub fn dismiss(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.open.is_none() {
+            return false;
+        }
+        self.close(cx);
+        true
     }
 
     /// Capture knob (`COMET_OPEN_DIALOG=model`): open the combined
@@ -623,6 +635,7 @@ impl Pickers {
                 self.ensure_harnesses(cx);
                 if let Some(harness) = self.effective_harness(cx) {
                     self.ensure_models(harness, cx);
+                    self.ensure_commands(harness, cx);
                 }
             }
         }
@@ -665,6 +678,7 @@ impl Pickers {
                 };
                 if let Some(harness) = pickers.effective_harness(cx) {
                     pickers.ensure_models(harness, cx);
+                    pickers.ensure_commands(harness, cx);
                 }
                 cx.notify();
             })
@@ -718,6 +732,77 @@ impl Pickers {
             .ok();
         })
         .detach();
+    }
+
+    fn command_cwd(&self, cx: &App) -> String {
+        let state = self.state.read(cx);
+        if let Some(cwd) = state
+            .selected_chat_row()
+            .and_then(|chat| chat.cwd.as_deref())
+        {
+            return cwd.to_string();
+        }
+        state
+            .selected_space_row()
+            .map(|space| space.path.clone())
+            .unwrap_or_default()
+    }
+
+    fn ensure_commands(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+        if self
+            .commands
+            .get(&harness)
+            .is_some_and(|slot| !matches!(slot, Loadable::Idle))
+        {
+            return;
+        }
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        let target = self.space_target(cx);
+        let cwd = self.command_cwd(cx);
+        self.commands.insert(harness, Loadable::Loading);
+        cx.spawn(async move |this, cx| {
+            let mut params = serde_json::json!({ "harness": harness, "cwd": cwd });
+            if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
+                object.insert(
+                    "targetDeviceId".into(),
+                    serde_json::Value::String(target.clone()),
+                );
+            }
+            let result = engine
+                .client()
+                .call(methods::LIST_HARNESS_COMMANDS, params)
+                .await;
+            this.update(cx, |pickers, cx| {
+                let loaded = match result {
+                    Ok(value) => match serde_json::from_value::<Vec<HarnessCommand>>(value) {
+                        Ok(commands) => Loadable::Ready(commands),
+                        Err(err) => Loadable::Error(err.to_string()),
+                    },
+                    Err(err) => Loadable::Error(err.to_string()),
+                };
+                pickers.commands.insert(harness, loaded);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn prepare_harness_commands(&mut self, cx: &mut Context<Self>) {
+        self.ensure_harnesses(cx);
+        if let Some(harness) = self.effective_harness(cx) {
+            self.ensure_commands(harness, cx);
+        }
+    }
+
+    pub fn harness_commands<'a>(&'a self, cx: &App) -> &'a [HarnessCommand] {
+        self.effective_harness(cx)
+            .and_then(|harness| self.commands.get(&harness))
+            .and_then(Loadable::ready)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
     /// ListRefs for the selected SPACE's folder — targeted at the space's
@@ -996,6 +1081,7 @@ impl Pickers {
         self.save_defaults();
         self.model_scroll.set_offset(gpui::Point::default());
         self.ensure_models(harness, cx);
+        self.ensure_commands(harness, cx);
         cx.notify();
     }
 
@@ -2264,9 +2350,9 @@ fn trait_chip(theme: &Theme, active: bool) -> gpui::Div {
         })
 }
 
-/// Brand mark + optional tint for a harness (the Claude mark keeps its brand
-/// orange even on the monochrome surface; the mock harness scripts
-/// Claude-flavoured runs, so it wears the Claude mark).
+/// Brand mark + optional tint for a harness. Imported-only OpenCode provenance
+/// uses the neutral terminal glyph because it has no registered executable or
+/// product-owned brand asset.
 pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gpui::Hsla>) {
     match harness {
         HarnessId::ClaudeCode | HarnessId::Mock => (
@@ -2275,6 +2361,8 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
         ),
         HarnessId::Codex => (crate::icons::OPENAI_MARK, None),
         HarnessId::Omp => (crate::icons::COMET_LOGO, None),
+        HarnessId::PrimeAgent => (crate::icons::COMET_LOGO, None),
+        HarnessId::OpenCode => (crate::icons::TERMINAL, None),
         HarnessId::Cursor => (crate::icons::CURSOR_MARK, None),
     }
 }
@@ -2408,6 +2496,7 @@ impl Render for Pickers {
         self.ensure_harnesses(cx);
         if let Some(harness) = self.effective_harness(cx) {
             self.ensure_models(harness, cx);
+            self.ensure_commands(harness, cx);
         }
         // A popover opened data-side (COMET_OPEN_PICKER) never went through
         // `toggle`, so kick its loads here (all ensure_* are idempotent).

@@ -327,6 +327,42 @@ pub fn tool_chip_content(call: &crate::ToolCall) -> (&'static str, String) {
     (label, single_line(&detail))
 }
 
+fn agent_activity_detail(agents: &[crate::AgentActivity]) -> String {
+    use crate::AgentActivityStatus;
+    if let [agent] = agents {
+        let status = match agent.status {
+            AgentActivityStatus::Pending => "pending",
+            AgentActivityStatus::Running => "running",
+            AgentActivityStatus::Completed => "completed",
+            AgentActivityStatus::Failed => "failed",
+            AgentActivityStatus::Cancelled => "cancelled",
+        };
+        return format!("{} · {} · {status}", agent.id, agent.role);
+    }
+    let active = agents
+        .iter()
+        .filter(|agent| {
+            matches!(
+                agent.status,
+                AgentActivityStatus::Pending | AgentActivityStatus::Running
+            )
+        })
+        .count();
+    if active > 0 {
+        format!("{} agents · {active} active", agents.len())
+    } else {
+        let failed = agents
+            .iter()
+            .filter(|agent| agent.status == AgentActivityStatus::Failed)
+            .count();
+        if failed > 0 {
+            format!("{} agents · {failed} failed", agents.len())
+        } else {
+            format!("{} agents · completed", agents.len())
+        }
+    }
+}
+
 fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
     use crate::ToolCall;
     match call {
@@ -351,6 +387,10 @@ fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
             let done = items.iter().filter(|i| i.done).count();
             ("Todo", format!("{done}/{} done", items.len()))
         }
+        ToolCall::Agent { agents } => (
+            if agents.len() == 1 { "Agent" } else { "Agents" },
+            agent_activity_detail(agents),
+        ),
         ToolCall::Mcp { server, tool, .. } => ("MCP", format!("{server} · {tool}")),
         ToolCall::Unknown { name, .. } => ("Tool", name.clone()),
     }
@@ -368,6 +408,7 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
     let mut searches = 0usize;
     let mut fetches = 0usize;
     let mut todos = 0usize;
+    let mut agents = 0usize;
     let mut other = 0usize;
     let mut failed = 0usize;
     for (call, is_error) in tools {
@@ -393,6 +434,7 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
             }
             ToolCall::WebFetch { .. } => fetches += 1,
             ToolCall::Todo { .. } => todos += 1,
+            ToolCall::Agent { agents: activity } => agents += activity.len(),
             ToolCall::Mcp { .. } | ToolCall::Unknown { .. } => other += 1,
         }
     }
@@ -415,6 +457,9 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
     if todos > 0 {
         segments.push("updated todos".to_string());
     }
+    if agents > 0 {
+        segments.push(format!("used {}", plural(agents, "agent", "agents")));
+    }
     if other > 0 {
         segments.push(format!("called {}", plural(other, "tool", "tools")));
     }
@@ -431,6 +476,35 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
         summary.replace_range(0..1, &upper);
     }
     summary
+}
+
+#[cfg(test)]
+mod agent_activity_tests {
+    use super::*;
+    use crate::{AgentActivity, AgentActivityStatus, ToolCall};
+
+    fn activity(status: AgentActivityStatus) -> ToolCall {
+        ToolCall::Agent {
+            agents: vec![AgentActivity {
+                id: "PleasantBeetle".into(),
+                role: "scout".into(),
+                status,
+                model: Some("anthropic/claude-opus-5:xhigh".into()),
+            }],
+        }
+    }
+
+    #[test]
+    fn activity_chip_reports_identity_role_and_lifecycle() {
+        assert_eq!(
+            tool_chip_content(&activity(AgentActivityStatus::Running)),
+            ("Agent", "PleasantBeetle · scout · running".to_string())
+        );
+        assert_eq!(
+            tool_group_summary(&[(activity(AgentActivityStatus::Completed), false)]),
+            "Used 1 agent"
+        );
+    }
 }
 
 /// The status-dot palette, as oklch triples (L, C, H°).

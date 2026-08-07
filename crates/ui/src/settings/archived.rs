@@ -57,7 +57,7 @@ impl ArchivedPage {
             this.update(cx, |page, cx| {
                 page.busy = None;
                 if let Err(err) = result {
-                    page.error = Some(format!("Unarchive failed: {err}").into());
+                    page.error = Some(format!("Could not unsettle session: {err}").into());
                 }
                 cx.notify();
             })
@@ -229,9 +229,9 @@ impl Render for ArchivedPage {
                                     .text_color(theme.text_muted),
                             )
                             .child(SharedString::from(if is_busy {
-                                "Unarchiving…"
+                                "Unsettling…"
                             } else {
-                                "Unarchive"
+                                "Unsettle"
                             })),
                     )
                     .into_any_element()
@@ -258,7 +258,7 @@ impl Render for ArchivedPage {
                     div()
                         .mt(px(12.0))
                         .text_size(px(14.0))
-                        .child(SharedString::from("Nothing archived")),
+                        .child(SharedString::from("Nothing settled")),
                 )
                 .child(
                     div()
@@ -266,7 +266,7 @@ impl Render for ArchivedPage {
                         .text_size(px(12.0))
                         .text_color(theme.text_muted.opacity(0.4))
                         .child(SharedString::from(
-                            "Right-click a session in the sidebar to archive it.",
+                            "Right-click a session in the sidebar to settle it.",
                         )),
                 )
                 .into_any_element()
@@ -288,12 +288,12 @@ impl Render for ArchivedPage {
                 widgets::page_column()
                     .child(widgets::page_header(
                         &theme,
-                        "Archived sessions",
+                        "Settled sessions",
                         (count > 0).then_some(count),
                     ))
                     .child(widgets::page_subtitle(
                         &theme,
-                        "Hidden from the sidebar, never deleted. Unarchiving puts a session back on its device.",
+                        "Settled sessions stay below active work in the sidebar.",
                     ))
                     .when_some(self.error.clone(), |el, message| {
                         el.child(

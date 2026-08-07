@@ -71,6 +71,60 @@ impl MessagePart {
     }
 }
 
+fn intrinsic_call_state(call: &ToolCall) -> Option<(bool, bool)> {
+    match call {
+        ToolCall::Todo { .. } => Some((true, false)),
+        ToolCall::Agent { agents } => {
+            let resolved = !agents.is_empty()
+                && agents.iter().all(|agent| {
+                    matches!(
+                        agent.status,
+                        comet_proto::AgentActivityStatus::Completed
+                            | comet_proto::AgentActivityStatus::Failed
+                            | comet_proto::AgentActivityStatus::Cancelled
+                    )
+                });
+            let is_error = agents
+                .iter()
+                .any(|agent| agent.status == comet_proto::AgentActivityStatus::Failed);
+            Some((resolved, is_error))
+        }
+        _ => None,
+    }
+}
+
+fn refresh_tool_call(existing: &mut ToolCall, incoming: &ToolCall) {
+    if let (
+        ToolCall::Todo {
+            items: current_items,
+        },
+        ToolCall::Todo {
+            items: incoming_items,
+        },
+    ) = (&mut *existing, incoming)
+    {
+        let overlaps = incoming_items.iter().any(|incoming| {
+            current_items
+                .iter()
+                .any(|current| current.text == incoming.text)
+        });
+        if overlaps {
+            for incoming in incoming_items {
+                if let Some(current) = current_items
+                    .iter_mut()
+                    .find(|current| current.text == incoming.text)
+                {
+                    current.done = incoming.done;
+                } else {
+                    current_items.push(incoming.clone());
+                }
+            }
+            return;
+        }
+    }
+    *existing = incoming.clone();
+}
+
 /// Fold one agent event into a parts accumulator, in place.
 ///
 /// In place because the fold runs once per streamed event: rebuilding the
@@ -104,19 +158,28 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
             // Reasoning is not rendered as a transcript part (matches comet).
         }
         AgentEvent::ToolCall { id, call } => {
-            if let Some(existing) = out.iter_mut().find_map(|p| match p {
+            let intrinsic_state = intrinsic_call_state(call);
+            if let Some((existing, is_error, resolved)) = out.iter_mut().find_map(|p| match p {
                 MessagePart::Tool {
-                    id: pid, call: c, ..
-                } if pid == id => Some(c),
+                    id: pid,
+                    call,
+                    is_error,
+                    resolved,
+                } if pid == id => Some((call, is_error, resolved)),
                 _ => None,
             }) {
-                *existing = call.clone();
+                refresh_tool_call(existing, call);
+                if let Some((next_resolved, next_error)) = intrinsic_state {
+                    *resolved = next_resolved;
+                    *is_error = next_error;
+                }
             } else {
+                let (resolved, is_error) = intrinsic_state.unwrap_or((false, false));
                 out.push(MessagePart::Tool {
                     id: id.clone(),
                     call: call.clone(),
-                    is_error: false,
-                    resolved: false,
+                    is_error,
+                    resolved,
                 });
             }
         }
@@ -178,7 +241,9 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 });
             }
         }
-        AgentEvent::AssistantMessageCompleted { .. } | AgentEvent::Usage { .. } => {}
+        AgentEvent::SessionTitleChanged { .. }
+        | AgentEvent::AssistantMessageCompleted { .. }
+        | AgentEvent::Usage { .. } => {}
     }
 }
 
@@ -370,6 +435,128 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn agent_activity_updates_in_place_and_resolves_from_terminal_statuses() {
+        use comet_proto::{AgentActivity, AgentActivityStatus};
+
+        let event = |status| AgentEvent::ToolCall {
+            id: "task-1".into(),
+            call: ToolCall::Agent {
+                agents: vec![AgentActivity {
+                    id: "Scout".into(),
+                    role: "scout".into(),
+                    status,
+                    model: Some("anthropic/claude-opus-5:xhigh".into()),
+                }],
+            },
+        };
+        let mut parts = Vec::new();
+        fold_event_into_parts(&mut parts, &event(AgentActivityStatus::Pending));
+        fold_event_into_parts(&mut parts, &event(AgentActivityStatus::Running));
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Tool {
+                resolved: false,
+                is_error: false,
+                ..
+            }
+        ));
+
+        fold_event_into_parts(&mut parts, &event(AgentActivityStatus::Completed));
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Tool {
+                resolved: true,
+                is_error: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn todo_snapshots_are_complete_when_persisted() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "omp-plan".into(),
+                call: ToolCall::Todo {
+                    items: vec![comet_proto::TodoItem {
+                        text: "Ship it".into(),
+                        done: false,
+                    }],
+                },
+            },
+        );
+
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Tool {
+                resolved: true,
+                is_error: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn todo_refresh_preserves_completed_items_omitted_by_later_updates() {
+        let event = |items| AgentEvent::ToolCall {
+            id: "omp-plan".into(),
+            call: ToolCall::Todo { items },
+        };
+        let item = |text: &str, done| comet_proto::TodoItem {
+            text: text.into(),
+            done,
+        };
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &event(vec![item("Goal alpha", false), item("Goal beta", false)]),
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &event(vec![item("Goal alpha", true), item("Goal beta", false)]),
+        );
+        fold_event_into_parts(&mut parts, &event(vec![item("Goal beta", false)]));
+
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Tool {
+                call: ToolCall::Todo { items },
+                ..
+            } if items == &vec![item("Goal alpha", true), item("Goal beta", false)]
+        ));
+    }
+
+    #[test]
+    fn todo_refresh_replaces_an_unrelated_plan() {
+        let mut parts = Vec::new();
+        for (text, done) in [("Old goal", true), ("New goal", false)] {
+            fold_event_into_parts(
+                &mut parts,
+                &AgentEvent::ToolCall {
+                    id: "omp-plan".into(),
+                    call: ToolCall::Todo {
+                        items: vec![comet_proto::TodoItem {
+                            text: text.into(),
+                            done,
+                        }],
+                    },
+                },
+            );
+        }
+
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Tool {
+                call: ToolCall::Todo { items },
+                ..
+            } if items.len() == 1 && items[0].text == "New goal" && !items[0].done
+        ));
     }
 
     #[test]

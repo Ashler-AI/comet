@@ -1,40 +1,15 @@
-//! Chat auto-titling — after the first user+assistant exchange completes on an
-//! untitled chat, name it with the harness's cheapest model (port of comet's
-//! `generateTitle` in `sessions.ts`).
+//! Deterministic local chat titles derived from the first user prompt.
 //!
-//! Flow (fire-and-forget from the run task; every failure is a silent skip with
-//! tracing — a title must never fail or delay a run):
-//! 1. skip when the chat already has a title (or has no workspace row);
-//! 2. pick the run harness's cheapest model (small-tier name heuristic, else the
-//!    last listed model — comet's `cheapestModel`);
-//! 3. run a one-shot, non-streaming-collected titling prompt through the
-//!    [`Harness`] trait (read-only sandbox, minimal reasoning, auto-approve),
-//!    retrying on comet's short backoff ladder; fall back to the prompt's first
-//!    words when every attempt produces nothing;
-//! 4. re-check the title (a user rename during generation wins);
-//! 5. when the chat sits in a comet worktree (`comet/<name>` branch), rename the
-//!    branch from the title and update the chat's branch row;
-//! 6. `rename_chat` in the workspace doc.
+//! Titling never consults a model catalog or starts an auxiliary harness run.
+//! The chat row is named immediately; an eligible Comet worktree branch is
+//! renamed asynchronously without delaying the agent run.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use futures::StreamExt;
-
-use comet_harness::{CancellationToken, RunControls, SteerMessage};
-use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
-    UserInputAnswer, UserInputQuestion,
-};
-
 use crate::EngineError;
-use crate::registry::HarnessRegistry;
 use crate::repos::Repos;
 use crate::workspace_host::WorkspaceHost;
-
-/// Throwaway title runs are cheap but still cross a process boundary — retry a
-/// couple of times with a short backoff before falling back (comet's ladder).
-const RETRY_DELAYS_MS: &[u64] = &[250, 1_000];
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -42,9 +17,12 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 struct Inner {
     workspace: WorkspaceHost,
-    registry: Arc<HarnessRegistry>,
     repos: Repos,
     in_flight: Mutex<HashSet<String>>,
+    /// Locally generated titles remain provisional until a harness supplies
+    /// its canonical session name. The map has the same chat cardinality as
+    /// the engine's standing session caches.
+    generated_titles: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Clone)]
@@ -53,82 +31,64 @@ pub struct TitleGenerator {
 }
 
 impl TitleGenerator {
-    pub fn new(workspace: WorkspaceHost, registry: Arc<HarnessRegistry>, repos: Repos) -> Self {
+    pub fn new(workspace: WorkspaceHost, repos: Repos) -> Self {
         Self {
             inner: Arc::new(Inner {
                 workspace,
-                registry,
                 repos,
                 in_flight: Mutex::new(HashSet::new()),
+                generated_titles: Mutex::new(HashMap::new()),
             }),
         }
     }
 
-    /// Fire-and-forget: title `chat_id` if it's still untitled. Called by the run
-    /// task after a completed exchange; runs detached so it never delays anything.
-    /// Duplicate completion signals for the same chat share one generation.
-    pub fn maybe_generate(&self, chat_id: &str, harness: HarnessId, prompt: &str, cwd: &str) {
+    /// Fire-and-forget: derive a stable local title from `prompt` if `chat_id`
+    /// is still untitled. Duplicate signals for the same chat share one task.
+    pub fn maybe_generate(&self, chat_id: &str, prompt: &str) {
         if !lock(&self.inner.in_flight).insert(chat_id.to_string()) {
             return;
         }
         let this = self.clone();
         let chat_id = chat_id.to_string();
         let prompt = prompt.to_string();
-        let cwd = cwd.to_string();
         tokio::spawn(async move {
-            if let Err(err) = this.generate(&chat_id, harness, &prompt, &cwd).await {
+            if let Err(err) = this.generate(&chat_id, &prompt).await {
                 tracing::debug!(chat = %chat_id, error = %err, "chat auto-titling skipped");
             }
             lock(&this.inner.in_flight).remove(&chat_id);
         });
     }
 
-    async fn generate(
-        &self,
-        chat_id: &str,
-        harness_id: HarnessId,
-        prompt: &str,
-        cwd: &str,
-    ) -> Result<(), EngineError> {
+    async fn generate(&self, chat_id: &str, prompt: &str) -> Result<(), EngineError> {
         let chat = self
             .inner
             .workspace
             .doc()
             .chat(chat_id)?
             .ok_or_else(|| EngineError::Other("chat has no workspace row".into()))?;
-        if chat.title.as_deref().is_some_and(|t| !t.trim().is_empty()) {
-            return Ok(()); // already named
-        }
-
-        let generated = self.run_title_model(harness_id, prompt, cwd).await;
-        // Fallback so a chat is always named even if the model run produced nothing.
-        let fallback: String = prompt
-            .split_whitespace()
-            .take(7)
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(48)
-            .collect();
-        let title = generated.unwrap_or(fallback);
-        if title.is_empty() {
-            return Ok(());
-        }
-
-        // Re-read after the model call: a user may have named the chat or checked
-        // out another branch while the throwaway generation was live.
-        let latest = self.inner.workspace.doc().chat(chat_id)?.unwrap_or(chat);
-        if latest
+        if chat
             .title
             .as_deref()
-            .is_some_and(|t| !t.trim().is_empty())
+            .is_some_and(|title| !title.trim().is_empty())
         {
             return Ok(());
         }
 
-        // Rename the worktree branch when the chat still sits on its original
-        // comet/<name> branch (guards live inside rename_worktree_branch).
-        if let (Some(chat_cwd), Some(branch)) = (&latest.cwd, &latest.branch)
+        let title = title_from_prompt(prompt);
+        if title.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut generated = lock(&self.inner.generated_titles);
+            generated.insert(chat_id.to_string(), title.clone());
+            if let Err(err) = self.inner.workspace.rename_chat(chat_id, &title) {
+                generated.remove(chat_id);
+                return Err(err);
+            }
+        }
+        tracing::info!(chat = %chat_id, title = %title, "chat auto-titled locally");
+
+        if let (Some(chat_cwd), Some(branch)) = (&chat.cwd, &chat.branch)
             && branch.starts_with("comet/")
         {
             match self
@@ -148,162 +108,81 @@ impl TitleGenerator {
                 }
             }
         }
-
-        self.inner.workspace.rename_chat(chat_id, &title)?;
-        tracing::info!(chat = %chat_id, title = %title, "chat auto-titled");
         Ok(())
     }
 
-    /// One-shot titling run: collect TextDeltas until Done; retries on failure.
-    async fn run_title_model(
-        &self,
-        harness_id: HarnessId,
-        prompt: &str,
-        cwd: &str,
-    ) -> Option<String> {
-        let harness = match self.inner.registry.resolve(harness_id) {
-            Ok(harness) => harness,
-            Err(err) => {
-                tracing::debug!(error = %err, "titling harness unavailable");
-                return None;
-            }
-        };
-        let cheap = cheapest_model(&harness.models().await.unwrap_or_default());
-        let title_prompt = format!(
-            "Reply with ONLY a concise 3-5 word title in Title Case (no quotes, no punctuation) \
-             for a coding session that begins with this request:\n\n{prompt}"
-        );
-        for attempt in 0..=RETRY_DELAYS_MS.len() {
-            let request = RunRequest {
-                prompt: title_prompt.clone(),
-                model: cheap.clone(),
-                reasoning: Some(ReasoningLevel::Minimal),
-                model_options: serde_json::Map::new(),
-                cwd: cwd.to_string(),
-                sandbox: SandboxLevel::ReadOnly,
-                auto_approve: true,
-                attachments: Vec::new(),
-                resume: None,
-            };
-            match collect_text(harness.as_ref(), request).await {
-                Ok(raw) => {
-                    let candidate = clean_title(&raw);
-                    if !candidate.is_empty() {
-                        return Some(candidate);
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(attempt = attempt + 1, error = %err,
-                        "automatic chat title generation attempt failed");
-                }
-            }
-            if let Some(delay) = RETRY_DELAYS_MS.get(attempt) {
-                tokio::time::sleep(std::time::Duration::from_millis(*delay)).await;
-            }
+    /// Replace Comet's provisional first-prompt title with the canonical name
+    /// emitted by an ACP harness. A later manual rename always wins.
+    pub fn adopt_harness_title(&self, chat_id: &str, title: &str) -> Result<(), EngineError> {
+        let title = title
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(120)
+            .collect::<String>();
+        if title.is_empty() {
+            return Ok(());
         }
-        None
+
+        let mut generated = lock(&self.inner.generated_titles);
+        let chat = self
+            .inner
+            .workspace
+            .doc()
+            .chat(chat_id)?
+            .ok_or_else(|| EngineError::Other("chat has no workspace row".into()))?;
+        let current = chat
+            .title
+            .as_deref()
+            .filter(|current| !current.trim().is_empty());
+        if current.is_some() && generated.get(chat_id).map(String::as_str) != current {
+            return Ok(());
+        }
+        if current != Some(title.as_str()) {
+            self.inner.workspace.rename_chat(chat_id, &title)?;
+            tracing::info!(chat = %chat_id, title = %title, "chat adopted harness session title");
+        }
+        generated.remove(chat_id);
+        Ok(())
     }
 }
 
-/// The cheapest model a harness offers (comet's `cheapestModel` heuristic):
-/// prefer a small-tier name (haiku/mini/nano/flash/small/lite), else the last
-/// listed model; `None` when the catalog is empty (harness picks its default).
-fn cheapest_model(models: &[Model]) -> Option<String> {
-    if models.is_empty() {
-        return None;
-    }
-    let small = models.iter().find(|m| {
-        let haystack = format!("{} {}", m.id, m.label).to_lowercase();
-        ["haiku", "mini", "nano", "flash", "small", "lite"]
-            .iter()
-            .any(|tier| haystack.contains(tier))
-    });
-    small.or(models.last()).map(|m| m.id.clone())
-}
-
-/// First line, stripped of quote/heading dressing, capped at 60 chars.
-fn clean_title(raw: &str) -> String {
-    let first = raw.trim().lines().next().unwrap_or("");
-    first
-        .trim_start_matches(['"', '\'', '#', ' ', '\t'])
-        .trim_end_matches(['"', '\'', ' ', '\t'])
-        .chars()
-        .take(60)
-        .collect()
-}
-
-/// Drive one titling run through the harness: no steering, questions resolved
-/// empty immediately (a titling prompt must never block on input).
-async fn collect_text(
-    harness: &dyn comet_harness::Harness,
-    request: RunRequest,
-) -> Result<String, EngineError> {
-    let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<SteerMessage>(1);
-    let controls = RunControls {
-        request_input: Box::new(|_questions: Vec<UserInputQuestion>| {
-            let (tx, rx) = tokio::sync::oneshot::channel::<Vec<UserInputAnswer>>();
-            let _ = tx.send(Vec::new());
-            rx
-        }),
-        steering: steer_rx,
-        interrupt: CancellationToken::new(),
-    };
-    let mut stream = harness.run(request, controls).await?;
-    let mut text = String::new();
-    while let Some(event) = stream.next().await {
-        match event? {
-            AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
-            AgentEvent::Error { message } => {
-                return Err(EngineError::Other(format!("titling run error: {message}")));
+fn title_from_prompt(prompt: &str) -> String {
+    let mut title = String::with_capacity(48);
+    let mut char_count = 0;
+    for word in prompt.split_whitespace().take(7) {
+        if char_count == 48 {
+            break;
+        }
+        if !title.is_empty() {
+            title.push(' ');
+            char_count += 1;
+        }
+        for character in word.chars() {
+            if char_count == 48 {
+                return title;
             }
-            AgentEvent::Done { status, error, .. } => {
-                if status == DoneStatus::Completed {
-                    break;
-                }
-                return Err(EngineError::Other(format!(
-                    "titling run ended {status:?}: {}",
-                    error.unwrap_or_default()
-                )));
-            }
-            _ => {}
+            title.push(character);
+            char_count += 1;
         }
     }
-    drop(steer_tx); // keep the mailbox open for the run's whole lifetime
-    Ok(text)
+    title
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use comet_proto::Model;
-
-    fn model(id: &str, label: &str) -> Model {
-        Model {
-            id: id.into(),
-            label: label.into(),
-            description: None,
-            reasoning_levels: vec![],
-            options: vec![],
-        }
-    }
+    use super::title_from_prompt;
 
     #[test]
-    fn cheapest_prefers_small_tier_then_last() {
-        let models = vec![
-            model("opus-4", "Opus"),
-            model("haiku-3", "Haiku"),
-            model("sonnet-4", "Sonnet"),
-        ];
-        assert_eq!(cheapest_model(&models).as_deref(), Some("haiku-3"));
-        let no_small = vec![model("opus-4", "Opus"), model("sonnet-4", "Sonnet")];
-        assert_eq!(cheapest_model(&no_small).as_deref(), Some("sonnet-4"));
-        assert_eq!(cheapest_model(&[]), None);
-    }
-
-    #[test]
-    fn titles_are_cleaned() {
-        assert_eq!(clean_title("\"Fix Login Flow\"\nextra"), "Fix Login Flow");
-        assert_eq!(clean_title("# Add Dark Mode  "), "Add Dark Mode");
-        assert_eq!(clean_title("   "), "");
+    fn titles_are_local_bounded_and_deterministic() {
+        let prompt = "  Investigate   the staging restart and make it reliable for everyone  ";
+        assert_eq!(
+            title_from_prompt(prompt),
+            "Investigate the staging restart and make it"
+        );
+        assert_eq!(title_from_prompt(prompt), title_from_prompt(prompt));
+        assert!(title_from_prompt(&"x".repeat(80)).chars().count() <= 48);
+        assert_eq!(title_from_prompt(" \n\t "), "");
     }
 }

@@ -60,6 +60,8 @@ pub const fn harness_label(harness: comet_proto::HarnessId) -> &'static str {
         comet_proto::HarnessId::ClaudeCode => "Claude Code",
         comet_proto::HarnessId::Codex => "Codex",
         comet_proto::HarnessId::Omp => "OMP",
+        comet_proto::HarnessId::PrimeAgent => "Prime Agent",
+        comet_proto::HarnessId::OpenCode => "OpenCode",
         comet_proto::HarnessId::Cursor => "Cursor",
         comet_proto::HarnessId::Mock => "Mock",
     }

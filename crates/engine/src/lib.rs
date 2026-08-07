@@ -236,11 +236,7 @@ impl EngineCore {
         let terminals = Terminals::new();
         let uploads = Uploads::new(data_dir, edge.clone());
         let agent_accounts = AgentAccounts::new(AgentAccountsConfig::detect(data_dir));
-        sessions.set_titles(TitleGenerator::new(
-            workspace.clone(),
-            registry.clone(),
-            repos.clone(),
-        ));
+        sessions.set_titles(TitleGenerator::new(workspace.clone(), repos.clone()));
         let diff_sync = CheckoutDiffSync::start(repos.clone(), workspace.clone(), &device_id, edge);
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
         Ok(Self {

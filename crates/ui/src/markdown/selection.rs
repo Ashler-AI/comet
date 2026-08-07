@@ -12,8 +12,8 @@
 //! This module is the pure state half (gpui-free, unit-tested); the
 //! registry, geometry and mouse listeners live in `render.rs`.
 
+use std::cell::RefCell;
 use std::ops::Range;
-use std::sync::{Mutex, OnceLock};
 
 /// One element's slice of the selection, in document order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,11 +36,13 @@ struct MdSelection {
     dragging: bool,
     /// Resolved spans, document order. Empty while a click hasn't moved.
     spans: Vec<Span>,
+    /// Window-space pointer position captured when the drag settles. The shell
+    /// places the comment action beside the highlighted text.
+    action_position: Option<(f32, f32)>,
 }
 
-fn state() -> &'static Mutex<Option<MdSelection>> {
-    static STATE: OnceLock<Mutex<Option<MdSelection>>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(None))
+thread_local! {
+    static STATE: RefCell<Option<MdSelection>> = const { RefCell::new(None) };
 }
 
 /// Resolve the spans for a selection between `a` and `b`, each an
@@ -70,95 +72,133 @@ pub fn resolve_spans(elements: &[(&str, &str)], a: (usize, usize), b: (usize, us
 
 /// Begin a drag anchored at `(key, ix)`; claims the global selection.
 pub fn begin(key: &str, ix: usize) {
-    *state().lock().unwrap() = Some(MdSelection {
-        anchor_key: key.to_string(),
-        anchor_ix: ix,
-        dragging: true,
-        spans: Vec::new(),
+    STATE.with(|state| {
+        *state.borrow_mut() = Some(MdSelection {
+            anchor_key: key.to_string(),
+            anchor_ix: ix,
+            dragging: true,
+            spans: Vec::new(),
+            action_position: None,
+        });
     });
 }
 
 /// Begin with an immediate span (double/triple click inside one element).
 pub fn begin_with_span(key: &str, text: &str, range: Range<usize>) {
-    *state().lock().unwrap() = Some(MdSelection {
-        anchor_key: key.to_string(),
-        anchor_ix: range.start,
-        dragging: true,
-        spans: vec![Span {
-            key: key.to_string(),
-            range,
-            text: text.to_string(),
-        }],
+    STATE.with(|state| {
+        *state.borrow_mut() = Some(MdSelection {
+            anchor_key: key.to_string(),
+            anchor_ix: range.start,
+            dragging: true,
+            spans: vec![Span {
+                key: key.to_string(),
+                range,
+                text: text.to_string(),
+            }],
+            action_position: None,
+        });
     });
 }
 
-/// The live drag's anchor, if `key` owns it: `(anchor byte offset)`.
-pub fn drag_anchor(key: &str) -> Option<usize> {
-    let guard = state().lock().unwrap();
-    let sel = guard.as_ref()?;
-    (sel.dragging && sel.anchor_key == key).then_some(sel.anchor_ix)
+/// The active drag's document anchor.
+pub fn drag_anchor() -> Option<(String, usize)> {
+    STATE.with(|state| {
+        let guard = state.borrow();
+        let selection = guard.as_ref()?;
+        selection
+            .dragging
+            .then(|| (selection.anchor_key.clone(), selection.anchor_ix))
+    })
 }
 
 /// Replace the resolved spans (drag update). Returns true if they changed.
 pub fn update_spans(spans: Vec<Span>) -> bool {
-    let mut guard = state().lock().unwrap();
-    let Some(sel) = guard.as_mut() else {
-        return false;
-    };
-    if sel.spans == spans {
-        return false;
-    }
-    sel.spans = spans;
-    true
+    STATE.with(|state| {
+        let mut guard = state.borrow_mut();
+        let Some(selection) = guard.as_mut() else {
+            return false;
+        };
+        if selection.spans == spans {
+            return false;
+        }
+        selection.spans = spans;
+        true
+    })
 }
 
 /// End the drag for `key`'s claim; returns the joined text if non-empty.
-pub fn end_drag(key: &str) -> Option<String> {
-    let mut guard = state().lock().unwrap();
-    let sel = guard.as_mut()?;
-    if sel.anchor_key != key || !sel.dragging {
-        return None;
-    }
-    sel.dragging = false;
-    if sel.spans.iter().all(|s| s.range.is_empty()) {
-        *guard = None;
-        return None;
-    }
-    Some(join_spans(&sel.spans))
+pub fn end_drag(key: &str, action_position: Option<(f32, f32)>) -> Option<String> {
+    STATE.with(|state| {
+        let mut guard = state.borrow_mut();
+        let selection = guard.as_mut()?;
+        if selection.anchor_key != key || !selection.dragging {
+            return None;
+        }
+        selection.dragging = false;
+        selection.action_position = action_position;
+        if selection.spans.iter().all(|span| span.range.is_empty()) {
+            *guard = None;
+            return None;
+        }
+        Some(join_spans(&selection.spans))
+    })
 }
 
-/// Clear if `key` owns a settled selection (a mouse-down landed outside the
-/// owner; the element the down landed IN claims right after). True if cleared.
-pub fn clear_if_owner(key: &str) -> bool {
-    let mut guard = state().lock().unwrap();
-    if guard
-        .as_ref()
-        .is_some_and(|s| s.anchor_key == key && !s.dragging)
-    {
-        *guard = None;
-        return true;
-    }
-    false
+/// Clear any settled or active selection. True if one existed.
+pub fn clear() -> bool {
+    STATE.with(|state| state.borrow_mut().take().is_some())
 }
 
 /// The wash range for `key` this frame (empty ⇒ nothing to paint).
 pub fn wash_range(key: &str) -> Option<Range<usize>> {
-    let guard = state().lock().unwrap();
-    let sel = guard.as_ref()?;
-    sel.spans
-        .iter()
-        .find(|s| s.key == key && !s.range.is_empty())
-        .map(|s| s.range.clone())
+    STATE.with(|state| {
+        let guard = state.borrow();
+        let selection = guard.as_ref()?;
+        selection
+            .spans
+            .iter()
+            .find(|span| span.key == key && !span.range.is_empty())
+            .map(|span| span.range.clone())
+    })
 }
 
 /// The full selected text (Cmd+C), spans joined in document order.
 pub fn selected_text() -> Option<String> {
-    let guard = state().lock().unwrap();
-    let sel = guard.as_ref()?;
-    if sel.spans.iter().all(|s| s.range.is_empty()) {
-        return None;
-    }
-    Some(join_spans(&sel.spans))
+    STATE.with(|state| {
+        let guard = state.borrow();
+        let selection = guard.as_ref()?;
+        if selection.spans.iter().all(|span| span.range.is_empty()) {
+            return None;
+        }
+        Some(join_spans(&selection.spans))
+    })
+}
+
+/// Selected transcript message and text, when the settled selection stays
+/// within one message entry. Element keys are `{row_key}:{element}` and
+/// markdown row keys begin with `{message_id}#`.
+pub fn selected_message_context() -> Option<(String, String, (f32, f32))> {
+    STATE.with(|state| {
+        let guard = state.borrow();
+        let selection = guard.as_ref()?;
+        if selection.dragging || selection.spans.is_empty() {
+            return None;
+        }
+        let mut message_id: Option<&str> = None;
+        for span in &selection.spans {
+            let row_key = span.key.rsplit_once(':')?.0;
+            let current = row_key.split_once('#')?.0;
+            if message_id.is_some_and(|id| id != current) {
+                return None;
+            }
+            message_id = Some(current);
+        }
+        Some((
+            message_id?.to_string(),
+            join_spans(&selection.spans),
+            selection.action_position?,
+        ))
+    })
 }
 
 fn join_spans(spans: &[Span]) -> String {
@@ -238,49 +278,64 @@ mod tests {
         assert_eq!(resolve_spans(&elems(), (2, 5), (0, 6)), spans);
     }
 
-    /// The drag tests below mutate the process-global selection state —
-    /// serialize them, or the parallel test runner interleaves their
-    /// begin/end_drag calls (long-standing flake).
-    fn state_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
     #[test]
     fn drag_lifecycle_and_copy_joins() {
-        let _state = state_lock();
         begin("p1", 6);
-        assert_eq!(drag_anchor("p1"), Some(6));
-        assert_eq!(drag_anchor("p2"), None);
+        assert_eq!(drag_anchor(), Some(("p1".into(), 6)));
         let spans = resolve_spans(&elems(), (0, 6), (1, 6));
         assert!(update_spans(spans.clone()));
         assert!(!update_spans(spans)); // unchanged ⇒ no repaint
         assert_eq!(wash_range("p1"), Some(6..15));
         assert_eq!(wash_range("p2"), Some(0..6));
         assert_eq!(wash_range("p3"), None);
-        assert_eq!(end_drag("p1").as_deref(), Some("paragraph\nsecond"));
+        assert_eq!(
+            end_drag("p1", Some((10.0, 20.0))).as_deref(),
+            Some("paragraph\nsecond")
+        );
         assert_eq!(selected_text().as_deref(), Some("paragraph\nsecond"));
-        // Settled: a down elsewhere clears via the owner's listener.
-        assert!(!clear_if_owner("p2"));
-        assert!(clear_if_owner("p1"));
+        assert!(clear());
+        assert!(!clear());
         assert_eq!(selected_text(), None);
     }
 
     #[test]
+    fn settled_selection_exposes_one_message_context() {
+        begin("message-1#part.0:0", 0);
+        let spans = vec![
+            Span {
+                key: "message-1#part.0:0".into(),
+                range: 0..5,
+                text: "first".into(),
+            },
+            Span {
+                key: "message-1#part.1:0".into(),
+                range: 0..6,
+                text: "second".into(),
+            },
+        ];
+        assert!(update_spans(spans));
+        assert_eq!(
+            end_drag("message-1#part.0:0", Some((42.0, 84.0))).as_deref(),
+            Some("first\nsecond")
+        );
+        assert_eq!(
+            selected_message_context(),
+            Some(("message-1".into(), "first\nsecond".into(), (42.0, 84.0)))
+        );
+    }
+
+    #[test]
     fn empty_click_clears_on_release() {
-        let _state = state_lock();
         begin("p1", 3);
-        assert_eq!(end_drag("p1"), None);
+        assert_eq!(end_drag("p1", None), None);
         assert_eq!(selected_text(), None);
     }
 
     #[test]
     fn double_click_span() {
-        let _state = state_lock();
         begin_with_span("p1", "hello world", 6..11);
         assert_eq!(wash_range("p1"), Some(6..11));
-        assert_eq!(end_drag("p1").as_deref(), Some("world"));
+        assert_eq!(end_drag("p1", None).as_deref(), Some("world"));
     }
 
     #[test]

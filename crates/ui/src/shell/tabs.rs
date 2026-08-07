@@ -113,7 +113,7 @@ impl Shell {
         let created: Vec<String> = self
             .state
             .read(cx)
-            .chats_in_space(space_id)
+            .chats_in_selected_source()
             .iter()
             .map(|c| c.id.clone())
             .collect();
@@ -123,6 +123,13 @@ impl Shell {
         }
     }
 
+    /// Open the new-session canvas in the current folder.
+    pub(super) fn open_new_session(&mut self, cx: &mut Context<Self>) {
+        self.route = Route::Chat;
+        self.state
+            .update(cx, |state, cx| state.select_chat(None, cx));
+        cx.notify();
+    }
     /// Close a tab = archive the session. Selection moves to a neighbor; the
     /// last tab lands on the new-session canvas.
     pub(super) fn close_session_tab(&mut self, chat_id: String, cx: &mut Context<Self>) {
@@ -435,10 +442,7 @@ impl Shell {
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
             .on_click(cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.route = Route::Chat;
-                this.state.update(cx, |s, cx| s.select_chat(None, cx));
-                cx.notify();
+                this.open_new_session(cx);
             }))
             .child(
                 icon(icons::PLUS)

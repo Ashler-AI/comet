@@ -249,6 +249,25 @@ pub fn default_registry(profile: RuntimeProfile) -> HarnessRegistry {
             Ok(Arc::new(harness) as Arc<dyn Harness>)
         }),
     );
+    if profile != RuntimeProfile::ScaffoldHost {
+        registry.register_lazy(
+            HarnessDescriptor {
+                id: HarnessId::PrimeAgent,
+                name: "Prime Agent".into(),
+                supports_steering: false,
+                steering_mode: SteeringMode::TurnBoundary,
+                reasoning_levels: vec![
+                    ReasoningLevel::Minimal,
+                    ReasoningLevel::Low,
+                    ReasoningLevel::Medium,
+                    ReasoningLevel::High,
+                    ReasoningLevel::XHigh,
+                    ReasoningLevel::Max,
+                ],
+            },
+            Box::new(|| Ok(Arc::new(comet_harness::PrimeAgentHarness::new()) as Arc<dyn Harness>)),
+        );
+    }
     registry
 }
 
@@ -293,7 +312,12 @@ mod tests {
         let ids: Vec<HarnessId> = registry.descriptors().iter().map(|d| d.id).collect();
         assert_eq!(
             ids,
-            vec![HarnessId::ClaudeCode, HarnessId::Codex, HarnessId::Omp]
+            vec![
+                HarnessId::ClaudeCode,
+                HarnessId::Codex,
+                HarnessId::Omp,
+                HarnessId::PrimeAgent,
+            ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_err());
         assert!(registry.resolve(HarnessId::ClaudeCode).is_ok());

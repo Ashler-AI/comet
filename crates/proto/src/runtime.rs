@@ -23,7 +23,7 @@ impl RuntimeProfile {
         match self {
             Self::LocalController => matches!(
                 harness,
-                HarnessId::ClaudeCode | HarnessId::Codex | HarnessId::Omp
+                HarnessId::ClaudeCode | HarnessId::Codex | HarnessId::Omp | HarnessId::PrimeAgent
             ),
             Self::ScaffoldHost => harness == HarnessId::Omp,
             Self::Mock => harness == HarnessId::Mock,
@@ -60,9 +60,15 @@ mod tests {
 
     #[test]
     fn local_controller_can_use_real_local_harnesses_and_scaffold() {
-        for harness in [HarnessId::ClaudeCode, HarnessId::Codex, HarnessId::Omp] {
+        for harness in [
+            HarnessId::ClaudeCode,
+            HarnessId::Codex,
+            HarnessId::Omp,
+            HarnessId::PrimeAgent,
+        ] {
             assert!(RuntimeProfile::LocalController.allows_harness(harness));
         }
+        assert!(!RuntimeProfile::LocalController.allows_harness(HarnessId::OpenCode));
         assert!(!RuntimeProfile::LocalController.allows_harness(HarnessId::Mock));
         assert!(RuntimeProfile::LocalController.allows_scaffold_control());
         assert!(RuntimeProfile::LocalController.allows_session_import());
