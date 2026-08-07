@@ -713,8 +713,14 @@ export const rpcAllowedForScopedHost = (
   try {
     const value = JSON.parse(new TextDecoder().decode(payload)) as {
       method?: string;
-      params?: { command?: { sessionId?: string } };
+      params?: Record<string, unknown> & { command?: { sessionId?: string } };
     };
+    if (
+      value.method === "LocalDevice" &&
+      (!value.params || Object.keys(value.params).length === 0)
+    ) {
+      return true;
+    }
     return (
       value.method === "QueueCommand" &&
       value.params?.command?.sessionId === grant.scope.sessionId

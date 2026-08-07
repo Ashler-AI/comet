@@ -220,6 +220,11 @@ describe("session-scoped host RPC", () => {
     ).toBe(false);
   });
 
+  it("allows only the non-mutating exact-device readiness probe", () => {
+    expect(rpcAllowedForScopedHost(rpc, payload({ method: "LocalDevice", params: {} }), grant)).toBe(true);
+    expect(rpcAllowedForScopedHost(rpc, payload({ method: "LocalDevice", params: { targetDeviceId: "other" } }), grant)).toBe(false);
+  });
+
   it("denies unrelated document RPCs and generic harness/model discovery", () => {
     expect(rpcAllowedForScopedHost(rpc, payload({ method: "WatchDocMessages" }), grant)).toBe(false);
     expect(rpcAllowedForScopedHost(rpc, payload({ method: "ListHarnesses" }), grant)).toBe(false);

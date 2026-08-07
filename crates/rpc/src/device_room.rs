@@ -650,7 +650,7 @@ pub struct LinkCacheConfig {
     pub cooldown_base: Duration,
     pub cooldown_max: Duration,
     /// Readiness probe budget: the relay accepts client joins even when the host is
-    /// offline, so a `ListHarnesses` round-trip proves the path before caching.
+    /// offline, so an exact `LocalDevice` identity round-trip proves the path before caching.
     pub probe_timeout: Duration,
 }
 
@@ -675,6 +675,10 @@ impl LinkCacheConfig {
 /// Consecutive failures older than this decay to zero — a blip an hour ago must
 /// not escalate today's first retry up the backoff curve.
 const FAILURE_DECAY: Duration = Duration::from_secs(600);
+
+fn exact_device_response(response: &serde_json::Value, device_id: &str) -> bool {
+    response.get("deviceId").and_then(serde_json::Value::as_str) == Some(device_id)
+}
 
 #[derive(Default)]
 struct DialState {
@@ -854,11 +858,12 @@ impl LinkCache {
         );
         tracing::info!(device = %device_id, "peer: dialing via device room");
         let link = Arc::new(DeviceLink::connect(&url).await?);
-        // Readiness probe: prove the host answers before caching (an offline host bounces
-        // host_offline, which closes the link and fails this call fast).
+        // Readiness probe: prove that the exact target host answers without
+        // invoking generic catalog discovery. Session-scoped Scaffold hosts
+        // expose only this non-mutating identity RPC before command routing.
         let client = link.client();
-        let probe = client.call(crate::methods::LIST_HARNESSES, serde_json::json!({}));
-        tokio::time::timeout(self.config.probe_timeout, probe)
+        let probe = client.call(crate::methods::LOCAL_DEVICE, serde_json::json!({}));
+        let response = tokio::time::timeout(self.config.probe_timeout, probe)
             .await
             .map_err(|_| {
                 RpcError::Transport(format!("peer {device_id}: readiness check timed out"))
@@ -866,6 +871,11 @@ impl LinkCache {
             .map_err(|e| {
                 RpcError::Transport(format!("peer {device_id}: readiness check failed: {e}"))
             })?;
+        if !exact_device_response(&response, device_id) {
+            return Err(RpcError::Transport(format!(
+                "peer {device_id}: readiness identity mismatch"
+            )));
+        }
         Ok(link)
     }
 
@@ -974,6 +984,19 @@ mod tests {
         assert_eq!((h.s.as_str(), h.k.as_str()), ("a", "b"));
         assert_eq!(p, vec![9]);
         assert!(decode_device_frame(&[0xff, 0xff, 0xff, 0xff, 0xff, 0x01]).is_err()); // overflow
+    }
+
+    #[test]
+    fn readiness_requires_the_exact_device_identity() {
+        assert!(exact_device_response(
+            &serde_json::json!({ "deviceId": "dev-1" }),
+            "dev-1"
+        ));
+        assert!(!exact_device_response(
+            &serde_json::json!({ "deviceId": "dev-2" }),
+            "dev-1"
+        ));
+        assert!(!exact_device_response(&serde_json::json!({}), "dev-1"));
     }
 
     #[test]
