@@ -713,8 +713,18 @@ export const rpcAllowedForScopedHost = (
   try {
     const value = JSON.parse(new TextDecoder().decode(payload)) as {
       method?: string;
-      params?: { command?: { sessionId?: string } };
+      params?: {
+        command?: { sessionId?: string };
+        harness?: string;
+      };
     };
+    if (value.method === "ListHarnesses") return true;
+    if (
+      (value.method === "ListModels" || value.method === "ListHarnessCommands") &&
+      value.params?.harness === "omp"
+    ) {
+      return true;
+    }
     return (
       value.method === "QueueCommand" &&
       value.params?.command?.sessionId === grant.scope.sessionId
