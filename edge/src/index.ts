@@ -10,7 +10,6 @@ import {
   handleAuthenticatedAuthRoute,
   handlePublicAuthRoute
 } from "./auth-routes";
-import { debugPageResponse } from "./debug-page";
 import {
   AUTH_CAPABILITIES_HEADER,
   AUTH_GRANT_HEADER,
@@ -171,12 +170,6 @@ export default {
     if (!credentialTransportAllowed(url)) {
       return json({ error: "secure_transport_required" }, 403);
     }
-    // The inspector shell is static and secret-free (a login page): every
-    // data call it makes authenticates like any other client.
-    if (url.pathname === "/debug" && request.method === "GET") {
-      return debugPageResponse();
-    }
-
     const publicAuth = await handlePublicAuthRoute(request, env, url);
     if (publicAuth) return publicAuth;
 
@@ -184,18 +177,6 @@ export default {
     if (!identity) return json({ error: "unauthenticated" }, 401);
     if (identity.projectScope !== env.SCAFFOLD_PROJECT_SCOPE) {
       return json({ error: "forbidden" }, 403);
-    }
-
-    // Token/identity introspection for the inspector page (and curl debugging).
-    if (url.pathname === "/whoami" && request.method === "GET") {
-      return json({
-        userId: identity.userId,
-        email: identity.email,
-        projectScope: identity.projectScope,
-        capabilities: identity.capabilities,
-        credential: identity.credential,
-        environment: env.ENVIRONMENT
-      });
     }
 
     const authenticatedAuth = await handleAuthenticatedAuthRoute(request, env, url, identity);
