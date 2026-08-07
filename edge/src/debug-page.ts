@@ -271,6 +271,14 @@ class Room {
       this.joined = { lor: false, eph: false };
       this.fragments.clear();
       this.pingSentAt = null;
+      if (ev.code === 4410) {
+        // Room reset (wedge break / POST /reset-log): our copy now contains
+        // history the server dropped. Resync fresh like the native clients.
+        if (this.doc.free) this.doc.free();
+        this.doc = new LoroDoc();
+        this.knownEntries.clear();
+        this.e2e.length = 0;
+      }
       this.scheduleRedial("closed " + ev.code + (ev.reason ? " " + ev.reason : ""));
     };
     ws.onerror = () => {};

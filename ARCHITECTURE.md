@@ -203,6 +203,8 @@ Direct ports of comet behaviors (spec: feature-inventory §3):
 
 The TypeScript edge hosts SessionRoom and DeviceRoom Durable Objects plus the R2 attachment seam. Release artifacts are promoted separately to private, environment-isolated GCS buckets. Room authority comes from Scaffold's existing Google Cloud IAP access path. Deterministic room keys bind the authorized Scaffold project, deployment, and thread/session scope; caller-supplied organization identifiers never grant access.
 
+The Worker also serves `GET /debug`, a read-only browser inspector for live rooms: workspace-doc session discovery, streaming transcripts over the same loro-protocol sockets, and per-room latency panels (WS RTT, `%LOR` frame cadence, entry createdAt→arrival). The shell is static and unauthenticated; every data call presents the same Scaffold bearer as the native clients (`GET /whoami` introspects it). It is view-only by construction — it never publishes doc or presence updates.
+
 `edge/wrangler.jsonc` is the source of truth for two isolated environments:
 
 - `staging`: staging Worker, Durable Objects, blobs, releases, Scaffold control-plane URL, and project scope.
