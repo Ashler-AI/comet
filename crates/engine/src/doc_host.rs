@@ -248,13 +248,14 @@ fn local_owner_authority_key(entry: &SessionCommandEntry) -> Result<String, serd
     ))
 }
 
-fn grant_authorizes_control_entry(
+fn grant_authorizes_control_scope(
     grant: &CapabilityGrant,
     entry: &SessionCommandEntry,
     project_scope: &str,
     now: i64,
 ) -> bool {
     let SessionCommandPayload::Control {
+        actor_device_id,
         actor_subject,
         owner_device_id,
         grant_id,
@@ -265,8 +266,9 @@ fn grant_authorizes_control_entry(
     else {
         return false;
     };
-    grant.id == *grant_id
-        && grant.principal_subject == *actor_subject
+    !actor_device_id.trim().is_empty()
+        && !actor_subject.trim().is_empty()
+        && grant.id == *grant_id
         && grant.scope.project_id == project_scope
         && grant
             .scope
@@ -282,6 +284,19 @@ fn grant_authorizes_control_entry(
             .capabilities
             .iter()
             .any(|capability| capability == action.required_capability())
+}
+
+fn grant_authorizes_control_entry(
+    grant: &CapabilityGrant,
+    entry: &SessionCommandEntry,
+    project_scope: &str,
+    now: i64,
+) -> bool {
+    let SessionCommandPayload::Control { actor_subject, .. } = &entry.payload else {
+        return false;
+    };
+    grant.principal_subject == *actor_subject
+        && grant_authorizes_control_scope(grant, entry, project_scope, now)
 }
 
 fn grant_matches_projected_scaffold_room(
@@ -599,6 +614,13 @@ impl DocHost {
         {
             return Err("grant_envelope_scope_rejected");
         }
+        let projection = SessionRoomProjection {
+            project_id: grant.scope.project_id.clone(),
+            deployment_id: deployment_id.to_owned(),
+            session_id: stream_session_id.to_owned(),
+        };
+        self.open_projection(stream_session_id, Some(&projection))
+            .map_err(|_| "grant_room_projection_rejected")?;
         {
             let mut grants = lock(&self.inner.trusted_grants);
             grants.retain(|_, trusted| !trusted.edge_derived);
@@ -1124,6 +1146,46 @@ impl DocHost {
             })
     }
 
+    fn edge_grant_authorizes_local_scaffold_command(
+        &self,
+        chat_id: &str,
+        projection: Option<&SessionRoomProjection>,
+        entry: &SessionCommandEntry,
+    ) -> bool {
+        let SessionCommandPayload::Control {
+            actor_device_id,
+            owner_device_id,
+            grant_id,
+            source,
+            ..
+        } = &entry.payload
+        else {
+            return false;
+        };
+        if entry.issued_by != self.device_id()
+            || actor_device_id == self.device_id()
+            || owner_device_id != self.device_id()
+            || !matches!(source, comet_proto::AgentSessionSource::Scaffold)
+        {
+            return false;
+        }
+        let Some(workspace) = self.workspace() else {
+            return false;
+        };
+        lock(&self.inner.trusted_grants)
+            .get(grant_id)
+            .is_some_and(|trusted| {
+                trusted.edge_derived
+                    && grant_authorizes_control_scope(
+                        &trusted.grant,
+                        entry,
+                        workspace.project_scope(),
+                        now_ms(),
+                    )
+                    && grant_matches_projected_scaffold_room(&trusted.grant, chat_id, projection)
+            })
+    }
+
     fn command_nudge_route(
         &self,
         chat_id: &str,
@@ -1210,6 +1272,11 @@ impl DocHost {
         };
         let nudge_route =
             self.command_nudge_route(chat_id, handle.room_projection.as_ref(), &entry);
+        let authorized_local_scaffold_command = self.edge_grant_authorizes_local_scaffold_command(
+            chat_id,
+            handle.room_projection.as_ref(),
+            &entry,
+        );
         if matches!(
             &entry.payload,
             SessionCommandPayload::Control {
@@ -1217,14 +1284,17 @@ impl DocHost {
                 ..
             }
         ) && !matches!(nudge_route, CommandNudgeRoute::ExactDevice(_))
+            && !authorized_local_scaffold_command
         {
             return Err(EngineError::Other(
                 "Scaffold control command does not match its attached room".into(),
             ));
         }
         let locally_authorized_control = self.local_owner_grant_authorizes(&entry);
+        let locally_trusted_control =
+            locally_authorized_control || authorized_local_scaffold_command;
         let trust_key = if matches!(&entry.payload, SessionCommandPayload::Control { .. }) {
-            locally_authorized_control
+            locally_trusted_control
                 .then(|| local_owner_authority_key(&entry))
                 .transpose()
                 .map_err(|error| {
@@ -1393,11 +1463,28 @@ impl DocHost {
             // A present grant is authoritative even when it is stale or revoked:
             // never fall through to restart reconstruction and bypass that state.
             if let Some(trusted) = grants.get(grant_id) {
+                let now = now_ms();
+                if trusted.edge_derived
+                    && entry.issued_by == self.device_id()
+                    && local_owner_authority_key(entry).is_ok_and(|key| {
+                        self.inner
+                            .store
+                            .is_trusted_local_command(&key)
+                            .unwrap_or(false)
+                    })
+                {
+                    return Some(grant_authorizes_control_scope(
+                        &trusted.grant,
+                        entry,
+                        workspace.project_scope(),
+                        now,
+                    ));
+                }
                 return Some(grant_authorizes_control_entry(
                     &trusted.grant,
                     entry,
                     workspace.project_scope(),
-                    now_ms(),
+                    now,
                 ));
             }
         }
@@ -2439,6 +2526,114 @@ mod authority_tests {
         assert_eq!(host.command_grant_authorization(&edge_command), Some(true));
         host.drain_commands(&handle).await;
         assert!(host.inner.store.is_processed(&edge_command.id).unwrap());
+    }
+
+    #[tokio::test]
+    async fn relayed_scaffold_control_queues_only_in_its_exact_attached_room() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let workspace = WorkspaceHost::open(
+            store.clone(),
+            crate::workspace_host::WorkspaceHostConfig {
+                device_id: "comet-scaffold-smoke-001".into(),
+                device_name: "test".into(),
+                platform: "test".into(),
+                project_scope: "project-a".into(),
+                user_id: "accounts.google.com:owner@example.com".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "comet-scaffold-smoke-001".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        host.set_workspace(workspace);
+        let now = now_ms();
+        let envelope = VerifiedCapabilityGrantEnvelope {
+            grant: CapabilityGrant {
+                id: "edge-control-grant".into(),
+                principal_subject: "accounts.google.com:owner@example.com".into(),
+                scope: comet_proto::CollaborationScope {
+                    project_id: "project-a".into(),
+                    deployment_id: Some("deployment-a".into()),
+                    session_id: Some("session-a".into()),
+                    unknown: Default::default(),
+                },
+                capabilities: vec![comet_proto::CAPABILITY_SESSION_CONTROL.into()],
+                sandbox_id: Some("smoke-001".into()),
+                device_id: Some("comet-scaffold-smoke-001".into()),
+                granted_by: "comet-edge-device-room".into(),
+                granted_at: now - 1,
+                expires_at: Some(now + 60_000),
+                revoked_at: None,
+                unknown: Default::default(),
+            },
+            room_id: "s4/project-a/deployment-a/session-a".into(),
+            target_device_id: "comet-scaffold-smoke-001".into(),
+            target_session_id: "session-a".into(),
+            unknown: Default::default(),
+        };
+        host.ingest_verified_grant("session-a", &serde_json::to_vec(&envelope).unwrap())
+            .unwrap();
+        let exact = SessionCommandPayload::Control {
+            session_id: "session-a".into(),
+            owner_device_id: "comet-scaffold-smoke-001".into(),
+            actor_device_id: "operator-device".into(),
+            actor_subject: "accounts.google.com:operator@example.com".into(),
+            grant_id: "edge-control-grant".into(),
+            source: AgentSessionSource::Scaffold,
+            action: Box::new(SessionControlAction::Pause {}),
+        };
+        let exact_id = host
+            .queue_command("session-a", exact)
+            .expect("the exact relayed command should execute on its attached host");
+        let exact_handle = host
+            .open_projection(
+                "session-a",
+                Some(&SessionRoomProjection {
+                    project_id: "project-a".into(),
+                    deployment_id: "deployment-a".into(),
+                    session_id: "session-a".into(),
+                }),
+            )
+            .unwrap();
+        let exact_entry = exact_handle
+            .doc
+            .read_commands()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.id == exact_id)
+            .unwrap();
+        assert_eq!(host.command_grant_authorization(&exact_entry), Some(true));
+        host.open_projection(
+            "session-b",
+            Some(&SessionRoomProjection {
+                project_id: "project-a".into(),
+                deployment_id: "deployment-a".into(),
+                session_id: "session-b".into(),
+            }),
+        )
+        .unwrap();
+        let mismatched = SessionCommandPayload::Control {
+            session_id: "session-a".into(),
+            owner_device_id: "comet-scaffold-smoke-001".into(),
+            actor_device_id: "operator-device".into(),
+            actor_subject: "accounts.google.com:operator@example.com".into(),
+            grant_id: "edge-control-grant".into(),
+            source: AgentSessionSource::Scaffold,
+            action: Box::new(SessionControlAction::Pause {}),
+        };
+        let error = host.queue_command("session-b", mismatched).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its attached room")
+        );
     }
 
     #[tokio::test]
