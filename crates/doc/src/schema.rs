@@ -596,6 +596,8 @@ fn status_str(status: MessageStatus) -> &'static str {
         MessageStatus::Streaming => "streaming",
         MessageStatus::Complete => "complete",
         MessageStatus::Aborted => "aborted",
+        MessageStatus::Queued => "queued",
+        MessageStatus::Steered => "steered",
     }
 }
 

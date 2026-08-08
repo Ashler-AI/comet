@@ -23,12 +23,12 @@ use comet_doc::{
 use comet_proto::{
     AgentSessionRecord, AuditEvent, AuditResult, COLLABORATION_SCHEMA_VERSION, CapabilityGrant,
     FileTargetReference, HarnessId, MessageProvenance, ModelHandoff, PublicationRecord,
-    PublicationValue, SemanticAnchor, SemanticAnnotation, SessionRoomProjection, UserInputAnswer,
-    UserInputQuestion, VerifiedCapabilityGrantEnvelope,
+    PublicationValue, SemanticAnchor, SemanticAnnotation, SessionRoomProjection, SteeringMode,
+    UserInputAnswer, UserInputQuestion, VerifiedCapabilityGrantEnvelope,
 };
 use comet_sync::{DocsStore, RoomClient};
 
-use crate::sessions::{SessionsEngine, SteerOutcome};
+use crate::sessions::{QueueOutcome, SessionsEngine, SteerOutcome};
 use crate::workspace_host::WorkspaceHost;
 use crate::{EngineError, new_id, now_ms};
 
@@ -420,6 +420,18 @@ impl ChatDocHandle {
         text: &str,
         created_at: i64,
     ) -> Result<(), DocError> {
+        self.write_user_message_with_status(message_id, text, created_at, MessageStatus::Complete)
+    }
+
+    /// Write a user message with its delivery state. Queue and steer paths use
+    /// this so transcript feedback follows the durable message across devices.
+    pub fn write_user_message_with_status(
+        &self,
+        message_id: &str,
+        text: &str,
+        created_at: i64,
+        status: MessageStatus,
+    ) -> Result<(), DocError> {
         if self.doc.read_entries()?.iter().any(|e| e.id == message_id) {
             return Ok(());
         }
@@ -432,7 +444,7 @@ impl ChatDocHandle {
             }],
             created_at,
             device_id: self.device_id.clone(),
-            status: Some(MessageStatus::Complete),
+            status: Some(status),
             continuation_of: None,
         })
     }
@@ -1717,10 +1729,14 @@ impl DocHost {
     ) -> Result<(SessionCommandStatus, Option<String>), EngineError> {
         let chat_id = &handle.chat_id;
         let carries_user_input = match &entry.payload {
-            SessionCommandPayload::Run { .. } | SessionCommandPayload::Steer { .. } => true,
+            SessionCommandPayload::Run { .. }
+            | SessionCommandPayload::Steer { .. }
+            | SessionCommandPayload::Queue { .. } => true,
             SessionCommandPayload::Control { action, .. } => matches!(
                 action.as_ref(),
-                SessionControlAction::Start { .. } | SessionControlAction::Steer { .. }
+                SessionControlAction::Start { .. }
+                    | SessionControlAction::Steer { .. }
+                    | SessionControlAction::Queue { .. }
             ),
             _ => false,
         };
@@ -1751,6 +1767,10 @@ impl DocHost {
             }
             SessionCommandPayload::Steer { prompt, message_id } => {
                 self.execute_steer(sessions, chat_id, chat_id, prompt, message_id)
+                    .await
+            }
+            SessionCommandPayload::Queue { prompt, message_id } => {
+                self.execute_queue(sessions, chat_id, chat_id, prompt, message_id)
                     .await
             }
             SessionCommandPayload::Interrupt {} => {
@@ -1894,6 +1914,10 @@ impl DocHost {
                     }
                     SessionControlAction::Steer { prompt, message_id } => {
                         self.execute_steer(sessions, &execution_key, chat_id, prompt, message_id)
+                            .await
+                    }
+                    SessionControlAction::Queue { prompt, message_id } => {
+                        self.execute_queue(sessions, &execution_key, chat_id, prompt, message_id)
                             .await
                     }
                     SessionControlAction::RespondInput {
@@ -2068,7 +2092,13 @@ impl DocHost {
             .steer(execution_key, prompt, message_id.clone())
             .await?
         {
-            SteerOutcome::Accepted => Ok((SessionCommandStatus::Applied, None)),
+            SteerOutcome::Accepted(SteeringMode::StepBoundary) => {
+                Ok((SessionCommandStatus::Applied, None))
+            }
+            SteerOutcome::Accepted(SteeringMode::TurnBoundary) => Ok((
+                SessionCommandStatus::Applied,
+                Some("queued for the next turn boundary".into()),
+            )),
             SteerOutcome::NotSteerable => {
                 // No live steerable run: the durable command still delivers to
                 // the selected session as its next turn.
@@ -2095,6 +2125,55 @@ impl DocHost {
                 Ok((
                     SessionCommandStatus::Applied,
                     Some("queued as new turn".into()),
+                ))
+            }
+        }
+    }
+
+    async fn execute_queue(
+        &self,
+        sessions: &SessionsEngine,
+        execution_key: &str,
+        chat_id: &str,
+        prompt: &str,
+        message_id: &Option<String>,
+    ) -> Result<(SessionCommandStatus, Option<String>), EngineError> {
+        match sessions
+            .queue(execution_key, prompt, message_id.clone())
+            .await?
+        {
+            QueueOutcome::Queued => Ok((
+                SessionCommandStatus::Applied,
+                Some("queued for the next turn".into()),
+            )),
+            QueueOutcome::Delivered => Ok((
+                SessionCommandStatus::Applied,
+                Some("delivered as the next turn".into()),
+            )),
+            QueueOutcome::NotRunning => {
+                let request = sessions
+                    .last_request(execution_key)
+                    .or_else(|| self.request_from_chat_row(chat_id, prompt));
+                let Some(mut request) = request else {
+                    return Ok((
+                        SessionCommandStatus::Rejected,
+                        Some("no live run and no prior run config".into()),
+                    ));
+                };
+                request.prompt = prompt.to_string();
+                request.resume = None;
+                request.attachments.clear();
+                sessions
+                    .dispatch(
+                        execution_key,
+                        self.harness_for(chat_id),
+                        request,
+                        message_id.clone(),
+                    )
+                    .await?;
+                Ok((
+                    SessionCommandStatus::Applied,
+                    Some("started as the next turn".into()),
                 ))
             }
         }

@@ -229,7 +229,7 @@ pub fn default_registry(profile: RuntimeProfile) -> HarnessRegistry {
         HarnessDescriptor {
             id: HarnessId::Omp,
             name: "OMP".into(),
-            supports_steering: false,
+            supports_steering: true,
             steering_mode: SteeringMode::TurnBoundary,
             reasoning_levels: vec![
                 ReasoningLevel::Minimal,
@@ -254,7 +254,7 @@ pub fn default_registry(profile: RuntimeProfile) -> HarnessRegistry {
             HarnessDescriptor {
                 id: HarnessId::PrimeAgent,
                 name: "Prime Agent".into(),
-                supports_steering: false,
+                supports_steering: true,
                 steering_mode: SteeringMode::TurnBoundary,
                 reasoning_levels: vec![
                     ReasoningLevel::Minimal,
@@ -351,6 +351,32 @@ mod tests {
         assert_eq!(before.supports_steering, after.supports_steering);
         assert_eq!(before.steering_mode, after.steering_mode);
         assert_eq!(before.reasoning_levels, after.reasoning_levels);
+    }
+
+    #[test]
+    fn omp_catalog_advertises_turn_boundary_queueing_before_resolve() {
+        let registry = default_registry(RuntimeProfile::LocalController);
+        let omp = registry
+            .descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor.id == HarnessId::Omp)
+            .unwrap();
+
+        assert!(omp.supports_steering);
+        assert_eq!(omp.steering_mode, SteeringMode::TurnBoundary);
+    }
+
+    #[test]
+    fn prime_agent_catalog_advertises_turn_boundary_queueing_before_resolve() {
+        let registry = default_registry(RuntimeProfile::LocalController);
+        let prime_agent = registry
+            .descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor.id == HarnessId::PrimeAgent)
+            .unwrap();
+
+        assert!(prime_agent.supports_steering);
+        assert_eq!(prime_agent.steering_mode, SteeringMode::TurnBoundary);
     }
     #[test]
     fn scaffold_profile_rejects_crafted_local_dispatch_without_calling_factory() {

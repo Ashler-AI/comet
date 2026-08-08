@@ -17,7 +17,7 @@
 //! Every dying path must instead carry its own visible error (child crash with stderr,
 //! spawn failure, stream error, engine-restart recovery).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use chrono::Utc;
@@ -31,8 +31,8 @@ use comet_doc::{
 };
 use comet_harness::{CancellationToken, Harness, HarnessError, RunControls, SteerMessage};
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, UserInputAnswer,
-    UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, SteeringMode,
+    UserInputAnswer, UserInputQuestion,
 };
 
 use crate::doc_host::{ChatDocHandle, DocHost};
@@ -50,10 +50,21 @@ pub struct JournaledEvent {
 /// Outcome of a steer attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SteerOutcome {
-    /// Delivered into the live run's steering mailbox.
-    Accepted,
+    /// Accepted into the live run's steering mailbox at the harness's boundary.
+    Accepted(SteeringMode),
     /// No live steerable run — the caller should dispatch the prompt as a new turn.
     NotSteerable,
+}
+
+/// Outcome of an explicit next-turn queue request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueOutcome {
+    /// Held by the engine until the active turn finishes.
+    Queued,
+    /// The persistent harness was already parked, so the next turn started now.
+    Delivered,
+    /// No run exists; the caller should dispatch the prompt as a new turn.
+    NotRunning,
 }
 
 type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>;
@@ -71,7 +82,14 @@ struct HarnessSessionRef {
 struct RunHandle {
     run_id: String,
     steerable: bool,
+    steering_mode: SteeringMode,
     steer_tx: mpsc::Sender<SteerMessage>,
+    /// True while the harness is producing the current turn. Updated under the
+    /// same run-map lock used to enqueue followups, closing the Done/enqueue race.
+    turn_active: bool,
+    /// Explicit next-turn followups. Unlike the harness steering mailbox, this
+    /// queue is not visible to step-boundary harnesses until the current Done.
+    queued_followups: VecDeque<SteerMessage>,
     /// Harness-level cancellation (protocol interrupt + child teardown).
     interrupt_token: CancellationToken,
     /// Engine-level cancel: arms the run task's grace deadline so a harness that
@@ -246,9 +264,17 @@ impl SessionsEngine {
         message_id: Option<String>,
         inject_resume: bool,
     ) -> Result<String, EngineError> {
-        let routed = lock(&self.inner.runs)
-            .get(chat_id)
-            .map(|h| (h.run_id.clone(), h.steerable, h.steer_tx.clone()));
+        let routed = {
+            let mut runs = lock(&self.inner.runs);
+            runs.get_mut(chat_id).map(|handle| {
+                handle.turn_active = true;
+                (
+                    handle.run_id.clone(),
+                    handle.steerable,
+                    handle.steer_tx.clone(),
+                )
+            })
+        };
         if let Some((run_id, steerable, steer_tx)) = routed {
             let message = SteerMessage {
                 prompt: request.prompt.clone(),
@@ -257,7 +283,12 @@ impl SessionsEngine {
             if steerable && steer_tx.try_send(message).is_ok() {
                 let user_id = message_id.unwrap_or_else(new_id);
                 let handle = self.doc_handle(chat_id)?;
-                handle.write_user_message(&user_id, &request.prompt, now_ms())?;
+                handle.write_user_message_with_status(
+                    &user_id,
+                    &request.prompt,
+                    now_ms(),
+                    MessageStatus::Steered,
+                )?;
                 // Working BEFORE the lastMessageAt bump: both ride the
                 // workspace doc from this one peer, so causal order makes it
                 // impossible for an observer to hold [new message, old status]
@@ -321,7 +352,10 @@ impl SessionsEngine {
             RunHandle {
                 run_id: run_id.clone(),
                 steerable: harness.supports_steering(),
+                steering_mode: harness.steering_mode(),
                 steer_tx,
+                turn_active: true,
+                queued_followups: VecDeque::new(),
                 interrupt_token,
                 cancel: cancel_tx,
                 engine_tx,
@@ -414,11 +448,16 @@ impl SessionsEngine {
         prompt: &str,
         message_id: Option<String>,
     ) -> Result<SteerOutcome, EngineError> {
-        let target = lock(&self.inner.runs)
-            .get(chat_id)
-            .filter(|h| h.steerable)
-            .map(|h| h.steer_tx.clone());
-        let Some(steer_tx) = target else {
+        let target = {
+            let mut runs = lock(&self.inner.runs);
+            runs.get_mut(chat_id)
+                .filter(|handle| handle.steerable)
+                .map(|handle| {
+                    handle.turn_active = true;
+                    (handle.steer_tx.clone(), handle.steering_mode)
+                })
+        };
+        let Some((steer_tx, steering_mode)) = target else {
             return Ok(SteerOutcome::NotSteerable);
         };
         let message = SteerMessage {
@@ -431,9 +470,65 @@ impl SessionsEngine {
         // Accepted: the steer prompt becomes a user entry immediately (client-minted id).
         let user_id = message_id.unwrap_or_else(new_id);
         let handle = self.doc_handle(chat_id)?;
-        handle.write_user_message(&user_id, prompt, now_ms())?;
+        handle.write_user_message_with_status(
+            &user_id,
+            prompt,
+            now_ms(),
+            MessageStatus::Steered,
+        )?;
         self.inner.note_message(chat_id, prompt);
-        Ok(SteerOutcome::Accepted)
+        Ok(SteerOutcome::Accepted(steering_mode))
+    }
+
+    /// Hold a followup outside the harness mailbox until the active turn is
+    /// complete. A parked persistent harness receives it immediately because
+    /// it is already at the requested next-turn boundary.
+    pub async fn queue(
+        &self,
+        chat_id: &str,
+        prompt: &str,
+        message_id: Option<String>,
+    ) -> Result<QueueOutcome, EngineError> {
+        let user_id = message_id.unwrap_or_else(new_id);
+        let message = SteerMessage {
+            prompt: prompt.to_string(),
+            message_id: Some(user_id.clone()),
+        };
+        let outcome = {
+            let mut runs = lock(&self.inner.runs);
+            let Some(handle) = runs.get_mut(chat_id) else {
+                return Ok(QueueOutcome::NotRunning);
+            };
+            if !handle.turn_active && handle.steerable {
+                if handle.steer_tx.try_send(message.clone()).is_err() {
+                    return Ok(QueueOutcome::NotRunning);
+                }
+                handle.turn_active = true;
+                QueueOutcome::Delivered
+            } else {
+                handle.queued_followups.push_back(message);
+                QueueOutcome::Queued
+            }
+        };
+        let handle = self.doc_handle(chat_id)?;
+        handle.write_user_message_with_status(
+            &user_id,
+            prompt,
+            now_ms(),
+            match outcome {
+                QueueOutcome::Queued => MessageStatus::Queued,
+                QueueOutcome::Delivered => MessageStatus::Complete,
+                QueueOutcome::NotRunning => unreachable!("returned above"),
+            },
+        )?;
+        if outcome == QueueOutcome::Delivered {
+            handle
+                .doc_arc()
+                .set_message_status(&user_id, MessageStatus::Complete)?;
+            self.set_status(chat_id, SessionStatus::Working, false);
+        }
+        self.inner.note_message(chat_id, prompt);
+        Ok(outcome)
     }
 
     /// Interrupt the live run, if any. The run settles with a synthetic
@@ -1304,10 +1399,36 @@ async fn drive_run(
             {
                 titles.maybe_generate(&chat_id, &user_prompt);
             }
+            let persistent_boundary = *status == DoneStatus::Completed && steerable && !interrupted;
+            let (queued_delivery, queue_transport_open) = {
+                let mut runs = lock(&inner.runs);
+                match runs.get_mut(&chat_id) {
+                    Some(handle) => {
+                        handle.turn_active = false;
+                        if persistent_boundary {
+                            if let Some(followup) = handle.queued_followups.pop_front() {
+                                if handle.steer_tx.try_send(followup.clone()).is_ok() {
+                                    handle.turn_active = true;
+                                    (Some(followup), true)
+                                } else {
+                                    handle.queued_followups.push_front(followup);
+                                    (None, false)
+                                }
+                            } else {
+                                (None, true)
+                            }
+                        } else {
+                            (None, true)
+                        }
+                    }
+                    None => (None, false),
+                }
+            };
+
             // PERSISTENT SESSION: a cleanly completed turn on a steerable
-            // harness PARKS instead of ending — child + mailbox stay warm for
-            // the next routed dispatch; per-turn state resets for it.
-            if *status == DoneStatus::Completed && steerable && !interrupted {
+            // harness parks instead of ending. Explicit queue messages cross
+            // into the harness mailbox only here, after Done.
+            if persistent_boundary && queue_transport_open {
                 folded.clear();
                 dirty = false;
                 entry_id = new_id();
@@ -1315,7 +1436,23 @@ async fn drive_run(
                 // Resume-retry is strictly a first-turn concern.
                 saw_session_started = true;
                 idle_since = Some(tokio::time::Instant::now());
-                inner.set_status(&chat_id, SessionStatus::Idle, false);
+                if let Some(followup) = queued_delivery {
+                    if let Some(message_id) = followup.message_id.as_deref()
+                        && let Err(err) =
+                            doc_ref.set_message_status(message_id, MessageStatus::Complete)
+                    {
+                        tracing::warn!(
+                            chat = %chat_id,
+                            message = %message_id,
+                            error = %err,
+                            "queued user message delivery stamp failed"
+                        );
+                    }
+                    idle_since = None;
+                    inner.set_status(&chat_id, SessionStatus::Working, false);
+                } else {
+                    inner.set_status(&chat_id, SessionStatus::Idle, false);
+                }
                 continue;
             }
             break match status {
@@ -1331,6 +1468,85 @@ async fn drive_run(
         }
     };
 
+    let mut deferred_followups = {
+        let mut runs = lock(&inner.runs);
+        runs.get_mut(&chat_id)
+            .map(|handle| handle.queued_followups.drain(..).collect::<VecDeque<_>>())
+            .unwrap_or_default()
+    };
     inner.remove_run(&chat_id, &run_id);
     inner.set_status(&chat_id, final_status, false);
+
+    if interrupted {
+        for followup in deferred_followups {
+            if let Some(message_id) = followup.message_id.as_deref()
+                && let Err(err) = doc_ref.set_message_status(message_id, MessageStatus::Aborted)
+            {
+                tracing::warn!(
+                    chat = %chat_id,
+                    message = %message_id,
+                    error = %err,
+                    "cancelled queued user message stamp failed"
+                );
+            }
+        }
+        return;
+    }
+
+    if !deferred_followups.is_empty() {
+        let engine = SessionsEngine {
+            inner: inner.clone(),
+        };
+        let chat = chat_id.clone();
+        tokio::spawn(async move {
+            while let Some(followup) = deferred_followups.pop_front() {
+                let prompt = followup.prompt;
+                let message_id = followup.message_id;
+                match engine.queue(&chat, &prompt, message_id.clone()).await {
+                    Ok(QueueOutcome::Queued | QueueOutcome::Delivered) => {}
+                    Ok(QueueOutcome::NotRunning) => {
+                        let Some(mut request) = engine.last_request(&chat) else {
+                            tracing::error!(chat = %chat, "queued followup lost its run config");
+                            return;
+                        };
+                        request.prompt = prompt;
+                        request.resume = None;
+                        request.attachments.clear();
+                        if let Some(message_id) = message_id.as_deref()
+                            && let Ok(handle) = engine.doc_handle(&chat)
+                            && let Err(err) = handle
+                                .doc_arc()
+                                .set_message_status(message_id, MessageStatus::Complete)
+                        {
+                            tracing::warn!(
+                                chat = %chat,
+                                message = %message_id,
+                                error = %err,
+                                "queued user message fallback stamp failed"
+                            );
+                        }
+                        if let Err(err) = engine
+                            .dispatch(&chat, harness_id, request, message_id)
+                            .await
+                        {
+                            tracing::error!(
+                                chat = %chat,
+                                error = %err,
+                                "queued followup fallback dispatch failed"
+                            );
+                            return;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            chat = %chat,
+                            error = %err,
+                            "queued followup delivery failed"
+                        );
+                        return;
+                    }
+                }
+            }
+        });
+    }
 }

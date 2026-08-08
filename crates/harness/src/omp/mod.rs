@@ -47,6 +47,10 @@ const AUTH_BROKER_TOKEN_FILE_ENV: &str = "OMP_AUTH_BROKER_TOKEN_FILE";
 const OMP_SESSION_DIRECTORY_SCAN_LIMIT: usize = 10_000;
 const OMP_SESSION_HEADER_BYTES: u64 = 64 * 1024;
 
+fn acp_assistant_message_id(session_id: &str, run_nonce: &uuid::Uuid, turn_number: u64) -> String {
+    format!("acp-{session_id}-{run_nonce}-{turn_number}")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdvisorConfigUpdate {
     Enabled(bool),
@@ -1238,7 +1242,10 @@ pub(crate) async fn run_acp(
     } else {
         reported_session_id
     };
-    let mut assistant_message_id = format!("acp-{session_id}");
+    let message_id_run_nonce = uuid::Uuid::new_v4();
+    let mut turn_number = 0_u64;
+    let mut assistant_message_id =
+        acp_assistant_message_id(&session_id, &message_id_run_nonce, turn_number);
     if events
         .send(Ok(AgentEvent::SessionStarted {
             harness: options.harness,
@@ -1283,7 +1290,6 @@ pub(crate) async fn run_acp(
     let mut queued_prompts = VecDeque::new();
     let mut steering_open = true;
     let mut prompt_blocks = first_prompt;
-    let mut turn_number = 0_u64;
     let mut acp_closed = false;
 
     loop {
@@ -1502,7 +1508,8 @@ pub(crate) async fn run_acp(
         };
 
         turn_number += 1;
-        let next_assistant_message_id = format!("acp-{session_id}-{turn_number}");
+        let next_assistant_message_id =
+            acp_assistant_message_id(&session_id, &message_id_run_nonce, turn_number);
         if events
             .send(Ok(AgentEvent::Steered {
                 assistant_message_id: Some(assistant_message_id),
@@ -1803,6 +1810,18 @@ fn normalize_update(params: &Value, harness: HarnessId) -> Option<AgentEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resumed_acp_runs_use_distinct_assistant_message_ids() {
+        let session_id = "same-durable-session";
+        let first_run = uuid::Uuid::from_u128(1);
+        let resumed_run = uuid::Uuid::from_u128(2);
+
+        assert_ne!(
+            acp_assistant_message_id(session_id, &first_run, 0),
+            acp_assistant_message_id(session_id, &resumed_run, 0)
+        );
+    }
 
     #[test]
     fn scaffold_command_invokes_only_omp_acp_with_hardening() {

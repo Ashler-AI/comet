@@ -29,6 +29,7 @@ pub enum HarnessError {
 }
 
 /// A steer prompt pushed into a live run; delivered at the harness's steering boundary.
+#[derive(Debug, Clone)]
 pub struct SteerMessage {
     pub prompt: String,
     pub message_id: Option<String>,

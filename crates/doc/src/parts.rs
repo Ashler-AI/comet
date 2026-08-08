@@ -15,6 +15,10 @@ pub enum MessageStatus {
     Streaming,
     Complete,
     Aborted,
+    /// User followup accepted for delivery after the active turn settles.
+    Queued,
+    /// User followup sent to the active harness's steering boundary.
+    Steered,
 }
 
 /// One rendered part of an assistant message.

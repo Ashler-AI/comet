@@ -48,6 +48,11 @@ while IFS= read -r line; do
       ;;
     session/prompt)
       [ -z "${OMP_PROMPT_LOG:-}" ] || printf '%s\n' "$line" >> "$OMP_PROMPT_LOG"
+      if [ -n "${OMP_PROMPT_GATE:-}" ]; then
+        while [ ! -f "$OMP_PROMPT_GATE" ]; do
+          sleep 0.1
+        done
+      fi
       if [ -n "${OMP_PROMPT_ERROR_DETAILS:-}" ]; then
         printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"error\":{\"code\":-32603,\"message\":\"Internal error\",\"data\":{\"details\":\"$OMP_PROMPT_ERROR_DETAILS\"}}}"
         continue

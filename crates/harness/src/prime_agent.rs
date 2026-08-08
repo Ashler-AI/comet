@@ -1,4 +1,4 @@
-//! Prime Agent harness over its Agent Client Protocol (ACP) mode.
+//! Prime Agent harness over its persistent Agent Client Protocol (ACP) mode.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -206,7 +206,7 @@ impl Harness for PrimeAgentHarness {
     }
 
     fn supports_steering(&self) -> bool {
-        false
+        true
     }
 
     fn steering_mode(&self) -> SteeringMode {
@@ -374,7 +374,7 @@ impl Harness for PrimeAgentHarness {
                     preloaded_session_id,
                     reported_session_dir,
                     configure_session: false,
-                    persistent: false,
+                    persistent: true,
                 },
             )
             .await
@@ -394,6 +394,14 @@ impl Harness for PrimeAgentHarness {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advertises_turn_boundary_queueing() {
+        let harness = PrimeAgentHarness::new();
+
+        assert!(harness.supports_steering());
+        assert_eq!(harness.steering_mode(), SteeringMode::TurnBoundary);
+    }
 
     #[test]
     fn parses_prime_model_catalog() {

@@ -194,6 +194,19 @@ pub struct ToolItem {
     pub resolved: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserDelivery {
+    Normal,
+    Steered,
+    Queued,
+}
+
+#[cfg(target_os = "macos")]
+const STEERED_FEEDBACK: &str = "Steering the model · ⌘↩ queues for the next turn";
+#[cfg(not(target_os = "macos"))]
+const STEERED_FEEDBACK: &str = "Steering the model · Ctrl↩ queues for the next turn";
+const QUEUED_FEEDBACK: &str = "Queued for the next turn";
+
 #[derive(Clone)]
 pub enum RowKind {
     User {
@@ -212,6 +225,7 @@ pub enum RowKind {
         text_attachments: Arc<Vec<crate::attachments::UserTextAttachment>>,
         /// Optimistic echo not yet confirmed by a doc frame.
         pending: bool,
+        delivery: UserDelivery,
     },
     /// One top-level markdown block of a completed message.
     Markdown {
@@ -333,9 +347,14 @@ pub fn rows_for_entry(
             Some((display, spans)) => (display, spans),
             None => (parsed.text, Vec::new()),
         };
+        let delivery = match entry.status {
+            Some(MessageStatus::Steered) => UserDelivery::Steered,
+            Some(MessageStatus::Queued) => UserDelivery::Queued,
+            _ => UserDelivery::Normal,
+        };
         return vec![Row {
             id: entry.id.clone().into(),
-            version: (raw.len() as u64) << 1 | pending as u64,
+            version: (raw.len() as u64) << 3 | (delivery as u64) << 1 | pending as u64,
             turn_start: true,
             kind: RowKind::User {
                 text: text.into(),
@@ -343,6 +362,7 @@ pub fn rows_for_entry(
                 attachments: Arc::new(parsed.attachments),
                 text_attachments: Arc::new(parsed.text_attachments),
                 pending,
+                delivery,
             },
             entry_id,
             // User rows always carry the strip (chat-view.tsx: whenever
@@ -1702,12 +1722,14 @@ impl Transcript {
                 attachments,
                 text_attachments,
                 pending,
+                delivery,
             } => {
                 let attachments = attachments.clone();
                 let text_attachments = text_attachments.clone();
                 let text = text.clone();
                 let mentions = mentions.clone();
                 let pending = *pending;
+                let delivery = *delivery;
                 // Attachment cards ride above the bubble, right-aligned.
                 // Attachment-only sends show no text bubble.
                 let mut column = div().w_full().flex().flex_col();
@@ -1733,7 +1755,15 @@ impl Transcript {
                             div()
                                 .min_w_0()
                                 .max_w(px(MAX_CONTENT_WIDTH * 0.8))
-                                .bg(theme.surface_raised)
+                                .when(delivery != UserDelivery::Queued, |el| {
+                                    el.bg(theme.surface_raised)
+                                })
+                                .when(delivery == UserDelivery::Queued, |el| {
+                                    el.bg(theme.warning.opacity(0.05))
+                                        .border_1()
+                                        .border_dashed()
+                                        .border_color(theme.warning.opacity(0.25))
+                                })
                                 .rounded(px(Theme::BUBBLE_RADIUS))
                                 .px(px(16.0))
                                 .py(px(10.0))
@@ -1844,7 +1874,17 @@ impl Transcript {
         // a RESERVED 16px lane under the entry's last row — the label only
         // flips opacity, so revealing it never shifts the virtualizer's
         // layout. User entries align end (under the bubble), assistant start.
-        let is_user_row = matches!(row.kind, RowKind::User { .. });
+        let (is_user_row, delivery_feedback) = match row.kind {
+            RowKind::User { delivery, .. } => (
+                true,
+                match delivery {
+                    UserDelivery::Normal => None,
+                    UserDelivery::Steered => Some((STEERED_FEEDBACK, theme.accent)),
+                    UserDelivery::Queued => Some((QUEUED_FEEDBACK, theme.warning)),
+                },
+            ),
+            _ => (false, None),
+        };
         let hovered = self
             .hovered_entry
             .as_ref()
@@ -1858,6 +1898,19 @@ impl Transcript {
         // defaults to 0 in mugen), the label's centering inside the 16px lane
         // is all the gap the original has.
         let strip = row.timestamp.map(|ms| {
+            let (label, tone) = if hovered {
+                (
+                    Some(SharedString::from(format_timestamp(ms, &chrono::Local))),
+                    theme.text_muted.opacity(0.55),
+                )
+            } else {
+                (
+                    delivery_feedback.map(|(label, _)| SharedString::from(label)),
+                    delivery_feedback
+                        .map(|(_, tone)| tone)
+                        .unwrap_or(theme.text_muted.opacity(0.55)),
+                )
+            };
             div()
                 .h(px(if is_user_row { 16.0 } else { 20.0 }))
                 .when(!is_user_row, |el| el.pt(px(4.0)))
@@ -1872,14 +1925,13 @@ impl Transcript {
                 // text's first-character x, user label's right edge on the
                 // bubble's right edge (user-reported 4px drift).
                 .when(is_user_row, |el| el.justify_end())
-                .when(hovered, |el| {
-                    el.child(motion::fade_quick(
-                        SharedString::from(format!("ts-{}", row.id)),
+                .when_some(label, |el, label| {
+                    el.child(
                         div()
                             .text_size(px(11.0))
-                            .text_color(theme.text_muted.opacity(0.55))
-                            .child(SharedString::from(format_timestamp(ms, &chrono::Local))),
-                    ))
+                            .text_color(tone.opacity(0.85))
+                            .child(label),
+                    )
                 })
         });
         let entry_id = row.entry_id.clone();
@@ -2465,6 +2517,8 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
         Some(MessageStatus::Streaming) => 1,
         Some(MessageStatus::Complete) => 2,
         Some(MessageStatus::Aborted) => 3,
+        Some(MessageStatus::Queued) => 4,
+        Some(MessageStatus::Steered) => 5,
     });
     acc.push(pending as u8);
     for part in &entry.parts {
@@ -2971,6 +3025,33 @@ mod tests {
         assert!(matches!(
             &echoed[0].kind,
             RowKind::User { pending: true, .. }
+        ));
+    }
+
+    #[test]
+    fn user_rows_preserve_steered_and_queued_delivery_states() {
+        let mut entry = assistant("u-delivery", MessageStatus::Complete, vec![]);
+        entry.role = MessageRole::User;
+        entry.parts = vec![text_part("t0", "follow up")];
+
+        entry.status = Some(MessageStatus::Steered);
+        let steered = rows_for_entry(&entry, false, &mut parse);
+        assert!(matches!(
+            &steered[0].kind,
+            RowKind::User {
+                delivery: UserDelivery::Steered,
+                ..
+            }
+        ));
+
+        entry.status = Some(MessageStatus::Queued);
+        let queued = rows_for_entry(&entry, false, &mut parse);
+        assert!(matches!(
+            &queued[0].kind,
+            RowKind::User {
+                delivery: UserDelivery::Queued,
+                ..
+            }
         ));
     }
 

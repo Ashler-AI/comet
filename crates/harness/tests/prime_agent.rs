@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::{Mutex, MutexGuard};
 
-use comet_harness::{CancellationToken, Harness, PrimeAgentHarness, RunControls};
+use comet_harness::{CancellationToken, Harness, PrimeAgentHarness, RunControls, SteerMessage};
 use comet_proto::{AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel};
 use futures::StreamExt as _;
 use tokio::sync::{mpsc, oneshot};
@@ -183,6 +183,91 @@ async fn prime_resume_uses_the_native_token_without_creating_a_parallel_store() 
         event,
         AgentEvent::SessionStarted { session_id, .. } if session_id == "native-prime-session"
     )));
+}
+
+#[tokio::test]
+async fn persistent_prime_run_delivers_queued_turn_boundary_steers() {
+    let _env = env_lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let prompt_log = temp.path().join("prompts");
+    let _argv_log = EnvGuard::set("PRIME_ARGV_LOG", temp.path().join("argv"));
+    let _prompt_log = EnvGuard::set("PRIME_PROMPT_LOG", &prompt_log);
+    let _keep_open = EnvGuard::set("PRIME_KEEP_OPEN", "1");
+    let _coding_agent_dir =
+        EnvGuard::set("PRIME_AGENT_CODING_AGENT_DIR", temp.path().join("config"));
+    let harness = PrimeAgentHarness::new().with_executable(fixture_path());
+    let (steer_tx, steer_rx) = mpsc::channel(4);
+    let controls = RunControls {
+        request_input: Box::new(|_| {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(Vec::new());
+            rx
+        }),
+        steering: steer_rx,
+        interrupt: CancellationToken::new(),
+    };
+    let mut stream = harness
+        .run(request(None), controls)
+        .await
+        .expect("persistent run starts");
+    let mut events = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("first turn completes")
+            .expect("stream remains open")
+            .expect("valid first-turn event");
+        let done = matches!(event, AgentEvent::Done { .. });
+        events.push(event);
+        if done {
+            break;
+        }
+    }
+
+    steer_tx
+        .send(SteerMessage {
+            prompt: "follow up".into(),
+            message_id: Some("user-follow-up".into()),
+        })
+        .await
+        .unwrap();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("second turn completes")
+            .expect("stream remains open")
+            .expect("valid second-turn event");
+        let done = matches!(event, AgentEvent::Done { .. });
+        events.push(event);
+        if done {
+            break;
+        }
+    }
+    drop(steer_tx);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("mailbox closure reaps ACP child")
+            .is_none()
+    );
+
+    let first_done = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::Done { .. }))
+        .unwrap();
+    let boundary = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::Steered { .. }))
+        .unwrap();
+    let second_done = events
+        .iter()
+        .rposition(|event| matches!(event, AgentEvent::Done { .. }))
+        .unwrap();
+    assert!(first_done < boundary && boundary < second_done);
+    assert_eq!(
+        std::fs::read_to_string(prompt_log).unwrap().lines().count(),
+        2
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
