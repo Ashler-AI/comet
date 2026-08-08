@@ -114,6 +114,7 @@ pub struct AuthConfig {
     pub expected_device_id: Option<String>,
     pub expected_session_id: Option<String>,
     pub expected_deployment_id: Option<String>,
+    pub expected_lifecycle_epoch: Option<u64>,
     pub expected_sandbox_id: Option<String>,
 }
 
@@ -135,6 +136,7 @@ impl std::fmt::Debug for AuthConfig {
             .field("expected_device_id", &self.expected_device_id)
             .field("expected_session_id", &self.expected_session_id)
             .field("expected_deployment_id", &self.expected_deployment_id)
+            .field("expected_lifecycle_epoch", &self.expected_lifecycle_epoch)
             .field("expected_sandbox_id", &self.expected_sandbox_id)
             .finish()
     }
@@ -155,6 +157,7 @@ impl AuthConfig {
             expected_device_id: None,
             expected_session_id: None,
             expected_deployment_id: None,
+            expected_lifecycle_epoch: None,
             expected_sandbox_id: None,
         }
     }
@@ -305,6 +308,7 @@ impl Auth {
             sandbox_id: String,
             target_device_id: String,
             session_id: String,
+            lifecycle_epoch: u64,
             #[serde(default)]
             capabilities: Vec<String>,
         }
@@ -349,6 +353,11 @@ impl Auth {
                 .expected_deployment_id
                 .as_deref()
                 .is_some_and(|expected| expected != exchange.deployment_id)
+            || self
+                .inner
+                .config
+                .expected_lifecycle_epoch
+                .is_some_and(|expected| expected != exchange.lifecycle_epoch)
             || self
                 .inner
                 .config

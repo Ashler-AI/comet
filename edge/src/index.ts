@@ -78,6 +78,7 @@ const forward = (
       sandboxId: string;
       targetDeviceId: string;
       sessionId: string;
+      lifecycleEpoch: number;
       grantedAt: number;
       expiresAt: number;
       revokedAt: null;
@@ -90,10 +91,12 @@ const forward = (
         scope: {
           projectId: grant.projectId,
           deploymentId: grant.deploymentId,
-          sessionId: grant.sessionId
+          sessionId: grant.sessionId,
+          lifecycleEpoch: grant.lifecycleEpoch
         },
         sandboxId: grant.sandboxId,
         targetDeviceId: grant.targetDeviceId,
+        lifecycleEpoch: grant.lifecycleEpoch,
         capabilities: grant.capabilities,
         grantedAt: grant.grantedAt,
         expiresAt: grant.expiresAt,

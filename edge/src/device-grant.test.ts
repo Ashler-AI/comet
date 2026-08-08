@@ -17,10 +17,12 @@ const rawGrant = {
   scope: {
     projectId: "ashler-staging",
     deploymentId: "deploy-123",
-    sessionId: "session-456"
+    sessionId: "session-456",
+    lifecycleEpoch: 1
   },
   sandboxId: "sandbox-789",
-  targetDeviceId: "comet-scaffold-sandbox-789",
+  targetDeviceId: "comet-scaffold-sandbox-789-e1",
+  lifecycleEpoch: 1,
   capabilities: ["session.read", "session.control"],
   grantedAt: now - 1_000,
   expiresAt: now + 60_000,
@@ -44,6 +46,7 @@ describe("trusted device grants", () => {
         capabilities: rawGrant.capabilities,
         sandboxId: rawGrant.sandboxId,
         deviceId: rawGrant.targetDeviceId,
+        lifecycleEpoch: rawGrant.lifecycleEpoch,
         grantedBy: "comet-edge-device-room",
         grantedAt: rawGrant.grantedAt,
         expiresAt: rawGrant.expiresAt,
@@ -59,6 +62,7 @@ describe("trusted device grants", () => {
     ["missing deployment", { ...rawGrant, scope: { projectId: "ashler-staging", sessionId: "session-456" } }],
     ["missing sandbox", { ...rawGrant, sandboxId: undefined }],
     ["wrong project", { ...rawGrant, scope: { ...rawGrant.scope, projectId: "other" } }],
+    ["lifecycle mismatch", { ...rawGrant, lifecycleEpoch: 2 }],
     ["revoked", { ...rawGrant, revokedAt: now - 1 }],
     ["expired", { ...rawGrant, expiresAt: now }]
   ])("rejects %s authority", (_name, value) => {

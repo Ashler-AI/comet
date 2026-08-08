@@ -75,10 +75,12 @@ describe("device relay collaboration authorization", () => {
       scope: {
         projectId: "project-a",
         deploymentId: "deployment-a",
-        sessionId: "session-a"
+        sessionId: "session-a",
+        lifecycleEpoch: 1
       },
       sandboxId: "sandbox-a",
       targetDeviceId: "device-a",
+      lifecycleEpoch: 1,
       capabilities: ["session.read", "session.control"],
       grantedAt: 10,
       expiresAt: 100,

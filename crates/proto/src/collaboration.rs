@@ -343,8 +343,10 @@ pub enum SessionEnvironmentSource {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         region: Option<String>,
         lifecycle: ScaffoldLifecycle,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lifecycle_epoch: Option<u64>,
         #[serde(default)]
-        links: ScaffoldEnvironmentLinks,
+        links: Box<ScaffoldEnvironmentLinks>,
     },
 }
 

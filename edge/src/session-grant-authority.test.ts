@@ -120,6 +120,7 @@ describe("grant revocation delivery", () => {
       deploymentId: string;
       sessionId: string;
       targetDeviceId: string;
+      lifecycleEpoch: number;
       accessExpiresAt: number;
       revokedAt?: number;
     } = {
@@ -128,6 +129,7 @@ describe("grant revocation delivery", () => {
       deploymentId: "candidate",
       sessionId: "session-1",
       targetDeviceId: "device-1",
+      lifecycleEpoch: 1,
       accessExpiresAt: Date.now() + 60_000
     };
     const ctx = {
@@ -162,6 +164,7 @@ describe("grant revocation delivery", () => {
       sandboxId: "sandbox-1",
       targetDeviceId: "device-1",
       sessionId: "session-1",
+      lifecycleEpoch: 1,
       capabilities: ["session.read", "session.control"],
       grantHash: "unused",
       issuedAt: NOW - 1_000,

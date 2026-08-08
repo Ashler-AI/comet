@@ -35,9 +35,11 @@ export interface TrustedDeviceGrant {
     projectId: string;
     deploymentId: string;
     sessionId: string;
+    lifecycleEpoch: number;
   };
   sandboxId: string;
   targetDeviceId: string;
+  lifecycleEpoch: number;
   capabilities: string[];
   grantedAt: number;
   expiresAt: number;
@@ -71,10 +73,14 @@ export const parseTrustedDeviceGrant = (
     !GRANT_ID_RE.test(value.scope.deploymentId) ||
     typeof value.scope.sessionId !== "string" ||
     !GRANT_ID_RE.test(value.scope.sessionId) ||
+    !Number.isSafeInteger(value.scope.lifecycleEpoch) ||
+    (value.scope.lifecycleEpoch as number) < 1 ||
     typeof value.sandboxId !== "string" ||
     !GRANT_ID_RE.test(value.sandboxId) ||
     typeof value.targetDeviceId !== "string" ||
     !GRANT_ID_RE.test(value.targetDeviceId) ||
+    !Number.isSafeInteger(value.lifecycleEpoch) ||
+    (value.lifecycleEpoch as number) !== value.scope.lifecycleEpoch ||
     !Array.isArray(value.capabilities) ||
     value.capabilities.length === 0 ||
     value.capabilities.length > 32 ||
@@ -101,6 +107,7 @@ export const canonicalGrantEnvelope = (value: TrustedDeviceGrant) => ({
     capabilities: value.capabilities,
     sandboxId: value.sandboxId,
     deviceId: value.targetDeviceId,
+    lifecycleEpoch: value.lifecycleEpoch,
     grantedBy: "comet-edge-device-room",
     grantedAt: value.grantedAt,
     expiresAt: value.expiresAt,

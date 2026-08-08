@@ -109,6 +109,7 @@ pub struct DeviceBootstrapConfig {
     pub deployment_id: String,
     pub session_id: String,
     pub device_id: String,
+    pub lifecycle_epoch: u64,
     pub sandbox_id: String,
 }
 
@@ -120,6 +121,7 @@ impl std::fmt::Debug for DeviceBootstrapConfig {
             .field("deployment_id", &self.deployment_id)
             .field("session_id", &self.session_id)
             .field("device_id", &self.device_id)
+            .field("lifecycle_epoch", &self.lifecycle_epoch)
             .field("sandbox_id", &self.sandbox_id)
             .finish()
     }
@@ -478,6 +480,7 @@ impl Engine {
             auth_config.expected_device_id = Some(bootstrap.device_id.clone());
             auth_config.expected_session_id = Some(bootstrap.session_id.clone());
             auth_config.expected_deployment_id = Some(bootstrap.deployment_id.clone());
+            auth_config.expected_lifecycle_epoch = Some(bootstrap.lifecycle_epoch);
             auth_config.expected_sandbox_id = Some(bootstrap.sandbox_id.clone());
         }
         if let Ok(scopes) = std::env::var("COMET_OAUTH_SCOPES")
@@ -795,7 +798,12 @@ fn validate_device_bootstrap(
         || !valid_id(&bootstrap.session_id)
         || !valid_id(&bootstrap.device_id)
         || !valid_id(&bootstrap.sandbox_id)
-        || bootstrap.device_id != format!("comet-scaffold-{}", bootstrap.sandbox_id)
+        || bootstrap.lifecycle_epoch == 0
+        || bootstrap.device_id
+            != format!(
+                "comet-scaffold-{}-e{}",
+                bootstrap.sandbox_id, bootstrap.lifecycle_epoch
+            )
     {
         return Err(EngineError::Other("device_join_grant_unavailable".into()));
     }

@@ -58,6 +58,7 @@ struct DeviceBootstrapFile {
     deployment_id: String,
     session_id: String,
     device_id: String,
+    lifecycle_epoch: u64,
     sandbox_id: String,
 }
 
@@ -89,6 +90,7 @@ impl HeadlessArgs {
             deployment_id: bootstrap.deployment_id,
             session_id: bootstrap.session_id,
             device_id: bootstrap.device_id,
+            lifecycle_epoch: bootstrap.lifecycle_epoch,
             sandbox_id: bootstrap.sandbox_id,
         }))
     }
@@ -529,7 +531,7 @@ mod device_bootstrap_tests {
             .unwrap();
         write!(
             file,
-            r#"{{"deviceJoinGrant":"cg1.secret","projectId":"project-a","deploymentId":"project-a","sessionId":"session-a","deviceId":"device-a","sandboxId":"sandbox-a"}}"#
+            r#"{{"deviceJoinGrant":"cg1.secret","projectId":"project-a","deploymentId":"project-a","sessionId":"session-a","deviceId":"device-a","lifecycleEpoch":1,"sandboxId":"sandbox-a"}}"#
         )
         .unwrap();
         drop(file);
@@ -559,7 +561,8 @@ mod device_bootstrap_tests {
             project_id: "ashler-staging".into(),
             deployment_id: "deployment-a".into(),
             session_id: "session-a".into(),
-            device_id: "comet-scaffold-sandbox-a".into(),
+            device_id: "comet-scaffold-sandbox-a-e1".into(),
+            lifecycle_epoch: 1,
             sandbox_id: "sandbox-a".into(),
         };
         apply_device_bootstrap_policy(&mut config, &bootstrap);

@@ -8,6 +8,7 @@ interface GrantAuthorityRecord {
   deploymentId: string;
   sessionId: string;
   targetDeviceId: string;
+  lifecycleEpoch: number;
   accessExpiresAt?: number;
   revokedAt?: number;
 }
@@ -27,7 +28,9 @@ const hasGrantScope = (value: unknown): value is GrantAuthorityRecord => {
     typeof record.sessionId === "string" &&
     ID_RE.test(record.sessionId) &&
     typeof record.targetDeviceId === "string" &&
-    ID_RE.test(record.targetDeviceId)
+    ID_RE.test(record.targetDeviceId) &&
+    Number.isSafeInteger(record.lifecycleEpoch) &&
+    (record.lifecycleEpoch as number) >= 1
   );
 };
 
