@@ -386,7 +386,7 @@ pub(crate) async fn create_scaffold_session(
     handle: &EngineHandle,
     scope: &CollaborationScope,
     source_ref: Option<&str>,
-) -> Result<String, RpcError> {
+) -> Result<(String, CollaborationScope), RpcError> {
     let create = ScaffoldEnvironmentControl::Create {
         scope: scope.clone(),
         name: Some("Comet Scaffold session".into()),
@@ -403,12 +403,13 @@ pub(crate) async fn create_scaffold_session(
         .await?;
     let created: ScaffoldEnvironmentControlResult =
         serde_json::from_value(value).map_err(|err| RpcError::Failed(err.to_string()))?;
+    let authoritative_scope = created.environment.scope.clone();
     let SessionEnvironmentSource::Scaffold { sandbox_id, .. } = created.environment.source else {
         return Err(RpcError::Failed(
             "Scaffold returned a local environment".into(),
         ));
     };
-    Ok(sandbox_id)
+    Ok((sandbox_id, authoritative_scope))
 }
 
 /// Read the sandbox lifecycle without opening a session-room projection or
@@ -545,8 +546,9 @@ pub(crate) async fn create_and_attach_scaffold_session(
     scope: &CollaborationScope,
     source_ref: Option<&str>,
 ) -> Result<(String, ScaffoldSessionAttachment), RpcError> {
-    let sandbox_id = create_scaffold_session(handle, scope, source_ref).await?;
-    let attachment = attach_scaffold_session(handle, &sandbox_id, scope.clone()).await?;
+    let (sandbox_id, authoritative_scope) =
+        create_scaffold_session(handle, scope, source_ref).await?;
+    let attachment = attach_scaffold_session(handle, &sandbox_id, authoritative_scope).await?;
     Ok((sandbox_id, attachment))
 }
 
