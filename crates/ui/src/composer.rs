@@ -4166,14 +4166,6 @@ impl Composer {
             .child(self.input.clone())
             .children(self.render_file_mention_popup(theme, cx))
     }
-    pub fn select_agent_target(&mut self, session_id: Option<String>, cx: &mut Context<Self>) {
-        self.agent_target = session_id;
-        self.start_agent = false;
-        self.input.update(cx, |input, cx| {
-            input.set_placeholder("Steer this agent…", cx)
-        });
-        cx.notify();
-    }
 
     pub fn begin_start_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.agent_target = None;
@@ -4183,11 +4175,6 @@ impl Composer {
         });
         window.focus(&self.input.focus_handle(cx), cx);
         cx.notify();
-    }
-
-    pub fn begin_steer(&mut self, session_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.select_agent_target(Some(session_id), cx);
-        window.focus(&self.input.focus_handle(cx), cx);
     }
 
     /// Append review or annotation context to the current draft without

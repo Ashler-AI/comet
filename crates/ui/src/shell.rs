@@ -1156,8 +1156,6 @@ pub struct Shell {
     /// Set by comment controls; consumed on the next render after the drawer
     /// mounts so typing lands in the note input rather than the composer.
     annotation_focus_pending: bool,
-    /// Participant whose remote focus/cursor is mirrored in the transcript.
-    following_subject: Option<String>,
     control_tasks: Vec<Task<()>>,
     /// Outside-click dismissal instant — suppresses the trigger click that
     /// follows the same mouse-down from instantly reopening the menu.
@@ -1370,7 +1368,6 @@ impl Shell {
             control_feedback: Vec::new(),
             annotation_inspector: None,
             annotation_focus_pending: false,
-            following_subject: None,
             control_tasks: Vec::new(),
             user_menu_dismissed_at: None,
             sidebar_notice: None,
@@ -2335,15 +2332,6 @@ impl Shell {
             .ok();
         });
         self.control_tasks.push(task);
-        cx.notify();
-    }
-
-    fn toggle_follow(&mut self, subject: String, cx: &mut Context<Self>) {
-        if self.following_subject.as_deref() == Some(subject.as_str()) {
-            self.following_subject = None;
-        } else {
-            self.following_subject = Some(subject);
-        }
         cx.notify();
     }
 
@@ -5978,298 +5966,6 @@ impl Shell {
             )
     }
 
-    fn render_session_toolbar(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let theme = Theme::of(cx).clone();
-        let (sessions, participants, selected_session_id, can_control) = {
-            let state = self.state.read(cx);
-            let chat_id = state.selected_chat.clone()?;
-            (
-                state
-                    .collaboration_sessions(&chat_id)
-                    .cloned()
-                    .collect::<Vec<_>>(),
-                state.participants().to_vec(),
-                state.selected_agent_session.clone(),
-                state.has_collaboration_capability(comet_proto::CAPABILITY_SESSION_CONTROL),
-            )
-        };
-        let participant_elements = participants.into_iter().take(5).map(|participant| {
-            let name: SharedString = participant
-                .display_name
-                .clone()
-                .unwrap_or_else(|| participant.principal_subject.clone())
-                .into();
-            let initials = crate::multiplayer::initials(name.as_ref());
-            let subject = participant.principal_subject.clone();
-            let following = self.following_subject.as_deref() == Some(subject.as_str());
-            let presence = match participant.state {
-                comet_proto::ParticipantState::Active => theme.success,
-                comet_proto::ParticipantState::Idle => theme.warning,
-                comet_proto::ParticipantState::Disconnected => theme.text_faint,
-            };
-            div()
-                .id(SharedString::from(format!("participant-{subject}")))
-                .relative()
-                .size(px(24.0))
-                .rounded_full()
-                .border_1()
-                .border_color(if following {
-                    theme.accent
-                } else {
-                    theme.border
-                })
-                .bg(theme.surface_raised)
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(px(9.0))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(theme.text_muted)
-                .cursor_pointer()
-                .hover(|style| style.bg(theme.surface_raised_hover))
-                .on_click(
-                    cx.listener(move |this, _, _, cx| this.toggle_follow(subject.clone(), cx)),
-                )
-                .child(SharedString::from(initials))
-                .child(
-                    div()
-                        .absolute()
-                        .right(px(-1.0))
-                        .bottom(px(-1.0))
-                        .size(px(6.0))
-                        .rounded_full()
-                        .border_1()
-                        .border_color(theme.bg)
-                        .bg(presence),
-                )
-        });
-        let session_elements = sessions.iter().map(|session| {
-            let selected = selected_session_id.as_deref() == Some(session.session_id.as_str());
-            let owner: SharedString = {
-                let state = self.state.read(cx);
-                state
-                    .participant_name(&session.owner_subject)
-                    .to_string()
-                    .into()
-            };
-            let initials = crate::multiplayer::initials(owner.as_ref());
-            let device: SharedString = self
-                .state
-                .read(cx)
-                .device_name(&session.owner_device_id)
-                .unwrap_or("Remote device")
-                .to_string()
-                .into();
-            let runtime = session.harness.map(crate::multiplayer::harness_label);
-            let runtime_model =
-                crate::multiplayer::runtime_model(runtime, session.model.as_deref());
-            let source = crate::multiplayer::source_label(session.source);
-            let (status, status_tone) = match session.status {
-                Some(comet_proto::SessionStatus::Working) => ("Working", theme.busy),
-                Some(comet_proto::SessionStatus::AwaitingInput) => ("Needs input", theme.warning),
-                Some(comet_proto::SessionStatus::Errored) => ("Failed", theme.danger),
-                Some(comet_proto::SessionStatus::Idle) | None => ("Idle", theme.text_faint),
-            };
-            let session_id = session.session_id.clone();
-            div()
-                .id(SharedString::from(format!("agent-session-{session_id}")))
-                .h(px(30.0))
-                .max_w(px(220.0))
-                .px(px(Theme::SPACE_SM))
-                .rounded(px(Theme::CONTROL_RADIUS))
-                .border_1()
-                .border_color(if selected {
-                    theme.border_strong
-                } else {
-                    theme.border
-                })
-                .bg(if selected {
-                    crate::theme::card_selected_bg()
-                } else {
-                    crate::theme::ink(0.03)
-                })
-                .flex()
-                .items_center()
-                .gap(px(Theme::SPACE_XS))
-                .cursor_pointer()
-                .hover(|style| style.bg(theme.element_hover))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.state.update(cx, |state, cx| {
-                        state.select_agent_session(Some(session_id.clone()));
-                        cx.notify();
-                    });
-                    this.composer.update(cx, |composer, cx| {
-                        composer.select_agent_target(Some(session_id.clone()), cx)
-                    });
-                }))
-                .child(
-                    div()
-                        .size(px(18.0))
-                        .rounded_full()
-                        .bg(theme.surface_raised)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(8.0))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .child(SharedString::from(initials)),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .truncate()
-                                .text_size(px(10.5))
-                                .line_height(px(12.0))
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .child(owner),
-                        )
-                        .child(
-                            div()
-                                .truncate()
-                                .text_size(px(9.0))
-                                .line_height(px(10.0))
-                                .text_color(theme.text_faint)
-                                .child(SharedString::from(format!(
-                                    "{device} · {runtime_model} · {source}"
-                                ))),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(3.0))
-                        .child(div().size(px(5.0)).rounded_full().bg(status_tone))
-                        .child(
-                            div()
-                                .text_size(px(9.0))
-                                .text_color(theme.text_faint)
-                                .child(SharedString::from(status)),
-                        ),
-                )
-        });
-        let selected_session = sessions
-            .iter()
-            .find(|session| selected_session_id.as_deref() == Some(session.session_id.as_str()))
-            .cloned();
-        let mut controls = div().flex().items_center().gap(px(Theme::SPACE_XS));
-        if let Some(session) = selected_session
-            && can_control
-        {
-            let steer_session = session.session_id.clone();
-            controls = controls.child(
-                popover::btn_ghost(&theme, "Steer", "steer-agent")
-                    .id("steer-agent")
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.composer.update(cx, |composer, cx| {
-                            composer.begin_steer(steer_session.clone(), window, cx)
-                        });
-                    })),
-            );
-            match session.status {
-                Some(comet_proto::SessionStatus::Working)
-                | Some(comet_proto::SessionStatus::AwaitingInput) => {
-                    let pause = session.clone();
-                    let stop = session.clone();
-                    controls = controls
-                        .child(
-                            popover::btn_ghost(&theme, "Pause", "pause-agent")
-                                .id("pause-agent")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.queue_control(
-                                        pause.clone(),
-                                        SessionControlAction::Pause {},
-                                        "Pause",
-                                        cx,
-                                    )
-                                })),
-                        )
-                        .child(
-                            popover::btn_danger(&theme, "Stop")
-                                .id("stop-agent")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.queue_control(
-                                        stop.clone(),
-                                        SessionControlAction::Stop {},
-                                        "Stop",
-                                        cx,
-                                    )
-                                })),
-                        );
-                }
-                _ => {
-                    let resume = session.clone();
-                    controls = controls.child(
-                        popover::btn_ghost(&theme, "Resume", "resume-agent")
-                            .id("resume-agent")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.queue_control(
-                                    resume.clone(),
-                                    SessionControlAction::Resume {},
-                                    "Resume",
-                                    cx,
-                                )
-                            })),
-                    );
-                }
-            }
-        }
-        Some(
-            div()
-                .id("session-toolbar")
-                .h(px(42.0))
-                .w_full()
-                .flex_none()
-                .border_b_1()
-                .border_color(theme.border)
-                .overflow_x_scroll()
-                .px(px(Theme::SPACE_MD))
-                .flex()
-                .items_center()
-                .gap(px(Theme::SPACE_SM))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(2.0))
-                        .children(participant_elements),
-                )
-                .when_some(self.following_subject.clone(), |el, subject| {
-                    let name = self.state.read(cx).participant_name(&subject).to_string();
-                    el.child(
-                        div()
-                            .flex_none()
-                            .text_size(px(10.0))
-                            .text_color(theme.accent)
-                            .child(SharedString::from(format!("Following {name}"))),
-                    )
-                })
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(Theme::SPACE_XS))
-                        .children(session_elements),
-                )
-                .when(sessions.is_empty(), |el| {
-                    el.child(
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(theme.text_faint)
-                            .child(SharedString::from("No agent running")),
-                    )
-                })
-                .child(div().flex_1())
-                .child(controls)
-                .into_any_element(),
-        )
-    }
-
     fn render_workspace_status(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let preferred_harness = {
@@ -6659,11 +6355,6 @@ impl Shell {
         let _ = (text, border);
         let has_selection = self.state.read(cx).selected_chat.is_some();
         let has_spaces = !self.state.read(cx).spaces.is_empty();
-        let session_toolbar = if has_selection {
-            self.render_session_toolbar(cx)
-        } else {
-            None
-        };
         let space_name: SharedString = self
             .state
             .read(cx)
@@ -6794,7 +6485,6 @@ impl Shell {
                     .update(cx, |composer, cx| composer.add_paths(paths, cx));
                 cx.notify();
             }))
-            .children(session_toolbar)
             .child(
                 // The conversation fades out at its bottom edge instead of
                 // hard-cutting against the composer — a gradient overlay from
