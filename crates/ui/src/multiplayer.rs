@@ -2,7 +2,8 @@
 //! and activity drawer.
 
 use comet_proto::{
-    AgentSessionSource, AuditResult, CollaborationSnapshot, ParticipantState, PublicationValue,
+    AgentSessionSource, AuditResult, CollaborationSnapshot, ParticipantPresence, ParticipantState,
+    PublicationValue,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +36,20 @@ pub fn initials(name: &str) -> String {
         (Some(first), None) => first.to_uppercase().to_string(),
         _ => "?".into(),
     }
+}
+
+/// Room presence minus the viewing user — the floating transcript cluster
+/// shows only OTHER people (your own avatar is noise). With no principal
+/// (offline/local room) everyone is "someone else" and passes through.
+pub fn remote_participants(
+    participants: &[ParticipantPresence],
+    own_subject: Option<&str>,
+) -> Vec<ParticipantPresence> {
+    participants
+        .iter()
+        .filter(|participant| own_subject != Some(participant.principal_subject.as_str()))
+        .cloned()
+        .collect()
 }
 
 pub const fn source_label(source: AgentSessionSource) -> &'static str {
@@ -353,6 +368,31 @@ pub fn activity_items(snapshot: &CollaborationSnapshot) -> Vec<ActivityItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn presence(subject: &str) -> ParticipantPresence {
+        ParticipantPresence {
+            principal_subject: subject.into(),
+            display_name: None,
+            device_id: "dev".into(),
+            state: ParticipantState::Active,
+            last_seen_at: 0,
+            focused_target_id: None,
+            cursor: None,
+            unknown: Default::default(),
+        }
+    }
+
+    #[test]
+    fn remote_participants_drop_the_viewer_only() {
+        let room = [presence("iap:me"), presence("iap:peer")];
+        let remote = remote_participants(&room, Some("iap:me"));
+        assert_eq!(remote.len(), 1);
+        assert_eq!(remote[0].principal_subject, "iap:peer");
+        // Alone in the room → cluster renders nothing.
+        assert!(remote_participants(&[presence("iap:me")], Some("iap:me")).is_empty());
+        // No principal (offline/local): nobody can be "you".
+        assert_eq!(remote_participants(&room, None).len(), 2);
+    }
 
     #[test]
     fn initials_are_compact_and_stable() {

@@ -5966,6 +5966,75 @@ impl Shell {
             )
     }
 
+    /// Floating presence cluster over the transcript's top-left corner —
+    /// the barless remnant of the old session toolbar. REMOTE participants
+    /// only: your own avatar is noise, so nothing renders while you're alone
+    /// in the room (user request).
+    fn render_remote_presence(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = Theme::of(cx).clone();
+        let remote = {
+            let state = self.state.read(cx);
+            state.selected_chat.as_ref()?;
+            crate::multiplayer::remote_participants(state.participants(), state.principal_subject())
+        };
+        if remote.is_empty() {
+            return None;
+        }
+        let avatars = remote
+            .into_iter()
+            .take(5)
+            .enumerate()
+            .map(|(ix, participant)| {
+                let name: SharedString = participant
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| participant.principal_subject.clone())
+                    .into();
+                let initials = crate::multiplayer::initials(name.as_ref());
+                let presence = match participant.state {
+                    comet_proto::ParticipantState::Active => theme.success,
+                    comet_proto::ParticipantState::Idle => theme.warning,
+                    comet_proto::ParticipantState::Disconnected => theme.text_faint,
+                };
+                div()
+                    .relative()
+                    .when(ix > 0, |el| el.ml(px(-6.0)))
+                    .size(px(24.0))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.surface_raised)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(9.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(initials))
+                    .child(
+                        div()
+                            .absolute()
+                            .right(px(-1.0))
+                            .bottom(px(-1.0))
+                            .size(px(6.0))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(theme.bg)
+                            .bg(presence),
+                    )
+            });
+        Some(
+            div()
+                .absolute()
+                .top(px(Theme::SPACE_SM))
+                .left(px(Theme::SPACE_MD))
+                .flex()
+                .items_center()
+                .children(avatars)
+                .into_any_element(),
+        )
+    }
+
     fn render_workspace_status(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let preferred_harness = {
@@ -6507,7 +6576,8 @@ impl Shell {
                                 gpui::linear_color_stop(theme_bg.opacity(0.0), 1.0),
                             )),
                     )
-                    .children(self.render_jump_to_bottom(cx)),
+                    .children(self.render_jump_to_bottom(cx))
+                    .children(self.render_remote_presence(cx)),
             )
             // Reserved status strip (h-6) — the WorkingIndicator lives here so
             // the composer below never shifts. Both live INSIDE the
