@@ -681,6 +681,10 @@ impl WorkspaceHost {
     ) -> Result<bool, EngineError> {
         Ok(self.inner.doc.set_chat_seen(chat_id, at)?)
     }
+    /// Clear the synced seen marker — "mark as unread" on any device.
+    pub fn mark_chat_unread(&self, chat_id: &str) -> Result<bool, EngineError> {
+        Ok(self.inner.doc.set_chat_unread(chat_id)?)
+    }
 
     /// Owner-only git stamp (SpacesSync). Refuses rows owned by another device.
     pub fn set_space_git(

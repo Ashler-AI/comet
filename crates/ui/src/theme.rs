@@ -227,6 +227,10 @@ pub struct Theme {
     pub success: Hsla,
     /// Working / streaming indicator — pink.
     pub busy: Hsla,
+    /// Attention dot — finished-unseen / needs-you session rows. Sky blue,
+    /// deliberately lighter than the indigo `accent` (reference: the sidebar
+    /// indicator mock).
+    pub attention: Hsla,
     /// Softer success for text on a success-tinted chip.
     pub success_muted: Hsla,
 
@@ -453,6 +457,7 @@ impl Theme {
             warning_muted: oklch(0.924, 0.12, 95.746), // amber-200
             success: oklch(0.765, 0.177, 163.223),     // emerald-400
             busy: oklch(0.718, 0.202, 349.761),        // pink-400
+            attention: oklch(0.707, 0.165, 254.624),   // blue-400
             success_muted: oklch(0.845, 0.143, 164.978), // emerald-300
             surface_raised_hover: neutral(0.29),
             band: band_for(Appearance::Dark),
@@ -527,6 +532,7 @@ impl Theme {
             warning_muted: oklch(0.473, 0.137, 46.201), // amber-800
             success: oklch(0.596, 0.145, 163.225),      // emerald-600
             busy: oklch(0.592, 0.249, 0.584),           // pink-600
+            attention: oklch(0.546, 0.245, 262.881),    // blue-600
             success_muted: oklch(0.508, 0.118, 165.612), // emerald-700
             // Opaque pills darken on hover here rather than brighten — same
             // "brighten the plate, don't wash it out" rule, read the other way.

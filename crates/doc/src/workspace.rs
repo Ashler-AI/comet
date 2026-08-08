@@ -292,6 +292,22 @@ impl WorkspaceDoc {
         Ok(true)
     }
 
+    /// Clear the seen marker — "mark as unread" from any device. Deleting the
+    /// key (rather than back-dating it) sidesteps [`Self::set_chat_seen`]'s
+    /// monotonic guard, so a later read can stamp seen again. No oplog write
+    /// when the row is already unseen. `false` when no such row.
+    pub fn set_chat_unread(&self, chat_id: &str) -> Result<bool, DocError> {
+        let Some(row) = self.existing_row("chats", chat_id) else {
+            return Ok(false);
+        };
+        if row.get("lastSeenAt").is_none() {
+            return Ok(true);
+        }
+        row.delete("lastSeenAt")?;
+        self.doc.commit();
+        Ok(true)
+    }
+
     pub fn chat(&self, chat_id: &str) -> Result<Option<Chat>, DocError> {
         // Single-row read: this sits on the per-tick `is_host` path, where
         // materializing every chat row per call multiplied with chat count.
@@ -1207,6 +1223,37 @@ mod tests {
         let seen_b = b.chat("chat-1").unwrap().unwrap().last_seen_at;
         assert_eq!(seen_a, seen_b);
         assert!(matches!(seen_a, Some(t) if t == ts(9_000) || t == ts(9_001)));
+    }
+
+    #[test]
+    fn chat_unread_clears_seen_and_allows_restamp() {
+        let a = WorkspaceDoc::new();
+        a.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
+        // Unread on a never-seen row is a no-op (no oplog write).
+        let before = a.doc().oplog_vv();
+        assert!(a.set_chat_unread("chat-1").unwrap());
+        assert_eq!(a.doc().oplog_vv(), before);
+        assert!(!a.set_chat_unread("nope").unwrap());
+
+        a.set_chat_seen("chat-1", ts(5_000)).unwrap();
+        assert!(a.set_chat_unread("chat-1").unwrap());
+        assert_eq!(a.chat("chat-1").unwrap().unwrap().last_seen_at, None);
+        // The monotonic guard resets with the key: an OLDER stamp lands again.
+        assert!(a.set_chat_seen("chat-1", ts(4_000)).unwrap());
+        assert_eq!(
+            a.chat("chat-1").unwrap().unwrap().last_seen_at,
+            Some(ts(4_000))
+        );
+
+        // Unread propagates to peers.
+        let b = WorkspaceDoc::from_doc({
+            let d = LoroDoc::new();
+            d.import(&a.export_snapshot().unwrap()).unwrap();
+            d
+        });
+        a.set_chat_unread("chat-1").unwrap();
+        cross_sync(&a, &b);
+        assert_eq!(b.chat("chat-1").unwrap().unwrap().last_seen_at, None);
     }
 
     #[test]

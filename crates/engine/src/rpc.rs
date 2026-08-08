@@ -16,7 +16,7 @@
 //! - `WatchSessions` → stream of `Session[]`: this engine's live statuses merged with
 //!   remote devices' workspace session rows
 //! - `Mutate {op, …}` → `{ok}` — workspace entity mutations (createChat, renameChat,
-//!   setChatArchived, deleteChat, renameDevice, markChatSeen)
+//!   setChatArchived, deleteChat, renameDevice, markChatSeen, markChatUnread)
 //! - `LocalDevice` → `{deviceId}` — this engine's identity (never forwarded)
 //! - AuthRpc: `AuthStatus` (stream), `SignIn`/`SignInHeadless` → `{url}`,
 //!   `CompleteSignIn {code}`, and `SignOut`
@@ -451,6 +451,10 @@ enum MutateParams {
         #[serde(default)]
         at: Option<i64>,
     },
+    /// Clear the seen marker — "mark as unread" raises the attention badge
+    /// on every device.
+    #[serde(rename_all = "camelCase")]
+    MarkChatUnread { chat_id: String },
 }
 
 pub struct EngineRpc {
@@ -1024,6 +1028,11 @@ impl EngineRpc {
                     .map_err(failed)
                     .map(drop)
             }
+            MutateParams::MarkChatUnread { chat_id } => self
+                .workspace
+                .mark_chat_unread(&chat_id)
+                .map_err(failed)
+                .map(drop),
         }
     }
 }

@@ -699,6 +699,30 @@ pub fn seed_attachment(device_id: &str, path: &str, name: &str, image: Arc<Image
     store_loaded(device_id, path, name.to_string().into(), image);
 }
 
+/// Resolve an inline-markdown image URL (`![alt](url)`) to an engine-readable
+/// file path. `file://` URLs and absolute paths pass through; relative paths
+/// join the chat's cwd; anything else with a scheme (http, data, …) is not
+/// inline-loadable — the app registers no HTTP client — and stays a link.
+pub fn inline_image_path(url: &str, cwd: Option<&str>) -> Option<String> {
+    let url = url.trim();
+    if let Some(path) = url.strip_prefix("file://") {
+        return path.starts_with('/').then(|| path.to_string());
+    }
+    if url.starts_with('/') {
+        return Some(url.to_string());
+    }
+    if url.is_empty()
+        // A scheme before the first slash (`https:`, `data:`, the mend
+        // sentinel `comet:`) means remote/synthetic.
+        || url.split('/').next().is_some_and(|head| head.contains(':'))
+        // `~` only means home on the DEVICE OWNING the file; never guess it.
+        || url.starts_with('~')
+    {
+        return None;
+    }
+    cwd.map(|cwd| format!("{}/{url}", cwd.trim_end_matches('/')))
+}
+
 // ---------------------------------------------------------------------------
 // Preview lightbox (attachment-ui.tsx AttachmentPreviewDialog)
 // ---------------------------------------------------------------------------
@@ -882,5 +906,32 @@ mod tests {
         assert_eq!(retry_delay(2), Duration::from_millis(8_000));
         assert_eq!(retry_delay(3), Duration::from_millis(15_000));
         assert_eq!(retry_delay(9), Duration::from_millis(15_000));
+    }
+
+    #[test]
+    fn inline_image_paths_resolve_local_sources_only() {
+        assert_eq!(
+            inline_image_path("/tmp/shot.png", None).as_deref(),
+            Some("/tmp/shot.png")
+        );
+        assert_eq!(
+            inline_image_path("file:///tmp/shot.png", None).as_deref(),
+            Some("/tmp/shot.png")
+        );
+        // Relative paths anchor on the chat's cwd — and stay links without one.
+        assert_eq!(
+            inline_image_path("shots/a.png", Some("/repo/")).as_deref(),
+            Some("/repo/shots/a.png")
+        );
+        assert_eq!(inline_image_path("shots/a.png", None), None);
+        // Remote/synthetic schemes and home-relative guesses never load.
+        assert_eq!(
+            inline_image_path("https://x.dev/i.png", Some("/repo")),
+            None
+        );
+        assert_eq!(inline_image_path("data:image/png;base64,xx", None), None);
+        assert_eq!(inline_image_path("comet:pending-link", Some("/repo")), None);
+        assert_eq!(inline_image_path("~/shot.png", Some("/repo")), None);
+        assert_eq!(inline_image_path("", Some("/repo")), None);
     }
 }

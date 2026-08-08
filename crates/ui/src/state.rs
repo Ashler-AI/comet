@@ -605,6 +605,11 @@ pub struct AppState {
     scaffold_scope: Option<(String, String)>,
     /// First turns intentionally wait here after the staging sandbox is accepted.
     scaffold_starting_chats: HashSet<String>,
+    /// Chats the user explicitly marked unread. Suppresses the shell's
+    /// "looking at it ⇒ seen" auto-stamp until the user actively re-selects
+    /// the chat, and pins the row unseen against in-flight watch frames that
+    /// still carry the pre-mutate seen stamp.
+    unread_marks: HashSet<String>,
     /// Optimistic user echoes per chat id, shown until the doc frame carrying
     /// the same message id arrives (client-minted ids make dedup exact).
     echoes: HashMap<String, Vec<SessionMessageEntry>>,
@@ -671,6 +676,7 @@ impl AppState {
             scaffold_session_error: None,
             scaffold_scope: None,
             scaffold_starting_chats: HashSet::new(),
+            unread_marks: HashSet::new(),
             echoes: HashMap::new(),
             local_device_id: None,
             update: None,
@@ -694,6 +700,19 @@ impl AppState {
                 .is_some_and(|id| id.starts_with(LEGACY_SCAFFOLD_SPACE_ID_PREFIX))
         });
         sort_chats(&mut chats);
+        // An explicit "mark unread" must survive watch frames that raced the
+        // mutate (they still carry the pre-clear seen stamp). Once the synced
+        // row itself reads unseen, the pin has served its display purpose —
+        // it stays set only to keep suppressing the shell's auto-seen stamp.
+        if !self.unread_marks.is_empty() {
+            self.unread_marks
+                .retain(|id| chats.iter().any(|chat| chat.id == *id));
+            for chat in &mut chats {
+                if self.unread_marks.contains(&chat.id) {
+                    chat.last_seen_at = None;
+                }
+            }
+        }
         self.chats = chats;
         let chats = &self.chats;
         self.local_session_candidates
@@ -1750,6 +1769,8 @@ impl AppState {
     /// (idempotence — no mutate spam), stamps the local row optimistically so
     /// the LWW round-trip is invisible, and fire-and-forgets the mutate.
     pub fn mark_chat_seen(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        // An explicit read releases the "marked unread" pin either way.
+        self.unread_marks.remove(chat_id);
         let Some(chat) = self.chats.iter_mut().find(|c| c.id == chat_id) else {
             return;
         };
@@ -1769,6 +1790,35 @@ impl AppState {
             }
         })
         .detach();
+    }
+
+    /// Explicit "mark as unread": clears the synced seen marker (optimistically
+    /// locally, LWW mutate to every device) and pins the chat against the
+    /// shell's window-active auto-seen stamp until the user re-selects it.
+    pub fn mark_chat_unread(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        let Some(chat) = self.chats.iter_mut().find(|c| c.id == chat_id) else {
+            return;
+        };
+        chat.last_seen_at = None;
+        self.unread_marks.insert(chat_id.to_string());
+        cx.notify();
+        let Some(handle) = self.engine.clone() else {
+            return;
+        };
+        let chat_id = chat_id.to_string();
+        cx.spawn(async move |_, _| {
+            let params = serde_json::json!({ "op": "markChatUnread", "chatId": chat_id });
+            if let Err(err) = handle.client().call(methods::MUTATE, params).await {
+                tracing::warn!(chat = %chat_id, error = %err, "markChatUnread failed");
+            }
+        })
+        .detach();
+    }
+
+    /// True while an explicit "mark unread" is pinned (the shell's
+    /// looking-at-it auto-seen stamp must not clear it).
+    pub fn chat_marked_unread(&self, chat_id: &str) -> bool {
+        self.unread_marks.contains(chat_id)
     }
 }
 

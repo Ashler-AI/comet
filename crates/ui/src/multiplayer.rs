@@ -2,8 +2,7 @@
 //! and activity drawer.
 
 use comet_proto::{
-    AgentSessionSource, AuditResult, ChatIndicator, CollaborationSnapshot, ParticipantState,
-    PublicationValue,
+    AgentSessionSource, AuditResult, CollaborationSnapshot, ParticipantState, PublicationValue,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,16 +41,6 @@ pub const fn source_label(source: AgentSessionSource) -> &'static str {
     match source {
         AgentSessionSource::Local => "Local",
         AgentSessionSource::Scaffold => "Scaffold",
-    }
-}
-
-pub const fn chat_status_label(status: ChatIndicator) -> &'static str {
-    match status {
-        ChatIndicator::Working => "Working",
-        ChatIndicator::AwaitingInput => "Needs input",
-        ChatIndicator::Errored => "Failed",
-        ChatIndicator::Completed => "Complete",
-        ChatIndicator::Idle => "Idle",
     }
 }
 

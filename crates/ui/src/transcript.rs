@@ -1643,6 +1643,92 @@ impl Transcript {
         self.attachment_retries.insert(key, task);
     }
 
+    /// Claim cache loads for every inline `![alt](url)` in a block whose URL
+    /// resolves to an engine-readable path — the render-time [`render::ImageUi`]
+    /// resolver is pure and only ever reads the cache this pre-pass fills.
+    fn claim_inline_images(&mut self, block: &Block, cx: &mut Context<Self>) {
+        fn collect(block: &Block, out: &mut Vec<String>) {
+            match block {
+                Block::Paragraph { runs } => {
+                    out.extend(runs.iter().filter_map(|run| run.style.image.clone()))
+                }
+                Block::BlockQuote { children } => {
+                    children.iter().for_each(|child| collect(child, out))
+                }
+                Block::List { items, .. } => {
+                    items.iter().flatten().for_each(|child| collect(child, out))
+                }
+                _ => {}
+            }
+        }
+        let mut urls = Vec::new();
+        collect(block, &mut urls);
+        if urls.is_empty() {
+            return;
+        }
+        let cwd = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .and_then(|chat| chat.cwd.clone());
+        let device_ids = self.attachment_device_ids(cx);
+        for url in urls {
+            if let Some(path) = crate::attachments::inline_image_path(&url, cwd.as_deref()) {
+                self.attachment_state(&device_ids, &path, cx);
+            }
+        }
+    }
+
+    /// Render-pass image plumbing for markdown rows: a pure cache-snapshot
+    /// resolver (loads were claimed by [`Self::claim_inline_images`]) plus the
+    /// click-to-preview hook.
+    fn inline_image_ui(&self, cx: &mut Context<Self>) -> render::ImageUi {
+        use crate::attachments::{AttachmentSnapshot, attachment_snapshot};
+        let device_ids = self.attachment_device_ids(cx);
+        let cwd = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .and_then(|chat| chat.cwd.clone());
+        let entity = cx.entity().downgrade();
+        render::ImageUi {
+            resolve: Rc::new(move |url| {
+                let path = crate::attachments::inline_image_path(url, cwd.as_deref())?;
+                let mut any_loading = false;
+                let mut min_retry: Option<Duration> = None;
+                for dev in &device_ids {
+                    match attachment_snapshot(dev, &path) {
+                        AttachmentSnapshot::Loaded(image) => {
+                            return Some(AttachmentSnapshot::Loaded(image));
+                        }
+                        AttachmentSnapshot::Loading => any_loading = true,
+                        AttachmentSnapshot::Error { retry_in } => {
+                            min_retry = Some(min_retry.map_or(retry_in, |m| m.min(retry_in)));
+                        }
+                    }
+                }
+                Some(if any_loading {
+                    AttachmentSnapshot::Loading
+                } else {
+                    AttachmentSnapshot::Error {
+                        retry_in: min_retry.unwrap_or(Duration::MAX),
+                    }
+                })
+            }),
+            open: Rc::new(move |image, _, cx| {
+                entity
+                    .update(cx, |transcript, cx| {
+                        transcript.attachment_preview = Some(crate::attachments::PreviewImage {
+                            name: image.name.clone(),
+                            image: image.image.clone(),
+                        });
+                        cx.notify();
+                    })
+                    .ok();
+            }),
+        }
+    }
+
     /// The right-aligned thumbnail strip above a user bubble.
     fn render_user_attachments(
         &mut self,
@@ -1914,17 +2000,19 @@ impl Transcript {
                 column.into_any_element()
             }
             RowKind::Markdown { tree, block_ix } => {
+                let Some(top) = tree.blocks.get(*block_ix) else {
+                    return gpui::Empty.into_any_element();
+                };
+                self.claim_inline_images(&top.block, cx);
                 let opts = RenderOptions {
                     row_key: row.id.clone(),
                     veil: None,
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
+                    image: Some(self.inline_image_ui(cx)),
                 };
                 let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
-                let Some(top) = tree.blocks.get(*block_ix) else {
-                    return gpui::Empty.into_any_element();
-                };
                 render::render_block(
                     &top.block,
                     *block_ix,
@@ -1956,17 +2044,19 @@ impl Transcript {
                         })
                         .clone()
                 });
+                let Some(top) = tree.blocks.get(*block_ix) else {
+                    return gpui::Empty.into_any_element();
+                };
+                self.claim_inline_images(&top.block, cx);
                 let opts = RenderOptions {
                     row_key: row.id.clone(),
                     veil: veil.clone(),
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
+                    image: Some(self.inline_image_ui(cx)),
                 };
                 let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
-                let Some(top) = tree.blocks.get(*block_ix) else {
-                    return gpui::Empty.into_any_element();
-                };
                 let timer = frame_stats_enabled().then(Instant::now);
                 let el = render::render_block(
                     &top.block,

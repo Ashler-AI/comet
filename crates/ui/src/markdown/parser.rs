@@ -26,8 +26,11 @@ pub struct InlineStyle {
     pub italic: bool,
     pub code: bool,
     pub strikethrough: bool,
-    /// Destination URL when inside a link.
+    /// Destination URL when inside a link (images carry theirs here too, so
+    /// contexts that can't paint pixels degrade to a plain link).
     pub link: Option<String>,
+    /// Image source URL (`![alt](url)`); `text` holds the alt.
+    pub image: Option<String>,
     /// TeX math delimited by `$…$` or `$$…$$`.
     pub math: Option<MathStyle>,
 }
@@ -522,8 +525,32 @@ fn parse_inline_event(cur: &mut Cursor, runs: &mut Vec<InlineRun>, style: &Inlin
                 Tag::Emphasis => inner.italic = true,
                 Tag::Strong => inner.bold = true,
                 Tag::Strikethrough => inner.strikethrough = true,
-                Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } => {
+                Tag::Link { dest_url, .. } => {
                     inner.link = Some(dest_url.into_string());
+                }
+                Tag::Image { dest_url, .. } => {
+                    // One run per image: alt text as the payload (styled like a
+                    // link wherever pixels can't render), the URL on the style.
+                    // Alt-less images fall back to the URL's file name so the
+                    // run always has link-fallback text.
+                    let url = dest_url.into_string();
+                    let alt: String = parse_inline_container(cur, &inner)
+                        .iter()
+                        .map(|run| run.text.as_str())
+                        .collect();
+                    let alt = if alt.trim().is_empty() {
+                        image_name_from_url(&url)
+                    } else {
+                        alt
+                    };
+                    let mut s = style.clone();
+                    s.link = Some(url.clone());
+                    s.image = Some(url);
+                    runs.push(InlineRun {
+                        text: alt,
+                        style: s,
+                    });
+                    return;
                 }
                 _ => {}
             }
@@ -545,6 +572,24 @@ fn merge_runs(runs: Vec<InlineRun>) -> Vec<InlineRun> {
         }
     }
     out
+}
+
+/// Display fallback for an alt-less image: the URL's trailing path segment
+/// (query/fragment stripped), or "image" when even that is empty.
+fn image_name_from_url(url: &str) -> String {
+    let tail = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    if tail.is_empty() {
+        "image".into()
+    } else {
+        tail.into()
+    }
 }
 
 fn heading_level(level: HeadingLevel) -> u8 {
@@ -990,6 +1035,38 @@ mod tests {
             .expect("link run");
         assert_eq!(link.text, "zed");
         assert_eq!(link.style.link.as_deref(), Some("https://zed.dev"));
+    }
+
+    #[test]
+    fn images_become_dedicated_runs_with_link_fallback() {
+        let tree = parse_full("shot:\n\n![Steered states](/tmp/shot.png)\n");
+        let Block::Paragraph { runs } = &tree.blocks[1].block else {
+            panic!()
+        };
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].text, "Steered states");
+        assert_eq!(runs[0].style.image.as_deref(), Some("/tmp/shot.png"));
+        // Pixel-less contexts degrade to a link to the same URL.
+        assert_eq!(runs[0].style.link.as_deref(), Some("/tmp/shot.png"));
+
+        // Alt-less images keep a readable run (URL file name).
+        let tree = parse_full("![](/tmp/screens/final.png?raw=1)\n");
+        let Block::Paragraph { runs } = &tree.blocks[0].block else {
+            panic!()
+        };
+        assert_eq!(runs[0].text, "final.png");
+        assert_eq!(
+            runs[0].style.image.as_deref(),
+            Some("/tmp/screens/final.png?raw=1")
+        );
+
+        // Images mixed into prose stay inline runs between text runs.
+        let tree = parse_full("before ![a](/x.png) after\n");
+        let Block::Paragraph { runs } = &tree.blocks[0].block else {
+            panic!()
+        };
+        assert_eq!(runs.len(), 3);
+        assert!(runs[1].style.image.is_some());
     }
 
     #[test]

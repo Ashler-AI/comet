@@ -312,6 +312,8 @@ pub const HOVER_FADE: MotionSpec = MotionSpec::new(150, EASE_TAILWIND);
 pub const COMET_PULSE: MotionSpec = MotionSpec::new(2400, EASE);
 /// Gradient matrix spinner wave period: 750ms.
 pub const GRADIENT_SPIN: MotionSpec = MotionSpec::new(750, EASE);
+/// Session-row status arc spinner: one revolution per 900ms.
+pub const ARC_SPIN: MotionSpec = MotionSpec::new(900, EASE);
 
 // ---------------------------------------------------------------------------
 // Element helpers (paint-layer entrances/exits)
@@ -743,6 +745,7 @@ mod tests {
         assert_eq!(CHEVRON.duration_ms, 200);
         assert_eq!(COMET_PULSE.duration_ms, 2400);
         assert_eq!(GRADIENT_SPIN.duration_ms, 750);
+        assert_eq!(ARC_SPIN.duration_ms, 900);
         assert_eq!(EASE_OUT_EXPO, CubicBezier::new(0.16, 1.0, 0.3, 1.0));
     }
 

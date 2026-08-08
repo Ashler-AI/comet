@@ -15,9 +15,9 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use gpui::{
-    AnyElement, BorderStyle, Bounds, FontStyle, FontWeight, Hsla, InteractiveText, SharedString,
-    StyledText, TextRun, UnderlineStyle, Window, canvas, div, font, point, prelude::*, px, quad,
-    size,
+    AnyElement, BorderStyle, Bounds, FontStyle, FontWeight, Hsla, InteractiveText, ObjectFit,
+    SharedString, StyledText, TextRun, UnderlineStyle, Window, canvas, div, font, img, point,
+    prelude::*, px, quad, size,
 };
 
 use crate::theme::Theme;
@@ -79,7 +79,28 @@ pub struct RenderOptions {
     /// Code-block copy-button plumbing (round 9): `None` renders no button
     /// (previews outside the transcript).
     pub copy: Option<CopyUi>,
+    /// Inline-image plumbing: `None` renders `![alt](url)` as a plain link.
+    pub image: Option<ImageUi>,
 }
+
+/// Inline `![alt](url)` plumbing: the transcript resolves URLs against the
+/// cross-device attachment cache (claiming loads in its own pre-pass) and owns
+/// the full-size preview overlay. `None` (previews outside the transcript)
+/// renders image runs as plain links to the same URL.
+#[derive(Clone)]
+pub struct ImageUi {
+    /// URL → current cache snapshot; `None` means "not renderable inline"
+    /// (remote/unsupported source) and the run stays in the text flow.
+    pub resolve: Rc<ImageResolver>,
+    /// Open the clicked, already-decoded image in the preview overlay.
+    pub open: Rc<ImageOpener>,
+}
+
+/// URL → current cache snapshot (see [`ImageUi::resolve`]).
+pub type ImageResolver = dyn Fn(&str) -> Option<crate::attachments::AttachmentSnapshot>;
+/// Open a decoded image in the host's preview overlay.
+pub type ImageOpener =
+    dyn Fn(crate::attachments::CachedAttachmentImage, &mut Window, &mut gpui::App);
 
 pub type CopyHandler = dyn Fn(usize, SharedString, &mut Window, &mut gpui::App);
 
@@ -101,6 +122,7 @@ impl RenderOptions {
             cache: None,
             now: Instant::now(),
             copy: None,
+            image: None,
         }
     }
 }
@@ -203,16 +225,33 @@ pub fn render_block(
     highlight: CodeHighlight,
 ) -> AnyElement {
     match block {
-        Block::Paragraph { runs } => text_element(
-            runs,
-            MD_TEXT_SIZE,
-            MD_LINE_HEIGHT,
-            false,
-            top_ix,
-            ix,
-            opts,
-            theme,
-        ),
+        Block::Paragraph { runs } => {
+            // Inline images lift out of the text flow into real pixels when
+            // the host wired an [`ImageUi`] and the source resolves; anything
+            // else (previews, remote URLs) stays a link-styled run.
+            let has_images = opts.image.as_ref().is_some_and(|ui| {
+                runs.iter().any(|run| {
+                    run.style
+                        .image
+                        .as_deref()
+                        .is_some_and(|url| (ui.resolve)(url).is_some())
+                })
+            });
+            if has_images {
+                paragraph_with_images(runs, top_ix, ix, opts, theme)
+            } else {
+                text_element(
+                    runs,
+                    MD_TEXT_SIZE,
+                    MD_LINE_HEIGHT,
+                    false,
+                    top_ix,
+                    ix,
+                    opts,
+                    theme,
+                )
+            }
+        }
         Block::Heading { level, runs } => {
             let (size, line) = heading_metrics(*level);
             text_element(runs, size, line, true, top_ix, ix, opts, theme)
@@ -333,6 +372,131 @@ pub fn render_block(
             .h(px(1.0))
             .w_full()
             .bg(theme.border)
+            .into_any_element(),
+    }
+}
+
+/// A paragraph whose image runs resolve to pixels: text segments and images
+/// stack in document order. Segment element ids extend the paragraph's own
+/// discriminator (the nested-block convention), so flatten caches stay unique
+/// per (row, top block, element).
+fn paragraph_with_images(
+    runs: &[super::parser::InlineRun],
+    top_ix: usize,
+    ix: usize,
+    opts: &RenderOptions,
+    theme: &Theme,
+) -> AnyElement {
+    let ui = opts.image.as_ref().expect("checked by caller");
+    let mut parts: Vec<AnyElement> = Vec::new();
+    let mut seg: Vec<super::parser::InlineRun> = Vec::new();
+    let mut child_ix = ix * 100;
+    let flush = |seg: &mut Vec<super::parser::InlineRun>,
+                 parts: &mut Vec<AnyElement>,
+                 child_ix: &mut usize| {
+        if seg.is_empty() {
+            return;
+        }
+        *child_ix += 1;
+        parts.push(text_element(
+            seg,
+            MD_TEXT_SIZE,
+            MD_LINE_HEIGHT,
+            false,
+            top_ix,
+            *child_ix,
+            opts,
+            theme,
+        ));
+        seg.clear();
+    };
+    for run in runs {
+        let resolved = run.style.image.as_deref().and_then(|url| (ui.resolve)(url));
+        match resolved {
+            Some(snapshot) => {
+                flush(&mut seg, &mut parts, &mut child_ix);
+                child_ix += 1;
+                parts.push(inline_image_element(
+                    &run.text, snapshot, child_ix, ui, opts, theme,
+                ));
+            }
+            None => seg.push(run.clone()),
+        }
+    }
+    flush(&mut seg, &mut parts, &mut child_ix);
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .children(parts)
+        .into_any_element()
+}
+
+/// One resolved inline image: the decoded picture at natural size (capped),
+/// a static skeleton while loading, or a dashed "unavailable" chip after the
+/// cache gave up. Clicking a loaded image opens the transcript's preview.
+fn inline_image_element(
+    alt: &str,
+    snapshot: crate::attachments::AttachmentSnapshot,
+    elem_ix: usize,
+    ui: &ImageUi,
+    opts: &RenderOptions,
+    theme: &Theme,
+) -> AnyElement {
+    use crate::attachments::AttachmentSnapshot;
+    match snapshot {
+        AttachmentSnapshot::Loaded(image) => {
+            let open = ui.open.clone();
+            let preview = image.clone();
+            div()
+                .flex()
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "{}-img-{elem_ix}",
+                            opts.row_key
+                        )))
+                        .max_w_full()
+                        .rounded(px(10.0))
+                        .border_1()
+                        .border_color(theme.border)
+                        .overflow_hidden()
+                        .cursor_pointer()
+                        .on_click(move |_, window, cx| (open)(preview.clone(), window, cx))
+                        .child(
+                            img(image.image.clone())
+                                .object_fit(ObjectFit::Contain)
+                                .max_w_full()
+                                .max_h(px(360.0)),
+                        ),
+                )
+                .into_any_element()
+        }
+        // Loading: a fixed-footprint skeleton (the image's own size settles on
+        // decode) — static on purpose, this path has no animation clock.
+        AttachmentSnapshot::Loading => div()
+            .w(px(300.0))
+            .h(px(160.0))
+            .rounded(px(10.0))
+            .border_1()
+            .border_color(crate::theme::hairline(0.08))
+            .bg(crate::theme::ink(0.055))
+            .into_any_element(),
+        AttachmentSnapshot::Error { .. } => div()
+            .flex()
+            .child(
+                div()
+                    .rounded(px(10.0))
+                    .border_1()
+                    .border_dashed()
+                    .border_color(crate::theme::hairline(0.14))
+                    .bg(crate::theme::ink(0.025))
+                    .px(px(12.0))
+                    .py(px(8.0))
+                    .text_size(px(12.0))
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from(format!("{alt} — image unavailable"))),
+            )
             .into_any_element(),
     }
 }

@@ -9,9 +9,12 @@
 //! are paint-local and never move surrounding layout. Reduced motion snaps every
 //! cell to its rest state automatically (gpui `reduce_motion`).
 
-use gpui::{AnyElement, App, EntityId, IntoElement, ParentElement, SharedString, Styled, div, px};
+use gpui::{
+    AnyElement, App, EntityId, Hsla, IntoElement, ParentElement, PathBuilder, SharedString, Styled,
+    canvas, div, point, px,
+};
 
-use crate::motion::{self, COMET_PULSE, GRADIENT_SPIN, PULSE_STAGGER, SPLASH_OUT};
+use crate::motion::{self, ARC_SPIN, COMET_PULSE, GRADIENT_SPIN, PULSE_STAGGER, SPLASH_OUT};
 use crate::theme::Theme;
 
 // Shared with the terminal viewport (`comet_proto::motion`) so both animate the
@@ -184,6 +187,45 @@ pub fn mini_gradient_spinner(
         }))
 }
 
+/// The thin activity arc for the session rows' top-right status slot (the
+/// macOS-style open ring in the reference shot): a hairline 300° stroke
+/// rotating once per [`ARC_SPIN`] period, phase-locked on the shared pulse
+/// clock. Reduced motion paints the arc static.
+pub fn arc_spinner(color: Hsla, diameter: f32, view: EntityId, cx: &mut App) -> impl IntoElement {
+    let phase = motion::pulse_delta(&ARC_SPIN, view, cx);
+    let stroke = 1.5f32;
+    div().size(px(diameter)).flex_none().child(canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let r = diameter / 2.0 - stroke / 2.0;
+            let center = bounds.center();
+            let at = |angle: f32| {
+                point(
+                    center.x + px(r * angle.cos()),
+                    center.y + px(r * angle.sin()),
+                )
+            };
+            let start = phase * std::f32::consts::TAU;
+            let sweep = std::f32::consts::TAU * (300.0 / 360.0);
+            let mut pb = PathBuilder::stroke(px(stroke));
+            pb.move_to(at(start));
+            // Two half-sweep segments keep each SVG arc under 180° — no
+            // large-arc flag ambiguity.
+            pb.arc_to(
+                point(px(r), px(r)),
+                px(0.0),
+                false,
+                true,
+                at(start + sweep / 2.0),
+            );
+            pb.arc_to(point(px(r), px(r)), px(0.0), false, true, at(start + sweep));
+            if let Ok(path) = pb.build() {
+                window.paint_path(path, color);
+            }
+        },
+    ))
+}
+
 /// Full-window boot splash (comet App.tsx `Splash`): the animated comet mark
 /// (`h-16`) over the app background with an uppercase tracked "Loading" line.
 /// While `fading` it plays `splash-out` (150ms hold, then 0.5s fade + 6px
@@ -224,6 +266,7 @@ const _: () = {
     assert!(SPLASH_OUT.delay_ms == 150);
     assert!(COMET_PULSE.duration_ms == 2400);
     assert!(GRADIENT_SPIN.duration_ms == 750);
+    assert!(ARC_SPIN.duration_ms == 900);
 };
 
 #[cfg(test)]

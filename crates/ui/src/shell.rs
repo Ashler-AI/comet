@@ -362,8 +362,8 @@ pub fn resort_offsets(
 /// chrome only, never the type scale or the information shown.
 fn chat_row_height(density: Density) -> f32 {
     match density {
-        Density::Compact => 76.0,
-        Density::Comfortable => 88.0,
+        Density::Compact => 57.0,
+        Density::Comfortable => 66.0,
     }
 }
 
@@ -530,16 +530,9 @@ fn local_session_age(updated_at: i64, now: chrono::DateTime<Utc>) -> String {
 }
 
 #[derive(Debug, Clone)]
-struct SidebarParticipant {
-    name: SharedString,
-    state: comet_proto::ParticipantState,
-}
-
-#[derive(Debug, Clone)]
 struct SidebarSessionMeta {
     source: comet_proto::AgentSessionSource,
     runtime_model: SharedString,
-    participants: Vec<SidebarParticipant>,
 }
 /// Flex gap between sidebar list items.
 const SIDEBAR_LIST_GAP: f32 = 2.0;
@@ -3225,9 +3218,11 @@ impl Shell {
             .into_any_element()
     }
 
-    /// Rich session row: room context, title, source/runtime/model, participant
-    /// presence, status, and recent activity. The row retains the same content
-    /// at both density settings; compact only tightens the vertical insets.
+    /// Rich session row: room context, title, source/runtime/model, and the
+    /// top-right status slot — a spinner while the agent works, an attention
+    /// dot when it finished or needs input, otherwise the recency label. The
+    /// row retains the same content at both density settings; compact only
+    /// tightens the vertical insets.
     #[allow(clippy::too_many_arguments)]
     fn render_chat_row(
         &self,
@@ -3242,7 +3237,6 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let dot_color = spaces::status_dot_color(status, theme);
         let subline = theme.text_muted.opacity(0.66);
         let history_source = self
             .state
@@ -3253,56 +3247,9 @@ impl Shell {
             .and_then(|chat| {
                 imported_chat_history_source(&chat.id, chat.harness_session_id.as_deref())
             });
-        let status_label = if history_source.is_some() {
-            "Imported"
-        } else {
-            crate::multiplayer::chat_status_label(status)
-        };
         let source_label =
             history_source.unwrap_or_else(|| crate::multiplayer::source_label(meta.source));
-        let participant_count = meta.participants.len();
         let compact = self.settings.density == Density::Compact;
-        let avatar_size = if compact { 18.0 } else { 20.0 };
-        let avatars = meta
-            .participants
-            .iter()
-            .take(3)
-            .enumerate()
-            .map(|(ix, participant)| {
-                let initials = crate::multiplayer::initials(participant.name.as_ref());
-                let presence = match participant.state {
-                    comet_proto::ParticipantState::Active => theme.success,
-                    comet_proto::ParticipantState::Idle => theme.warning,
-                    comet_proto::ParticipantState::Disconnected => theme.text_faint,
-                };
-                div()
-                    .id(SharedString::from(format!("chat-{id}-participant-{ix}")))
-                    .relative()
-                    .when(ix > 0, |el| el.ml(px(-4.0)))
-                    .size(px(avatar_size))
-                    .rounded_full()
-                    .border_1()
-                    .border_color(theme.surface)
-                    .bg(theme.surface_raised)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(8.5))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.text_muted)
-                    .child(SharedString::from(initials))
-                    .child(
-                        div()
-                            .absolute()
-                            .right(px(-1.0))
-                            .bottom(px(-1.0))
-                            .size(px(5.0))
-                            .rounded_full()
-                            .border_1()
-                            .border_color(theme.surface)
-                            .bg(presence),
-                    )
-            });
         let (hover, text) = (theme.glass_hover(), theme.text);
         let selected_wash = crate::theme::glass_selected_bg();
         let select_id = id.clone();
@@ -3315,24 +3262,38 @@ impl Shell {
         };
         let hover_bg = if selected { selected_wash } else { hover };
         let rest_text = if selected { text } else { text.opacity(0.8) };
-        let status_text = div()
-            .text_size(px(10.0))
-            .text_color(if status == comet_proto::ChatIndicator::Errored {
-                theme.danger
-            } else {
-                subline
-            })
-            .child(SharedString::from(status_label));
-        let status_text = if status == comet_proto::ChatIndicator::Working {
-            status_text
-                .with_animation(
-                    SharedString::from(format!("chat-working-text-{id}")),
-                    motion::COMET_PULSE.animation().repeat(),
-                    |el, t| el.opacity(0.66 + 0.34 * t),
-                )
-                .into_any_element()
-        } else {
-            status_text.into_any_element()
+        // Top-right status slot (reference shot): Working spins the thin arc,
+        // finished-unseen / awaiting-input / errored raise the attention dot,
+        // Idle keeps the plain recency label.
+        let status_slot: AnyElement = match status {
+            // 9px ring nudged 1px down: its top edge lands 3px into the 13px
+            // band — the same inset as the attention dot — instead of hugging
+            // the card's top border (user report).
+            comet_proto::ChatIndicator::Working => div()
+                .mt(px(1.0))
+                .child(crate::loaders::arc_spinner(
+                    theme.text_muted.opacity(0.8),
+                    9.0,
+                    cx.entity_id(),
+                    cx,
+                ))
+                .into_any_element(),
+            // One attention blue for every finished/needs-you state (reference
+            // shot) — errored included; the transcript's error chip carries
+            // the red. 7px in the 13px slot keeps whole-pixel centering.
+            comet_proto::ChatIndicator::AwaitingInput
+            | comet_proto::ChatIndicator::Completed
+            | comet_proto::ChatIndicator::Errored => div()
+                .size(px(7.0))
+                .rounded_full()
+                .bg(theme.attention)
+                .into_any_element(),
+            comet_proto::ChatIndicator::Idle => div()
+                .text_size(px(10.5))
+                .line_height(px(13.0))
+                .text_color(subline)
+                .child(time_ago)
+                .into_any_element(),
         };
         div()
             .id(SharedString::from(format!("chat-{id}")))
@@ -3382,11 +3343,14 @@ impl Shell {
                             .child(space_name),
                     )
                     .child(
+                        // Fixed to the header line's 13px so dot/spinner/label
+                        // all center on the same baseline band.
                         div()
                             .flex_none()
-                            .text_size(px(10.5))
-                            .text_color(subline)
-                            .child(time_ago),
+                            .h(px(13.0))
+                            .flex()
+                            .items_center()
+                            .child(status_slot),
                     ),
             )
             .child(
@@ -3438,35 +3402,6 @@ impl Shell {
                                     .child(branch),
                             )
                     }),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .child(div().flex().items_center().children(avatars))
-                    .child(
-                        div()
-                            .ml(px(Theme::SPACE_XS))
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(10.0))
-                            .text_color(subline)
-                            .child(SharedString::from(match participant_count {
-                                0 => "No one here".into(),
-                                1 => "1 participant".into(),
-                                count => format!("{count} participants"),
-                            })),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(Theme::SPACE_XS))
-                            .child(div().size(px(6.0)).rounded_full().bg(dot_color))
-                            .child(status_text),
-                    ),
             )
             .into_any_element()
     }
@@ -5733,13 +5668,18 @@ impl Shell {
             let rename_id = chat_id.clone();
             let archive_id = chat_id.clone();
             let delete_id = chat_id.clone();
-            let is_settled = self
-                .state
-                .read(cx)
-                .chats
-                .iter()
-                .find(|chat| chat.id == chat_id)
-                .is_some_and(|chat| chat.archived);
+            let unread_id = chat_id.clone();
+            let (is_settled, unread_toggle) = {
+                let state = self.state.read(cx);
+                let chat = state.chats.iter().find(|chat| chat.id == chat_id);
+                (
+                    chat.is_some_and(|chat| chat.archived),
+                    // Unread only exists relative to activity: rows without a
+                    // message yet offer neither direction of the toggle.
+                    chat.filter(|chat| chat.last_message_at.is_some())
+                        .map(|chat| chat.unseen()),
+                )
+            };
             let menu = popover::popover_card(&theme)
                 .w(px(170.0))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -5770,6 +5710,45 @@ impl Shell {
                                     .text_color(theme.text_muted),
                             )
                             .child(SharedString::from("Settle")),
+                    )
+                })
+                .when_some(unread_toggle, |menu, unseen| {
+                    menu.child(
+                        popover::menu_row(&theme, false, format!("chat-menu-unread-{chat_id}"))
+                            .id("chat-menu-unread")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.chat_menu = None;
+                                this.state.update(cx, |state, cx| {
+                                    if unseen {
+                                        state.mark_chat_seen(&unread_id, cx);
+                                    } else {
+                                        state.mark_chat_unread(&unread_id, cx);
+                                    }
+                                });
+                                cx.notify();
+                            }))
+                            // The dot the action raises (or clears) is its own
+                            // best icon — accent-filled for "mark as unread",
+                            // hollow for "mark as read".
+                            .child(
+                                div()
+                                    .size(px(16.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(div().size(px(7.0)).rounded_full().map(|dot| {
+                                        if unseen {
+                                            dot.border_1().border_color(theme.text_muted)
+                                        } else {
+                                            dot.bg(theme.attention)
+                                        }
+                                    })),
+                            )
+                            .child(SharedString::from(if unseen {
+                                "Mark as read"
+                            } else {
+                                "Mark as unread"
+                            })),
                     )
                 })
                 .child(popover::menu_separator())
@@ -7696,7 +7675,9 @@ impl Render for Shell {
                     let unseen_selected = {
                         let s = self.state.read(cx);
                         s.selected_chat_row()
-                            .filter(|c| c.unseen())
+                            // An explicit "mark as unread" pin outranks the
+                            // looking-at-it stamp until the user re-selects.
+                            .filter(|c| c.unseen() && !s.chat_marked_unread(&c.id))
                             .map(|c| c.id.clone())
                     };
                     if let Some(chat_id) = unseen_selected {

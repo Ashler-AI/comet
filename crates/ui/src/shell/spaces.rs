@@ -951,37 +951,6 @@ impl Shell {
                                 .and_then(|config| config.model.as_deref())
                         });
                     let runtime_model = crate::multiplayer::runtime_model(runtime, model).into();
-                    let mut participants: Vec<super::SidebarParticipant> =
-                        if state.selected_chat.as_deref() == Some(chat.id.as_str()) {
-                            state
-                                .participants()
-                                .iter()
-                                .map(|participant| super::SidebarParticipant {
-                                    name: participant
-                                        .display_name
-                                        .clone()
-                                        .unwrap_or_else(|| participant.principal_subject.clone())
-                                        .into(),
-                                    state: participant.state,
-                                })
-                                .collect()
-                        } else {
-                            Vec::new()
-                        };
-                    if participants.is_empty() {
-                        participants.push(super::SidebarParticipant {
-                            name: state
-                                .device_name(&chat.device_id)
-                                .unwrap_or("Session owner")
-                                .to_string()
-                                .into(),
-                            state: if state.device_online(&chat.device_id, now) {
-                                comet_proto::ParticipantState::Active
-                            } else {
-                                comet_proto::ParticipantState::Disconnected
-                            },
-                        });
-                    }
                     (
                         status,
                         chat,
@@ -990,7 +959,6 @@ impl Shell {
                         super::SidebarSessionMeta {
                             source,
                             runtime_model,
-                            participants,
                         },
                     )
                 })

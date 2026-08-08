@@ -298,6 +298,18 @@ impl Harness for MockHarness {
             )
             .into(),
         });
+        // Dev/testing knob: `COMET_MOCK_IMAGE=/abs/path.png` appends an inline
+        // markdown image (plus a remote URL that must stay a link) — for
+        // checking the transcript's inline-image rendering.
+        let image_event = std::env::var("COMET_MOCK_IMAGE")
+            .ok()
+            .filter(|v| !v.is_empty() && v != "0")
+            .map(|path| AgentEvent::TextDelta {
+                text: format!(
+                    "\n### Screenshot\n\n![Steered and queued followup states]({path})\n\n\
+                     Remote sources stay links: ![remote](https://example.com/i.png)\n\n"
+                ),
+            });
         // With the code knob, also exercise a MULTILINE Exec command — the
         // round-9 chip breaker shape ("set -e\nfixture_in_original=0"): the
         // Run chip must stay one 30px line.
@@ -329,6 +341,7 @@ impl Harness for MockHarness {
             .chain(table_event)
             .chain(mend_event)
             .chain(mermaid_event)
+            .chain(image_event)
             .chain(error_event)
             .chain(tail.iter().cloned())
             .map(Ok)
