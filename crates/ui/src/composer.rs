@@ -4601,17 +4601,23 @@ impl Composer {
                 if let Some(scope) = scaffold_scope {
                     let wait_started = Instant::now();
                     let mut sandbox_id = None;
+                    let mut pending_attachment = None;
                     let mut last_error = None;
-                    let launch = crate::state::create_scaffold_session(&engine, &scope);
+                    let launch =
+                        crate::state::create_and_attach_scaffold_session(&engine, &scope);
                     let deadline = cx.background_executor().timer(SCAFFOLD_DEMO_WAIT);
                     futures::pin_mut!(launch);
                     match futures::future::select(launch, deadline).await {
-                        futures::future::Either::Left((Ok(created_id), _)) => {
+                        futures::future::Either::Left((
+                            Ok((created_id, attachment)),
+                            _,
+                        )) => {
                             tracing::info!(
                                 sandbox_id = %created_id,
                                 "Scaffold sandbox launched; waiting for remote Comet"
                             );
                             sandbox_id = Some(created_id);
+                            pending_attachment = Some(attachment);
                         }
                         futures::future::Either::Left((Err(error), _)) => {
                             last_error = Some(error.to_string());
@@ -4622,7 +4628,9 @@ impl Composer {
                         }
                     }
 
-                    if let Some(created_id) = sandbox_id.as_deref() {
+                    if let (Some(created_id), Some(attachment)) =
+                        (sandbox_id.as_deref(), pending_attachment.as_ref())
+                    {
                         loop {
                             let remaining =
                                 SCAFFOLD_DEMO_WAIT.saturating_sub(wait_started.elapsed());
@@ -4663,55 +4671,30 @@ impl Composer {
                                     }
                                 };
                             if ready {
-                                let remaining =
-                                    SCAFFOLD_DEMO_WAIT.saturating_sub(wait_started.elapsed());
-                                if remaining.is_zero() {
+                                let Some(actor_device_id) = local_device_id.clone() else {
+                                    last_error = Some("Local device unavailable".into());
                                     break;
-                                }
-                                let attach = crate::state::attach_scaffold_session(
-                                    &engine,
-                                    created_id,
-                                    scope.clone(),
+                                };
+                                host_device_id = Some(attachment.owner_device_id.clone());
+                                control_route = Some(ControlRoute {
+                                    session_id: attachment.projection.session_id.clone(),
+                                    owner_device_id: attachment.owner_device_id.clone(),
+                                    actor_device_id,
+                                    actor_subject: attachment.actor_subject.clone(),
+                                    grant_id: attachment.grant_id.clone(),
+                                    source: AgentSessionSource::Scaffold,
+                                });
+                                this.update(cx, |composer, cx| {
+                                    composer.state.update(cx, |state, cx| {
+                                        state.install_scaffold_session(attachment, cx);
+                                    });
+                                })
+                                .ok();
+                                scaffold_attached = true;
+                                tracing::info!(
+                                    sandbox_id = %created_id,
+                                    "Scaffold sandbox ready; routing prompt remotely"
                                 );
-                                let deadline = cx.background_executor().timer(remaining);
-                                futures::pin_mut!(attach);
-                                match futures::future::select(attach, deadline).await {
-                                    futures::future::Either::Left((Ok(attachment), _)) => {
-                                        let Some(actor_device_id) = local_device_id.clone() else {
-                                            last_error = Some("Local device unavailable".into());
-                                            break;
-                                        };
-                                        host_device_id = Some(attachment.owner_device_id.clone());
-                                        control_route = Some(ControlRoute {
-                                            session_id: attachment.projection.session_id.clone(),
-                                            owner_device_id: attachment.owner_device_id.clone(),
-                                            actor_device_id,
-                                            actor_subject: attachment.actor_subject.clone(),
-                                            grant_id: attachment.grant_id.clone(),
-                                            source: AgentSessionSource::Scaffold,
-                                        });
-                                        this.update(cx, |composer, cx| {
-                                            composer.state.update(cx, |state, cx| {
-                                                state.install_scaffold_session(&attachment, cx);
-                                            });
-                                        })
-                                        .ok();
-                                        scaffold_attached = true;
-                                        tracing::info!(
-                                            sandbox_id = %created_id,
-                                            "Scaffold sandbox ready; routing prompt remotely"
-                                        );
-                                    }
-                                    futures::future::Either::Left((Err(error), _)) => {
-                                        last_error = Some(error.to_string());
-                                    }
-                                    futures::future::Either::Right(_) => {
-                                        last_error = Some(
-                                            "Scaffold attach exceeded the readiness deadline"
-                                                .into(),
-                                        );
-                                    }
-                                }
                                 break;
                             }
                             let remaining =

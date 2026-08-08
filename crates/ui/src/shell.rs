@@ -636,6 +636,9 @@ struct AnnotationInspector {
     is_new: bool,
     input: Entity<ComposerInput>,
     error: Option<SharedString>,
+    /// Window-space origin for a compact transcript-selection comment pop-up.
+    /// Other annotation entry points keep using the full inspector drawer.
+    popup_origin: Option<Point<Pixels>>,
 }
 
 fn right_drawer_overlay(viewport: gpui::Size<Pixels>, drawer: impl IntoElement) -> AnyElement {
@@ -1518,7 +1521,7 @@ impl Shell {
             resolved_at: None,
             unknown: Default::default(),
         });
-        let input = cx.new(|cx| ComposerInput::new("Add a note…", cx));
+        let input = cx.new(|cx| ComposerInput::new("Add a comment…", cx));
         input.update(cx, |input, cx| input.set_text(annotation.body.clone(), cx));
         self.annotation_inspector = Some(AnnotationInspector {
             annotation,
@@ -1526,6 +1529,7 @@ impl Shell {
             is_new,
             input,
             error: None,
+            popup_origin: None,
         });
         self.annotation_focus_pending = true;
         self.activity_open = false;
@@ -1551,6 +1555,7 @@ impl Shell {
         &mut self,
         message_id: String,
         exact: String,
+        popup_origin: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
         self.open_annotation_anchor(
@@ -1560,6 +1565,9 @@ impl Shell {
             },
             cx,
         );
+        if let Some(inspector) = self.annotation_inspector.as_mut() {
+            inspector.popup_origin = Some(popup_origin);
+        }
     }
 
     fn append_annotation_to_prompt(
@@ -1595,7 +1603,7 @@ impl Shell {
         let body = inspector.input.read(cx).text().trim().to_string();
         if body.is_empty() {
             if let Some(inspector) = self.annotation_inspector.as_mut() {
-                inspector.error = Some("Enter a note".into());
+                inspector.error = Some("Enter a comment".into());
             }
             cx.notify();
             return;
@@ -1613,7 +1621,7 @@ impl Shell {
         let (action, label) = if is_new {
             (
                 SessionControlAction::AnnotationCreate { annotation },
-                "Add note",
+                "Add comment",
             )
         } else {
             (
@@ -1622,7 +1630,7 @@ impl Shell {
                     body: Some(body),
                     anchor: None,
                 },
-                "Edit note",
+                "Edit comment",
             )
         };
         self.queue_control(session, action, label, cx);
@@ -1648,9 +1656,9 @@ impl Shell {
                 resolved,
             },
             if resolved {
-                "Resolve note"
+                "Resolve comment"
             } else {
-                "Reopen note"
+                "Reopen comment"
             },
             cx,
         );
@@ -4484,11 +4492,165 @@ impl Shell {
         popover::modal("command-palette", viewport, card)
     }
 
+    fn render_selection_annotation_popover(
+        &mut self,
+        viewport: gpui::Size<Pixels>,
+        popup_origin: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let theme = Theme::of(cx).clone();
+        let inspector = self.annotation_inspector.as_ref()?;
+        let selected = inspector.annotation.clone();
+        let input = inspector.input.clone();
+        let is_new = inspector.is_new;
+        let error = inspector.error.clone();
+        let can_annotate = self
+            .state
+            .read(cx)
+            .has_collaboration_capability(comet_proto::CAPABILITY_SESSION_ANNOTATE);
+        let exact = selected
+            .anchor
+            .exact
+            .as_deref()
+            .map(str::trim)
+            .filter(|exact| !exact.is_empty())
+            .map(SharedString::from);
+        let prompt_annotation = selected.clone();
+        let width = px((f32::from(viewport.width) - 24.0).clamp(240.0, 340.0));
+
+        let card = popover::popover_card(&theme)
+            .id("selection-comment-popover")
+            .w(width)
+            .p(px(0.0))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.annotation_inspector = None;
+                cx.notify();
+            }))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" {
+                    this.annotation_inspector = None;
+                    cx.notify();
+                }
+            }))
+            .child(
+                div()
+                    .h(px(40.0))
+                    .px(px(Theme::SPACE_MD))
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .flex()
+                    .items_center()
+                    .text_size(px(13.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(SharedString::from("Comment")),
+            )
+            .when_some(exact, |card, exact| {
+                card.child(
+                    div()
+                        .mx(px(Theme::SPACE_MD))
+                        .mt(px(Theme::SPACE_MD))
+                        .max_h(px(58.0))
+                        .overflow_hidden()
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.surface_raised)
+                        .px(px(Theme::SPACE_SM))
+                        .py(px(Theme::SPACE_XS))
+                        .text_size(px(11.0))
+                        .line_height(px(16.0))
+                        .text_color(theme.text_muted)
+                        .child(exact),
+                )
+            })
+            .child(
+                div()
+                    .px(px(Theme::SPACE_MD))
+                    .pt(px(Theme::SPACE_MD))
+                    .when(can_annotate, |body| {
+                        body.child(
+                            popover::dialog_field(input.into_any_element())
+                                .min_h(px(72.0))
+                                .items_start(),
+                        )
+                    })
+                    .when(!can_annotate, |body| {
+                        body.child(
+                            div()
+                                .text_size(px(12.0))
+                                .line_height(px(18.0))
+                                .text_color(theme.text)
+                                .child(SharedString::from(selected.body.clone())),
+                        )
+                    })
+                    .when_some(error, |body, error| {
+                        body.child(
+                            div()
+                                .mt(px(Theme::SPACE_XS))
+                                .text_size(px(11.0))
+                                .text_color(theme.danger)
+                                .child(error),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .px(px(Theme::SPACE_MD))
+                    .py(px(Theme::SPACE_MD))
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(Theme::SPACE_SM))
+                    .when(!is_new, |actions| {
+                        actions.child(
+                            popover::btn_ghost(&theme, "Add to prompt", "selection-comment-prompt")
+                                .id("selection-comment-prompt")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.append_annotation_to_prompt(
+                                        prompt_annotation.clone(),
+                                        window,
+                                        cx,
+                                    )
+                                })),
+                        )
+                    })
+                    .child(
+                        popover::btn_ghost(&theme, "Cancel", "selection-comment-cancel")
+                            .id("selection-comment-cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.annotation_inspector = None;
+                                cx.notify();
+                            })),
+                    )
+                    .when(can_annotate, |actions| {
+                        actions.child(
+                            popover::btn_primary(&theme, if is_new { "Comment" } else { "Save" })
+                                .id("annotation-save")
+                                .on_click(cx.listener(|this, _, _, cx| this.save_annotation(cx))),
+                        )
+                    }),
+            )
+            .into_any_element();
+
+        Some(popover::menu_at(
+            "selection-comment-popover-layer",
+            popup_origin,
+            card,
+        ))
+    }
+
     fn render_annotation_inspector(
         &mut self,
         viewport: gpui::Size<Pixels>,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        if let Some(popup_origin) = self
+            .annotation_inspector
+            .as_ref()
+            .and_then(|inspector| inspector.popup_origin)
+        {
+            return self.render_selection_annotation_popover(viewport, popup_origin, cx);
+        }
         let theme = Theme::of(cx).clone();
         let inspector = self.annotation_inspector.as_ref()?;
         let selected = inspector.annotation.clone();
@@ -4717,9 +4879,9 @@ impl Shell {
                             .child(SharedString::from(if !can_annotate {
                                 "View only"
                             } else if is_new {
-                                "Add note"
+                                "Add comment"
                             } else {
-                                "Edit note"
+                                "Edit comment"
                             })),
                     )
                     .when(can_annotate, |el| el.child(input))
@@ -4817,7 +4979,12 @@ impl Shell {
                 .hover(|style| style.bg(theme.surface_raised_hover))
                 .on_mouse_down(MouseButton::Left, stop_selection_action_mouse_down)
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.open_selection_annotation(message_id.clone(), exact.clone(), cx)
+                    this.open_selection_annotation(
+                        message_id.clone(),
+                        exact.clone(),
+                        gpui::point(px(left), px(top + 38.0)),
+                        cx,
+                    )
                 }))
                 .child(
                     icon(icons::CHAT_ROUND_LINE)
@@ -6638,13 +6805,14 @@ mod tests {
 
     struct SelectionCommentActionProbe {
         parent_mouse_down: Rc<Cell<bool>>,
-        action_clicked: Rc<Cell<bool>>,
+        popover_open: Rc<Cell<bool>>,
     }
 
     impl Render for SelectionCommentActionProbe {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             let parent_mouse_down = self.parent_mouse_down.clone();
-            let action_clicked = self.action_clicked.clone();
+            let popover_open = self.popover_open.clone();
+            let is_open = self.popover_open.get();
             div()
                 .size_full()
                 .on_mouse_down(MouseButton::Left, move |_, _, _| {
@@ -6659,10 +6827,21 @@ mod tests {
                         .top(px(100.0))
                         .size(px(120.0))
                         .on_mouse_down(MouseButton::Left, stop_selection_action_mouse_down)
-                        .on_click(move |_, _, _| {
-                            action_clicked.set(true);
+                        .on_click(move |_, window, _| {
+                            popover_open.set(true);
+                            window.refresh();
                         }),
                 )
+                .when(is_open, |root| {
+                    root.child(popover::menu_at(
+                        "selection-comment-popover-probe",
+                        gpui::point(px(100.0), px(138.0)),
+                        div()
+                            .debug_selector(|| "SELECTION_COMMENT_POPOVER".into())
+                            .size(px(160.0))
+                            .into_any_element(),
+                    ))
+                })
         }
     }
 
@@ -6681,15 +6860,18 @@ mod tests {
     }
 
     #[gpui::test]
-    fn selection_comment_action_survives_ancestor_mouse_down(cx: &mut gpui::TestAppContext) {
+    fn selection_comment_action_opens_popover_without_clearing_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| Theme::install(crate::theme::Appearance::Dark, cx));
         let parent_mouse_down = Rc::new(Cell::new(false));
-        let action_clicked = Rc::new(Cell::new(false));
+        let popover_open = Rc::new(Cell::new(false));
         let window = cx.open_window(gpui::size(px(400.0), px(300.0)), {
             let parent_mouse_down = parent_mouse_down.clone();
-            let action_clicked = action_clicked.clone();
+            let popover_open = popover_open.clone();
             move |_, _| SelectionCommentActionProbe {
                 parent_mouse_down,
-                action_clicked,
+                popover_open,
             }
         });
         cx.run_until_parked();
@@ -6701,9 +6883,10 @@ mod tests {
         cx.simulate_click(bounds.center(), gpui::Modifiers::default());
         cx.run_until_parked();
 
+        assert!(popover_open.get(), "comment action should open its popover");
         assert!(
-            action_clicked.get(),
-            "comment action should receive the click"
+            cx.debug_bounds("SELECTION_COMMENT_POPOVER").is_some(),
+            "comment popover should render after the action is clicked"
         );
         assert!(
             !parent_mouse_down.get(),

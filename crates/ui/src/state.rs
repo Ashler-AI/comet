@@ -495,6 +495,17 @@ pub(crate) async fn attach_scaffold_session(
         actor_subject: attached.environment.owner_principal,
     })
 }
+/// Create the sandbox and immediately dispatch its supervised Comet bootstrap.
+/// Runtime readiness depends on this attachment, so callers must not wait for
+/// `Ready` before attaching.
+pub(crate) async fn create_and_attach_scaffold_session(
+    handle: &EngineHandle,
+    scope: &CollaborationScope,
+) -> Result<(String, ScaffoldSessionAttachment), RpcError> {
+    let sandbox_id = create_scaffold_session(handle, scope).await?;
+    let attachment = attach_scaffold_session(handle, &sandbox_id, scope.clone()).await?;
+    Ok((sandbox_id, attachment))
+}
 
 /// Root application state. Reducer methods (`apply_*`, [`Self::session_for`], …)
 /// are plain `&mut self` functions so tests construct the struct directly; gpui
@@ -1241,6 +1252,18 @@ impl AppState {
     pub fn scaffold_session_creating(&self) -> bool {
         self.scaffold_session_creating
     }
+    fn select_pending_scaffold_chat(
+        &mut self,
+        draft: ScaffoldSessionDraft,
+        cx: &mut Context<Self>,
+    ) {
+        let chat_id = draft.chat_id.clone();
+        self.pending_scaffold_session = Some(draft);
+        self.mark_chat_pending(&chat_id);
+        // `select_chat` keeps pending Scaffold drafts unopened until Attach
+        // returns their exact room projection.
+        self.select_chat(Some(chat_id), cx);
+    }
 
     /// Create one local Comet session under the selected folder. No Scaffold
     /// environment RPC is made until this exact session sends its first prompt.
@@ -1282,16 +1305,15 @@ impl AppState {
             let _ = this.update(cx, |state, cx| {
                 state.scaffold_session_creating = false;
                 match result {
-                    Ok(_) => {
-                        state.pending_scaffold_session = Some(ScaffoldSessionDraft {
+                    Ok(_) => state.select_pending_scaffold_chat(
+                        ScaffoldSessionDraft {
                             project_id,
                             deployment_id,
                             space_id,
-                            chat_id: chat_id.clone(),
-                        });
-                        state.mark_chat_pending(&chat_id);
-                        state.select_chat(Some(chat_id), cx);
-                    }
+                            chat_id,
+                        },
+                        cx,
+                    ),
                     Err(err) => {
                         tracing::warn!(error = %err, "Scaffold Comet session creation failed");
                         state.scaffold_session_error =
@@ -1550,6 +1572,10 @@ impl AppState {
         }
         if let (Some(chat_id), Some(handle)) = (chat_id, self.engine.clone())
             && !self.scaffold_starting_chats.contains(&chat_id)
+            && !self
+                .pending_scaffold_session
+                .as_ref()
+                .is_some_and(|draft| draft.chat_id == chat_id)
         {
             let projection = self.room_projections.get(&chat_id).cloned();
             self.transcript_task = Some(spawn_transcript_watch(
@@ -1899,8 +1925,11 @@ mod tests {
     // `SessionStatus` is only needed to build the fixtures below — the module
     // itself derives everything through `comet_proto::view`.
     use comet_proto::{SessionStatus, UserProfile};
+    use std::sync::Mutex as StdMutex;
 
-    struct ReadyScaffoldRpc;
+    struct ReadyScaffoldRpc {
+        operations: Arc<StdMutex<Vec<String>>>,
+    }
 
     #[async_trait::async_trait]
     impl RpcService for ReadyScaffoldRpc {
@@ -1914,17 +1943,26 @@ mod tests {
                 .get("operation")
                 .and_then(serde_json::Value::as_str)
                 .expect("typed Scaffold operation");
+            self.operations
+                .lock()
+                .expect("Scaffold operation log")
+                .push(operation.to_string());
             let scope = params.get("scope").expect("Scaffold scope");
             let session_id = scope
                 .get("sessionId")
                 .and_then(serde_json::Value::as_str)
                 .expect("session id");
+            let lifecycle = if operation == "inspect" {
+                "ready"
+            } else {
+                "starting"
+            };
             let environment = serde_json::json!({
                 "source": {
                     "kind": "scaffold",
                     "sandbox_id": "sandbox-ready",
                     "region": "default",
-                    "lifecycle": "ready",
+                    "lifecycle": lifecycle,
                     "links": {}
                 },
                 "ownerPrincipal": "accounts.google.com:ready@example.com",
@@ -1992,8 +2030,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ready_scaffold_lifecycle_produces_a_valid_remote_route() {
-        let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc);
+    async fn scaffold_attaches_while_starting_before_readiness_inspection() {
+        let operations = Arc::new(StdMutex::new(Vec::new()));
+        let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
+            operations: Arc::clone(&operations),
+        });
         let handle = EngineHandle {
             inner: Arc::new(RemoteEngine {
                 client: memory_client(service),
@@ -2007,17 +2048,30 @@ mod tests {
             unknown: Default::default(),
         };
 
-        let sandbox_id = create_scaffold_session(&handle, &scope).await.unwrap();
+        let (sandbox_id, attachment) = create_and_attach_scaffold_session(&handle, &scope)
+            .await
+            .unwrap();
         assert_eq!(sandbox_id, "sandbox-ready");
+        assert_eq!(
+            operations
+                .lock()
+                .expect("Scaffold operation log")
+                .as_slice(),
+            ["create", "attach"]
+        );
         assert_eq!(
             inspect_scaffold_session(&handle, &sandbox_id, &scope)
                 .await
                 .unwrap(),
             ScaffoldLifecycle::Ready
         );
-        let attachment = attach_scaffold_session(&handle, &sandbox_id, scope)
-            .await
-            .unwrap();
+        assert_eq!(
+            operations
+                .lock()
+                .expect("Scaffold operation log")
+                .as_slice(),
+            ["create", "attach", "inspect"]
+        );
         assert_eq!(attachment.projection.session_id, "session-ready");
         assert_eq!(attachment.owner_device_id, "comet-scaffold-sandbox-ready");
         assert_eq!(attachment.grant_id, "grant-ready");
@@ -2235,6 +2289,46 @@ mod tests {
             state.select_chat(None, cx);
             assert!(state.pending_scaffold_session.is_none());
         });
+    }
+    #[gpui::test]
+    fn pending_scaffold_chat_does_not_open_the_unscoped_room(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Runtime::new().expect("Tokio test runtime");
+        let _runtime_guard = runtime.enter();
+        let operations = Arc::new(StdMutex::new(Vec::new()));
+        let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
+            operations: Arc::clone(&operations),
+        });
+        let handle = EngineHandle {
+            inner: Arc::new(RemoteEngine {
+                client: memory_client(service),
+                url: "memory://pending-scaffold".into(),
+            }),
+        };
+        let state = cx.new(|_| AppState::new());
+
+        state.update(cx, |state, cx| {
+            state.engine = Some(handle);
+            state.select_pending_scaffold_chat(
+                ScaffoldSessionDraft {
+                    project_id: "project-a".into(),
+                    deployment_id: "deployment-a".into(),
+                    space_id: "space-a".into(),
+                    chat_id: "chat-a".into(),
+                },
+                cx,
+            );
+
+            assert_eq!(state.selected_chat.as_deref(), Some("chat-a"));
+            assert!(!state.scaffold_chat_starting("chat-a"));
+            assert!(state.transcript_task.is_none());
+            assert!(state.collaboration_task.is_none());
+        });
+        assert!(
+            operations
+                .lock()
+                .expect("Scaffold operation log")
+                .is_empty()
+        );
     }
 
     #[test]

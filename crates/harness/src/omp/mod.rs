@@ -328,7 +328,12 @@ fn resolve_omp_executable() -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.exists())
 }
 
-fn propagate_auth_broker_environment(command: &mut Command, scaffold_host: bool) {
+fn propagate_auth_broker_environment(
+    command: &mut Command,
+    scaffold_host: bool,
+    include_token: bool,
+) {
+    command.env_remove(AUTH_BROKER_TOKEN_FILE_ENV);
     if scaffold_host {
         for name in [
             AUTH_BROKER_TOKEN_ENV,
@@ -341,8 +346,14 @@ fn propagate_auth_broker_environment(command: &mut Command, scaffold_host: bool)
             command.env_remove(name);
         }
     }
+    if !include_token {
+        command.env_remove(AUTH_BROKER_TOKEN_ENV);
+    }
     if let Some(url) = std::env::var_os(AUTH_BROKER_URL_ENV).filter(|value| !value.is_empty()) {
         command.env(AUTH_BROKER_URL_ENV, url);
+    }
+    if !include_token {
+        return;
     }
     // Local controllers may inherit a workstation broker token. A scoped host
     // must never accept that long-lived credential and can use only its
@@ -491,10 +502,19 @@ impl OmpHarness {
         })
     }
 
-    fn base_command(&self, executable: &Path, cwd: &str) -> Command {
+    fn base_command(
+        &self,
+        executable: &Path,
+        cwd: &str,
+        include_auth_broker_token: bool,
+    ) -> Command {
         let mut command = Command::new(executable);
         crate::compose_child_path(&mut command, executable);
-        propagate_auth_broker_environment(&mut command, self.scaffold_host);
+        propagate_auth_broker_environment(
+            &mut command,
+            self.scaffold_host,
+            include_auth_broker_token,
+        );
         if !cwd.is_empty() {
             command.current_dir(cwd);
         }
@@ -506,12 +526,14 @@ impl OmpHarness {
         command
     }
 
-    fn command(&self, executable: &Path, cwd: &str, auto_approve: bool) -> Command {
-        let mut command = self.base_command(executable, cwd);
-        command.arg("acp");
-        if auto_approve {
-            command.args(["--approval-mode", "yolo"]);
-        }
+    fn acp_command(
+        &self,
+        executable: &Path,
+        cwd: &str,
+        include_auth_broker_token: bool,
+    ) -> Command {
+        let mut command = self.base_command(executable, cwd, include_auth_broker_token);
+        command.args(["acp", "--approval-mode", "yolo"]);
         if self.scaffold_host {
             command.args([
                 "--profile",
@@ -523,8 +545,12 @@ impl OmpHarness {
         }
         command
     }
+
+    fn command(&self, executable: &Path, cwd: &str, _auto_approve: bool) -> Command {
+        self.acp_command(executable, cwd, true)
+    }
     fn command_catalog_command(&self, executable: &Path, cwd: &str) -> Command {
-        let mut command = self.command(executable, cwd, false);
+        let mut command = self.acp_command(executable, cwd, false);
         command.arg("--no-session");
         command
     }
@@ -737,7 +763,7 @@ impl Harness for OmpHarness {
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         let executable = self.resolve_executable()?;
         let output = self
-            .base_command(&executable, "")
+            .base_command(&executable, "", false)
             .args(["models", "--json"])
             .stdin(Stdio::null())
             .output()
@@ -783,7 +809,9 @@ impl Harness for OmpHarness {
                     "initialize",
                     json!({
                         "protocolVersion": ACP_PROTOCOL_VERSION,
-                        "clientCapabilities": {},
+                        "clientCapabilities": {
+                            "elicitation": { "form": {}, "url": {} }
+                        },
                         "clientInfo": {
                             "name": "ashler-comet",
                             "version": env!("CARGO_PKG_VERSION")
@@ -1097,7 +1125,9 @@ pub(crate) async fn run_acp(
             "initialize",
             json!({
                 "protocolVersion": ACP_PROTOCOL_VERSION,
-                "clientCapabilities": {},
+                "clientCapabilities": {
+                    "elicitation": { "form": {}, "url": {} }
+                },
                 "clientInfo": { "name": "ashler-comet", "version": env!("CARGO_PKG_VERSION") }
             }),
         ),
@@ -1311,7 +1341,6 @@ pub(crate) async fn run_acp(
                             if !handle_session_incoming(
                                 item,
                                 &client,
-                                request.auto_approve,
                                 options.harness,
                                 &request_input,
                                 &events,
@@ -1354,15 +1383,8 @@ pub(crate) async fn run_acp(
         };
 
         while let Ok(item) = incoming.try_recv() {
-            if !handle_session_incoming(
-                item,
-                &client,
-                request.auto_approve,
-                options.harness,
-                &request_input,
-                &events,
-            )
-            .await
+            if !handle_session_incoming(item, &client, options.harness, &request_input, &events)
+                .await
             {
                 acp_closed = true;
                 break;
@@ -1451,7 +1473,6 @@ pub(crate) async fn run_acp(
                         if !handle_session_incoming(
                             item,
                             &client,
-                            request.auto_approve,
                             options.harness,
                             &request_input,
                             &events,
@@ -1509,7 +1530,6 @@ type RequestInputFn = Box<
 async fn handle_session_incoming(
     incoming: Incoming,
     client: &RpcClient,
-    auto_approve: bool,
     harness: HarnessId,
     request_input: &RequestInputFn,
     events: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
@@ -1524,7 +1544,13 @@ async fn handle_session_incoming(
             true
         }
         Incoming::Request { id, method, params } if method == "session/request_permission" => {
-            handle_permission_request(id, params, client.clone(), auto_approve, request_input);
+            // The ACP child already runs in YOLO mode. Any permission request
+            // that survives that policy is an explicit provider safety gate.
+            handle_permission_request(id, params, client.clone(), request_input);
+            true
+        }
+        Incoming::Request { id, method, params } if method == "elicitation/create" => {
+            handle_elicitation_request(id, params, client.clone(), request_input);
             true
         }
         Incoming::Request { id, .. } => {
@@ -1539,7 +1565,6 @@ fn handle_permission_request(
     id: Value,
     params: Value,
     client: RpcClient,
-    auto_approve: bool,
     request_input: &RequestInputFn,
 ) {
     let options = params
@@ -1547,29 +1572,6 @@ fn handle_permission_request(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    if auto_approve {
-        let option_id = options.iter().find_map(|option| {
-            let kind = option
-                .get("kind")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let option_id = option
-                .get("optionId")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            (kind == "allow_once" || option_id.contains("allow_once"))
-                .then_some(option_id)
-                .filter(|value| !value.is_empty())
-        });
-        match option_id {
-            Some(option_id) => client.respond(
-                &id,
-                json!({ "outcome": { "outcome": "selected", "optionId": option_id } }),
-            ),
-            None => client.respond(&id, json!({ "outcome": { "outcome": "cancelled" } })),
-        }
-        return;
-    }
     let labels: Vec<String> = options
         .iter()
         .filter_map(|option| {
@@ -1609,6 +1611,23 @@ fn handle_permission_request(
             ),
             None => client.respond(&id, json!({ "outcome": { "outcome": "cancelled" } })),
         }
+    });
+}
+
+fn handle_elicitation_request(
+    id: Value,
+    params: Value,
+    client: RpcClient,
+    request_input: &RequestInputFn,
+) {
+    let questions = crate::approval::elicitation_questions(&params);
+    let receiver = request_input(questions.clone());
+    tokio::spawn(async move {
+        let answers = receiver.await.unwrap_or_default();
+        client.respond(
+            &id,
+            crate::approval::elicitation_response(&params, &questions, &answers),
+        );
     });
 }
 
@@ -1814,7 +1833,7 @@ mod tests {
     }
 
     #[test]
-    fn command_omits_yolo_for_an_explicit_approval_opt_out() {
+    fn command_keeps_yolo_for_a_legacy_approval_opt_out() {
         let command =
             OmpHarness::new().command(Path::new("/usr/local/bin/omp"), "/workspace", false);
         let args: Vec<String> = command
@@ -1822,7 +1841,7 @@ mod tests {
             .get_args()
             .map(|value| value.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(args, ["acp"]);
+        assert_eq!(args, ["acp", "--approval-mode", "yolo"]);
     }
 
     #[test]
@@ -1844,6 +1863,20 @@ mod tests {
             std::env::set_var(AUTH_BROKER_TOKEN_ENV, "workstation-token-must-not-leak");
             std::env::set_var(AUTH_BROKER_TOKEN_FILE_ENV, &token_file);
         }
+        let catalog_command = OmpHarness::scaffold_host()
+            .command_catalog_command(Path::new("/usr/local/bin/omp"), "/workspace");
+        let catalog_process = catalog_command.as_std();
+        assert!(catalog_process.get_envs().any(|(key, value)| {
+            key == std::ffi::OsStr::new(AUTH_BROKER_TOKEN_ENV) && value.is_none()
+        }));
+        assert!(catalog_process.get_envs().any(|(key, value)| {
+            key == std::ffi::OsStr::new(AUTH_BROKER_TOKEN_FILE_ENV) && value.is_none()
+        }));
+        assert!(
+            token_file.exists(),
+            "command discovery must preserve the token for the persistent ACP child"
+        );
+
         let command = OmpHarness::scaffold_host().command(
             Path::new("/usr/local/bin/omp"),
             "/workspace",

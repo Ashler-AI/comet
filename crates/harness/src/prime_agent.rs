@@ -328,7 +328,7 @@ impl Harness for PrimeAgentHarness {
             command.args(["--thinking", reasoning_arg(reasoning)]);
         }
         command
-            .args(["--mode", "acp"])
+            .args(["--dangerously-skip-permissions", "--mode", "acp"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

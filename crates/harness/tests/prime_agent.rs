@@ -143,6 +143,10 @@ async fn new_prime_run_reports_a_durable_native_session_and_maps_events() {
     assert!(argv.lines().any(|arg| arg == "openai-codex/gpt-5.6-sol"));
     assert!(argv.lines().any(|arg| arg == "--thinking"));
     assert!(argv.lines().any(|arg| arg == "high"));
+    assert!(
+        argv.lines()
+            .any(|argument| argument == "--dangerously-skip-permissions")
+    );
 }
 
 #[tokio::test]

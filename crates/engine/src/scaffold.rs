@@ -756,7 +756,7 @@ impl ScaffoldSandbox {
                 self.id
             )));
         }
-        let owner_principal = format!("accounts.google.com:{owner_email}");
+        let owner_principal = owner_email.to_string();
         let activity = self.last_activity_at.as_deref().unwrap_or(&self.updated_at);
         let last_activity_at = Some(parse_rfc3339_ms(activity, "lastActivityAt")?);
         // Validate required timestamps even though only last activity enters the projection.
@@ -1780,6 +1780,7 @@ mod tests {
             Some("comet-scaffold-sandbox-a")
         );
         assert_eq!(result.run_id.as_deref(), Some("run-a"));
+        assert_eq!(result.environment.owner_principal, "alice@example.com");
         assert_eq!(
             result.room_projection,
             Some(SessionRoomProjection {

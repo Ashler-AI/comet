@@ -99,8 +99,10 @@ async fn fake_omp_proves_acp_only_execution_and_event_mapping() {
         std::env::set_var("OMP_ARGV_LOG", &argv_log);
     }
     let harness = OmpHarness::new().with_executable(fixture_path());
+    let mut run_request = request(None);
+    run_request.auto_approve = false;
     let stream = harness
-        .run(request(None), controls())
+        .run(run_request, controls())
         .await
         .expect("run starts");
     let events = tokio::time::timeout(
@@ -157,6 +159,68 @@ async fn fake_omp_proves_acp_only_execution_and_event_mapping() {
             session_id: Some("omp-session-1".into()),
         })
     );
+}
+
+#[tokio::test]
+async fn acp_provider_elicitation_round_trips_through_shared_input() {
+    let _env = env_lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("OMP_ARGV_LOG", temp.path().join("argv"));
+    }
+    let (asked_tx, asked_rx) = std::sync::mpsc::channel();
+    let (steer_tx, steering) = mpsc::channel(4);
+    drop(steer_tx);
+    let controls = RunControls {
+        request_input: Box::new(move |questions| {
+            let _ = asked_tx.send(questions.clone());
+            let answers = questions
+                .iter()
+                .map(|question| comet_proto::UserInputAnswer {
+                    question_id: question.id.clone(),
+                    labels: vec![question.options[0].clone()],
+                })
+                .collect();
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(answers);
+            rx
+        }),
+        steering,
+        interrupt: CancellationToken::new(),
+    };
+    let harness = OmpHarness::new().with_executable(fixture_path());
+    let mut run_request = request(None);
+    run_request.prompt = "scenario:elicitation".into();
+    let stream = harness
+        .run(run_request, controls)
+        .await
+        .expect("run starts");
+    let events = tokio::time::timeout(
+        Duration::from_secs(10),
+        stream
+            .map(|event| event.expect("valid ACP event"))
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .expect("fake completes");
+
+    let asked = [
+        asked_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        asked_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+    ]
+    .concat();
+    assert_eq!(asked.len(), 2, "{events:?}");
+    assert_eq!(asked[0].header, "Permission");
+    assert_eq!(asked[0].options, ["Allow once", "Reject"]);
+    assert_eq!(asked[1].header, "Region");
+    assert_eq!(asked[1].options, ["East", "West"]);
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
 }
 
 #[tokio::test]

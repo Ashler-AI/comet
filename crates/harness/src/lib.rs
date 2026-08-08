@@ -67,6 +67,7 @@ pub trait Harness: Send + Sync {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError>;
 }
 
+mod approval;
 pub mod claude;
 pub mod codex;
 pub mod mock;
