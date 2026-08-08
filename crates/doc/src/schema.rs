@@ -1027,6 +1027,7 @@ mod tests {
             &AgentEvent::ToolResult {
                 id: "tool-1".into(),
                 is_error: false,
+                output: None,
             },
         );
         writer.sync(&folded).unwrap();

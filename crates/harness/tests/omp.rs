@@ -162,7 +162,8 @@ async fn fake_omp_proves_acp_only_execution_and_event_mapping() {
     );
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "tool-1".into(),
-        is_error: false
+        is_error: false,
+        output: Some("# README".into()),
     }));
     assert_eq!(
         events.last(),

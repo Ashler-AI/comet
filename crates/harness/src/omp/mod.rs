@@ -1642,6 +1642,31 @@ fn content_text(content: &Value) -> Option<&str> {
     content.get("text").and_then(Value::as_str)
 }
 
+/// Tool output text from a terminal `tool_call_update`. OMP's completed
+/// update carries the accumulated output as `rawOutput.content:
+/// [{type:"text", text}]` (observed live; the `content` field echoes the
+/// INPUT first, so `rawOutput` is the clean source). Non-conforming shapes
+/// degrade to the raw JSON so an unfamiliar tool still shows something.
+fn tool_output_text(update: &Value) -> Option<String> {
+    let raw = update.get("rawOutput")?;
+    if let Some(text) = raw.as_str() {
+        return (!text.is_empty()).then(|| text.to_string());
+    }
+    if let Some(blocks) = raw.get("content").and_then(Value::as_array) {
+        let joined = blocks
+            .iter()
+            .filter_map(content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !joined.is_empty() {
+            return Some(joined);
+        }
+    }
+    (!raw.is_null()).then(|| {
+        serde_json::to_string_pretty(raw).unwrap_or_else(|_| raw.to_string())
+    })
+}
+
 fn agent_activity_status(status: &str) -> AgentActivityStatus {
     match status {
         "pending" => AgentActivityStatus::Pending,
@@ -1799,6 +1824,8 @@ fn normalize_update(params: &Value, harness: HarnessId) -> Option<AgentEvent> {
                 matches!(status, "completed" | "failed").then(|| AgentEvent::ToolResult {
                     id,
                     is_error: status == "failed",
+                    output: tool_output_text(update)
+                        .map(comet_proto::truncate_tool_output),
                 })
             }
         }
@@ -2041,7 +2068,25 @@ mod tests {
             ),
             Some(AgentEvent::ToolResult {
                 id: "t1".into(),
-                is_error: true
+                is_error: true,
+                output: None,
+            })
+        );
+        // The observed completed-update shape: output rides `rawOutput.content`
+        // as text blocks (`content` echoes the input first — never used).
+        assert_eq!(
+            normalize_update(
+                &json!({"update":{
+                    "sessionUpdate":"tool_call_update","toolCallId":"t2","status":"completed",
+                    "rawOutput": {"content":[{"type":"text","text":"hello\n/tmp"}], "details":{}},
+                    "content": [{"type":"content","content":{"type":"text","text":"$ echo hello"}}]
+                }}),
+                HarnessId::Omp,
+            ),
+            Some(AgentEvent::ToolResult {
+                id: "t2".into(),
+                is_error: false,
+                output: Some("hello\n/tmp".into()),
             })
         );
     }

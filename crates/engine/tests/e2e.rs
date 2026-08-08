@@ -73,6 +73,7 @@ fn mock_script() -> Vec<AgentEvent> {
         AgentEvent::ToolResult {
             id: "tool-1".into(),
             is_error: false,
+            output: Some("wrote 6 bytes".into()),
         },
         done(DoneStatus::Completed),
     ]
@@ -485,6 +486,22 @@ async fn queued_run_command_executes_end_to_end() {
         }
         other => panic!("unexpected second part {other:?}"),
     }
+
+    // The expanded-chip detail comes from the journal: the full input the doc
+    // stripped, plus the harness-captured output.
+    let detail = core
+        .sessions
+        .tool_call_detail(EXECUTION_KEY, "tool-1")
+        .unwrap()
+        .expect("journal saw tool-1");
+    assert_eq!(detail.input.as_deref(), Some("/tmp/x\n\nSECRET"));
+    assert_eq!(detail.output.as_deref(), Some("wrote 6 bytes"));
+    assert!(detail.resolved);
+    assert!(!detail.is_error);
+    assert_eq!(
+        core.sessions.tool_call_detail(EXECUTION_KEY, "nope").unwrap(),
+        None
+    );
 
     // Command outcome written by the host (sole outcome writer).
     assert_eq!(

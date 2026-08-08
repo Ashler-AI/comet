@@ -160,6 +160,9 @@ pub fn default_registry(profile: RuntimeProfile) -> HarnessRegistry {
             AgentEvent::ToolResult {
                 id: "mock-tool-1".into(),
                 is_error: false,
+                output: Some(
+                    "   Compiling comet-engine v0.1.0\n    Finished `test` profile in 4.2s\n     Running unittests src/lib.rs\n\ntest result: ok. 148 passed; 0 failed; 0 ignored".into(),
+                ),
             },
             AgentEvent::ToolCall {
                 id: "mock-tool-2".into(),
@@ -171,6 +174,9 @@ pub fn default_registry(profile: RuntimeProfile) -> HarnessRegistry {
             AgentEvent::ToolResult {
                 id: "mock-tool-2".into(),
                 is_error: false,
+                output: Some(
+                    "a1b2c3d (HEAD -> main) fold: coalesce doc commits\n9f8e7d6 engine: journal replay dedupe\n5c4b3a2 ui: stick-to-bottom spring".into(),
+                ),
             },
             AgentEvent::TextDelta {
                 text: "The `SegmentWriter` appends into `LoroText` so the oplog stays RLE-merged:\n\n```rust\nfolded = fold_event_into_parts(&folded, &event);\nwriter.sync(&folded)?; // 120ms coalesced commits\n```\n\nSynced to every device through the session room. *Mock harness reporting in.*".into(),

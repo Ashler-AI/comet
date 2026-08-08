@@ -318,6 +318,7 @@ async fn active_prime_tool_survives_the_prompt_inactivity_deadline() {
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "long-tool".into(),
         is_error: false,
+        output: None,
     }));
     assert!(matches!(
         events.last(),
@@ -354,7 +355,8 @@ async fn completed_prime_tool_can_be_followed_by_prompt_silence() {
                 event,
                 AgentEvent::ToolResult {
                     ref id,
-                    is_error: false
+                    is_error: false,
+                    ..
                 } if id == "completed-tool"
             ) {
                 break;

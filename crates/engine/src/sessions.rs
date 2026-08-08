@@ -40,6 +40,19 @@ use crate::registry::HarnessRegistry;
 use crate::run_journal::RunJournal;
 use crate::{EngineError, new_id, now_ms};
 
+/// [`SessionsEngine::tool_call_detail`]'s reduction of one tool id's journal
+/// events.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ToolCallDetail {
+    /// Full multiline input (pre-sanitize — journals keep what the doc strips).
+    pub input: Option<String>,
+    /// Harness-captured output, when the adapter reported one.
+    pub output: Option<String>,
+    pub is_error: bool,
+    /// True once a ToolResult landed.
+    pub resolved: bool,
+}
+
 /// One journaled event: the durable seq plus the event, as broadcast to subscribers.
 #[derive(Debug, Clone)]
 pub struct JournaledEvent {
@@ -221,6 +234,41 @@ impl SessionsEngine {
             .map(|(seq, event)| JournaledEvent { seq, event })
             .collect();
         Ok((replay, rx))
+    }
+
+    /// One tool invocation's full input/output, reduced from the chat's run
+    /// journal (the doc only carries the sanitized chip line — see
+    /// [`render_parts`]). Last-write-wins on repeated ids, mirroring the
+    /// fold's refresh-in-place rule. `None` when the journal never saw the
+    /// call (imported/foreign sessions).
+    pub fn tool_call_detail(
+        &self,
+        chat_id: &str,
+        tool_id: &str,
+    ) -> Result<Option<ToolCallDetail>, EngineError> {
+        let mut detail: Option<ToolCallDetail> = None;
+        for (_, event) in self.inner.journal.replay(chat_id, 0)? {
+            match event {
+                AgentEvent::ToolCall { ref id, ref call } if id == tool_id => {
+                    let slot = detail.get_or_insert_with(ToolCallDetail::default);
+                    slot.input = comet_proto::view::tool_call_input_text(call);
+                }
+                AgentEvent::ToolResult {
+                    ref id,
+                    is_error,
+                    ref output,
+                } if id == tool_id => {
+                    let slot = detail.get_or_insert_with(ToolCallDetail::default);
+                    slot.resolved = true;
+                    slot.is_error = is_error;
+                    if output.is_some() {
+                        slot.output = output.clone();
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(detail)
     }
 
     /// Start (or route) a run for `chat_id`.

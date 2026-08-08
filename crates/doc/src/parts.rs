@@ -187,7 +187,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 });
             }
         }
-        AgentEvent::ToolResult { id, is_error } => {
+        AgentEvent::ToolResult { id, is_error, .. } => {
             for p in out.iter_mut() {
                 if let MessagePart::Tool {
                     id: pid,
@@ -428,6 +428,7 @@ mod tests {
             &AgentEvent::ToolResult {
                 id: "t".into(),
                 is_error: true,
+                output: None,
             },
         );
         match &parts[0] {
