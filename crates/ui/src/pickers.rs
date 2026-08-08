@@ -71,6 +71,16 @@ pub enum CheckoutKind {
     NewWorktree,
 }
 
+impl CheckoutKind {
+    fn remembered(new_worktree: bool) -> Self {
+        if new_worktree {
+            Self::NewWorktree
+        } else {
+            Self::Local
+        }
+    }
+}
+
 /// The resolved on-send checkout action (composer consumes this — see
 /// [`Pickers::checkout_plan`]).
 #[derive(Debug, Clone, PartialEq)]
@@ -346,7 +356,7 @@ impl Pickers {
             if space != this.space_owner {
                 this.space_owner = space;
                 this.config.branch = None;
-                this.config.checkout = CheckoutKind::default();
+                this.config.checkout = CheckoutKind::remembered(this.defaults.new_worktree);
                 this.refs = Loadable::Idle;
                 this.refs_space = None;
                 // Catalogs are per-DEVICE (fetched from the space's host):
@@ -368,18 +378,22 @@ impl Pickers {
             _ => None,
         };
         // Sticky last-used picks: loaded synchronously so the very first frame
-        // shows the remembered harness/model/reasoning, never a placeholder.
+        // shows the remembered run config and checkout kind, never a placeholder.
         let data_dir = state.read(cx).data_dir.clone();
         let defaults = data_dir
             .as_deref()
             .map(ComposerDefaults::load)
             .unwrap_or_default();
+        let config = DraftConfig {
+            checkout: CheckoutKind::remembered(defaults.new_worktree),
+            ..DraftConfig::default()
+        };
         let draft_owner = state.read(cx).selected_chat.clone();
         let space_owner = state.read(cx).selected_space.clone();
         Self {
             state,
             space_owner,
-            config: DraftConfig::default(),
+            config,
             defaults,
             data_dir,
             draft_owner,
@@ -412,6 +426,15 @@ impl Pickers {
             && let Err(err) = self.defaults.save(dir)
         {
             tracing::warn!(error = %err, "composer-defaults save failed");
+        }
+    }
+
+    fn set_draft_checkout(&mut self, kind: CheckoutKind) {
+        self.config.checkout = kind;
+        let new_worktree = kind == CheckoutKind::NewWorktree;
+        if self.defaults.new_worktree != new_worktree {
+            self.defaults.new_worktree = new_worktree;
+            self.save_defaults();
         }
     }
 
@@ -889,7 +912,7 @@ impl Pickers {
         if row.worktree_path.is_some() {
             // Reuse the ref's existing worktree ("Current worktree").
             self.config.branch = Some(row.name.clone());
-            self.config.checkout = CheckoutKind::Local;
+            self.set_draft_checkout(CheckoutKind::Local);
         } else if self.config.checkout == CheckoutKind::NewWorktree || row.current {
             // Base pick for a new worktree, or the already-current ref.
             self.config.branch = Some(row.name.clone());
@@ -1060,7 +1083,7 @@ impl Pickers {
             // branch takes over.
             self.config.branch = None;
         }
-        self.config.checkout = kind;
+        self.set_draft_checkout(kind);
         self.open = None;
         cx.notify();
     }
