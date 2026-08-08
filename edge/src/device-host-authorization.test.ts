@@ -109,7 +109,7 @@ describe("trusted device host forwarding", () => {
     const response = await worker.fetch(
       hostRequest(
         "http://127.0.0.1",
-        "comet-scaffold-sandbox-1",
+        "comet-scaffold-sandbox-1-e1",
         "engine@ashler-local",
         "sandbox"
       ),

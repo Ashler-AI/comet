@@ -65,6 +65,15 @@ pub struct CollaborationScope {
     pub unknown: UnknownFields,
 }
 
+/// Parse the immutable Scaffold device identity
+/// `comet-scaffold-{sandbox_id}-e{lifecycle_epoch}`.
+pub fn parse_scaffold_device_id(device_id: &str) -> Option<(&str, u64)> {
+    let target = device_id.strip_prefix("comet-scaffold-")?;
+    let (sandbox_id, epoch) = target.rsplit_once("-e")?;
+    let epoch = epoch.parse::<u64>().ok().filter(|value| *value >= 1)?;
+    (!sandbox_id.is_empty()).then_some((sandbox_id, epoch))
+}
+
 /// An installed-app invitation routes to one durable chat, independently-owned
 /// agent session, and verified grant. The grant id is a lookup key, never a
 /// credential; authority still comes from the authenticated host projection.
@@ -137,6 +146,8 @@ pub struct CapabilityGrant {
     pub sandbox_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_epoch: Option<u64>,
     pub granted_by: String,
     pub granted_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -757,7 +768,9 @@ pub struct CollaborationSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use super::{CollaborationScope, CometInvitation, ScaffoldEnvironmentControl};
+    use super::{
+        CollaborationScope, CometInvitation, ScaffoldEnvironmentControl, parse_scaffold_device_id,
+    };
 
     #[test]
     fn omp_handoff_control_uses_additive_camel_case_wire_shape() {
@@ -796,6 +809,23 @@ mod tests {
         );
         assert!(
             CometInvitation::parse_deep_link("comet://invite/chat-a/session-b/grant%2Fc").is_none()
+        );
+    }
+
+    #[test]
+    fn scaffold_device_identity_requires_lifecycle_epoch() {
+        assert_eq!(
+            parse_scaffold_device_id("comet-scaffold-sandbox-a-e12"),
+            Some(("sandbox-a", 12))
+        );
+        assert_eq!(
+            parse_scaffold_device_id("comet-scaffold-sandbox-e2-a-e3"),
+            Some(("sandbox-e2-a", 3))
+        );
+        assert_eq!(parse_scaffold_device_id("comet-scaffold-sandbox-a"), None);
+        assert_eq!(
+            parse_scaffold_device_id("comet-scaffold-sandbox-a-e0"),
+            None
         );
     }
 }

@@ -642,6 +642,7 @@ impl EngineRpc {
             capabilities: vec![action.required_capability().to_string()],
             sandbox_id: None,
             device_id: Some(owner_device_id.clone()),
+            lifecycle_epoch: None,
             granted_by: "authenticated-local-identity".into(),
             granted_at: now,
             expires_at: Some(now + crate::doc_host::LOCAL_OWNER_GRANT_TTL_MS),
@@ -666,7 +667,11 @@ impl EngineRpc {
                 "Scaffold control grant has no attached device".into(),
             ));
         };
-        let SessionEnvironmentSource::Scaffold { sandbox_id, .. } = &result.environment.source
+        let SessionEnvironmentSource::Scaffold {
+            sandbox_id,
+            lifecycle_epoch,
+            ..
+        } = &result.environment.source
         else {
             return Err(RpcError::Failed(
                 "Scaffold control grant has no sandbox".into(),
@@ -692,6 +697,7 @@ impl EngineRpc {
             capabilities: control_grant.capabilities.clone(),
             sandbox_id: Some(sandbox_id.clone()),
             device_id: Some(attached_device_id.clone()),
+            lifecycle_epoch: *lifecycle_epoch,
             granted_by: "comet-edge-device-room".into(),
             granted_at: crate::now_ms(),
             expires_at: Some(control_grant.expires_at),
@@ -2062,6 +2068,7 @@ mod tests {
             capabilities: vec![comet_proto::CAPABILITY_SESSION_ANNOTATE.into()],
             sandbox_id: None,
             device_id: Some("device-a".into()),
+            lifecycle_epoch: None,
             granted_by: "authenticated-local-identity".into(),
             granted_at: now,
             expires_at: Some(now + 60_000),
@@ -2107,7 +2114,8 @@ mod tests {
             },
             capabilities: vec![comet_proto::CAPABILITY_SESSION_CHAT.into()],
             sandbox_id: Some("sandbox-a".into()),
-            device_id: Some("comet-scaffold-sandbox-a".into()),
+            device_id: Some("comet-scaffold-sandbox-a-e1".into()),
+            lifecycle_epoch: Some(1),
             granted_by: "comet-edge-device-room".into(),
             granted_at: now,
             expires_at: Some(now + 60_000),

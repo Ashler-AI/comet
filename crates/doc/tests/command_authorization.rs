@@ -34,6 +34,7 @@ fn grant(capabilities: &[&str]) -> CapabilityGrant {
         capabilities: capabilities.iter().map(|value| (*value).into()).collect(),
         sandbox_id: None,
         device_id: Some("device-chris".into()),
+        lifecycle_epoch: None,
         granted_by: "iap:admin@example.com".into(),
         granted_at: 1,
         expires_at: Some(1_000),
