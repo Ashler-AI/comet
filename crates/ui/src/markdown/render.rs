@@ -226,15 +226,27 @@ pub fn render_block(
                 runs, 16.0, 26.0, false, top_ix, ix, opts, theme,
             ))
             .into_any_element(),
-        Block::CodeBlock { language, code } => render_code_block(
-            language.as_deref(),
-            code,
-            top_ix,
-            ix,
-            opts,
-            theme,
-            highlight,
-        ),
+        Block::CodeBlock { language, code } => {
+            // ```mermaid``` upgrades to a native diagram when the source
+            // parses (streaming-tolerant); otherwise it stays a code block.
+            let mermaid = language
+                .as_deref()
+                .is_some_and(|l| l.eq_ignore_ascii_case("mermaid"))
+                .then(|| super::mermaid::render::mermaid_block(code, ix, opts, theme, window))
+                .flatten();
+            match mermaid {
+                Some(el) => el,
+                None => render_code_block(
+                    language.as_deref(),
+                    code,
+                    top_ix,
+                    ix,
+                    opts,
+                    theme,
+                    highlight,
+                ),
+            }
+        }
         Block::BlockQuote { children } => div()
             // Accent-tinted quote: indigo rail + a whisper of the same hue
             // behind it (the inline-code treatment, dialed down).
@@ -1383,51 +1395,7 @@ fn render_code_block(
         None => Vec::new(),
     };
     let scroll_id: SharedString = format!("{}-code{ix}", opts.row_key).into();
-    // Copy affordance (round 9; no source counterpart — the original block is
-    // header + body only): a small ghost button in the block's top-right,
-    // absolutely overlaid so clicking / the "Copied" flash never shifts
-    // layout. Sits centered in the header when there is one, floats over the
-    // first code line otherwise.
-    let copy_button = opts.copy.clone().map(|copy| {
-        let copied = copy.copied_ix == Some(ix);
-        let code_text: SharedString = code.to_string().into();
-        let handler = copy.handler.clone();
-        let fade_key = format!("{}-copy{ix}", opts.row_key);
-        div()
-            .id(SharedString::from(fade_key.clone()))
-            .absolute()
-            .top(px(3.0))
-            .right(px(5.0))
-            .h(px(20.0))
-            .px(px(6.0))
-            .rounded(px(5.0))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(4.0))
-            .cursor_pointer()
-            // Ghost-button hover wash fades over transition-colors like every
-            // other interactive chrome (crate::motion hover fades).
-            .bg(crate::motion::hover_blend(
-                &fade_key,
-                gpui::transparent_black(),
-                crate::theme::ink(0.08),
-            ))
-            .on_hover(crate::motion::hover_listener(fade_key))
-            .text_size(px(10.5))
-            .text_color(theme.text_muted)
-            .on_click(move |_, window, cx| handler(ix, code_text.clone(), window, cx))
-            .child(
-                crate::icons::icon(if copied {
-                    crate::icons::CHECK
-                } else {
-                    crate::icons::COPY
-                })
-                .size(px(12.0))
-                .text_color(theme.text_muted),
-            )
-            .when(copied, |el| el.child(SharedString::from("Copied")))
-    });
+    let copy_button = code_copy_button(code, ix, opts, theme);
     div()
         .rounded(px(10.0))
         // Faint white wash over the near-black panel ≈ #101010 (comet's code
@@ -1480,6 +1448,59 @@ fn render_code_block(
         // Overlay LAST so it paints above the header/body.
         .children(copy_button)
         .into_any_element()
+}
+
+/// Copy affordance shared by code blocks and mermaid diagrams (round 9; no
+/// source counterpart — the original block is header + body only): a small
+/// ghost button in the block's top-right, absolutely overlaid so clicking /
+/// the "Copied" flash never shifts layout. Sits centered in the header when
+/// there is one, floats over the first code line otherwise.
+pub(crate) fn code_copy_button(
+    code: &str,
+    ix: usize,
+    opts: &RenderOptions,
+    theme: &Theme,
+) -> Option<gpui::Stateful<gpui::Div>> {
+    opts.copy.clone().map(|copy| {
+        let copied = copy.copied_ix == Some(ix);
+        let code_text: SharedString = code.to_string().into();
+        let handler = copy.handler.clone();
+        let fade_key = format!("{}-copy{ix}", opts.row_key);
+        div()
+            .id(SharedString::from(fade_key.clone()))
+            .absolute()
+            .top(px(3.0))
+            .right(px(5.0))
+            .h(px(20.0))
+            .px(px(6.0))
+            .rounded(px(5.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .cursor_pointer()
+            // Ghost-button hover wash fades over transition-colors like every
+            // other interactive chrome (crate::motion hover fades).
+            .bg(crate::motion::hover_blend(
+                &fade_key,
+                gpui::transparent_black(),
+                crate::theme::ink(0.08),
+            ))
+            .on_hover(crate::motion::hover_listener(fade_key))
+            .text_size(px(10.5))
+            .text_color(theme.text_muted)
+            .on_click(move |_, window, cx| handler(ix, code_text.clone(), window, cx))
+            .child(
+                crate::icons::icon(if copied {
+                    crate::icons::CHECK
+                } else {
+                    crate::icons::COPY
+                })
+                .size(px(12.0))
+                .text_color(theme.text_muted),
+            )
+            .when(copied, |el| el.child(SharedString::from("Copied")))
+    })
 }
 
 /// Paint color for a token class — the soft syntax palette (round 9: the
