@@ -22,7 +22,7 @@ const PROJECT_ID = "ashler-local";
 const DEPLOYMENT_ID = "deployment-smoke";
 const SANDBOX_ID = "smoke-001";
 const DEVICE_ID = `comet-scaffold-${SANDBOX_ID}`;
-const SESSION_ID = "session-smoke-001";
+const SESSION_ID = "11111111-1111-4111-8111-111111111111";
 const CAPABILITIES = [
   "session.read",
   "session.chat",
@@ -265,9 +265,10 @@ const openWebSocket = (url, label) =>
         dispose();
         resolve(socket);
       };
-      const onError = () => {
+      const onError = (event) => {
         dispose();
-        reject(new Error(`${label} failed to open`));
+        const detail = event.error?.message ?? event.message ?? "network error";
+        reject(new Error(`${label} failed to open: ${detail}`));
       };
       const onClose = (event) => {
         dispose();
@@ -463,9 +464,20 @@ const main = async () => {
   });
   assert.deepEqual(health, { ok: true, auth: "scaffold", environment: "local" });
   const ipcPort = await reservePort();
+  const roomProbe = await ownerFetch(
+    edgeOrigin,
+    `/stats/${SESSION_ID}?deploymentId=${encodeURIComponent(DEPLOYMENT_ID)}`
+  );
+  assert.equal(
+    roomProbe.response.status,
+    404,
+    `owner session scope probe failed: ${JSON.stringify(roomProbe.body)}`
+  );
+  const ownerRoomURL =
+    `${edgeOrigin.replace("http:", "ws:")}/session/${SESSION_ID}/ws?device=owner-ui&token=${OWNER_TOKEN}&deploymentId=${encodeURIComponent(DEPLOYMENT_ID)}`;
 
   const ownerSession = await openWebSocket(
-    `${edgeOrigin.replace("http:", "ws:")}/session/${SESSION_ID}/ws?device=owner-ui&token=${OWNER_TOKEN}&deploymentId=${encodeURIComponent(DEPLOYMENT_ID)}`,
+    ownerRoomURL,
     "owner session room"
   );
   console.log("PASS Edge authenticated the verified owner and routed its real session WebSocket");
