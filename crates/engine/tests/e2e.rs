@@ -144,6 +144,7 @@ impl Harness for ScriptedHarness {
 struct QueuedFollowupHarness {
     release_first_turn: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
     received: tokio::sync::mpsc::UnboundedSender<String>,
+    steering_mode: SteeringMode,
 }
 
 #[async_trait]
@@ -161,7 +162,7 @@ impl Harness for QueuedFollowupHarness {
     }
 
     fn steering_mode(&self) -> SteeringMode {
-        SteeringMode::StepBoundary
+        self.steering_mode
     }
 
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
@@ -511,7 +512,9 @@ async fn queued_run_command_executes_end_to_end() {
     assert!(detail.resolved);
     assert!(!detail.is_error);
     assert_eq!(
-        core.sessions.tool_call_detail(EXECUTION_KEY, "nope").unwrap(),
+        core.sessions
+            .tool_call_detail(EXECUTION_KEY, "nope")
+            .unwrap(),
         None
     );
 
@@ -801,6 +804,7 @@ async fn explicit_queue_waits_for_the_next_turn_across_step_boundary_harnesses()
         Arc::new(QueuedFollowupHarness {
             release_first_turn: Arc::new(std::sync::Mutex::new(Some(release_rx))),
             received: received_tx,
+            steering_mode: SteeringMode::StepBoundary,
         }),
     );
     let _handle = core.doc_host.open(CHAT).unwrap();
@@ -882,7 +886,7 @@ async fn explicit_queue_waits_for_the_next_turn_across_step_boundary_harnesses()
 }
 
 #[tokio::test]
-async fn turn_boundary_steer_is_acknowledged_as_queued() {
+async fn turn_boundary_steer_is_displayed_as_queued_until_acknowledged() {
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(
         dir.path(),
@@ -944,10 +948,89 @@ async fn turn_boundary_steer_is_acknowledged_as_queued() {
             .iter()
             .find(|entry| entry.id == "m-2")
             .and_then(|entry| entry.status),
-        Some(MessageStatus::Steered)
+        Some(MessageStatus::Queued)
     );
 
     core.sessions.interrupt(EXECUTION_KEY).await.unwrap();
+}
+
+#[tokio::test]
+async fn turn_boundary_steer_becomes_active_when_the_harness_acknowledges_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (received_tx, mut received_rx) = tokio::sync::mpsc::unbounded_channel();
+    let core = assemble(
+        dir.path(),
+        Arc::new(QueuedFollowupHarness {
+            release_first_turn: Arc::new(std::sync::Mutex::new(Some(release_rx))),
+            received: received_tx,
+            steering_mode: SteeringMode::TurnBoundary,
+        }),
+    );
+    let _handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_controller(
+        &core,
+        "cmd-run-before-turn-boundary-steer",
+        SessionCommandPayload::Run {
+            request: run_request("start"),
+            message_id: "m-1".into(),
+        },
+    )
+    .await;
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|entry| {
+                entry
+                    .parts
+                    .iter()
+                    .any(|part| matches!(part, MessagePart::Text { text, .. } if text == "first turn active"))
+            })
+        },
+        "first turn to become active",
+    )
+    .await;
+
+    queue_as_controller(
+        &core,
+        "cmd-turn-boundary-steer",
+        SessionCommandPayload::Steer {
+            prompt: "change direction next".into(),
+            message_id: Some("m-turn-steer".into()),
+        },
+    )
+    .await;
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .find(|entry| entry.id == "m-turn-steer")
+                .is_some_and(|entry| entry.status == Some(MessageStatus::Queued))
+        },
+        "turn-boundary steer to remain queued",
+    )
+    .await;
+    assert!(matches!(
+        received_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), received_rx.recv())
+            .await
+            .unwrap(),
+        Some("change direction next".into())
+    );
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .find(|entry| entry.id == "m-turn-steer")
+                .is_some_and(|entry| entry.status == Some(MessageStatus::Steered))
+        },
+        "turn-boundary steer acknowledgement",
+    )
+    .await;
 }
 
 #[tokio::test]

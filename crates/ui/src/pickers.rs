@@ -23,7 +23,7 @@ use gpui::{
 use comet_engine::registry::HarnessDescriptor;
 use comet_proto::{
     ChatConfig, FolderListing, HarnessCommand, HarnessId, Model, ReasoningLevel, RepoRef,
-    SandboxLevel,
+    SandboxLevel, SteeringMode,
 };
 use comet_rpc::methods;
 
@@ -569,6 +569,17 @@ impl Pickers {
             reasoning: self.effective_reasoning(cx),
             model_options: self.explicit_options(cx),
         }
+    }
+
+    /// Delivery semantics advertised by the selected harness. The composer
+    /// uses this to avoid presenting a next-turn prompt as a live steer.
+    pub fn steering_mode(&self, cx: &App) -> Option<SteeringMode> {
+        let harness = self.effective_harness(cx)?;
+        self.harnesses
+            .ready()?
+            .iter()
+            .find(|descriptor| descriptor.id == harness)
+            .map(|descriptor| descriptor.steering_mode)
     }
 
     // ---- open/close ----

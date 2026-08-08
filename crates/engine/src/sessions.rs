@@ -103,6 +103,9 @@ struct RunHandle {
     /// Explicit next-turn followups. Unlike the harness steering mailbox, this
     /// queue is not visible to step-boundary harnesses until the current Done.
     queued_followups: VecDeque<SteerMessage>,
+    /// Turn-boundary steers accepted by the mailbox but not yet handed to the
+    /// harness as a new prompt. The matching `Steered` event acknowledges them FIFO.
+    pending_turn_boundary_steers: VecDeque<SteerMessage>,
     /// Harness-level cancellation (protocol interrupt + child teardown).
     interrupt_token: CancellationToken,
     /// Engine-level cancel: arms the run task's grace deadline so a harness that
@@ -404,6 +407,7 @@ impl SessionsEngine {
                 steer_tx,
                 turn_active: true,
                 queued_followups: VecDeque::new(),
+                pending_turn_boundary_steers: VecDeque::new(),
                 interrupt_token,
                 cancel: cancel_tx,
                 engine_tx,
@@ -496,34 +500,36 @@ impl SessionsEngine {
         prompt: &str,
         message_id: Option<String>,
     ) -> Result<SteerOutcome, EngineError> {
-        let target = {
-            let mut runs = lock(&self.inner.runs);
-            runs.get_mut(chat_id)
-                .filter(|handle| handle.steerable)
-                .map(|handle| {
-                    handle.turn_active = true;
-                    (handle.steer_tx.clone(), handle.steering_mode)
-                })
-        };
-        let Some((steer_tx, steering_mode)) = target else {
-            return Ok(SteerOutcome::NotSteerable);
-        };
+        let user_id = message_id.unwrap_or_else(new_id);
         let message = SteerMessage {
             prompt: prompt.to_string(),
-            message_id: message_id.clone(),
+            message_id: Some(user_id.clone()),
         };
-        if steer_tx.try_send(message).is_err() {
-            return Ok(SteerOutcome::NotSteerable);
-        }
-        // Accepted: the steer prompt becomes a user entry immediately (client-minted id).
-        let user_id = message_id.unwrap_or_else(new_id);
+        let steering_mode = {
+            let mut runs = lock(&self.inner.runs);
+            let Some(handle) = runs.get_mut(chat_id).filter(|handle| handle.steerable) else {
+                return Ok(SteerOutcome::NotSteerable);
+            };
+            handle.turn_active = true;
+            if handle.steer_tx.try_send(message.clone()).is_err() {
+                return Ok(SteerOutcome::NotSteerable);
+            }
+            if handle.steering_mode == SteeringMode::TurnBoundary {
+                handle.pending_turn_boundary_steers.push_back(message);
+            }
+            handle.steering_mode
+        };
+        // Step-boundary harnesses can alter the active turn immediately.
+        // Turn-boundary harnesses have only accepted a future prompt so far.
+        let status = match steering_mode {
+            SteeringMode::StepBoundary => MessageStatus::Steered,
+            SteeringMode::TurnBoundary => MessageStatus::Queued,
+        };
         let handle = self.doc_handle(chat_id)?;
-        handle.write_user_message_with_status(
-            &user_id,
-            prompt,
-            now_ms(),
-            MessageStatus::Steered,
-        )?;
+        handle.write_user_message_with_status(&user_id, prompt, now_ms(), status)?;
+        // The optimistic echo may already exist with a generic steer status.
+        // Stamp the harness-authoritative state instead of preserving that guess.
+        handle.doc_arc().set_message_status(&user_id, status)?;
         self.inner.note_message(chat_id, prompt);
         Ok(SteerOutcome::Accepted(steering_mode))
     }
@@ -1327,6 +1333,25 @@ async fn drive_run(
             ..
         } = &event
         {
+            let acknowledged = {
+                let mut runs = lock(&inner.runs);
+                runs.get_mut(&chat_id).and_then(|handle| {
+                    (handle.steering_mode == SteeringMode::TurnBoundary)
+                        .then(|| handle.pending_turn_boundary_steers.pop_front())
+                        .flatten()
+                })
+            };
+            if let Some(message) = acknowledged
+                && let Some(message_id) = message.message_id.as_deref()
+                && let Err(err) = doc_ref.set_message_status(message_id, MessageStatus::Steered)
+            {
+                tracing::warn!(
+                    chat = %chat_id,
+                    message = %message_id,
+                    error = %err,
+                    "turn-boundary steer acknowledgement stamp failed"
+                );
+            }
             inner.publish(&chat_id, &event);
             if let Err(err) = finish_segment(
                 doc_ref,
@@ -1519,7 +1544,14 @@ async fn drive_run(
     let mut deferred_followups = {
         let mut runs = lock(&inner.runs);
         runs.get_mut(&chat_id)
-            .map(|handle| handle.queued_followups.drain(..).collect::<VecDeque<_>>())
+            .map(|handle| {
+                let mut deferred = handle
+                    .pending_turn_boundary_steers
+                    .drain(..)
+                    .collect::<VecDeque<_>>();
+                deferred.extend(handle.queued_followups.drain(..));
+                deferred
+            })
             .unwrap_or_default()
     };
     inner.remove_run(&chat_id, &run_id);

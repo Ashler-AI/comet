@@ -25,11 +25,12 @@ use gpui::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use comet_doc::{
-    MessagePart, MessageRole, SessionCommandPayload, SessionControlAction, SessionMessageEntry,
+    MessagePart, MessageRole, MessageStatus, SessionCommandPayload, SessionControlAction,
+    SessionMessageEntry,
 };
 use comet_proto::{
     AgentSessionSource, ChatConfig, FileSearchMatch, HarnessCommand, HarnessId, RunRequest,
-    SandboxLevel, ScaffoldLifecycle, UserInputAnswer, UserInputQuestion,
+    SandboxLevel, ScaffoldLifecycle, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 use comet_rpc::{RpcError, methods};
 
@@ -397,6 +398,19 @@ fn submit_delivery(run_live: bool, queue_requested: bool) -> SubmitDelivery {
         (true, true) => SubmitDelivery::Queue,
         (true, false) => SubmitDelivery::Steer,
         (false, _) => SubmitDelivery::Send,
+    }
+}
+
+fn optimistic_message_status(
+    delivery: SubmitDelivery,
+    steering_mode: Option<SteeringMode>,
+) -> Option<MessageStatus> {
+    match (delivery, steering_mode) {
+        (SubmitDelivery::Send, _) => None,
+        (SubmitDelivery::Queue, _) | (SubmitDelivery::Steer, Some(SteeringMode::TurnBoundary)) => {
+            Some(MessageStatus::Queued)
+        }
+        (SubmitDelivery::Steer, _) => Some(MessageStatus::Steered),
     }
 }
 
@@ -4590,11 +4604,8 @@ impl Composer {
         } else {
             delivery
         };
-        let echo_status = match effective_delivery {
-            SubmitDelivery::Send => None,
-            SubmitDelivery::Steer => Some(comet_doc::MessageStatus::Steered),
-            SubmitDelivery::Queue => Some(comet_doc::MessageStatus::Queued),
-        };
+        let steering_mode = self.pickers.read(cx).steering_mode(cx);
+        let echo_status = optimistic_message_status(effective_delivery, steering_mode);
 
         // Optimistic echo (client-minted id doubles as the persisted message id,
         // so the doc frame dedups it away).
@@ -6586,6 +6597,18 @@ mod tests {
         assert_eq!(submit_delivery(true, false), SubmitDelivery::Steer);
         assert_eq!(submit_delivery(true, true), SubmitDelivery::Queue);
         assert_eq!(submit_delivery(false, true), SubmitDelivery::Send);
+        assert_eq!(
+            optimistic_message_status(SubmitDelivery::Steer, Some(SteeringMode::StepBoundary)),
+            Some(MessageStatus::Steered)
+        );
+        assert_eq!(
+            optimistic_message_status(SubmitDelivery::Steer, Some(SteeringMode::TurnBoundary)),
+            Some(MessageStatus::Queued)
+        );
+        assert_eq!(
+            optimistic_message_status(SubmitDelivery::Queue, Some(SteeringMode::StepBoundary)),
+            Some(MessageStatus::Queued)
+        );
     }
 
     #[test]
