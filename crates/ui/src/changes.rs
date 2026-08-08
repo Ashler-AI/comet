@@ -358,6 +358,15 @@ pub enum DiffPhase {
     List,
 }
 
+/// Compact worktree state for shell-level status surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangesSummary {
+    pub file_count: usize,
+    pub additions: u32,
+    pub deletions: u32,
+    pub truncated: bool,
+}
+
 pub fn diff_phase(resolved: Option<&CheckoutDiff>) -> DiffPhase {
     match resolved {
         None => DiffPhase::Preparing,
@@ -622,6 +631,16 @@ impl Changes {
         let state = self.state.read(cx);
         let chat = state.selected_chat_row()?;
         resolve_diff(&self.diffs, chat).cloned()
+    }
+
+    /// Current selected checkout summary without exposing or reparsing the patch.
+    pub fn summary(&self, cx: &App) -> Option<ChangesSummary> {
+        self.resolved(cx).map(|diff| ChangesSummary {
+            file_count: diff.files.len(),
+            additions: diff.additions,
+            deletions: diff.deletions,
+            truncated: diff.truncated,
+        })
     }
 
     /// Reconcile parsed content with the currently-resolved diff.

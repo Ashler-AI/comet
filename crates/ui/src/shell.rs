@@ -12,7 +12,7 @@
 //! that pane to its default width.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use gpui::{
@@ -33,7 +33,7 @@ use crate::loaders;
 use crate::motion::{self, AnimationExt as _, COMET_PULSE, MotionSpec, RESIZE, SPLASH_OUT};
 use crate::popover::{self};
 use crate::rail;
-use crate::settings::accounts::AccountsPage;
+use crate::settings::accounts::{AccountsPage, format_reset, usage_color, usage_level};
 use crate::settings::advisor::AdvisorPage;
 use crate::settings::appearance::AppearancePage;
 use crate::settings::archived::ArchivedPage;
@@ -544,6 +544,12 @@ const SIDEBAR_LIST_GAP: f32 = 2.0;
 /// [`gpui::EdgeFade`] scope — per-primitive, so text fades per glyph).
 const SIDEBAR_GLASS_FADE_BAND: f32 = 32.0;
 
+/// Width reserved beside the conversation for the always-visible floating
+/// worktree/account/goals card. The rail itself is transparent; only the card
+/// paints, so this behaves like the Changes pane without reading as a panel.
+const WORKSPACE_STATUS_RAIL_WIDTH: f32 = 348.0;
+const WORKSPACE_GOALS_MAX_HEIGHT: f32 = 232.0;
+
 /// Drag marker for the sidebar resize handle.
 struct SidebarResize;
 /// Drag marker for the right-pane resize handle.
@@ -696,6 +702,368 @@ fn latest_goal_items(
         })
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct GoalGroupData {
+    label: Option<String>,
+    items: Vec<comet_proto::TodoItem>,
+}
+
+fn todo_items_from_value(value: Option<&serde_json::Value>) -> Vec<comet_proto::TodoItem> {
+    value
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|text| comet_proto::TodoItem {
+            text: text.to_string(),
+            done: false,
+        })
+        .collect()
+}
+
+/// Replays OMP's persisted `todo` tool inputs. ACP's `plan` update is flat,
+/// while the originating tool input retains phase/list structure. Other
+/// harnesses fall back to their latest flat `ToolCall::Todo` snapshot.
+fn structured_goal_groups(
+    entries: &[comet_doc::SessionMessageEntry],
+) -> Option<Vec<GoalGroupData>> {
+    let mut groups: Option<Vec<GoalGroupData>> = None;
+    for part in entries.iter().flat_map(|entry| &entry.parts) {
+        let comet_doc::MessagePart::Tool {
+            call:
+                comet_proto::ToolCall::Unknown {
+                    input: Some(input), ..
+                },
+            ..
+        } = part
+        else {
+            continue;
+        };
+        let Some(op) = input.get("op").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        match op {
+            "init" => {
+                if let Some(list) = input.get("list").and_then(serde_json::Value::as_array) {
+                    groups = Some(
+                        list.iter()
+                            .filter_map(|group| {
+                                let label = group
+                                    .get("phase")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::trim)
+                                    .filter(|label| !label.is_empty())?
+                                    .to_string();
+                                Some(GoalGroupData {
+                                    label: Some(label),
+                                    items: todo_items_from_value(group.get("items")),
+                                })
+                            })
+                            .collect(),
+                    );
+                } else if input.get("items").is_some() {
+                    groups = Some(vec![GoalGroupData {
+                        label: None,
+                        items: todo_items_from_value(input.get("items")),
+                    }]);
+                }
+            }
+            "append" => {
+                let Some(groups) = groups.as_mut() else {
+                    continue;
+                };
+                let Some(label) = input
+                    .get("phase")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|label| !label.is_empty())
+                else {
+                    continue;
+                };
+                let items = todo_items_from_value(input.get("items"));
+                if let Some(group) = groups
+                    .iter_mut()
+                    .find(|group| group.label.as_deref() == Some(label))
+                {
+                    group.items.extend(items);
+                } else {
+                    groups.push(GoalGroupData {
+                        label: Some(label.to_string()),
+                        items,
+                    });
+                }
+            }
+            "done" => {
+                let Some(groups) = groups.as_mut() else {
+                    continue;
+                };
+                if let Some(task) = input
+                    .get("task")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|task| !task.is_empty())
+                {
+                    if let Some(item) = groups
+                        .iter_mut()
+                        .flat_map(|group| &mut group.items)
+                        .find(|item| item.text == task)
+                    {
+                        item.done = true;
+                    }
+                } else if let Some(phase) = input
+                    .get("phase")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|phase| !phase.is_empty())
+                    && let Some(group) = groups
+                        .iter_mut()
+                        .find(|group| group.label.as_deref() == Some(phase))
+                {
+                    group.items.iter_mut().for_each(|item| item.done = true);
+                }
+            }
+            "drop" | "rm" => {
+                let Some(groups) = groups.as_mut() else {
+                    continue;
+                };
+                let task = input
+                    .get("task")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|task| !task.is_empty());
+                let phase = input
+                    .get("phase")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|phase| !phase.is_empty());
+                if let Some(task) = task {
+                    for group in groups {
+                        group.items.retain(|item| item.text != task);
+                    }
+                } else if let Some(phase) = phase {
+                    groups.retain(|group| group.label.as_deref() != Some(phase));
+                } else if op == "rm" {
+                    groups.clear();
+                }
+            }
+            _ => {}
+        }
+    }
+    groups
+}
+
+fn latest_goal_groups(entries: &[comet_doc::SessionMessageEntry]) -> Vec<GoalGroupData> {
+    structured_goal_groups(entries).unwrap_or_else(|| {
+        latest_goal_items(entries)
+            .map(|items| {
+                vec![GoalGroupData {
+                    label: None,
+                    items: items.to_vec(),
+                }]
+            })
+            .unwrap_or_default()
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GoalRowData {
+    text: String,
+    done: bool,
+    depth: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GoalGroupRows {
+    label: Option<String>,
+    rows: Vec<GoalRowData>,
+}
+
+fn goal_group_rows(groups: Vec<GoalGroupData>) -> Vec<GoalGroupRows> {
+    groups
+        .into_iter()
+        .map(|group| GoalGroupRows {
+            label: group.label,
+            rows: goal_rows(&group.items),
+        })
+        .collect()
+}
+
+/// Split one goal line into indentation, optional checkbox state, list-marker
+/// presence, and display text. This accepts markdown-style bullets, numbered
+/// lists, and checkboxes without requiring goal producers to share a schema.
+fn strip_goal_list_marker(line: &str) -> (usize, Option<bool>, bool, &str) {
+    let trimmed = line.trim_start();
+    let indent = line.len().saturating_sub(trimmed.len()) / 2;
+    let mut body = trimmed;
+    let mut marked = false;
+
+    for marker in ["- ", "* ", "+ ", "• "] {
+        if let Some(rest) = body.strip_prefix(marker) {
+            body = rest;
+            marked = true;
+            break;
+        }
+    }
+    if !marked {
+        let digits = body.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 {
+            let suffix = &body[digits..];
+            if let Some(rest) = suffix
+                .strip_prefix(". ")
+                .or_else(|| suffix.strip_prefix(") "))
+            {
+                body = rest;
+                marked = true;
+            }
+        }
+    }
+
+    let done = if let Some(rest) = body
+        .strip_prefix("[x] ")
+        .or_else(|| body.strip_prefix("[X] "))
+    {
+        body = rest;
+        marked = true;
+        Some(true)
+    } else if let Some(rest) = body.strip_prefix("[ ] ") {
+        body = rest;
+        marked = true;
+        Some(false)
+    } else {
+        None
+    };
+    (indent, done, marked, body.trim())
+}
+
+/// Preserve the complete ordered goal list. A multiline goal may carry a
+/// nested markdown/indented sublist; continuation prose stays on its parent.
+fn goal_rows(items: &[comet_proto::TodoItem]) -> Vec<GoalRowData> {
+    let mut rows = Vec::new();
+    for item in items {
+        let first_row = rows.len();
+        for line in item.text.lines() {
+            let (indent, explicit_done, marked, text) = strip_goal_list_marker(line);
+            if text.is_empty() {
+                continue;
+            }
+            if rows.len() == first_row {
+                rows.push(GoalRowData {
+                    text: text.to_string(),
+                    done: explicit_done.unwrap_or(item.done),
+                    depth: indent,
+                });
+            } else if marked || indent > 0 {
+                rows.push(GoalRowData {
+                    text: text.to_string(),
+                    done: explicit_done.unwrap_or(item.done),
+                    depth: indent + 1,
+                });
+            } else if let Some(parent) = rows.last_mut() {
+                parent.text.push(' ');
+                parent.text.push_str(text);
+            }
+        }
+    }
+    rows
+}
+
+fn render_goal_row(goal: GoalRowData, index: usize, id_prefix: &str, theme: &Theme) -> AnyElement {
+    let marker: AnyElement = if goal.done {
+        icon(icons::CHECK)
+            .size(px(12.0))
+            .text_color(theme.success)
+            .into_any_element()
+    } else {
+        div()
+            .size(px(12.0))
+            .rounded(px(3.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .into_any_element()
+    };
+    let depth = goal.depth.min(8);
+    div()
+        .id(SharedString::from(format!("{id_prefix}-{index}")))
+        .ml(px(depth as f32 * 12.0))
+        .py(px(5.0))
+        .when(depth > 0, |el| {
+            el.pl(px(8.0))
+                .border_l_1()
+                .border_color(theme.border.opacity(0.7))
+        })
+        .flex()
+        .items_start()
+        .gap(px(8.0))
+        .child(div().mt(px(2.0)).flex_none().child(marker))
+        .child(
+            div()
+                .min_w_0()
+                .text_size(px(11.0))
+                .line_height(px(15.0))
+                .text_color(if goal.done {
+                    theme.text_faint
+                } else {
+                    theme.text
+                })
+                .child(SharedString::from(goal.text)),
+        )
+        .into_any_element()
+}
+
+fn render_goal_group(
+    group: GoalGroupRows,
+    group_index: usize,
+    id_prefix: &str,
+    theme: &Theme,
+) -> AnyElement {
+    let total = group.rows.len();
+    let done = group.rows.iter().filter(|row| row.done).count();
+    let row_prefix = format!("{id_prefix}-{group_index}");
+    let rows = group
+        .rows
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| render_goal_row(row, index, &row_prefix, theme))
+        .collect::<Vec<_>>();
+    let labelled = group.label.is_some();
+    div()
+        .id(SharedString::from(format!(
+            "{id_prefix}-group-{group_index}"
+        )))
+        .when_some(group.label.map(SharedString::from), |el, label| {
+            el.pt(px(7.0)).child(
+                div()
+                    .pb(px(3.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .text_size(px(10.5))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(if done == total && total > 0 {
+                        theme.text_faint
+                    } else {
+                        theme.text_muted
+                    })
+                    .child(label)
+                    .child(div().flex_1())
+                    .child(SharedString::from(format!("{done}/{total}"))),
+            )
+        })
+        .child(
+            div()
+                .when(labelled, |el| {
+                    el.ml(px(4.0))
+                        .pl(px(8.0))
+                        .border_l_1()
+                        .border_color(theme.border.opacity(0.7))
+                })
+                .children(rows),
+        )
+        .into_any_element()
+}
+
 pub struct Shell {
     state: Entity<AppState>,
     transcript: Entity<Transcript>,
@@ -705,9 +1073,10 @@ pub struct Shell {
     /// the files in the composer.
     changes_sub: Option<Subscription>,
     file_drag_active: bool,
-    /// Lazy panes: no entity (and no RPC) until first opened.
+    /// Terminal stays lazy; Changes starts once the selected-chat status surface mounts.
     terminal: Option<Entity<TerminalPanel>>,
     changes: Option<Entity<Changes>>,
+    changes_observation: Option<Subscription>,
     /// Chat outlet vs settings pages.
     route: Route,
     /// Route history behind the titlebar back/forward buttons (§ nav history).
@@ -761,6 +1130,13 @@ pub struct Shell {
     command_palette_open: bool,
     activity_open: bool,
     invite_open: bool,
+    /// Scroll state for the persistent top-right goal list.
+    workspace_goals_scroll: gpui::ScrollHandle,
+    account_usage: Option<comet_proto::AgentAccountsSnapshot>,
+    account_usage_error: Option<SharedString>,
+    account_usage_loading: bool,
+    account_usage_loaded_at: Option<Instant>,
+    account_usage_task: Option<Task<()>>,
     /// On-demand native session picker. Discovery starts only when this opens.
     session_import_open: bool,
     /// Candidate chat selected from the picker; success closes the picker once
@@ -934,7 +1310,7 @@ impl Shell {
             Route::Chat => NavEntry::Chat(String::new()),
             Route::Settings(section) => NavEntry::Settings(section),
         });
-        Self {
+        let mut shell = Self {
             state,
             transcript,
             composer,
@@ -944,6 +1320,7 @@ impl Shell {
             route,
             nav,
             changes_sub: None,
+            changes_observation: None,
             devices_page: None,
             archived_page: None,
             appearance_page: None,
@@ -972,6 +1349,12 @@ impl Shell {
             command_palette_open: false,
             activity_open: false,
             invite_open: false,
+            workspace_goals_scroll: gpui::ScrollHandle::new(),
+            account_usage: None,
+            account_usage_error: None,
+            account_usage_loading: false,
+            account_usage_loaded_at: None,
+            account_usage_task: None,
             session_import_open: false,
             session_import_target_chat: None,
             session_import_sections: Vec::new(),
@@ -1021,7 +1404,9 @@ impl Shell {
             _ticker: ticker,
             _state_observation: observation,
             _composer_events: composer_events,
-        }
+        };
+        shell.refresh_account_usage(true, cx);
+        shell
     }
 
     // ---- splash ----
@@ -1047,6 +1432,9 @@ impl Shell {
     }
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
+        if self.account_usage_loaded_at.is_none() && !self.account_usage_loading {
+            self.refresh_account_usage(true, cx);
+        }
         if self.session_import_open {
             self.sync_session_import_sections(cx);
         }
@@ -1293,8 +1681,8 @@ impl Shell {
         let open = self.panels.toggle_changes(&key);
         self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
         if open {
-            // Lazy: the Changes entity (and its WatchCheckoutDiffs) exists only
-            // once the pane has been opened.
+            // The status surface normally starts this watch; opening the pane
+            // remains a safe fallback for routes that bypass the toolbar.
             let changes = self.changes_pane(cx);
             changes.update(cx, |changes, cx| changes.ensure_watch(cx));
         }
@@ -1315,8 +1703,65 @@ impl Shell {
             },
         );
         self.changes_sub = Some(subscription);
+        let observation = cx.observe(&changes, |_: &mut Shell, _, cx| cx.notify());
+        self.changes_observation = Some(observation);
         self.changes = Some(changes.clone());
         changes
+    }
+
+    fn refresh_account_usage(&mut self, force: bool, cx: &mut Context<Self>) {
+        if self.account_usage_loading {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.account_usage_loading = true;
+        self.account_usage_error = None;
+        self.account_usage_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::LIST_AGENT_ACCOUNTS,
+                    serde_json::json!({ "forceUsage": force }),
+                )
+                .await;
+            this.update(cx, |shell, cx| {
+                shell.account_usage_loading = false;
+                shell.account_usage_loaded_at = Some(Instant::now());
+                match result {
+                    Ok(value) => {
+                        match serde_json::from_value::<comet_proto::AgentAccountsSnapshot>(value) {
+                            Ok(snapshot) => {
+                                shell.account_usage = Some(snapshot);
+                                shell.account_usage_error = None;
+                            }
+                            Err(error) => {
+                                shell.account_usage_error =
+                                    Some(format!("Account usage unavailable: {error}").into());
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        shell.account_usage_error =
+                            Some(format!("Account usage unavailable: {error}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn open_workspace_changes(&mut self, cx: &mut Context<Self>) {
+        if self.settings.focus_mode {
+            self.toggle_focus_mode(cx);
+        }
+        if !self.right_pane_open(cx) {
+            self.toggle_right_pane(cx);
+        }
+        cx.notify();
     }
 
     fn toggle_focus_mode(&mut self, cx: &mut Context<Self>) {
@@ -1348,6 +1793,7 @@ impl Shell {
 
     fn toggle_command_palette(&mut self, cx: &mut Context<Self>) {
         self.command_palette_open = !self.command_palette_open;
+
         if self.command_palette_open {
             self.activity_open = false;
             self.invite_open = false;
@@ -4067,9 +4513,7 @@ impl Shell {
                     .as_ref()
                     .map(crate::multiplayer::activity_items)
                     .unwrap_or_default(),
-                latest_goal_items(&state.transcript)
-                    .map(|items| items.to_vec())
-                    .unwrap_or_default(),
+                latest_goal_groups(&state.transcript),
             )
         };
         for feedback in &self.control_feedback {
@@ -4100,45 +4544,20 @@ impl Shell {
         items.sort_by_key(|item| std::cmp::Reverse(item.occurred_at));
         let now = Utc::now();
         let has_activity = !items.is_empty();
-        let goal_total = goals.len();
-        let goal_done = goals.iter().filter(|goal| goal.done).count();
-        let goal_rows = goals
+        let goal_groups = goal_group_rows(goals);
+        let goal_total = goal_groups
+            .iter()
+            .map(|group| group.rows.len())
+            .sum::<usize>();
+        let goal_done = goal_groups
+            .iter()
+            .flat_map(|group| &group.rows)
+            .filter(|goal| goal.done)
+            .count();
+        let goal_group_elements = goal_groups
             .into_iter()
             .enumerate()
-            .map(|(index, goal)| {
-                let marker: AnyElement = if goal.done {
-                    icon(icons::CHECK)
-                        .size(px(12.0))
-                        .text_color(theme.success)
-                        .into_any_element()
-                } else {
-                    div()
-                        .size(px(12.0))
-                        .rounded(px(3.0))
-                        .border_1()
-                        .border_color(theme.border_strong)
-                        .into_any_element()
-                };
-                div()
-                    .id(("activity-goal", index))
-                    .py(px(Theme::SPACE_XS))
-                    .flex()
-                    .items_start()
-                    .gap(px(Theme::SPACE_SM))
-                    .child(div().mt(px(2.0)).flex_none().child(marker))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .text_size(px(12.0))
-                            .text_color(if goal.done {
-                                theme.text_faint
-                            } else {
-                                theme.text
-                            })
-                            .child(SharedString::from(goal.text)),
-                    )
-                    .into_any_element()
-            })
+            .map(|(index, group)| render_goal_group(group, index, "activity-goal", &theme))
             .collect::<Vec<_>>();
         let goals_card = (goal_total > 0).then(|| {
             div()
@@ -4171,7 +4590,7 @@ impl Shell {
                                 ))),
                         ),
                 )
-                .children(goal_rows)
+                .children(goal_group_elements)
                 .into_any_element()
         });
         let rows = items.into_iter().map(|item| {
@@ -5231,7 +5650,7 @@ impl Shell {
 
     fn render_session_toolbar(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
-        let (sessions, participants, selected_session_id, can_control, can_start, can_invite) = {
+        let (sessions, participants, selected_session_id, can_control) = {
             let state = self.state.read(cx);
             let chat_id = state.selected_chat.clone()?;
             (
@@ -5242,9 +5661,6 @@ impl Shell {
                 state.participants().to_vec(),
                 state.selected_agent_session.clone(),
                 state.has_collaboration_capability(comet_proto::CAPABILITY_SESSION_CONTROL),
-                state.has_collaboration_capability(comet_proto::CAPABILITY_SESSION_CHAT)
-                    && state.local_device_id.is_some(),
-                state.has_collaboration_capability(comet_proto::CAPABILITY_SESSION_INVITE),
             )
         };
         let participant_elements = participants.into_iter().take(5).map(|participant| {
@@ -5412,16 +5828,6 @@ impl Shell {
             .find(|session| selected_session_id.as_deref() == Some(session.session_id.as_str()))
             .cloned();
         let mut controls = div().flex().items_center().gap(px(Theme::SPACE_XS));
-        if can_start {
-            controls = controls.child(
-                popover::btn_primary(&theme, "Start agent")
-                    .id("start-agent")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.composer
-                            .update(cx, |composer, cx| composer.begin_start_agent(window, cx));
-                    })),
-            );
-        }
         if let Some(session) = selected_session
             && can_control
         {
@@ -5483,20 +5889,6 @@ impl Shell {
                 }
             }
         }
-        let focus_label = if self.settings.focus_mode {
-            "Exit focus"
-        } else {
-            "Focus"
-        };
-        let goal_summary = {
-            let state = self.state.read(cx);
-            latest_goal_items(&state.transcript).and_then(|items| {
-                (!items.is_empty()).then(|| {
-                    let done = items.iter().filter(|item| item.done).count();
-                    format!("Goals {done}/{}", items.len())
-                })
-            })
-        };
         Some(
             div()
                 .id("session-toolbar")
@@ -5544,32 +5936,374 @@ impl Shell {
                 })
                 .child(div().flex_1())
                 .child(controls)
-                .when_some(goal_summary, |el, label| {
-                    el.child(
-                        popover::btn_ghost(&theme, &label, "open-goals")
-                            .id("open-goals")
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_activity(cx))),
-                    )
-                })
-                .child(
-                    popover::btn_ghost(&theme, "Activity", "open-activity")
-                        .id("open-activity")
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_activity(cx))),
-                )
-                .when(can_invite, |el| {
-                    el.child(
-                        popover::btn_ghost(&theme, "Invite", "open-invite")
-                            .id("open-invite")
-                            .on_click(cx.listener(|this, _, _, cx| this.open_invite(cx))),
-                    )
-                })
-                .child(
-                    popover::btn_ghost(&theme, focus_label, "toggle-focus")
-                        .id("toggle-focus")
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_focus_mode(cx))),
-                )
                 .into_any_element(),
         )
+    }
+
+    fn render_workspace_status(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let preferred_harness = {
+            let state = self.state.read(cx);
+            let session_harness = state.selected_chat.as_deref().and_then(|chat_id| {
+                let selected_id = state.selected_agent_session.as_deref()?;
+                state
+                    .collaboration_sessions(chat_id)
+                    .find(|session| session.session_id == selected_id)
+                    .and_then(|session| session.harness)
+            });
+            session_harness.or_else(|| {
+                state
+                    .selected_chat_row()
+                    .and_then(|chat| chat.config.as_ref().map(|config| config.harness))
+            })
+        };
+        let changes = self.changes_pane(cx);
+        changes.update(cx, |changes, cx| changes.ensure_watch(cx));
+        let changes_summary = changes.read(cx).summary(cx);
+        let git_detected = self.space_git_detected(cx);
+        let branch: SharedString = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .and_then(|chat| chat.branch.clone())
+            .filter(|branch| !branch.is_empty())
+            .unwrap_or_else(|| "Worktree".to_string())
+            .into();
+        let goal_groups = {
+            let state = self.state.read(cx);
+            goal_group_rows(latest_goal_groups(&state.transcript))
+        };
+        let goal_total = goal_groups
+            .iter()
+            .map(|group| group.rows.len())
+            .sum::<usize>();
+        let goal_done = goal_groups
+            .iter()
+            .flat_map(|group| &group.rows)
+            .filter(|goal| goal.done)
+            .count();
+        let goal_group_elements = goal_groups
+            .into_iter()
+            .enumerate()
+            .map(|(index, group)| render_goal_group(group, index, "workspace-goal", &theme))
+            .collect::<Vec<_>>();
+
+        let account = self.account_usage.as_ref().and_then(|snapshot| {
+            snapshot
+                .accounts
+                .iter()
+                .find(|account| account.active && Some(account.harness) == preferred_harness)
+                .or_else(|| {
+                    snapshot.accounts.iter().find(|account| {
+                        account.active && account.harness == comet_proto::HarnessId::Codex
+                    })
+                })
+                .or_else(|| snapshot.accounts.iter().find(|account| account.active))
+                .map(|account| {
+                    let provider = crate::multiplayer::harness_label(account.harness);
+                    let identity = account
+                        .display_name
+                        .as_deref()
+                        .or(account.email.as_deref())
+                        .unwrap_or(provider);
+                    let identity = account
+                        .plan_label
+                        .as_deref()
+                        .map(|plan| format!("{identity} · {plan}"))
+                        .unwrap_or_else(|| identity.to_string());
+                    (account.harness, identity, account.usage_windows.clone())
+                })
+        });
+        let (account_harness, account_identity, usage_windows) = account.unwrap_or((
+            preferred_harness.unwrap_or(comet_proto::HarnessId::Codex),
+            String::new(),
+            Vec::new(),
+        ));
+        let account_icon = match account_harness {
+            comet_proto::HarnessId::Codex => icons::OPENAI_MARK,
+            comet_proto::HarnessId::ClaudeCode => icons::CLAUDE_MARK,
+            comet_proto::HarnessId::Cursor => icons::CURSOR_MARK,
+            _ => icons::COMET_LOGO,
+        };
+        let account_icon_color = if account_harness == comet_proto::HarnessId::ClaudeCode {
+            icons::claude_brand()
+        } else {
+            theme.text_muted
+        };
+        let changes_detail = match changes_summary {
+            Some(summary) if summary.file_count == 0 => "Working tree clean".to_string(),
+            Some(summary) if summary.file_count == 1 => "1 changed file".to_string(),
+            Some(summary) => format!("{} changed files", summary.file_count),
+            None if git_detected => "Checking the current worktree…".to_string(),
+            None => "No Git worktree detected".to_string(),
+        };
+        let changes_stats = changes_summary.map(|summary| {
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .text_size(px(11.5))
+                .child(
+                    div()
+                        .text_color(theme.diff_add)
+                        .child(SharedString::from(format!("+{}", summary.additions))),
+                )
+                .child(
+                    div()
+                        .text_color(theme.diff_del)
+                        .child(SharedString::from(format!("−{}", summary.deletions))),
+                )
+                .into_any_element()
+        });
+        let usage_meter_rows = usage_windows
+            .iter()
+            .take(2)
+            .enumerate()
+            .map(|(index, window)| {
+                let fraction = window.used_fraction.clamp(0.0, 1.0);
+                let fill = usage_color(usage_level(fraction), &theme);
+                let reset = format_reset(window.resets_at, Utc::now())
+                    .map(|reset| format!(" · {reset}"))
+                    .unwrap_or_default();
+                div()
+                    .id(("workspace-usage-window", index))
+                    .mt(px(7.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(5.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .text_size(px(10.5))
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from(format!("{}{reset}", window.label)))
+                            .child(div().flex_1())
+                            .child(SharedString::from(format!(
+                                "{}% used",
+                                (fraction * 100.0).round() as u32
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .h(px(5.0))
+                            .w_full()
+                            .rounded_full()
+                            .overflow_hidden()
+                            .bg(crate::theme::ink(0.07))
+                            .when(fraction > 0.0, |el| {
+                                el.child(
+                                    div()
+                                        .h_full()
+                                        .w(gpui::relative(fraction.max(0.015)))
+                                        .rounded_full()
+                                        .bg(fill),
+                                )
+                            }),
+                    )
+            })
+            .collect::<Vec<_>>();
+        let account_detail: SharedString =
+            if self.account_usage_loading && account_identity.is_empty() {
+                "Loading current account…".into()
+            } else if !account_identity.is_empty() {
+                account_identity.into()
+            } else if self.account_usage_error.is_some() {
+                "Usage unavailable".into()
+            } else {
+                "No active agent account".into()
+            };
+
+        let changes_row = div()
+            .id("workspace-status-changes")
+            .px(px(14.0))
+            .py(px(11.0))
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.element_hover))
+            .on_click(cx.listener(|this, _, _, cx| this.open_workspace_changes(cx)))
+            .child(
+                icon(icons::DOCUMENT)
+                    .size(px(16.0))
+                    .text_color(theme.text_muted),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child("Changes"),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(10.5))
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from(changes_detail)),
+                    ),
+            )
+            .when_some(changes_stats, |el, stats| el.child(stats));
+        let account_row = div()
+            .id("workspace-status-account")
+            .px(px(14.0))
+            .py(px(11.0))
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.element_hover))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.open_settings(SettingsSection::Agents, cx);
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(
+                        icon(account_icon)
+                            .size(px(16.0))
+                            .text_color(account_icon_color),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .child("Account usage"),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(10.5))
+                                    .text_color(theme.text_faint)
+                                    .child(account_detail),
+                            ),
+                    ),
+            )
+            .children(usage_meter_rows);
+        let goals_section = div()
+            .id("workspace-status-goals")
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(42.0))
+                    .flex_none()
+                    .px(px(14.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(
+                        icon(icons::CHECKLIST)
+                            .size(px(16.0))
+                            .text_color(theme.text_muted),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child("Goals"),
+                    )
+                    .child(div().flex_1())
+                    .when(goal_total > 0, |el| {
+                        el.child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(format!("{goal_done} / {goal_total}"))),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .id("workspace-goals-scroll")
+                    .max_h(px(WORKSPACE_GOALS_MAX_HEIGHT))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.workspace_goals_scroll)
+                    .px(px(14.0))
+                    .pb(px(10.0))
+                    .when(goal_total == 0, |el| {
+                        el.child(
+                            div()
+                                .pb(px(4.0))
+                                .text_size(px(10.5))
+                                .text_color(theme.text_faint)
+                                .child("No goals published yet"),
+                        )
+                    })
+                    .children(goal_group_elements),
+            );
+
+        popover::popover_card(&theme)
+            .id("workspace-status-card")
+            .w_full()
+            .p(px(0.0))
+            .rounded(px(16.0))
+            .overflow_hidden()
+            .child(
+                div()
+                    .px(px(14.0))
+                    .pt(px(12.0))
+                    .pb(px(10.0))
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(theme.text_faint)
+                                    .child("Current worktree"),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(12.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .child(branch),
+                            ),
+                    )
+                    .when(
+                        changes_summary.is_some_and(|summary| summary.truncated),
+                        |el| {
+                            el.child(
+                                div()
+                                    .rounded_full()
+                                    .bg(theme.warning.opacity(0.12))
+                                    .px(px(7.0))
+                                    .py(px(3.0))
+                                    .text_size(px(9.5))
+                                    .text_color(theme.warning)
+                                    .child("Partial"),
+                            )
+                        },
+                    ),
+            )
+            .child(popover::menu_separator())
+            .child(changes_row)
+            .child(popover::menu_separator())
+            .child(account_row)
+            .child(popover::menu_separator())
+            .child(goals_section)
+            .into_any_element()
     }
 
     fn render_main(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -5706,7 +6440,7 @@ impl Shell {
         // files in the composer. `has_active_drag` gates the veil so a drag
         // that left the window (FileDrop Exited) can't strand it.
         let file_drag_active = self.file_drag_active && cx.has_active_drag();
-        div()
+        let conversation = div()
             .id("chat-dropzone")
             .relative()
             .flex_1()
@@ -5774,6 +6508,29 @@ impl Shell {
                         .text_size(px(13.0))
                         .text_color(theme.text)
                         .child("Drop images to attach"),
+                )
+            });
+        let workspace_status = has_selection.then(|| self.render_workspace_status(cx));
+        div()
+            .id("chat-layout")
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_row()
+            .overflow_hidden()
+            .child(conversation)
+            .when_some(workspace_status, |el, status| {
+                el.child(
+                    div()
+                        .id("workspace-status-rail")
+                        .w(px(WORKSPACE_STATUS_RAIL_WIDTH))
+                        .h_full()
+                        .flex_none()
+                        .pt(px(10.0))
+                        .pr(px(12.0))
+                        .pl(px(8.0))
+                        .child(status),
                 )
             })
             .into_any_element()
@@ -6981,6 +7738,132 @@ mod tests {
 
         let cleared = vec![todo_entry("cleared", Vec::new())];
         assert_eq!(latest_goal_items(&cleared), Some([].as_slice()));
+    }
+
+    #[test]
+    fn structured_goal_groups_replay_phases_and_updates() {
+        let tool_entry = |id: &str, input: serde_json::Value| comet_doc::SessionMessageEntry {
+            id: id.into(),
+            role: comet_doc::MessageRole::Assistant,
+            parts: vec![comet_doc::MessagePart::Tool {
+                id: id.into(),
+                call: comet_proto::ToolCall::Unknown {
+                    name: "todo".into(),
+                    input: Some(input),
+                },
+                is_error: false,
+                resolved: true,
+            }],
+            created_at: 0,
+            device_id: "device".into(),
+            status: Some(comet_doc::MessageStatus::Complete),
+            continuation_of: None,
+        };
+        let entries = vec![
+            tool_entry(
+                "init",
+                serde_json::json!({
+                    "op": "init",
+                    "list": [
+                        {"phase": "Layout", "items": ["Inspect", "Implement"]},
+                        {"phase": "Verification", "items": ["Build"]}
+                    ]
+                }),
+            ),
+            tool_entry(
+                "done-task",
+                serde_json::json!({"op": "done", "task": "Inspect"}),
+            ),
+            tool_entry(
+                "append",
+                serde_json::json!({
+                    "op": "append",
+                    "phase": "Verification",
+                    "items": ["Smoke"]
+                }),
+            ),
+            tool_entry(
+                "done-phase",
+                serde_json::json!({"op": "done", "phase": "Verification"}),
+            ),
+        ];
+
+        assert_eq!(
+            structured_goal_groups(&entries),
+            Some(vec![
+                GoalGroupData {
+                    label: Some("Layout".into()),
+                    items: vec![
+                        comet_proto::TodoItem {
+                            text: "Inspect".into(),
+                            done: true,
+                        },
+                        comet_proto::TodoItem {
+                            text: "Implement".into(),
+                            done: false,
+                        },
+                    ],
+                },
+                GoalGroupData {
+                    label: Some("Verification".into()),
+                    items: vec![
+                        comet_proto::TodoItem {
+                            text: "Build".into(),
+                            done: true,
+                        },
+                        comet_proto::TodoItem {
+                            text: "Smoke".into(),
+                            done: true,
+                        },
+                    ],
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn goal_rows_preserve_nested_lists_and_continuation_text() {
+        let items = vec![
+            comet_proto::TodoItem {
+                text: "Release\n- [x] Build\n  1. [ ] Verify narrow viewport\n- Ship".into(),
+                done: false,
+            },
+            comet_proto::TodoItem {
+                text: "Document the status\nwithout splitting prose".into(),
+                done: true,
+            },
+        ];
+
+        assert_eq!(
+            goal_rows(&items),
+            vec![
+                GoalRowData {
+                    text: "Release".into(),
+                    done: false,
+                    depth: 0,
+                },
+                GoalRowData {
+                    text: "Build".into(),
+                    done: true,
+                    depth: 1,
+                },
+                GoalRowData {
+                    text: "Verify narrow viewport".into(),
+                    done: false,
+                    depth: 2,
+                },
+                GoalRowData {
+                    text: "Ship".into(),
+                    done: false,
+                    depth: 1,
+                },
+                GoalRowData {
+                    text: "Document the status without splitting prose".into(),
+                    done: true,
+                    depth: 0,
+                },
+            ]
+        );
     }
 
     #[test]
