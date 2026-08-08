@@ -2391,7 +2391,7 @@ mod authority_tests {
         let workspace = WorkspaceHost::open(
             store.clone(),
             crate::workspace_host::WorkspaceHostConfig {
-                device_id: "device-a".into(),
+                device_id: "comet-scaffold-sandbox-a-e1".into(),
                 device_name: "test".into(),
                 platform: "test".into(),
                 project_scope: "project-a".into(),
@@ -2403,7 +2403,7 @@ mod authority_tests {
         let host = DocHost::new(
             store,
             DocHostConfig {
-                device_id: "device-a".into(),
+                device_id: "comet-scaffold-sandbox-a-e1".into(),
                 default_harness: HarnessId::Mock,
                 edge: None,
             },
@@ -2420,7 +2420,8 @@ mod authority_tests {
             .unwrap();
         row.insert("projectId", "project-a").unwrap();
         row.insert("sessionId", "session-a").unwrap();
-        row.insert("deviceId", "device-a").unwrap();
+        row.insert("deviceId", "comet-scaffold-sandbox-a-e1")
+            .unwrap();
         workspace.doc().doc().commit();
 
         let now = now_ms();
@@ -2428,14 +2429,14 @@ mod authority_tests {
             id: "command-a".into(),
             payload: SessionCommandPayload::Control {
                 session_id: "session-a".into(),
-                owner_device_id: "device-a".into(),
-                actor_device_id: "device-a".into(),
+                owner_device_id: "comet-scaffold-sandbox-a-e1".into(),
+                actor_device_id: "comet-scaffold-sandbox-a-e1".into(),
                 actor_subject: "accounts.google.com:alice@example.com".into(),
                 grant_id: "forged-grant".into(),
                 source: AgentSessionSource::Local,
                 action: Box::new(SessionControlAction::Pause {}),
             },
-            issued_by: "device-a".into(),
+            issued_by: "comet-scaffold-sandbox-a-e1".into(),
             issued_at: now,
             based_on: None,
             expires_at: Some(now + 60_000),
@@ -2447,7 +2448,7 @@ mod authority_tests {
         let local_command = SessionCommandEntry {
             id: "command-local".into(),
             payload: SessionCommandPayload::Interrupt {},
-            issued_by: "device-a".into(),
+            issued_by: "comet-scaffold-sandbox-a-e1".into(),
             issued_at: now,
             based_on: None,
             expires_at: Some(now + 60_000),
@@ -2474,10 +2475,10 @@ mod authority_tests {
                 unknown: Default::default(),
             },
             capabilities: vec![comet_proto::CAPABILITY_SESSION_CONTROL.into()],
-            device_id: Some("device-a".into()),
-            lifecycle_epoch: None,
-            sandbox_id: None,
-            granted_by: "scaffold-control-plane".into(),
+            device_id: Some("comet-scaffold-sandbox-a-e1".into()),
+            lifecycle_epoch: Some(1),
+            sandbox_id: Some("sandbox-a".into()),
+            granted_by: "comet-edge-device-room".into(),
             granted_at: now - 1,
             expires_at: Some(now + 60_000),
             revoked_at: None,
@@ -2487,7 +2488,7 @@ mod authority_tests {
             id: "command-edge".into(),
             payload: SessionCommandPayload::Control {
                 session_id: "session-a".into(),
-                owner_device_id: "device-a".into(),
+                owner_device_id: "comet-scaffold-sandbox-a-e1".into(),
                 actor_device_id: "device-peer".into(),
                 actor_subject: edge_grant.principal_subject.clone(),
                 grant_id: edge_grant.id.clone(),
@@ -2504,7 +2505,7 @@ mod authority_tests {
         let envelope = VerifiedCapabilityGrantEnvelope {
             grant: edge_grant,
             room_id: "s4/project-a/project-a/session-a".into(),
-            target_device_id: "device-a".into(),
+            target_device_id: "comet-scaffold-sandbox-a-e1".into(),
             target_session_id: "session-a".into(),
             unknown: Default::default(),
         };
