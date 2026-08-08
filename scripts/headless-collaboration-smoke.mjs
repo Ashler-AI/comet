@@ -21,7 +21,8 @@ const CLIENT_B_SUBJECT = "agent-b@example.test";
 const PROJECT_ID = "ashler-local";
 const DEPLOYMENT_ID = "deployment-smoke";
 const SANDBOX_ID = "smoke-001";
-const DEVICE_ID = `comet-scaffold-${SANDBOX_ID}`;
+const LIFECYCLE_EPOCH = 1;
+const DEVICE_ID = `comet-scaffold-${SANDBOX_ID}-e${LIFECYCLE_EPOCH}`;
 const SESSION_ID = "session-smoke-001";
 const CAPABILITIES = [
   "session.read",
@@ -139,7 +140,8 @@ const startFakeScaffold = async (port) => {
           sandboxId: SANDBOX_ID,
           deploymentId: DEPLOYMENT_ID,
           targetDeviceId: DEVICE_ID,
-          sessionId: SESSION_ID
+          sessionId: SESSION_ID,
+          lifecycleEpoch: LIFECYCLE_EPOCH
         });
         observations.targetProofs += 1;
         sendJson(response, 200, {
@@ -477,6 +479,7 @@ const main = async () => {
       sandboxId: SANDBOX_ID,
       targetDeviceId: DEVICE_ID,
       sessionId: SESSION_ID,
+      lifecycleEpoch: LIFECYCLE_EPOCH,
       capabilities: ["session.read", "session.control", "session.environment"],
       ttlSeconds: 60
     })
@@ -498,7 +501,8 @@ const main = async () => {
       deploymentId: DEPLOYMENT_ID,
       sessionId: SESSION_ID,
       deviceId: DEVICE_ID,
-      sandboxId: SANDBOX_ID
+      sandboxId: SANDBOX_ID,
+      lifecycleEpoch: LIFECYCLE_EPOCH
     }),
     { mode: 0o600 }
   );

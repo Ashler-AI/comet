@@ -51,6 +51,21 @@ const EDGE_GRANT_CAPABILITIES: &[&str] = &[
     comet_proto::CAPABILITY_SESSION_ENVIRONMENT,
 ];
 
+fn scaffold_sandbox_id_from_device(device_id: &str) -> Option<&str> {
+    let target = device_id.strip_prefix("comet-scaffold-")?;
+    let (sandbox_id, epoch) = target.rsplit_once("-e")?;
+    if sandbox_id.is_empty()
+        || epoch
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value >= 1)
+            .is_none()
+    {
+        return None;
+    }
+    Some(sandbox_id)
+}
+
 /// Warm-doc LRU: how many unwatched, run-less docs stay fully open. Everything
 /// beyond this (and beyond [`comet_doc::DOC_LRU_BYTE_BUDGET`]) is evicted
 /// oldest-access-first — reopening from the SQLite snapshot measured within
@@ -578,7 +593,7 @@ impl DocHost {
             serde_json::from_slice(payload).map_err(|_| "grant_envelope_invalid")?;
         let workspace = self.workspace().ok_or("workspace_unavailable")?;
         let expected_device_id = self.device_id();
-        let expected_sandbox_id = expected_device_id.strip_prefix("comet-scaffold-");
+        let expected_sandbox_id = scaffold_sandbox_id_from_device(expected_device_id);
         let now = now_ms();
         let grant = &envelope.grant;
         let deployment_id = grant.scope.deployment_id.as_deref().unwrap_or_default();
@@ -653,7 +668,7 @@ impl DocHost {
         let workspace = self.workspace().ok_or("workspace_unavailable")?;
         let now = now_ms();
         let device_id = grant.device_id.as_deref().unwrap_or_default();
-        let expected_sandbox_id = device_id.strip_prefix("comet-scaffold-");
+        let expected_sandbox_id = scaffold_sandbox_id_from_device(device_id);
         if grant.id.trim().is_empty()
             || grant.principal_subject.trim().is_empty()
             || grant.granted_by != "comet-edge-device-room"
@@ -2550,7 +2565,7 @@ mod authority_tests {
         let workspace = WorkspaceHost::open(
             store.clone(),
             crate::workspace_host::WorkspaceHostConfig {
-                device_id: "comet-scaffold-smoke-001".into(),
+                device_id: "comet-scaffold-smoke-001-e1".into(),
                 device_name: "test".into(),
                 platform: "test".into(),
                 project_scope: "project-a".into(),
@@ -2562,7 +2577,7 @@ mod authority_tests {
         let host = DocHost::new(
             store,
             DocHostConfig {
-                device_id: "comet-scaffold-smoke-001".into(),
+                device_id: "comet-scaffold-smoke-001-e1".into(),
                 default_harness: HarnessId::Mock,
                 edge: None,
             },
@@ -2581,7 +2596,7 @@ mod authority_tests {
                 },
                 capabilities: vec![comet_proto::CAPABILITY_SESSION_CONTROL.into()],
                 sandbox_id: Some("smoke-001".into()),
-                device_id: Some("comet-scaffold-smoke-001".into()),
+                device_id: Some("comet-scaffold-smoke-001-e1".into()),
                 granted_by: "comet-edge-device-room".into(),
                 granted_at: now - 1,
                 expires_at: Some(now + 60_000),
@@ -2589,7 +2604,7 @@ mod authority_tests {
                 unknown: Default::default(),
             },
             room_id: "s4/project-a/deployment-a/session-a".into(),
-            target_device_id: "comet-scaffold-smoke-001".into(),
+            target_device_id: "comet-scaffold-smoke-001-e1".into(),
             target_session_id: "session-a".into(),
             unknown: Default::default(),
         };
@@ -2597,7 +2612,7 @@ mod authority_tests {
             .unwrap();
         let exact = SessionCommandPayload::Control {
             session_id: "session-a".into(),
-            owner_device_id: "comet-scaffold-smoke-001".into(),
+            owner_device_id: "comet-scaffold-smoke-001-e1".into(),
             actor_device_id: "operator-device".into(),
             actor_subject: "accounts.google.com:operator@example.com".into(),
             grant_id: "edge-control-grant".into(),
@@ -2646,7 +2661,7 @@ mod authority_tests {
         .unwrap();
         let mismatched = SessionCommandPayload::Control {
             session_id: "session-a".into(),
-            owner_device_id: "comet-scaffold-smoke-001".into(),
+            owner_device_id: "comet-scaffold-smoke-001-e1".into(),
             actor_device_id: "operator-device".into(),
             actor_subject: "accounts.google.com:operator@example.com".into(),
             grant_id: "edge-control-grant".into(),
