@@ -476,6 +476,7 @@ pub(crate) async fn attach_scaffold_session(
     let source_ref = attached.environment.source_ref.clone();
     let SessionEnvironmentSource::Scaffold {
         sandbox_id: attached_sandbox_id,
+        lifecycle_epoch,
         ..
     } = &attached.environment.source
     else {
@@ -511,12 +512,16 @@ pub(crate) async fn attach_scaffold_session(
             "Scaffold attach returned no chat authority".into(),
         ));
     }
+    let expected_lifecycle_epoch = lifecycle_epoch
+        .ok_or_else(|| RpcError::Failed("Scaffold attach returned no lifecycle epoch".into()))?;
     let owner_device_id = attached
         .attached_device_id
         .filter(|device_id| {
-            device_id
-                .strip_prefix("comet-scaffold-")
-                .is_some_and(|sandbox| sandbox == sandbox_id)
+            comet_proto::parse_scaffold_device_id(device_id).is_some_and(
+                |(device_sandbox_id, lifecycle_epoch)| {
+                    device_sandbox_id == sandbox_id && lifecycle_epoch == expected_lifecycle_epoch
+                },
+            )
         })
         .ok_or_else(|| RpcError::Failed("Scaffold attach returned a different device".into()))?;
     if attached.environment.owner_principal.is_empty() {
@@ -2198,6 +2203,7 @@ mod tests {
                     "sandbox_id": "sandbox-ready",
                     "region": "default",
                     "lifecycle": lifecycle,
+                    "lifecycle_epoch": 1,
                     "links": {}
                 },
                 "ownerPrincipal": "accounts.google.com:ready@example.com",
@@ -2207,12 +2213,12 @@ mod tests {
                     "deploymentId": "ashler-staging",
                     "sessionId": session_id
                 },
-                "lastActivityAt": 1
+                "lastActivityAt": 1,
             });
             let result = if operation == "attach" {
                 serde_json::json!({
                     "environment": environment,
-                    "attachedDeviceId": "comet-scaffold-sandbox-ready",
+                    "attachedDeviceId": "comet-scaffold-sandbox-ready-e1",
                     "runId": "run-ready",
                     "roomProjection": {
                         "projectId": "ashler-staging",
@@ -2325,7 +2331,10 @@ mod tests {
             ["create", "attach", "inspect"]
         );
         assert_eq!(attachment.projection.session_id, "session-ready");
-        assert_eq!(attachment.owner_device_id, "comet-scaffold-sandbox-ready");
+        assert_eq!(
+            attachment.owner_device_id,
+            "comet-scaffold-sandbox-ready-e1"
+        );
         assert_eq!(attachment.grant_id, "grant-ready");
         assert_eq!(
             attachment.actor_subject,

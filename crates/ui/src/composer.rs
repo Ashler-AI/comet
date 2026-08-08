@@ -3264,11 +3264,14 @@ fn scaffold_start_control_route(
         grant.id == preferred_grant_id
             && grant.granted_by == "comet-edge-device-room"
             && grant.permits(principal, required_capability, now)
-            && grant.device_id.as_deref().and_then(|device| {
-                device
-                    .strip_prefix("comet-scaffold-")
-                    .map(|sandbox| Some(sandbox) == grant.sandbox_id.as_deref())
-            }) == Some(true)
+            && grant.device_id.as_deref().is_some_and(|device| {
+                comet_proto::parse_scaffold_device_id(device).is_some_and(
+                    |(sandbox_id, lifecycle_epoch)| {
+                        Some(sandbox_id) == grant.sandbox_id.as_deref()
+                            && Some(lifecycle_epoch) == grant.lifecycle_epoch
+                    },
+                )
+            })
     })?;
     Some((
         grant.scope.session_id.clone()?,
@@ -6928,7 +6931,8 @@ mod tests {
                     },
                     "capabilities": ["session.chat"],
                     "sandboxId": "sandbox-a",
-                    "deviceId": "comet-scaffold-sandbox-a",
+                    "deviceId": "comet-scaffold-sandbox-a-e1",
+                    "lifecycleEpoch": 1,
                     "grantedBy": "comet-edge-device-room",
                     "grantedAt": 1,
                     "expiresAt": 60_000
@@ -6944,7 +6948,7 @@ mod tests {
             ),
             Some((
                 "session-a".into(),
-                "comet-scaffold-sandbox-a".into(),
+                "comet-scaffold-sandbox-a-e1".into(),
                 "grant-a".into(),
             ))
         );
