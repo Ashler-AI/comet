@@ -1,31 +1,17 @@
-// Sign-in — the OAuth authorization-code flow against WorkOS AuthKit, with
-// the secret-bearing exchange delegated to the edge (`POST /auth/exchange`).
-// The comet mark on black, one white button — the old mobile app's Gate.
-//
-// Endpoints are fixed to production (the old app's rule: mobile always talks
-// to prod; a stale override once broke sign-in in the worst ghost way).
+// Sign-in — Scaffold OAuth authorization code + dynamic native-client
+// registration + PKCE S256. The issued revocable `sc_rc_` bearer is validated
+// against Scaffold before it is stored.
 
 import AuthenticationServices
+import Network
 import SwiftUI
 
 /// Production cloud endpoints — mirrors edge/wrangler.jsonc.
 enum Endpoints {
-    static let edgeURL = URL(string: "https://edge.comet.zeron.sh")!
-    static let workosClientId = "client_01KWD0EAKZKD50YCQJNYSRE4BY"
-    static let workosAPIBase = "https://api.workos.com"
-    static let callbackScheme = "comet"
-
-    static func authorizeURL(state: String) -> URL {
-        var components = URLComponents(string: "\(workosAPIBase)/user_management/authorize")!
-        components.queryItems = [
-            URLQueryItem(name: "response_type", value: "code"),
-            URLQueryItem(name: "client_id", value: workosClientId),
-            URLQueryItem(name: "redirect_uri", value: "\(callbackScheme)://callback"),
-            URLQueryItem(name: "provider", value: "authkit"),
-            URLQueryItem(name: "state", value: state),
-        ]
-        return components.url!
-    }
+    static let edgeURL = URL(string: "https://comet.internal.ashler.com")!
+    static let scaffoldURL = URL(string: "https://scaffold.internal.ashler.com")!
+    static let projectScope = "ashler-production"
+    static let loopbackHost = "127.0.0.1"
 }
 
 struct SignInView: View {
@@ -92,38 +78,37 @@ struct SignInView: View {
         }
     }
 
-    /// The AuthKit code flow: system browser session → comet://callback with
-    /// code + state → exchange on the edge.
     private func signIn() {
         busy = true
         error = nil
-        let state = UUID().uuidString
-        authSession.start(url: Endpoints.authorizeURL(state: state),
-                          callbackScheme: Endpoints.callbackScheme) { result in
+        authSession.start(
+            begin: { redirectURI in
+                try await model.beginSignIn(
+                    scaffoldURL: Endpoints.scaffoldURL,
+                    redirectURI: redirectURI
+                )
+            }
+        ) { result in
             Task { @MainActor in
                 switch result {
                 case .cancelled:
-                    busy = false
+                    break
                 case .failure(let message):
-                    busy = false
                     error = message
-                case .success(let callbackURL):
-                    let params = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?
-                        .queryItems ?? []
-                    let code = params.first { $0.name == "code" }?.value
-                    let cbState = params.first { $0.name == "state" }?.value
-                    guard let code, cbState == state else {
-                        busy = false
-                        error = "Callback missing code or state mismatch"
-                        return
-                    }
+                case .success(let flow, let callbackURL):
                     do {
-                        try await model.signIn(edgeURL: Endpoints.edgeURL, code: code)
+                        try await model.completeSignIn(
+                            edgeURL: Endpoints.edgeURL,
+                            scaffoldURL: Endpoints.scaffoldURL,
+                            projectScope: Endpoints.projectScope,
+                            flow: flow,
+                            callbackURL: callbackURL
+                        )
                     } catch {
                         self.error = error.localizedDescription
                     }
-                    busy = false
                 }
+                busy = false
             }
         }
     }
@@ -131,104 +116,204 @@ struct SignInView: View {
 
 // MARK: - Auth session plumbing
 
-/// Wraps ASWebAuthenticationSession with a presentation anchor.
+/// Runs OAuth in the system sheet while an HTTP listener bound only to
+/// 127.0.0.1 receives Scaffold's exact loopback redirect.
 @MainActor
 final class AuthSessionCoordinator: NSObject, ASWebAuthenticationPresentationContextProviding {
     enum Outcome {
-        case success(URL)
+        case success(OAuthFlow, URL)
         case cancelled
         case failure(String)
     }
 
+    private var listener: NWListener?
     private var session: ASWebAuthenticationSession?
+    private var flow: OAuthFlow?
+    private var completion: ((Outcome) -> Void)?
+    private var beginning = false
+    private var finished = false
+    private let networkQueue = DispatchQueue(label: "dev.cometnative.Comet.oauth-loopback")
 
-    func start(url: URL, callbackScheme: String, completion: @escaping (Outcome) -> Void) {
-        let session = ASWebAuthenticationSession(url: url,
-                                                 callbackURLScheme: callbackScheme) { callbackURL, error in
-            if let callbackURL {
-                completion(.success(callbackURL))
-            } else if let error = error as? ASWebAuthenticationSessionError,
-                      error.code == .canceledLogin {
-                completion(.cancelled)
-            } else {
-                completion(.failure(error?.localizedDescription ?? "Sign-in failed"))
+    func start(
+        begin: @MainActor @escaping (String) async throws -> OAuthFlow,
+        completion: @escaping (Outcome) -> Void
+    ) {
+        guard listener == nil, session == nil else {
+            completion(.failure("A sign-in is already in progress"))
+            return
+        }
+        self.completion = completion
+        finished = false
+        beginning = false
+        do {
+            let parameters = NWParameters.tcp
+            parameters.requiredLocalEndpoint = .hostPort(
+                host: NWEndpoint.Host(Endpoints.loopbackHost),
+                port: .any
+            )
+            let listener = try NWListener(using: parameters)
+            self.listener = listener
+            listener.stateUpdateHandler = { [weak self] state in
+                Task { @MainActor in
+                    self?.handleListenerState(state, begin: begin)
+                }
             }
-        }
-        session.presentationContextProvider = self
-        session.prefersEphemeralWebBrowserSession = false
-        self.session = session
-        session.start()
-    }
-
-    nonisolated func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-        MainActor.assumeIsolated {
-            UIApplication.shared.connectedScenes
-                .compactMap { ($0 as? UIWindowScene)?.keyWindow }
-                .first ?? ASPresentationAnchor()
+            listener.newConnectionHandler = { [weak self] connection in
+                Task { @MainActor in
+                    self?.accept(connection)
+                }
+            }
+            listener.start(queue: networkQueue)
+        } catch {
+            finish(.failure(error.localizedDescription))
         }
     }
-}
 
-struct OrgPickerView: View {
-    @Environment(AppModel.self) private var model
-    let tokens: AuthTokens
-    let orgs: [AuthOrg]
-    @State private var busy = false
-    @State private var error: String?
-
-    var body: some View {
-        ZStack {
-            Theme.bg.ignoresSafeArea()
-            VStack(spacing: 20) {
-                Text("Choose an organization")
-                    .font(Theme.sans(16, weight: .semibold))
-                    .foregroundStyle(Theme.text)
-                VStack(spacing: 8) {
-                    ForEach(orgs) { org in
-                        Button {
-                            select(org)
-                        } label: {
-                            HStack {
-                                Text(org.name)
-                                    .font(Theme.sans(14, weight: .medium))
-                                    .foregroundStyle(Theme.text)
-                                Spacer()
-                                Image(systemName: "chevron.right")
-                                    .font(.system(size: 12))
-                                    .foregroundStyle(Theme.textFaint)
+    private func handleListenerState(
+        _ state: NWListener.State,
+        begin: @MainActor @escaping (String) async throws -> OAuthFlow
+    ) {
+        switch state {
+        case .ready:
+            guard !beginning, let port = listener?.port else { return }
+            beginning = true
+            let redirectURI = "http://\(Endpoints.loopbackHost):\(port.rawValue)/callback"
+            Task {
+                do {
+                    let flow = try await begin(redirectURI)
+                    guard !finished else { return }
+                    self.flow = flow
+                    let session = ASWebAuthenticationSession(
+                        url: flow.authorizeURL,
+                        callbackURLScheme: nil
+                    ) { [weak self] _, error in
+                        Task { @MainActor in
+                            guard let self, !self.finished else { return }
+                            if let error = error as? ASWebAuthenticationSessionError,
+                               error.code == .canceledLogin {
+                                self.finish(.cancelled)
+                            } else {
+                                self.finish(.failure(error?.localizedDescription ?? "Sign-in failed"))
                             }
-                            .padding(.horizontal, 16)
-                            .frame(height: 48)
-                            .glassEffect(.regular.interactive(), in: RoundedRectangle(cornerRadius: 14))
                         }
-                        .disabled(busy)
                     }
+                    session.presentationContextProvider = self
+                    session.prefersEphemeralWebBrowserSession = false
+                    self.session = session
+                    if !session.start() {
+                        finish(.failure("Could not open the sign-in browser"))
+                    }
+                } catch {
+                    finish(.failure(error.localizedDescription))
                 }
-                if let error {
-                    Text(error).font(Theme.sans(12)).foregroundStyle(Theme.danger)
-                }
-                Button("Back") { model.signOut() }
-                    .font(Theme.sans(13))
-                    .foregroundStyle(Theme.textMuted)
             }
-            .padding(24)
-            .frame(maxWidth: 480)
+        case .failed(let error):
+            finish(.failure("Could not start the OAuth callback listener: \(error)"))
+        case .cancelled:
+            if !finished { finish(.failure("OAuth callback listener stopped")) }
+        default:
+            break
         }
     }
 
-    private func select(_ org: AuthOrg) {
-        busy = true
-        error = nil
-        Task {
-            do {
-                try await model.selectOrg(org, tokens: tokens)
-            } catch {
-                self.error = error.localizedDescription
+    private func accept(_ connection: NWConnection) {
+        connection.start(queue: networkQueue)
+        receive(connection, buffer: Data())
+    }
+
+    private func receive(_ connection: NWConnection, buffer: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 16_384) {
+            [weak self] data, _, complete, error in
+            Task { @MainActor in
+                guard let self else { return }
+                var request = buffer
+                if let data { request.append(data) }
+                if request.range(of: Data("\r\n\r\n".utf8)) != nil {
+                    self.handleRequest(request, connection: connection)
+                } else if error == nil, !complete, request.count < 32_768 {
+                    self.receive(connection, buffer: request)
+                } else {
+                    self.respond(status: "400 Bad Request", body: "Invalid OAuth callback.",
+                                 connection: connection, then: nil)
+                }
             }
-            busy = false
+        }
+    }
+
+    private func handleRequest(_ data: Data, connection: NWConnection) {
+        guard let request = String(data: data, encoding: .utf8),
+              let requestLine = request.components(separatedBy: "\r\n").first else {
+            respond(status: "400 Bad Request", body: "Invalid OAuth callback.",
+                    connection: connection, then: nil)
+            return
+        }
+        let fields = requestLine.split(separator: " ")
+        guard fields.count == 3, fields[0] == "GET",
+              let port = listener?.port,
+              let callback = URL(
+                string: String(fields[1]),
+                relativeTo: URL(string: "http://\(Endpoints.loopbackHost):\(port.rawValue)")!
+              )?.absoluteURL,
+              callback.path == "/callback",
+              let flow else {
+            respond(status: "404 Not Found", body: "Not found.",
+                    connection: connection, then: nil)
+            return
+        }
+        respond(
+            status: "200 OK",
+            body: "Sign-in complete. You can return to Comet.",
+            connection: connection,
+            then: { [weak self] in self?.finish(.success(flow, callback)) }
+        )
+    }
+
+    private func respond(
+        status: String,
+        body: String,
+        connection: NWConnection,
+        then completion: (() -> Void)?
+    ) {
+        let payload = Data(body.utf8)
+        let response = Data(
+            ("HTTP/1.1 \(status)\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                + "Content-Length: \(payload.count)\r\nConnection: close\r\n\r\n").utf8
+        ) + payload
+        connection.send(content: response, completion: .contentProcessed { _ in
+            connection.cancel()
+            Task { @MainActor in completion?() }
+        })
+    }
+
+    private func finish(_ outcome: Outcome) {
+        guard !finished else { return }
+        finished = true
+        listener?.cancel()
+        session?.cancel()
+        listener = nil
+        session = nil
+        flow = nil
+        let completion = self.completion
+        self.completion = nil
+        completion?(outcome)
+    }
+
+    nonisolated func presentationAnchor(
+        for session: ASWebAuthenticationSession
+    ) -> ASPresentationAnchor {
+        MainActor.assumeIsolated {
+            let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+            if let window = scenes.compactMap(\.keyWindow).first {
+                return window
+            }
+            guard let scene = scenes.first else {
+                preconditionFailure("OAuth presentation requires a window scene")
+            }
+            return ASPresentationAnchor(windowScene: scene)
         }
     }
 }
+
 
 /// The actual comet mark — the desktop's 34-cell logo
 /// (crates/ui/assets/icons/comet-logo.svg), cells scaled from its 820×940

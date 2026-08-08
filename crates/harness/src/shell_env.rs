@@ -58,10 +58,11 @@ pub fn prewarm() {
 mod unix {
     use std::ffi::OsString;
     use std::io::Read;
+    use std::os::fd::AsRawFd;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::unix::process::CommandExt as _;
     use std::path::{Path, PathBuf};
-    use std::process::Stdio;
-    use std::sync::{Arc, Mutex};
+    use std::process::{Child, ChildStdout, Stdio};
     use std::time::{Duration, Instant};
 
     const BEGIN_MARKER: &str = "__COMET_SHELL_ENV_BEGIN__";
@@ -135,10 +136,11 @@ mod unix {
         }
     }
 
-    /// Run `<shell> <flags> 'echo BEGIN; env; echo END'` per flag set until one
-    /// yields a parseable PATH.
+    /// Run `<shell> <flags> 'echo BEGIN; echo PATH="$PATH"; echo END'` per flag
+    /// set until one yields a parseable PATH. Shell built-ins only: a valid
+    /// user PATH is not required to contain an external `env` binary.
     pub(super) fn snapshot_path(shell: &Path, timeout: Duration) -> Option<OsString> {
-        let script = format!("echo {BEGIN_MARKER}; env; echo {END_MARKER}");
+        let script = format!("echo {BEGIN_MARKER}; echo PATH=\"$PATH\"; echo {END_MARKER}");
         for flags in attempt_flag_sets(shell) {
             let output = run_and_capture(shell, &flags, &script, timeout);
             if let Some(path) = parse_snapshot_path(&output) {
@@ -148,11 +150,44 @@ mod unix {
         None
     }
 
-    /// Spawn the shell and collect stdout until the end marker appears, the
-    /// child exits (plus a flush grace), or the timeout kills it. The reader
-    /// lives on its own thread appending into a shared buffer, so a shell that
-    /// blocks after printing — or a grandchild that inherits the pipe and
-    /// never closes it — can't hang us on EOF.
+    fn make_nonblocking(stdout: &ChildStdout) -> bool {
+        let fd = stdout.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0
+    }
+
+    /// Drain every currently available byte. Returns true once the pipe reaches
+    /// EOF or cannot be read again.
+    fn drain_available(stdout: &mut ChildStdout, output: &mut Vec<u8>) -> bool {
+        let mut chunk = [0u8; 8192];
+        loop {
+            let remaining = MAX_OUTPUT.saturating_sub(output.len());
+            if remaining == 0 {
+                return true;
+            }
+            let read_limit = remaining.min(chunk.len());
+            match stdout.read(&mut chunk[..read_limit]) {
+                Ok(0) => return true,
+                Ok(n) => output.extend_from_slice(&chunk[..n]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return false,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return true,
+            }
+        }
+    }
+
+    fn terminate_process_group(child: &mut Child) {
+        let process_group = child.id() as libc::pid_t;
+        unsafe {
+            libc::killpg(process_group, libc::SIGKILL);
+        }
+        let _ = child.wait();
+    }
+
+    /// Spawn the shell in a dedicated process group and collect stdout until
+    /// the end marker appears, the child exits, or the timeout expires.
+    /// Nonblocking reads avoid a detached reader thread; terminating the whole
+    /// process group also closes pipes inherited by rc-spawned descendants.
     fn run_and_capture(shell: &Path, flags: &[&str], script: &str, timeout: Duration) -> Vec<u8> {
         let mut cmd = std::process::Command::new(shell);
         cmd.args(flags)
@@ -163,72 +198,54 @@ mod unix {
             // Let rc files detect (and skip work for) this probe, mirroring
             // VSCODE_RESOLVING_ENVIRONMENT; TERM=dumb quiets fancy prompts.
             .env("COMET_RESOLVING_ENVIRONMENT", "1")
-            .env("TERM", "dumb");
+            .env("TERM", "dumb")
+            .process_group(0);
         let Ok(mut child) = cmd.spawn() else {
             return Vec::new();
         };
-        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        if let Some(mut stdout) = child.stdout.take() {
-            let buf = Arc::clone(&buf);
-            let _ = std::thread::Builder::new()
-                .name("comet-shell-env-read".into())
-                .spawn(move || {
-                    let mut chunk = [0u8; 8192];
-                    loop {
-                        match stdout.read(&mut chunk) {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => {
-                                let mut b = buf
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                if b.len() >= MAX_OUTPUT {
-                                    break;
-                                }
-                                b.extend_from_slice(&chunk[..n]);
-                            }
-                        }
-                    }
-                });
+        let Some(mut stdout) = child.stdout.take() else {
+            terminate_process_group(&mut child);
+            return Vec::new();
+        };
+        if !make_nonblocking(&stdout) {
+            terminate_process_group(&mut child);
+            return Vec::new();
         }
+
         let deadline = Instant::now() + timeout;
         let mut exited_at: Option<Instant> = None;
         let mut scanned = 0usize;
+        let mut output = Vec::new();
         loop {
+            let eof = drain_available(&mut stdout, &mut output);
+            let from = scanned.saturating_sub(END_MARKER.len());
+            if find_subslice(&output[from..], END_MARKER.as_bytes()).is_some()
+                || output.len() >= MAX_OUTPUT
+                || eof
             {
-                let b = buf
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                // Only scan the unscanned tail (minus marker-length overlap).
-                let from = scanned.saturating_sub(END_MARKER.len());
-                if find_subslice(&b[from..], END_MARKER.as_bytes()).is_some() {
-                    break;
-                }
-                scanned = b.len();
+                break;
             }
+            scanned = output.len();
+
             match exited_at {
                 Some(at) if at.elapsed() >= EXIT_FLUSH_GRACE => break,
                 Some(_) => {}
                 None => match child.try_wait() {
                     Ok(Some(_)) => exited_at = Some(Instant::now()),
-                    Ok(None) if Instant::now() >= deadline => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break;
-                    }
+                    Ok(None) if Instant::now() >= deadline => break,
                     Ok(None) => {}
                     Err(_) => break,
                 },
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        if exited_at.is_none() {
-            let _ = child.kill();
-            let _ = child.wait();
+
+        terminate_process_group(&mut child);
+        let flush_deadline = Instant::now() + EXIT_FLUSH_GRACE;
+        while !drain_available(&mut stdout, &mut output) && Instant::now() < flush_deadline {
+            std::thread::sleep(Duration::from_millis(5));
         }
-        let b = buf
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        b.clone()
+        output
     }
 
     /// Extract PATH from the `env` dump between the LAST begin marker and the
@@ -323,20 +340,64 @@ exit 1
             let shell = fake_shell(
                 dir.path(),
                 &format!(
-                    "#!/bin/sh\ncase \" $* \" in *\" -i \"*) sleep 60;; esac\nPATH=\"/comet-test/fallback/bin:/bin\"; export PATH\n{RUN_PAYLOAD}"
+                    "#!/bin/sh\ncase \" $* \" in *\" -i \"*) sleep 60;; esac\nPATH=\"/comet-test/fallback/bin:/usr/bin:/bin\"; export PATH\n{RUN_PAYLOAD}"
                 ),
             );
             let start = Instant::now();
-            let path = snapshot_path(&shell, Duration::from_millis(400)).unwrap();
+            let path = snapshot_path(&shell, Duration::from_secs(5)).unwrap();
             assert!(
                 path.to_string_lossy()
                     .starts_with("/comet-test/fallback/bin"),
                 "got: {}",
                 path.to_string_lossy()
             );
-            // First attempt burned ~400ms then was killed; the whole resolve
-            // must not have waited out the sleep.
-            assert!(start.elapsed() < Duration::from_secs(5));
+            // First attempt burned ~5s then its process group was killed;
+            // the whole resolve must not have waited out the sleep.
+            assert!(start.elapsed() < Duration::from_secs(10));
+        }
+
+        #[test]
+        fn process_group_termination_kills_descendants() {
+            let dir = tempfile::tempdir().unwrap();
+            let pid_path = dir.path().join("grandchild-pid");
+            let mut command = std::process::Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg(format!(
+                    "sleep 60 & echo $! > \"{}\"; wait",
+                    pid_path.display()
+                ))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0);
+            let mut child = command.spawn().unwrap();
+
+            let started_deadline = Instant::now() + Duration::from_secs(5);
+            while !pid_path.is_file() && Instant::now() < started_deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if !pid_path.is_file() {
+                terminate_process_group(&mut child);
+                panic!("grandchild did not start");
+            }
+            let grandchild_pid: libc::pid_t = std::fs::read_to_string(&pid_path)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+
+            terminate_process_group(&mut child);
+            let stopped_deadline = Instant::now() + Duration::from_secs(5);
+            while unsafe { libc::kill(grandchild_pid, 0) } == 0 && Instant::now() < stopped_deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH),
+                "grandchild process {grandchild_pid} survived process-group termination"
+            );
         }
 
         #[test]

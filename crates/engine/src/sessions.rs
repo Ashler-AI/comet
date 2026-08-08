@@ -17,27 +17,43 @@
 //! Every dying path must instead carry its own visible error (child crash with stderr,
 //! spawn failure, stream error, engine-restart recovery).
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 use chrono::Utc;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use comet_doc::{
     DocError, MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, SegmentWriter, SessionDoc,
     fold_event_into_parts, sanitize_tool_call,
 };
-use comet_harness::{CancellationToken, Harness, RunControls, SteerMessage};
+use comet_harness::{
+    CancellationToken, Harness, HarnessError, RunContext, RunControls, SteerMessage,
+};
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, UserInputAnswer,
-    UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, SteeringMode,
+    UserInputAnswer, UserInputQuestion,
 };
 
 use crate::doc_host::{ChatDocHandle, DocHost};
 use crate::registry::HarnessRegistry;
 use crate::run_journal::RunJournal;
 use crate::{EngineError, new_id, now_ms};
+
+/// [`SessionsEngine::tool_call_detail`]'s reduction of one tool id's journal
+/// events.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ToolCallDetail {
+    /// Full multiline input (pre-sanitize — journals keep what the doc strips).
+    pub input: Option<String>,
+    /// Harness-captured output, when the adapter reported one.
+    pub output: Option<String>,
+    pub is_error: bool,
+    /// True once a ToolResult landed.
+    pub resolved: bool,
+}
 
 /// One journaled event: the durable seq plus the event, as broadcast to subscribers.
 #[derive(Debug, Clone)]
@@ -49,13 +65,75 @@ pub struct JournaledEvent {
 /// Outcome of a steer attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SteerOutcome {
-    /// Delivered into the live run's steering mailbox.
-    Accepted,
+    /// Accepted into the live run's steering mailbox at the harness's boundary.
+    Accepted(SteeringMode),
     /// No live steerable run — the caller should dispatch the prompt as a new turn.
     NotSteerable,
 }
 
+/// Outcome of an explicit next-turn queue request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueOutcome {
+    /// Held by the engine until the active turn finishes.
+    Queued,
+    /// The persistent harness was already parked, so the next turn started now.
+    Delivered,
+    /// No run exists; the caller should dispatch the prompt as a new turn.
+    NotRunning,
+}
+
 type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerReply {
+    pub command_id: String,
+    pub text: String,
+    pub source_chat_id: String,
+}
+
+struct LivePeerWaiter {
+    registration_id: String,
+    sender: oneshot::Sender<PeerReply>,
+}
+
+pub struct PeerWaitClaim {
+    sender: oneshot::Sender<PeerReply>,
+}
+
+impl PeerWaitClaim {
+    pub fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+
+    pub fn deliver(self, reply: PeerReply) -> bool {
+        self.sender.send(reply).is_ok()
+    }
+}
+
+/// One race-free subscription to a source-session peer thread. Dropping it
+/// unregisters only this generation, so a timed-out waiter cannot remove a
+/// later registration for the same thread.
+pub struct PeerWaitRegistration {
+    inner: Weak<Inner>,
+    key: (String, String),
+    registration_id: String,
+    receiver: Option<oneshot::Receiver<PeerReply>>,
+}
+
+impl Drop for PeerWaitRegistration {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let mut waiters = lock(&inner.peer_waiters);
+        if waiters
+            .get(&self.key)
+            .is_some_and(|waiter| waiter.registration_id == self.registration_id)
+        {
+            waiters.remove(&self.key);
+        }
+    }
+}
 
 /// A harness-native session id plus the cwd it was created under. Harness
 /// session stores are cwd-scoped (claude keys conversations by project
@@ -70,7 +148,17 @@ struct HarnessSessionRef {
 struct RunHandle {
     run_id: String,
     steerable: bool,
+    steering_mode: SteeringMode,
     steer_tx: mpsc::Sender<SteerMessage>,
+    /// True while the harness is producing the current turn. Updated under the
+    /// same run-map lock used to enqueue followups, closing the Done/enqueue race.
+    turn_active: bool,
+    /// Explicit next-turn followups. Unlike the harness steering mailbox, this
+    /// queue is not visible to step-boundary harnesses until the current Done.
+    queued_followups: VecDeque<SteerMessage>,
+    /// Turn-boundary steers accepted by the mailbox but not yet handed to the
+    /// harness as a new prompt. The matching `Steered` event acknowledges them FIFO.
+    pending_turn_boundary_steers: VecDeque<SteerMessage>,
     /// Harness-level cancellation (protocol interrupt + child teardown).
     interrupt_token: CancellationToken,
     /// Engine-level cancel: arms the run task's grace deadline so a harness that
@@ -84,6 +172,8 @@ struct Inner {
     device_id: String,
     journal: Arc<RunJournal>,
     registry: Arc<HarnessRegistry>,
+    /// Loopback port advertised to harness children for `comet session` RPC.
+    ipc_port: u16,
     doc_host: OnceLock<DocHost>,
     /// chat_id → live run.
     runs: Mutex<HashMap<String, RunHandle>>,
@@ -99,7 +189,10 @@ struct Inner {
     /// (comet kept the same pair on `chats.harness_session_id`). An empty
     /// session id is the "do not resume" tombstone after a rejected resume.
     harness_sessions: Mutex<HashMap<String, HarnessSessionRef>>,
-    /// Auto-titler for untitled chats (wired at engine assembly; absent in bare tests).
+    /// One local live waiter per `(source chat, thread)`. Intentionally process-local:
+    /// the command ledger remains the only durable outbox.
+    peer_waiters: Mutex<HashMap<(String, String), LivePeerWaiter>>,
+    /// Deterministic local auto-titler, wired at engine assembly; absent in bare tests.
     titles: OnceLock<crate::titles::TitleGenerator>,
 }
 
@@ -117,6 +210,7 @@ impl SessionsEngine {
         device_id: String,
         journal: Arc<RunJournal>,
         registry: Arc<HarnessRegistry>,
+        ipc_port: u16,
     ) -> Self {
         let (sessions_tx, _) = watch::channel(Vec::new());
         Self {
@@ -124,6 +218,7 @@ impl SessionsEngine {
                 device_id,
                 journal,
                 registry,
+                ipc_port,
                 doc_host: OnceLock::new(),
                 runs: Mutex::new(HashMap::new()),
                 hubs: Mutex::new(HashMap::new()),
@@ -131,6 +226,7 @@ impl SessionsEngine {
                 sessions_tx,
                 last_requests: Mutex::new(HashMap::new()),
                 harness_sessions: Mutex::new(HashMap::new()),
+                peer_waiters: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
             }),
         }
@@ -142,8 +238,7 @@ impl SessionsEngine {
         let _ = self.inner.doc_host.set(host);
     }
 
-    /// Wire the chat auto-titler (called once at engine assembly). After each
-    /// completed exchange the run task fires it for still-untitled chats.
+    /// Wire the local chat auto-titler (called once at engine assembly).
     pub fn set_titles(&self, titles: crate::titles::TitleGenerator) {
         let _ = self.inner.titles.set(titles);
     }
@@ -154,6 +249,63 @@ impl SessionsEngine {
                 EngineError::Other("doc host not wired into sessions engine".into())
             })?;
         host.open(chat_id)
+    }
+
+    /// Register before appending the outbound command, closing the immediate
+    /// reply race. Only one live consumer may own a source/thread pair.
+    pub fn register_peer_waiter(
+        &self,
+        source_chat_id: &str,
+        thread_id: &str,
+    ) -> Result<PeerWaitRegistration, EngineError> {
+        let key = (source_chat_id.to_string(), thread_id.to_string());
+        let registration_id = new_id();
+        let (sender, receiver) = oneshot::channel();
+        let mut waiters = lock(&self.inner.peer_waiters);
+        if waiters.contains_key(&key) {
+            return Err(EngineError::Other("waiter_already_registered".into()));
+        }
+        waiters.insert(
+            key.clone(),
+            LivePeerWaiter {
+                registration_id: registration_id.clone(),
+                sender,
+            },
+        );
+        Ok(PeerWaitRegistration {
+            inner: Arc::downgrade(&self.inner),
+            key,
+            registration_id,
+            receiver: Some(receiver),
+        })
+    }
+
+    /// Await one reply. Timeout/drop removes the local waiter but never mutates
+    /// or cancels the durable peer command.
+    pub async fn wait_peer_reply(
+        &self,
+        mut registration: PeerWaitRegistration,
+        timeout: std::time::Duration,
+    ) -> Option<PeerReply> {
+        let receiver = registration.receiver.take()?;
+        tokio::time::timeout(timeout, receiver)
+            .await
+            .ok()
+            .and_then(Result::ok)
+    }
+
+    /// Atomically reserve the active waiter for executor completion. Once
+    /// claimed, no second reply can resolve the same source/thread pair.
+    pub fn claim_peer_waiter(
+        &self,
+        source_chat_id: &str,
+        thread_id: &str,
+    ) -> Option<PeerWaitClaim> {
+        let waiter = lock(&self.inner.peer_waiters)
+            .remove(&(source_chat_id.to_string(), thread_id.to_string()))?;
+        Some(PeerWaitClaim {
+            sender: waiter.sender,
+        })
     }
 
     /// Status watch: the full session list, re-sent on every transition.
@@ -205,6 +357,41 @@ impl SessionsEngine {
         Ok((replay, rx))
     }
 
+    /// One tool invocation's full input/output, reduced from the chat's run
+    /// journal (the doc only carries the sanitized chip line — see
+    /// [`render_parts`]). Last-write-wins on repeated ids, mirroring the
+    /// fold's refresh-in-place rule. `None` when the journal never saw the
+    /// call (imported/foreign sessions).
+    pub fn tool_call_detail(
+        &self,
+        chat_id: &str,
+        tool_id: &str,
+    ) -> Result<Option<ToolCallDetail>, EngineError> {
+        let mut detail: Option<ToolCallDetail> = None;
+        for (_, event) in self.inner.journal.replay(chat_id, 0)? {
+            match event {
+                AgentEvent::ToolCall { ref id, ref call } if id == tool_id => {
+                    let slot = detail.get_or_insert_with(ToolCallDetail::default);
+                    slot.input = comet_proto::view::tool_call_input_text(call);
+                }
+                AgentEvent::ToolResult {
+                    ref id,
+                    is_error,
+                    ref output,
+                } if id == tool_id => {
+                    let slot = detail.get_or_insert_with(ToolCallDetail::default);
+                    slot.resolved = true;
+                    slot.is_error = is_error;
+                    if output.is_some() {
+                        slot.output = output.clone();
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(detail)
+    }
+
     /// Start (or route) a run for `chat_id`.
     ///
     /// - The user message entry is written to the doc immediately (id = `message_id`).
@@ -246,9 +433,17 @@ impl SessionsEngine {
         message_id: Option<String>,
         inject_resume: bool,
     ) -> Result<String, EngineError> {
-        let routed = lock(&self.inner.runs)
-            .get(chat_id)
-            .map(|h| (h.run_id.clone(), h.steerable, h.steer_tx.clone()));
+        let routed = {
+            let mut runs = lock(&self.inner.runs);
+            runs.get_mut(chat_id).map(|handle| {
+                handle.turn_active = true;
+                (
+                    handle.run_id.clone(),
+                    handle.steerable,
+                    handle.steer_tx.clone(),
+                )
+            })
+        };
         if let Some((run_id, steerable, steer_tx)) = routed {
             let message = SteerMessage {
                 prompt: request.prompt.clone(),
@@ -257,7 +452,12 @@ impl SessionsEngine {
             if steerable && steer_tx.try_send(message).is_ok() {
                 let user_id = message_id.unwrap_or_else(new_id);
                 let handle = self.doc_handle(chat_id)?;
-                handle.write_user_message(&user_id, &request.prompt, now_ms())?;
+                handle.write_user_message_with_status(
+                    &user_id,
+                    &request.prompt,
+                    now_ms(),
+                    MessageStatus::Steered,
+                )?;
                 // Working BEFORE the lastMessageAt bump: both ride the
                 // workspace doc from this one peer, so causal order makes it
                 // impossible for an observer to hold [new message, old status]
@@ -314,6 +514,10 @@ impl SessionsEngine {
             request_input,
             steering: steer_rx,
             interrupt: interrupt_token.clone(),
+            context: Some(RunContext {
+                session_id: chat_id.to_string(),
+                ipc_port: self.inner.ipc_port,
+            }),
         };
 
         lock(&self.inner.runs).insert(
@@ -321,7 +525,11 @@ impl SessionsEngine {
             RunHandle {
                 run_id: run_id.clone(),
                 steerable: harness.supports_steering(),
+                steering_mode: harness.steering_mode(),
                 steer_tx,
+                turn_active: true,
+                queued_followups: VecDeque::new(),
+                pending_turn_boundary_steers: VecDeque::new(),
                 interrupt_token,
                 cancel: cancel_tx,
                 engine_tx,
@@ -333,14 +541,60 @@ impl SessionsEngine {
         // lastMessageAt bump must never be observable ahead of the live run.
         self.inner.note_message(chat_id, &request.prompt);
 
-        // Name the chat NOW, off the first prompt — not after the first
-        // exchange completes ("called New session for a long time for no
-        // reason"; the titler only needs the prompt and skips titled chats;
-        // the Done-time call below stays as the retry for a failed
-        // generation).
+        // Name the chat immediately from its first prompt. This is entirely
+        // local and never starts an auxiliary harness/model session.
         if let Some(titles) = self.inner.titles.get() {
-            titles.maybe_generate(chat_id, harness_id, &request.prompt, &request.cwd);
+            titles.maybe_generate(chat_id, &request.prompt);
         }
+        // Starting the harness is part of dispatch, not background run
+        // consumption. A spawn/transport error must return to the durable
+        // command executor so it can write Rejected + an audit reason instead
+        // of first reporting Applied and failing moments later.
+        let stream = match harness.run(request.clone(), controls).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                let message = err.to_string();
+                let error_event = AgentEvent::Error {
+                    message: message.clone(),
+                };
+                let done_event = AgentEvent::Done {
+                    status: DoneStatus::Errored,
+                    result: None,
+                    error: Some(message),
+                    session_id: None,
+                };
+                self.inner.publish(chat_id, &error_event);
+                self.inner.publish(chat_id, &done_event);
+
+                // A harness can reject a run before returning its event stream
+                // (for example, when another process still owns a native OMP
+                // session). `drive_run` cannot fold that error, so persist the
+                // same visible error part here instead of leaving the composer
+                // with an unexplained "Run failed" status.
+                let mut folded = Vec::new();
+                fold_event_into_parts(&mut folded, &error_event);
+                if let Err(write_err) = finish_segment(
+                    &handle.doc_arc(),
+                    None,
+                    &new_id(),
+                    &self.inner.device_id,
+                    now_ms(),
+                    &folded,
+                    MessageStatus::Complete,
+                ) {
+                    tracing::warn!(
+                        chat = %chat_id,
+                        err = %write_err,
+                        "dispatch failure transcript write failed"
+                    );
+                }
+
+                self.inner.remove_run(chat_id, &run_id);
+                self.inner
+                    .set_status(chat_id, SessionStatus::Errored, false);
+                return Err(err.into());
+            }
+        };
 
         tokio::spawn(drive_run(
             self.inner.clone(),
@@ -349,7 +603,7 @@ impl SessionsEngine {
             harness,
             request,
             handle.doc_arc(),
-            controls,
+            stream,
             engine_rx,
             cancel_rx,
             RunResumeState {
@@ -368,26 +622,89 @@ impl SessionsEngine {
         prompt: &str,
         message_id: Option<String>,
     ) -> Result<SteerOutcome, EngineError> {
-        let target = lock(&self.inner.runs)
-            .get(chat_id)
-            .filter(|h| h.steerable)
-            .map(|h| h.steer_tx.clone());
-        let Some(steer_tx) = target else {
-            return Ok(SteerOutcome::NotSteerable);
-        };
+        let user_id = message_id.unwrap_or_else(new_id);
         let message = SteerMessage {
             prompt: prompt.to_string(),
-            message_id: message_id.clone(),
+            message_id: Some(user_id.clone()),
         };
-        if steer_tx.try_send(message).is_err() {
-            return Ok(SteerOutcome::NotSteerable);
-        }
-        // Accepted: the steer prompt becomes a user entry immediately (client-minted id).
-        let user_id = message_id.unwrap_or_else(new_id);
+        let steering_mode = {
+            let mut runs = lock(&self.inner.runs);
+            let Some(handle) = runs.get_mut(chat_id).filter(|handle| handle.steerable) else {
+                return Ok(SteerOutcome::NotSteerable);
+            };
+            handle.turn_active = true;
+            if handle.steer_tx.try_send(message.clone()).is_err() {
+                return Ok(SteerOutcome::NotSteerable);
+            }
+            if handle.steering_mode == SteeringMode::TurnBoundary {
+                handle.pending_turn_boundary_steers.push_back(message);
+            }
+            handle.steering_mode
+        };
+        // Step-boundary harnesses can alter the active turn immediately.
+        // Turn-boundary harnesses have only accepted a future prompt so far.
+        let status = match steering_mode {
+            SteeringMode::StepBoundary => MessageStatus::Steered,
+            SteeringMode::TurnBoundary => MessageStatus::Queued,
+        };
         let handle = self.doc_handle(chat_id)?;
-        handle.write_user_message(&user_id, prompt, now_ms())?;
+        handle.write_user_message_with_status(&user_id, prompt, now_ms(), status)?;
+        // The optimistic echo may already exist with a generic steer status.
+        // Stamp the harness-authoritative state instead of preserving that guess.
+        handle.doc_arc().set_message_status(&user_id, status)?;
         self.inner.note_message(chat_id, prompt);
-        Ok(SteerOutcome::Accepted)
+        Ok(SteerOutcome::Accepted(steering_mode))
+    }
+
+    /// Hold a followup outside the harness mailbox until the active turn is
+    /// complete. A parked persistent harness receives it immediately because
+    /// it is already at the requested next-turn boundary.
+    pub async fn queue(
+        &self,
+        chat_id: &str,
+        prompt: &str,
+        message_id: Option<String>,
+    ) -> Result<QueueOutcome, EngineError> {
+        let user_id = message_id.unwrap_or_else(new_id);
+        let message = SteerMessage {
+            prompt: prompt.to_string(),
+            message_id: Some(user_id.clone()),
+        };
+        let outcome = {
+            let mut runs = lock(&self.inner.runs);
+            let Some(handle) = runs.get_mut(chat_id) else {
+                return Ok(QueueOutcome::NotRunning);
+            };
+            if !handle.turn_active && handle.steerable {
+                if handle.steer_tx.try_send(message.clone()).is_err() {
+                    return Ok(QueueOutcome::NotRunning);
+                }
+                handle.turn_active = true;
+                QueueOutcome::Delivered
+            } else {
+                handle.queued_followups.push_back(message);
+                QueueOutcome::Queued
+            }
+        };
+        let handle = self.doc_handle(chat_id)?;
+        handle.write_user_message_with_status(
+            &user_id,
+            prompt,
+            now_ms(),
+            match outcome {
+                QueueOutcome::Queued => MessageStatus::Queued,
+                QueueOutcome::Delivered => MessageStatus::Complete,
+                QueueOutcome::NotRunning => unreachable!("returned above"),
+            },
+        )?;
+        if outcome == QueueOutcome::Delivered {
+            handle
+                .doc_arc()
+                .set_message_status(&user_id, MessageStatus::Complete)?;
+            self.set_status(chat_id, SessionStatus::Working, false);
+        }
+        self.inner.note_message(chat_id, prompt);
+        Ok(outcome)
     }
 
     /// Interrupt the live run, if any. The run settles with a synthetic
@@ -547,7 +864,7 @@ impl SessionsEngine {
                             model_options: Default::default(),
                             cwd,
                             sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
-                            auto_approve: false,
+                            auto_approve: true,
                             attachments: Vec::new(),
                             resume: None,
                         })
@@ -694,6 +1011,44 @@ impl Inner {
         }
     }
 
+    fn advance_omp_import_watermark(&self, chat_id: &str, cwd: &str) {
+        let Some(workspace) = self.workspace() else {
+            return;
+        };
+        let Some((session_id, session_cwd)) = workspace.chat_harness_session(chat_id) else {
+            return;
+        };
+        if session_id.trim().is_empty()
+            || session_cwd
+                .as_deref()
+                .is_some_and(|session_cwd| !session_cwd.is_empty() && session_cwd != cwd)
+        {
+            return;
+        }
+        let Some(updated_at) = crate::local_sessions::omp_session_updated_at(&session_id, cwd)
+        else {
+            return;
+        };
+        let current = workspace
+            .doc()
+            .chat(chat_id)
+            .ok()
+            .flatten()
+            .and_then(|chat| chat.last_message_at)
+            .map(|at| at.timestamp_millis());
+        if current.is_some_and(|current| current >= updated_at) {
+            return;
+        }
+        if let Err(err) = workspace.set_chat_activity(chat_id, Some(updated_at), None) {
+            tracing::warn!(
+                chat = %chat_id,
+                session = %session_id,
+                error = %err,
+                "OMP native import watermark write failed"
+            );
+        }
+    }
+
     /// Record the chat's harness-native session id (and its cwd): live-process
     /// cache plus the durable workspace chat row — the row is what survives an
     /// engine restart (comet sessions.ts:1039).
@@ -710,6 +1065,9 @@ impl Inner {
         );
         if let Some(ws) = self.workspace() {
             ws.set_chat_harness_session(chat_id, session_id, cwd);
+        }
+        if let Some(host) = self.doc_host.get() {
+            host.ensure_room_for_chat(chat_id);
         }
     }
 
@@ -891,13 +1249,13 @@ async fn drive_run(
     harness: Arc<dyn Harness>,
     request: RunRequest,
     doc: Arc<SessionDoc>,
-    controls: RunControls,
+    mut stream: BoxStream<'static, Result<AgentEvent, HarnessError>>,
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
     mut cancel_rx: watch::Receiver<bool>,
     resume_state: RunResumeState,
 ) {
     let device_id = inner.device_id.clone();
-    // Captured for post-run auto-titling (the request moves into the harness).
+    // Retained for resume ownership and the one-shot failed-resume retry.
     let harness_id = harness.id();
     let user_prompt = request.prompt.clone();
     let run_cwd = request.cwd.clone();
@@ -907,30 +1265,6 @@ async fn drive_run(
         resume: None,
         ..request.clone()
     });
-    let mut stream = match harness.run(request, controls).await {
-        Ok(stream) => stream,
-        Err(err) => {
-            let message = err.to_string();
-            inner.publish(
-                &chat_id,
-                &AgentEvent::Error {
-                    message: message.clone(),
-                },
-            );
-            inner.publish(
-                &chat_id,
-                &AgentEvent::Done {
-                    status: DoneStatus::Errored,
-                    result: None,
-                    error: Some(message),
-                    session_id: None,
-                },
-            );
-            inner.remove_run(&chat_id, &run_id);
-            inner.set_status(&chat_id, SessionStatus::Errored, false);
-            return;
-        }
-    };
 
     let doc_ref: &SessionDoc = &doc;
     let mut folded: Vec<MessagePart> = Vec::new();
@@ -1060,6 +1394,18 @@ async fn drive_run(
             continue;
         }
 
+        // ACP session names are workspace metadata, not transcript content.
+        // Adopt them only while Comet's local title remains provisional; the
+        // title generator preserves any later manual rename.
+        if let AgentEvent::SessionTitleChanged { title } = &event {
+            if let Some(titles) = inner.titles.get()
+                && let Err(err) = titles.adopt_harness_title(&chat_id, title)
+            {
+                tracing::warn!(chat = %chat_id, error = %err, "harness session title update failed");
+            }
+            continue;
+        }
+
         // Failed-resume fallback: an engine-injected `--resume` naming a session
         // the harness no longer knows dies before ever starting (claude exits
         // without an init frame; codex falls back internally via thread/start).
@@ -1109,6 +1455,25 @@ async fn drive_run(
             ..
         } = &event
         {
+            let acknowledged = {
+                let mut runs = lock(&inner.runs);
+                runs.get_mut(&chat_id).and_then(|handle| {
+                    (handle.steering_mode == SteeringMode::TurnBoundary)
+                        .then(|| handle.pending_turn_boundary_steers.pop_front())
+                        .flatten()
+                })
+            };
+            if let Some(message) = acknowledged
+                && let Some(message_id) = message.message_id.as_deref()
+                && let Err(err) = doc_ref.set_message_status(message_id, MessageStatus::Steered)
+            {
+                tracing::warn!(
+                    chat = %chat_id,
+                    message = %message_id,
+                    error = %err,
+                    "turn-boundary steer acknowledgement stamp failed"
+                );
+            }
             inner.publish(&chat_id, &event);
             if let Err(err) = finish_segment(
                 doc_ref,
@@ -1214,22 +1579,51 @@ async fn drive_run(
                 }
                 inner.note_message(&chat_id, &folded_text(&folded));
             }
+            if harness_id == HarnessId::Omp {
+                inner.advance_omp_import_watermark(&chat_id, &run_cwd);
+            }
             if *status == DoneStatus::Completed {
                 // A cleanly completed turn resets the auto-resume revival
                 // budget: only consecutive crash-revive-crash cycles spend it.
                 inner.journal.clear_resume_attempts(&chat_id);
             }
-            // Exchange completed on an untitled chat → name it (fire-and-forget;
-            // interrupted/errored turns never trigger naming).
+            // Retry local titling after a completed exchange in case the
+            // dispatch-time task could not observe the chat row yet.
             if *status == DoneStatus::Completed
                 && let Some(titles) = inner.titles.get()
             {
-                titles.maybe_generate(&chat_id, harness_id, &user_prompt, &run_cwd);
+                titles.maybe_generate(&chat_id, &user_prompt);
             }
+            let persistent_boundary = *status == DoneStatus::Completed && steerable && !interrupted;
+            let (queued_delivery, queue_transport_open) = {
+                let mut runs = lock(&inner.runs);
+                match runs.get_mut(&chat_id) {
+                    Some(handle) => {
+                        handle.turn_active = false;
+                        if persistent_boundary {
+                            if let Some(followup) = handle.queued_followups.pop_front() {
+                                if handle.steer_tx.try_send(followup.clone()).is_ok() {
+                                    handle.turn_active = true;
+                                    (Some(followup), true)
+                                } else {
+                                    handle.queued_followups.push_front(followup);
+                                    (None, false)
+                                }
+                            } else {
+                                (None, true)
+                            }
+                        } else {
+                            (None, true)
+                        }
+                    }
+                    None => (None, false),
+                }
+            };
+
             // PERSISTENT SESSION: a cleanly completed turn on a steerable
-            // harness PARKS instead of ending — child + mailbox stay warm for
-            // the next routed dispatch; per-turn state resets for it.
-            if *status == DoneStatus::Completed && steerable && !interrupted {
+            // harness parks instead of ending. Explicit queue messages cross
+            // into the harness mailbox only here, after Done.
+            if persistent_boundary && queue_transport_open {
                 folded.clear();
                 dirty = false;
                 entry_id = new_id();
@@ -1237,7 +1631,23 @@ async fn drive_run(
                 // Resume-retry is strictly a first-turn concern.
                 saw_session_started = true;
                 idle_since = Some(tokio::time::Instant::now());
-                inner.set_status(&chat_id, SessionStatus::Idle, false);
+                if let Some(followup) = queued_delivery {
+                    if let Some(message_id) = followup.message_id.as_deref()
+                        && let Err(err) =
+                            doc_ref.set_message_status(message_id, MessageStatus::Complete)
+                    {
+                        tracing::warn!(
+                            chat = %chat_id,
+                            message = %message_id,
+                            error = %err,
+                            "queued user message delivery stamp failed"
+                        );
+                    }
+                    idle_since = None;
+                    inner.set_status(&chat_id, SessionStatus::Working, false);
+                } else {
+                    inner.set_status(&chat_id, SessionStatus::Idle, false);
+                }
                 continue;
             }
             break match status {
@@ -1253,6 +1663,92 @@ async fn drive_run(
         }
     };
 
+    let mut deferred_followups = {
+        let mut runs = lock(&inner.runs);
+        runs.get_mut(&chat_id)
+            .map(|handle| {
+                let mut deferred = handle
+                    .pending_turn_boundary_steers
+                    .drain(..)
+                    .collect::<VecDeque<_>>();
+                deferred.extend(handle.queued_followups.drain(..));
+                deferred
+            })
+            .unwrap_or_default()
+    };
     inner.remove_run(&chat_id, &run_id);
     inner.set_status(&chat_id, final_status, false);
+
+    if interrupted {
+        for followup in deferred_followups {
+            if let Some(message_id) = followup.message_id.as_deref()
+                && let Err(err) = doc_ref.set_message_status(message_id, MessageStatus::Aborted)
+            {
+                tracing::warn!(
+                    chat = %chat_id,
+                    message = %message_id,
+                    error = %err,
+                    "cancelled queued user message stamp failed"
+                );
+            }
+        }
+        return;
+    }
+
+    if !deferred_followups.is_empty() {
+        let engine = SessionsEngine {
+            inner: inner.clone(),
+        };
+        let chat = chat_id.clone();
+        tokio::spawn(async move {
+            while let Some(followup) = deferred_followups.pop_front() {
+                let prompt = followup.prompt;
+                let message_id = followup.message_id;
+                match engine.queue(&chat, &prompt, message_id.clone()).await {
+                    Ok(QueueOutcome::Queued | QueueOutcome::Delivered) => {}
+                    Ok(QueueOutcome::NotRunning) => {
+                        let Some(mut request) = engine.last_request(&chat) else {
+                            tracing::error!(chat = %chat, "queued followup lost its run config");
+                            return;
+                        };
+                        request.prompt = prompt;
+                        request.resume = None;
+                        request.attachments.clear();
+                        if let Some(message_id) = message_id.as_deref()
+                            && let Ok(handle) = engine.doc_handle(&chat)
+                            && let Err(err) = handle
+                                .doc_arc()
+                                .set_message_status(message_id, MessageStatus::Complete)
+                        {
+                            tracing::warn!(
+                                chat = %chat,
+                                message = %message_id,
+                                error = %err,
+                                "queued user message fallback stamp failed"
+                            );
+                        }
+                        if let Err(err) = engine
+                            .dispatch(&chat, harness_id, request, message_id)
+                            .await
+                        {
+                            tracing::error!(
+                                chat = %chat,
+                                error = %err,
+                                "queued followup fallback dispatch failed"
+                            );
+                            return;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            chat = %chat,
+                            error = %err,
+                            "queued followup delivery failed"
+                        );
+                        return;
+                    }
+                }
+            }
+        });
+    }
 }

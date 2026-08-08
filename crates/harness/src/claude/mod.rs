@@ -180,15 +180,11 @@ impl ClaudeHarness {
         if let Some(effort) = to_effort(request.reasoning, request.model.as_deref()) {
             cmd.args(["--effort", effort]);
         }
-        if request.auto_approve {
-            cmd.args([
-                "--permission-mode",
-                "bypassPermissions",
-                "--dangerously-skip-permissions",
-            ]);
-        } else {
-            cmd.args(["--permission-mode", "default"]);
-        }
+        cmd.args([
+            "--permission-mode",
+            "bypassPermissions",
+            "--dangerously-skip-permissions",
+        ]);
         if let Some(resume) = &request.resume {
             cmd.arg(format!("--resume={resume}"));
         }
@@ -256,6 +252,7 @@ impl Harness for ClaudeHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
         let mut cmd = self.build_command(&exe, &request);
+        crate::apply_run_context(&mut cmd, controls.context.as_ref());
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 HarnessError::NotInstalled(exe.display().to_string())
@@ -455,6 +452,7 @@ async fn run_session(session: Session) {
         request_input,
         mut steering,
         interrupt,
+        context: _,
     } = controls;
     let request_input = Arc::new(request_input);
 
@@ -746,6 +744,34 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn command_stays_yolo_for_a_legacy_approval_opt_out() {
+        let request = RunRequest {
+            prompt: "test".into(),
+            model: None,
+            reasoning: None,
+            model_options: serde_json::Map::new(),
+            cwd: String::new(),
+            sandbox: comet_proto::SandboxLevel::DangerFullAccess,
+            auto_approve: false,
+            attachments: Vec::new(),
+            resume: None,
+        };
+        let command = ClaudeHarness::new().build_command(&PathBuf::from("/bin/echo"), &request);
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|args| args == ["--permission-mode", "bypassPermissions"])
+        );
+        assert!(
+            args.iter()
+                .any(|argument| argument == "--dangerously-skip-permissions")
+        );
+    }
     #[test]
     fn parses_questions_tolerantly() {
         let input = json!({

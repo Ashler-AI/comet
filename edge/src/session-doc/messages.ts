@@ -93,9 +93,15 @@ export const fromDocParts = (
 
 /** Streaming lifecycle (§6): the stream IS the transcript being written.
  * Host recovery marks abandoned streams `aborted`, preserving a crashed
- * turn's partial output on every device. User/system entries are always
- * `complete`. */
-export type SessionMessageStatus = "streaming" | "complete" | "aborted";
+ * turn's partial output on every device. User entries are normally `complete`;
+ * followups are `queued` until their next-turn boundary or `steered` when
+ * routed to the active harness's steering boundary. */
+export type SessionMessageStatus =
+  | "streaming"
+  | "complete"
+  | "aborted"
+  | "queued"
+  | "steered";
 
 export interface SessionTokenUsage {
   readonly inputTokens: number;

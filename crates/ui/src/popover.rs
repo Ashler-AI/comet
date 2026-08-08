@@ -12,7 +12,8 @@
 //! feed them measurements/events.
 
 use gpui::{
-    Anchor, AnyElement, ElementId, IntoElement, Pixels, Point, SharedString, div, prelude::*, px,
+    Anchor, AnyElement, ElementId, InteractiveElement as _, IntoElement, Pixels, Point,
+    SharedString, div, prelude::*, px,
 };
 
 use crate::motion::{self, COMET_PULSE};
@@ -243,9 +244,8 @@ pub fn anchored_menu_above_at(
         .into_any_element()
 }
 
-/// [`anchored_menu_above`] right-aligned to the trigger's right edge (t3code
-/// ComboboxPopup `align="end"` — right-side triggers like the composer's ref
-/// picker open leftward instead of running off the window).
+/// [`anchored_menu_above`] right-aligns the menu so right-side triggers open
+/// leftward instead of overflowing the window.
 pub fn anchored_menu_above_end(id: impl Into<ElementId>, content: AnyElement) -> AnyElement {
     let content = crate::frost::frosted(12.0, 16.0, content).into_any_element();
     div()
@@ -301,32 +301,62 @@ pub(crate) fn scrim_alpha(alpha_dark: f32) -> gpui::Hsla {
 }
 
 /// Full-window modal: dim scrim + centered card with the `dialog-in` entrance.
-/// The scrim swallows clicks; the caller wires its own dismiss/confirm.
 /// `viewport` is the window size (an `anchored` layer sizes to its children,
 /// so the scrim needs explicit dimensions).
+fn modal_scrim(
+    id: impl Into<ElementId>,
+    viewport: gpui::Size<Pixels>,
+    card: AnyElement,
+) -> gpui::Div {
+    let card = crate::frost::frosted(12.0, 16.0, card).into_any_element();
+    div()
+        .occlude()
+        .w(viewport.width)
+        .h(viewport.height)
+        .bg(scrim_alpha(0.6))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(motion::dialog_in(id, div().child(card)))
+}
+
+fn deferred_modal(scrim: impl IntoElement) -> AnyElement {
+    gpui::deferred(
+        gpui::anchored()
+            .position(gpui::point(px(0.0), px(0.0)))
+            .child(scrim),
+    )
+    .priority(2)
+    .into_any_element()
+}
+
+/// Full-window modal whose scrim swallows clicks.
 pub fn modal(
     id: impl Into<ElementId>,
     viewport: gpui::Size<Pixels>,
     card: AnyElement,
 ) -> AnyElement {
-    let card = crate::frost::frosted(12.0, 16.0, card).into_any_element();
-    gpui::deferred(
-        gpui::anchored()
-            .position(gpui::point(px(0.0), px(0.0)))
-            .child(
-                div()
-                    .occlude()
-                    .w(viewport.width)
-                    .h(viewport.height)
-                    .bg(scrim_alpha(0.6))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(motion::dialog_in(id, div().child(card))),
-            ),
+    deferred_modal(modal_scrim(id, viewport, card))
+}
+
+/// Full-window modal that dismisses on a scrim click while card clicks remain
+/// inside the dialog.
+pub fn dismissible_modal(
+    id: impl Into<ElementId>,
+    viewport: gpui::Size<Pixels>,
+    card: AnyElement,
+    on_dismiss: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    let card = div()
+        .id("dismissible-modal-card")
+        .on_click(|_, _, cx| cx.stop_propagation())
+        .child(card)
+        .into_any_element();
+    deferred_modal(
+        modal_scrim(id, viewport, card)
+            .id("dismissible-modal-scrim")
+            .on_click(on_dismiss),
     )
-    .priority(2)
-    .into_any_element()
 }
 
 /// One menu row (comet `menuItem`): `gap-2.5 rounded-lg px-2 py-1.5

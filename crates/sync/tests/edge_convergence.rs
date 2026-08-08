@@ -8,8 +8,8 @@
 //! COMET_EDGE_WS=ws://127.0.0.1:8787 cargo test -p comet-sync -- --ignored
 //! ```
 //!
-//! `COMET_EDGE_TOKEN` overrides the dev bearer (defaults to `sync-it-user`;
-//! both clients must share it — chat rooms are claim-on-first-join owned).
+//! `COMET_EDGE_TOKEN_A` and `COMET_EDGE_TOKEN_B` override the two dev bearers
+//! (defaults are distinct users in one organization).
 
 use std::time::Duration;
 
@@ -49,21 +49,25 @@ fn text_message(id: &str, device: &str, text: &str) -> SessionMessageEntry {
 async fn two_session_docs_converge_through_a_real_room() {
     let base = std::env::var("COMET_EDGE_WS")
         .expect("set COMET_EDGE_WS to the edge origin, e.g. ws://127.0.0.1:8787");
-    let token = std::env::var("COMET_EDGE_TOKEN").unwrap_or_else(|_| "sync-it-user".to_string());
+    let token_a =
+        std::env::var("COMET_EDGE_TOKEN_A").unwrap_or_else(|_| "alice@sync-it-org".to_string());
+    let token_b =
+        std::env::var("COMET_EDGE_TOKEN_B").unwrap_or_else(|_| "bob@sync-it-org".to_string());
     let chat_id = format!("it-{}", uuid::Uuid::new_v4().simple());
-    let url = format!("{base}/session/{chat_id}/ws?token={token}");
+    let host_url = format!("{base}/session/{chat_id}/ws?token={token_a}");
+    let peer_url = format!("{base}/session/{chat_id}/ws?token={token_b}");
 
-    // Host device initializes the doc and claims the room.
+    // Alice initializes the doc; room access is authentication-only.
     let host = SessionDoc::init(&chat_id).expect("init session doc");
-    let host_client = RoomClient::connect(&url, &chat_id, host.doc().clone())
+    let host_client = RoomClient::connect(&host_url, &chat_id, host.doc().clone())
         .await
-        .expect("host connect");
+        .expect("alice connect");
 
-    // Second device starts empty and backfills from the room.
+    // Bob starts empty and backfills from the same room.
     let peer_doc = loro::LoroDoc::new();
-    let peer_client = RoomClient::connect(&url, &chat_id, peer_doc.clone())
+    let peer_client = RoomClient::connect(&peer_url, &chat_id, peer_doc.clone())
         .await
-        .expect("peer connect");
+        .expect("bob connect");
     let peer = SessionDoc::from_doc(peer_doc);
     wait_until(|| peer.chat_id().as_deref() == Some(chat_id.as_str())).await;
 

@@ -14,8 +14,8 @@ use tokio::sync::{mpsc, oneshot};
 pub use tokio_util::sync::CancellationToken;
 
 use comet_proto::{
-    AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode, UserInputAnswer,
-    UserInputQuestion,
+    AgentEvent, HarnessCommand, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode,
+    UserInputAnswer, UserInputQuestion,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -29,9 +29,17 @@ pub enum HarnessError {
 }
 
 /// A steer prompt pushed into a live run; delivered at the harness's steering boundary.
+#[derive(Debug, Clone)]
 pub struct SteerMessage {
     pub prompt: String,
     pub message_id: Option<String>,
+}
+/// Engine-owned context exposed to an agent child process. This is launch
+/// metadata, not user-authored run configuration or prompt content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunContext {
+    pub session_id: String,
+    pub ipc_port: u16,
 }
 
 /// Host-side controls handed to a run: input-request bridge + steering mailbox.
@@ -46,6 +54,9 @@ pub struct RunControls {
     /// interrupt, then escalates to SIGTERM/SIGKILL on the child after a grace
     /// period. The run's stream ends with `Done { status: Interrupted }`.
     pub interrupt: CancellationToken,
+    /// Current Comet session and loopback RPC port for session CLI calls.
+    /// Non-session utility runs (for example title generation) leave this unset.
+    pub context: Option<RunContext>,
 }
 
 #[async_trait]
@@ -56,6 +67,9 @@ pub trait Harness: Send + Sync {
     fn steering_mode(&self) -> SteeringMode;
     fn reasoning_levels(&self) -> &[ReasoningLevel];
     async fn models(&self) -> Result<Vec<Model>, HarnessError>;
+    async fn commands(&self, _cwd: &str) -> Result<Vec<HarnessCommand>, HarnessError> {
+        Ok(Vec::new())
+    }
     /// Run one (persistent) session; the stream ends with `AgentEvent::Done`.
     async fn run(
         &self,
@@ -64,10 +78,40 @@ pub trait Harness: Send + Sync {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError>;
 }
 
+mod approval;
 pub mod claude;
 pub mod codex;
 pub mod mock;
+pub mod omp;
+pub mod prime_agent;
 pub mod shell_env;
+
+/// Product-curated model set shared by ACP-backed harness catalogs.
+///
+/// Exact ids keep renamed/legacy variants out. GPT-5.6 is admitted by family
+/// prefix because both Codex and Prime publish multiple current profiles.
+pub(crate) fn is_curated_comet_model(model_id: &str) -> bool {
+    let is_gpt_56_family = |prefix: &str| {
+        model_id == prefix
+            || model_id
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| suffix.starts_with('-'))
+    };
+    is_gpt_56_family("openai-codex/gpt-5.6")
+        || is_gpt_56_family("prime-inference/openai/gpt-5.6")
+        || matches!(
+            model_id,
+            "anthropic/claude-opus-5"
+                | "anthropic/claude-sonnet-5"
+                | "anthropic/claude-fable-5"
+                | "prime-inference/anthropic/claude-opus-5"
+                | "prime-inference/anthropic/claude-sonnet-5"
+                | "prime-inference/anthropic/claude-fable-5"
+                | "prime-inference/moonshotai/kimi-k3"
+                | "prime-inference/x-ai/grok-4.20"
+                | "prime-inference/x-ai/grok-4.20-multi-agent"
+        )
+}
 
 /// Bin directories where npm-installed CLIs land under Node version managers.
 /// GUI launches never see these on PATH — the managers shape PATH in shell
@@ -130,6 +174,15 @@ pub(crate) fn compose_child_path(cmd: &mut tokio::process::Command, exe: &std::p
     paths.retain(|p| !p.as_os_str().is_empty() && seen.insert(p.clone()));
     if let Ok(joined) = std::env::join_paths(paths) {
         cmd.env("PATH", joined);
+    }
+}
+pub(crate) fn apply_run_context(cmd: &mut tokio::process::Command, context: Option<&RunContext>) {
+    // Never inherit a stale context from the engine's own launch environment.
+    cmd.env_remove("COMET_SESSION_ID")
+        .env_remove("COMET_IPC_PORT");
+    if let Some(context) = context {
+        cmd.env("COMET_SESSION_ID", &context.session_id)
+            .env("COMET_IPC_PORT", context.ipc_port.to_string());
     }
 }
 
@@ -208,3 +261,47 @@ pub(crate) fn crash_message(
 
 pub use claude::ClaudeHarness;
 pub use codex::CodexHarness;
+pub use omp::OmpHarness;
+pub use prime_agent::PrimeAgentHarness;
+#[cfg(test)]
+mod run_context_tests {
+    use super::{RunContext, apply_run_context};
+
+    fn configured_env(cmd: &tokio::process::Command, key: &str) -> Option<String> {
+        cmd.as_std()
+            .get_envs()
+            .find(|(name, _)| name.to_string_lossy() == key)
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn applies_exact_session_and_ipc_context() {
+        let mut cmd = tokio::process::Command::new("unused");
+        apply_run_context(
+            &mut cmd,
+            Some(&RunContext {
+                session_id: "session-123".into(),
+                ipc_port: 38117,
+            }),
+        );
+
+        assert_eq!(
+            configured_env(&cmd, "COMET_SESSION_ID").as_deref(),
+            Some("session-123")
+        );
+        assert_eq!(
+            configured_env(&cmd, "COMET_IPC_PORT").as_deref(),
+            Some("38117")
+        );
+    }
+
+    #[test]
+    fn absent_context_does_not_expose_comet_environment() {
+        let mut cmd = tokio::process::Command::new("unused");
+        apply_run_context(&mut cmd, None);
+
+        assert_eq!(configured_env(&cmd, "COMET_SESSION_ID"), None);
+        assert_eq!(configured_env(&cmd, "COMET_IPC_PORT"), None);
+    }
+}

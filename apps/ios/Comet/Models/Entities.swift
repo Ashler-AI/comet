@@ -14,6 +14,16 @@ struct DeviceRow: Identifiable, Hashable {
     var lastSeenAt: Int64?
     var createdAt: Int64?
 }
+/// Imported global-session membership. This is deliberately not a Chat: it
+/// carries no owner, host device, space, or cached public metadata.
+struct SessionRef: Identifiable, Hashable {
+    var chatId: String
+    var addedAt: Int64
+
+    var id: String { chatId }
+    var fallbackTitle: String { "Session \(chatId.prefix(8))" }
+}
+
 
 struct Space: Identifiable, Hashable {
     var id: String

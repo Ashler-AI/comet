@@ -32,6 +32,8 @@ use crate::{RpcClient, RpcError, RpcService, serve_connection};
 pub const RELAY_KIND: &str = " relay";
 /// Durable command nudge frames (§7 cold-chat delivery): payload `{chatId}`.
 pub const NUDGE_KIND: &str = "nudge";
+/// Edge-verified authority grant emitted only on the authenticated host socket.
+pub const GRANT_KIND: &str = "grant";
 /// The RPC stream over the relay: both `s` (stream id) and `k` (kind) are `"rpc"`.
 pub const RPC_KIND: &str = "rpc";
 
@@ -205,6 +207,12 @@ impl TokenSource for StaticToken {
 /// Called with the chat id of every nudge frame ("this chat's doc has pending commands —
 /// open it and drain"); the engine warms/opens the chat doc.
 pub type NudgeHandler = Arc<dyn Fn(String) + Send + Sync>;
+/// Called only for an edge-emitted [`GRANT_KIND`] frame. The stream id is the
+/// edge-verified session id and the bytes are the edge-derived grant envelope.
+pub type GrantHandler = Arc<dyn Fn(String, Vec<u8>) + Send + Sync>;
+/// Called after every authenticated host reconnect, before any grant frame is
+/// accepted, so previously cached edge authority can be invalidated.
+pub type GrantResetHandler = Arc<dyn Fn() + Send + Sync>;
 
 pub struct HostRelayConfig {
     /// Edge base URL (`http(s)://…`; rewritten to `ws(s)` for the socket).
@@ -245,6 +253,25 @@ impl HostRelay {
         service: Arc<dyn RpcService>,
         on_nudge: NudgeHandler,
     ) -> Self {
+        Self::spawn_with_grants(config, service, on_nudge, Arc::new(|_, _| {}))
+    }
+
+    pub fn spawn_with_grants(
+        config: HostRelayConfig,
+        service: Arc<dyn RpcService>,
+        on_nudge: NudgeHandler,
+        on_grant: GrantHandler,
+    ) -> Self {
+        Self::spawn_with_authority(config, service, on_nudge, Arc::new(|| {}), on_grant)
+    }
+
+    pub fn spawn_with_authority(
+        config: HostRelayConfig,
+        service: Arc<dyn RpcService>,
+        on_nudge: NudgeHandler,
+        on_grant_reset: GrantResetHandler,
+        on_grant: GrantHandler,
+    ) -> Self {
         let task = tokio::spawn(async move {
             let mut wake = comet_sync::wake::subscribe();
             // Fast-rejoin bookkeeping: the edge DO periodically ends healthy
@@ -264,7 +291,8 @@ impl HostRelay {
                         &token,
                     );
                     let started = tokio::time::Instant::now();
-                    let outcome = host_session(&url, &service, &on_nudge).await;
+                    let outcome =
+                        host_session(&url, &service, &on_nudge, &on_grant_reset, &on_grant).await;
                     let healthy = started.elapsed() >= HOST_HEALTHY_SESSION;
                     match outcome {
                         Ok(()) => {
@@ -362,10 +390,13 @@ async fn host_session(
     url: &str,
     service: &Arc<dyn RpcService>,
     on_nudge: &NudgeHandler,
+    on_grant_reset: &GrantResetHandler,
+    on_grant: &GrantHandler,
 ) -> Result<(), RpcError> {
     let (ws, _) = tokio_tungstenite::connect_async(url)
         .await
         .map_err(|e| RpcError::Transport(format!("device room unreachable: {e}")))?;
+    on_grant_reset();
     tracing::info!("device-room: host connected");
     let (mut sink, mut stream) = ws.split();
     // All writers (per-conn pumps) funnel through one outbound queue → one socket writer.
@@ -389,7 +420,14 @@ async fn host_session(
             message = stream.next() => match message {
                 Some(Ok(WsMessage::Binary(bytes))) => {
                     last_rx = tokio::time::Instant::now();
-                    handle_host_frame(&bytes, &mut conns, service, &out_tx, on_nudge).await;
+                    handle_host_frame(
+                        &bytes,
+                        &mut conns,
+                        service,
+                        &out_tx,
+                        on_nudge,
+                        on_grant,
+                    ).await;
                 }
                 Some(Ok(WsMessage::Close(frame))) => {
                     if let Some(frame) = frame {
@@ -427,6 +465,7 @@ async fn handle_host_frame(
     service: &Arc<dyn RpcService>,
     out_tx: &mpsc::Sender<Vec<u8>>,
     on_nudge: &NudgeHandler,
+    on_grant: &GrantHandler,
 ) {
     let (header, payload) = match decode_device_frame(bytes) {
         Ok(frame) => frame,
@@ -443,6 +482,10 @@ async fn handle_host_frame(
             tracing::debug!(conn = %conn_id, %code, "device-room: client conn torn down");
             conns.remove(conn_id);
         }
+        return;
+    }
+    if header.k == GRANT_KIND {
+        on_grant(header.s, payload);
         return;
     }
     if header.k == NUDGE_KIND {
@@ -607,7 +650,7 @@ pub struct LinkCacheConfig {
     pub cooldown_base: Duration,
     pub cooldown_max: Duration,
     /// Readiness probe budget: the relay accepts client joins even when the host is
-    /// offline, so a `ListHarnesses` round-trip proves the path before caching.
+    /// offline, so an exact `LocalDevice` identity round-trip proves the path before caching.
     pub probe_timeout: Duration,
 }
 
@@ -632,6 +675,10 @@ impl LinkCacheConfig {
 /// Consecutive failures older than this decay to zero — a blip an hour ago must
 /// not escalate today's first retry up the backoff curve.
 const FAILURE_DECAY: Duration = Duration::from_secs(600);
+
+fn exact_device_response(response: &serde_json::Value, device_id: &str) -> bool {
+    response.get("deviceId").and_then(serde_json::Value::as_str) == Some(device_id)
+}
 
 #[derive(Default)]
 struct DialState {
@@ -811,11 +858,12 @@ impl LinkCache {
         );
         tracing::info!(device = %device_id, "peer: dialing via device room");
         let link = Arc::new(DeviceLink::connect(&url).await?);
-        // Readiness probe: prove the host answers before caching (an offline host bounces
-        // host_offline, which closes the link and fails this call fast).
+        // Readiness probe: prove that the exact target host answers without
+        // invoking generic catalog discovery. Session-scoped Scaffold hosts
+        // expose only this non-mutating identity RPC before command routing.
         let client = link.client();
-        let probe = client.call(crate::methods::LIST_HARNESSES, serde_json::json!({}));
-        tokio::time::timeout(self.config.probe_timeout, probe)
+        let probe = client.call(crate::methods::LOCAL_DEVICE, serde_json::json!({}));
+        let response = tokio::time::timeout(self.config.probe_timeout, probe)
             .await
             .map_err(|_| {
                 RpcError::Transport(format!("peer {device_id}: readiness check timed out"))
@@ -823,6 +871,11 @@ impl LinkCache {
             .map_err(|e| {
                 RpcError::Transport(format!("peer {device_id}: readiness check failed: {e}"))
             })?;
+        if !exact_device_response(&response, device_id) {
+            return Err(RpcError::Transport(format!(
+                "peer {device_id}: readiness identity mismatch"
+            )));
+        }
         Ok(link)
     }
 
@@ -931,6 +984,19 @@ mod tests {
         assert_eq!((h.s.as_str(), h.k.as_str()), ("a", "b"));
         assert_eq!(p, vec![9]);
         assert!(decode_device_frame(&[0xff, 0xff, 0xff, 0xff, 0xff, 0x01]).is_err()); // overflow
+    }
+
+    #[test]
+    fn readiness_requires_the_exact_device_identity() {
+        assert!(exact_device_response(
+            &serde_json::json!({ "deviceId": "dev-1" }),
+            "dev-1"
+        ));
+        assert!(!exact_device_response(
+            &serde_json::json!({ "deviceId": "dev-2" }),
+            "dev-1"
+        ));
+        assert!(!exact_device_response(&serde_json::json!({}), "dev-1"));
     }
 
     #[test]

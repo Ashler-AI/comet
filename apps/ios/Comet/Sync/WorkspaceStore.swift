@@ -1,9 +1,7 @@
-// Workspace doc mirror — the iOS analogue of the desktop's comet-doc mirror
-// over the workspace doc (crates/doc/src/workspace.rs). Joins the per-user
-// `ws3/{orgId}/{userId}` room, projects the doc into typed rows, and performs
-// the writes the writer discipline allows a viewer device: chat creates,
-// archives and seen marks. iOS is a viewport, not an engine device, so it
-// deliberately owns neither a device row nor a presence heartbeat.
+// Workspace doc mirror. The edge binds this app to its verified project room;
+// rows are globally shared within that project while `sessionRefs` are scoped
+// to the authenticated principal. iOS is a viewport, not an engine device, so
+// it deliberately owns neither a device row nor a presence heartbeat.
 
 import Foundation
 import Loro
@@ -16,6 +14,7 @@ final class WorkspaceStore {
     private(set) var spaces: [Space] = []
     private(set) var chats: [Chat] = []
     private(set) var sessions: [String: SessionRow] = [:]
+    private(set) var sessionRefs: [SessionRef] = []
     private(set) var presence: [String: Int64] = [:]  // deviceId → last heartbeat ms
     private(set) var connected = false
 
@@ -32,7 +31,7 @@ final class WorkspaceStore {
 
     func start() {
         guard room == nil else { return }
-        let roomId = "ws3/\(config.orgId)/\(config.userId)"
+        let roomId = "ws4/\(config.projectScope)"
         // Local-first: hydrate from the on-device snapshot before joining —
         // the sidebar renders immediately and the join backfills incrementally.
         if DocDisk.load(into: doc, id: roomId) {
@@ -118,7 +117,7 @@ final class WorkspaceStore {
     private func projectPresence() {
         guard let room else { return }
         Task { @MainActor in
-            let states = await room.eph.getAllStates()
+            let states = room.eph.getAllStates()
             var fresh: [String: Int64] = [:]
             for (key, value) in states where key.hasPrefix("presence/") {
                 if let ms = value.i64Value {
@@ -184,6 +183,17 @@ final class WorkspaceStore {
                         spaceId: m["spaceId"]?.stringValue,
                         lastSeenAt: m["lastSeenAt"]?.i64Value)
         }
+        sessionRefs = (root["sessionRefs"]?.mapValue ?? [:]).compactMap { _, value in
+            guard let row = value.mapValue,
+                  row["userId"]?.stringValue == config.userId,
+                  let rawChatId = row["chatId"]?.stringValue,
+                  let uuid = UUID(uuidString: rawChatId),
+                  let addedAt = row["addedAt"]?.i64Value else { return nil }
+            return SessionRef(chatId: uuid.uuidString.lowercased(), addedAt: addedAt)
+        }.sorted {
+            ($0.addedAt, $0.chatId) > ($1.addedAt, $1.chatId)
+        }
+
 
         var rows: [String: SessionRow] = [:]
         for (_, v) in root["sessions"]?.mapValue ?? [:] {
@@ -200,22 +210,33 @@ final class WorkspaceStore {
 
     // MARK: Derived views
 
-    /// state.rs `overview_chats`: every non-archived chat of a live space,
-    /// attention-sorted.
+    /// state.rs `overview_chats`: every non-archived, non-imported chat of a
+    /// live space, attention-sorted.
     var overviewChats: [Chat] {
         let liveSpaceIds = Set(spaces.map(\.id))
-        let live = chats.filter { !$0.archived && $0.spaceId.map(liveSpaceIds.contains) == true }
+        let importedIds = Set(sessionRefs.map(\.chatId))
+        let live = chats.filter {
+            !$0.archived
+                && !importedIds.contains($0.id)
+                && $0.spaceId.map(liveSpaceIds.contains) == true
+        }
         return sortActive(live)
     }
+    /// Exact session ids this principal explicitly imported.
+    var sharedSessionRefs: [SessionRef] { sessionRefs }
 
-    /// A space's sessions, in the sidebar's Sessions order (recency).
+
+    /// A space's owned sessions, in the sidebar's Sessions order (recency).
     ///
     /// NOT desktop's `chats_in_space`, which is creation order because there
     /// the rows are TABS and activity must never reorder tabs. The phone has
     /// no tabs — a space opens into the same list, with the same rows, as the
     /// Sessions section — so it follows that list's ordering instead.
     func chats(in spaceId: String) -> [Chat] {
-        sortActive(chats.filter { !$0.archived && $0.spaceId == spaceId })
+        let importedIds = Set(sessionRefs.map(\.chatId))
+        return sortActive(chats.filter {
+            !$0.archived && !importedIds.contains($0.id) && $0.spaceId == spaceId
+        })
     }
 
     func indicator(for chat: Chat) -> ChatIndicator {
@@ -316,6 +337,43 @@ final class WorkspaceStore {
     }
 
     // MARK: Writes (viewer-device discipline)
+    private func sessionRefKey(chatId: String) -> String {
+        "\(config.userId.utf8.count):\(config.userId):\(chatId)"
+    }
+
+    /// Upsert an exact global session id without creating a Chat host row.
+    @discardableResult
+    func addSessionRef(chatId rawChatId: String) -> SessionRef? {
+        guard let uuid = UUID(uuidString: rawChatId.trimmingCharacters(in: .whitespacesAndNewlines))
+        else { return nil }
+        let chatId = uuid.uuidString.lowercased()
+        let map = doc.getMap(id: "sessionRefs")
+        do {
+            let row = try map.getOrCreateContainer(
+                key: sessionRefKey(chatId: chatId), child: LoroMap()
+            )
+            try row.insert(key: "userId", v: config.userId)
+            try row.insert(key: "chatId", v: chatId)
+            let addedAt = row.get(key: "addedAt")?.asValue()?.i64Value ?? nowMs()
+            try row.insert(key: "addedAt", v: addedAt)
+            doc.commit()
+            project()
+            return SessionRef(chatId: chatId, addedAt: addedAt)
+        } catch {
+            return nil
+        }
+    }
+
+    /// Remove only this workspace's membership; the `s2/{chatId}` room remains.
+    func removeSessionRef(chatId: String) {
+        let map = doc.getMap(id: "sessionRefs")
+        do {
+            try map.delete(key: sessionRefKey(chatId: chatId))
+            doc.commit()
+            project()
+        } catch {}
+    }
+
 
     /// Mint a new chat onto a space (workspace_host.rs create_chat shape).
     /// The host = the space's owning device picks it up via the doc.

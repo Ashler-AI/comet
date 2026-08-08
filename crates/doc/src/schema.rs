@@ -11,9 +11,13 @@
 //! isError?, questions?: json, resolved?, message? }. Text bodies are **LoroText** so streaming
 //! appends RLE-merge (1.03x oplog overhead vs 125x for whole-value rewrites).
 
+use comet_proto::{
+    COLLABORATION_SCHEMA_VERSION, CollaborationSnapshot, PublicationRecord, PublicationValue,
+};
 use loro::{ExportMode, LoroDoc, LoroError, LoroList, LoroMap, LoroText, LoroValue, ToJson};
 use serde::{Deserialize, Serialize};
 
+use crate::collaboration::validate_publication;
 use crate::commands::{SessionCommandEntry, SessionCommandStatus};
 use crate::constants::{SESSION_SCHEMA_VERSION, TAIL_MESSAGE_COUNT};
 use crate::parts::{MessagePart, MessageStatus};
@@ -158,8 +162,21 @@ pub struct SessionDoc {
 }
 
 impl SessionDoc {
-    /// Wrap an existing doc (e.g. imported from a snapshot).
+    /// Wrap an existing doc (e.g. imported from a snapshot) and perform the additive v2
+    /// cutover. Existing/unknown containers and fields are untouched.
     pub fn from_doc(doc: LoroDoc) -> Self {
+        let meta = doc.get_map("meta");
+        let current = match meta.get("schemaVersion") {
+            Some(loro::ValueOrContainer::Value(LoroValue::I64(value))) => value,
+            _ => 0,
+        };
+        if current < i64::from(SESSION_SCHEMA_VERSION) {
+            if let Err(error) = meta.insert("schemaVersion", i64::from(SESSION_SCHEMA_VERSION)) {
+                tracing::warn!(%error, "session schema version cutover failed");
+            } else {
+                doc.commit();
+            }
+        }
         Self { doc }
     }
 
@@ -226,6 +243,95 @@ impl SessionDoc {
             .collect())
     }
 
+    /// Append one immutable collaboration publication. Publication ids are durable
+    /// idempotency keys: replay/reconnect of the same record is a no-op and can never
+    /// remove a message or an earlier publication.
+    pub fn append_publication(&self, record: &PublicationRecord) -> Result<bool, DocError> {
+        validate_publication(record)?;
+        let publications = self.doc.get_list("publications");
+        for index in 0..publications.len() {
+            if let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) =
+                publications.get(index)
+                && matches!(
+                    map.get("id"),
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(id))) if id.as_str() == record.id
+                )
+            {
+                return Ok(false);
+            }
+        }
+        let map = publications.push_container(LoroMap::new())?;
+        map.insert("id", record.id.as_str())?;
+        map.insert(
+            "record",
+            loro_value_from_json(&serde_json::to_value(record)?),
+        )?;
+        self.doc.commit();
+        Ok(true)
+    }
+
+    /// Materialize collaboration publications in append order. Malformed or
+    /// over-bound future rows are skipped independently, like transcript rows.
+    pub fn read_publications(&self) -> Result<Vec<PublicationRecord>, DocError> {
+        #[derive(Deserialize)]
+        struct RawPublication {
+            record: PublicationRecord,
+        }
+
+        let value = self
+            .doc
+            .get_list("publications")
+            .get_deep_value()
+            .to_json_value();
+        let rows: Vec<serde_json::Value> = serde_json::from_value(value)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let raw: RawPublication = match serde_json::from_value(row) {
+                    Ok(raw) => raw,
+                    Err(error) => {
+                        tracing::warn!(%error, "skipping malformed collaboration publication");
+                        return None;
+                    }
+                };
+                match validate_publication(&raw.record) {
+                    Ok(()) => Some(raw.record),
+                    Err(error) => {
+                        tracing::warn!(%error, "skipping over-bound collaboration publication");
+                        None
+                    }
+                }
+            })
+            .collect())
+    }
+
+    pub fn collaboration_snapshot(&self) -> Result<CollaborationSnapshot, DocError> {
+        let publications = self.read_publications()?;
+        let mut sessions_by_id = std::collections::BTreeMap::new();
+        let mut message_provenance = Vec::new();
+        for publication in &publications {
+            match &publication.value {
+                PublicationValue::AgentSession(session) => {
+                    sessions_by_id.insert(session.session_id.clone(), session.as_ref().clone());
+                }
+                PublicationValue::MessageProvenance(provenance) => {
+                    message_provenance.push(provenance.clone());
+                }
+                _ => {}
+            }
+        }
+        let sessions = sessions_by_id.into_values().collect();
+        Ok(CollaborationSnapshot {
+            schema_version: COLLABORATION_SCHEMA_VERSION,
+            sessions,
+            message_provenance,
+            publications,
+            participants: Vec::new(),
+            principal: None,
+            grants: Vec::new(),
+        })
+    }
+
     /// Read the commands ledger.
     ///
     /// Same skip-not-fail policy as `read_entries`: any device can append
@@ -254,6 +360,23 @@ impl SessionDoc {
 
     /// Append a command entry (rule 1: own entries only, append-only).
     pub fn queue_command(&self, entry: &SessionCommandEntry) -> Result<(), DocError> {
+        if self
+            .read_commands()?
+            .iter()
+            .any(|existing| existing.id == entry.id)
+        {
+            return Ok(());
+        }
+        const MAX_COMMAND_METADATA_BYTES: usize = 256 * 1024;
+        if entry.id.is_empty() || entry.id.len() > 256 || entry.issued_by.len() > 512 {
+            return Err(DocError::Schema(
+                "command identity metadata exceeds bounds".into(),
+            ));
+        }
+        let payload_json = serde_json::to_value(&entry.payload)?;
+        if serde_json::to_vec(&payload_json)?.len() > MAX_COMMAND_METADATA_BYTES {
+            return Err(DocError::Schema("command payload exceeds 256 KiB".into()));
+        }
         let commands = self.doc.get_list("commands");
         let map = commands.push_container(LoroMap::new())?;
         map.insert("id", entry.id.as_str())?;
@@ -263,10 +386,7 @@ impl SessionDoc {
                 .as_str()
                 .ok_or_else(|| DocError::Schema("kind not a string".into()))?,
         )?;
-        map.insert(
-            "payload",
-            loro_value_from_json(&serde_json::to_value(&entry.payload)?),
-        )?;
+        map.insert("payload", loro_value_from_json(&payload_json))?;
         map.insert("issuedBy", entry.issued_by.as_str())?;
         map.insert("issuedAt", entry.issued_at)?;
         if let Some(based_on) = &entry.based_on {
@@ -295,6 +415,11 @@ impl SessionDoc {
         status: SessionCommandStatus,
         resolution: Option<&str>,
     ) -> Result<(), DocError> {
+        if command_id.len() > 256 || resolution.is_some_and(|value| value.len() > 2 * 1024) {
+            return Err(DocError::Schema(
+                "command outcome metadata exceeds bounds".into(),
+            ));
+        }
         let commands = self.doc.get_list("commands");
         for i in 0..commands.len() {
             if let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) =
@@ -478,6 +603,8 @@ fn status_str(status: MessageStatus) -> &'static str {
         MessageStatus::Streaming => "streaming",
         MessageStatus::Complete => "complete",
         MessageStatus::Aborted => "aborted",
+        MessageStatus::Queued => "queued",
+        MessageStatus::Steered => "steered",
     }
 }
 
@@ -907,6 +1034,7 @@ mod tests {
             &AgentEvent::ToolResult {
                 id: "tool-1".into(),
                 is_error: false,
+                output: None,
             },
         );
         writer.sync(&folded).unwrap();
@@ -975,6 +1103,52 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].status, SessionCommandStatus::Applied);
         assert_eq!(commands[0].payload, entry.payload);
+    }
+
+    #[test]
+    fn command_queue_is_idempotent_by_entry_id() {
+        use crate::commands::{SessionCommandPayload, SessionCommandStatus};
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let first = SessionCommandEntry {
+            id: "stable-id".into(),
+            payload: SessionCommandPayload::Interrupt {},
+            issued_by: "dev-a".into(),
+            issued_at: 10,
+            based_on: None,
+            expires_at: None,
+            status: SessionCommandStatus::Pending,
+            resolution: None,
+        };
+        let retry = SessionCommandEntry {
+            payload: SessionCommandPayload::Steer {
+                prompt: "must not replace the original".into(),
+                message_id: None,
+            },
+            ..first.clone()
+        };
+        doc.queue_command(&first).unwrap();
+        doc.queue_command(&retry).unwrap();
+        let commands = doc.read_commands().unwrap();
+        assert_eq!(commands, vec![first]);
+    }
+
+    #[test]
+    fn unknown_publication_kinds_do_not_enter_collaboration_state() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let record = PublicationRecord {
+            id: "future-1".into(),
+            schema_version: COLLABORATION_SCHEMA_VERSION,
+            published_at: 1,
+            published_by: "iap:alice@example.com".into(),
+            value: PublicationValue::Unknown {
+                kind: "futureControl".into(),
+                value: serde_json::json!({ "action": "mutate" }),
+            },
+            unknown: Default::default(),
+        };
+
+        assert!(doc.append_publication(&record).is_err());
+        assert!(doc.read_publications().unwrap().is_empty());
     }
 
     #[test]

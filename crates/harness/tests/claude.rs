@@ -68,6 +68,7 @@ fn controls(
         }),
         steering: steer_rx,
         interrupt: token.clone(),
+        context: None,
     };
     (controls, steer_tx, token)
 }
@@ -157,11 +158,13 @@ async fn happy_path_normalizes_events_and_filters_subagents() {
     );
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "tool-1".into(),
-        is_error: false
+        is_error: false,
+        output: Some("total 0".into()),
     }));
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "tool-2".into(),
-        is_error: true
+        is_error: true,
+        output: None,
     }));
 
     // Informational rate-limit frames stay quiet.
@@ -210,6 +213,7 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
         }),
         steering: steer_rx,
         interrupt: token.clone(),
+        context: None,
     };
     let events = run_to_end(&harness(), request("scenario:askuser"), controls).await;
 

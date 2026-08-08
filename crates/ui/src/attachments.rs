@@ -1,7 +1,7 @@
-//! Attachments (feature-inventory §1.7/§1.8): the composer's staged images,
-//! the chunked upload to the chat's host device, the plain-text attachment-ref
-//! transport that rides the prompt, the transcript read-back cache, and the
-//! full-size preview lightbox.
+//! Attachments (feature-inventory §1.7/§1.8): composer-staged images and
+//! pasted text, chunked upload to the chat's host device, the plain-text
+//! attachment-ref transport that rides the prompt, the transcript read-back
+//! cache for images, and the full-size image preview lightbox.
 //!
 //! Ports of comet's `composer/use-attachments.ts` (staging/upload),
 //! `control/message-attachments.ts` (the `withAttachments` /
@@ -12,6 +12,7 @@
 //! round-trip).
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -41,25 +42,48 @@ const MAX_READ_CHUNKS: usize = 1_000;
 
 /// The body used for image-only sends (`use-attachments.ts`).
 pub const ATTACHMENT_ONLY_TEXT: &str = "See the attached image(s).";
+/// The body used when a large paste is the only prompt content.
+pub const TEXT_ATTACHMENT_ONLY_TEXT: &str = "See the attached text.";
 
-/// How attachments ride the prompt (use-attachments.ts `withAttachments`):
-/// plain local paths appended to the text — the files are staged on the device
-/// that runs the agent, so the agent can open them with its own tools; the
-/// same text is what persists as the user doc entry.
-pub fn with_attachments(text: &str, paths: &[String]) -> String {
-    if paths.is_empty() {
+/// How attachments ride the prompt: plain local paths appended to the text.
+/// Files are staged on the device that runs the agent, so the agent can open
+/// them with its own tools; the same text persists as the user doc entry.
+pub fn with_attachment_files(text: &str, image_paths: &[String], text_paths: &[String]) -> String {
+    if image_paths.is_empty() && text_paths.is_empty() {
         return text.to_string();
     }
-    let refs: Vec<String> = paths.iter().map(|p| format!("- {p}")).collect();
-    let body = if text.is_empty() {
-        ATTACHMENT_ONLY_TEXT
-    } else {
+    let body = if !text.is_empty() {
         text
+    } else if !text_paths.is_empty() && image_paths.is_empty() {
+        TEXT_ATTACHMENT_ONLY_TEXT
+    } else {
+        ATTACHMENT_ONLY_TEXT
     };
-    format!(
-        "{body}\n\nAttached images (local files — open them to view):\n{}",
-        refs.join("\n")
-    )
+    let mut content = String::with_capacity(
+        body.len()
+            + image_paths.iter().map(String::len).sum::<usize>()
+            + text_paths.iter().map(String::len).sum::<usize>()
+            + 128,
+    );
+    content.push_str(body);
+    if !image_paths.is_empty() {
+        content.push_str("\n\nAttached images (local files — open them to view):");
+        for path in image_paths {
+            let _ = write!(content, "\n- {path}");
+        }
+    }
+    if !text_paths.is_empty() {
+        content.push_str("\n\nAttached text (local files — open them to read):");
+        for path in text_paths {
+            let _ = write!(content, "\n- {path}");
+        }
+    }
+    content
+}
+
+/// Compatibility entry point for the existing image-only transport.
+pub fn with_attachments(text: &str, paths: &[String]) -> String {
+    with_attachment_files(text, paths, &[])
 }
 
 /// An attachment ref parsed back out of a user message's text.
@@ -70,11 +94,20 @@ pub struct UserImageAttachment {
     pub name: String,
 }
 
+/// A pasted-text ref parsed back out of a user message's text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserTextAttachment {
+    pub id: String,
+    pub path: String,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedUserMessage {
-    /// The visible prompt (the refs trailer stripped; empty for image-only sends).
+    /// The visible prompt (attachment-ref trailers stripped).
     pub text: String,
     pub attachments: Vec<UserImageAttachment>,
+    pub text_attachments: Vec<UserTextAttachment>,
 }
 
 fn name_from_path(path: &str) -> String {
@@ -90,47 +123,65 @@ fn name_from_path(path: &str) -> String {
     }
 }
 
-/// Find the refs trailer: a blank line, then a line starting (case-insensitive)
-/// with `Attached images (local files` and ending `):`. Returns
-/// `(body_end, refs_start)` byte offsets — the tolerant equivalent of comet's
-/// `ATTACHED_IMAGES_RE`.
-fn find_refs_marker(content: &str) -> Option<(usize, usize)> {
+/// Find a refs trailer headed by `needle` (case-insensitive). Returns the byte
+/// offsets for the preceding body gap and the first refs line.
+fn find_refs_marker(content: &str, needle: &str) -> Option<(usize, usize)> {
     let lower = content.to_ascii_lowercase();
-    let needle = "\n\nattached images (local files";
-    let mut from = 0usize;
-    while let Some(rel) = lower[from..].find(needle) {
-        let gap = from + rel;
-        let line_start = gap + 2;
-        let line_end = content[line_start..]
-            .find('\n')
-            .map(|p| line_start + p)
-            .unwrap_or(content.len());
-        let line = content[line_start..line_end].trim_end_matches('\r');
-        if line.ends_with("):") {
-            let refs_start = (line_end + 1).min(content.len());
-            return Some((gap, refs_start));
-        }
-        from = line_start;
-    }
-    None
+    let needle = format!("\n\n{needle}");
+    let gap = lower.find(&needle)?;
+    let line_start = gap + 2;
+    let line_end = content[line_start..]
+        .find('\n')
+        .map(|p| line_start + p)
+        .unwrap_or(content.len());
+    let line = content[line_start..line_end].trim_end_matches('\r');
+    line.ends_with("):")
+        .then_some((gap, (line_end + 1).min(content.len())))
 }
 
-/// message-attachments.ts `parseUserMessageImages`: split the visible prompt
-/// from its attachment-ref trailer.
-pub fn parse_user_message_images(content: &str) -> ParsedUserMessage {
-    let Some((body_end, refs_start)) = find_refs_marker(content) else {
-        return ParsedUserMessage {
-            text: content.to_string(),
-            attachments: Vec::new(),
-        };
-    };
-    let body = content[..body_end].trim_end();
-    let attachments: Vec<UserImageAttachment> = content[refs_start..]
+fn ref_paths(content: &str, start: usize, end: usize) -> Vec<String> {
+    content[start..end]
         .lines()
         .filter_map(|line| {
             let path = line.trim_start().strip_prefix("- ")?.trim();
             (!path.is_empty()).then(|| path.to_string())
         })
+        .collect()
+}
+
+/// Split the visible prompt from image and pasted-text attachment trailers.
+pub fn parse_user_message_images(content: &str) -> ParsedUserMessage {
+    let image_marker = find_refs_marker(content, "attached images (local files");
+    let text_marker = find_refs_marker(content, "attached text (local files");
+    let image_end = text_marker
+        .filter(|(gap, _)| image_marker.is_some_and(|(image_gap, _)| *gap > image_gap))
+        .map_or(content.len(), |(gap, _)| gap);
+    let text_end = image_marker
+        .filter(|(gap, _)| text_marker.is_some_and(|(text_gap, _)| *gap > text_gap))
+        .map_or(content.len(), |(gap, _)| gap);
+    let image_paths = image_marker
+        .map(|(_, start)| ref_paths(content, start, image_end))
+        .unwrap_or_default();
+    let text_paths = text_marker
+        .map(|(_, start)| ref_paths(content, start, text_end))
+        .unwrap_or_default();
+    if image_paths.is_empty() && text_paths.is_empty() {
+        return ParsedUserMessage {
+            text: content.to_string(),
+            attachments: Vec::new(),
+            text_attachments: Vec::new(),
+        };
+    }
+    let mut body_end = content.len();
+    if !image_paths.is_empty() {
+        body_end = body_end.min(image_marker.expect("non-empty image refs require marker").0);
+    }
+    if !text_paths.is_empty() {
+        body_end = body_end.min(text_marker.expect("non-empty text refs require marker").0);
+    }
+    let body = content[..body_end].trim_end();
+    let attachments = image_paths
+        .into_iter()
         .enumerate()
         .map(|(index, path)| UserImageAttachment {
             id: format!("{index}:{path}"),
@@ -138,33 +189,39 @@ pub fn parse_user_message_images(content: &str) -> ParsedUserMessage {
             path,
         })
         .collect();
-    if attachments.is_empty() {
-        return ParsedUserMessage {
-            text: content.to_string(),
-            attachments,
-        };
-    }
+    let text_attachments = text_paths
+        .into_iter()
+        .enumerate()
+        .map(|(index, path)| UserTextAttachment {
+            id: format!("{index}:{path}"),
+            name: name_from_path(&path),
+            path,
+        })
+        .collect();
     ParsedUserMessage {
-        text: if body.trim() == ATTACHMENT_ONLY_TEXT {
+        text: if body.trim() == ATTACHMENT_ONLY_TEXT || body.trim() == TEXT_ATTACHMENT_ONLY_TEXT {
             String::new()
         } else {
             body.to_string()
         },
         attachments,
+        text_attachments,
     }
 }
 
-/// message-attachments.ts `userMessageRailText`: what the rail/sidebar shows
-/// for a user message ("Attached image" / "N attached images" when image-only).
+/// What the rail/sidebar shows for a user message with no visible prompt.
 pub fn user_message_rail_text(content: &str) -> String {
     let parsed = parse_user_message_images(content);
     if !parsed.text.trim().is_empty() {
         return parsed.text;
     }
-    match parsed.attachments.len() {
-        0 => content.to_string(),
-        1 => "Attached image".to_string(),
-        n => format!("{n} attached images"),
+    match (parsed.attachments.len(), parsed.text_attachments.len()) {
+        (0, 0) => content.to_string(),
+        (1, 0) => "Attached image".to_string(),
+        (images, 0) => format!("{images} attached images"),
+        (0, 1) => "Attached text".to_string(),
+        (0, texts) => format!("{texts} text attachments"),
+        (images, texts) => format!("{} attached files", images + texts),
     }
 }
 
@@ -172,21 +229,38 @@ pub fn user_message_rail_text(content: &str) -> String {
 // Staging (use-attachments.ts intake)
 // ---------------------------------------------------------------------------
 
-/// An image staged in the composer, before upload. The raw bytes live inside
-/// the [`Image`] (gpui decodes them at paint; the same Arc feeds thumbnails,
-/// the lightbox, the upload, and the post-send cache seed).
+/// Content staged in the composer before upload. Bytes remain shared through
+/// the thumbnail/preview/upload path instead of being copied between layers.
+#[derive(Clone)]
+pub enum StagedAttachmentContent {
+    Image(Arc<Image>),
+    Text(Arc<str>),
+}
+
 #[derive(Clone)]
 pub struct StagedAttachment {
     pub id: String,
-    /// File name with a type-matching extension (use-attachments.ts
-    /// `ensureExtension` — agents sniff images by extension).
     pub name: String,
-    pub image: Arc<Image>,
+    pub content: StagedAttachmentContent,
 }
 
 impl StagedAttachment {
     pub fn bytes(&self) -> &[u8] {
-        &self.image.bytes
+        match &self.content {
+            StagedAttachmentContent::Image(image) => &image.bytes,
+            StagedAttachmentContent::Text(text) => text.as_bytes(),
+        }
+    }
+
+    pub fn image(&self) -> Option<&Arc<Image>> {
+        match &self.content {
+            StagedAttachmentContent::Image(image) => Some(image),
+            StagedAttachmentContent::Text(_) => None,
+        }
+    }
+
+    pub fn is_text(&self) -> bool {
+        matches!(self.content, StagedAttachmentContent::Text(_))
     }
 }
 
@@ -241,7 +315,7 @@ pub fn stage_file(path: &Path) -> Result<StagedAttachment, String> {
     Ok(StagedAttachment {
         id: uuid::Uuid::new_v4().to_string(),
         name: ensure_extension(&display_name, format),
-        image: Arc::new(Image::from_bytes(format, bytes)),
+        content: StagedAttachmentContent::Image(Arc::new(Image::from_bytes(format, bytes))),
     })
 }
 
@@ -251,7 +325,16 @@ pub fn stage_clipboard_image(image: Image) -> StagedAttachment {
     StagedAttachment {
         id: uuid::Uuid::new_v4().to_string(),
         name: ensure_extension("image", format),
-        image: Arc::new(image),
+        content: StagedAttachmentContent::Image(Arc::new(image)),
+    }
+}
+
+/// Stage a large clipboard paste as a UTF-8 text file without touching disk.
+pub fn stage_pasted_text(text: String) -> StagedAttachment {
+    StagedAttachment {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: "pasted-text.txt".to_string(),
+        content: StagedAttachmentContent::Text(Arc::from(text)),
     }
 }
 
@@ -259,7 +342,10 @@ pub fn stage_clipboard_image(image: Image) -> StagedAttachment {
 // Upload (state.ts uploadAttachment) + read-back (state.ts readAttachmentImage)
 // ---------------------------------------------------------------------------
 
-fn with_target(mut params: serde_json::Value, target_device_id: Option<&str>) -> serde_json::Value {
+pub(crate) fn with_target(
+    mut params: serde_json::Value,
+    target_device_id: Option<&str>,
+) -> serde_json::Value {
     if let (Some(target), Some(map)) = (target_device_id, params.as_object_mut()) {
         map.insert("targetDeviceId".into(), target.into());
     }
@@ -277,7 +363,7 @@ const READ_CHUNK_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Race an RPC against `timeout` on the gpui background executor (these
 /// futures run under `cx.spawn`, so tokio's timer reactor isn't available).
-async fn call_with_timeout(
+pub(crate) async fn call_with_timeout(
     engine: &EngineHandle,
     executor: &BackgroundExecutor,
     method: &str,
@@ -684,6 +770,7 @@ mod tests {
         let parsed = parse_user_message_images(&content);
         assert_eq!(parsed.text, "look at these");
         assert_eq!(parsed.attachments.len(), 2);
+        assert!(parsed.text_attachments.is_empty());
         assert_eq!(parsed.attachments[0].path, "/data/uploads/ab-cat.png");
         assert_eq!(parsed.attachments[0].name, "ab-cat.png");
         assert_eq!(parsed.attachments[1].name, "dog.jpg");
@@ -700,10 +787,32 @@ mod tests {
     }
 
     #[test]
+    fn pasted_text_and_images_round_trip_as_distinct_attachment_types() {
+        let content = with_attachment_files(
+            "",
+            &["/data/uploads/shot.png".to_string()],
+            &["/data/uploads/pasted-text.txt".to_string()],
+        );
+        let parsed = parse_user_message_images(&content);
+        assert!(parsed.text.is_empty());
+        assert_eq!(parsed.attachments[0].name, "shot.png");
+        assert_eq!(parsed.text_attachments[0].name, "pasted-text.txt");
+
+        let text_only =
+            with_attachment_files("", &[], &["/data/uploads/pasted-text.txt".to_string()]);
+        assert!(text_only.starts_with(TEXT_ATTACHMENT_ONLY_TEXT));
+        let parsed = parse_user_message_images(&text_only);
+        assert!(parsed.text.is_empty());
+        assert!(parsed.attachments.is_empty());
+        assert_eq!(parsed.text_attachments.len(), 1);
+    }
+
+    #[test]
     fn plain_text_passes_through_unchanged() {
         assert_eq!(with_attachments("hello", &[]), "hello");
         let parsed = parse_user_message_images("hello\n\nno images here");
         assert!(parsed.attachments.is_empty());
+        assert!(parsed.text_attachments.is_empty());
         assert_eq!(parsed.text, "hello\n\nno images here");
     }
 
@@ -722,11 +831,13 @@ mod tests {
     }
 
     #[test]
-    fn rail_text_summarizes_image_only_sends() {
+    fn rail_text_summarizes_attachment_only_sends() {
         let one = with_attachments("", &["/a/b.png".to_string()]);
         assert_eq!(user_message_rail_text(&one), "Attached image");
         let two = with_attachments("", &["/a/b.png".to_string(), "/c/d.png".into()]);
         assert_eq!(user_message_rail_text(&two), "2 attached images");
+        let text = with_attachment_files("", &[], &["/a/pasted-text.txt".to_string()]);
+        assert_eq!(user_message_rail_text(&text), "Attached text");
         let with_text = with_attachments("fix this", &["/a/b.png".to_string()]);
         assert_eq!(user_message_rail_text(&with_text), "fix this");
         assert_eq!(user_message_rail_text("plain"), "plain");

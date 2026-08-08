@@ -1,12 +1,10 @@
 //! comet-update — release checking and self-update, shared by the engine (the
-//! background checker + `ApplyUpdate`), the CLI (`comet update`), and the UI
-//! (the sidebar update strip + macOS bundle swap).
-//!
-//! Release layout (see `.github/workflows/release.yml` and `edge/src/install.sh`):
-//! artifacts live in the `comet-native-releases` R2 bucket, served pre-auth at
-//! `{edge}/releases/*`. `manifest.json` carries the latest version plus a
-//! sha256 per artifact; `latest.txt` (version only) remains as the fallback for
-//! releases published before the manifest existed.
+//! background checker + `ApplyUpdate`), the CLI (`comet update`), and the UI.
+//! Release artifacts are stored privately in GCS and served through the
+//! authenticated Comet edge (see `.github/workflows/release.yml` and
+//! `install.sh`). Each request resolves the persisted Comet login; the edge
+//! obtains its own short-lived GCS authorization, so no storage credential is
+//! persisted on the device.
 //!
 //! Install kinds and their update paths:
 //! - **Managed** (`~/.comet-native/app/<ver>` + `current` symlink — the curl|sh
@@ -22,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context as _, bail};
-use futures::StreamExt as _;
+use futures::{StreamExt as _, future::BoxFuture};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt as _;
@@ -47,20 +45,18 @@ const IDLE_RECHECK: std::time::Duration = std::time::Duration::from_secs(5 * 60)
 // Release metadata
 // ---------------------------------------------------------------------------
 
-/// `{edge}/releases/manifest.json` — written by the release workflow.
+/// Private `manifest.json` written by the release workflow.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: String,
-    /// Artifact file name → metadata. Empty for pre-manifest releases resolved
-    /// via `latest.txt` — downloads then skip checksum verification (with a log).
+    /// Artifact file name → required digest metadata.
     #[serde(default)]
     pub files: BTreeMap<String, FileMeta>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FileMeta {
-    #[serde(default)]
-    pub sha256: Option<String>,
+    pub sha256: String,
 }
 
 /// Artifact-name platform pair — `uname`-style strings matching the packaging
@@ -109,52 +105,63 @@ pub fn version_newer(latest: &str, current: &str) -> bool {
     }
 }
 
-/// Fetch the newest release metadata: `manifest.json`, falling back to
-/// `latest.txt` (version only, no checksums) for pre-manifest releases.
-pub async fn fetch_latest(edge_url: &str) -> anyhow::Result<Manifest> {
-    let base = edge_url.trim_end_matches('/');
-    let client = http_client()?;
-    let manifest_url = format!("{base}/releases/manifest.json");
-    match client.get(&manifest_url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            let manifest: Manifest = resp.json().await.context("parsing manifest.json")?;
-            if manifest.version.trim().is_empty() {
-                bail!("manifest.json has an empty version");
-            }
-            return Ok(manifest);
-        }
-        Ok(resp) => {
-            tracing::debug!(status = %resp.status(), "manifest.json unavailable; trying latest.txt")
-        }
-        Err(err) => tracing::debug!(error = %err, "manifest.json fetch failed; trying latest.txt"),
+fn releases_base(edge_url: &str) -> anyhow::Result<String> {
+    let mut url = reqwest::Url::parse(edge_url).context("invalid Comet edge URL")?;
+    let local = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"));
+    if url.host_str().is_none()
+        || (url.scheme() != "https" && !(url.scheme() == "http" && local))
+        || url.username() != ""
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        bail!("Comet edge URL must be an exact HTTPS origin (HTTP is loopback-only)");
     }
-    let latest_url = format!("{base}/releases/latest.txt");
-    let version = client
-        .get(&latest_url)
+    url.set_path("/api/releases");
+    Ok(url.to_string().trim_end_matches('/').to_string())
+}
+
+fn authorized_get(
+    client: &reqwest::Client,
+    url: &str,
+    access_token: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let request = client.get(url);
+    match access_token.filter(|value| !value.trim().is_empty()) {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    }
+}
+
+/// Fetch the signed release manifest through the authenticated Comet edge.
+pub async fn fetch_latest(edge_url: &str, access_token: Option<&str>) -> anyhow::Result<Manifest> {
+    let base = releases_base(edge_url)?;
+    let manifest_url = format!("{base}/manifest.json");
+    let client = http_client()?;
+    let manifest: Manifest = authorized_get(&client, &manifest_url, access_token)
         .send()
         .await
-        .context("fetching latest.txt")?
+        .with_context(|| format!("fetching {manifest_url}"))?
         .error_for_status()
-        .context("fetching latest.txt")?
-        .text()
+        .with_context(|| format!("fetching {manifest_url}"))?
+        .json()
         .await
-        .context("reading latest.txt")?
-        .trim()
-        .to_string();
-    if version.is_empty() {
-        bail!("latest.txt is empty");
+        .context("parsing private release manifest")?;
+    if manifest.version.trim().is_empty() {
+        bail!("manifest.json has an empty version");
     }
-    Ok(Manifest {
-        version,
-        files: BTreeMap::new(),
-    })
+    if manifest.files.is_empty() {
+        bail!("manifest.json has no checksummed release files");
+    }
+    Ok(manifest)
 }
 
 fn http_client() -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(concat!("comet/", env!("CARGO_PKG_VERSION")))
         .build()
-        .context("building http client")
+        .context("building release HTTP client")
 }
 
 // ---------------------------------------------------------------------------
@@ -205,26 +212,26 @@ fn detect_install_from(exe: &Path, home: Option<&Path>) -> InstallKind {
 // Download + verify
 // ---------------------------------------------------------------------------
 
-/// Stream `{edge}/releases/<file>` to `dest`, verifying the manifest sha256 when
-/// present. Writes through a `.partial` sidecar so an interrupted download never
+/// Stream `{private release feed}/<file>` to `dest`, verifying its manifest
+/// SHA-256. Writes through a `.partial` sidecar so an interrupted download never
 /// leaves a plausible-looking artifact behind.
 pub async fn download_release_file(
     edge_url: &str,
+    access_token: Option<&str>,
     manifest: &Manifest,
     file: &str,
     dest: &Path,
 ) -> anyhow::Result<()> {
-    let url = format!("{}/releases/{file}", edge_url.trim_end_matches('/'));
-    let expected = manifest.files.get(file).and_then(|m| m.sha256.as_deref());
-    if expected.is_none() {
-        tracing::warn!(
-            file,
-            "no checksum in release metadata; skipping verification"
-        );
-    }
+    let url = format!("{}/{file}", releases_base(edge_url)?);
+    let expected = manifest
+        .files
+        .get(file)
+        .map(|metadata| metadata.sha256.as_str())
+        .filter(|digest| !digest.trim().is_empty())
+        .with_context(|| format!("release manifest has no SHA-256 for {file}"))?;
     let partial = dest.with_extension("partial");
-    let resp = http_client()?
-        .get(&url)
+    let client = http_client()?;
+    let resp = authorized_get(&client, &url, access_token)
         .send()
         .await
         .with_context(|| format!("downloading {url}"))?
@@ -242,12 +249,10 @@ pub async fn download_release_file(
     }
     out.flush().await.ok();
     drop(out);
-    if let Some(expected) = expected {
-        let actual = format!("{:x}", hasher.finalize());
-        if !actual.eq_ignore_ascii_case(expected.trim()) {
-            tokio::fs::remove_file(&partial).await.ok();
-            bail!("checksum mismatch for {file}: expected {expected}, got {actual}");
-        }
+    let actual = format!("{:x}", hasher.finalize());
+    if !actual.eq_ignore_ascii_case(expected.trim()) {
+        tokio::fs::remove_file(&partial).await.ok();
+        bail!("checksum mismatch for {file}: expected {expected}, got {actual}");
     }
     tokio::fs::rename(&partial, dest)
         .await
@@ -279,6 +284,7 @@ fn run(program: &str, args: &[&str]) -> anyhow::Result<()> {
 /// an already-staged version is reused). Returns the versioned dir.
 pub async fn stage_headless(
     edge_url: &str,
+    access_token: Option<&str>,
     manifest: &Manifest,
     app_root: &Path,
 ) -> anyhow::Result<PathBuf> {
@@ -293,7 +299,7 @@ pub async fn stage_headless(
     std::fs::create_dir_all(&stage).with_context(|| format!("creating {}", stage.display()))?;
     let result = async {
         let tarball = stage.join(&file);
-        download_release_file(edge_url, manifest, &file, &tarball).await?;
+        download_release_file(edge_url, access_token, manifest, &file, &tarball).await?;
         let unpacked = stage.join("unpacked");
         std::fs::create_dir_all(&unpacked)?;
         // Tarball root is the versioned stage dir (see scripts/package-linux.sh);
@@ -357,7 +363,7 @@ pub fn restart_service() -> anyhow::Result<()> {
         let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
         run(
             "launchctl",
-            &["kickstart", "-k", &format!("gui/{uid}/sh.zeron.comet")],
+            &["kickstart", "-k", &format!("gui/{uid}/ai.ashler.comet")],
         )
     } else {
         run("systemctl", &["--user", "restart", "comet-native.service"])
@@ -372,6 +378,7 @@ pub fn restart_service() -> anyhow::Result<()> {
 /// (idempotent). Returns the staged bundle path.
 pub async fn stage_mac_app(
     edge_url: &str,
+    access_token: Option<&str>,
     manifest: &Manifest,
     data_dir: &Path,
 ) -> anyhow::Result<PathBuf> {
@@ -385,7 +392,7 @@ pub async fn stage_mac_app(
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let file = mac_app_artifact(version);
     let tarball = dir.join(&file);
-    download_release_file(edge_url, manifest, &file, &tarball).await?;
+    download_release_file(edge_url, access_token, manifest, &file, &tarball).await?;
     run(
         "tar",
         &[
@@ -501,6 +508,9 @@ fn auto_update_enabled() -> bool {
 /// "Nothing would be interrupted by a restart right now" — wired by the engine
 /// to its live-run and open-terminal registries. `None` = no gate.
 pub type QuiescentCheck = Arc<dyn Fn() -> bool + Send + Sync>;
+/// Resolves the current Comet login bearer for each release request, allowing
+/// the credential to rotate without rebuilding the updater.
+pub type AccessTokenSource = Arc<dyn Fn() -> BoxFuture<'static, Option<String>> + Send + Sync>;
 
 /// Background release checker: polls `{edge}/releases` on a 6h cadence and
 /// publishes [`UpdateStatus`] over a watch channel (the `UpdateStatus` RPC
@@ -510,18 +520,27 @@ pub type QuiescentCheck = Arc<dyn Fn() -> bool + Send + Sync>;
 #[derive(Clone)]
 pub struct Updater {
     edge_url: String,
+    data_dir: PathBuf,
     status_tx: Arc<watch::Sender<UpdateStatus>>,
     quiescent: Option<QuiescentCheck>,
+    access_token: AccessTokenSource,
 }
 
 impl Updater {
     /// Spawn the check loop (must run on a tokio runtime).
-    pub fn spawn(edge_url: String, quiescent: Option<QuiescentCheck>) -> Self {
+    pub fn spawn(
+        edge_url: String,
+        data_dir: PathBuf,
+        quiescent: Option<QuiescentCheck>,
+        access_token: AccessTokenSource,
+    ) -> Self {
         let (status_tx, _) = watch::channel(UpdateStatus::initial());
         let updater = Self {
             edge_url,
+            data_dir,
             status_tx: Arc::new(status_tx),
             quiescent,
+            access_token,
         };
         let for_loop = updater.clone();
         tokio::spawn(async move { for_loop.check_loop().await });
@@ -536,14 +555,20 @@ impl Updater {
         self.quiescent.as_ref().is_none_or(|check| check())
     }
 
+    async fn current_access_token(&self) -> Option<String> {
+        (self.access_token)().await
+    }
+
     async fn check_loop(&self) {
         tokio::time::sleep(CHECK_INITIAL_DELAY).await;
         loop {
             let ok = self.check_once().await;
-            if ok && self.status_tx.borrow().update_available && auto_update_enabled() {
-                if let InstallKind::Managed { .. } = detect_install() {
-                    self.auto_apply_when_idle().await;
-                }
+            if ok
+                && self.status_tx.borrow().update_available
+                && auto_update_enabled()
+                && let InstallKind::Managed { .. } = detect_install()
+            {
+                self.auto_apply_when_idle().await;
             }
             tokio::time::sleep(if ok { CHECK_INTERVAL } else { CHECK_RETRY }).await;
         }
@@ -556,9 +581,18 @@ impl Updater {
     /// idle→restart gap to well under a second.
     async fn auto_apply_when_idle(&self) {
         if let InstallKind::Managed { app_root } = detect_install() {
-            match fetch_latest(&self.edge_url).await {
+            let manifest_token = self.current_access_token().await;
+            match fetch_latest(&self.edge_url, manifest_token.as_deref()).await {
                 Ok(manifest) if version_newer(&manifest.version, current_version()) => {
-                    if let Err(err) = stage_headless(&self.edge_url, &manifest, &app_root).await {
+                    let artifact_token = self.current_access_token().await;
+                    if let Err(err) = stage_headless(
+                        &self.edge_url,
+                        artifact_token.as_deref(),
+                        &manifest,
+                        &app_root,
+                    )
+                    .await
+                    {
                         tracing::warn!(error = %err, "auto-update staging failed");
                         return;
                     }
@@ -588,7 +622,8 @@ impl Updater {
 
     /// One check; returns false on fetch failure (retry sooner).
     async fn check_once(&self) -> bool {
-        match fetch_latest(&self.edge_url).await {
+        let access_token = self.current_access_token().await;
+        match fetch_latest(&self.edge_url, access_token.as_deref()).await {
             Ok(manifest) => {
                 let status = UpdateStatus {
                     current_version: current_version().to_string(),
@@ -626,11 +661,19 @@ impl Updater {
                  source builds update via git"
             );
         };
-        let manifest = fetch_latest(&self.edge_url).await?;
+        let manifest_token = self.current_access_token().await;
+        let manifest = fetch_latest(&self.edge_url, manifest_token.as_deref()).await?;
         if !version_newer(&manifest.version, current_version()) {
             bail!("already up to date ({})", current_version());
         }
-        stage_headless(&self.edge_url, &manifest, &app_root).await?;
+        let artifact_token = self.current_access_token().await;
+        stage_headless(
+            &self.edge_url,
+            artifact_token.as_deref(),
+            &manifest,
+            &app_root,
+        )
+        .await?;
         apply_headless(&app_root, &manifest.version)?;
         tokio::spawn(async {
             tokio::time::sleep(std::time::Duration::from_millis(800)).await;
@@ -639,6 +682,23 @@ impl Updater {
             }
         });
         Ok(manifest.version)
+    }
+
+    /// Download and verify a macOS app update through the authenticated edge.
+    pub async fn stage_mac_update(&self) -> anyhow::Result<PathBuf> {
+        let manifest_token = self.current_access_token().await;
+        let manifest = fetch_latest(&self.edge_url, manifest_token.as_deref()).await?;
+        if !version_newer(&manifest.version, current_version()) {
+            bail!("already up to date ({})", current_version());
+        }
+        let artifact_token = self.current_access_token().await;
+        stage_mac_app(
+            &self.edge_url,
+            artifact_token.as_deref(),
+            &manifest,
+            &self.data_dir,
+        )
+        .await
     }
 }
 
@@ -665,6 +725,20 @@ mod tests {
         // Garbage never counts as newer.
         assert!(!version_newer("", "0.1.0"));
         assert!(!version_newer("nightly", "0.1.0"));
+    }
+
+    #[test]
+    fn release_feed_is_derived_from_exact_edge_origin() {
+        assert_eq!(
+            releases_base("https://comet.internal.ashler.com").unwrap(),
+            "https://comet.internal.ashler.com/api/releases"
+        );
+        assert!(releases_base("http://comet.internal.ashler.com").is_err());
+        assert!(releases_base("https://comet.internal.ashler.com/other").is_err());
+        assert_eq!(
+            releases_base("http://127.0.0.1:8787").unwrap(),
+            "http://127.0.0.1:8787/api/releases"
+        );
     }
 
     #[test]
@@ -713,20 +787,17 @@ mod tests {
     }
 
     #[test]
-    fn manifest_parses_with_and_without_files() {
+    fn manifest_requires_file_checksums() {
         let full: Manifest = serde_json::from_str(
             r#"{"version":"0.1.1","files":{"comet-0.1.1-linux-x86_64.tar.gz":{"sha256":"abc"}}}"#,
         )
         .unwrap();
         assert_eq!(full.version, "0.1.1");
-        assert_eq!(
-            full.files["comet-0.1.1-linux-x86_64.tar.gz"]
-                .sha256
-                .as_deref(),
-            Some("abc")
+        assert_eq!(full.files["comet-0.1.1-linux-x86_64.tar.gz"].sha256, "abc");
+        assert!(
+            serde_json::from_str::<Manifest>(r#"{"version":"0.1.1","files":{"comet.tar.gz":{}}}"#)
+                .is_err()
         );
-        let bare: Manifest = serde_json::from_str(r#"{"version":"0.1.1"}"#).unwrap();
-        assert!(bare.files.is_empty());
     }
 
     #[cfg(unix)]

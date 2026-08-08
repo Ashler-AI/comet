@@ -5,8 +5,8 @@
 //! is saved debounced from its own boot-time copy, so the composer keeps its
 //! own file rather than racing it): last harness, last model per harness
 //! (id + label, so the chip names the pick before the model list loads),
-//! and last reasoning level. Written synchronously on every pick (picks are
-//! rare); corrupt or missing files fall back to defaults.
+//! last reasoning level, and whether the next session should use the current
+//! checkout or a fresh worktree. Written synchronously on every pick.
 
 use std::collections::HashMap;
 use std::io;
@@ -37,6 +37,9 @@ pub struct ComposerDefaults {
     pub model_by_harness: HashMap<HarnessId, RememberedModel>,
     /// Last reasoning level picked (global, like comet's `reasoning` key).
     pub reasoning: Option<ReasoningLevel>,
+    /// Whether the last new-session draft used a fresh isolated worktree.
+    /// Missing in older files means the current checkout.
+    pub new_worktree: bool,
     /// Every model label ever seen (id → label), fed from catalog loads.
     /// The chip's fallback while a harness's list is still loading — a
     /// session whose configured model differs from the remembered pick
@@ -118,6 +121,7 @@ mod tests {
         let mut defaults = ComposerDefaults {
             harness: Some(HarnessId::ClaudeCode),
             reasoning: Some(ReasoningLevel::XHigh),
+            new_worktree: true,
             ..Default::default()
         };
         defaults.remember_model(
@@ -133,6 +137,15 @@ mod tests {
             loaded.model_for(HarnessId::ClaudeCode).map(|m| &*m.label),
             Some("Fable 5")
         );
+    }
+
+    #[test]
+    fn older_defaults_keep_current_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(ComposerDefaults::path(dir.path()), r#"{"harness":"codex"}"#).unwrap();
+        let loaded = ComposerDefaults::load(dir.path());
+        assert_eq!(loaded.harness, Some(HarnessId::Codex));
+        assert!(!loaded.new_worktree);
     }
 
     #[test]

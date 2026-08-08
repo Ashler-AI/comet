@@ -412,9 +412,8 @@ impl Theme {
     /// a method rather than a constant because it has to be *re-applied* after
     /// every theme swap: gpui's macOS backend tears the `NSVisualEffectView`
     /// out of the hierarchy whenever the value is anything but `Blurred`, and
-    /// the re-apply in `appearance::apply` is what restores vibrancy when the
-    /// user switches back to dark. See zed's `crates/zed/src/main.rs`, which
-    /// runs the same loop on every settings change.
+    /// the re-apply in `appearance::apply` restores vibrancy when the user
+    /// switches back to dark.
     pub fn window_background_appearance(&self) -> gpui::WindowBackgroundAppearance {
         if self.is_glass() {
             gpui::WindowBackgroundAppearance::Blurred

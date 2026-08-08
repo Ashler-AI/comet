@@ -68,6 +68,7 @@ fn controls(
         }),
         steering: steer_rx,
         interrupt: token.clone(),
+        context: None,
     };
     (controls, steer_tx, token)
 }
@@ -145,7 +146,8 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
     }));
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "c1".into(),
-        is_error: true
+        is_error: true,
+        output: None,
     }));
 
     // fileChange (single add): WriteFile, refreshed at completion.
@@ -165,7 +167,8 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
     );
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "f1".into(),
-        is_error: false
+        is_error: false,
+        output: None,
     }));
 
     // mcpToolCall with failed status.
@@ -179,7 +182,8 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
     }));
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "mcp1".into(),
-        is_error: true
+        is_error: true,
+        output: None,
     }));
 
     // webSearch lifecycle.
@@ -191,7 +195,8 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
     }));
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "w1".into(),
-        is_error: false
+        is_error: false,
+        output: None,
     }));
 
     // Completion-only todoList still opens and closes the lifecycle.
@@ -212,7 +217,8 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
     }));
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "td1".into(),
-        is_error: false
+        is_error: false,
+        output: None,
     }));
 
     // Streamed agentMessage must not re-emit its completed text…
@@ -369,7 +375,12 @@ async fn approvals_round_trip_as_input_requests() {
                 .iter()
                 .map(|q| UserInputAnswer {
                     question_id: q.id.clone(),
-                    labels: vec!["Yes".into()],
+                    labels: vec![
+                        q.options
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "typed answer".into()),
+                    ],
                 })
                 .collect();
             let _ = tx.send(answers);
@@ -377,18 +388,21 @@ async fn approvals_round_trip_as_input_requests() {
         }),
         steering: steer_rx,
         interrupt: token.clone(),
+        context: None,
     };
-    let mut req = request("scenario:approve");
-    req.auto_approve = false;
-    let events = run_to_end(&harness(), req, controls).await;
+    let events = run_to_end(&harness(), request("scenario:approve"), controls).await;
 
     let asked = asked.lock().unwrap();
-    assert_eq!(asked.len(), 2, "{events:?}");
+    assert_eq!(asked.len(), 5, "{events:?}");
     assert_eq!(asked[0].header, "Approve command");
     assert!(asked[0].question.contains("rm -rf /tmp/x"));
     assert_eq!(asked[0].options, vec!["Yes".to_string(), "No".to_string()]);
     assert_eq!(asked[1].header, "Approve file change");
     assert!(asked[1].question.contains("/tmp/a.rs"));
+    assert_eq!(asked[2].header, "Grant access");
+    assert!(asked[2].question.contains("Connect to the provider"));
+    assert_eq!(asked[3].header, "Safety check");
+    assert_eq!(asked[4].header, "Region");
     assert!(
         !events.iter().any(|e| matches!(
             e,

@@ -18,7 +18,7 @@ final class DemoDataset {
 
     private static let dummyConfig = AppConfig(
         edgeURL: URL(string: "http://localhost:8787")!, mode: .dev,
-        userId: "demo", orgId: "demo", deviceId: "ios-demo", deviceName: "iPhone")
+        userId: "demo", projectScope: "demo", deviceId: "ios-demo", deviceName: "iPhone")
 
     init(devices: [DeviceRow], spaces: [Space], chats: [Chat], sessions: [String: SessionRow]) {
         self.devices = devices

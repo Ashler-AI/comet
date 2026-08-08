@@ -24,9 +24,9 @@ mod server;
 
 pub use client::{RpcClient, connect_ws};
 pub use device_room::{
-    DeviceFrameHeader, DeviceLink, HostRelay, HostRelayConfig, LinkCache, LinkCacheConfig,
-    NudgeHandler, StaticToken, TokenSource, decode_device_frame, device_room_ws_url,
-    encode_device_frame,
+    DeviceFrameHeader, DeviceLink, GRANT_KIND, GrantHandler, GrantResetHandler, HostRelay,
+    HostRelayConfig, LinkCache, LinkCacheConfig, NudgeHandler, StaticToken, TokenSource,
+    decode_device_frame, device_room_ws_url, encode_device_frame,
 };
 pub use server::{serve_connection, serve_ws_listener};
 
@@ -35,8 +35,19 @@ pub use server::{serve_connection, serve_ws_listener};
 pub mod methods {
     pub const LIST_HARNESSES: &str = "ListHarnesses";
     pub const LIST_MODELS: &str = "ListModels";
+    pub const LIST_HARNESS_COMMANDS: &str = "ListHarnessCommands";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
+    pub const SEND_PEER_MESSAGE: &str = "SendPeerMessage";
+    pub const REPLY_PEER_MESSAGE: &str = "ReplyPeerMessage";
+    pub const WAIT_PEER_REPLY: &str = "WaitPeerReply";
+    /// Metadata-only harness-native session candidates stored on this device.
+    pub const LIST_LOCAL_SESSIONS: &str = "ListLocalSessions";
+    /// Re-resolve and import one local candidate into a Comet chat.
+    pub const ATTACH_LOCAL_SESSION: &str = "AttachLocalSession";
+    /// Capture exact bytes for a discovered OMP native session. Local-controller
+    /// only; the opaque candidate id is re-resolved server-side.
+    pub const CAPTURE_OMP_SESSION_ARTIFACT: &str = "CaptureOmpSessionArtifact";
     /// Nudge every open room client to verify liveness NOW (window focus,
     /// app foregrounded). No params; IPC-only. Each room ignores the hint
     /// unless it has been broadcast-quiet ≥30s, so this is cheap to spam.
@@ -51,6 +62,16 @@ pub mod methods {
     pub const WATCH_SESSIONS: &str = "WatchSessions";
     /// Spaces registry (device+folder pairs) from the workspace doc.
     pub const WATCH_SPACES: &str = "WatchSpaces";
+    /// Workspace-local pointers to exact-id global session rooms.
+    pub const WATCH_SESSION_REFS: &str = "WatchSessionRefs";
+    pub const ADD_SESSION_REF: &str = "AddSessionRef";
+    pub const REMOVE_SESSION_REF: &str = "RemoveSessionRef";
+    /// Current native Scaffold environment snapshot and event-driven updates.
+    pub const WATCH_SCAFFOLD_ENVIRONMENTS: &str = "WatchScaffoldEnvironments";
+    /// Explicitly refresh Scaffold environments; no native polling loop is started.
+    pub const REFRESH_SCAFFOLD_ENVIRONMENTS: &str = "RefreshScaffoldEnvironments";
+    /// Inspect/create/pause/resume/stop/attach a typed Scaffold environment.
+    pub const CONTROL_SCAFFOLD_ENVIRONMENT: &str = "ControlScaffoldEnvironment";
     /// Entity mutations against the workspace doc (feature-inventory §2 DataRpc).
     /// Params are tagged `{op: createChat|createSpace|renameSpace|deleteSpace|
     /// renameChat|setChatArchived|deleteChat|renameDevice|markChatSeen, …}`.
@@ -64,9 +85,6 @@ pub mod methods {
     pub const SIGN_IN_HEADLESS: &str = "SignInHeadless";
     pub const COMPLETE_SIGN_IN: &str = "CompleteSignIn";
     pub const SIGN_OUT: &str = "SignOut";
-    pub const LIST_ORGS: &str = "ListOrgs";
-    pub const CREATE_ORG: &str = "CreateOrg";
-    pub const SELECT_ORG: &str = "SelectOrg";
     // Repos / worktrees / folders (ControlRpc, relay-forwardable).
     pub const LIST_REPOS: &str = "ListRepos";
     pub const ADD_REPO: &str = "AddRepo";
@@ -97,16 +115,97 @@ pub mod methods {
     pub const COMPLETE_AGENT_LOGIN: &str = "CompleteAgentLogin";
     pub const POLL_AGENT_LOGIN: &str = "PollAgentLogin";
     pub const CANCEL_AGENT_LOGIN: &str = "CancelAgentLogin";
+    /// Read and update OMP's device-local advisor settings.
+    pub const GET_OMP_ADVISOR_CONFIG: &str = "GetOmpAdvisorConfig";
+    pub const SET_OMP_ADVISOR_CONFIG: &str = "SetOmpAdvisorConfig";
     // Uploads / attachments (ControlRpc, relay-forwardable — target the chat's host device).
     pub const UPLOAD_CHUNK: &str = "UploadChunk";
     pub const UPLOAD_COMMIT: &str = "UploadCommit";
     pub const READ_ATTACHMENT_CHUNK: &str = "ReadAttachmentChunk";
+    /// One tool invocation's full input/output from the target device's run
+    /// journal (the doc keeps only the sanitized chip line).
+    pub const TOOL_CALL_DETAIL: &str = "ToolCallDetail";
     // Updates (ControlRpc, relay-forwardable — a device reports/applies its own
     // binary's update). Stream: current UpdateStatus, then every change.
     pub const UPDATE_STATUS: &str = "UpdateStatus";
     /// Download + apply the newest release on the target device (symlink-managed
     /// installs; the service restart is scheduled after the reply flushes).
     pub const APPLY_UPDATE: &str = "ApplyUpdate";
+    /// Download and verify the newest macOS app bundle on the target device.
+    pub const STAGE_UPDATE: &str = "StageUpdate";
+}
+
+/// Shared parameters for `AddSessionRef` and `RemoveSessionRef`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRefParams {
+    pub chat_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveSessionRefResult {
+    pub removed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendPeerMessageParams {
+    pub source_chat_id: String,
+    pub target_chat_id: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_id: Option<String>,
+    #[serde(default)]
+    pub wait: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplyPeerMessageParams {
+    pub session_id: String,
+    pub command_id: String,
+    pub text: String,
+    #[serde(default)]
+    pub wait: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WaitPeerReplyParams {
+    pub source_chat_id: String,
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerReplyResult {
+    pub command_id: String,
+    pub text: String,
+    pub source_chat_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerMessageResult {
+    pub command_id: String,
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<PeerReplyResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerWaitResult {
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<PeerReplyResult>,
 }
 
 #[derive(Debug, thiserror::Error)]

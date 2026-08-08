@@ -1,9 +1,8 @@
 /**
  * SessionRoom — one Durable Object per doc room, speaking loro-protocol over
- * hibernatable WebSockets (design §2, §3.1). Two doc kinds share this class:
- * chat session docs (room name = chatId, claim-on-first-join ownership) and
- * workspace docs (room name = `ws/{orgId}`, org-membership authz enforced by
- * the Worker — the DO sees the ROOM_KIND_HEADER stamp and skips ownership).
+ * hibernatable WebSockets (design §2, §3.1). Chat and workspace documents use
+ * deterministic room names derived from the verified Scaffold scope; the DO binds
+ * the scope on first use and rejects cross-scope access.
  *
  * Persistence model:
  * - `updates` — append-only incoming update log, buffered in memory during
@@ -48,7 +47,48 @@ import {
   materializeTail
 } from "./session-doc";
 import { createBlobStore, getJsonBlob, putJsonBlob, type BlobStore } from "./blobs";
-import { AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
+import {
+  AUTH_GRANT_HEADER,
+  AUTH_USER_HEADER,
+  GRANT_EVENT_HEADER,
+  ROOM_KIND_HEADER,
+  SESSION_OWNER_AUTH_HEADER,
+  type Env
+} from "./env";
+import { parseTrustedDeviceGrant } from "./device-room";
+
+const AUTH_PROJECT_HEADER = "x-comet-auth-project";
+const AUTH_CAPABILITIES_HEADER = "x-comet-auth-capabilities";
+const SESSION_READ = "session.read";
+const GRANT_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+const PUBLISH_CAPABILITIES: Record<string, true> = {
+  "session.chat": true,
+  "session.control": true,
+  "session.annotate": true,
+  "session.files": true
+};
+const parseCapabilities = (request: Request): string[] =>
+  (request.headers.get(AUTH_CAPABILITIES_HEADER) ?? "").split(/\s+/).filter(Boolean);
+const canPublish = (capabilities: readonly string[]): boolean =>
+  capabilities.some((capability) => PUBLISH_CAPABILITIES[capability] === true);
+
+const SESSION_OWNER_AUTH_VALUE = "verify";
+
+export const sessionOwnerForConnection = (
+  currentOwnerUserId: string | undefined,
+  userId: string,
+  workspace: boolean,
+  device: boolean
+): string | undefined =>
+  currentOwnerUserId ?? (!workspace && !device ? userId : undefined);
+
+const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** The sole name accepted for a globally shared session room. */
+export const canonicalSessionId = (value: string | undefined): string | undefined => {
+  if (!value || !SESSION_ID_RE.test(value)) return undefined;
+  return value.toLowerCase();
+};
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RETAIN_MS = RETAIN_DAYS * DAY_MS;
@@ -57,6 +97,54 @@ const RETAIN_MS = RETAIN_DAYS * DAY_MS;
 const REPLAY_CRASH_LIMIT = 3;
 /** Payload bytes per outbound fragment (leaves room for the envelope). */
 const FRAGMENT_BYTES = 200_000;
+const MAX_PRESENCE_UPDATE_BYTES = 16 * 1024;
+
+/** Validates the typed JSON carried inside a Loro ephemeral participant value. */
+export const isValidParticipantCursor = (cursor: unknown, text?: string): boolean => {
+  if (!cursor || typeof cursor !== "object") return false;
+  const value = cursor as Record<string, unknown>;
+  if (
+    typeof value.targetId !== "string" ||
+    value.targetId.length === 0 ||
+    new TextEncoder().encode(value.targetId).length > 256 ||
+    !Number.isSafeInteger(value.caret) ||
+    (value.caret as number) < 0 ||
+    (value.caret as number) > 16 * 1024 * 1024
+  ) {
+    return false;
+  }
+  let start = value.caret as number;
+  let end = start;
+  if (value.selection !== undefined) {
+    if (!value.selection || typeof value.selection !== "object") return false;
+    const selection = value.selection as Record<string, unknown>;
+    if (
+      !Number.isSafeInteger(selection.start) ||
+      !Number.isSafeInteger(selection.end) ||
+      (selection.start as number) < 0 ||
+      (selection.start as number) > (selection.end as number) ||
+      (selection.end as number) > 16 * 1024 * 1024 ||
+      (value.caret as number) < (selection.start as number) ||
+      (value.caret as number) > (selection.end as number)
+    ) {
+      return false;
+    }
+    start = selection.start as number;
+    end = selection.end as number;
+  }
+  if (text === undefined) return true;
+  const bytes = new TextEncoder().encode(text);
+  if (end > bytes.length) return false;
+  try {
+    const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
+    decoder.decode(bytes.slice(0, start));
+    decoder.decode(bytes.slice(0, value.caret as number));
+    decoder.decode(bytes.slice(0, end));
+  } catch {
+    return false;
+  }
+  return true;
+};
 /** Keep a rolling ~5 weeks of daily frontier checkpoints. */
 const MAX_CHECKPOINTS = 36;
 /** Isolate-wide poisoned-wasm strike counter — MODULE state on purpose: every
@@ -88,12 +176,54 @@ const DOC_IDLE_RELEASE_MS = 60_000;
  * the pressed wasm heap for three more days of thrash. */
 const TRIM_FORCE_BYTES = 512 * 1024;
 
-interface SocketState {
+export interface SocketGrantState {
+  grantId?: string;
+  grantExpiresAt?: number;
+}
+
+export const enforceDeviceGrantAuthority = async (
+  ws: Pick<WebSocket, "close">,
+  state: SocketGrantState | null,
+  now: number,
+  validate: (grantId: string) => Promise<boolean>
+): Promise<boolean> => {
+  const grantId = state?.grantId;
+  const grantExpiresAt = state?.grantExpiresAt;
+  const hasGrantState = grantId !== undefined || grantExpiresAt !== undefined;
+  let valid = state !== null;
+  if (valid && hasGrantState) {
+    if (
+      typeof grantId !== "string" ||
+      !GRANT_ID_RE.test(grantId) ||
+      typeof grantExpiresAt !== "number" ||
+      !Number.isSafeInteger(grantExpiresAt) ||
+      grantExpiresAt <= now
+    ) {
+      valid = false;
+    } else {
+      try {
+        valid = (await validate(grantId)) === true;
+      } catch {
+        valid = false;
+      }
+    }
+  }
+  if (valid) return true;
+  try {
+    ws.close(4403, "device grant invalid");
+  } catch {
+    /* already gone */
+  }
+  return false;
+};
+
+interface SocketState extends SocketGrantState {
   userId: string;
+  projectScope: string;
+  capabilities: string[];
   /** Joined sub-rooms by crdt magic ("%LOR", "%EPH"). */
   rooms: string[];
-  /** True for sockets on a workspace-doc room — org membership was enforced
-   * by the Worker, so the per-chat ownership discipline does not apply. */
+  /** True for sockets on a project-workspace document. */
   workspace?: boolean;
   /** Dialing engine's device id (from `&device=`, Worker-validated) — pure
    * log attribution; never used for authz. */
@@ -125,6 +255,9 @@ export class SessionRoom implements DurableObject {
   /** In-memory fragment reassembly. Lost on hibernation → the sender gets a
    * FragmentTimeout ack for the unknown batch and resends — self-healing. */
   private readonly fragments = new Map<WebSocket, Map<string, FragmentBatch>>();
+  /** Revocations delivered while this instance is live close the TOCTOU gap
+   * between an authority response and a handler's final mutation/send. */
+  private readonly revokedGrants = new Set<string>();
   /** Idle-doc release bookkeeping (see DOC_IDLE_RELEASE_MS / touchDoc). */
   private docIdleTimer: ReturnType<typeof setTimeout> | undefined;
   private lastDocUse = 0;
@@ -168,25 +301,106 @@ export class SessionRoom implements DurableObject {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    if (url.pathname === "/grant-revoked" && request.method === "POST") {
+      if (request.headers.get(GRANT_EVENT_HEADER) !== "revoke") {
+        return new Response("forbidden", { status: 403 });
+      }
+      let body: unknown;
+      try {
+        body = await request.json();
+      } catch {
+        return new Response("invalid request", { status: 400 });
+      }
+      if (
+        !body ||
+        typeof body !== "object" ||
+        !("grantId" in body) ||
+        typeof body.grantId !== "string" ||
+        !GRANT_ID_RE.test(body.grantId)
+      ) {
+        return new Response("invalid request", { status: 400 });
+      }
+      await this.revokeGrant(body.grantId);
+      return new Response(null, { status: 204 });
+    }
+    if (url.pathname === "/authorize-owner") {
+      if (request.headers.get(SESSION_OWNER_AUTH_HEADER) !== SESSION_OWNER_AUTH_VALUE) {
+        return new Response("forbidden", { status: 403 });
+      }
+      if (request.method !== "GET") {
+        return new Response("method not allowed", { status: 405 });
+      }
+      const candidateUserId = request.headers.get(AUTH_USER_HEADER);
+      const candidateProjectScope = request.headers.get(AUTH_PROJECT_HEADER);
+      if (!candidateUserId || !candidateProjectScope) {
+        return new Response("unauthenticated", { status: 401 });
+      }
+      const ownsSession =
+        this.getMeta("projectScope") === candidateProjectScope &&
+        this.getMeta("ownerUserId") === candidateUserId;
+      return json({ ownsSession });
+    }
     const userId = request.headers.get(AUTH_USER_HEADER);
     if (!userId) return new Response("unauthenticated", { status: 401 });
-    // Workspace rooms: the Worker already checked org membership; every
-    // member may read/write, so the owner gates below are bypassed.
+    const projectScope = request.headers.get(AUTH_PROJECT_HEADER);
+    const capabilities = parseCapabilities(request);
+    if (!projectScope || !capabilities.includes(SESSION_READ)) {
+      return new Response("forbidden", { status: 403 });
+    }
+    const boundScope = this.getMeta("projectScope");
+    if (!boundScope) this.setMeta("projectScope", projectScope);
+    else if (boundScope !== projectScope) return new Response("forbidden", { status: 403 });
+    // Workspace routing was scope-checked by the Worker; this DO independently
+    // binds the same verified project scope above.
     const workspace = request.headers.get(ROOM_KIND_HEADER) === "workspace";
 
     if (url.pathname === "/ws") {
       const chatId = url.searchParams.get("chatId") ?? "";
+      const encodedGrant = request.headers.get(AUTH_GRANT_HEADER);
+      const grant =
+        encodedGrant === null
+          ? undefined
+          : parseTrustedDeviceGrant(encodedGrant, userId, projectScope, Date.now());
+      if (encodedGrant !== null && (!grant || grant.scope.sessionId !== chatId)) {
+        return new Response("forbidden", { status: 403 });
+      }
+      if (grant) {
+        const boundDeploymentId = this.getMeta("deploymentId");
+        const boundSessionId = this.getMeta("scopedSessionId");
+        if (
+          (boundDeploymentId && boundDeploymentId !== grant.scope.deploymentId) ||
+          (boundSessionId && boundSessionId !== grant.scope.sessionId)
+        ) {
+          return new Response("forbidden", { status: 403 });
+        }
+        if (!boundDeploymentId) this.setMeta("deploymentId", grant.scope.deploymentId);
+        if (!boundSessionId) this.setMeta("scopedSessionId", grant.scope.sessionId);
+      }
+      const currentOwnerUserId = this.getMeta("ownerUserId");
+      const ownerUserId = sessionOwnerForConnection(
+        currentOwnerUserId,
+        userId,
+        workspace,
+        grant !== undefined
+      );
+      if (!currentOwnerUserId && ownerUserId) this.setMeta("ownerUserId", ownerUserId);
       if (chatId && !this.getMeta("chatId")) this.setMeta("chatId", chatId);
       const deviceId = url.searchParams.get("device") ?? undefined;
       const pair = new WebSocketPair();
       this.ctx.acceptWebSocket(pair[1]);
       const state: SocketState = {
         userId,
+        projectScope,
+        capabilities,
         rooms: [],
         ...(workspace ? { workspace } : {}),
-        ...(deviceId ? { deviceId } : {})
+        ...(deviceId ? { deviceId } : {}),
+        ...(grant
+          ? { grantId: grant.grantId, grantExpiresAt: grant.expiresAt }
+          : {})
       };
       pair[1].serializeAttachment(state);
+      await this.scheduleGrantExpiryAlarm();
       console.log(
         "socket accepted",
         `room=${this.getMeta("chatId") ?? "?"}`,
@@ -197,12 +411,13 @@ export class SessionRoom implements DurableObject {
     }
 
     const owner = this.getMeta("owner");
+
     if (url.pathname === "/stats" && request.method === "GET") {
       // Observability: what this room holds and who's on it. Owner-gated like
       // every other read (org-membership-gated for workspace rooms).
       if (!workspace) {
         if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
+        if (owner !== projectScope) return json({ error: "forbidden" }, 403);
       }
       await this.flush();
       const updateRows = [...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM updates")][0]
@@ -234,23 +449,26 @@ export class SessionRoom implements DurableObject {
     if (url.pathname === "/tail" && request.method === "GET") {
       if (!workspace) {
         if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
+        if (owner !== projectScope) return json({ error: "forbidden" }, 403);
       }
       return json(await this.currentTail());
     }
     if (url.pathname === "/diff" && request.method === "GET") {
       if (!workspace) {
         if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
+        if (owner !== projectScope) return json({ error: "forbidden" }, 403);
       }
       const diff = getJsonBlob<unknown>(this.blobs, "diff");
       return diff === undefined ? json({ error: "not_found" }, 404) : json(diff);
     }
     if (url.pathname === "/diff" && request.method === "POST") {
+      if (!capabilities.includes("session.files")) {
+        return json({ error: "forbidden" }, 403);
+      }
       // The host may publish before any room join has claimed the doc.
       if (!workspace) {
-        if (!owner) this.setMeta("owner", userId);
-        else if (owner !== userId) return json({ error: "forbidden" }, 403);
+        if (!owner) this.setMeta("owner", projectScope);
+        else if (owner !== projectScope) return json({ error: "forbidden" }, 403);
       }
       putJsonBlob(this.blobs, "diff", await request.json());
       return json({ ok: true });
@@ -259,7 +477,7 @@ export class SessionRoom implements DurableObject {
       // Repair/inspection read: the doc's full current snapshot bytes.
       if (!workspace) {
         if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
+        if (owner !== projectScope) return json({ error: "forbidden" }, 403);
       }
       await this.flush();
       const doc = await this.ensureDoc();
@@ -269,11 +487,14 @@ export class SessionRoom implements DurableObject {
       });
     }
     if (url.pathname === "/append" && request.method === "POST") {
+      if (!capabilities.includes("session.chat")) {
+        return json({ error: "forbidden" }, 403);
+      }
       // MERGE-safe repair write: import a Loro update (never replaces the
       // doc). Same durability bookkeeping as a WS DocUpdate.
       if (!workspace) {
         if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
+        if (owner !== projectScope) return json({ error: "forbidden" }, 403);
       }
       const body = new Uint8Array(await request.arrayBuffer());
       const doc = await this.ensureDoc();
@@ -288,11 +509,15 @@ export class SessionRoom implements DurableObject {
       for (const ws of this.ctx.getWebSockets()) {
         const state = ws.deserializeAttachment() as SocketState | null;
         if (!state?.rooms.includes(CrdtType.Loro)) continue;
+        if (!(await this.authorizeSocket(ws, state))) continue;
         this.sendUpdates(ws, CrdtType.Loro, roomId, [body]);
       }
       return json({ ok: true });
     }
     if (url.pathname === "/reset-log" && request.method === "POST") {
+      if (!capabilities.includes("session.control")) {
+        return json({ error: "forbidden" }, 403);
+      }
       // WEDGE BREAK: drop the persisted update log + snapshot so the NEXT cold
       // `ensureDoc` starts from empty instead of replaying a log so large it
       // exceeds the DO CPU limit and resets before any client can join (which
@@ -304,7 +529,7 @@ export class SessionRoom implements DurableObject {
       // is ephemeral and simply re-published. Owner/chatId meta are preserved.
       if (!workspace) {
         if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
+        if (owner !== projectScope) return json({ error: "forbidden" }, 403);
       }
       const before = [...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM updates")][0]?.n as
         | number
@@ -328,8 +553,42 @@ export class SessionRoom implements DurableObject {
 
   // ── WebSocket protocol ────────────────────────────────────────────────────
 
+  async revokeGrant(grantId: string): Promise<void> {
+    this.revokedGrants.add(grantId);
+    for (const ws of this.ctx.getWebSockets()) {
+      const state = ws.deserializeAttachment() as SocketState | null;
+      if (state?.grantId !== grantId) continue;
+      try {
+        ws.close(4403, "device grant revoked");
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+
+  private async authorizeSocket(
+    ws: WebSocket,
+    state: SocketState | null
+  ): Promise<boolean> {
+    return enforceDeviceGrantAuthority(ws, state, Date.now(), async (grantId) => {
+      if (this.revokedGrants.has(grantId)) return false;
+      const stub = this.env.AUTH_GRANTS.get(
+        this.env.AUTH_GRANTS.idFromName(grantId)
+      );
+      const response = await stub.fetch(
+        new Request(`https://grant.internal/status?grantId=${encodeURIComponent(grantId)}`, {
+          headers: { [GRANT_EVENT_HEADER]: "status" }
+        })
+      );
+      return response.ok && !this.revokedGrants.has(grantId);
+    });
+  }
+
   async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): Promise<void> {
+    const attached = ws.deserializeAttachment() as SocketState | null;
+    if (!(await this.authorizeSocket(ws, attached))) return;
     if (typeof message === "string") return; // ping/pong handled by auto-response
+    const state = attached as SocketState;
     let decoded: ProtocolMessage;
     try {
       decoded = decode(new Uint8Array(message));
@@ -337,7 +596,6 @@ export class SessionRoom implements DurableObject {
       ws.close(1002, "Protocol error");
       return;
     }
-    const state = ws.deserializeAttachment() as SocketState;
     try {
       switch (decoded.type) {
         case MessageType.JoinRequest:
@@ -445,25 +703,24 @@ export class SessionRoom implements DurableObject {
   }
 
   private async handleJoin(ws: WebSocket, state: SocketState, message: JoinRequest): Promise<void> {
-    if (!state.workspace) {
-      // Chat rooms: claim-on-first-join ownership, then owner-only forever.
-      const owner = this.getMeta("owner");
-      if (!owner) this.setMeta("owner", state.userId);
-      else if (owner !== state.userId) {
-        this.send(ws, {
-          type: MessageType.JoinError,
-          crdt: message.crdt,
-          roomId: message.roomId,
-          code: JoinErrorCode.AuthFailed,
-          message: "not the room owner"
-        });
-        return;
-      }
+    // The room is bound to verified control-plane scope, not one user's identity.
+    const owner = this.getMeta("owner");
+    if (!owner) this.setMeta("owner", state.projectScope);
+    else if (owner !== state.projectScope) {
+      this.send(ws, {
+        type: MessageType.JoinError,
+        crdt: message.crdt,
+        roomId: message.roomId,
+        code: JoinErrorCode.AuthFailed,
+        message: "scope does not own this room"
+      });
+      return;
     }
     if (!this.getMeta("chatId") && message.roomId) this.setMeta("chatId", message.roomId);
 
     if (message.crdt === CrdtType.Loro) {
       const doc = await this.ensureDoc();
+      if (!(await this.authorizeSocket(ws, state))) return;
       if (!state.rooms.includes(message.crdt)) state.rooms.push(message.crdt);
       ws.serializeAttachment(state);
       // Wasm-bindgen objects (VersionVector here and below) free their wasm
@@ -477,7 +734,7 @@ export class SessionRoom implements DurableObject {
           type: MessageType.JoinResponseOk,
           crdt: message.crdt,
           roomId: message.roomId,
-          permission: "write",
+          permission: canPublish(state.capabilities) ? "write" : "read",
           version: vv.encode()
         });
       } finally {
@@ -560,14 +817,22 @@ export class SessionRoom implements DurableObject {
   /** Shared apply path for whole and reassembled updates. */
   private async applyUpdates(
     ws: WebSocket,
-    _state: SocketState,
+    state: SocketState,
     crdt: CrdtType,
     roomId: string,
     batchId: `0x${string}`,
     updates: Uint8Array[]
   ): Promise<void> {
+    if (
+      crdt === CrdtType.Loro &&
+      !canPublish(state.capabilities)
+    ) {
+      this.ack(ws, { crdt, roomId }, UpdateStatusCode.PermissionDenied, batchId);
+      return;
+    }
     if (crdt === CrdtType.Loro) {
       const doc = await this.ensureDoc();
+      if (!(await this.authorizeSocket(ws, state))) return;
       try {
         for (const update of updates) if (update.length > 0) doc.import(update);
       } catch {
@@ -578,10 +843,14 @@ export class SessionRoom implements DurableObject {
       }
       this.recordLoroUpdates(updates);
       this.ack(ws, { crdt, roomId }, UpdateStatusCode.Ok, batchId);
-      this.relay(ws, crdt, roomId, updates);
+      await this.relay(ws, crdt, roomId, updates);
       return;
     }
     if (crdt === CrdtType.LoroEphemeralStore) {
+      if (updates.some((update) => update.length > MAX_PRESENCE_UPDATE_BYTES)) {
+        this.ack(ws, { crdt, roomId }, UpdateStatusCode.PayloadTooLarge, batchId);
+        return;
+      }
       const eph = this.ensureEph();
       try {
         for (const update of updates) if (update.length > 0) eph.apply(update);
@@ -590,7 +859,7 @@ export class SessionRoom implements DurableObject {
         return;
       }
       this.ack(ws, { crdt, roomId }, UpdateStatusCode.Ok, batchId);
-      this.relay(ws, crdt, roomId, updates);
+      await this.relay(ws, crdt, roomId, updates);
       return;
     }
     this.ack(ws, { crdt, roomId }, UpdateStatusCode.Unknown, batchId);
@@ -944,12 +1213,51 @@ export class SessionRoom implements DurableObject {
     }
   }
 
-  /** Daily alarm: frontier checkpoint, history trim, R2 backup. */
-  async alarm(): Promise<void> {
-    await this.flush();
-    if (this.getMeta("backupDirty") !== "1") return; // idle: stop the chain
-    const doc = await this.ensureDoc();
+  private closeExpiredGrantSockets(now: number): void {
+    for (const ws of this.ctx.getWebSockets()) {
+      const state = ws.deserializeAttachment() as SocketState | null;
+      if (
+        !Number.isSafeInteger(state?.grantExpiresAt) ||
+        (state?.grantExpiresAt as number) > now
+      ) {
+        continue;
+      }
+      try {
+        ws.close(4403, "device grant expired");
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+
+  private async scheduleGrantExpiryAlarm(): Promise<void> {
     const now = Date.now();
+    let earliest: number | undefined;
+    for (const ws of this.ctx.getWebSockets()) {
+      const state = ws.deserializeAttachment() as SocketState | null;
+      const expiresAt = state?.grantExpiresAt;
+      if (!Number.isSafeInteger(expiresAt) || (expiresAt as number) <= now) continue;
+      if (earliest === undefined || (expiresAt as number) < earliest) {
+        earliest = expiresAt as number;
+      }
+    }
+    if (earliest === undefined) return;
+    const scheduled = await this.ctx.storage.getAlarm();
+    if (scheduled === null || earliest < scheduled) {
+      await this.ctx.storage.setAlarm(earliest);
+    }
+  }
+
+  /** Daily maintenance and device-grant expiry alarm. */
+  async alarm(): Promise<void> {
+    const now = Date.now();
+    this.closeExpiredGrantSockets(now);
+    await this.flush();
+    if (this.getMeta("backupDirty") !== "1") {
+      await this.scheduleGrantExpiryAlarm();
+      return;
+    }
+    const doc = await this.ensureDoc();
 
     // 1. Record today's frontier checkpoint.
     const checkpoints = JSON.parse(this.getMeta("checkpoints") ?? "[]") as FrontierCheckpoint[];
@@ -1010,6 +1318,7 @@ export class SessionRoom implements DurableObject {
     }
     // Re-arm only while there is a reason to wake again; markActivity re-arms
     // on the next write otherwise.
+    await this.scheduleGrantExpiryAlarm();
   }
 
   /** Arm the daily alarm if none is scheduled (called on every write). */
@@ -1113,11 +1422,17 @@ export class SessionRoom implements DurableObject {
    * full workspace history after a server reset) blew the loro-protocol
    * message cap and NEVER reached peers live; they only converged via a
    * later rejoin backfill (2026-08-04, the last silent-staleness path). */
-  private relay(from: WebSocket, crdt: CrdtType, roomId: string, updates: Uint8Array[]): void {
+  private async relay(
+    from: WebSocket,
+    crdt: CrdtType,
+    roomId: string,
+    updates: Uint8Array[]
+  ): Promise<void> {
     for (const ws of this.ctx.getWebSockets()) {
       if (ws === from) continue;
       const state = ws.deserializeAttachment() as SocketState | null;
       if (!state?.rooms.includes(crdt)) continue;
+      if (!(await this.authorizeSocket(ws, state))) continue;
       if (!this.sendUpdates(ws, crdt, roomId, updates)) {
         // A member socket we cannot send to is a DEAF PEER, not a skippable
         // one: swallowing the failure left it looking alive (runtime

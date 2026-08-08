@@ -59,6 +59,23 @@ fn is_internal_diagnostic(message: &str) -> bool {
     message.contains("[ede_diagnostic]")
 }
 
+/// `tool_result` content → plain text: the API sends either a bare string or
+/// an array of `{type:"text", text}` blocks (images and other block kinds are
+/// skipped).
+fn tool_result_text(content: &Value) -> Option<String> {
+    if let Some(text) = content.as_str() {
+        return (!text.is_empty()).then(|| text.to_string());
+    }
+    let blocks = content.as_array()?;
+    let joined = blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!joined.is_empty()).then_some(joined)
+}
+
 fn str_field(input: &Value, key: &str) -> String {
     input.get(key).and_then(Value::as_str).unwrap_or("").into()
 }
@@ -251,6 +268,7 @@ impl Normalizer {
                     .map(|b| AgentEvent::ToolResult {
                         id: b.tool_use_id.clone(),
                         is_error: b.is_error.unwrap_or(false),
+                        output: tool_result_text(&b.content).map(comet_proto::truncate_tool_output),
                     })
                     .collect()
             }

@@ -11,8 +11,21 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 command -v cargo >/dev/null 2>&1 || PATH="$HOME/.cargo/bin:$PATH"
-VERSION="$(grep -m1 '^version' "$ROOT/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')"
-ARCH="$(uname -m)" # arm64 on Apple silicon runners
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "macOS packaging requires a macOS runner" >&2
+  exit 1
+fi
+WORKSPACE_VERSION="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' "$ROOT/Cargo.toml")"
+VERSION="${COMET_RELEASE_VERSION:-$WORKSPACE_VERSION}"
+if [[ -z "$WORKSPACE_VERSION" || "$VERSION" != "$WORKSPACE_VERSION" ]]; then
+  echo "release version '$VERSION' does not match workspace version '$WORKSPACE_VERSION'" >&2
+  exit 1
+fi
+ARCH="$(uname -m)"
+if [[ "$ARCH" != "arm64" ]]; then
+  echo "macOS releases require an Apple-silicon runner (found $ARCH)" >&2
+  exit 1
+fi
 OUT_DIR="$ROOT/target/package"
 APP="$OUT_DIR/Comet.app"
 DMG="$OUT_DIR/comet-$VERSION-macos-$ARCH.dmg"
@@ -46,11 +59,9 @@ else
   codesign --deep --force --sign - "$APP"
 fi
 
-# The auto-updater artifact: the signed bundle as a plain tarball (the in-app
-# updater downloads + extracts it, then swaps /Applications/Comet.app —
-# crates/update stage_mac_app/apply_mac_app).
-tar -czf "$APP_TARBALL" -C "$OUT_DIR" Comet.app
+# The auto-updater artifact is the exact signed bundle promoted by CI.
+COPYFILE_DISABLE=1 tar -czf "$APP_TARBALL" -C "$OUT_DIR" Comet.app
 echo "packaged: $APP_TARBALL"
 
-hdiutil create -volname Comet -srcfolder "$APP" -ov -format UDZO "$DMG"
+hdiutil create -volname "Ashler Comet" -srcfolder "$APP" -ov -format UDZO "$DMG"
 echo "packaged: $DMG"

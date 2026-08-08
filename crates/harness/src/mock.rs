@@ -247,6 +247,57 @@ impl Harness for MockHarness {
             )
             .into(),
         });
+        // Dev/testing knob: `COMET_MOCK_MERMAID=1` appends a mermaid
+        // flowchart (subgraphs, shapes, labeled/dotted/thick edges), a
+        // sequence diagram (frames, notes, self-message, autonumber), and an
+        // unsupported diagram type that must stay a plain code block — for
+        // checking the native diagram renderer (crates/ui markdown/mermaid).
+        let mock_mermaid = std::env::var("COMET_MOCK_MERMAID")
+            .ok()
+            .is_some_and(|v| !v.is_empty() && v != "0");
+        let mermaid_event = mock_mermaid.then(|| AgentEvent::TextDelta {
+            text: concat!(
+                "\n### Mermaid check\n\n",
+                "```mermaid\n",
+                "flowchart LR\n",
+                "    H[harness adapters<br/>omp / claude / codex] -->|\"ToolResult { output }\"| J[run journal<br/>jsonl]\n",
+                "    J -->|\"ToolCallDetail RPC<br/>(relay-forwardable)\"| T[transcript chip pane]\n",
+                "    J -.->|\"render_parts still strips\"| D[synced doc<br/>unchanged]\n",
+                "    T ==> S{ship it?}\n",
+                "    S -->|yes| Y((done))\n",
+                "    S -->|no| H\n",
+                "    subgraph edge [Edge relay]\n",
+                "        R[(session room)]\n",
+                "    end\n",
+                "    D --> R\n",
+                "```\n\n",
+                "```mermaid\n",
+                "sequenceDiagram\n",
+                "    autonumber\n",
+                "    participant U as UI thread\n",
+                "    participant E as Engine\n",
+                "    U->>E: QueueCommand run\n",
+                "    E-->>U: RunState streaming\n",
+                "    E->>E: fold parts\n",
+                "    loop every 120ms\n",
+                "        E->>U: TextDelta\n",
+                "    end\n",
+                "    Note over U,E: veil fades per chunk\n",
+                "    alt journal ok\n",
+                "        E->>U: Done\n",
+                "    else error\n",
+                "        E--xU: Error chip\n",
+                "    end\n",
+                "```\n\n",
+                "```mermaid\n",
+                "gantt\n",
+                "    title Unsupported — must stay a code block\n",
+                "    section A\n",
+                "    task :a1, 2026-01-01, 3d\n",
+                "```\n\n",
+            )
+            .into(),
+        });
         // With the code knob, also exercise a MULTILINE Exec command — the
         // round-9 chip breaker shape ("set -e\nfixture_in_original=0"): the
         // Run chip must stay one 30px line.
@@ -262,6 +313,7 @@ impl Harness for MockHarness {
                     AgentEvent::ToolResult {
                         id: "mock-code-tool".into(),
                         is_error: false,
+                        output: Some("42".into()),
                     },
                 ]
             })
@@ -276,6 +328,7 @@ impl Harness for MockHarness {
             .chain(code_event)
             .chain(table_event)
             .chain(mend_event)
+            .chain(mermaid_event)
             .chain(error_event)
             .chain(tail.iter().cloned())
             .map(Ok)
