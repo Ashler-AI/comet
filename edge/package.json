@@ -1,27 +1,29 @@
 {
-  "name": "comet-native-edge",
+  "name": "ashler-comet-edge",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "wrangler dev --port 27640 --var AUTH_MODE:dev",
-    "deploy": "wrangler deploy",
-    "build": "wrangler deploy --dry-run --outdir dist",
+    "deploy": "wrangler deploy --env staging",
+    "deploy:production": "wrangler deploy --env production",
+    "build": "wrangler deploy --dry-run --env staging --outdir dist",
+    "types": "wrangler types --include-runtime=false",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "smoke": "node scripts/smoke.mjs"
+    "smoke": "node scripts/smoke.mjs",
+    "smoke:collaboration": "node ../scripts/headless-collaboration-smoke.mjs"
   },
   "dependencies": {
-    "jose": "^6.0.11",
     "loro-crdt": "^1.13.7",
     "loro-protocol": "^0.3.0"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20260714.1",
+    "@cloudflare/workers-types": "^5.20260804.1",
     "loro-adaptors": "^0.6.1",
     "loro-websocket": "^0.6.2",
     "typescript": "^6.0.3",
     "vitest": "^3.2.7",
-    "wrangler": "^4.111.0"
+    "wrangler": "^4.119.0"
   }
 }

@@ -11,9 +11,22 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 command -v cargo >/dev/null 2>&1 || PATH="$HOME/.cargo/bin:$PATH"
+if [[ "$(uname -s)" != "Linux" ]]; then
+  echo "Linux packaging requires a Linux runner" >&2
+  exit 1
+fi
 PROFILE="${PROFILE:-release}"
 ARCH="$(uname -m)"
-VERSION="$(grep -m1 '^version' "$ROOT/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')"
+case "$ARCH" in
+  amd64) ARCH=x86_64 ;;
+  arm64) ARCH=aarch64 ;;
+esac
+WORKSPACE_VERSION="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' "$ROOT/Cargo.toml")"
+VERSION="${COMET_RELEASE_VERSION:-$WORKSPACE_VERSION}"
+if [[ -z "$WORKSPACE_VERSION" || "$VERSION" != "$WORKSPACE_VERSION" ]]; then
+  echo "release version '$VERSION' does not match workspace version '$WORKSPACE_VERSION'" >&2
+  exit 1
+fi
 OUT_DIR="$ROOT/target/package"
 STAGE="$OUT_DIR/comet-$VERSION-linux-$ARCH"
 TARBALL="$STAGE.tar.gz"
@@ -35,7 +48,7 @@ install -m 644 "$ROOT/dist/comet.png" "$STAGE/comet.png"
 
 cat >"$STAGE/install.sh" <<'INSTALL'
 #!/usr/bin/env bash
-# Install Comet into ~/.local (no root needed).
+# Install Ashler Comet into ~/.local (no root needed).
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 install -Dm755 "$HERE/comet" "$HOME/.local/bin/comet"
@@ -43,11 +56,12 @@ install -Dm644 "$HERE/comet.desktop" "$HOME/.local/share/applications/comet.desk
 install -Dm644 "$HERE/comet.png" "$HOME/.local/share/icons/hicolor/1024x1024/apps/comet.png"
 command -v update-desktop-database >/dev/null 2>&1 \
   && update-desktop-database "$HOME/.local/share/applications" || true
-echo "Installed. Make sure ~/.local/bin is on your PATH."
+echo "Ashler Comet installed. Make sure ~/.local/bin is on your PATH."
 INSTALL
 chmod 755 "$STAGE/install.sh"
 
-tar -czf "$TARBALL" -C "$OUT_DIR" "$(basename "$STAGE")"
+GZIP=-n tar --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" --owner=0 --group=0 \
+  --numeric-owner -czf "$TARBALL" -C "$OUT_DIR" "$(basename "$STAGE")"
 rm -rf "$STAGE"
 echo "packaged: $TARBALL"
 tar -tzf "$TARBALL"

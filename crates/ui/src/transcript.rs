@@ -22,18 +22,17 @@
 //! scroll handler fires exclusively from its wheel/touch path) and re-engages
 //! inside the 70px band; own-send re-engages with the same glide.
 
+use gpui::{
+    AnyElement, BorderStyle, ClipboardItem, Context, Entity, ListAlignment, ListScrollEvent,
+    ListState, MouseButton, ObjectFit, SharedString, Styled, StyledImage as _, StyledText,
+    Subscription, Task, TextRun, Window, canvas, div, img, list, prelude::*, px, quad,
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-use gpui::{
-    AnyElement, BorderStyle, ClipboardItem, Context, Entity, ListAlignment, ListScrollEvent,
-    ListState, ObjectFit, SharedString, StyledImage as _, StyledText, Subscription, Task, TextRun,
-    Window, canvas, div, img, list, prelude::*, px, quad,
-};
 
 use comet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
 use comet_proto::ToolCall;
@@ -206,9 +205,11 @@ pub enum RowKind {
         /// once per entry change in [`rows_for_entry`] (rows are cached by
         /// fingerprint), never per frame. Empty for ordinary prompts.
         mentions: Arc<Vec<crate::composer::SentMentionSpan>>,
-        /// Image refs parsed out of the message text (message-attachments.ts):
-        /// thumbnails load from the owning device via ReadAttachmentChunk.
+        /// Image refs parsed out of the message text: thumbnails load from the
+        /// owning device via ReadAttachmentChunk.
         attachments: Arc<Vec<crate::attachments::UserImageAttachment>>,
+        /// Large clipboard pastes uploaded as readable text files.
+        text_attachments: Arc<Vec<crate::attachments::UserTextAttachment>>,
         /// Optimistic echo not yet confirmed by a doc frame.
         pending: bool,
     },
@@ -340,6 +341,7 @@ pub fn rows_for_entry(
                 text: text.into(),
                 mentions: Arc::new(mentions),
                 attachments: Arc::new(parsed.attachments),
+                text_attachments: Arc::new(parsed.text_attachments),
                 pending,
             },
             entry_id,
@@ -662,6 +664,26 @@ pub fn diff_rows(old: &[Row], new: &[Row]) -> Option<(Range<usize>, usize)> {
         suffix += 1;
     }
     Some((prefix..old.len() - suffix, new.len() - suffix - prefix))
+}
+/// Whether a changed row range can be remeasured in place rather than
+/// structurally spliced. Stable row identities are critical for the virtual
+/// list: replacing an item that merely changed content resets an anchor inside
+/// that item and can leave stale cells visible while a tool group streams.
+fn preserves_row_identities(
+    old: &[Row],
+    new: &[Row],
+    old_range: &Range<usize>,
+    new_count: usize,
+) -> bool {
+    if old_range.is_empty() || old_range.len() != new_count {
+        return false;
+    }
+    let new_end = old_range.start + new_count;
+    new_end <= new.len()
+        && old[old_range.clone()]
+            .iter()
+            .zip(&new[old_range.start..new_end])
+            .all(|(old, new)| old.id == new.id)
 }
 
 // ---------------------------------------------------------------------------
@@ -1269,14 +1291,18 @@ impl Transcript {
                 return;
             }
             Some((old_range, count)) => {
-                // Any replaced row's cached flatten results are stale — and
-                // because live replies splice only the rows whose content hash
+                // Any changed row's cached flatten results are stale — and
+                // because live replies refresh only the rows whose content hash
                 // changed (the tail), this is O(changed rows) per commit, never
                 // O(reply).
                 for row in &self.rows[old_range.clone()] {
                     self.render_cache.borrow_mut().invalidate_row(&row.id);
                 }
-                self.list.splice(old_range, count);
+                if preserves_row_identities(&self.rows, &new_rows, &old_range, count) {
+                    self.list.remeasure_items(old_range);
+                } else {
+                    self.list.splice(old_range, count);
+                }
             }
         }
         self.rows = new_rows;
@@ -1539,6 +1565,59 @@ impl Transcript {
         strip.into_any_element()
     }
 
+    /// Right-aligned cards for large clipboard pastes uploaded as text files.
+    fn render_user_text_attachments(
+        &self,
+        row_id: &SharedString,
+        atts: &[crate::attachments::UserTextAttachment],
+        theme: &Theme,
+    ) -> AnyElement {
+        let mut strip = div()
+            .w_full()
+            .h(px(ATT_STRIP_H))
+            .flex()
+            .flex_row()
+            .justify_end()
+            .items_start()
+            .gap(px(8.0))
+            .overflow_hidden()
+            .px(px(4.0))
+            .pt(px(4.0));
+        for (aix, att) in atts.iter().enumerate() {
+            strip = strip.child(
+                div()
+                    .id(SharedString::from(format!("{row_id}#text-att{aix}")))
+                    .flex_none()
+                    .w(px(ATT_THUMB_W))
+                    .h(px(ATT_THUMB_H))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(crate::theme::hairline(0.11))
+                    .bg(crate::theme::ink(0.035))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(5.0))
+                    .child(
+                        crate::icons::icon(crate::icons::DOCUMENT)
+                            .size(px(20.0))
+                            .text_color(theme.text_muted),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(ATT_THUMB_W - 16.0))
+                            .overflow_hidden()
+                            .truncate()
+                            .text_size(px(10.0))
+                            .text_color(theme.text_muted)
+                            .child(att.name.clone()),
+                    ),
+            );
+        }
+        strip.into_any_element()
+    }
+
     // ---- rendering ----
 
     fn render_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -1552,24 +1631,95 @@ impl Transcript {
             top_gap_for(ix.checked_sub(1).and_then(|i| self.rows.get(i)), &row)
         };
         let bottom_pad = if ix + 1 == self.rows.len() { 24.0 } else { 0.0 };
+        let (timeline_label, collaborator_cursors) = {
+            let state = self.state.read(cx);
+            let timeline_label = row
+                .turn_start
+                .then(|| state.message_provenance(row.entry_id.as_ref()))
+                .flatten()
+                .map(|provenance| {
+                    let actor = state.participant_name(&provenance.author_subject);
+                    let session = state.collaboration.as_ref().and_then(|snapshot| {
+                        snapshot
+                            .sessions
+                            .iter()
+                            .find(|session| session.session_id == provenance.session_id)
+                    });
+                    let source = session
+                        .map(|session| crate::multiplayer::source_label(session.source))
+                        .unwrap_or("Teammate");
+                    let runtime = session
+                        .and_then(|session| session.harness)
+                        .map(crate::multiplayer::harness_label);
+                    let runtime_model =
+                        crate::multiplayer::runtime_model(runtime, provenance.model.as_deref());
+                    SharedString::from(format!("{actor} · {source} · {runtime_model}"))
+                });
+            let cursors = state
+                .participants()
+                .iter()
+                .filter(|participant| {
+                    let targets_row =
+                        |target: &str| target == row.id.as_ref() || target == row.entry_id.as_ref();
+                    participant
+                        .cursor
+                        .as_ref()
+                        .is_some_and(|cursor| targets_row(&cursor.target_id))
+                        || participant
+                            .focused_target_id
+                            .as_deref()
+                            .is_some_and(targets_row)
+                })
+                .take(3)
+                .map(|participant| {
+                    let name = participant
+                        .display_name
+                        .as_deref()
+                        .unwrap_or(&participant.principal_subject);
+                    let location = participant
+                        .cursor
+                        .as_ref()
+                        .filter(|cursor| {
+                            cursor.target_id == row.id.as_ref()
+                                || cursor.target_id == row.entry_id.as_ref()
+                        })
+                        .map(crate::multiplayer::cursor_location)
+                        .map(SharedString::from);
+                    (
+                        SharedString::from(crate::multiplayer::initials(name)),
+                        participant.state,
+                        location,
+                    )
+                })
+                .collect::<Vec<_>>();
+            (timeline_label, cursors)
+        };
 
         let inner: AnyElement = match &row.kind {
             RowKind::User {
                 text,
                 mentions,
                 attachments,
+                text_attachments,
                 pending,
             } => {
                 let attachments = attachments.clone();
+                let text_attachments = text_attachments.clone();
                 let text = text.clone();
                 let mentions = mentions.clone();
                 let pending = *pending;
-                // Attachment thumbnails ride ABOVE the bubble, right-aligned
-                // (chat-view.tsx RowView: UserAttachmentStrip then the text
-                // HStack); image-only sends show no bubble at all.
+                // Attachment cards ride above the bubble, right-aligned.
+                // Attachment-only sends show no text bubble.
                 let mut column = div().w_full().flex().flex_col();
                 if !attachments.is_empty() {
                     column = column.child(self.render_user_attachments(&row.id, &attachments, cx));
+                }
+                if !text_attachments.is_empty() {
+                    column = column.child(self.render_user_text_attachments(
+                        &row.id,
+                        &text_attachments,
+                        &theme,
+                    ));
                 }
                 if !text.is_empty() {
                     // `min_w_0` is load-bearing: gpui text answers min/max-content
@@ -1591,11 +1741,7 @@ impl Transcript {
                                 .line_height(px(22.0))
                                 .text_color(theme.text)
                                 .when(pending, |el| el.opacity(0.65))
-                                .child(if mentions.is_empty() {
-                                    text.into_any_element()
-                                } else {
-                                    user_mention_text(text, mentions, &theme)
-                                }),
+                                .child(user_mention_text(&row.id, text, mentions, &theme)),
                         ),
                     );
                 }
@@ -1774,9 +1920,69 @@ impl Transcript {
             .px(px(48.0))
             .child(
                 div()
+                    .relative()
                     .w_full()
                     .max_w(px(MAX_CONTENT_WIDTH))
                     .min_w_0()
+                    .when(!collaborator_cursors.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .left(px(-(Theme::SPACE_LG * 2.0)))
+                                .top_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .children(collaborator_cursors.into_iter().map(
+                                    |(initials, state, location)| {
+                                        let tone = match state {
+                                            comet_proto::ParticipantState::Active => theme.success,
+                                            comet_proto::ParticipantState::Idle => theme.warning,
+                                            comet_proto::ParticipantState::Disconnected => {
+                                                theme.text_faint
+                                            }
+                                        };
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .items_center()
+                                            .child(
+                                                div()
+                                                    .size(px(20.0))
+                                                    .rounded_full()
+                                                    .border_1()
+                                                    .border_color(tone)
+                                                    .bg(theme.surface_raised)
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .text_size(px(8.0))
+                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                    .text_color(theme.text_muted)
+                                                    .child(initials),
+                                            )
+                                            .when_some(location, |el, location| {
+                                                el.child(
+                                                    div()
+                                                        .mt(px(2.0))
+                                                        .text_size(px(7.0))
+                                                        .text_color(tone)
+                                                        .child(location),
+                                                )
+                                            })
+                                    },
+                                )),
+                        )
+                    })
+                    .when_some(timeline_label, |el, label| {
+                        el.child(
+                            div()
+                                .mb(px(Theme::SPACE_XS))
+                                .text_size(px(10.0))
+                                .text_color(theme.text_faint)
+                                .child(label),
+                        )
+                    })
                     .child(inner)
                     .children(strip),
             )
@@ -1794,28 +2000,27 @@ impl Transcript {
             .map(|(_, ix)| *ix);
         let row_key = row_id.clone();
         let entity = cx.weak_entity();
-        let handler: Rc<dyn Fn(usize, SharedString, &mut Window, &mut gpui::App)> =
-            Rc::new(move |ix, code, _window, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(code.to_string()));
-                let row_key = row_key.clone();
-                entity
-                    .update(cx, |this, cx| {
-                        this.copied_code = Some((row_key, ix));
-                        this.copied_clear = Some(cx.spawn(async move |this, cx| {
-                            cx.background_executor()
-                                .timer(Duration::from_millis(1200))
-                                .await;
-                            this.update(cx, |this, cx| {
-                                this.copied_code = None;
-                                this.copied_clear = None;
-                                cx.notify();
-                            })
-                            .ok();
-                        }));
-                        cx.notify();
-                    })
-                    .ok();
-            });
+        let handler: Rc<render::CopyHandler> = Rc::new(move |ix, code, _window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(code.to_string()));
+            let row_key = row_key.clone();
+            entity
+                .update(cx, |this, cx| {
+                    this.copied_code = Some((row_key, ix));
+                    this.copied_clear = Some(cx.spawn(async move |this, cx| {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(1200))
+                            .await;
+                        this.update(cx, |this, cx| {
+                            this.copied_code = None;
+                            this.copied_clear = None;
+                            cx.notify();
+                        })
+                        .ok();
+                    }));
+                    cx.notify();
+                })
+                .ok();
+        });
         render::CopyUi { handler, copied_ix }
     }
 
@@ -1960,6 +2165,7 @@ impl Transcript {
 /// repaints O(chips) quads — no layout work, no re-projection (spans were
 /// computed once in [`rows_for_entry`]).
 fn user_mention_text(
+    row_id: &SharedString,
     text: SharedString,
     mentions: Arc<Vec<crate::composer::SentMentionSpan>>,
     theme: &Theme,
@@ -1997,6 +2203,8 @@ fn user_mention_text(
     }
     let styled = StyledText::new(text.clone()).with_runs(runs);
     let layout = styled.layout().clone();
+    let selection_key: SharedString = format!("{}#user:0", row_id).into();
+    let selectable = render::selectable_styled_text(selection_key, text, styled, theme);
     let wash = theme.code_wash;
     let underlay = canvas(
         |_, _, _| (),
@@ -2020,7 +2228,7 @@ fn user_mention_text(
     div()
         .relative()
         .child(underlay)
-        .child(styled)
+        .child(selectable)
         .into_any_element()
 }
 
@@ -2161,6 +2369,7 @@ fn tool_icon_path(call: &ToolCall) -> &'static str {
         ToolCall::Glob { .. } => crate::icons::FOLDER_WITH_FILES,
         ToolCall::WebFetch { .. } | ToolCall::WebSearch { .. } => crate::icons::GLOBAL,
         ToolCall::Todo { .. } => crate::icons::CHECKLIST,
+        ToolCall::Agent { .. } => crate::icons::CHAT_ROUND_LINE,
         ToolCall::Mcp { .. } | ToolCall::Unknown { .. } => crate::icons::WIDGET,
     }
 }
@@ -2306,6 +2515,30 @@ impl Render for Transcript {
         let root = div()
             .relative()
             .size_full()
+            .on_mouse_down(MouseButton::Left, |event, window, _| {
+                if render::selection_mouse_down(event.position, event.click_count) {
+                    window.refresh();
+                }
+            })
+            .on_mouse_move(|event, window, _| {
+                if event.dragging() && render::selection_mouse_move(event.position) {
+                    window.refresh();
+                }
+            })
+            .on_mouse_up(MouseButton::Left, |event, window, _cx| {
+                if let Some(_text) = render::selection_mouse_up(event.position) {
+                    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                    _cx.write_to_primary(ClipboardItem::new_string(_text));
+                    window.refresh();
+                }
+            })
+            .on_mouse_up_out(MouseButton::Left, |event, window, _cx| {
+                if let Some(_text) = render::selection_mouse_up(event.position) {
+                    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                    _cx.write_to_primary(ClipboardItem::new_string(_text));
+                    window.refresh();
+                }
+            })
             .min_h_0()
             // FIRST child ⇒ paints first: clears the frame's markdown text-
             // selection registry before any row's text elements re-register
@@ -2587,7 +2820,7 @@ mod tests {
         for (live, done) in live_rows.iter().zip(&done_rows) {
             assert_eq!(live.id, done.id);
             // The flip changes the version even at identical text (the
-            // streaming bit), forcing a splice.
+            // streaming bit), forcing an in-place remeasurement.
             assert_ne!(live.version, done.version);
         }
         assert!(matches!(
@@ -2599,7 +2832,7 @@ mod tests {
     #[test]
     fn live_commit_changes_only_tail_row_versions() {
         // Streaming commit: appending to the last block leaves every settled
-        // block row's (id, version) untouched — the diff splices only the tail.
+        // block row's (id, version) untouched — only the tail is refreshed.
         let t1 = "para one\n\npara two\n\npara three";
         let t2 = "para one\n\npara two\n\npara three grows here";
         let live1 = assistant("m1", MessageStatus::Streaming, vec![text_part("t0", t1)]);
@@ -2612,6 +2845,35 @@ mod tests {
         assert_eq!(r1[1].version, r2[1].version, "settled block untouched");
         assert_ne!(r1[2].version, r2[2].version, "tail block respliced");
         assert_eq!(diff_rows(&r1, &r2), Some((2..3, 1)));
+    }
+
+    #[test]
+    fn streaming_tool_group_updates_remeasure_in_place() {
+        let first = assistant(
+            "m1",
+            MessageStatus::Streaming,
+            vec![text_part("t0", "working"), tool_part("a", "ls")],
+        );
+        let second = assistant(
+            "m1",
+            MessageStatus::Streaming,
+            vec![
+                text_part("t0", "working"),
+                tool_part("a", "ls"),
+                tool_part("b", "pwd"),
+            ],
+        );
+        let old = rows_for_entry(&first, false, &mut parse);
+        let new = rows_for_entry(&second, false, &mut parse);
+
+        let (range, count) = diff_rows(&old, &new).expect("tool group changed");
+        assert_eq!((range.clone(), count), (1..2, 1));
+        assert_eq!(old[1].id.as_ref(), "m1#g0");
+        assert_eq!(new[1].id.as_ref(), "m1#g0");
+        assert!(
+            preserves_row_identities(&old, &new, &range, count),
+            "a growing tool group must keep its virtual-list cell and scroll anchor"
+        );
     }
 
     #[test]
@@ -2714,9 +2976,10 @@ mod tests {
 
     #[test]
     fn user_rows_split_attachment_refs_from_text() {
-        let content = crate::attachments::with_attachments(
+        let content = crate::attachments::with_attachment_files(
             "what color is this?",
             &["/data/uploads/ab12-red.png".to_string()],
+            &["/data/uploads/pasted-text.txt".to_string()],
         );
         let mut entry = assistant("u2", MessageStatus::Complete, vec![]);
         entry.role = MessageRole::User;
@@ -2725,7 +2988,10 @@ mod tests {
         let rows = rows_for_entry(&entry, false, &mut parse);
         assert_eq!(rows.len(), 1);
         let RowKind::User {
-            text, attachments, ..
+            text,
+            attachments,
+            text_attachments,
+            ..
         } = &rows[0].kind
         else {
             panic!("expected a user row");
@@ -2734,6 +3000,8 @@ mod tests {
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].path, "/data/uploads/ab12-red.png");
         assert_eq!(attachments[0].name, "ab12-red.png");
+        assert_eq!(text_attachments.len(), 1);
+        assert_eq!(text_attachments[0].name, "pasted-text.txt");
 
         // Image-only send: no bubble text, refs parsed.
         let only = crate::attachments::with_attachments("", &["/a/p.png".to_string()]);

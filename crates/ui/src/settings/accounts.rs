@@ -23,6 +23,7 @@ use comet_proto::{
 use comet_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
+use crate::motion::{AnimationExt as _, COMET_PULSE};
 use crate::popover::{self, Loadable};
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -1037,24 +1038,18 @@ impl AccountsPage {
                         el.child(
                             div()
                                 .mt(px(16.0))
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(8.0))
-                                .child(crate::loaders::gradient_spinner(
-                                    "login-poll",
-                                    &theme,
-                                    3.0,
-                                    cx.entity_id(),
-                                    cx,
-                                ))
+                                .text_size(px(12.5))
+                                .text_color(theme.text_muted)
                                 .child(
                                     div()
-                                        .text_size(px(12.5))
-                                        .text_color(theme.text_muted.opacity(0.7))
                                         .child(message.clone().unwrap_or_else(|| {
                                             SharedString::from("Waiting for the browser…")
-                                        })),
+                                        }))
+                                        .with_animation(
+                                            "login-waiting",
+                                            COMET_PULSE.animation().repeat(),
+                                            |label, delta| label.opacity(0.55 + 0.35 * delta),
+                                        ),
                                 ),
                         )
                     })

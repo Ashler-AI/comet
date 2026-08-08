@@ -20,8 +20,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, Context, Entity, ListAlignment, ListState, SharedString, Subscription, Task,
-    Window, div, font, list, prelude::*, px,
+    AnyElement, App, Context, Entity, EventEmitter, ListAlignment, ListState, SharedString,
+    Subscription, Task, Window, div, font, list, prelude::*, px,
 };
 
 use comet_proto::{Chat, CheckoutDiff};
@@ -32,6 +32,13 @@ use crate::markdown::render;
 use crate::motion::{self, AnimationExt as _, CHEVRON, COLLAPSE};
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
+
+#[derive(Debug, Clone)]
+pub enum ChangesEvent {
+    OpenAnnotations(comet_proto::SemanticAnchor),
+}
+
+impl EventEmitter<ChangesEvent> for Changes {}
 
 // ---------------------------------------------------------------------------
 // Layout numbers (analytic — they drive the fold tween)
@@ -757,6 +764,52 @@ impl Changes {
 
     // ---- rendering ----
 
+    fn annotation_anchor_for_file(
+        &self,
+        file: &FileDiff,
+        exact: Option<String>,
+        cx: &App,
+    ) -> Option<comet_proto::SemanticAnchor> {
+        let state = self.state.read(cx);
+        if let Some(anchor) = state.collaboration.as_ref().and_then(|snapshot| {
+            snapshot.publications.iter().rev().find_map(|publication| {
+                let comet_proto::PublicationValue::Annotation(annotation) = &publication.value
+                else {
+                    return None;
+                };
+                let matches = match annotation.anchor.file.as_ref() {
+                    Some(comet_proto::FileTargetReference::LocalWorkspacePath {
+                        relative_path,
+                        ..
+                    }) => relative_path == &file.path,
+                    Some(comet_proto::FileTargetReference::ScaffoldArtifact {
+                        artifact_id,
+                        artifact_uri,
+                        ..
+                    }) => {
+                        artifact_id == &file.path
+                            || artifact_uri.as_deref() == Some(file.path.as_str())
+                    }
+                    None => false,
+                };
+                matches.then(|| annotation.anchor.clone())
+            })
+        }) {
+            return Some(anchor);
+        }
+        let chat = state.selected_chat_row()?;
+        let workspace_id = chat
+            .checkout_id
+            .clone()
+            .or_else(|| chat.space_id.clone())
+            .unwrap_or_else(|| chat.device_id.clone());
+        Some(crate::multiplayer::local_file_anchor(
+            workspace_id,
+            file.path.clone(),
+            exact,
+        ))
+    }
+
     fn render_row(
         &mut self,
         ix: usize,
@@ -777,9 +830,9 @@ impl Changes {
         let highlight = self.request_highlight(file, &parsed_key, cx);
         let path = file.path.clone();
 
+        let annotation_anchor = self.annotation_anchor_for_file(file, None, cx);
         let header = self.render_file_header(ix, file, &fold, expanded_height, &theme, cx);
-        let body = render_file_body(file, highlight, &theme);
-
+        let body = render_file_body(file, highlight, annotation_anchor, &theme, cx);
         // Collapse: 180 ms committed-height tween on toggle (windowed — see
         // FileFold::animating); steady states paint at the target height
         // directly.
@@ -827,6 +880,23 @@ impl Changes {
         let path = file.path.clone();
         let adds = file.additions;
         let dels = file.deletions;
+        let annotation_anchor = self.annotation_anchor_for_file(file, None, cx);
+        let has_notes = annotation_anchor.as_ref().is_some_and(|anchor| {
+            self.state
+                .read(cx)
+                .collaboration
+                .as_ref()
+                .is_some_and(|snapshot| {
+                    snapshot.publications.iter().any(|publication| {
+                        matches!(
+                            &publication.value,
+                            comet_proto::PublicationValue::Annotation(annotation)
+                                if annotation.anchor.target_id == anchor.target_id
+                        )
+                    })
+                })
+        });
+        let path_for_fold = path.clone();
 
         // Chevron (comet checkout-diff-sidebar): chevron-right closed,
         // chevron-down open; gpui divs have no rotation transform at the
@@ -868,7 +938,7 @@ impl Changes {
             .cursor_pointer()
             .hover(|s| s.bg(crate::theme::ink(0.05)))
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.toggle_fold(&path, expanded_height);
+                this.toggle_fold(&path_for_fold, expanded_height);
                 cx.notify();
             }))
             .child(chevron)
@@ -889,6 +959,26 @@ impl Changes {
                         .text_size(px(10.0))
                         .text_color(theme.text_faint)
                         .child(SharedString::from("BIN")),
+                )
+            })
+            .when_some(annotation_anchor, |el, anchor| {
+                el.child(
+                    div()
+                        .id(SharedString::from(format!("file-notes-{ix}")))
+                        .flex_none()
+                        .px(px(Theme::SPACE_SM))
+                        .py(px(2.0))
+                        .rounded(px(Theme::CONTROL_RADIUS))
+                        .border_1()
+                        .border_color(theme.border)
+                        .text_size(px(10.0))
+                        .text_color(theme.text_muted)
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme.surface_raised_hover))
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(ChangesEvent::OpenAnnotations(anchor.clone()));
+                        }))
+                        .child(SharedString::from(if has_notes { "Notes" } else { "Note" })),
                 )
             })
             .when(adds > 0 || !file.binary, |el| {
@@ -988,7 +1078,9 @@ fn diff_token_color(class: crate::markdown::highlight::TokenClass, theme: &Theme
 fn render_file_body(
     file: &FileDiff,
     highlight: Option<Arc<Vec<Vec<Token>>>>,
+    annotation_anchor: Option<comet_proto::SemanticAnchor>,
     theme: &Theme,
+    cx: &mut Context<Changes>,
 ) -> AnyElement {
     let mono = font(theme.font_mono.clone());
     let mut line_ix = 0usize;
@@ -1009,17 +1101,26 @@ fn render_file_body(
         );
     }
 
-    // Row tints sampled from the reference: ~5–6% washes over the pane tone.
     let mut add_bg = add_color(theme);
     add_bg.a = 0.055;
     let mut del_bg = del_color(theme);
     del_bg.a = 0.055;
-    // Bluish-grey hunk-header wash.
     let hunk_bg = theme.diff_hunk_bg;
 
-    for hunk in &file.hunks {
+    for (hunk_ix, hunk) in file.hunks.iter().enumerate() {
+        let hunk_anchor = annotation_anchor.clone().map(|mut anchor| {
+            anchor.exact = Some(crate::multiplayer::bounded_anchor_exact(&hunk.header));
+            anchor.byte_range = None;
+            anchor.prefix_hash = None;
+            anchor.suffix_hash = None;
+            anchor
+        });
         children.push(
             div()
+                .id(SharedString::from(format!(
+                    "diff-section-{}-{hunk_ix}",
+                    file.path
+                )))
                 .h(px(HUNK_HEADER_HEIGHT))
                 .flex_none()
                 .flex()
@@ -1029,6 +1130,13 @@ fn render_file_body(
                 .font_family(theme.font_mono.clone())
                 .text_size(px(11.0))
                 .text_color(theme.text_faint)
+                .when_some(hunk_anchor, |el, anchor| {
+                    el.cursor_pointer()
+                        .hover(|style| style.bg(theme.surface_raised_hover))
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(ChangesEvent::OpenAnnotations(anchor.clone()));
+                        }))
+                })
                 .child(SharedString::from(hunk.header.clone()))
                 .into_any_element(),
         );
@@ -1036,7 +1144,7 @@ fn render_file_body(
             let tokens = highlight
                 .as_ref()
                 .and_then(|lines| lines.get(line_ix))
-                .map(|t| t.as_slice())
+                .map(|tokens| tokens.as_slice())
                 .unwrap_or(&[]);
             line_ix += 1;
 
@@ -1094,7 +1202,7 @@ fn render_file_body(
                     .justify_end()
                     .pr(px(8.0))
                     .child(SharedString::from(
-                        no.map(|n| n.to_string()).unwrap_or_default(),
+                        no.map(|number| number.to_string()).unwrap_or_default(),
                     ))
             };
             let runs = render::runs_with_palette(
@@ -1104,6 +1212,18 @@ fn render_file_body(
                 theme.text.opacity(0.92),
                 |class| diff_token_color(class, theme),
             );
+            let line_anchor = annotation_anchor.clone().map(|mut anchor| {
+                anchor.exact = Some(crate::multiplayer::bounded_anchor_exact(&line.text));
+                anchor.byte_range = None;
+                anchor.prefix_hash = None;
+                anchor.suffix_hash = None;
+                anchor
+            });
+            let marker_id = format!(
+                "diff-note-{}-{}",
+                file.path,
+                line.new_no.or(line.old_no).unwrap_or(line_ix as u32)
+            );
             children.push(
                 div()
                     .h(px(DIFF_LINE_HEIGHT))
@@ -1112,8 +1232,6 @@ fn render_file_body(
                     .flex_row()
                     .items_center()
                     .when_some(row_bg, |el, bg| el.bg(bg))
-                    // Accent bar: solid colour on +/− rows, invisible spacer on
-                    // context rows so columns always align.
                     .child(
                         div()
                             .w(px(ACCENT_BAR_WIDTH))
@@ -1139,13 +1257,23 @@ fn render_file_body(
                     ))
                     .child(
                         div()
+                            .id(SharedString::from(marker_id))
                             .w(px(MARKER_WIDTH))
+                            .h_full()
                             .flex_none()
                             .flex()
+                            .items_center()
                             .justify_center()
                             .text_size(px(DIFF_TEXT_SIZE))
                             .text_color(marker_color)
                             .font_family(theme.font_mono.clone())
+                            .when_some(line_anchor, |el, anchor| {
+                                el.cursor_pointer()
+                                    .hover(|style| style.bg(theme.surface_raised_hover))
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.emit(ChangesEvent::OpenAnnotations(anchor.clone()));
+                                    }))
+                            })
                             .child(SharedString::from(marker)),
                     )
                     .child(
@@ -1188,24 +1316,18 @@ impl Render for Changes {
         let content: AnyElement = match phase {
             DiffPhase::Preparing => div()
                 .flex_1()
+                .p(px(Theme::SPACE_MD))
                 .flex()
                 .flex_col()
-                .items_center()
-                .justify_center()
                 .gap(px(Theme::SPACE_SM))
-                .child(crate::loaders::gradient_spinner(
-                    "changes-preparing",
-                    &theme,
-                    3.0,
-                    cx.entity_id(),
-                    cx,
-                ))
-                .child(
+                .children((0..4).map(|index| {
                     div()
-                        .text_size(px(12.0))
-                        .text_color(theme.text_faint)
-                        .child(SharedString::from("Preparing diff…")),
-                )
+                        .h(px(if index == 0 { 36.0 } else { 64.0 }))
+                        .w_full()
+                        .rounded(px(Theme::CONTROL_RADIUS))
+                        .bg(theme.element_hover)
+                        .opacity(0.45)
+                }))
                 .into_any_element(),
             DiffPhase::Clean => div()
                 .flex_1()
@@ -1231,19 +1353,22 @@ impl Render for Changes {
                         )
                         .into_any_element()
                 } else {
-                    // Diff known, parse still running.
+                    // Diff known, parse still running. Keep its eventual
+                    // file-row geometry stable instead of centering a spinner.
                     div()
                         .flex_1()
+                        .p(px(Theme::SPACE_MD))
                         .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(crate::loaders::gradient_spinner(
-                            "changes-parsing",
-                            &theme,
-                            3.0,
-                            cx.entity_id(),
-                            cx,
-                        ))
+                        .flex_col()
+                        .gap(px(Theme::SPACE_SM))
+                        .children((0..3).map(|_| {
+                            div()
+                                .h(px(64.0))
+                                .w_full()
+                                .rounded(px(Theme::CONTROL_RADIUS))
+                                .bg(theme.element_hover)
+                                .opacity(0.45)
+                        }))
                         .into_any_element()
                 }
             }

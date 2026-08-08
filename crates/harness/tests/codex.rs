@@ -369,7 +369,12 @@ async fn approvals_round_trip_as_input_requests() {
                 .iter()
                 .map(|q| UserInputAnswer {
                     question_id: q.id.clone(),
-                    labels: vec!["Yes".into()],
+                    labels: vec![
+                        q.options
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "typed answer".into()),
+                    ],
                 })
                 .collect();
             let _ = tx.send(answers);
@@ -378,17 +383,19 @@ async fn approvals_round_trip_as_input_requests() {
         steering: steer_rx,
         interrupt: token.clone(),
     };
-    let mut req = request("scenario:approve");
-    req.auto_approve = false;
-    let events = run_to_end(&harness(), req, controls).await;
+    let events = run_to_end(&harness(), request("scenario:approve"), controls).await;
 
     let asked = asked.lock().unwrap();
-    assert_eq!(asked.len(), 2, "{events:?}");
+    assert_eq!(asked.len(), 5, "{events:?}");
     assert_eq!(asked[0].header, "Approve command");
     assert!(asked[0].question.contains("rm -rf /tmp/x"));
     assert_eq!(asked[0].options, vec!["Yes".to_string(), "No".to_string()]);
     assert_eq!(asked[1].header, "Approve file change");
     assert!(asked[1].question.contains("/tmp/a.rs"));
+    assert_eq!(asked[2].header, "Grant access");
+    assert!(asked[2].question.contains("Connect to the provider"));
+    assert_eq!(asked[3].header, "Safety check");
+    assert_eq!(asked[4].header, "Region");
     assert!(
         !events.iter().any(|e| matches!(
             e,

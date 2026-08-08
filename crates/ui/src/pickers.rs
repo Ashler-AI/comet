@@ -22,13 +22,13 @@ use gpui::{
 
 use comet_engine::registry::HarnessDescriptor;
 use comet_proto::{
-    ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel,
+    ChatConfig, FolderListing, HarnessCommand, HarnessId, Model, ReasoningLevel, RepoRef,
+    SandboxLevel,
 };
 use comet_rpc::methods;
 
-/// Display cap for the ref list (t3code shows pages of 100 with a status
-/// footer; a flat cap + "Showing X of Y refs" reads the same without
-/// pagination plumbing).
+/// Display cap for the ref list. A status footer states how many refs are
+/// visible when the list is capped.
 const MAX_REF_ROWS: usize = 300;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
@@ -55,11 +55,11 @@ pub struct DraftConfig {
     /// The picked ref (base branch in NewWorktree mode; a worktree's branch
     /// when reusing one). `None` = the repo's current branch.
     pub branch: Option<String>,
-    /// Where the new session runs (the t3code env-mode).
+    /// Where the new session runs.
     pub checkout: CheckoutKind,
 }
 
-/// Where a new session runs (t3code's env-mode: `local | worktree`). "Current
+/// Where a new session runs (`local | worktree`). "Current
 /// worktree" is NOT a third mode — it's `Local` when the picked ref is already
 /// materialized as a worktree (the session reuses that checkout's path).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -257,6 +257,16 @@ pub enum PickerKind {
     HarnessModel,
     Traits,
 }
+fn is_pending_scaffold_selection(
+    selected_chat: Option<&str>,
+    pending_scaffold_chat: Option<&str>,
+) -> bool {
+    selected_chat.is_some() && selected_chat == pending_scaffold_chat
+}
+
+fn draft_config_applies(selected_chat: Option<&str>, pending_scaffold_chat: Option<&str>) -> bool {
+    selected_chat.is_none() || is_pending_scaffold_selection(selected_chat, pending_scaffold_chat)
+}
 
 pub struct Pickers {
     state: Entity<AppState>,
@@ -275,6 +285,7 @@ pub struct Pickers {
     open: Option<PickerKind>,
     harnesses: Loadable<Vec<HarnessDescriptor>>,
     models: HashMap<HarnessId, Loadable<Vec<Model>>>,
+    commands: HashMap<HarnessId, Loadable<Vec<HarnessCommand>>>,
     refs: Loadable<Vec<RepoRef>>,
     /// Space id the `refs` slot belongs to (invalidated on space change).
     refs_space: Option<String>,
@@ -316,8 +327,9 @@ impl Pickers {
                 cx.notify();
             }
             ComposerInputEvent::Submitted => this.on_search_submit(cx),
-            // Pasted images/files don't apply to a search box.
+            // Attachment events don't apply to a generic search box.
             ComposerInputEvent::PastedImages(_)
+            | ComposerInputEvent::PastedText(_)
             | ComposerInputEvent::PastedPaths(_)
             | ComposerInputEvent::CursorMoved
             | ComposerInputEvent::ViewportChanged
@@ -326,21 +338,30 @@ impl Pickers {
             | ComposerInputEvent::MentionDismiss => {}
         });
         // Chat selection / config changes must re-render the chips (child views
-        // only re-render on their own notify). A selection change also drops
-        // the draft picks — they belonged to the previous chat/new-chat canvas.
+        // only re-render on their own notify). A selection change normally
+        // drops draft picks so they cannot leak into another chat. The pending
+        // Scaffold chat is the exception: it is deliberately created before
+        // first send, and its draft must carry the chosen harness into that
+        // first prompt.
         let state_observe = cx.observe(&state, |this: &mut Self, state, cx| {
-            let selected = state.read(cx).selected_chat.clone();
+            let state = state.read(cx);
+            let selected = state.selected_chat.clone();
+            let pending_scaffold_chat = state
+                .scaffold_session_draft()
+                .map(|draft| draft.chat_id.as_str());
             if selected != this.draft_owner {
-                this.draft_owner = selected;
-                this.config.harness = None;
-                this.config.model = None;
-                this.config.reasoning = None;
-                this.config.model_options.clear();
+                this.draft_owner = selected.clone();
+                if !is_pending_scaffold_selection(selected.as_deref(), pending_scaffold_chat) {
+                    this.config.harness = None;
+                    this.config.model = None;
+                    this.config.reasoning = None;
+                    this.config.model_options.clear();
+                }
                 this.switch_error = None;
             }
             // A space switch invalidates the branch draft + cache — the folder
             // (and possibly the device) changed under them.
-            let space = state.read(cx).selected_space.clone();
+            let space = state.selected_space.clone();
             if space != this.space_owner {
                 this.space_owner = space;
                 this.config.branch = None;
@@ -351,6 +372,7 @@ impl Pickers {
                 // a space switch may land on another device, so refetch.
                 this.harnesses = Loadable::Idle;
                 this.models.clear();
+                this.commands.clear();
             }
             cx.notify();
         });
@@ -383,6 +405,7 @@ impl Pickers {
             open,
             harnesses: Loadable::Idle,
             models: HashMap::new(),
+            commands: HashMap::new(),
             refs: Loadable::Idle,
             refs_space: None,
             active: 0,
@@ -415,9 +438,21 @@ impl Pickers {
         &self.config
     }
 
-    /// Harness is locked once the chat exists (feature-inventory §1.7).
+    /// Harness is locked once a persisted chat owns its run configuration.
+    /// A pending Scaffold chat is still a first-send draft even though its
+    /// local chat row already exists.
     fn harness_locked(&self, cx: &App) -> bool {
-        self.state.read(cx).selected_chat.is_some()
+        !self.draft_config_applies(cx)
+    }
+
+    fn draft_config_applies(&self, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        draft_config_applies(
+            state.selected_chat.as_deref(),
+            state
+                .scaffold_session_draft()
+                .map(|draft| draft.chat_id.as_str()),
+        )
     }
 
     fn engine(&self, cx: &App) -> Option<EngineHandle> {
@@ -435,18 +470,19 @@ impl Pickers {
         (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device)
     }
 
-    /// Effective harness: picked, or the chat's config, or the first listed.
+    /// Effective harness: a persisted chat owns its harness; otherwise use the
+    /// first-send draft, remembered default, or first listed harness.
     fn effective_harness(&self, cx: &App) -> Option<HarnessId> {
+        if let Some(chat) = self.state.read(cx).selected_chat_row() {
+            if let Some(config) = chat.config.as_ref() {
+                return Some(config.harness);
+            }
+            if !self.draft_config_applies(cx) {
+                return None;
+            }
+        }
         if let Some(harness) = self.config.harness {
             return Some(harness);
-        }
-        if let Some(config) = self
-            .state
-            .read(cx)
-            .selected_chat_row()
-            .and_then(|c| c.config.as_ref())
-        {
-            return Some(config.harness);
         }
         // New-chat canvas: the remembered last-used harness (sticky defaults),
         // when the loaded catalog still offers it.
@@ -468,30 +504,42 @@ impl Pickers {
             .and_then(|list| visible_harnesses(list).first().map(|d| d.id))
     }
 
-    /// Effective model id: the draft pick, the selected chat's config, or (on
-    /// the new-chat canvas) the remembered last-used model for the harness.
+    /// Effective model id: a persisted chat owns its model; the draft and
+    /// remembered defaults also apply to a pending first-send Scaffold chat.
     fn effective_model_id<'a>(&'a self, cx: &'a App) -> Option<&'a str> {
+        if let Some(chat) = self.state.read(cx).selected_chat_row() {
+            if let Some(config) = chat.config.as_ref() {
+                return config.model.as_deref();
+            }
+            if !self.draft_config_applies(cx) {
+                return None;
+            }
+        }
         if let Some(id) = self.config.model.as_deref() {
             return Some(id);
         }
-        if let Some(chat) = self.state.read(cx).selected_chat_row() {
-            return chat.config.as_ref().and_then(|c| c.model.as_deref());
-        }
         let harness = self.effective_harness(cx)?;
-        self.defaults.model_for(harness).map(|m| m.id.as_str())
+        self.defaults
+            .model_for(harness)
+            .map(|model| model.id.as_str())
     }
 
     /// Effective reasoning — always concrete once the model is known: the
     /// draft pick / chat config / remembered default, clamped to the selected
     /// model's ladder, falling back to the model's default level.
     fn effective_reasoning(&self, cx: &App) -> Option<ReasoningLevel> {
-        let explicit = self.config.reasoning.or_else(|| {
-            match self.state.read(cx).selected_chat_row() {
-                Some(chat) => chat.config.as_ref().and_then(|c| c.reasoning),
-                // New chat: the remembered last-used level.
-                None => self.defaults.reasoning,
-            }
-        });
+        let chat_config = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .and_then(|chat| chat.config.as_ref());
+        let explicit = if let Some(config) = chat_config {
+            config.reasoning
+        } else if self.draft_config_applies(cx) {
+            self.config.reasoning.or(self.defaults.reasoning)
+        } else {
+            None
+        };
         if self.selected_model(cx).is_none() {
             // Catalog not loaded yet: show the explicit value as-is (nothing
             // to clamp against); it resolves to a concrete level on load.
@@ -515,18 +563,21 @@ impl Pickers {
         }
     }
 
-    /// The explicit (non-default) option picks: the chat's persisted
-    /// selections for existing chats, the draft's for the new-chat canvas.
+    /// The explicit (non-default) option picks: the persisted chat's
+    /// selections, or the first-send draft's selections.
     fn explicit_options(&self, cx: &App) -> serde_json::Map<String, serde_json::Value> {
-        match self
+        if let Some(config) = self
             .state
             .read(cx)
             .selected_chat_row()
-            .and_then(|c| c.config.as_ref())
+            .and_then(|chat| chat.config.as_ref())
         {
-            Some(config) => config.model_options.clone(),
-            None => self.config.model_options.clone(),
+            return config.model_options.clone();
         }
+        if self.draft_config_applies(cx) {
+            return self.config.model_options.clone();
+        }
+        serde_json::Map::new()
     }
 
     /// The fully-resolved config the composer threads into the Run request and
@@ -552,6 +603,15 @@ impl Pickers {
             self.suppressed = Some((kind, Instant::now()));
         }
         cx.notify();
+    }
+
+    /// Close the active composer picker. Returns whether a picker was open.
+    pub fn dismiss(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.open.is_none() {
+            return false;
+        }
+        self.close(cx);
+        true
     }
 
     /// Capture knob (`COMET_OPEN_DIALOG=model`): open the combined
@@ -624,6 +684,7 @@ impl Pickers {
                 self.ensure_harnesses(cx);
                 if let Some(harness) = self.effective_harness(cx) {
                     self.ensure_models(harness, cx);
+                    self.ensure_commands(harness, cx);
                 }
             }
         }
@@ -666,6 +727,7 @@ impl Pickers {
                 };
                 if let Some(harness) = pickers.effective_harness(cx) {
                     pickers.ensure_models(harness, cx);
+                    pickers.ensure_commands(harness, cx);
                 }
                 cx.notify();
             })
@@ -719,6 +781,77 @@ impl Pickers {
             .ok();
         })
         .detach();
+    }
+
+    fn command_cwd(&self, cx: &App) -> String {
+        let state = self.state.read(cx);
+        if let Some(cwd) = state
+            .selected_chat_row()
+            .and_then(|chat| chat.cwd.as_deref())
+        {
+            return cwd.to_string();
+        }
+        state
+            .selected_space_row()
+            .map(|space| space.path.clone())
+            .unwrap_or_default()
+    }
+
+    fn ensure_commands(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+        if self
+            .commands
+            .get(&harness)
+            .is_some_and(|slot| !matches!(slot, Loadable::Idle))
+        {
+            return;
+        }
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        let target = self.space_target(cx);
+        let cwd = self.command_cwd(cx);
+        self.commands.insert(harness, Loadable::Loading);
+        cx.spawn(async move |this, cx| {
+            let mut params = serde_json::json!({ "harness": harness, "cwd": cwd });
+            if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
+                object.insert(
+                    "targetDeviceId".into(),
+                    serde_json::Value::String(target.clone()),
+                );
+            }
+            let result = engine
+                .client()
+                .call(methods::LIST_HARNESS_COMMANDS, params)
+                .await;
+            this.update(cx, |pickers, cx| {
+                let loaded = match result {
+                    Ok(value) => match serde_json::from_value::<Vec<HarnessCommand>>(value) {
+                        Ok(commands) => Loadable::Ready(commands),
+                        Err(err) => Loadable::Error(err.to_string()),
+                    },
+                    Err(err) => Loadable::Error(err.to_string()),
+                };
+                pickers.commands.insert(harness, loaded);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn prepare_harness_commands(&mut self, cx: &mut Context<Self>) {
+        self.ensure_harnesses(cx);
+        if let Some(harness) = self.effective_harness(cx) {
+            self.ensure_commands(harness, cx);
+        }
+    }
+
+    pub fn harness_commands<'a>(&'a self, cx: &App) -> &'a [HarnessCommand] {
+        self.effective_harness(cx)
+            .and_then(|harness| self.commands.get(&harness))
+            .and_then(Loadable::ready)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
     /// ListRefs for the selected SPACE's folder — targeted at the space's
@@ -796,15 +929,14 @@ impl Pickers {
     // ---- selections ----
 
     fn pick_ref(&mut self, row: RepoRef, cx: &mut Context<Self>) {
-        // Existing session: the pick SWITCHES the session's checkout (the
-        // t3code mid-session `switchRef`) instead of updating the draft.
-        if self.state.read(cx).selected_chat_row().is_some() {
+        // Persisted-session ref picks switch its checkout. A pending Scaffold
+        // chat is still a first-send draft and must only update that draft.
+        if self.state.read(cx).selected_chat_row().is_some() && !self.draft_config_applies(cx) {
             self.switch_session_ref(row, cx);
             return;
         }
         if row.worktree_path.is_some() {
-            // Reuse the ref's existing worktree ("Current worktree") — the
-            // t3code `reuseExistingWorktree` path.
+            // Reuse the ref's existing worktree ("Current worktree").
             self.config.branch = Some(row.name.clone());
             self.config.checkout = CheckoutKind::Local;
         } else if self.config.checkout == CheckoutKind::NewWorktree || row.current {
@@ -812,7 +944,7 @@ impl Pickers {
             self.config.branch = Some(row.name.clone());
         } else {
             // Local mode + a plain non-current ref: CHECK OUT the space
-            // folder (full t3code `switchRef` — picking `main` means "put my
+            // folder. Picking `main` means "put my
             // local checkout on main", it must never flip the mode).
             self.switch_draft_ref(row, cx);
             return;
@@ -875,13 +1007,13 @@ impl Pickers {
         cx.notify();
     }
 
-    /// Mid-session ref switch, two shapes (both t3code):
+    /// Mid-session ref switch, two shapes:
     ///
     /// - The picked ref already lives in ANOTHER worktree → RETARGET the
     ///   session onto that worktree (`reuseExistingWorktree`): a `setChatCwd`
     ///   + `setChatBranch` mutate, no git. Resume is cwd-scoped, so the next
-    ///   run there starts a fresh harness conversation — the transcript
-    ///   itself carries on.
+    ///     run there starts a fresh harness conversation — the transcript
+    ///     itself carries on.
     /// - Otherwise → `git checkout` in the SESSION's own cwd (`SwitchRef`,
     ///   relay-forwarded to the host device). The host's HEAD watcher
     ///   reconciles `chat.branch` to every device. Errors (dirty tree, ref
@@ -998,6 +1130,7 @@ impl Pickers {
         self.save_defaults();
         self.model_scroll.set_offset(gpui::Point::default());
         self.ensure_models(harness, cx);
+        self.ensure_commands(harness, cx);
         cx.notify();
     }
 
@@ -1184,7 +1317,7 @@ impl Pickers {
             .collect()
     }
 
-    // ---- checkout resolution (the t3code env-mode semantics) ----
+    // ---- checkout resolution ----
 
     /// Index of the highlighted-by-default row in the (filtered) ref list:
     /// the session's branch on an existing chat, the draft pick on a new one,
@@ -1244,8 +1377,7 @@ impl Pickers {
         }
     }
 
-    /// Label of the checkout-kind trigger (t3code `resolveEnvModeLabel` /
-    /// `resolveCurrentWorkspaceLabel`).
+    /// Label of the checkout-kind trigger.
     fn checkout_label(&self) -> &'static str {
         match self.config.checkout {
             CheckoutKind::NewWorktree => "New worktree",
@@ -1260,7 +1392,7 @@ impl Pickers {
     }
 
     /// Label of the ref trigger: `From <ref>` only when a NEW worktree will be
-    /// created off it (t3code `getBranchTriggerLabel`); the bare name otherwise.
+    /// created off it; the bare name otherwise.
     fn ref_label(&self) -> SharedString {
         match (self.config.checkout, self.effective_ref_name()) {
             (_, None) => SharedString::from("Select ref"),
@@ -1337,7 +1469,6 @@ impl Pickers {
         &self,
         kind: PickerKind,
         label: SharedString,
-        set: bool,
         chip_icon: Option<(&'static str, Option<gpui::Hsla>)>,
         suffix: Option<SharedString>,
         theme: &Theme,
@@ -1368,15 +1499,7 @@ impl Pickers {
             .font_weight(gpui::FontWeight::MEDIUM)
             // comet composer/styles.tsx `pill`: `transition-colors` — the wash
             // and text brighten fade over 150ms.
-            .text_color(motion::hover_blend(
-                id,
-                if set {
-                    theme.text.opacity(0.9)
-                } else {
-                    theme.text_muted
-                },
-                theme.text,
-            ))
+            .text_color(motion::hover_blend(id, theme.text.opacity(0.9), theme.text))
             .bg(if open {
                 theme.element_hover
             } else {
@@ -1405,7 +1528,7 @@ impl Pickers {
             })
     }
 
-    /// A footer-row trigger (t3code ghost `Button size="xs"`): leading icon,
+    /// A compact footer-row trigger: leading icon,
     /// truncating label, trailing chevron — smaller and quieter than the
     /// in-pill chips.
     fn footer_chip(
@@ -1456,8 +1579,7 @@ impl Pickers {
             )
     }
 
-    /// A read-only footer label (locked sessions — t3code's
-    /// `resolveLockedWorkspaceLabel` span).
+    /// A read-only footer label for locked sessions.
     fn footer_label(icon_path: &'static str, label: SharedString, theme: &Theme) -> gpui::Div {
         div()
             .h(px(20.0))
@@ -1478,10 +1600,11 @@ impl Pickers {
             .child(div().min_w_0().truncate().child(label))
     }
 
-    /// The composer footer row (t3code BranchToolbar): checkout-kind on the
-    /// left, the ref selector right-aligned. `None` for non-git spaces. On an
-    /// existing session both sides are read-only labels ("Worktree" /
-    /// "Local checkout" + the chat's branch).
+    /// The composer footer row: checkout-kind on the
+    /// left, the ref selector right-aligned. `None` for non-git spaces. On a
+    /// persisted session both sides are read-only labels ("Worktree" /
+    /// "Local checkout" + the chat's branch). A pending Scaffold chat remains
+    /// editable until its first send commits the run configuration.
     pub fn render_footer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
         // A selected chat whose workspace row hasn't synced yet (the moment
@@ -1491,10 +1614,15 @@ impl Pickers {
         let (space, session) = {
             let state = self.state.read(cx);
             let space = state.selected_space_row().cloned()?;
-            let session = state
-                .selected_chat
-                .as_ref()
-                .and_then(|_| state.selected_chat_row().cloned());
+            let selected_chat = state.selected_chat.as_deref();
+            let pending_scaffold_chat = state
+                .scaffold_session_draft()
+                .map(|draft| draft.chat_id.as_str());
+            let session = if draft_config_applies(selected_chat, pending_scaffold_chat) {
+                None
+            } else {
+                selected_chat.and_then(|_| state.selected_chat_row().cloned())
+            };
             (space, session)
         };
         if !space.git_detected {
@@ -1518,9 +1646,8 @@ impl Pickers {
             .px(px(10.0))
             .mb(px(-8.0));
 
-        // The ref side is LIVE in both modes: draft pick on a new chat,
-        // checkout switch on an existing session (t3code keeps its branch
-        // selector interactive mid-session too).
+        // The ref side stays live for both draft picks and existing-session
+        // checkout switches.
         let ref_label = match &session {
             Some(chat) => chat
                 .branch
@@ -1666,7 +1793,7 @@ impl Pickers {
             .into_any_element()
     }
 
-    /// The ref picker (t3code BranchToolbarBranchSelector): search on top,
+    /// The ref picker: search on top,
     /// rows with right-aligned muted `current`/`worktree` tags, and a
     /// "Showing X of Y refs" footer when the list is capped.
     fn render_branch_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -1720,8 +1847,7 @@ impl Pickers {
                             |(ix, row)| {
                                 let label: SharedString = row.name.clone().into();
                                 let is_selected = selected.as_deref() == Some(row.name.as_str());
-                                // Right-aligned muted tag (t3code `text-[10px]
-                                // text-muted-foreground/45`): current beats worktree.
+                                // Right-aligned muted tag: current beats worktree.
                                 let tag: Option<&'static str> = if row.current {
                                     Some("current")
                                 } else if row.worktree_path.is_some() {
@@ -1802,7 +1928,7 @@ impl Pickers {
         popover.into_any_element()
     }
 
-    /// The checkout-kind dropdown (t3code BranchToolbarEnvModeSelector): two
+    /// The checkout-kind dropdown: two
     /// rows — "Current checkout"/"Current worktree" (local) and "New worktree".
     fn render_checkout_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
@@ -2279,9 +2405,9 @@ fn trait_chip(theme: &Theme, active: bool) -> gpui::Div {
         })
 }
 
-/// Brand mark + optional tint for a harness (the Claude mark keeps its brand
-/// orange even on the monochrome surface; the mock harness scripts
-/// Claude-flavoured runs, so it wears the Claude mark).
+/// Brand mark + optional tint for a harness. Imported-only OpenCode provenance
+/// uses the neutral terminal glyph because it has no registered executable or
+/// product-owned brand asset.
 pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gpui::Hsla>) {
     match harness {
         HarnessId::ClaudeCode | HarnessId::Mock => (
@@ -2289,6 +2415,9 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
             Some(crate::icons::claude_brand()),
         ),
         HarnessId::Codex => (crate::icons::OPENAI_MARK, None),
+        HarnessId::Omp => (crate::icons::COMET_LOGO, None),
+        HarnessId::PrimeAgent => (crate::icons::COMET_LOGO, None),
+        HarnessId::OpenCode => (crate::icons::TERMINAL, None),
         HarnessId::Cursor => (crate::icons::CURSOR_MARK, None),
     }
 }
@@ -2370,8 +2499,7 @@ fn attach_overlay(
     chip
 }
 
-/// [`attach_overlay`] with the menu RIGHT-ALIGNED to the trigger (t3code
-/// `align="end"` — right-edge triggers like the ref picker open leftward).
+/// [`attach_overlay`] with the menu right-aligned to the trigger.
 fn attach_overlay_end(
     chip: gpui::Stateful<gpui::Div>,
     overlay: &mut Option<(PickerKind, AnyElement)>,
@@ -2423,6 +2551,7 @@ impl Render for Pickers {
         self.ensure_harnesses(cx);
         if let Some(harness) = self.effective_harness(cx) {
             self.ensure_models(harness, cx);
+            self.ensure_commands(harness, cx);
         }
         // A popover opened data-side (COMET_OPEN_PICKER) never went through
         // `toggle`, so kick its loads here (all ensure_* are idempotent).
@@ -2506,7 +2635,6 @@ impl Render for Pickers {
         let combined_chip = self.trigger_chip(
             PickerKind::HarnessModel,
             model_label,
-            true,
             Some(harness_icon),
             Some(traits_label),
             &theme,
@@ -2544,6 +2672,24 @@ impl Render for Pickers {
 mod tests {
     use super::*;
     use comet_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+
+    #[test]
+    fn pending_scaffold_chat_keeps_first_send_draft_config() {
+        assert!(draft_config_applies(None, None));
+        assert!(draft_config_applies(
+            Some("scaffold-chat"),
+            Some("scaffold-chat")
+        ));
+        assert!(is_pending_scaffold_selection(
+            Some("scaffold-chat"),
+            Some("scaffold-chat")
+        ));
+        assert!(!draft_config_applies(Some("ordinary-chat"), None));
+        assert!(!draft_config_applies(
+            Some("ordinary-chat"),
+            Some("different-scaffold-chat")
+        ));
+    }
 
     #[test]
     fn traits_summary_formats_non_defaults() {

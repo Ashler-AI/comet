@@ -17,8 +17,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the engine without a UI (VPS / remote device mode).
-    Headless,
+    /// Run without the desktop app.
+    Headless(HeadlessArgs),
     /// Sign in (paste-code flow), persist the session, and exit.
     Login,
     /// Remove the saved session.
@@ -41,9 +41,62 @@ enum Command {
     },
 }
 
+#[derive(clap::Args)]
+struct HeadlessArgs {
+    /// Mode-0600, single-use JSON bootstrap file written by Scaffold.
+    #[arg(long)]
+    device_bootstrap_file: Option<std::path::PathBuf>,
+    #[arg(long)]
+    edge_url: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceBootstrapFile {
+    device_join_grant: String,
+    project_id: String,
+    deployment_id: String,
+    session_id: String,
+    device_id: String,
+    sandbox_id: String,
+}
+
+impl HeadlessArgs {
+    fn into_bootstrap(self) -> anyhow::Result<Option<comet_engine::DeviceBootstrapConfig>> {
+        let Some(path) = self.device_bootstrap_file else {
+            return Ok(None);
+        };
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if !metadata.is_file() || metadata.len() > 16 * 1024 {
+            anyhow::bail!("device_join_grant_unavailable");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                anyhow::bail!("device_join_grant_unavailable");
+            }
+        }
+        let bytes = std::fs::read(&path);
+        // A bootstrap credential is single use. Remove it before parsing or
+        // making any network request, including on malformed input.
+        let _ = std::fs::remove_file(&path);
+        let bootstrap: DeviceBootstrapFile = serde_json::from_slice(&bytes?)
+            .map_err(|_| anyhow::anyhow!("device_join_grant_unavailable"))?;
+        Ok(Some(comet_engine::DeviceBootstrapConfig {
+            device_join_grant: bootstrap.device_join_grant,
+            project_id: bootstrap.project_id,
+            deployment_id: bootstrap.deployment_id,
+            session_id: bootstrap.session_id,
+            device_id: bootstrap.device_id,
+            sandbox_id: bootstrap.sandbox_id,
+        }))
+    }
+}
+
 #[derive(Subcommand)]
 enum DaemonCommand {
-    /// Install, enable, and start the service (captures COMET_* env).
+    /// Install, enable, and start the service with approved non-secret overrides.
     Install,
     /// Stop and remove the service.
     Uninstall,
@@ -57,34 +110,44 @@ enum DaemonCommand {
     Status,
 }
 
-/// Production edge (Cloudflare Worker + Durable Objects on the zeron.sh zone).
-/// `COMET_EDGE_URL` overrides (local dev / self-hosting).
-const DEFAULT_EDGE_URL: &str = "https://edge.comet.zeron.sh";
+const STAGING_EDGE_URL: &str = "https://comet-staging.internal.ashler.com";
+const PRODUCTION_EDGE_URL: &str = "https://comet.internal.ashler.com";
+const STAGING_SCAFFOLD_URL: &str = "https://scaffold-staging.internal.ashler.com";
+const PRODUCTION_SCAFFOLD_URL: &str = "https://scaffold.internal.ashler.com";
+const STAGING_PROJECT_SCOPE: &str = "ashler-staging";
+const PRODUCTION_PROJECT_SCOPE: &str = "ashler-production";
 
-/// Production WorkOS AuthKit client id — public knowledge (it appears in every
-/// authorize URL), so baking it in is safe. Overridden by `COMET_WORKOS_CLIENT_ID`;
-/// set it to the empty string — or set a dev bearer via `COMET_EDGE_TOKEN` — to
-/// force dev-mode auth instead.
-const DEFAULT_WORKOS_CLIENT_ID: &str = "client_01KWD0EAKZKD50YCQJNYSRE4BY";
+fn release_defaults() -> (&'static str, &'static str, &'static str) {
+    if option_env!("COMET_DEFAULT_ENVIRONMENT") == Some("production") {
+        (
+            PRODUCTION_EDGE_URL,
+            PRODUCTION_SCAFFOLD_URL,
+            PRODUCTION_PROJECT_SCOPE,
+        )
+    } else {
+        (
+            STAGING_EDGE_URL,
+            STAGING_SCAFFOLD_URL,
+            STAGING_PROJECT_SCOPE,
+        )
+    }
+}
 
 fn edge_url_from_env() -> String {
     std::env::var("COMET_EDGE_URL")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_EDGE_URL.into())
+        .unwrap_or_else(|| release_defaults().0.into())
 }
 
-/// WorkOS client id resolution: explicit env wins (empty string = dev mode);
-/// otherwise a `COMET_EDGE_TOKEN` dev bearer keeps dev mode (smoke tests,
-/// local wrangler); otherwise the baked production client id — so a bare
-/// `comet headless` signs in against production with zero configuration.
-fn workos_client_id_from_env(edge_token: &Option<String>) -> Option<String> {
-    match std::env::var("COMET_WORKOS_CLIENT_ID") {
-        Ok(v) if v.trim().is_empty() => None,
-        Ok(v) => Some(v),
-        Err(_) if edge_token.is_some() => None,
-        Err(_) => Some(DEFAULT_WORKOS_CLIENT_ID.into()),
+fn scaffold_url_from_env(edge_token: &Option<String>) -> Option<String> {
+    if edge_token.is_some() {
+        return None;
     }
+    std::env::var("COMET_SCAFFOLD_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| Some(release_defaults().1.into()))
 }
 
 /// mimalloc: system malloc (macOS libmalloc especially) never returns the
@@ -94,14 +157,23 @@ fn workos_client_id_from_env(edge_token: &Option<String>) -> Option<String> {
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let mut args = std::env::args_os().collect::<Vec<_>>();
+    let initial_url = args
+        .get(1)
+        .and_then(|value| value.to_str())
+        .filter(|value| value.starts_with("comet://invite/"))
+        .map(str::to_owned);
+    if initial_url.is_some() {
+        args.remove(1);
+    }
+    let cli = Cli::parse_from(args);
     // Long-running modes log at info, one-shot CLI commands at warn (RUST_LOG
     // overrides either).
     // loro's internal block-encode diagnostics log at info and flood
     // journald on every snapshot export — enough to fill a disk on a
     // long-running headless host. Quiet them by default (RUST_LOG still
     // overrides the whole filter).
-    let long_running = matches!(&cli.command, None | Some(Command::Headless));
+    let long_running = matches!(&cli.command, None | Some(Command::Headless(_)));
     let default_filter = if long_running {
         "info,loro_internal=warn,loro=warn"
     } else {
@@ -143,10 +215,27 @@ fn main() -> anyhow::Result<()> {
     }
 
     match cli.command {
-        Some(Command::Headless) => {
+        Some(Command::Headless(args)) => {
+            let mut config = engine_config_from_env();
+            if let Some(edge_url) = args
+                .edge_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                config.edge_url = edge_url.to_string();
+            }
+            let bootstrap = args.into_bootstrap()?;
+            if let Some(bootstrap) = bootstrap.as_ref() {
+                apply_device_bootstrap_policy(&mut config, bootstrap);
+            }
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(async {
-                let engine = comet_engine::Engine::new(engine_config_from_env());
+                let engine = comet_engine::Engine::new(config);
+                let engine = match bootstrap {
+                    Some(bootstrap) => engine.with_device_bootstrap(bootstrap),
+                    None => engine,
+                };
                 engine.run().await
             })
         }
@@ -168,7 +257,7 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Command::Update { check }) => {
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(update_cli::update(&edge_url_from_env(), check))
+            runtime.block_on(update_cli::update(engine_config_from_env(), check))
         }
         Some(Command::Daemon { command }) => match command {
             DaemonCommand::Install => daemon::install(&engine_config_from_env().data_dir),
@@ -179,33 +268,67 @@ fn main() -> anyhow::Result<()> {
             DaemonCommand::Status => daemon::status(),
         },
         None => {
-            let edge_token = std::env::var("COMET_EDGE_TOKEN").ok();
-            // Headed: the UI probes COMET_IPC_PORT and connects to a running
-            // daemon, or embeds the engine in-process (ARCHITECTURE §1).
-            comet_ui::run_app(comet_ui::UiConfig {
-                data_dir: std::env::var_os("COMET_DATA_DIR")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(dirs_data_dir),
-                ipc_port: std::env::var("COMET_IPC_PORT")
-                    .ok()
-                    .and_then(|p| p.parse().ok())
-                    .unwrap_or(27654),
-                edge_url: edge_url_from_env(),
-                workos_client_id: workos_client_id_from_env(&edge_token),
-                edge_token,
-                org_id: std::env::var("COMET_ORG_ID").ok(),
-                default_harness: comet_ui::HarnessId::ClaudeCode,
-            });
+            run_headed(initial_url);
             Ok(())
         }
     }
+}
+
+fn run_headed(initial_url: Option<String>) {
+    let edge_token = std::env::var("COMET_EDGE_TOKEN").ok();
+    // Headed: the UI probes COMET_IPC_PORT and connects to a running daemon,
+    // or embeds the engine in-process (ARCHITECTURE §1).
+    comet_ui::run_app(comet_ui::UiConfig {
+        data_dir: std::env::var_os("COMET_DATA_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(dirs_data_dir),
+        ipc_port: std::env::var("COMET_IPC_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(27654),
+        edge_url: edge_url_from_env(),
+        scaffold_url: scaffold_url_from_env(&edge_token),
+        edge_token,
+        project_scope: std::env::var("COMET_PROJECT_SCOPE")
+            .unwrap_or_else(|_| release_defaults().2.into()),
+        deployment_id: None,
+        initial_url,
+        default_harness: comet_ui::HarnessId::ClaudeCode,
+        runtime_profile: comet_ui::RuntimeProfile::LocalController,
+    });
+}
+
+/// Local installs select either the production-local or deterministic mock
+/// profile. Scaffold-host authority is forced only by a validated bootstrap.
+fn runtime_profile_from_env() -> comet_engine::RuntimeProfile {
+    if matches!(
+        std::env::var("COMET_HARNESS").as_deref().map(str::trim),
+        Ok("mock")
+    ) {
+        comet_engine::RuntimeProfile::Mock
+    } else {
+        comet_engine::RuntimeProfile::LocalController
+    }
+}
+
+fn apply_device_bootstrap_policy(
+    config: &mut comet_engine::EngineConfig,
+    bootstrap: &comet_engine::DeviceBootstrapConfig,
+) {
+    config.project_scope = bootstrap.project_id.clone();
+    config.deployment_id = Some(bootstrap.deployment_id.clone());
+    config.runtime_profile = comet_engine::RuntimeProfile::ScaffoldHost;
+    config.default_harness = comet_engine::HarnessId::Omp;
+    // Device-mode auth already prevents constructing ScaffoldRuntime. Keep the
+    // endpoint absent as defense in depth against recursive sandbox control.
+    config.scaffold_url = None;
 }
 
 /// The env-resolved engine configuration shared by `headless`, `login`,
 /// `logout`, and `status` — one resolution so the CLI auth commands always
 /// operate on the exact session the daemon will load.
 fn engine_config_from_env() -> comet_engine::EngineConfig {
-    // Dev-mode bearer (no WorkOS): an explicit token enables sync.
+    // An explicit local bearer opts out of Scaffold OAuth.
     let edge_token = std::env::var("COMET_EDGE_TOKEN").ok();
     comet_engine::EngineConfig {
         data_dir: std::env::var_os("COMET_DATA_DIR")
@@ -217,12 +340,13 @@ fn engine_config_from_env() -> comet_engine::EngineConfig {
             .and_then(|p| p.parse().ok())
             .unwrap_or(27654),
         default_harness: harness_from_env(),
-        // WorkOS mode: the signed-in session's org wins; COMET_ORG_ID (dev
-        // default "dev-org") scopes the workspace room otherwise.
-        org_id: std::env::var("COMET_ORG_ID").ok(),
-        // Real auth against production by default; see
-        // `workos_client_id_from_env` for the dev-mode escape hatches.
-        workos_client_id: workos_client_id_from_env(&edge_token),
+        runtime_profile: runtime_profile_from_env(),
+        project_scope: std::env::var("COMET_PROJECT_SCOPE")
+            .unwrap_or_else(|_| release_defaults().2.into()),
+        // Ordinary environment/config input cannot select a trusted deployment
+        // room. Only validated device bootstrap populates this field.
+        deployment_id: None,
+        scaffold_url: scaffold_url_from_env(&edge_token),
         edge_token,
     }
 }
@@ -362,8 +486,10 @@ fn open_log_file_in(dir: &std::path::Path, mode: &str) -> Option<std::fs::File> 
         let rc = unsafe { libc::flock(existing.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
             // A live process owns the canonical log — leave it alone.
-            return std::fs::File::create(dir.join(format!("comet-{mode}.{}.log", std::process::id())))
-                .ok();
+            return std::fs::File::create(
+                dir.join(format!("comet-{mode}.{}.log", std::process::id())),
+            )
+            .ok();
         }
         // No live writer: rotate, create fresh, and lock it as ours. (The
         // probe's flock dies with `existing`; a first-ever launch has nothing
@@ -381,6 +507,70 @@ fn open_log_file_in(dir: &std::path::Path, mode: &str) -> Option<std::fs::File> 
     {
         let _ = std::fs::rename(&path, dir.join(format!("comet-{mode}.log.old")));
         std::fs::File::create(&path).ok()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod device_bootstrap_tests {
+    use super::{Cli, HeadlessArgs, apply_device_bootstrap_policy};
+    use clap::Parser as _;
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    #[test]
+    fn consumes_private_bootstrap_file_and_rejects_secret_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bootstrap.json");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        write!(
+            file,
+            r#"{{"deviceJoinGrant":"cg1.secret","projectId":"project-a","deploymentId":"project-a","sessionId":"session-a","deviceId":"device-a","sandboxId":"sandbox-a"}}"#
+        )
+        .unwrap();
+        drop(file);
+
+        let bootstrap = HeadlessArgs {
+            device_bootstrap_file: Some(path.clone()),
+            edge_url: None,
+        }
+        .into_bootstrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(bootstrap.device_join_grant, "cg1.secret");
+        assert!(!path.exists(), "single-use credential file must be removed");
+        assert!(
+            Cli::try_parse_from(["comet", "headless", "--device-join-grant", "cg1.secret"])
+                .is_err(),
+            "join credentials must never be accepted in process argv"
+        );
+    }
+
+    #[test]
+    fn validated_bootstrap_forces_omp_only_scaffold_host_policy() {
+        let mut config = super::engine_config_from_env();
+        config.scaffold_url = Some("https://scaffold.invalid".into());
+        let bootstrap = comet_engine::DeviceBootstrapConfig {
+            device_join_grant: "cg1.redacted".into(),
+            project_id: "ashler-staging".into(),
+            deployment_id: "deployment-a".into(),
+            session_id: "session-a".into(),
+            device_id: "comet-scaffold-sandbox-a".into(),
+            sandbox_id: "sandbox-a".into(),
+        };
+        apply_device_bootstrap_policy(&mut config, &bootstrap);
+        assert_eq!(
+            config.runtime_profile,
+            comet_engine::RuntimeProfile::ScaffoldHost
+        );
+        assert_eq!(config.default_harness, comet_engine::HarnessId::Omp);
+        assert_eq!(config.project_scope, "ashler-staging");
+        assert_eq!(config.deployment_id.as_deref(), Some("deployment-a"));
+        assert!(config.scaffold_url.is_none());
     }
 }
 
@@ -408,7 +598,10 @@ mod log_file_tests {
         // After the owner exits, a fresh launch rotates normally.
         drop(first);
         let third = open_log_file_in(dir, "headed").expect("third log");
-        assert!(dir.join("comet-headed.log.old").is_file(), "rotation resumes");
+        assert!(
+            dir.join("comet-headed.log.old").is_file(),
+            "rotation resumes"
+        );
         drop(third);
     }
 }
@@ -417,7 +610,9 @@ mod log_file_tests {
 /// only exist when a second instance raced a live one for the canonical log.
 #[cfg(unix)]
 fn sweep_stale_pid_logs(dir: &std::path::Path, mode: &str) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     let prefix = format!("comet-{mode}.");
     let week = std::time::Duration::from_secs(7 * 24 * 60 * 60);
     for entry in entries.flatten() {

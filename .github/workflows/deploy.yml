@@ -1,67 +1,211 @@
 name: deploy
 
-# Autodeploy the edge Worker + Durable Objects (session/device rooms, R2,
-# WorkOS auth routes) on every push to main that touches edge/. Skips
-# gracefully until the CLOUDFLARE_API_TOKEN secret is configured (until then:
-# `npm -C edge run deploy` from a wrangler-authenticated machine).
-#
-# The token needs: Workers Scripts (edit), Workers Routes (edit) on zeron.sh,
-# Workers R2 Storage (edit). Account id is pinned in edge/wrangler.jsonc.
-
 on:
   push:
     branches: [main]
+    tags: ["edge-staging-v*"]
+    paths:
+      - edge/**
+      - apps/comet/**
+      - crates/**
+      - scripts/**
+      - vendor/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/deploy.yml
   workflow_dispatch:
+    inputs:
+      target:
+        description: "Highest environment to deploy"
+        required: true
+        default: staging
+        type: choice
+        options: [staging, production]
+
+permissions:
+  contents: read
+  id-token: write
 
 concurrency:
-  group: deploy-main
+  group: comet-deploy-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  edge:
-    runs-on: ubuntu-latest
-    env:
-      # `secrets` is not a valid context in step `if:` expressions — surface
-      # the token through job env and gate on that instead.
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  candidate:
+    runs-on: ubuntu-24.04
+    outputs:
+      digest: ${{ steps.candidate.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          # `github.event.before` may precede several commits in a batched push.
-          fetch-depth: 0
-      - name: detect edge changes
-        id: changed
-        shell: bash
-        run: |
-          before="${{ github.event.before }}"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
-            || [ -z "$before" ] || ! git cat-file -e "$before" 2>/dev/null; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          if git diff --name-only "$before" "$GITHUB_SHA" | grep -qE "^(edge/|\.github/workflows/deploy\.yml)"; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
       - uses: actions/setup-node@v4
-        if: steps.changed.outputs.changed == 'true'
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: edge/package-lock.json
-      - name: install
-        if: steps.changed.outputs.changed == 'true'
+      - name: Install locked edge dependencies
         working-directory: edge
         run: npm ci
-      - name: typecheck
-        if: steps.changed.outputs.changed == 'true'
+      - name: Install native Rust build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcb1-dev libx11-xcb-dev \
+            libfontconfig1-dev libfreetype-dev libasound2-dev \
+            libvulkan-dev pkg-config cmake
+      - name: Select checked-in Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Build real headless host
+        run: cargo build --locked --package comet --bin comet
+      - name: Real local Edge and Rust collaboration smoke
+        env:
+          COMET_BIN: ${{ github.workspace }}/target/debug/comet
+        run: node scripts/headless-collaboration-smoke.mjs
+      - name: Generate Worker binding types
+        working-directory: edge
+        run: npm run types
+      - name: Require current Worker binding declarations
+        run: git diff --exit-code -- edge/worker-configuration.d.ts
+      - name: Typecheck
         working-directory: edge
         run: npm run typecheck
-      - name: test
-        if: steps.changed.outputs.changed == 'true'
+      - name: Test
         working-directory: edge
         run: npm test
-      - name: deploy
-        if: steps.changed.outputs.changed == 'true' && env.CLOUDFLARE_API_TOKEN != ''
+      - name: Build deployment candidate once
         working-directory: edge
-        run: npx wrangler deploy
+        run: npx wrangler deploy --dry-run --outdir "$RUNNER_TEMP/comet-edge-candidate"
+      - id: candidate
+        name: Seal candidate digest
+        env:
+          SOURCE_DATE_EPOCH: "0"
+        run: |
+          set -euo pipefail
+          tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner \
+            -czf comet-edge-candidate.tar.gz -C "$RUNNER_TEMP/comet-edge-candidate" .
+          digest="$(sha256sum comet-edge-candidate.tar.gz | cut -d' ' -f1)"
+          printf '%s  %s\n' "$digest" comet-edge-candidate.tar.gz > comet-edge-candidate.tar.gz.sha256
+          jq -n --arg digest "$digest" --arg commit "$GITHUB_SHA" \
+            --arg workflowRun "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{schemaVersion:1,sha256:$digest,sourceCommit:$commit,workflowRun:$workflowRun}' \
+            > comet-edge-candidate.provenance.json
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: comet-edge-candidate-${{ github.sha }}
+          path: |
+            comet-edge-candidate.tar.gz
+            comet-edge-candidate.tar.gz.sha256
+            comet-edge-candidate.provenance.json
+          if-no-files-found: error
+
+  staging:
+    if: github.repository_owner == 'Ashler-AI'
+    needs: candidate
+    runs-on: ubuntu-24.04
+    environment: comet-staging
+    outputs:
+      deployed_digest: ${{ steps.verify.outputs.digest }}
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: edge/package-lock.json
+      - name: Install locked deploy tooling
+        working-directory: edge
+        run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          name: comet-edge-candidate-${{ github.sha }}
+      - id: verify
+        name: Verify staging candidate
+        env:
+          EXPECTED_DIGEST: ${{ needs.candidate.outputs.digest }}
+        run: |
+          sha256sum --check comet-edge-candidate.tar.gz.sha256
+          actual="$(sha256sum comet-edge-candidate.tar.gz | cut -d' ' -f1)"
+          test "$actual" = "$EXPECTED_DIGEST"
+          mkdir "$RUNNER_TEMP/candidate"
+          tar -xzf comet-edge-candidate.tar.gz -C "$RUNNER_TEMP/candidate"
+          entry="$(find "$RUNNER_TEMP/candidate" -maxdepth 1 -type f -name '*.js' -print -quit)"
+          test -n "$entry"
+          echo "entry=$entry" >> "$GITHUB_OUTPUT"
+          echo "digest=$actual" >> "$GITHUB_OUTPUT"
+      - id: gcp_iap
+        name: Mint staging GCP IAP identity
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          token_format: id_token
+          id_token_audience: ${{ vars.GCP_IAP_AUDIENCE }}
+          create_credentials_file: false
+      - name: Require staging IAP credential
+        env:
+          IAP_ID_TOKEN: ${{ steps.gcp_iap.outputs.id_token }}
+        run: test -n "$IAP_ID_TOKEN"
+      - name: Deploy exact candidate with checked-in staging resources
+        working-directory: edge
+        run: npx wrangler deploy "${{ steps.verify.outputs.entry }}" --no-bundle --config wrangler.jsonc --env staging
+
+  production:
+    if: github.repository_owner == 'Ashler-AI' && github.event_name == 'workflow_dispatch' && inputs.target == 'production'
+    needs: [candidate, staging]
+    runs-on: ubuntu-24.04
+    environment: comet-production
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: edge/package-lock.json
+      - name: Install locked deploy tooling
+        working-directory: edge
+        run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          name: comet-edge-candidate-${{ github.sha }}
+      - id: verify
+        name: Require byte-identical staged candidate
+        env:
+          BUILD_DIGEST: ${{ needs.candidate.outputs.digest }}
+          STAGING_DIGEST: ${{ needs.staging.outputs.deployed_digest }}
+        run: |
+          sha256sum --check comet-edge-candidate.tar.gz.sha256
+          actual="$(sha256sum comet-edge-candidate.tar.gz | cut -d' ' -f1)"
+          test "$actual" = "$BUILD_DIGEST"
+          test "$actual" = "$STAGING_DIGEST"
+          mkdir "$RUNNER_TEMP/candidate"
+          tar -xzf comet-edge-candidate.tar.gz -C "$RUNNER_TEMP/candidate"
+          entry="$(find "$RUNNER_TEMP/candidate" -maxdepth 1 -type f -name '*.js' -print -quit)"
+          test -n "$entry"
+          echo "entry=$entry" >> "$GITHUB_OUTPUT"
+      - id: gcp_iap
+        name: Mint production GCP IAP identity
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          token_format: id_token
+          id_token_audience: ${{ vars.GCP_IAP_AUDIENCE }}
+          create_credentials_file: false
+      - name: Require production IAP credential
+        env:
+          IAP_ID_TOKEN: ${{ steps.gcp_iap.outputs.id_token }}
+        run: test -n "$IAP_ID_TOKEN"
+      - name: Deploy exact staged candidate with checked-in production resources
+        working-directory: edge
+        run: npx wrangler deploy "${{ steps.verify.outputs.entry }}" --no-bundle --config wrangler.jsonc --env production

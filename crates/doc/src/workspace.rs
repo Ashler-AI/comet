@@ -1,6 +1,5 @@
-//! Workspace doc schema over `loro` — the per-org entity index that replaces comet's
-//! residual entity sync (ARCHITECTURE.md §2.2). Lives in its own DO room (same
-//! SessionRoom class, doc id `ws/{orgId}`).
+//! Workspace doc schema over `loro` — the project-scoped entity index. It lives in a
+//! deterministic room bound to verified Scaffold project/deployment/session scope.
 //!
 //! Container layout — maps keyed by id, NOT lists: entity rows are LWW upserts, and a
 //! map-of-maps means concurrent writers to *different* rows never conflict while writes
@@ -17,9 +16,8 @@
 //!
 //! Writer discipline (ARCHITECTURE §2.2): each device writes its own device row, its
 //! own session rows, and rows for chats it hosts; title/archived renames are LWW map
-//! sets from any device — matching comet's Mutate surface. Presence rides the room's
-//! `EphemeralStore` under keys `presence/{deviceId}` (an online timestamp), replacing
-//! comet's 15s heartbeat writes so liveness never grows the oplog.
+//! sets from any device — matching comet's Mutate surface. Participant presence rides the
+//! room's `EphemeralStore`, so liveness never grows the oplog.
 //!
 //! Timestamps are stored as epoch millis (the session-doc convention) and surface as
 //! `chrono::DateTime<Utc>` through the `comet_proto` entity types.
@@ -32,10 +30,9 @@ use comet_proto::{Chat, ChatConfig, Device, Session, SessionStatus, Space};
 
 use crate::schema::DocError;
 
-/// Workspace doc schema version. v2 = the spaces overhaul (spaces container,
-/// chat spaceId/lastSeenAt) — a destructive break shipped via a fresh doc/room
-/// (`workspace2` / `ws2/{orgId}`), so no v1 reader exists.
-pub const WORKSPACE_SCHEMA_VERSION: i64 = 2;
+/// Workspace v3 is the project-scoped clean cutover. Unknown legacy containers remain
+/// round-trippable, but capability/device grants in CRDT state are never authority.
+pub const WORKSPACE_SCHEMA_VERSION: i64 = 3;
 
 /// Ephemeral presence key for a device (`presence/{deviceId}` → online timestamp).
 pub fn presence_key(device_id: &str) -> String {
@@ -344,9 +341,25 @@ impl WorkspaceDoc {
         self.doc.commit();
         Ok(true)
     }
+    /// Host-side reconciliation with a stale-write guard. Updates only while
+    /// the branch field still equals the value observed before async git work.
+    pub fn compare_and_set_chat_branch(
+        &self,
+        chat_id: &str,
+        expected: Option<&str>,
+        branch: &str,
+    ) -> Result<bool, DocError> {
+        let Some(chat) = self.chat(chat_id)? else {
+            return Ok(false);
+        };
+        if chat.branch.as_deref() != expected {
+            return Ok(false);
+        }
+        self.set_chat_branch(chat_id, branch)
+    }
 
     /// Retarget the chat onto another folder — the mid-session "switch to an
-    /// existing worktree" move (t3code `reuseExistingWorktree`). LWW set;
+    /// existing worktree" move. LWW set;
     /// `false` when no such row. Harness resume is cwd-scoped, so the next
     /// run in the new folder starts a fresh harness conversation by design.
     pub fn set_chat_cwd(&self, chat_id: &str, cwd: &str) -> Result<bool, DocError> {
@@ -354,6 +367,16 @@ impl WorkspaceDoc {
             return Ok(false);
         };
         row.insert("cwd", cwd)?;
+        self.doc.commit();
+        Ok(true)
+    }
+
+    /// Move a chat row to another synced folder. `false` when no such row.
+    pub fn set_chat_space(&self, chat_id: &str, space_id: &str) -> Result<bool, DocError> {
+        let Some(row) = self.existing_row("chats", chat_id) else {
+            return Ok(false);
+        };
+        row.insert("spaceId", space_id)?;
         self.doc.commit();
         Ok(true)
     }
@@ -847,6 +870,14 @@ mod tests {
         let ws = WorkspaceDoc::new();
         ws.upsert_device(&device("dev-a", "laptop")).unwrap();
         ws.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
+        assert!(
+            !ws.compare_and_set_chat_branch("chat-1", Some("stale"), "comet/wrong")
+                .unwrap()
+        );
+        assert!(
+            ws.compare_and_set_chat_branch("chat-1", Some("main"), "comet/renamed")
+                .unwrap()
+        );
 
         assert!(ws.rename_chat("chat-1", "Renamed").unwrap());
         assert!(ws.set_chat_archived("chat-1", true).unwrap());
@@ -863,6 +894,7 @@ mod tests {
 
         let chat = ws.chat("chat-1").unwrap().unwrap();
         assert_eq!(chat.title.as_deref(), Some("Renamed"));
+        assert_eq!(chat.branch.as_deref(), Some("comet/renamed"));
         assert!(chat.archived);
         assert_eq!(chat.last_message_preview.as_deref(), Some("preview text"));
         assert_eq!(chat.last_message_at, Some(ts(5_000)));

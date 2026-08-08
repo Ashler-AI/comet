@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub mod accounts;
+pub mod advisor;
 pub mod appearance;
 pub mod archived;
 pub mod composer;
@@ -41,6 +42,32 @@ pub const SAVE_DEBOUNCE_MS: u64 = 400;
 
 const FILE_NAME: &str = "ui-settings.json";
 
+/// Session list and transcript chrome density. Content typography stays fixed;
+/// only surrounding row/panel spacing changes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Density {
+    Compact,
+    #[default]
+    Comfortable,
+}
+
+impl Density {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Compact => "Compact",
+            Self::Comfortable => "Comfortable",
+        }
+    }
+
+    pub const fn toggled(self) -> Self {
+        match self {
+            Self::Compact => Self::Comfortable,
+            Self::Comfortable => Self::Compact,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiSettings {
@@ -52,6 +79,10 @@ pub struct UiSettings {
     /// The last selected space — restored on boot when the row still exists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_space_id: Option<String>,
+    /// Last selected collaboration room/session. Restored only when the row is
+    /// still available, so stale preference files never strand the shell.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_room_id: Option<String>,
     /// Manual session-tab order per space (drag-reorder; device-local).
     /// Missing chats are skipped; new chats append in creation order.
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
@@ -60,9 +91,17 @@ pub struct UiSettings {
     /// are skipped; new spaces append in creation order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub space_order: Vec<String>,
+    /// Spaces explicitly added through the folder picker. Unlike `space_order`,
+    /// these remain visible when they have no sessions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_space_ids: Vec<String>,
     /// Session notification chimes (done / awaiting-input). `COMET_DISABLE_SOUND`
     /// overrides.
     pub sound_enabled: bool,
+    /// Hides secondary chrome while keeping the transcript and composer live.
+    pub focus_mode: bool,
+    /// Device-local spacing preference.
+    pub density: Density,
     pub right_pane_width: f32,
     /// Legacy: panel *open* flags are session-scoped in-memory state now
     /// (`shell::SessionPanels`, comet `sessionPanels` parity). Kept for file
@@ -84,9 +123,13 @@ impl Default for UiSettings {
             sidebar_collapsed: false,
             sidebar_grouped: false,
             last_space_id: None,
+            last_room_id: None,
             tab_order: std::collections::HashMap::new(),
             space_order: Vec::new(),
+            pinned_space_ids: Vec::new(),
             sound_enabled: true,
+            focus_mode: false,
+            density: Density::default(),
             right_pane_width: RIGHT_PANE_DEFAULT,
             right_pane_open: false,
             terminal_height: TERMINAL_DEFAULT_HEIGHT,
@@ -337,12 +380,16 @@ mod tests {
             sidebar_collapsed: true,
             sidebar_grouped: true,
             last_space_id: Some("space-1".into()),
+            last_room_id: Some("chat-7".into()),
             tab_order: std::collections::HashMap::from([(
                 "space-1".to_string(),
                 vec!["b".to_string(), "a".to_string()],
             )]),
             space_order: vec!["space-2".to_string(), "space-1".to_string()],
+            pinned_space_ids: vec!["space-2".to_string()],
             sound_enabled: false,
+            focus_mode: true,
+            density: Density::Compact,
             right_pane_width: 700.0,
             right_pane_open: true,
             terminal_height: 320.0,
@@ -370,6 +417,9 @@ mod tests {
         .unwrap();
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.appearance, crate::appearance::AppearanceMode::System);
+        assert_eq!(loaded.density, Density::Comfortable);
+        assert_eq!(loaded.last_room_id, None);
+        assert!(!loaded.focus_mode);
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled, "other keys still parse");
     }
@@ -412,6 +462,9 @@ mod tests {
         assert_eq!(d.right_pane_width, 520.0);
         assert_eq!(d.terminal_height, 280.0);
         assert!(!d.sidebar_collapsed && !d.right_pane_open && !d.terminal_open);
+        assert_eq!(d.density, Density::Comfortable);
+        assert_eq!(d.last_room_id, None);
+        assert!(!d.focus_mode);
     }
 
     #[test]

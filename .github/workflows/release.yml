@@ -1,36 +1,86 @@
 name: release
 
-# Build release artifacts and publish them:
-#   - Linux headless tarballs (x86_64 + aarch64) via scripts/package-linux.sh
-#   - macOS dmg (Apple silicon) via scripts/package-macos.sh
-# then create a GitHub Release AND upload everything to the
-# `comet-native-releases` R2 bucket (served at comet.zeron.sh/releases/* for
-# `curl -fsSL https://comet.zeron.sh/install.sh | sh`), bumping latest.txt.
-#
-# Trigger: push a tag `v<version>` matching the workspace version in
-# Cargo.toml (bump it in the same commit), or run manually via
-# workflow_dispatch (builds + uploads artifacts, no release/R2 publish).
-
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Workspace version to build (for example 0.2.0)"
+        required: true
+        type: string
+      promotion_target:
+        description: "Choose where to promote the exact candidate"
+        required: true
+        default: none
+        type: choice
+        options:
+          - none
+          - staging
+          - production
 
 permissions:
-  contents: write
+  contents: read
+  id-token: write
+
+concurrency:
+  group: comet-release
+  cancel-in-progress: false
 
 jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      source_epoch: ${{ steps.version.outputs.source_epoch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: version
+        name: Verify release version against workspace metadata
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          workspace_version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
+          test -n "$workspace_version"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            requested="${GITHUB_REF_NAME#v}"
+          else
+            requested="$REQUESTED_VERSION"
+          fi
+          if [[ "$requested" != "$workspace_version" ]]; then
+            echo "::error::release version $requested does not match workspace version $workspace_version"
+            exit 1
+          fi
+          cargo_version="$(cargo metadata --no-deps --format-version 1 | jq -r '[.packages[] | select(.name == "comet") | .version] | unique | .[]')"
+          if [[ "$cargo_version" != "$workspace_version" ]]; then
+            echo "::error::Cargo metadata reports $cargo_version, expected $workspace_version"
+            exit 1
+          fi
+          echo "version=$workspace_version" >> "$GITHUB_OUTPUT"
+          echo "source_epoch=$(git show -s --format=%ct "$GITHUB_SHA")" >> "$GITHUB_OUTPUT"
+
   linux:
+    needs: version
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04 # x86_64
-          - runner: ubuntu-24.04-arm # aarch64
+          - runner: ubuntu-24.04
+            artifact: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            artifact: linux-aarch64
     runs-on: ${{ matrix.runner }}
+    env:
+      COMET_RELEASE_VERSION: ${{ needs.version.outputs.version }}
+      SOURCE_DATE_EPOCH: ${{ needs.version.outputs.source_epoch }}
+      COMET_DEFAULT_ENVIRONMENT: production
     steps:
       - uses: actions/checkout@v4
-      - name: gpui system deps
+      - name: Install native build dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
@@ -38,82 +88,290 @@ jobs:
             libx11-dev libxcb1-dev libx11-xcb-dev \
             libfontconfig1-dev libfreetype-dev libasound2-dev \
             libvulkan-dev pkg-config cmake
-      - name: rust toolchain (rust-toolchain.toml)
+      - name: Select checked-in Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - name: package
+      - name: Package
         run: scripts/package-linux.sh
+      - name: Record artifact checksums
+        run: |
+          cd target/package
+          sha256sum comet-*.tar.gz > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
-          name: linux-${{ runner.arch }}
-          path: target/package/*.tar.gz
+          name: ${{ matrix.artifact }}
+          path: |
+            target/package/comet-*.tar.gz
+            target/package/SHA256SUMS
           if-no-files-found: error
 
-  # Heads-up: the macOS cfg paths (Keychain in agent_accounts.rs) have never
-  # been type-checked against the Apple SDK — this job may surface errors on
-  # its first runs. continue-on-error keeps the Linux release shippable.
   macos:
-    runs-on: macos-latest # Apple silicon
-    continue-on-error: true
+    needs: version
+    runs-on: macos-14
+    env:
+      COMET_RELEASE_VERSION: ${{ needs.version.outputs.version }}
+      SOURCE_DATE_EPOCH: ${{ needs.version.outputs.source_epoch }}
+      COMET_DEFAULT_ENVIRONMENT: production
     steps:
       - uses: actions/checkout@v4
-      - name: rust toolchain (rust-toolchain.toml)
+      - name: Require Apple silicon runner
+        run: test "$(uname -m)" = arm64
+      - name: Select checked-in Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - name: package dmg
+      - name: Package
         run: scripts/package-macos.sh
+      - name: Record artifact checksums
+        run: |
+          cd target/package
+          shasum -a 256 comet-*.dmg comet-*-app.tar.gz > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
-          name: macos-${{ runner.arch }}
+          name: macos-arm64
           path: |
-            target/package/*.dmg
-            target/package/*.tar.gz
+            target/package/comet-*.dmg
+            target/package/comet-*.tar.gz
+            target/package/SHA256SUMS
           if-no-files-found: error
 
-  publish:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux, macos]
-    runs-on: ubuntu-latest
-    env:
-      # `secrets` is not a valid context in step `if:` expressions — surface
-      # the token through job env and gate on that instead.
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: b57dde68ee5964dccc025437b5478a5b
+  candidate:
+    needs: [version, linux, macos]
+    runs-on: ubuntu-24.04
+    outputs:
+      digest: ${{ steps.candidate.outputs.digest }}
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          path: dist
-          merge-multiple: true
-      - name: version guard (tag == artifact version)
+          path: incoming
+      - id: candidate
+        name: Assemble immutable release candidate
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          SOURCE_EPOCH: ${{ needs.version.outputs.source_epoch }}
         run: |
-          ver="${GITHUB_REF_NAME#v}"
-          ls dist/
-          ls dist/ | grep -q "comet-$ver-" \
-            || { echo "tag v$ver does not match built artifact versions — bump Cargo.toml [workspace.package] version"; exit 1; }
-          echo "VERSION=$ver" >> "$GITHUB_ENV"
-      - uses: softprops/action-gh-release@v2
+          set -euo pipefail
+          mkdir -p candidate
+          find incoming -type f -name 'comet-*' -exec cp '{}' candidate/ \;
+          cp install.sh candidate/install.sh
+          expected=(
+            "comet-$VERSION-linux-x86_64.tar.gz"
+            "comet-$VERSION-linux-aarch64.tar.gz"
+            "comet-$VERSION-macos-arm64.dmg"
+            "comet-$VERSION-macos-arm64-app.tar.gz"
+            "install.sh"
+          )
+          for file in "${expected[@]}"; do test -f "candidate/$file"; done
+          (cd candidate && sha256sum "${expected[@]}" > SHA256SUMS)
+          jq -n \
+            --arg version "$VERSION" \
+            --arg commit "$GITHUB_SHA" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --rawfile sums candidate/SHA256SUMS \
+            '{schemaVersion:1,version:$version,source:{repository:$repository,commit:$commit,workflowRun:$run},files:($sums|split("\n")|map(select(length>0)|capture("^(?<sha256>[0-9a-f]{64})  (?<name>.+)$"))|map({key:.name,value:{sha256:.sha256}})|from_entries)}' \
+            > candidate/manifest.json
+          tar --sort=name --mtime="@$SOURCE_EPOCH" --owner=0 --group=0 --numeric-owner \
+            -czf release-candidate.tar.gz -C candidate .
+          digest="$(sha256sum release-candidate.tar.gz | cut -d' ' -f1)"
+          printf '%s  %s\n' "$digest" release-candidate.tar.gz > release-candidate.tar.gz.sha256
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
         with:
-          files: dist/*
-          generate_release_notes: true
-      - name: upload to R2 (comet.zeron.sh/releases/*)
-        if: env.CLOUDFLARE_API_TOKEN != ''
+          name: release-candidate-${{ needs.version.outputs.version }}
+          path: |
+            release-candidate.tar.gz
+            release-candidate.tar.gz.sha256
+          if-no-files-found: error
+
+  publish-staging:
+    if: >-
+      github.repository_owner == 'Ashler-AI' &&
+      (startsWith(github.ref, 'refs/tags/v') || inputs.promotion_target == 'staging' || inputs.promotion_target == 'production')
+    needs: [version, candidate]
+    runs-on: ubuntu-24.04
+    environment: comet-release-staging
+    outputs:
+      promoted_digest: ${{ steps.verify.outputs.digest }}
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      COMET_RELEASES_GCS_BUCKET: ${{ secrets.COMET_RELEASES_GCS_BUCKET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-candidate-${{ needs.version.outputs.version }}
+      - id: verify
+        name: Verify candidate digest
+        env:
+          EXPECTED_DIGEST: ${{ needs.candidate.outputs.digest }}
         run: |
-          for f in dist/*; do
-            npx wrangler@4 r2 object put "comet-native-releases/$(basename "$f")" \
-              --file "$f" --remote
+          sha256sum --check release-candidate.tar.gz.sha256
+          actual="$(sha256sum release-candidate.tar.gz | cut -d' ' -f1)"
+          test "$actual" = "$EXPECTED_DIGEST"
+          echo "digest=$actual" >> "$GITHUB_OUTPUT"
+          mkdir candidate && tar -xzf release-candidate.tar.gz -C candidate
+      - id: auth
+        name: Authenticate the staging publisher
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Preflight exact storage permissions and privacy
+        run: |
+          set -euo pipefail
+          required='["storage.buckets.get","storage.buckets.getIamPolicy","storage.objects.create","storage.objects.delete","storage.objects.get","storage.objects.list"]'
+          access_token="$(gcloud auth print-access-token)"
+          printf 'header = "Authorization: Bearer %s"\n' "$access_token" |
+            curl --config - --fail-with-body --silent --show-error \
+              "https://storage.googleapis.com/storage/v1/b/$COMET_RELEASES_GCS_BUCKET/iam/testPermissions?permissions=storage.buckets.get&permissions=storage.buckets.getIamPolicy&permissions=storage.objects.create&permissions=storage.objects.delete&permissions=storage.objects.get&permissions=storage.objects.list" \
+              > permitted.json
+          unset access_token
+          jq -e --argjson required "$required" \
+            '($required - (.permissions // [])) as $missing | if ($missing | length) == 0 then true else error("missing publisher permissions: \($missing | join(", "))") end' \
+            permitted.json
+          gcloud storage buckets get-iam-policy "gs://$COMET_RELEASES_GCS_BUCKET" --format=json > bucket-iam.json
+          if jq -e '[.bindings[]?.members[]?] | any(. == "allUsers" or . == "allAuthenticatedUsers")' bucket-iam.json >/dev/null; then
+            echo "::error::release bucket must not grant public or all-authenticated-user access"
+            exit 1
+          fi
+      - name: Publish immutable staging release and latest aliases
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          publish_immutable() {
+            source="$1"
+            object="$2"
+            existing="$(mktemp)"
+            if gcloud storage cp "$object" "$existing" >/dev/null 2>&1; then
+              if ! cmp -s "$source" "$existing"; then
+                echo "::error::$object already exists with different bytes"
+                return 1
+              fi
+              return 0
+            fi
+            if gcloud storage cp --if-generation-match=0 "$source" "$object"; then
+              return 0
+            fi
+            gcloud storage cp "$object" "$existing" >/dev/null
+            if ! cmp -s "$source" "$existing"; then
+              echo "::error::$object won a publish race with different bytes"
+              return 1
+            fi
+          }
+          for file in candidate/*; do
+            name="$(basename "$file")"
+            publish_immutable "$file" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$VERSION/$name"
+            case "$name" in
+              manifest.json|SHA256SUMS|install.sh) ;;
+              *) publish_immutable "$file" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$name" ;;
+            esac
           done
-          # manifest.json: version + per-artifact sha256 — the auto-updater
-          # (crates/update) verifies downloads against it. Published before
-          # latest.txt so no client ever sees a version without its checksums.
-          manifest=$(jq -n --arg version "$VERSION" '{version: $version, files: {}}')
-          for f in dist/*; do
-            sha=$(sha256sum "$f" | cut -d' ' -f1)
-            manifest=$(jq --arg name "$(basename "$f")" --arg sha "$sha" \
-              '.files[$name] = {sha256: $sha}' <<<"$manifest")
+          current="$(gcloud storage cat "gs://$COMET_RELEASES_GCS_BUCKET/releases/latest.txt" 2>/dev/null || true)"
+          if [ -n "$current" ] && [ "$current" != "$VERSION" ] && ! dpkg --compare-versions "$VERSION" gt "$current"; then
+            echo "::error::latest release is $current; refusing to move aliases backward to $VERSION"
+            exit 1
+          fi
+          for alias in manifest.json SHA256SUMS install.sh; do
+            gcloud storage cp "candidate/$alias" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$alias"
           done
-          printf '%s' "$manifest" > manifest.json
-          npx wrangler@4 r2 object put comet-native-releases/manifest.json \
-            --file manifest.json --remote
           printf '%s' "$VERSION" > latest.txt
-          npx wrangler@4 r2 object put comet-native-releases/latest.txt \
-            --file latest.txt --remote
+          gcloud storage cp latest.txt "gs://$COMET_RELEASES_GCS_BUCKET/releases/latest.txt"
+
+  publish-production:
+    if: >-
+      github.repository_owner == 'Ashler-AI' &&
+      (startsWith(github.ref, 'refs/tags/v') || inputs.promotion_target == 'production')
+    needs: [version, candidate, publish-staging]
+    runs-on: ubuntu-24.04
+    environment: comet-release-production
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      COMET_RELEASES_GCS_BUCKET: ${{ secrets.COMET_RELEASES_GCS_BUCKET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-candidate-${{ needs.version.outputs.version }}
+      - name: Require byte-identical staging candidate
+        env:
+          BUILD_DIGEST: ${{ needs.candidate.outputs.digest }}
+          STAGING_DIGEST: ${{ needs.publish-staging.outputs.promoted_digest }}
+        run: |
+          sha256sum --check release-candidate.tar.gz.sha256
+          actual="$(sha256sum release-candidate.tar.gz | cut -d' ' -f1)"
+          test "$actual" = "$BUILD_DIGEST"
+          test "$actual" = "$STAGING_DIGEST"
+          mkdir candidate && tar -xzf release-candidate.tar.gz -C candidate
+      - id: auth
+        name: Authenticate the production publisher
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Preflight exact storage permissions and privacy
+        run: |
+          set -euo pipefail
+          required='["storage.buckets.get","storage.buckets.getIamPolicy","storage.objects.create","storage.objects.delete","storage.objects.get","storage.objects.list"]'
+          access_token="$(gcloud auth print-access-token)"
+          printf 'header = "Authorization: Bearer %s"\n' "$access_token" |
+            curl --config - --fail-with-body --silent --show-error \
+              "https://storage.googleapis.com/storage/v1/b/$COMET_RELEASES_GCS_BUCKET/iam/testPermissions?permissions=storage.buckets.get&permissions=storage.buckets.getIamPolicy&permissions=storage.objects.create&permissions=storage.objects.delete&permissions=storage.objects.get&permissions=storage.objects.list" \
+              > permitted.json
+          unset access_token
+          jq -e --argjson required "$required" \
+            '($required - (.permissions // [])) as $missing | if ($missing | length) == 0 then true else error("missing publisher permissions: \($missing | join(", "))") end' \
+            permitted.json
+          gcloud storage buckets get-iam-policy "gs://$COMET_RELEASES_GCS_BUCKET" --format=json > bucket-iam.json
+          if jq -e '[.bindings[]?.members[]?] | any(. == "allUsers" or . == "allAuthenticatedUsers")' bucket-iam.json >/dev/null; then
+            echo "::error::release bucket must not grant public or all-authenticated-user access"
+            exit 1
+          fi
+      - name: Promote immutable production release and latest aliases
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          publish_immutable() {
+            source="$1"
+            object="$2"
+            existing="$(mktemp)"
+            if gcloud storage cp "$object" "$existing" >/dev/null 2>&1; then
+              if ! cmp -s "$source" "$existing"; then
+                echo "::error::$object already exists with different bytes"
+                return 1
+              fi
+              return 0
+            fi
+            if gcloud storage cp --if-generation-match=0 "$source" "$object"; then
+              return 0
+            fi
+            gcloud storage cp "$object" "$existing" >/dev/null
+            if ! cmp -s "$source" "$existing"; then
+              echo "::error::$object won a publish race with different bytes"
+              return 1
+            fi
+          }
+          for file in candidate/*; do
+            name="$(basename "$file")"
+            publish_immutable "$file" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$VERSION/$name"
+            case "$name" in
+              manifest.json|SHA256SUMS|install.sh) ;;
+              *) publish_immutable "$file" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$name" ;;
+            esac
+          done
+          current="$(gcloud storage cat "gs://$COMET_RELEASES_GCS_BUCKET/releases/latest.txt" 2>/dev/null || true)"
+          if [ -n "$current" ] && [ "$current" != "$VERSION" ] && ! dpkg --compare-versions "$VERSION" gt "$current"; then
+            echo "::error::latest release is $current; refusing to move aliases backward to $VERSION"
+            exit 1
+          fi
+          for alias in manifest.json SHA256SUMS install.sh; do
+            gcloud storage cp "candidate/$alias" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$alias"
+          done
+          printf '%s' "$VERSION" > latest.txt
+          gcloud storage cp latest.txt "gs://$COMET_RELEASES_GCS_BUCKET/releases/latest.txt"

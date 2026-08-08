@@ -1,16 +1,19 @@
 //! Durable command ledger — port of `packages/session-doc/src/commands.ts`.
 //!
-//! Rules (verbatim from comet's design):
+//! Rules:
 //! 1. Each device inserts only its own entries; entries are append-only and immutable.
-//! 2. The chat's HOST is the sole writer of command outcomes; a composer may only set
-//!    `cancelled` on its own still-pending entries.
+//! 2. The addressed agent-session owner executes and writes the outcome; a composer may
+//!    only cancel its own still-pending entry. Shared threads can have several owners.
 //! 3. Evaluation (`evaluate_command`, pure): processed-id dedupe → Skip; expired TTL → Expired;
 //!    a newer command of the same kind supersedes steer/interrupt; an interrupt whose
 //!    `based_on.turn_id` is already past → Superseded; otherwise Execute.
 
 use serde::{Deserialize, Serialize};
 
-use comet_proto::{RunRequest, UserInputAnswer};
+use comet_proto::{
+    AgentSessionSource, CapabilityGrant, CollaborationPrincipal, RunRequest, SemanticAnchor,
+    SemanticAnnotation, UserInputAnswer,
+};
 
 use crate::constants::COMMAND_DEFAULT_TTL_MS;
 
@@ -21,6 +24,7 @@ pub enum SessionCommandKind {
     Steer,
     Interrupt,
     RespondInput,
+    Control,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +38,64 @@ pub enum SessionCommandStatus {
     Cancelled,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "camelCase")]
+pub enum SessionControlAction {
+    Start {
+        request: RunRequest,
+        message_id: String,
+    },
+    Steer {
+        prompt: String,
+        message_id: Option<String>,
+    },
+    RespondInput {
+        request_id: String,
+        answers: Vec<UserInputAnswer>,
+    },
+    Pause {},
+    Resume {},
+    Stop {},
+    Focus {
+        target_id: String,
+    },
+    AnnotationCreate {
+        annotation: SemanticAnnotation,
+    },
+    AnnotationEdit {
+        annotation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        anchor: Option<SemanticAnchor>,
+    },
+    AnnotationResolve {
+        annotation_id: String,
+        resolved: bool,
+    },
+    EnvironmentLifecycle {
+        operation: String,
+        #[serde(default)]
+        parameters: serde_json::Map<String, serde_json::Value>,
+    },
+}
+
+impl SessionControlAction {
+    pub fn required_capability(&self) -> &'static str {
+        match self {
+            Self::Start { .. } | Self::Steer { .. } | Self::RespondInput { .. } => {
+                comet_proto::CAPABILITY_SESSION_CHAT
+            }
+            Self::AnnotationCreate { .. }
+            | Self::AnnotationEdit { .. }
+            | Self::AnnotationResolve { .. } => comet_proto::CAPABILITY_SESSION_ANNOTATE,
+            Self::EnvironmentLifecycle { .. } => comet_proto::CAPABILITY_SESSION_ENVIRONMENT,
+            Self::Pause {} | Self::Resume {} | Self::Stop {} | Self::Focus { .. } => {
+                comet_proto::CAPABILITY_SESSION_CONTROL
+            }
+        }
+    }
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum SessionCommandPayload {
@@ -54,6 +116,17 @@ pub enum SessionCommandPayload {
         request_id: String,
         answers: Vec<UserInputAnswer>,
     },
+    /// Versioned multi-agent command. Ownership is per session, never per thread.
+    #[serde(rename_all = "camelCase")]
+    Control {
+        session_id: String,
+        owner_device_id: String,
+        actor_device_id: String,
+        actor_subject: String,
+        grant_id: String,
+        source: AgentSessionSource,
+        action: Box<SessionControlAction>,
+    },
 }
 
 impl SessionCommandPayload {
@@ -63,6 +136,7 @@ impl SessionCommandPayload {
             SessionCommandPayload::Steer { .. } => SessionCommandKind::Steer,
             SessionCommandPayload::Interrupt {} => SessionCommandKind::Interrupt,
             SessionCommandPayload::RespondInput { .. } => SessionCommandKind::RespondInput,
+            SessionCommandPayload::Control { .. } => SessionCommandKind::Control,
         }
     }
 }
@@ -101,6 +175,76 @@ impl SessionCommandEntry {
         self.expires_at
             .unwrap_or(self.issued_at + COMMAND_DEFAULT_TTL_MS)
     }
+
+    pub fn session_owner(&self) -> Option<(&str, &str)> {
+        match &self.payload {
+            SessionCommandPayload::Control {
+                session_id,
+                owner_device_id,
+                ..
+            } => Some((session_id, owner_device_id)),
+            _ => None,
+        }
+    }
+
+    pub fn actor_subject(&self) -> &str {
+        match &self.payload {
+            SessionCommandPayload::Control { actor_subject, .. } => actor_subject,
+            _ => &self.issued_by,
+        }
+    }
+
+    pub fn action_name(&self) -> &'static str {
+        match &self.payload {
+            SessionCommandPayload::Run { .. } => "start",
+            SessionCommandPayload::Steer { .. } => "steer",
+            SessionCommandPayload::Interrupt {} => "stop",
+            SessionCommandPayload::RespondInput { .. } => "respondInput",
+            SessionCommandPayload::Control { action, .. } => match action.as_ref() {
+                SessionControlAction::Start { .. } => "start",
+                SessionControlAction::Steer { .. } => "steer",
+                SessionControlAction::RespondInput { .. } => "respondInput",
+                SessionControlAction::Pause {} => "pause",
+                SessionControlAction::Resume {} => "resume",
+                SessionControlAction::Stop {} => "stop",
+                SessionControlAction::Focus { .. } => "focus",
+                SessionControlAction::AnnotationCreate { .. } => "annotationCreate",
+                SessionControlAction::AnnotationEdit { .. } => "annotationEdit",
+                SessionControlAction::AnnotationResolve { .. } => "annotationResolve",
+                SessionControlAction::EnvironmentLifecycle { .. } => "environmentLifecycle",
+            },
+        }
+    }
+
+    pub fn required_capability(&self) -> Option<&'static str> {
+        match &self.payload {
+            SessionCommandPayload::Control { action, .. } => Some(action.required_capability()),
+            _ => None,
+        }
+    }
+}
+
+/// Capability check for teammate control. `principal` must come from verified IAP/control-plane
+/// claims; command fields and caller-supplied project/device data are never authority.
+pub fn authorize_control_command(
+    entry: &SessionCommandEntry,
+    principal: &CollaborationPrincipal,
+    grants: &[CapabilityGrant],
+    now_ms: i64,
+) -> bool {
+    let SessionCommandPayload::Control {
+        actor_subject,
+        grant_id,
+        action,
+        ..
+    } = &entry.payload
+    else {
+        return true;
+    };
+    actor_subject == &principal.subject
+        && grants.iter().any(|grant| {
+            grant.id == *grant_id && grant.permits(principal, action.required_capability(), now_ms)
+        })
 }
 
 /// Rule 2: only the composer that issued a still-pending command may cancel it.

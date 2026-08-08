@@ -5,7 +5,7 @@
 //! (experimentalApi) and falls back to a curated snapshot; here the snapshot IS
 //! the catalog, and `CodexHarness::models` is the single seam where a
 //! short-lived `codex app-server` + `model/list` pagination can later be
-//! spliced in (same call t3code's Codex provider makes).
+//! spliced in through the same Codex app-server call.
 
 use comet_proto::{Model, ModelOption, ModelOptionChoice, ReasoningLevel, SandboxLevel};
 

@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
-use comet_doc::{CommandBasedOn, SessionCommandEntry, SessionCommandPayload, SessionCommandStatus};
+use comet_doc::{SessionCommandPayload, SessionCommandStatus};
 use comet_engine::{EngineCore, HarnessRegistry};
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
@@ -22,8 +22,6 @@ use comet_proto::{
     SessionStatus, SteeringMode,
 };
 use comet_rpc::methods;
-
-const VIEWER: &str = "viewer-device";
 
 /// Scripted harness: emits SessionStarted + text + Done with a per-event delay (so
 /// `Working` is observable across the bridge).
@@ -97,13 +95,13 @@ impl Harness for ScriptedHarness {
 fn registry() -> Arc<HarnessRegistry> {
     let registry = HarnessRegistry::new();
     registry.register(Arc::new(ScriptedHarness {
-        id: HarnessId::Mock,
+        id: HarnessId::ClaudeCode,
         text: "Hello",
         step_delay: Duration::from_millis(60),
     }));
     registry.register(Arc::new(ScriptedHarness {
-        id: HarnessId::Cursor,
-        text: "From cursor",
+        id: HarnessId::Codex,
+        text: "From codex",
         step_delay: Duration::from_millis(10),
     }));
     Arc::new(registry)
@@ -113,7 +111,8 @@ fn registry() -> Arc<HarnessRegistry> {
 fn assemble(dir: &std::path::Path, device_id: &str) -> EngineCore {
     std::fs::create_dir_all(dir).expect("create data dir");
     std::fs::write(dir.join("device-id"), device_id).expect("write device id");
-    EngineCore::assemble(dir, registry(), HarnessId::Mock, None).expect("engine core assembles")
+    EngineCore::assemble(dir, registry(), HarnessId::ClaudeCode, None)
+        .expect("engine core assembles")
 }
 
 /// The in-memory room: cross-import workspace-doc updates between two engines on a
@@ -164,25 +163,17 @@ fn run_request(prompt: &str) -> RunRequest {
     }
 }
 
-/// Queue a run command into a chat doc the way a remote viewer would (ledger rule 1).
-fn queue_run(core: &EngineCore, chat_id: &str, command_id: &str, message_id: &str) {
-    let handle = core.doc_host.open(chat_id).expect("open chat");
-    let now = chrono::Utc::now().timestamp_millis();
-    handle
-        .doc()
-        .queue_command(&SessionCommandEntry {
-            id: command_id.into(),
-            payload: SessionCommandPayload::Run {
+/// Queue a run through the device-local API. This persists local provenance;
+/// remotely authored commands use the grant-bearing `Control::Start` path.
+fn queue_run(core: &EngineCore, chat_id: &str, message_id: &str) {
+    core.doc_host
+        .queue_command(
+            chat_id,
+            SessionCommandPayload::Run {
                 request: run_request("go do it"),
                 message_id: message_id.into(),
             },
-            issued_by: VIEWER.into(),
-            issued_at: now,
-            based_on: None::<CommandBasedOn>,
-            expires_at: None,
-            status: SessionCommandStatus::Pending,
-            resolution: None,
-        })
+        )
         .expect("queue command");
 }
 
@@ -254,7 +245,7 @@ async fn two_engines_share_a_workspace() {
     .await;
 
     // Run on A: B's workspace view shows the session Working, then Idle.
-    queue_run(&a, "chat-1", "cmd-run-1", "m-1");
+    queue_run(&a, "chat-1", "m-1");
     let b_status = |wanted: SessionStatus| {
         let doc = b.workspace.doc_arc();
         move || {
@@ -347,7 +338,7 @@ async fn claim_on_first_command_creates_the_chat_row() {
     let link = bridge(&a, &b);
 
     // No CreateChat: the first run command claims the chat under A's device id.
-    queue_run(&a, "chat-claimed", "cmd-claim-1", "m-1");
+    queue_run(&a, "chat-claimed", "m-1");
     wait_for(
         || {
             b.workspace
@@ -380,7 +371,7 @@ async fn non_host_engine_leaves_remote_chats_commands_alone() {
     a.workspace
         .create_chat("chat-remote", "space-remote", None, None)
         .expect("create remote-hosted chat row");
-    queue_run(&a, "chat-remote", "cmd-remote-1", "m-1");
+    queue_run(&a, "chat-remote", "m-1");
 
     tokio::time::sleep(Duration::from_millis(400)).await;
     let handle = a.doc_host.open("chat-remote").expect("open chat");
@@ -404,7 +395,7 @@ async fn non_host_engine_leaves_remote_chats_commands_alone() {
 #[tokio::test]
 async fn chat_config_selects_the_run_harness() {
     let dir_a = tempfile::tempdir().unwrap();
-    let a = assemble(dir_a.path(), "dev-a"); // default harness = Mock ("Hello")
+    let a = assemble(dir_a.path(), "dev-a"); // default harness = Claude Code ("Hello")
 
     a.workspace
         .create_space("space-cfg", "dev-a", "/tmp/cfg", None, false)
@@ -414,7 +405,7 @@ async fn chat_config_selects_the_run_harness() {
             "chat-cfg",
             "space-cfg",
             Some(ChatConfig {
-                harness: HarnessId::Cursor,
+                harness: HarnessId::Codex,
                 model: None,
                 reasoning: None,
                 model_options: Default::default(),
@@ -423,15 +414,15 @@ async fn chat_config_selects_the_run_harness() {
             None,
         )
         .expect("create configured chat");
-    queue_run(&a, "chat-cfg", "cmd-cfg-1", "m-1");
+    queue_run(&a, "chat-cfg", "m-1");
 
-    // The configured harness (Cursor, "From cursor") ran — not the default Mock.
+    // The configured harness (Codex, "From codex") ran — not the default Claude Code.
     let handle = a.doc_host.open("chat-cfg").expect("open chat");
     wait_for(
         || {
             handle.doc().read_entries().unwrap_or_default().iter().any(|e| {
                 e.parts.iter().any(
-                    |p| matches!(p, comet_doc::MessagePart::Text { text, .. } if text == "From cursor"),
+                    |p| matches!(p, comet_doc::MessagePart::Text { text, .. } if text == "From codex"),
                 )
             })
         },
@@ -465,8 +456,16 @@ async fn two_engines_converge_through_a_real_workspace_room() {
             base.clone(),
             format!("{user}@{org}"),
         ));
-        EngineCore::assemble_with_identity(dir, registry(), HarnessId::Mock, edge, &org, user)
-            .expect("engine core assembles")
+        EngineCore::assemble_with_identity(
+            dir,
+            registry(),
+            HarnessId::ClaudeCode,
+            edge,
+            &org,
+            user,
+            comet_proto::RuntimeProfile::Mock,
+        )
+        .expect("engine core assembles")
     };
 
     // Workspace docs are per-user (`ws3/{org}/{user}`): convergence is across

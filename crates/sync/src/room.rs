@@ -47,9 +47,15 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 /// Payload bytes per outbound fragment — mirrors the edge's `FRAGMENT_BYTES`
 /// (leaves envelope room under loro-protocol's 256KB message cap).
 const FRAGMENT_BYTES: usize = 200_000;
-/// Refuse absurd inbound fragment batches (a healthy backfill snapshot is MBs).
-const MAX_REASSEMBLED_BYTES: usize = 256 * 1024 * 1024;
-const MAX_FRAGMENT_COUNT: u64 = 16 * 1024;
+/// Refuse inbound allocation claims beyond a generous healthy snapshot budget.
+const MAX_REASSEMBLED_BYTES: usize = 64 * 1024 * 1024;
+const MAX_FRAGMENT_COUNT: u64 = 1024;
+
+fn fragment_batch_within_limits(fragment_count: u64, total_size_bytes: u64) -> bool {
+    fragment_count > 0
+        && fragment_count <= MAX_FRAGMENT_COUNT
+        && total_size_bytes <= MAX_REASSEMBLED_BYTES as u64
+}
 /// Presence timeout, matching the edge's `new EphemeralStore(30_000)`.
 const EPHEMERAL_TIMEOUT_MS: i64 = 30_000;
 /// Text `"ping"` keepalive interval — answered by the DO's hibernation-safe
@@ -1072,10 +1078,7 @@ impl Session {
                 total_size_bytes,
                 ..
             } => {
-                if fragment_count == 0
-                    || fragment_count > MAX_FRAGMENT_COUNT
-                    || total_size_bytes as usize > MAX_REASSEMBLED_BYTES
-                {
+                if !fragment_batch_within_limits(fragment_count, total_size_bytes) {
                     tracing::warn!(
                         room = %self.room_id,
                         fragment_count,

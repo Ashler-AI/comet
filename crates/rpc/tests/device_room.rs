@@ -272,6 +272,9 @@ impl RpcService for TestService {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
         match method {
             methods::LIST_HARNESSES => Ok(RpcReply::Value(serde_json::json!([]))),
+            methods::LOCAL_DEVICE => {
+                Ok(RpcReply::Value(serde_json::json!({ "deviceId": "dev-a" })))
+            }
             "Echo" => Ok(RpcReply::Value(
                 serde_json::json!({ "host": self.label, "params": params }),
             )),

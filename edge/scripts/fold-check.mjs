@@ -1,29 +1,28 @@
-// Verifies the workspace-room log-fold budget against a running `wrangler dev`
-// (AUTH_MODE=dev). Drives >COMPACT_LOG_ROWS tiny commits into a workspace room,
-// then reads /workspace/:org/stats to confirm the update log folded into the
-// snapshot (rows collapse back to a small number, snapshot grows).
+// Verifies the project-scoped workspace-room log-fold budget against a running
+// `wrangler dev` (AUTH_MODE=dev). Drives >COMPACT_LOG_ROWS tiny commits, then
+// reads /workspace/:projectScope/stats to confirm the update log folded into
+// the snapshot (rows collapse back to a small number, snapshot grows).
 //
 // Usage: node scripts/fold-check.mjs [baseUrl]
 import { LoroWebsocketClient } from "loro-websocket";
 import { LoroAdaptor } from "loro-adaptors/loro";
-import { randomUUID } from "node:crypto";
 
 const base = process.argv[2] ?? "http://127.0.0.1:27640";
 const wsBase = base.replace(/^http/, "ws");
-const orgId = `org-fold-${randomUUID().slice(0, 8)}`;
-const token = `alice@${orgId}`;
-const room = `ws3/${orgId}/alice`;
+const projectScope = "ashler-local";
+const token = "alice";
+const room = `ws4/${projectScope}`;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const stats = async () => {
-  const res = await fetch(`${base}/workspace/${orgId}/stats`, {
+  const res = await fetch(`${base}/workspace/${projectScope}/stats`, {
     headers: { authorization: `Bearer ${token}` }
   });
   if (!res.ok) throw new Error(`stats ${res.status}`);
   return res.json();
 };
 
-const client = new LoroWebsocketClient({ url: `${wsBase}/workspace/${orgId}/ws?token=${token}` });
+const client = new LoroWebsocketClient({ url: `${wsBase}/workspace/${projectScope}/ws?token=${token}` });
 await client.waitConnected();
 const adaptor = new LoroAdaptor();
 await client.join({ roomId: room, crdtAdaptor: adaptor });

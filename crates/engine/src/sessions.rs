@@ -22,13 +22,14 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use chrono::Utc;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use comet_doc::{
     DocError, MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, SegmentWriter, SessionDoc,
     fold_event_into_parts, sanitize_tool_call,
 };
-use comet_harness::{CancellationToken, Harness, RunControls, SteerMessage};
+use comet_harness::{CancellationToken, Harness, HarnessError, RunControls, SteerMessage};
 use comet_proto::{
     AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, UserInputAnswer,
     UserInputQuestion,
@@ -99,7 +100,7 @@ struct Inner {
     /// (comet kept the same pair on `chats.harness_session_id`). An empty
     /// session id is the "do not resume" tombstone after a rejected resume.
     harness_sessions: Mutex<HashMap<String, HarnessSessionRef>>,
-    /// Auto-titler for untitled chats (wired at engine assembly; absent in bare tests).
+    /// Deterministic local auto-titler (wired at engine assembly; absent in bare tests).
     titles: OnceLock<crate::titles::TitleGenerator>,
 }
 
@@ -142,8 +143,7 @@ impl SessionsEngine {
         let _ = self.inner.doc_host.set(host);
     }
 
-    /// Wire the chat auto-titler (called once at engine assembly). After each
-    /// completed exchange the run task fires it for still-untitled chats.
+    /// Wire the local chat auto-titler (called once at engine assembly).
     pub fn set_titles(&self, titles: crate::titles::TitleGenerator) {
         let _ = self.inner.titles.set(titles);
     }
@@ -333,14 +333,60 @@ impl SessionsEngine {
         // lastMessageAt bump must never be observable ahead of the live run.
         self.inner.note_message(chat_id, &request.prompt);
 
-        // Name the chat NOW, off the first prompt — not after the first
-        // exchange completes ("called New session for a long time for no
-        // reason"; the titler only needs the prompt and skips titled chats;
-        // the Done-time call below stays as the retry for a failed
-        // generation).
+        // Name the chat immediately from its first prompt. This is entirely
+        // local and never starts an auxiliary harness/model session.
         if let Some(titles) = self.inner.titles.get() {
-            titles.maybe_generate(chat_id, harness_id, &request.prompt, &request.cwd);
+            titles.maybe_generate(chat_id, &request.prompt);
         }
+        // Starting the harness is part of dispatch, not background run
+        // consumption. A spawn/transport error must return to the durable
+        // command executor so it can write Rejected + an audit reason instead
+        // of first reporting Applied and failing moments later.
+        let stream = match harness.run(request.clone(), controls).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                let message = err.to_string();
+                let error_event = AgentEvent::Error {
+                    message: message.clone(),
+                };
+                let done_event = AgentEvent::Done {
+                    status: DoneStatus::Errored,
+                    result: None,
+                    error: Some(message),
+                    session_id: None,
+                };
+                self.inner.publish(chat_id, &error_event);
+                self.inner.publish(chat_id, &done_event);
+
+                // A harness can reject a run before returning its event stream
+                // (for example, when another process still owns a native OMP
+                // session). `drive_run` cannot fold that error, so persist the
+                // same visible error part here instead of leaving the composer
+                // with an unexplained "Run failed" status.
+                let mut folded = Vec::new();
+                fold_event_into_parts(&mut folded, &error_event);
+                if let Err(write_err) = finish_segment(
+                    &handle.doc_arc(),
+                    None,
+                    &new_id(),
+                    &self.inner.device_id,
+                    now_ms(),
+                    &folded,
+                    MessageStatus::Complete,
+                ) {
+                    tracing::warn!(
+                        chat = %chat_id,
+                        err = %write_err,
+                        "dispatch failure transcript write failed"
+                    );
+                }
+
+                self.inner.remove_run(chat_id, &run_id);
+                self.inner
+                    .set_status(chat_id, SessionStatus::Errored, false);
+                return Err(err.into());
+            }
+        };
 
         tokio::spawn(drive_run(
             self.inner.clone(),
@@ -349,7 +395,7 @@ impl SessionsEngine {
             harness,
             request,
             handle.doc_arc(),
-            controls,
+            stream,
             engine_rx,
             cancel_rx,
             RunResumeState {
@@ -547,7 +593,7 @@ impl SessionsEngine {
                             model_options: Default::default(),
                             cwd,
                             sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
-                            auto_approve: false,
+                            auto_approve: true,
                             attachments: Vec::new(),
                             resume: None,
                         })
@@ -694,6 +740,44 @@ impl Inner {
         }
     }
 
+    fn advance_omp_import_watermark(&self, chat_id: &str, cwd: &str) {
+        let Some(workspace) = self.workspace() else {
+            return;
+        };
+        let Some((session_id, session_cwd)) = workspace.chat_harness_session(chat_id) else {
+            return;
+        };
+        if session_id.trim().is_empty()
+            || session_cwd
+                .as_deref()
+                .is_some_and(|session_cwd| !session_cwd.is_empty() && session_cwd != cwd)
+        {
+            return;
+        }
+        let Some(updated_at) = crate::local_sessions::omp_session_updated_at(&session_id, cwd)
+        else {
+            return;
+        };
+        let current = workspace
+            .doc()
+            .chat(chat_id)
+            .ok()
+            .flatten()
+            .and_then(|chat| chat.last_message_at)
+            .map(|at| at.timestamp_millis());
+        if current.is_some_and(|current| current >= updated_at) {
+            return;
+        }
+        if let Err(err) = workspace.set_chat_activity(chat_id, Some(updated_at), None) {
+            tracing::warn!(
+                chat = %chat_id,
+                session = %session_id,
+                error = %err,
+                "OMP native import watermark write failed"
+            );
+        }
+    }
+
     /// Record the chat's harness-native session id (and its cwd): live-process
     /// cache plus the durable workspace chat row — the row is what survives an
     /// engine restart (comet sessions.ts:1039).
@@ -710,6 +794,9 @@ impl Inner {
         );
         if let Some(ws) = self.workspace() {
             ws.set_chat_harness_session(chat_id, session_id, cwd);
+        }
+        if let Some(host) = self.doc_host.get() {
+            host.ensure_room_for_chat(chat_id);
         }
     }
 
@@ -891,13 +978,13 @@ async fn drive_run(
     harness: Arc<dyn Harness>,
     request: RunRequest,
     doc: Arc<SessionDoc>,
-    controls: RunControls,
+    mut stream: BoxStream<'static, Result<AgentEvent, HarnessError>>,
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
     mut cancel_rx: watch::Receiver<bool>,
     resume_state: RunResumeState,
 ) {
     let device_id = inner.device_id.clone();
-    // Captured for post-run auto-titling (the request moves into the harness).
+    // Retained for resume ownership and the one-shot failed-resume retry.
     let harness_id = harness.id();
     let user_prompt = request.prompt.clone();
     let run_cwd = request.cwd.clone();
@@ -907,30 +994,6 @@ async fn drive_run(
         resume: None,
         ..request.clone()
     });
-    let mut stream = match harness.run(request, controls).await {
-        Ok(stream) => stream,
-        Err(err) => {
-            let message = err.to_string();
-            inner.publish(
-                &chat_id,
-                &AgentEvent::Error {
-                    message: message.clone(),
-                },
-            );
-            inner.publish(
-                &chat_id,
-                &AgentEvent::Done {
-                    status: DoneStatus::Errored,
-                    result: None,
-                    error: Some(message),
-                    session_id: None,
-                },
-            );
-            inner.remove_run(&chat_id, &run_id);
-            inner.set_status(&chat_id, SessionStatus::Errored, false);
-            return;
-        }
-    };
 
     let doc_ref: &SessionDoc = &doc;
     let mut folded: Vec<MessagePart> = Vec::new();
@@ -1057,6 +1120,18 @@ async fn drive_run(
         // to nothing, so journaling/publishing them is only noise (hundreds
         // per long turn observed) — the touch above already did their job.
         if matches!(&event, AgentEvent::ReasoningDelta { text } if text.is_empty()) {
+            continue;
+        }
+
+        // ACP session names are workspace metadata, not transcript content.
+        // Adopt them only while Comet's local title remains provisional; the
+        // title generator preserves any later manual rename.
+        if let AgentEvent::SessionTitleChanged { title } = &event {
+            if let Some(titles) = inner.titles.get()
+                && let Err(err) = titles.adopt_harness_title(&chat_id, title)
+            {
+                tracing::warn!(chat = %chat_id, error = %err, "harness session title update failed");
+            }
             continue;
         }
 
@@ -1214,17 +1289,20 @@ async fn drive_run(
                 }
                 inner.note_message(&chat_id, &folded_text(&folded));
             }
+            if harness_id == HarnessId::Omp {
+                inner.advance_omp_import_watermark(&chat_id, &run_cwd);
+            }
             if *status == DoneStatus::Completed {
                 // A cleanly completed turn resets the auto-resume revival
                 // budget: only consecutive crash-revive-crash cycles spend it.
                 inner.journal.clear_resume_attempts(&chat_id);
             }
-            // Exchange completed on an untitled chat → name it (fire-and-forget;
-            // interrupted/errored turns never trigger naming).
+            // Retry local titling after a completed exchange in case the
+            // dispatch-time task could not observe the chat row yet.
             if *status == DoneStatus::Completed
                 && let Some(titles) = inner.titles.get()
             {
-                titles.maybe_generate(&chat_id, harness_id, &user_prompt, &run_cwd);
+                titles.maybe_generate(&chat_id, &user_prompt);
             }
             // PERSISTENT SESSION: a cleanly completed turn on a steerable
             // harness PARKS instead of ending — child + mailbox stay warm for

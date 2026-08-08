@@ -36,7 +36,7 @@ not built yet).
 | LocalDevice | done | `{deviceId}`; IPC-only (never forwarded). |
 | DataRpc watches + QueueCommand | done | — |
 | Mutate ops | partial | createChat/renameChat/setChatArchived/deleteChat/renameDevice done; markChatSeen accepted as a no-op (unseen markers UI-local); `SetChatConfig` exists on the doc layer but is not yet exposed as a Mutate op. |
-| AuthRpc | done | AuthStatus emits the canonical proto shape (`{"state": "signedIn", …}`); SignIn/SignInHeadless/CompleteSignIn/SignOut/ListOrgs/CreateOrg/SelectOrg. |
+| AuthRpc | done | AuthStatus emits the canonical verified IAP principal and Scaffold project/deployment/session scope; participant grants carry explicit capabilities. |
 | Wire types | done | `comet-proto`: AgentEvent, ToolCall kinds, models/options, entities, AuthState. |
 
 ## §3 Backend engine
@@ -48,7 +48,7 @@ not built yet).
 | 3.3 Session-docs host | done | docs.sqlite snapshots + processed-command ledger, mark-BEFORE-execute, room join per open chat, diff sidecar publish, cold-chat delivery both directions (nudge POST on queue for remote-hosted chats + warm-open on nudge receipt). Gap (minor): no boot-time warm-open of recent chats (14d/30) — cold chats rely on nudges. |
 | 3.4 Terminals | done | PTYs, 1MB bounded replay + `afterSeq` resume, 32 max, exited 30-min TTL, live shells survive detach. |
 | 3.5 Repos/diffs | done | list/add/clone/create, branches, worktrees, checkout identity; CheckoutDiffSync (fs watchers + repair pass, name-status+numstat+patch incl. untracked, 3MiB cap, sha256, sidecar publish); chat.branch upkeep from HEAD watch; folder listing with timeout. |
-| 3.7 Auth / uploads / accounts / device-room | done | WorkOS code+loopback and paste-code flows, refresh persistence (0600), org gate, dev mode; chunked uploads; claude/codex credential swap with usage probes and OAuth flows; host relay (virtual sockets over `{s,k,to,from}` frames) + peer link cache. |
+| 3.7 Auth / uploads / accounts / device-room | done | Scaffold IAP principal sessions, scope-bound participant grants, and explicit local mock mode; chunked uploads; claude/codex credential swap with usage probes and OAuth flows; host relay (virtual sockets over `{s,k,to,from}` frames) + peer link cache. |
 
 ## §4 Harness
 
@@ -74,15 +74,15 @@ not built yet).
 | Item | Status | Notes |
 | --- | --- | --- |
 | Worker routes | done | health, session ws/tail/stats/diff/snapshot/append, workspace rooms, device ws/sidecar/status/nudge, attachments (content-addressed R2, hash-verified). |
-| Auth at edge | done | WorkOS JWKS verify; dev mode `user@org` bearers; DOs see Worker-stamped identity; claim-on-first-join ownership. |
+| Auth at edge | done | Caller bearer introspection through the Scaffold control plane; DOs see only Worker-stamped verified principal, authorized scope, and capabilities; local dev uses explicit mock principals. |
 | SessionRoom DO | done | Hibernatable WS, update log + snapshot, lazy tail, two-level compaction, daily alarm checkpoint/trim/R2 backup, VV backfill, fragment reassembly. |
 | DeviceRoom DO | done | Byte-pipe frames, single host socket + supersede, relay control frames, durable nudges (replay on join, cap), sidecar slots. |
 
-## §7 Server → edge
+## §7 Scaffold control plane → edge
 
 | Item | Status | Notes |
 | --- | --- | --- |
-| WorkOS exchange/refresh, org list/create at edge | done | `/auth/*` routes; API key stays edge-side. |
+| IAP session introspection and scoped grants | done | Edge verifies the caller through Scaffold's existing access path; no customer-facing application identity or database participates. |
 | Postgres/signaling dropped | done | Nothing depends on them. |
 
 ## §8 Exclusions
@@ -93,9 +93,7 @@ not built yet).
 
 ## Deferred (cross-cutting)
 
-- **Mobile app** — out of scope for the native rewrite so far.
-- **E2EE** — transport is TLS + WorkOS bearers; end-to-end encryption of doc
-  contents not designed.
+- **E2EE** — transport is TLS with verified IAP principals; end-to-end encryption of doc contents is not designed.
 - **Cursor harness** (§4).
 - **macOS packaging execution** — config + steps in `dist/` only (needs a Mac).
 - **Engine hardening**: single-instance lock, parent-PID watchdog, crash
@@ -103,6 +101,4 @@ not built yet).
 
 ## Summary
 
-Table rows above: **39 done · 6 partial · 1 deferred** (Cursor harness), plus
-the cross-cutting deferrals (mobile, E2EE, macOS packaging execution,
-engine hardening) — the last overlaps the named gaps in the partial rows.
+Table rows above: **39 done · 6 partial · 1 deferred** (Cursor harness), plus the cross-cutting deferrals (E2EE, macOS packaging execution, engine hardening) — the last overlaps the named gaps in the partial rows.

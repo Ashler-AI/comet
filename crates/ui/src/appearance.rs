@@ -185,8 +185,7 @@ pub fn apply(cx: &mut App) {
     // `NSVisualEffectView` from the window the moment the background appearance
     // is anything but `Blurred`, and nothing puts it back on its own — so a
     // single missed re-apply leaves the sidebar and tab strip permanently
-    // opaque, which is exactly how the frost died. zed runs the same loop on
-    // every settings change (`crates/zed/src/main.rs`).
+    // opaque. Re-apply after every settings change.
     reapply_window_background(cx);
 }
 
