@@ -19,7 +19,7 @@ use chrono::Utc;
 use tokio::sync::watch;
 
 use comet_doc::{DeletedSpace, WorkspaceDoc, presence_key};
-use comet_proto::{Chat, ChatConfig, Device, Session, Space};
+use comet_proto::{Chat, ChatConfig, Device, Session, SessionRef, Space};
 use comet_sync::{DocsStore, RoomClient};
 
 use crate::doc_host::EdgeConfig;
@@ -127,6 +127,7 @@ struct WorkspaceHostInner {
     devices_tx: watch::Sender<Vec<Device>>,
     sessions_tx: watch::Sender<Vec<Session>>,
     spaces_tx: watch::Sender<Vec<Space>>,
+    session_refs_tx: watch::Sender<Vec<SessionRef>>,
     room: Mutex<Option<RoomClient>>,
     /// Freshest presence heartbeat (ms) we have EVER observed per device. The
     /// ephemeral store forgets entries after its 30s TTL and starts empty on a
@@ -209,6 +210,7 @@ impl WorkspaceHost {
         let (devices_tx, _) = watch::channel(state.devices);
         let (sessions_tx, _) = watch::channel(state.sessions);
         let (spaces_tx, _) = watch::channel(state.spaces);
+        let (session_refs_tx, _) = watch::channel(state.session_refs);
 
         let host = Self {
             inner: Arc::new(WorkspaceHostInner {
@@ -219,6 +221,7 @@ impl WorkspaceHost {
                 devices_tx,
                 sessions_tx,
                 spaces_tx,
+                session_refs_tx,
                 room: Mutex::new(None),
                 presence_seen: Mutex::new(std::collections::HashMap::new()),
                 peer_alive: Mutex::new(None),
@@ -366,6 +369,28 @@ impl WorkspaceHost {
         self.inner.spaces_tx.subscribe()
     }
 
+    pub fn watch_session_refs(&self) -> watch::Receiver<Vec<SessionRef>> {
+        self.inner.session_refs_tx.subscribe()
+    }
+
+    /// Add an exact-id pointer to a global session without creating a local
+    /// chat host row. Repeated adds preserve the original membership timestamp.
+    pub fn upsert_session_ref(&self, chat_id: &str) -> Result<SessionRef, EngineError> {
+        if let Some(existing) = self.inner.doc.session_ref(chat_id)? {
+            return Ok(existing);
+        }
+        let session_ref = SessionRef {
+            chat_id: chat_id.to_string(),
+            added_at: Utc::now(),
+        };
+        self.inner.doc.upsert_session_ref(&session_ref)?;
+        Ok(session_ref)
+    }
+
+    pub fn remove_session_ref(&self, chat_id: &str) -> Result<bool, EngineError> {
+        Ok(self.inner.doc.remove_session_ref(chat_id)?)
+    }
+
     /// WatchSessions source: remote devices' rows from the workspace doc merged with
     /// this engine's live status watch (the local view is fresher for our own runs).
     pub fn merged_sessions_watch(
@@ -397,12 +422,20 @@ impl WorkspaceHost {
 
     // ── chat ownership (replaces the M2 "host everything" pragmatism) ───────
 
-    /// §2.2 writer discipline: the chat's host is its row's `deviceId`. Unknown chats
-    /// are claimable — the first run command claims them via [`Self::claim_chat`].
+    /// §2.2 writer discipline: the chat's host is its row's `deviceId`.
+    /// A session ref without a chat row is an imported room and is never hosted
+    /// here. Only ids absent from both maps retain claim-on-first-command.
     pub fn is_host(&self, chat_id: &str) -> bool {
         match self.inner.doc.chat(chat_id) {
             Ok(Some(chat)) => chat.device_id == self.inner.config.device_id,
-            Ok(None) => true,
+            Ok(None) => match self.inner.doc.session_ref(chat_id) {
+                Ok(Some(_)) => false,
+                Ok(None) => true,
+                Err(err) => {
+                    tracing::warn!(chat = %chat_id, error = %err, "workspace session ref read failed");
+                    true
+                }
+            },
             Err(err) => {
                 tracing::warn!(chat = %chat_id, error = %err, "workspace chat read failed");
                 true
@@ -421,7 +454,8 @@ impl WorkspaceHost {
     /// cwd claims a space *at the worktree path*, not the repo root — acceptable
     /// for tooling-only (raw doc command) traffic.
     pub fn claim_chat(&self, chat_id: &str, cwd: Option<&str>) -> Result<(), EngineError> {
-        if self.inner.doc.chat(chat_id)?.is_some() {
+        if self.inner.doc.chat(chat_id)?.is_some() || self.inner.doc.session_ref(chat_id)?.is_some()
+        {
             return Ok(());
         }
         let space_id = match cwd {
@@ -776,6 +810,7 @@ impl WorkspaceHostInner {
                 self.devices_tx.send_replace(state.devices);
                 self.sessions_tx.send_replace(state.sessions);
                 self.spaces_tx.send_replace(state.spaces);
+                self.session_refs_tx.send_replace(state.session_refs);
             }
             Err(err) => {
                 tracing::warn!(error = %err, "workspace read failed");

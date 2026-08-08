@@ -13,6 +13,7 @@
 //!   harnessSessionId?, harnessSessionCwd?, spaceId?, lastSeenAt?}
 //! - `sessions`: LoroMap keyed by chatId → row map {chatId, deviceId, status, startedAt?,
 //!   updatedAt}
+//! - `sessionRefs`: LoroMap keyed by chatId → row map {chatId, addedAt}
 //! - `meta`: LoroMap {schemaVersion} — in-band detection for future destructive changes
 //!
 //! Writer discipline (ARCHITECTURE §2.2): each device writes its own device row, its
@@ -28,14 +29,14 @@ use chrono::{DateTime, Utc};
 use loro::{ExportMode, LoroDoc, LoroMap, LoroValue, ToJson};
 use serde::{Deserialize, Serialize};
 
-use comet_proto::{Chat, ChatConfig, Device, Session, SessionStatus, Space};
+use comet_proto::{Chat, ChatConfig, Device, Session, SessionRef, SessionStatus, Space};
 
 use crate::schema::DocError;
 
-/// Workspace doc schema version. v2 = the spaces overhaul (spaces container,
-/// chat spaceId/lastSeenAt) — a destructive break shipped via a fresh doc/room
-/// (`workspace2` / `ws2/{orgId}`), so no v1 reader exists.
-pub const WORKSPACE_SCHEMA_VERSION: i64 = 2;
+/// Workspace doc schema version. v3 adds the non-owning `sessionRefs` container.
+/// v2 was the spaces overhaul, shipped via a fresh doc/room (`workspace2` /
+/// `ws2/{orgId}`), so no v1 reader exists.
+pub const WORKSPACE_SCHEMA_VERSION: i64 = 3;
 
 /// Ephemeral presence key for a device (`presence/{deviceId}` → online timestamp).
 pub fn presence_key(device_id: &str) -> String {
@@ -50,6 +51,7 @@ pub struct WorkspaceState {
     pub spaces: Vec<Space>,
     pub chats: Vec<Chat>,
     pub sessions: Vec<Session>,
+    pub session_refs: Vec<SessionRef>,
 }
 
 /// Result of a `delete_space` cascade — the chat ids removed alongside the
@@ -451,6 +453,53 @@ impl WorkspaceDoc {
         sessions.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
         Ok(sessions)
     }
+    // ── session refs ────────────────────────────────────────────────────────
+
+    /// Upsert a non-owning pointer to an existing global session room.
+    ///
+    /// This deliberately does not create or mutate a `chats` row: imported
+    /// sessions have no host placement in this workspace.
+    pub fn upsert_session_ref(&self, session_ref: &SessionRef) -> Result<(), DocError> {
+        let row = self.row("sessionRefs", &session_ref.chat_id)?;
+        row.insert("chatId", session_ref.chat_id.as_str())?;
+        row.insert("addedAt", session_ref.added_at.timestamp_millis())?;
+        self.doc.commit();
+        Ok(())
+    }
+
+    pub fn session_ref(&self, chat_id: &str) -> Result<Option<SessionRef>, DocError> {
+        let Some(row) = self.existing_row("sessionRefs", chat_id) else {
+            return Ok(None);
+        };
+        let value = row.get_deep_value().to_json_value();
+        match serde_json::from_value::<RawSessionRef>(value) {
+            Ok(raw) => Ok(Some(raw.into())),
+            Err(err) => {
+                tracing::warn!(row = %chat_id, error = %err, "skipping malformed session ref row");
+                Ok(None)
+            }
+        }
+    }
+
+    pub fn read_session_refs(&self) -> Result<Vec<SessionRef>, DocError> {
+        let mut refs: Vec<SessionRef> = self
+            .read_rows::<RawSessionRef>("sessionRefs")?
+            .into_iter()
+            .map(SessionRef::from)
+            .collect();
+        refs.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+        Ok(refs)
+    }
+
+    /// Remove only this workspace's membership pointer. The session room and
+    /// any independently owned `chats` row are untouched.
+    pub fn remove_session_ref(&self, chat_id: &str) -> Result<bool, DocError> {
+        let refs = self.doc.get_map("sessionRefs");
+        let existed = refs.get(chat_id).is_some();
+        refs.delete(chat_id)?;
+        self.doc.commit();
+        Ok(existed)
+    }
 
     // ── whole-doc read ──────────────────────────────────────────────────────
 
@@ -460,6 +509,7 @@ impl WorkspaceDoc {
             spaces: self.read_spaces()?,
             chats: self.read_chats()?,
             sessions: self.read_sessions()?,
+            session_refs: self.read_session_refs()?,
         })
     }
 
@@ -695,6 +745,22 @@ impl From<RawSession> for Session {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawSessionRef {
+    chat_id: String,
+    added_at: i64,
+}
+
+impl From<RawSessionRef> for SessionRef {
+    fn from(raw: RawSessionRef) -> Self {
+        SessionRef {
+            chat_id: raw.chat_id,
+            added_at: dt(raw.added_at),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -761,6 +827,13 @@ mod tests {
             status,
             started_at: Some(ts(3_000)),
             updated_at: ts(3_500),
+        }
+    }
+
+    fn session_ref(chat_id: &str, added_at: i64) -> SessionRef {
+        SessionRef {
+            chat_id: chat_id.into(),
+            added_at: ts(added_at),
         }
     }
 
@@ -840,6 +913,39 @@ mod tests {
         other.import(&bytes).unwrap();
         let restored = WorkspaceDoc::from_doc(other);
         assert_eq!(restored.read_all().unwrap(), ws.read_all().unwrap());
+    }
+
+    #[test]
+    fn session_refs_persist_without_creating_chat_rows() {
+        let ws = WorkspaceDoc::new();
+        let imported = session_ref("shared-chat", 7_000);
+        ws.upsert_session_ref(&imported).unwrap();
+
+        assert_eq!(
+            ws.session_ref("shared-chat").unwrap(),
+            Some(imported.clone())
+        );
+        assert!(ws.read_chats().unwrap().is_empty());
+
+        let snapshot = ws.export_snapshot().unwrap();
+        let restored_doc = LoroDoc::new();
+        restored_doc.import(&snapshot).unwrap();
+        let restored = WorkspaceDoc::from_doc(restored_doc);
+        assert_eq!(restored.read_session_refs().unwrap(), vec![imported]);
+        assert!(restored.read_chats().unwrap().is_empty());
+    }
+
+    #[test]
+    fn removing_session_ref_preserves_owned_chat() {
+        let ws = WorkspaceDoc::new();
+        ws.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
+        ws.upsert_session_ref(&session_ref("chat-1", 8_000))
+            .unwrap();
+
+        assert!(ws.remove_session_ref("chat-1").unwrap());
+        assert!(ws.read_session_refs().unwrap().is_empty());
+        assert!(ws.chat("chat-1").unwrap().is_some());
+        assert!(!ws.remove_session_ref("chat-1").unwrap());
     }
 
     #[test]

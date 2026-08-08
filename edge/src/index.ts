@@ -30,7 +30,7 @@
 import { authenticate } from "./auth";
 import { handleAuthRoute } from "./auth-routes";
 import { AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
-import { SessionRoom } from "./session-room";
+import { canonicalSessionId, SessionRoom } from "./session-room";
 import { DeviceRoom } from "./device-room";
 import installSh from "./install.sh";
 
@@ -131,39 +131,39 @@ export default {
     const auth = await authenticate(env, request);
     if (!auth) return json({ error: "unauthenticated" }, 401);
 
+    const sessionId = canonicalSessionId(parts[1]);
+
     // ── session rooms ───────────────────────────────────────────────────────
-    if (parts[0] === "session" && parts[1] && ID_RE.test(parts[1]) && parts[2] === "ws") {
+    if (parts[0] === "session" && sessionId && parts[2] === "ws") {
       if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
         return json({ error: "expected websocket" }, 426);
       }
-      // `s2/` = the WorkOS staging→production identity break: rooms are
-      // claim-on-first-join per user id, and prod issued a fresh id for
-      // everyone — a new namespace lets prod identities claim fresh rooms
-      // while hosts re-upload doc state from their local snapshots (same
-      // playbook as `ws3` below). Frame-level room ids stay the bare chatId.
+      // `s2/` preserves the deployed session-room namespace. The canonical
+      // lowercase UUID is both the Durable Object key and the bare chatId
+      // carried by protocol frames, so alternate casing cannot split a room.
       return forward(
         env.SESSION_ROOMS,
-        `s2/${parts[1]}`,
+        `s2/${sessionId}`,
         request,
         auth.userId,
         "/ws",
-        `?chatId=${parts[1]}${deviceParam(url)}`
+        `?chatId=${sessionId}${deviceParam(url)}`
       );
     }
-    if (parts[0] === "tail" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/tail", "");
+    if (parts[0] === "tail" && sessionId && request.method === "GET") {
+      return forward(env.SESSION_ROOMS, `s2/${sessionId}`, request, auth.userId, "/tail", "");
     }
-    if (parts[0] === "stats" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/stats", "");
+    if (parts[0] === "stats" && sessionId && request.method === "GET") {
+      return forward(env.SESSION_ROOMS, `s2/${sessionId}`, request, auth.userId, "/stats", "");
     }
-    if (parts[0] === "diff" && parts[1] && ID_RE.test(parts[1])) {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/diff", "");
+    if (parts[0] === "diff" && sessionId) {
+      return forward(env.SESSION_ROOMS, `s2/${sessionId}`, request, auth.userId, "/diff", "");
     }
-    if (parts[0] === "snapshot" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/snapshot", "");
+    if (parts[0] === "snapshot" && sessionId && request.method === "GET") {
+      return forward(env.SESSION_ROOMS, `s2/${sessionId}`, request, auth.userId, "/snapshot", "");
     }
-    if (parts[0] === "append" && parts[1] && ID_RE.test(parts[1]) && request.method === "POST") {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/append", "");
+    if (parts[0] === "append" && sessionId && request.method === "POST") {
+      return forward(env.SESSION_ROOMS, `s2/${sessionId}`, request, auth.userId, "/append", "");
     }
 
     // ── workspace rooms (ARCHITECTURE §2.2/§6.1): same SessionRoom DO class;

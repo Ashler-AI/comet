@@ -237,6 +237,7 @@ impl Harness for CodexHarness {
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
         crate::compose_child_path(&mut cmd, &exe);
+        crate::apply_run_context(&mut cmd, controls.context.as_ref());
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }
@@ -402,6 +403,7 @@ async fn run_session(session: Session) {
         request_input,
         mut steering,
         interrupt,
+        context: _,
     } = controls;
     let request_input = Arc::new(request_input);
 

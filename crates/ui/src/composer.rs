@@ -375,6 +375,10 @@ pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
     }
 }
 
+fn should_queue_steer(requested_steer: bool, is_new: bool, is_shared: bool) -> bool {
+    !is_new && (requested_steer || is_shared)
+}
+
 /// Find the unresolved input request the panel should serve, if any: an
 /// unresolved input part on the LAST assistant entry — regardless of the
 /// entry's run status. The question stays answerable until the user actually
@@ -3891,6 +3895,13 @@ impl Composer {
             Some(id) => (id, false),
             None => (uuid::Uuid::new_v4().to_string(), true),
         };
+        let is_shared = !is_new && self.state.read(cx).is_shared_session(&chat_id);
+        if is_shared && !self.staged().is_empty() {
+            self.failure =
+                Some("Attachments aren't available in shared sessions; send text only.".into());
+            cx.notify();
+            return;
+        }
         // Where the new session runs (Current checkout / reuse an existing
         // worktree / fresh worktree off the picked base) — resolved NOW so
         // the async block needs no picker access.
@@ -3994,7 +4005,9 @@ impl Composer {
         });
         cx.notify();
 
-        let steer_cmd = steer && !is_new;
+        // Imported sessions have no local Chat row, so they must use Steer:
+        // the owner host rebuilds a fresh turn from its own cwd/config.
+        let steer_cmd = should_queue_steer(steer, is_new, is_shared);
         let restore_text = text.clone();
         let err_chat_id = chat_id.clone();
         let err_message_id = message_id.clone();
@@ -5057,6 +5070,14 @@ mod tests {
             range,
             path: path.into(),
         }
+    }
+
+    #[test]
+    fn shared_session_send_uses_steer_without_a_live_status() {
+        assert!(should_queue_steer(false, false, true));
+        assert!(should_queue_steer(true, false, false));
+        assert!(!should_queue_steer(false, false, false));
+        assert!(!should_queue_steer(true, true, true));
     }
 
     #[test]

@@ -18,7 +18,7 @@
 //! spawn failure, stream error, engine-restart recovery).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 use chrono::Utc;
 use futures::StreamExt;
@@ -28,7 +28,7 @@ use comet_doc::{
     DocError, MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, SegmentWriter, SessionDoc,
     fold_event_into_parts, sanitize_tool_call,
 };
-use comet_harness::{CancellationToken, Harness, RunControls, SteerMessage};
+use comet_harness::{CancellationToken, Harness, RunContext, RunControls, SteerMessage};
 use comet_proto::{
     AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, UserInputAnswer,
     UserInputQuestion,
@@ -57,6 +57,57 @@ pub enum SteerOutcome {
 
 type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerReply {
+    pub command_id: String,
+    pub text: String,
+    pub source_chat_id: String,
+}
+
+struct LivePeerWaiter {
+    registration_id: String,
+    sender: oneshot::Sender<PeerReply>,
+}
+
+pub struct PeerWaitClaim {
+    sender: oneshot::Sender<PeerReply>,
+}
+
+impl PeerWaitClaim {
+    pub fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+
+    pub fn deliver(self, reply: PeerReply) -> bool {
+        self.sender.send(reply).is_ok()
+    }
+}
+
+/// One race-free subscription to a source-session peer thread. Dropping it
+/// unregisters only this generation, so a timed-out waiter cannot remove a
+/// later registration for the same thread.
+pub struct PeerWaitRegistration {
+    inner: Weak<Inner>,
+    key: (String, String),
+    registration_id: String,
+    receiver: Option<oneshot::Receiver<PeerReply>>,
+}
+
+impl Drop for PeerWaitRegistration {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let mut waiters = lock(&inner.peer_waiters);
+        if waiters
+            .get(&self.key)
+            .is_some_and(|waiter| waiter.registration_id == self.registration_id)
+        {
+            waiters.remove(&self.key);
+        }
+    }
+}
+
 /// A harness-native session id plus the cwd it was created under. Harness
 /// session stores are cwd-scoped (claude keys conversations by project
 /// directory — comet sessions.ts:563 "harness session stores are keyed by
@@ -84,6 +135,8 @@ struct Inner {
     device_id: String,
     journal: Arc<RunJournal>,
     registry: Arc<HarnessRegistry>,
+    /// Loopback port advertised to harness children for `comet session` RPC.
+    ipc_port: u16,
     doc_host: OnceLock<DocHost>,
     /// chat_id → live run.
     runs: Mutex<HashMap<String, RunHandle>>,
@@ -99,6 +152,9 @@ struct Inner {
     /// (comet kept the same pair on `chats.harness_session_id`). An empty
     /// session id is the "do not resume" tombstone after a rejected resume.
     harness_sessions: Mutex<HashMap<String, HarnessSessionRef>>,
+    /// (source chat, thread) → one local live waiter. This is intentionally
+    /// process-local: the command ledger remains the only durable outbox.
+    peer_waiters: Mutex<HashMap<(String, String), LivePeerWaiter>>,
     /// Auto-titler for untitled chats (wired at engine assembly; absent in bare tests).
     titles: OnceLock<crate::titles::TitleGenerator>,
 }
@@ -117,6 +173,7 @@ impl SessionsEngine {
         device_id: String,
         journal: Arc<RunJournal>,
         registry: Arc<HarnessRegistry>,
+        ipc_port: u16,
     ) -> Self {
         let (sessions_tx, _) = watch::channel(Vec::new());
         Self {
@@ -124,6 +181,7 @@ impl SessionsEngine {
                 device_id,
                 journal,
                 registry,
+                ipc_port,
                 doc_host: OnceLock::new(),
                 runs: Mutex::new(HashMap::new()),
                 hubs: Mutex::new(HashMap::new()),
@@ -131,6 +189,7 @@ impl SessionsEngine {
                 sessions_tx,
                 last_requests: Mutex::new(HashMap::new()),
                 harness_sessions: Mutex::new(HashMap::new()),
+                peer_waiters: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
             }),
         }
@@ -154,6 +213,63 @@ impl SessionsEngine {
                 EngineError::Other("doc host not wired into sessions engine".into())
             })?;
         host.open(chat_id)
+    }
+
+    /// Register before appending the outbound command, closing the immediate
+    /// reply race. Only one live consumer may own a source/thread pair.
+    pub fn register_peer_waiter(
+        &self,
+        source_chat_id: &str,
+        thread_id: &str,
+    ) -> Result<PeerWaitRegistration, EngineError> {
+        let key = (source_chat_id.to_string(), thread_id.to_string());
+        let registration_id = new_id();
+        let (sender, receiver) = oneshot::channel();
+        let mut waiters = lock(&self.inner.peer_waiters);
+        if waiters.contains_key(&key) {
+            return Err(EngineError::Other("waiter_already_registered".into()));
+        }
+        waiters.insert(
+            key.clone(),
+            LivePeerWaiter {
+                registration_id: registration_id.clone(),
+                sender,
+            },
+        );
+        Ok(PeerWaitRegistration {
+            inner: Arc::downgrade(&self.inner),
+            key,
+            registration_id,
+            receiver: Some(receiver),
+        })
+    }
+
+    /// Await one reply. Timeout/drop removes the local waiter but never mutates
+    /// or cancels the durable peer command.
+    pub async fn wait_peer_reply(
+        &self,
+        mut registration: PeerWaitRegistration,
+        timeout: std::time::Duration,
+    ) -> Option<PeerReply> {
+        let receiver = registration.receiver.take()?;
+        tokio::time::timeout(timeout, receiver)
+            .await
+            .ok()
+            .and_then(Result::ok)
+    }
+
+    /// Atomically reserve the active waiter for executor completion. Once
+    /// claimed, no second reply can resolve the same source/thread pair.
+    pub fn claim_peer_waiter(
+        &self,
+        source_chat_id: &str,
+        thread_id: &str,
+    ) -> Option<PeerWaitClaim> {
+        let waiter = lock(&self.inner.peer_waiters)
+            .remove(&(source_chat_id.to_string(), thread_id.to_string()))?;
+        Some(PeerWaitClaim {
+            sender: waiter.sender,
+        })
     }
 
     /// Status watch: the full session list, re-sent on every transition.
@@ -314,6 +430,10 @@ impl SessionsEngine {
             request_input,
             steering: steer_rx,
             interrupt: interrupt_token.clone(),
+            context: Some(RunContext {
+                session_id: chat_id.to_string(),
+                ipc_port: self.inner.ipc_port,
+            }),
         };
 
         lock(&self.inner.runs).insert(

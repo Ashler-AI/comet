@@ -27,9 +27,9 @@ use gpui::{App, Context, Entity, Task};
 use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
-use comet_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
+use comet_doc::{MessagePart, MessageRole, SessionMessageEntry, TranscriptDesync, TranscriptFrame};
 use comet_engine::{Engine, EngineConfig, EngineRuntime, rpc::AuthRpc};
-use comet_proto::{AuthState, Chat, ChatIndicator, Device, HarnessId, Session, Space};
+use comet_proto::{AuthState, Chat, ChatIndicator, Device, HarnessId, Session, SessionRef, Space};
 use comet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
 
 // ---------------------------------------------------------------------------
@@ -335,6 +335,37 @@ pub fn sort_memberships(mut orgs: Vec<OrgRow>) -> Vec<OrgRow> {
     orgs.dedup_by(|a, b| a.organization_id == b.organization_id);
     orgs
 }
+/// A compact transcript-derived label for an imported session. The first user
+/// turn is stable as the conversation grows; blank/tool-only turns keep the
+/// exact-id fallback.
+fn shared_session_preview(entries: &[SessionMessageEntry]) -> Option<String> {
+    let text = entries
+        .iter()
+        .find(|entry| entry.role == MessageRole::User)?
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.is_empty() {
+        return None;
+    }
+    let mut chars = one_line.chars();
+    let preview: String = chars.by_ref().take(48).collect();
+    Some(if chars.next().is_some() {
+        format!("{preview}\u{2026}")
+    } else {
+        preview
+    })
+}
+
+fn session_ref_fallback(chat_id: &str) -> String {
+    format!("Session {}", chat_id.chars().take(8).collect::<String>())
+}
 
 // ---------------------------------------------------------------------------
 // AppState entity
@@ -353,6 +384,10 @@ pub struct AppState {
     /// Sorted (see [`sort_chats`]); includes archived rows — views filter.
     pub chats: Vec<Chat>,
     pub sessions: Vec<Session>,
+    /// Imported session memberships from the workspace `sessionRefs` map.
+    pub session_refs: Vec<SessionRef>,
+    /// Transcript-derived labels learned after an imported room has opened.
+    shared_session_previews: HashMap<String, String>,
     /// The space whose tabs fill the main area. Healed by [`Self::apply_spaces`]
     /// when the row vanishes; selecting a chat implies its space.
     pub selected_space: Option<String>,
@@ -392,6 +427,8 @@ impl AppState {
             spaces: Vec::new(),
             chats: Vec::new(),
             sessions: Vec::new(),
+            session_refs: Vec::new(),
+            shared_session_previews: HashMap::new(),
             selected_space: None,
             selected_chat: None,
             transcript: Vec::new(),
@@ -411,10 +448,29 @@ impl AppState {
     pub fn apply_chats(&mut self, mut chats: Vec<Chat>) {
         sort_chats(&mut chats);
         self.chats = chats;
-        if let Some(selected) = &self.selected_chat
-            && !self.chats.iter().any(|c| &c.id == selected)
-        {
-            // Selected chat vanished (deleted elsewhere): drop selection + transcript.
+        self.heal_selected_session();
+    }
+
+    pub fn apply_session_refs(&mut self, mut refs: Vec<SessionRef>) {
+        refs.sort_by(|a, b| {
+            b.added_at
+                .cmp(&a.added_at)
+                .then_with(|| a.chat_id.cmp(&b.chat_id))
+        });
+        self.session_refs = refs;
+        self.heal_selected_session();
+    }
+
+    fn heal_selected_session(&mut self) {
+        let Some(selected) = self.selected_chat.as_deref() else {
+            return;
+        };
+        let owned = self.chats.iter().any(|chat| chat.id == selected);
+        let imported = self
+            .session_refs
+            .iter()
+            .any(|session_ref| session_ref.chat_id == selected);
+        if !owned && !imported {
             self.selected_chat = None;
             self.transcript.clear();
             self.transcript_task = None;
@@ -488,6 +544,7 @@ impl AppState {
             echoes.retain(|echo| !entries.iter().any(|e| e.id == echo.id));
         }
         self.transcript = entries;
+        self.update_selected_shared_preview();
     }
 
     /// Apply a `WatchDocMessages` delta frame in place. `Err` = this copy has
@@ -503,6 +560,7 @@ impl AppState {
             let transcript = &self.transcript;
             echoes.retain(|echo| !transcript.iter().any(|e| e.id == echo.id));
         }
+        self.update_selected_shared_preview();
         Ok(())
     }
 
@@ -530,11 +588,47 @@ impl AppState {
             .unwrap_or(&[])
     }
 
+    fn update_selected_shared_preview(&mut self) {
+        let Some(chat_id) = self.selected_chat.as_deref() else {
+            return;
+        };
+        if self.chats.iter().any(|chat| chat.id == chat_id)
+            || self.shared_session_previews.contains_key(chat_id)
+        {
+            return;
+        }
+        if let Some(preview) = shared_session_preview(&self.transcript) {
+            self.shared_session_previews
+                .insert(chat_id.to_string(), preview);
+        }
+    }
+
     // ---- queries ----
 
     /// Non-archived chats in sidebar order.
     pub fn visible_chats(&self) -> impl Iterator<Item = &Chat> {
         self.chats.iter().filter(|c| !c.archived)
+    }
+    /// Imported memberships which are not locally-owned chats.
+    pub fn shared_session_refs(&self) -> impl Iterator<Item = &SessionRef> {
+        self.session_refs
+            .iter()
+            .filter(|session_ref| !self.chats.iter().any(|chat| chat.id == session_ref.chat_id))
+    }
+
+    pub fn is_shared_session(&self, chat_id: &str) -> bool {
+        self.chats.iter().all(|chat| chat.id != chat_id)
+            && self
+                .session_refs
+                .iter()
+                .any(|session_ref| session_ref.chat_id == chat_id)
+    }
+
+    pub fn shared_session_title(&self, chat_id: &str) -> String {
+        self.shared_session_previews
+            .get(chat_id)
+            .cloned()
+            .unwrap_or_else(|| session_ref_fallback(chat_id))
     }
 
     pub fn selected_space_row(&self) -> Option<&Space> {
@@ -677,6 +771,12 @@ impl AppState {
                 handle.clone(),
                 methods::WATCH_SESSIONS,
                 AppState::apply_sessions,
+            ),
+            spawn_watch(
+                cx,
+                handle.clone(),
+                methods::WATCH_SESSION_REFS,
+                AppState::apply_session_refs,
             ),
             spawn_chats_watch(cx, handle.clone()),
             spawn_watch(
@@ -1717,5 +1817,64 @@ mod tests {
             1
         );
         assert!(parse_orgs(&serde_json::json!("nope")).is_empty());
+    }
+    #[test]
+    fn imported_membership_keeps_selection_without_a_chat_row() {
+        let chat_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let mut state = AppState::new();
+        state.selected_chat = Some(chat_id.into());
+        state.apply_session_refs(vec![SessionRef {
+            chat_id: chat_id.into(),
+            added_at: Utc::now(),
+        }]);
+
+        state.apply_chats(Vec::new());
+        assert_eq!(state.selected_chat.as_deref(), Some(chat_id));
+        assert!(state.selected_chat_row().is_none());
+        assert!(state.is_shared_session(chat_id));
+
+        state.apply_session_refs(Vec::new());
+        assert!(state.selected_chat.is_none());
+    }
+
+    #[test]
+    fn imported_session_title_promotes_from_id_to_transcript_preview() {
+        let chat_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let mut state = AppState::new();
+        state.selected_chat = Some(chat_id.into());
+        state.apply_session_refs(vec![SessionRef {
+            chat_id: chat_id.into(),
+            added_at: Utc::now(),
+        }]);
+        assert_eq!(state.shared_session_title(chat_id), "Session aaaaaaaa");
+
+        state.apply_transcript(vec![SessionMessageEntry {
+            id: "message".into(),
+            role: MessageRole::User,
+            parts: vec![MessagePart::Text {
+                id: "text".into(),
+                text: "  Explain   the shared transcript  ".into(),
+            }],
+            created_at: 1,
+            device_id: "remote".into(),
+            status: None,
+            continuation_of: None,
+        }]);
+        assert_eq!(
+            state.shared_session_title(chat_id),
+            "Explain the shared transcript"
+        );
+    }
+
+    #[test]
+    fn owned_chat_is_not_duplicated_in_shared_projection() {
+        let chat_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let mut state = AppState::new();
+        state.apply_session_refs(vec![SessionRef {
+            chat_id: chat_id.into(),
+            added_at: Utc::now(),
+        }]);
+        state.apply_chats(vec![chat(chat_id, 1, None)]);
+        assert_eq!(state.shared_session_refs().count(), 0);
     }
 }

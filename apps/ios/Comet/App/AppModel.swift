@@ -18,6 +18,7 @@ final class AppModel {
     var phase: Phase = .signedOut
     var workspace: WorkspaceStore?
     var demo: DemoDataset?
+    private var demoSessionRefs: [SessionRef] = []
     private var sessionStores: [String: SessionStore] = [:]
     private var config: AppConfig?
 
@@ -182,6 +183,7 @@ final class AppModel {
         workspace = nil
         sessionStores.values.forEach { $0.stop() }
         sessionStores.removeAll()
+        demoSessionRefs.removeAll()
         config = nil
         demo = nil
         Keychain.delete(key: "accessToken")
@@ -222,6 +224,38 @@ final class AppModel {
         }
         return workspace?.overviewChats ?? []
     }
+    var sharedSessionRefs: [SessionRef] {
+        demo != nil ? demoSessionRefs : (workspace?.sharedSessionRefs ?? [])
+    }
+
+    func sessionRef(id: String) -> SessionRef? {
+        sharedSessionRefs.first { $0.chatId == id }
+    }
+
+    @discardableResult
+    func addSessionRef(_ rawChatId: String) -> SessionRef? {
+        guard let uuid = UUID(uuidString: rawChatId.trimmingCharacters(in: .whitespacesAndNewlines))
+        else { return nil }
+        let chatId = uuid.uuidString.lowercased()
+        if demo != nil {
+            if let existing = demoSessionRefs.first(where: { $0.chatId == chatId }) {
+                return existing
+            }
+            let ref = SessionRef(chatId: chatId, addedAt: nowMs())
+            demoSessionRefs.insert(ref, at: 0)
+            return ref
+        }
+        return workspace?.addSessionRef(chatId: chatId)
+    }
+
+    func removeSessionRef(chatId: String) {
+        if demo != nil {
+            demoSessionRefs.removeAll { $0.chatId == chatId }
+            return
+        }
+        workspace?.removeSessionRef(chatId: chatId)
+    }
+
 
     func chats(in spaceId: String) -> [Chat] {
         if let demo {
@@ -429,17 +463,41 @@ final class AppModel {
     // MARK: Session stores
 
     func sessionStore(for chat: Chat) -> SessionStore? {
-        if let demo { return demo.sessionStore(for: chat.id) }
+        sessionStore(chatId: chat.id, hostDeviceId: chat.deviceId)
+    }
+
+    func sessionStore(for sessionRef: SessionRef) -> SessionStore? {
+        sessionStore(chatId: sessionRef.chatId, hostDeviceId: nil)
+    }
+
+    private func sessionStore(chatId: String, hostDeviceId: String?) -> SessionStore? {
+        if let demo { return demo.sessionStore(for: chatId) }
         guard let config else { return nil }
-        if let existing = sessionStores[chat.id] {
-            existing.hostDeviceId = chat.deviceId
+        if let existing = sessionStores[chatId] {
+            if existing.hostDeviceId != hostDeviceId {
+                existing.hostDeviceId = hostDeviceId
+            }
             return existing
         }
-        let store = SessionStore(chatId: chat.id, config: config)
-        store.hostDeviceId = chat.deviceId
-        sessionStores[chat.id] = store
+        let store = SessionStore(chatId: chatId, config: config)
+        store.hostDeviceId = hostDeviceId
+        sessionStores[chatId] = store
         store.start()
         return store
+    }
+
+    func sessionTitle(for sessionRef: SessionRef) -> String {
+        guard let store = sessionStore(for: sessionRef),
+              let entry = store.entries.first(where: { $0.role == .user }) else {
+            return sessionRef.fallbackTitle
+        }
+        let text = entry.parts.compactMap { part -> String? in
+            guard case .text(_, let text) = part else { return nil }
+            return text
+        }.joined(separator: " ")
+        let oneLine = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        guard !oneLine.isEmpty else { return sessionRef.fallbackTitle }
+        return oneLine.count > 48 ? String(oneLine.prefix(48)) + "\u{2026}" : oneLine
     }
 
     func releaseSessionStore(chatId: String) {
@@ -452,6 +510,9 @@ final class AppModel {
     func preloadSessions() {
         for chat in overviewChats {
             _ = sessionStore(for: chat)
+        }
+        for sessionRef in sharedSessionRefs {
+            _ = sessionStore(for: sessionRef)
         }
     }
 }

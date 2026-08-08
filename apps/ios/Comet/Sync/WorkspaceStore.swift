@@ -2,8 +2,9 @@
 // over the workspace doc (crates/doc/src/workspace.rs). Joins the per-user
 // `ws3/{orgId}/{userId}` room, projects the doc into typed rows, and performs
 // the writes the writer discipline allows a viewer device: chat creates,
-// archives and seen marks. iOS is a viewport, not an engine device, so it
-// deliberately owns neither a device row nor a presence heartbeat.
+// archives, seen marks, and exact-id shared-session membership. iOS is a
+// viewport, not an engine device, so it deliberately owns neither a device row
+// nor a presence heartbeat.
 
 import Foundation
 import Loro
@@ -16,6 +17,7 @@ final class WorkspaceStore {
     private(set) var spaces: [Space] = []
     private(set) var chats: [Chat] = []
     private(set) var sessions: [String: SessionRow] = [:]
+    private(set) var sessionRefs: [SessionRef] = []
     private(set) var presence: [String: Int64] = [:]  // deviceId → last heartbeat ms
     private(set) var connected = false
 
@@ -184,6 +186,16 @@ final class WorkspaceStore {
                         spaceId: m["spaceId"]?.stringValue,
                         lastSeenAt: m["lastSeenAt"]?.i64Value)
         }
+        sessionRefs = (root["sessionRefs"]?.mapValue ?? [:]).compactMap { _, value in
+            guard let row = value.mapValue,
+                  let rawChatId = row["chatId"]?.stringValue,
+                  let uuid = UUID(uuidString: rawChatId),
+                  let addedAt = row["addedAt"]?.i64Value else { return nil }
+            return SessionRef(chatId: uuid.uuidString.lowercased(), addedAt: addedAt)
+        }.sorted {
+            ($0.addedAt, $0.chatId) > ($1.addedAt, $1.chatId)
+        }
+
 
         var rows: [String: SessionRow] = [:]
         for (_, v) in root["sessions"]?.mapValue ?? [:] {
@@ -207,6 +219,12 @@ final class WorkspaceStore {
         let live = chats.filter { !$0.archived && $0.spaceId.map(liveSpaceIds.contains) == true }
         return sortActive(live)
     }
+    /// Imported memberships stay separate from owned workspace chat rows.
+    var sharedSessionRefs: [SessionRef] {
+        let owned = Set(chats.map(\.id))
+        return sessionRefs.filter { !owned.contains($0.chatId) }
+    }
+
 
     /// A space's sessions, in the sidebar's Sessions order (recency).
     ///
@@ -316,6 +334,36 @@ final class WorkspaceStore {
     }
 
     // MARK: Writes (viewer-device discipline)
+    /// Upsert an exact global session id without creating a Chat host row.
+    @discardableResult
+    func addSessionRef(chatId rawChatId: String) -> SessionRef? {
+        guard let uuid = UUID(uuidString: rawChatId.trimmingCharacters(in: .whitespacesAndNewlines))
+        else { return nil }
+        let chatId = uuid.uuidString.lowercased()
+        let map = doc.getMap(id: "sessionRefs")
+        do {
+            let row = try map.getOrCreateContainer(key: chatId, child: LoroMap())
+            try row.insert(key: "chatId", v: chatId)
+            let addedAt = row.get(key: "addedAt")?.asValue()?.i64Value ?? nowMs()
+            try row.insert(key: "addedAt", v: addedAt)
+            doc.commit()
+            project()
+            return SessionRef(chatId: chatId, addedAt: addedAt)
+        } catch {
+            return nil
+        }
+    }
+
+    /// Remove only this workspace's membership; the `s2/{chatId}` room remains.
+    func removeSessionRef(chatId: String) {
+        let map = doc.getMap(id: "sessionRefs")
+        do {
+            try map.delete(key: chatId)
+            doc.commit()
+            project()
+        } catch {}
+    }
+
 
     /// Mint a new chat onto a space (workspace_host.rs create_chat shape).
     /// The host = the space's owning device picks it up via the doc.

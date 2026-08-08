@@ -56,7 +56,11 @@ use tokio::sync::watch;
 
 use comet_doc::{MessagePart, SessionCommandPayload};
 use comet_proto::{ChatConfig, HarnessId, ToolCall};
-use comet_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
+use comet_rpc::{
+    LinkCache, PeerMessageResult, PeerReplyResult, PeerWaitResult, RemoveSessionRefResult,
+    ReplyPeerMessageParams, RpcError, RpcReply, RpcService, SendPeerMessageParams,
+    SessionRefParams, WaitPeerReplyParams, methods, parse_params,
+};
 
 use crate::agent_accounts::AgentAccounts;
 use crate::auth::Auth;
@@ -64,13 +68,35 @@ use crate::diff_sync::CheckoutDiffSync;
 use crate::doc_host::DocHost;
 use crate::registry::HarnessRegistry;
 use crate::repos::{Repos, home_dir};
-use crate::sessions::SessionsEngine;
+use crate::sessions::{PeerReply, SessionsEngine};
 use crate::terminals::Terminals;
 use crate::uploads::Uploads;
 use crate::workspace_host::WorkspaceHost;
 
 const FILE_SEARCH_RPC_TIMEOUT: Duration = Duration::from_secs(6);
 const FILE_SEARCH_FEATURED_PATHS: usize = 32;
+const DEFAULT_PEER_WAIT_MS: u64 = 30_000;
+const MAX_PEER_WAIT_MS: u64 = 120_000;
+
+fn peer_timeout(timeout_ms: Option<u64>) -> Duration {
+    Duration::from_millis(
+        timeout_ms
+            .unwrap_or(DEFAULT_PEER_WAIT_MS)
+            .min(MAX_PEER_WAIT_MS),
+    )
+}
+
+fn canonical_session_id(value: &str) -> Option<String> {
+    uuid::Uuid::parse_str(value).ok().map(|id| id.to_string())
+}
+
+fn peer_reply_result(reply: PeerReply) -> PeerReplyResult {
+    PeerReplyResult {
+        command_id: reply.command_id,
+        text: reply.text,
+        source_chat_id: reply.source_chat_id,
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -964,6 +990,202 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "commandId": command_id }))
             }
+            methods::SEND_PEER_MESSAGE => {
+                let p: SendPeerMessageParams = parse_params(params)?;
+                if p.text.trim().is_empty() {
+                    return Err(RpcError::Failed("empty_peer_message".into()));
+                }
+                let source_chat_id = canonical_session_id(&p.source_chat_id)
+                    .ok_or_else(|| RpcError::Failed("invalid_source_chat_id".into()))?;
+                let target_chat_id = canonical_session_id(&p.target_chat_id)
+                    .ok_or_else(|| RpcError::Failed("invalid_target_chat_id".into()))?;
+                if source_chat_id == target_chat_id {
+                    return Err(RpcError::Failed("self_peer_message".into()));
+                }
+                let command_id = p.command_id.unwrap_or_else(crate::new_id);
+                if command_id.trim().is_empty() {
+                    return Err(RpcError::Failed("invalid_command_id".into()));
+                }
+                if p.wait && !self.doc_host.is_locally_hosted(&source_chat_id) {
+                    return Err(RpcError::Failed("source_not_hosted".into()));
+                }
+                // Register before any target append: an immediately executing target
+                // cannot race ahead of the local source/thread subscription.
+                let registration = if p.wait {
+                    Some(
+                        self.sessions
+                            .register_peer_waiter(&source_chat_id, &command_id)
+                            .map_err(|e| RpcError::Failed(e.to_string()))?,
+                    )
+                } else {
+                    None
+                };
+                // Membership MUST precede DocHost::open inside queue_command_with_id;
+                // otherwise the missing-chat fallback could self-claim a foreign room.
+                self.workspace
+                    .upsert_session_ref(&target_chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let existing = self
+                    .doc_host
+                    .queue_command_with_id(
+                        &target_chat_id,
+                        &command_id,
+                        SessionCommandPayload::PeerMessage {
+                            text: p.text,
+                            source_chat_id: source_chat_id.clone(),
+                            thread_id: command_id.clone(),
+                            reply_to: None,
+                            hop_count: 0,
+                        },
+                    )
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let thread_id = match &existing.payload {
+                    SessionCommandPayload::PeerMessage {
+                        source_chat_id: stored_source_chat_id,
+                        thread_id,
+                        reply_to: None,
+                        hop_count: 0,
+                        ..
+                    } if stored_source_chat_id == &source_chat_id && thread_id == &command_id => {
+                        thread_id.clone()
+                    }
+                    _ => return Err(RpcError::Failed("command_id_conflict".into())),
+                };
+                let reply = match registration {
+                    Some(registration) => self
+                        .sessions
+                        .wait_peer_reply(registration, peer_timeout(p.timeout_ms))
+                        .await
+                        .map(peer_reply_result),
+                    None => None,
+                };
+                RpcReply::value(&PeerMessageResult {
+                    command_id,
+                    thread_id,
+                    reply,
+                })
+            }
+            methods::REPLY_PEER_MESSAGE => {
+                let p: ReplyPeerMessageParams = parse_params(params)?;
+                if p.text.trim().is_empty() {
+                    return Err(RpcError::Failed("empty_peer_message".into()));
+                }
+                let session_id = canonical_session_id(&p.session_id)
+                    .ok_or_else(|| RpcError::Failed("invalid_session_id".into()))?;
+                if p.command_id.trim().is_empty() {
+                    return Err(RpcError::Failed("invalid_command_id".into()));
+                }
+                let original = self
+                    .doc_host
+                    .command_entry(&session_id, &p.command_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .ok_or_else(|| RpcError::Failed("peer_command_not_found".into()))?;
+                let (target_chat_id, thread_id, hop_count) = match original.payload {
+                    SessionCommandPayload::PeerMessage {
+                        source_chat_id,
+                        thread_id,
+                        hop_count,
+                        ..
+                    } => (source_chat_id, thread_id, hop_count),
+                    _ => return Err(RpcError::Failed("not_peer_message".into())),
+                };
+                let target_chat_id = canonical_session_id(&target_chat_id)
+                    .ok_or_else(|| RpcError::Failed("invalid_target_chat_id".into()))?;
+                if thread_id.trim().is_empty() {
+                    return Err(RpcError::Failed("invalid_thread_id".into()));
+                }
+                if hop_count >= 8 {
+                    return Err(RpcError::Failed("peer_hop_limit".into()));
+                }
+                if target_chat_id == session_id {
+                    return Err(RpcError::Failed("self_peer_message".into()));
+                }
+                if p.wait && !self.doc_host.is_locally_hosted(&session_id) {
+                    return Err(RpcError::Failed("source_not_hosted".into()));
+                }
+                let registration = if p.wait {
+                    Some(
+                        self.sessions
+                            .register_peer_waiter(&session_id, &thread_id)
+                            .map_err(|e| RpcError::Failed(e.to_string()))?,
+                    )
+                } else {
+                    None
+                };
+                self.workspace
+                    .upsert_session_ref(&target_chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                // One reply is correlated to one stored command. Deriving its id
+                // makes transport retries append/execute exactly once without
+                // adding another durable idempotency store.
+                let reply_command_id = format!("reply:{}", p.command_id);
+                let source_session_id = session_id;
+                let original_command_id = p.command_id.clone();
+                let queued = self
+                    .doc_host
+                    .queue_command_with_id(
+                        &target_chat_id,
+                        &reply_command_id,
+                        SessionCommandPayload::PeerMessage {
+                            text: p.text,
+                            source_chat_id: source_session_id.clone(),
+                            thread_id: thread_id.clone(),
+                            reply_to: Some(original_command_id.clone()),
+                            hop_count: hop_count + 1,
+                        },
+                    )
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                match &queued.payload {
+                    SessionCommandPayload::PeerMessage {
+                        source_chat_id,
+                        thread_id: queued_thread,
+                        reply_to: Some(reply_to),
+                        hop_count: queued_hop,
+                        ..
+                    } if source_chat_id == &source_session_id
+                        && queued_thread == &thread_id
+                        && reply_to == &original_command_id
+                        && *queued_hop == hop_count + 1 => {}
+                    _ => return Err(RpcError::Failed("command_id_conflict".into())),
+                }
+                let reply = match registration {
+                    Some(registration) => self
+                        .sessions
+                        .wait_peer_reply(registration, peer_timeout(p.timeout_ms))
+                        .await
+                        .map(peer_reply_result),
+                    None => None,
+                };
+                RpcReply::value(&PeerMessageResult {
+                    command_id: reply_command_id,
+                    thread_id,
+                    reply,
+                })
+            }
+            methods::WAIT_PEER_REPLY => {
+                let p: WaitPeerReplyParams = parse_params(params)?;
+                let source_chat_id = canonical_session_id(&p.source_chat_id)
+                    .ok_or_else(|| RpcError::Failed("invalid_source_chat_id".into()))?;
+                if p.thread_id.trim().is_empty() {
+                    return Err(RpcError::Failed("invalid_thread_id".into()));
+                }
+                if !self.doc_host.is_locally_hosted(&source_chat_id) {
+                    return Err(RpcError::Failed("source_not_hosted".into()));
+                }
+                let registration = self
+                    .sessions
+                    .register_peer_waiter(&source_chat_id, &p.thread_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let reply = self
+                    .sessions
+                    .wait_peer_reply(registration, peer_timeout(p.timeout_ms))
+                    .await
+                    .map(peer_reply_result);
+                RpcReply::value(&PeerWaitResult {
+                    thread_id: p.thread_id,
+                    reply,
+                })
+            }
             methods::WATCH_DOC_MESSAGES => {
                 let p: ChatParams = parse_params(params)?;
                 let handle = self
@@ -1019,6 +1241,29 @@ impl RpcService for EngineRpc {
             methods::WATCH_SPACES => Ok(RpcReply::Stream(watch_stream(
                 self.workspace.watch_spaces(),
             ))),
+            methods::WATCH_SESSION_REFS => Ok(RpcReply::Stream(watch_stream(
+                self.workspace.watch_session_refs(),
+            ))),
+            methods::ADD_SESSION_REF => {
+                let p: SessionRefParams = parse_params(params)?;
+                let chat_id = canonical_session_id(&p.chat_id)
+                    .ok_or_else(|| RpcError::Failed("invalid_session_id".into()))?;
+                let session_ref = self
+                    .workspace
+                    .upsert_session_ref(&chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&session_ref)
+            }
+            methods::REMOVE_SESSION_REF => {
+                let p: SessionRefParams = parse_params(params)?;
+                let chat_id = canonical_session_id(&p.chat_id)
+                    .ok_or_else(|| RpcError::Failed("invalid_session_id".into()))?;
+                let removed = self
+                    .workspace
+                    .remove_session_ref(&chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&RemoveSessionRefResult { removed })
+            }
             methods::WATCH_SESSIONS => {
                 // Local live statuses merged with remote devices' workspace rows.
                 let merged = self
@@ -1339,6 +1584,19 @@ mod tests {
         assert!(!forwardable(methods::LOCAL_DEVICE));
         assert!(forwardable(methods::QUEUE_COMMAND));
         assert!(forwardable(methods::SEARCH_FILES));
+        assert!(!forwardable(methods::SEND_PEER_MESSAGE));
+        assert!(!forwardable(methods::REPLY_PEER_MESSAGE));
+        assert!(!forwardable(methods::WAIT_PEER_REPLY));
+    }
+
+    #[test]
+    fn peer_wait_timeout_is_capped_at_two_minutes() {
+        assert_eq!(peer_timeout(None), Duration::from_millis(30_000));
+        assert_eq!(peer_timeout(Some(1)), Duration::from_millis(1));
+        assert_eq!(
+            peer_timeout(Some(MAX_PEER_WAIT_MS + 1)),
+            Duration::from_millis(MAX_PEER_WAIT_MS)
+        );
     }
 
     #[test]

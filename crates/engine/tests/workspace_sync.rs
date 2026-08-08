@@ -367,6 +367,70 @@ async fn claim_on_first_command_creates_the_chat_row() {
 }
 
 #[tokio::test]
+async fn imported_session_ref_watches_and_never_claims_host_placement() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), "dev-a");
+    const SESSION_ID: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const COPIED_SESSION_ID: &str = "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE";
+    let client = comet_rpc::memory_client(core.rpc_service());
+    let mut refs = client
+        .subscribe(methods::WATCH_SESSION_REFS, serde_json::Value::Null)
+        .await
+        .expect("subscribe session refs");
+    assert_eq!(refs.recv().await.unwrap(), serde_json::json!([]));
+
+    let added = client
+        .call(
+            methods::ADD_SESSION_REF,
+            serde_json::json!({ "chatId": COPIED_SESSION_ID }),
+        )
+        .await
+        .expect("add session ref");
+    assert_eq!(added["chatId"], SESSION_ID);
+    let watched = refs.recv().await.expect("updated session refs");
+    assert_eq!(watched.as_array().map(Vec::len), Some(1));
+    assert_eq!(watched[0]["chatId"], SESSION_ID);
+
+    assert!(
+        core.workspace.doc().chat(SESSION_ID).unwrap().is_none(),
+        "membership must not create a Chat row"
+    );
+    assert!(!core.workspace.is_host(SESSION_ID));
+    core.workspace
+        .claim_chat(SESSION_ID, Some("/tmp"))
+        .expect("imported claim is a no-op");
+    assert!(
+        core.workspace.doc().chat(SESSION_ID).unwrap().is_none(),
+        "imported session must remain non-hosted"
+    );
+
+    queue_run(&core, SESSION_ID, "cmd-imported", "m-imported");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let handle = core.doc_host.open(SESSION_ID).unwrap();
+    assert_eq!(
+        handle.doc().read_commands().unwrap()[0].status,
+        SessionCommandStatus::Pending
+    );
+    assert!(handle.doc().read_entries().unwrap().is_empty());
+
+    let removed = client
+        .call(
+            methods::REMOVE_SESSION_REF,
+            serde_json::json!({ "chatId": COPIED_SESSION_ID }),
+        )
+        .await
+        .expect("remove session ref");
+    assert_eq!(removed, serde_json::json!({ "removed": true }));
+    assert_eq!(refs.recv().await.unwrap(), serde_json::json!([]));
+    assert!(
+        core.workspace.is_host(SESSION_ID),
+        "absence from both maps preserves the local-create fallback"
+    );
+
+    core.shutdown().await;
+}
+
+#[tokio::test]
 async fn non_host_engine_leaves_remote_chats_commands_alone() {
     let dir_a = tempfile::tempdir().unwrap();
     let a = assemble(dir_a.path(), "dev-a");

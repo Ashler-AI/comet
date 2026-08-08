@@ -256,6 +256,7 @@ impl Harness for ClaudeHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
         let mut cmd = self.build_command(&exe, &request);
+        crate::apply_run_context(&mut cmd, controls.context.as_ref());
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 HarnessError::NotInstalled(exe.display().to_string())
@@ -455,6 +456,7 @@ async fn run_session(session: Session) {
         request_input,
         mut steering,
         interrupt,
+        context: _,
     } = controls;
     let request_input = Arc::new(request_input);
 

@@ -33,6 +33,13 @@ pub struct SteerMessage {
     pub prompt: String,
     pub message_id: Option<String>,
 }
+/// Engine-owned context exposed to an agent child process. This is launch
+/// metadata, not user-authored run configuration or prompt content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunContext {
+    pub session_id: String,
+    pub ipc_port: u16,
+}
 
 /// Host-side controls handed to a run: input-request bridge + steering mailbox.
 pub struct RunControls {
@@ -46,6 +53,9 @@ pub struct RunControls {
     /// interrupt, then escalates to SIGTERM/SIGKILL on the child after a grace
     /// period. The run's stream ends with `Done { status: Interrupted }`.
     pub interrupt: CancellationToken,
+    /// Current Comet session and loopback RPC port for session CLI calls.
+    /// Non-session utility runs (for example title generation) leave this unset.
+    pub context: Option<RunContext>,
 }
 
 #[async_trait]
@@ -132,6 +142,15 @@ pub(crate) fn compose_child_path(cmd: &mut tokio::process::Command, exe: &std::p
         cmd.env("PATH", joined);
     }
 }
+pub(crate) fn apply_run_context(cmd: &mut tokio::process::Command, context: Option<&RunContext>) {
+    // Never inherit a stale context from the engine's own launch environment.
+    cmd.env_remove("COMET_SESSION_ID")
+        .env_remove("COMET_IPC_PORT");
+    if let Some(context) = context {
+        cmd.env("COMET_SESSION_ID", &context.session_id)
+            .env("COMET_IPC_PORT", context.ipc_port.to_string());
+    }
+}
 
 /// Rolling tail of a child's stderr, shared between the reader task and the
 /// crash-message composer: an unexpected exit surfaces "<name> exited
@@ -208,3 +227,46 @@ pub(crate) fn crash_message(
 
 pub use claude::ClaudeHarness;
 pub use codex::CodexHarness;
+
+#[cfg(test)]
+mod run_context_tests {
+    use super::{RunContext, apply_run_context};
+
+    fn configured_env(cmd: &tokio::process::Command, key: &str) -> Option<String> {
+        cmd.as_std()
+            .get_envs()
+            .find(|(name, _)| name.to_string_lossy() == key)
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn applies_exact_session_and_ipc_context() {
+        let mut cmd = tokio::process::Command::new("unused");
+        apply_run_context(
+            &mut cmd,
+            Some(&RunContext {
+                session_id: "session-123".into(),
+                ipc_port: 38117,
+            }),
+        );
+
+        assert_eq!(
+            configured_env(&cmd, "COMET_SESSION_ID").as_deref(),
+            Some("session-123")
+        );
+        assert_eq!(
+            configured_env(&cmd, "COMET_IPC_PORT").as_deref(),
+            Some("38117")
+        );
+    }
+
+    #[test]
+    fn absent_context_does_not_expose_comet_environment() {
+        let mut cmd = tokio::process::Command::new("unused");
+        apply_run_context(&mut cmd, None);
+
+        assert_eq!(configured_env(&cmd, "COMET_SESSION_ID"), None);
+        assert_eq!(configured_env(&cmd, "COMET_IPC_PORT"), None);
+    }
+}

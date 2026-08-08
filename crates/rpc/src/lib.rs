@@ -37,6 +37,9 @@ pub mod methods {
     pub const LIST_MODELS: &str = "ListModels";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
+    pub const SEND_PEER_MESSAGE: &str = "SendPeerMessage";
+    pub const REPLY_PEER_MESSAGE: &str = "ReplyPeerMessage";
+    pub const WAIT_PEER_REPLY: &str = "WaitPeerReply";
     /// Nudge every open room client to verify liveness NOW (window focus,
     /// app foregrounded). No params; IPC-only. Each room ignores the hint
     /// unless it has been broadcast-quiet ≥30s, so this is cheap to spam.
@@ -51,6 +54,10 @@ pub mod methods {
     pub const WATCH_SESSIONS: &str = "WatchSessions";
     /// Spaces registry (device+folder pairs) from the workspace doc.
     pub const WATCH_SPACES: &str = "WatchSpaces";
+    /// Workspace-local pointers to exact-id global session rooms.
+    pub const WATCH_SESSION_REFS: &str = "WatchSessionRefs";
+    pub const ADD_SESSION_REF: &str = "AddSessionRef";
+    pub const REMOVE_SESSION_REF: &str = "RemoveSessionRef";
     /// Entity mutations against the workspace doc (feature-inventory §2 DataRpc).
     /// Params are tagged `{op: createChat|createSpace|renameSpace|deleteSpace|
     /// renameChat|setChatArchived|deleteChat|renameDevice|markChatSeen, …}`.
@@ -107,6 +114,79 @@ pub mod methods {
     /// Download + apply the newest release on the target device (symlink-managed
     /// installs; the service restart is scheduled after the reply flushes).
     pub const APPLY_UPDATE: &str = "ApplyUpdate";
+}
+
+/// Shared parameters for `AddSessionRef` and `RemoveSessionRef`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRefParams {
+    pub chat_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveSessionRefResult {
+    pub removed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendPeerMessageParams {
+    pub source_chat_id: String,
+    pub target_chat_id: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_id: Option<String>,
+    #[serde(default)]
+    pub wait: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplyPeerMessageParams {
+    pub session_id: String,
+    pub command_id: String,
+    pub text: String,
+    #[serde(default)]
+    pub wait: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WaitPeerReplyParams {
+    pub source_chat_id: String,
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerReplyResult {
+    pub command_id: String,
+    pub text: String,
+    pub source_chat_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerMessageResult {
+    pub command_id: String,
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<PeerReplyResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerWaitResult {
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<PeerReplyResult>,
 }
 
 #[derive(Debug, thiserror::Error)]

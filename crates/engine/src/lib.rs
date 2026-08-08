@@ -128,7 +128,15 @@ impl EngineCore {
     ) -> Result<Self, EngineError> {
         let org_id = env_or("COMET_ORG_ID", DEFAULT_ORG_ID);
         let user_id = env_or("COMET_USER_ID", DEFAULT_USER_ID);
-        Self::assemble_with_identity(data_dir, registry, default_harness, edge, &org_id, &user_id)
+        Self::assemble_with_identity_and_ipc_port(
+            data_dir,
+            registry,
+            default_harness,
+            edge,
+            &org_id,
+            &user_id,
+            ipc_port_from_env(),
+        )
     }
 
     pub fn assemble_with_identity(
@@ -138,6 +146,26 @@ impl EngineCore {
         edge: Option<EdgeConfig>,
         org_id: &str,
         user_id: &str,
+    ) -> Result<Self, EngineError> {
+        Self::assemble_with_identity_and_ipc_port(
+            data_dir,
+            registry,
+            default_harness,
+            edge,
+            org_id,
+            user_id,
+            ipc_port_from_env(),
+        )
+    }
+
+    fn assemble_with_identity_and_ipc_port(
+        data_dir: &Path,
+        registry: Arc<HarnessRegistry>,
+        default_harness: HarnessId,
+        edge: Option<EdgeConfig>,
+        org_id: &str,
+        user_id: &str,
+        ipc_port: u16,
     ) -> Result<Self, EngineError> {
         std::fs::create_dir_all(data_dir)?;
         // Single-instance guard: two engines on one data dir would race the
@@ -154,7 +182,7 @@ impl EngineCore {
             .join(sanitize_path_id(user_id));
         let store = Arc::new(DocsStore::open(&org_dir)?);
         let journal = Arc::new(RunJournal::open(org_dir.join("journals"))?);
-        let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone());
+        let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone(), ipc_port);
         let doc_host = DocHost::new(
             store.clone(),
             DocHostConfig {
@@ -419,13 +447,14 @@ impl Engine {
         let user_id = auth
             .user_id()
             .unwrap_or_else(|| env_or("COMET_USER_ID", DEFAULT_USER_ID));
-        let core = EngineCore::assemble_with_identity(
+        let core = EngineCore::assemble_with_identity_and_ipc_port(
             &config.data_dir,
             Arc::new(default_registry()),
             config.default_harness,
             edge.clone(),
             &org_id,
             &user_id,
+            config.ipc_port,
         )?;
         core.set_auth(auth.clone());
         // Release checker: polls {edge}/releases on a 6h cadence; headless
@@ -712,6 +741,13 @@ fn env_or(key: &str, default: &str) -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| default.to_string())
+}
+
+fn ipc_port_from_env() -> u16 {
+    std::env::var("COMET_IPC_PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(27654)
 }
 
 /// Filesystem-safe form of an org/user id (path segments for `orgs/{org}/{user}/`).

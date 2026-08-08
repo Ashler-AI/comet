@@ -31,7 +31,7 @@ use comet_doc::{
 use comet_proto::{HarnessId, UserInputAnswer, UserInputQuestion};
 use comet_sync::{DocsStore, RoomClient};
 
-use crate::sessions::{SessionsEngine, SteerOutcome};
+use crate::sessions::{PeerReply, SessionsEngine, SteerOutcome};
 use crate::workspace_host::WorkspaceHost;
 use crate::{EngineError, new_id, now_ms};
 
@@ -189,6 +189,8 @@ pub struct ChatDocHandle {
     /// Last known snapshot blob size — the eviction budget estimate's input.
     snapshot_bytes: AtomicUsize,
     room: Mutex<Option<RoomClient>>,
+    /// Serializes idempotent command-id checks with appends for this doc.
+    command_lock: Mutex<()>,
     /// Doc subscription (drop = unsubscribe) — bumps the change watch on every commit.
     _sub: loro::Subscription,
 }
@@ -402,6 +404,7 @@ impl DocHost {
             last_access: AtomicI64::new(now_ms()),
             snapshot_bytes: AtomicUsize::new(snapshot_len),
             room: Mutex::new(None),
+            command_lock: Mutex::new(()),
             _sub: sub,
         });
         {
@@ -593,15 +596,36 @@ impl DocHost {
         chat_id: &str,
         payload: SessionCommandPayload,
     ) -> Result<String, EngineError> {
-        let handle = self.open(chat_id)?;
         let id = new_id();
+        self.queue_command_with_id(chat_id, &id, payload)?;
+        Ok(id)
+    }
+
+    /// Append using a caller-supplied durable id. Retries return the immutable
+    /// existing command instead of adding or replacing a ledger entry.
+    pub fn queue_command_with_id(
+        &self,
+        chat_id: &str,
+        command_id: &str,
+        payload: SessionCommandPayload,
+    ) -> Result<SessionCommandEntry, EngineError> {
+        let handle = self.open(chat_id)?;
+        let _guard = lock(&handle.command_lock);
+        if let Some(existing) = handle
+            .doc
+            .read_commands()?
+            .into_iter()
+            .find(|entry| entry.id == command_id)
+        {
+            return Ok(existing);
+        }
         let now = now_ms();
         let based_on = handle.doc.read_entries()?.last().map(|m| CommandBasedOn {
             turn_id: Some(m.id.clone()),
             frontier: None,
         });
-        handle.doc.queue_command(&SessionCommandEntry {
-            id: id.clone(),
+        let entry = SessionCommandEntry {
+            id: command_id.to_string(),
             payload,
             issued_by: self.inner.config.device_id.clone(),
             issued_at: now,
@@ -609,13 +633,25 @@ impl DocHost {
             expires_at: Some(now + COMMAND_DEFAULT_TTL_MS),
             status: SessionCommandStatus::Pending,
             resolution: None,
-        })?;
-        // §7 durable delivery: when another device hosts this chat, nudge its device
-        // room so a cold host opens the doc and drains the queue. Fire-and-forget —
-        // the command is durable in the doc either way (a host that opens the chat
-        // for any other reason still executes it).
+        };
+        handle.doc.queue_command(&entry)?;
+        // Preserve the existing best-effort cold-host wake after every new append.
         self.nudge_remote_host(chat_id);
-        Ok(id)
+        Ok(entry)
+    }
+
+    /// Read a command by durable id from a session's existing ledger.
+    pub fn command_entry(
+        &self,
+        chat_id: &str,
+        command_id: &str,
+    ) -> Result<Option<SessionCommandEntry>, EngineError> {
+        Ok(self
+            .open(chat_id)?
+            .doc
+            .read_commands()?
+            .into_iter()
+            .find(|entry| entry.id == command_id))
     }
 
     /// POST `{edge}/device/{host}/nudge {chatId}` when the chat's workspace row names
@@ -678,6 +714,19 @@ impl DocHost {
     /// behavior, now the degenerate case.
     fn is_host(&self, chat_id: &str) -> bool {
         self.workspace().is_none_or(|ws| ws.is_host(chat_id))
+    }
+
+    /// Strict ownership check for live waits: unlike `is_host`, a missing chat row
+    /// is not enough to claim that this engine hosts the source session.
+    pub fn is_locally_hosted(&self, chat_id: &str) -> bool {
+        self.workspace().is_none_or(|workspace| {
+            workspace
+                .doc()
+                .chat(chat_id)
+                .ok()
+                .flatten()
+                .is_some_and(|chat| chat.device_id == workspace.device_id())
+        })
     }
 
     /// Chat-config harness when the workspace row carries one, else the default.
@@ -743,17 +792,93 @@ impl DocHost {
                     skipped.insert(entry.id.clone());
                 }
                 CommandDisposition::Expired => {
-                    self.resolve_command(handle, &entry.id, SessionCommandStatus::Expired, None);
+                    let _ = self.resolve_command(
+                        handle,
+                        &entry.id,
+                        SessionCommandStatus::Expired,
+                        None,
+                    );
                 }
                 CommandDisposition::Superseded => {
-                    self.resolve_command(handle, &entry.id, SessionCommandStatus::Superseded, None);
+                    let _ = self.resolve_command(
+                        handle,
+                        &entry.id,
+                        SessionCommandStatus::Superseded,
+                        None,
+                    );
                 }
                 CommandDisposition::Execute => {
+                    // Claim a live reply waiter before ordinary delivery. The reply
+                    // becomes visible and Applied before the waiting RPC is woken.
+                    let waited = match &entry.payload {
+                        SessionCommandPayload::PeerMessage {
+                            text,
+                            source_chat_id,
+                            thread_id,
+                            reply_to: Some(_),
+                            ..
+                        } => sessions
+                            .claim_peer_waiter(&handle.chat_id, thread_id)
+                            .map(|claim| {
+                                (
+                                    claim,
+                                    text.clone(),
+                                    source_chat_id.clone(),
+                                    thread_id.clone(),
+                                )
+                            }),
+                        _ => None,
+                    };
+                    if let Some((claim, text, source_chat_id, thread_id)) = waited
+                        && !claim.is_closed()
+                    {
+                        let prompt = peer_message_prompt(
+                            &source_chat_id,
+                            &thread_id,
+                            &handle.chat_id,
+                            &entry.id,
+                            &text,
+                        );
+                        match handle.write_user_message(&entry.id, &prompt, entry.issued_at) {
+                            Ok(()) => {
+                                if self.resolve_command(
+                                    handle,
+                                    &entry.id,
+                                    SessionCommandStatus::Applied,
+                                    Some("delivered to live waiter"),
+                                ) {
+                                    if claim.deliver(PeerReply {
+                                        command_id: entry.id.clone(),
+                                        text,
+                                        source_chat_id,
+                                    }) {
+                                        continue;
+                                    }
+                                } else {
+                                    // Never report a reply whose Applied outcome
+                                    // could not be committed to the durable ledger.
+                                    continue;
+                                }
+                                // Timeout raced the outcome write. Deliver through
+                                // the normal path below; transcript insertion is
+                                // idempotent by this same command id.
+                            }
+                            Err(err) => {
+                                let _ = self.resolve_command(
+                                    handle,
+                                    &entry.id,
+                                    SessionCommandStatus::Rejected,
+                                    Some(&err.to_string()),
+                                );
+                                continue;
+                            }
+                        }
+                    }
                     let (status, resolution) = match self.execute(sessions, handle, &entry).await {
                         Ok(outcome) => outcome,
                         Err(err) => (SessionCommandStatus::Rejected, Some(err.to_string())),
                     };
-                    self.resolve_command(handle, &entry.id, status, resolution.as_deref());
+                    let _ = self.resolve_command(handle, &entry.id, status, resolution.as_deref());
                 }
             }
         }
@@ -766,17 +891,21 @@ impl DocHost {
         command_id: &str,
         status: SessionCommandStatus,
         resolution: Option<&str>,
-    ) {
-        if let Err(err) = handle
+    ) -> bool {
+        match handle
             .doc
             .set_command_status(command_id, status, resolution)
         {
-            tracing::warn!(
-                chat = %handle.chat_id,
-                command = %command_id,
-                error = %err,
-                "command outcome write failed"
-            );
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(
+                    chat = %handle.chat_id,
+                    command = %command_id,
+                    error = %err,
+                    "command outcome write failed"
+                );
+                false
+            }
         }
     }
 
@@ -835,6 +964,47 @@ impl DocHost {
                                 self.harness_for(chat_id),
                                 request,
                                 message_id.clone(),
+                            )
+                            .await?;
+                        Ok((
+                            SessionCommandStatus::Applied,
+                            Some("queued as new turn".into()),
+                        ))
+                    }
+                }
+            }
+            SessionCommandPayload::PeerMessage {
+                text,
+                source_chat_id,
+                thread_id,
+                ..
+            } => {
+                let prompt =
+                    peer_message_prompt(source_chat_id, thread_id, chat_id, &entry.id, text);
+                match sessions
+                    .steer(chat_id, &prompt, Some(entry.id.clone()))
+                    .await?
+                {
+                    SteerOutcome::Accepted => Ok((SessionCommandStatus::Applied, None)),
+                    SteerOutcome::NotSteerable => {
+                        let request = sessions
+                            .last_request(chat_id)
+                            .or_else(|| self.request_from_chat_row(chat_id, &prompt));
+                        let Some(mut request) = request else {
+                            return Ok((
+                                SessionCommandStatus::Rejected,
+                                Some("no live run and no prior run config".into()),
+                            ));
+                        };
+                        request.prompt = prompt;
+                        request.resume = None;
+                        request.attachments = Vec::new();
+                        sessions
+                            .dispatch(
+                                chat_id,
+                                self.harness_for(chat_id),
+                                request,
+                                Some(entry.id.clone()),
                             )
                             .await?;
                         Ok((
@@ -979,6 +1149,24 @@ impl DocHost {
     }
 }
 
+/// The exact user-visible prompt delivered to a peer session's transcript and
+/// harness. Keeping one string prevents the recorded and executed instructions
+/// from diverging.
+pub fn peer_message_prompt(
+    source_chat_id: &str,
+    thread_id: &str,
+    target_chat_id: &str,
+    command_id: &str,
+    text: &str,
+) -> String {
+    format!(
+        "Message from Comet session {source_chat_id} (thread {thread_id}):\n\n\
+         {text}\n\n\
+         To reply through Comet, run:\n\
+         comet session reply --session {target_chat_id} --command {command_id} \"<reply>\""
+    )
+}
+
 /// The resumed-turn prompt for answers to a question whose run died: each
 /// answer paired with its question text so the reattached conversation reads
 /// naturally. Pure.
@@ -1038,5 +1226,21 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
                 host.evict_over_budget();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_prompt_is_the_visible_replyable_instruction() {
+        assert_eq!(
+            peer_message_prompt("source", "thread", "target", "command", "Do the work."),
+            "Message from Comet session source (thread thread):\n\n\
+             Do the work.\n\n\
+             To reply through Comet, run:\n\
+             comet session reply --session target --command command \"<reply>\""
+        );
     }
 }

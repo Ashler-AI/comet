@@ -1,7 +1,7 @@
-// Home — the mobile shell. The desktop sidebar's two sections become the
-// phone's home screen: Spaces (grouped work) and Sessions (the global
-// attention-sorted list). Tabs-as-sessions don't fit a phone; a space opens
-// into its own session list instead, and close=archive becomes swipe-to-archive.
+// Home — the mobile shell. The desktop sidebar's Spaces, Sessions, and Shared
+// sections become the phone's home screen. Tabs-as-sessions don't fit a phone;
+// a space opens into its own session list instead, and close=archive becomes
+// swipe-to-archive while Shared removal drops only workspace membership.
 
 import SwiftUI
 
@@ -15,12 +15,14 @@ struct HomeView: View {
     @Environment(AppModel.self) private var model
     @State private var path: [Route] = []
     @State private var showNewSpace = false
+    @State private var showAddSharedSession = false
 
     var body: some View {
         NavigationStack(path: $path) {
             List {
                 spacesSection
                 sessionsSection
+                sharedSessionsSection
             }
             .listStyle(.plain)
             .environment(\.defaultMinListRowHeight, 10)
@@ -75,7 +77,12 @@ struct HomeView: View {
                     path.append(.space(spaceId))
                 }
             }
-            .task(id: model.overviewChats.map(\.id).joined()) {
+            .sheet(isPresented: $showAddSharedSession) {
+                AddSharedSessionSheet { chatId in
+                    path.append(.chat(chatId))
+                }
+            }
+            .task(id: (model.overviewChats.map(\.id) + model.sharedSessionRefs.map(\.chatId)).joined()) {
                 model.preloadSessions()
             }
             .onAppear {
@@ -161,6 +168,54 @@ struct HomeView: View {
             sectionHeader("Sessions")
         }
     }
+    // MARK: Shared sessions
+
+    private var sharedSessionsSection: some View {
+        Section {
+            let refs = model.sharedSessionRefs
+            if refs.isEmpty {
+                Text("No shared sessions")
+                    .font(Theme.sans(12))
+                    .foregroundStyle(Theme.textFaint)
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+            }
+            ForEach(refs) { sessionRef in
+                Button {
+                    path.append(.chat(sessionRef.chatId))
+                } label: {
+                    SharedSessionRow(sessionRef: sessionRef)
+                }
+                .buttonStyle(PressWashButtonStyle())
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
+                .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
+                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                    Button(role: .destructive) {
+                        model.removeSessionRef(chatId: sessionRef.chatId)
+                    } label: {
+                        Label("Remove", systemImage: "minus.circle")
+                    }
+                }
+            }
+        } header: {
+            HStack {
+                sectionHeader("Shared")
+                Spacer()
+                Button {
+                    showAddSharedSession = true
+                } label: {
+                    Image(systemName: "plus.circle")
+                        .font(.system(size: 13, weight: .medium))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Theme.textMuted)
+                .accessibilityLabel("Add shared session")
+            }
+            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 3, trailing: 16))
+        }
+    }
+
 
     private func sectionHeader(_ title: String) -> some View {
         Text(title)
@@ -298,6 +353,96 @@ struct ChatRow: View {
             : "\(space) · \(name) (offline)"
     }
 }
+struct SharedSessionRow: View {
+    @Environment(AppModel.self) private var model
+    let sessionRef: SessionRef
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "globe")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(Theme.textMuted.opacity(0.7))
+                .frame(width: 16)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(model.sessionTitle(for: sessionRef))
+                    .font(Theme.sans(13))
+                    .foregroundStyle(Theme.text)
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Text(relativeTime(sessionRef.addedAt))
+                    .font(Theme.sans(10.5))
+                    .foregroundStyle(Theme.textFaint)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 7)
+        .contentShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+struct AddSharedSessionSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    let onAdded: (String) -> Void
+
+    @State private var sessionId = ""
+    @State private var error: String?
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Paste the exact global session UUID.")
+                    .font(Theme.sans(12))
+                    .foregroundStyle(Theme.textMuted)
+                TextField("Session UUID", text: $sessionId)
+                    .font(Theme.mono(13))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .submitLabel(.go)
+                    .focused($focused)
+                    .onSubmit(add)
+                    .padding(.horizontal, 12)
+                    .frame(height: 42)
+                    .background(whiteAlpha(0.06), in: RoundedRectangle(cornerRadius: 10))
+                if let error {
+                    Text(error)
+                        .font(Theme.sans(11))
+                        .foregroundStyle(Theme.danger)
+                }
+                Spacer()
+            }
+            .padding(20)
+            .background(SheetStyle.panel)
+            .navigationTitle("Add shared session")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Add", action: add)
+                        .disabled(sessionId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+        .presentationDetents([.medium])
+        .presentationDragIndicator(.visible)
+        .presentationCornerRadius(32)
+        .preferredColorScheme(.dark)
+        .onAppear { focused = true }
+    }
+
+    private func add() {
+        guard let sessionRef = model.addSessionRef(sessionId) else {
+            error = "Enter a valid session UUID"
+            return
+        }
+        dismiss()
+        onAdded(sessionRef.chatId)
+    }
+}
+
 
 func relativeTime(_ ms: Int64) -> String {
     let delta = max(0, nowMs() - ms) / 1000

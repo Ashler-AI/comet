@@ -126,7 +126,7 @@ struct ComposerShell<Chips: View>: View {
 /// just the input and the morphing action button.
 struct ComposerView: View {
     let store: SessionStore
-    let chat: Chat
+    let chat: Chat?
     let runLive: Bool
 
     @State private var text = ""
@@ -146,7 +146,10 @@ struct ComposerView: View {
     private func send() {
         let prompt = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty else { return }
-        if runLive {
+        // Shared sessions deliberately have no local Chat row. Steer lets the
+        // owner host resume with its own cwd/model configuration instead of
+        // accepting an importer-manufactured RunRequest with empty defaults.
+        if runLive || chat == nil {
             store.sendSteer(prompt: prompt)
         } else {
             store.sendRun(prompt: prompt, chat: chat)

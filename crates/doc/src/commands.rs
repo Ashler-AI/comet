@@ -21,6 +21,7 @@ pub enum SessionCommandKind {
     Steer,
     Interrupt,
     RespondInput,
+    PeerMessage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +55,14 @@ pub enum SessionCommandPayload {
         request_id: String,
         answers: Vec<UserInputAnswer>,
     },
+    #[serde(rename_all = "camelCase")]
+    PeerMessage {
+        text: String,
+        source_chat_id: String,
+        thread_id: String,
+        reply_to: Option<String>,
+        hop_count: u8,
+    },
 }
 
 impl SessionCommandPayload {
@@ -63,6 +72,7 @@ impl SessionCommandPayload {
             SessionCommandPayload::Steer { .. } => SessionCommandKind::Steer,
             SessionCommandPayload::Interrupt {} => SessionCommandKind::Interrupt,
             SessionCommandPayload::RespondInput { .. } => SessionCommandKind::RespondInput,
+            SessionCommandPayload::PeerMessage { .. } => SessionCommandKind::PeerMessage,
         }
     }
 }
@@ -289,6 +299,37 @@ mod tests {
         let cx1 = cx(&entries, &NEVER, &NEVER, 3_000, None);
         assert_eq!(evaluate_command(&r1, &cx1), CommandDisposition::Execute);
         assert_eq!(evaluate_command(&r2, &cx1), CommandDisposition::Execute);
+    }
+
+    #[test]
+    fn peer_messages_serialize_as_camel_case_and_execute_independently() {
+        let payload = SessionCommandPayload::PeerMessage {
+            text: "review this".into(),
+            source_chat_id: "source".into(),
+            thread_id: "thread".into(),
+            reply_to: Some("previous".into()),
+            hop_count: 3,
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["kind"], "peerMessage");
+        assert_eq!(json["sourceChatId"], "source");
+        assert_eq!(json["threadId"], "thread");
+        assert_eq!(json["replyTo"], "previous");
+        assert_eq!(json["hopCount"], 3);
+        assert_eq!(payload.kind(), SessionCommandKind::PeerMessage);
+
+        let older = entry("p1", payload.clone(), 1_000);
+        let newer = entry("p2", payload, 2_000);
+        let entries = vec![older.clone(), newer.clone()];
+        let context = cx(&entries, &NEVER, &NEVER, 3_000, None);
+        assert_eq!(
+            evaluate_command(&older, &context),
+            CommandDisposition::Execute
+        );
+        assert_eq!(
+            evaluate_command(&newer, &context),
+            CommandDisposition::Execute
+        );
     }
 
     #[test]

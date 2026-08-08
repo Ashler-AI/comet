@@ -1,9 +1,9 @@
 /**
  * SessionRoom — one Durable Object per doc room, speaking loro-protocol over
- * hibernatable WebSockets (design §2, §3.1). Two doc kinds share this class:
- * chat session docs (room name = chatId, claim-on-first-join ownership) and
- * workspace docs (room name = `ws/{orgId}`, org-membership authz enforced by
- * the Worker — the DO sees the ROOM_KIND_HEADER stamp and skips ownership).
+ * hibernatable WebSockets (design §2, §3.1). Chat and workspace documents
+ * share this class: chat rooms are accessible to every authenticated client
+ * that knows the chat id, while workspace org membership is enforced by the
+ * Worker before the request reaches the room.
  *
  * Persistence model:
  * - `updates` — append-only incoming update log, buffered in memory during
@@ -50,6 +50,14 @@ import {
 import { createBlobStore, getJsonBlob, putJsonBlob, type BlobStore } from "./blobs";
 import { AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
 
+const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** The sole name accepted for a globally shared session room. */
+export const canonicalSessionId = (value: string | undefined): string | undefined => {
+  if (!value || !SESSION_ID_RE.test(value)) return undefined;
+  return value.toLowerCase();
+};
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RETAIN_MS = RETAIN_DAYS * DAY_MS;
 /** Consecutive cold-replay deaths (CPU-limit kills mid-`ensureDoc`) before the
@@ -89,12 +97,8 @@ const DOC_IDLE_RELEASE_MS = 60_000;
 const TRIM_FORCE_BYTES = 512 * 1024;
 
 interface SocketState {
-  userId: string;
   /** Joined sub-rooms by crdt magic ("%LOR", "%EPH"). */
   rooms: string[];
-  /** True for sockets on a workspace-doc room — org membership was enforced
-   * by the Worker, so the per-chat ownership discipline does not apply. */
-  workspace?: boolean;
   /** Dialing engine's device id (from `&device=`, Worker-validated) — pure
    * log attribution; never used for authz. */
   deviceId?: string;
@@ -170,8 +174,8 @@ export class SessionRoom implements DurableObject {
     const url = new URL(request.url);
     const userId = request.headers.get(AUTH_USER_HEADER);
     if (!userId) return new Response("unauthenticated", { status: 401 });
-    // Workspace rooms: the Worker already checked org membership; every
-    // member may read/write, so the owner gates below are bypassed.
+    // The Worker authenticates every request and separately enforces
+    // workspace org membership before stamping workspace-room requests.
     const workspace = request.headers.get(ROOM_KIND_HEADER) === "workspace";
 
     if (url.pathname === "/ws") {
@@ -181,9 +185,7 @@ export class SessionRoom implements DurableObject {
       const pair = new WebSocketPair();
       this.ctx.acceptWebSocket(pair[1]);
       const state: SocketState = {
-        userId,
         rooms: [],
-        ...(workspace ? { workspace } : {}),
         ...(deviceId ? { deviceId } : {})
       };
       pair[1].serializeAttachment(state);
@@ -196,14 +198,9 @@ export class SessionRoom implements DurableObject {
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
-    const owner = this.getMeta("owner");
     if (url.pathname === "/stats" && request.method === "GET") {
-      // Observability: what this room holds and who's on it. Owner-gated like
-      // every other read (org-membership-gated for workspace rooms).
-      if (!workspace) {
-        if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
-      }
+      // Observability: what this room holds and who's on it. Authentication
+      // (and workspace membership, when applicable) was enforced upstream.
       await this.flush();
       const updateRows = [...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM updates")][0]
         ?.n as number;
@@ -232,35 +229,18 @@ export class SessionRoom implements DurableObject {
       });
     }
     if (url.pathname === "/tail" && request.method === "GET") {
-      if (!workspace) {
-        if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
-      }
       return json(await this.currentTail());
     }
     if (url.pathname === "/diff" && request.method === "GET") {
-      if (!workspace) {
-        if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
-      }
       const diff = getJsonBlob<unknown>(this.blobs, "diff");
       return diff === undefined ? json({ error: "not_found" }, 404) : json(diff);
     }
     if (url.pathname === "/diff" && request.method === "POST") {
-      // The host may publish before any room join has claimed the doc.
-      if (!workspace) {
-        if (!owner) this.setMeta("owner", userId);
-        else if (owner !== userId) return json({ error: "forbidden" }, 403);
-      }
       putJsonBlob(this.blobs, "diff", await request.json());
       return json({ ok: true });
     }
     if (url.pathname === "/snapshot" && request.method === "GET") {
       // Repair/inspection read: the doc's full current snapshot bytes.
-      if (!workspace) {
-        if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
-      }
       await this.flush();
       const doc = await this.ensureDoc();
       const bytes = doc.export({ mode: "snapshot" });
@@ -271,10 +251,6 @@ export class SessionRoom implements DurableObject {
     if (url.pathname === "/append" && request.method === "POST") {
       // MERGE-safe repair write: import a Loro update (never replaces the
       // doc). Same durability bookkeeping as a WS DocUpdate.
-      if (!workspace) {
-        if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
-      }
       const body = new Uint8Array(await request.arrayBuffer());
       const doc = await this.ensureDoc();
       try {
@@ -293,6 +269,7 @@ export class SessionRoom implements DurableObject {
       return json({ ok: true });
     }
     if (url.pathname === "/reset-log" && request.method === "POST") {
+      const owner = this.getMeta("owner");
       // WEDGE BREAK: drop the persisted update log + snapshot so the NEXT cold
       // `ensureDoc` starts from empty instead of replaying a log so large it
       // exceeds the DO CPU limit and resets before any client can join (which
@@ -445,21 +422,6 @@ export class SessionRoom implements DurableObject {
   }
 
   private async handleJoin(ws: WebSocket, state: SocketState, message: JoinRequest): Promise<void> {
-    if (!state.workspace) {
-      // Chat rooms: claim-on-first-join ownership, then owner-only forever.
-      const owner = this.getMeta("owner");
-      if (!owner) this.setMeta("owner", state.userId);
-      else if (owner !== state.userId) {
-        this.send(ws, {
-          type: MessageType.JoinError,
-          crdt: message.crdt,
-          roomId: message.roomId,
-          code: JoinErrorCode.AuthFailed,
-          message: "not the room owner"
-        });
-        return;
-      }
-    }
     if (!this.getMeta("chatId") && message.roomId) this.setMeta("chatId", message.roomId);
 
     if (message.crdt === CrdtType.Loro) {

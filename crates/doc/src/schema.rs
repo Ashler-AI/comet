@@ -254,6 +254,13 @@ impl SessionDoc {
 
     /// Append a command entry (rule 1: own entries only, append-only).
     pub fn queue_command(&self, entry: &SessionCommandEntry) -> Result<(), DocError> {
+        if self
+            .read_commands()?
+            .iter()
+            .any(|existing| existing.id == entry.id)
+        {
+            return Ok(());
+        }
         let commands = self.doc.get_list("commands");
         let map = commands.push_container(LoroMap::new())?;
         map.insert("id", entry.id.as_str())?;
@@ -975,6 +982,66 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].status, SessionCommandStatus::Applied);
         assert_eq!(commands[0].payload, entry.payload);
+    }
+
+    #[test]
+    fn command_queue_is_idempotent_by_entry_id() {
+        use crate::commands::{SessionCommandPayload, SessionCommandStatus};
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let first = SessionCommandEntry {
+            id: "stable-id".into(),
+            payload: SessionCommandPayload::Interrupt {},
+            issued_by: "dev-a".into(),
+            issued_at: 10,
+            based_on: None,
+            expires_at: None,
+            status: SessionCommandStatus::Pending,
+            resolution: None,
+        };
+        let mut retry = first.clone();
+        retry.payload = SessionCommandPayload::Steer {
+            prompt: "must not replace the original".into(),
+            message_id: None,
+        };
+        doc.queue_command(&first).unwrap();
+        doc.queue_command(&retry).unwrap();
+        let commands = doc.read_commands().unwrap();
+        assert_eq!(commands, vec![first]);
+    }
+
+    #[test]
+    fn command_reader_skips_unknown_payload_and_keeps_known_entries() {
+        use crate::commands::{SessionCommandPayload, SessionCommandStatus};
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let commands = doc.doc().get_list("commands");
+        let unknown = commands.push_container(LoroMap::new()).unwrap();
+        unknown.insert("id", "future").unwrap();
+        unknown.insert("kind", "futureCommand").unwrap();
+        unknown
+            .insert(
+                "payload",
+                loro_value_from_json(&serde_json::json!({
+                    "kind": "futureCommand",
+                    "newField": true
+                })),
+            )
+            .unwrap();
+        unknown.insert("issuedBy", "future-device").unwrap();
+        unknown.insert("issuedAt", 10_i64).unwrap();
+        unknown.insert("status", "pending").unwrap();
+
+        let known = SessionCommandEntry {
+            id: "known".into(),
+            payload: SessionCommandPayload::Interrupt {},
+            issued_by: "dev-a".into(),
+            issued_at: 11,
+            based_on: None,
+            expires_at: None,
+            status: SessionCommandStatus::Pending,
+            resolution: None,
+        };
+        doc.queue_command(&known).unwrap();
+        assert_eq!(doc.read_commands().unwrap(), vec![known]);
     }
 
     #[test]

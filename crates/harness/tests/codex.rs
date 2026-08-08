@@ -68,6 +68,7 @@ fn controls(
         }),
         steering: steer_rx,
         interrupt: token.clone(),
+        context: None,
     };
     (controls, steer_tx, token)
 }
@@ -377,6 +378,7 @@ async fn approvals_round_trip_as_input_requests() {
         }),
         steering: steer_rx,
         interrupt: token.clone(),
+        context: None,
     };
     let mut req = request("scenario:approve");
     req.auto_approve = false;

@@ -157,6 +157,16 @@ pub fn chat_indicator(chat: &Chat, live: Option<&Session>) -> ChatIndicator {
         _ => ChatIndicator::Idle,
     }
 }
+/// A workspace-local pointer to an existing global session room.
+///
+/// Unlike [`Chat`], a session ref carries no host placement or cached session
+/// metadata. Knowing the exact chat id is sufficient to open the existing room.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRef {
+    pub chat_id: String,
+    pub added_at: DateTime<Utc>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

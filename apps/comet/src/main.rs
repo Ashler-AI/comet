@@ -4,6 +4,7 @@
 
 mod auth_cli;
 mod daemon;
+mod session_cli;
 mod update_cli;
 
 use clap::{Parser, Subcommand};
@@ -28,6 +29,11 @@ enum Command {
     /// Live sync introspection from the running engine: per-room connection
     /// state, last pushed-frame/ack ages, rejoin/probe/resync counters.
     Sync,
+    /// Import, inspect, and message global Comet sessions.
+    Session {
+        #[command(subcommand)]
+        command: session_cli::SessionCommand,
+    },
     /// Manage `comet headless` as a background service (launchd / systemd --user).
     Daemon {
         #[command(subcommand)]
@@ -165,6 +171,10 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Sync) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(sync_cli(engine_config_from_env().ipc_port))
+        }
+        Some(Command::Session { command }) => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(session_cli::run(command, engine_config_from_env().ipc_port))
         }
         Some(Command::Update { check }) => {
             let runtime = tokio::runtime::Runtime::new()?;
@@ -362,8 +372,10 @@ fn open_log_file_in(dir: &std::path::Path, mode: &str) -> Option<std::fs::File> 
         let rc = unsafe { libc::flock(existing.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
             // A live process owns the canonical log — leave it alone.
-            return std::fs::File::create(dir.join(format!("comet-{mode}.{}.log", std::process::id())))
-                .ok();
+            return std::fs::File::create(
+                dir.join(format!("comet-{mode}.{}.log", std::process::id())),
+            )
+            .ok();
         }
         // No live writer: rotate, create fresh, and lock it as ours. (The
         // probe's flock dies with `existing`; a first-ever launch has nothing
@@ -408,7 +420,10 @@ mod log_file_tests {
         // After the owner exits, a fresh launch rotates normally.
         drop(first);
         let third = open_log_file_in(dir, "headed").expect("third log");
-        assert!(dir.join("comet-headed.log.old").is_file(), "rotation resumes");
+        assert!(
+            dir.join("comet-headed.log.old").is_file(),
+            "rotation resumes"
+        );
         drop(third);
     }
 }
@@ -417,7 +432,9 @@ mod log_file_tests {
 /// only exist when a second instance raced a live one for the canonical log.
 #[cfg(unix)]
 fn sweep_stale_pid_logs(dir: &std::path::Path, mode: &str) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     let prefix = format!("comet-{mode}.");
     let week = std::time::Duration::from_secs(7 * 24 * 60 * 60);
     for entry in entries.flatten() {
@@ -441,5 +458,78 @@ fn sweep_stale_pid_logs(dir: &std::path::Path, mode: &str) {
         if stale {
             let _ = std::fs::remove_file(entry.path());
         }
+    }
+}
+
+#[cfg(test)]
+mod session_parser_tests {
+    use super::{Cli, Command};
+    use clap::Parser;
+
+    #[test]
+    fn parses_session_send_with_explicit_source_and_wait_options() {
+        let cli = Cli::try_parse_from([
+            "comet",
+            "session",
+            "send",
+            "target-chat",
+            "hello",
+            "--from",
+            "source-chat",
+            "--wait",
+            "--timeout",
+            "4500",
+        ])
+        .unwrap();
+        let Some(Command::Session {
+            command:
+                super::session_cli::SessionCommand::Send {
+                    chat_id,
+                    text,
+                    from,
+                    wait,
+                    timeout,
+                },
+        }) = cli.command
+        else {
+            panic!("expected session send");
+        };
+        assert_eq!(chat_id, "target-chat");
+        assert_eq!(text, "hello");
+        assert_eq!(from.as_deref(), Some("source-chat"));
+        assert!(wait);
+        assert_eq!(timeout, Some(4500));
+    }
+
+    #[test]
+    fn parses_session_reply_contract() {
+        let cli = Cli::try_parse_from([
+            "comet",
+            "session",
+            "reply",
+            "--session",
+            "target-chat",
+            "--command",
+            "command-id",
+            "done",
+            "--wait",
+        ])
+        .unwrap();
+        let Some(Command::Session {
+            command:
+                super::session_cli::SessionCommand::Reply {
+                    session,
+                    command,
+                    text,
+                    wait,
+                },
+        }) = cli.command
+        else {
+            panic!("expected session reply");
+        };
+        assert_eq!(session, "target-chat");
+        assert_eq!(command, "command-id");
+        assert_eq!(text, "done");
+        assert!(wait);
     }
 }

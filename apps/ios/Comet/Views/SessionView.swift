@@ -20,6 +20,20 @@ struct SessionView: View {
     @State private var viewWidth: CGFloat = 0
 
     private var chat: Chat? { model.chat(id: chatId) }
+    private var sessionRef: SessionRef? { model.sessionRef(id: chatId) }
+
+    private var store: SessionStore? {
+        if let chat { return model.sessionStore(for: chat) }
+        if let sessionRef { return model.sessionStore(for: sessionRef) }
+        return nil
+    }
+
+    private var displayTitle: String {
+        if let chat { return chat.displayTitle }
+        if let sessionRef { return model.sessionTitle(for: sessionRef) }
+        return "Session"
+    }
+
 
     private var chatSpace: Space? {
         guard let spaceId = chat?.spaceId else { return nil }
@@ -28,13 +42,13 @@ struct SessionView: View {
 
     var body: some View {
         Group {
-            if let chat, let store = model.sessionStore(for: chat) {
+            if (chat != nil || sessionRef != nil), let store {
                 content(chat: chat, store: store)
                     .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { viewWidth = $0 }
             } else {
                 VStack(spacing: 12) {
                     CometPulse()
-                    Text("Opening session…")
+                    Text("Opening session\u{2026}")
                         .font(Theme.sans(12))
                         .foregroundStyle(Theme.textFaint)
                 }
@@ -42,7 +56,7 @@ struct SessionView: View {
                 .background(Theme.bg)
             }
         }
-        .navigationTitle(chat?.displayTitle ?? "Session")  // feeds the back menu
+        .navigationTitle(displayTitle)  // feeds the back menu
         .navigationBarTitleDisplayMode(.inline)
         .toolbarBackground(.hidden, for: .navigationBar)
         .toolbar {
@@ -93,6 +107,19 @@ struct SessionView: View {
                     }
                     .buttonStyle(.plain)
                 }
+            } else if sessionRef != nil {
+                ToolbarItem(placement: .principal) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "globe")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(Theme.textMuted)
+                        Text(displayTitle)
+                            .font(Theme.sans(13, weight: .medium))
+                            .foregroundStyle(Theme.text)
+                            .lineLimit(1)
+                    }
+                    .frame(maxWidth: max(140, viewWidth - Self.headerChromeInset))
+                }
             }
         }
         .sheet(isPresented: $showConfig) {
@@ -131,14 +158,18 @@ struct SessionView: View {
             }
         }
         .onAppear {
-            model.markSeen(chatId: chatId)
-            if model.launchSheet == "config" {
+            if chat != nil {
+                model.markSeen(chatId: chatId)
+            }
+            if model.launchSheet == "config", chat != nil {
                 model.launchSheet = nil
                 showConfig = true
             }
         }
         .onDisappear {
-            model.markSeen(chatId: chatId)
+            if chat != nil {
+                model.markSeen(chatId: chatId)
+            }
             model.releaseSessionStore(chatId: chatId)
         }
     }
@@ -182,15 +213,15 @@ struct SessionView: View {
         return parts.joined(separator: " · ")
     }
 
-    private func content(chat: Chat, store: SessionStore) -> some View {
-        let status = liveStatus(chat: chat)
+    private func content(chat: Chat?, store: SessionStore) -> some View {
+        let status = liveStatus(chatId: chatId)
         return VStack(spacing: 0) {
             // The status strip floats over the transcript's faded bottom edge
             // instead of stacking below it — the loader sits on the
             // transparent zone and content is never pushed around.
-            TranscriptView(store: store, chatId: chat.id)
+            TranscriptView(store: store, chatId: chatId)
                 .overlay(alignment: .bottom) {
-                    statusStrip(chat: chat, status: status)
+                    statusStrip(chatId: chatId, status: status)
                         .allowsHitTesting(false)
                 }
 
@@ -208,26 +239,26 @@ struct SessionView: View {
         .motionAnimation(Motion.fadeQuick, value: store.openInputRequest?.requestId)
     }
 
-    private func liveStatus(chat: Chat) -> SessionStatus? {
+    private func liveStatus(chatId: String) -> SessionStatus? {
         if let demo = model.demo {
-            return effectiveStatus(demo.sessions[chat.id], now: nowMs())
+            return effectiveStatus(demo.sessions[chatId], now: nowMs())
         }
-        return effectiveStatus(model.workspace?.sessions[chat.id], now: nowMs())
+        return effectiveStatus(model.workspace?.sessions[chatId], now: nowMs())
     }
 
     /// Reserved 24pt status strip (shell.rs render_status_strip) — Working
     /// shows the sunrise spinner + rotating flavour word + elapsed; Errored
     /// shows "Run failed"; the strip always reserves its height so the
     /// composer never shifts.
-    private func statusStrip(chat: Chat, status: SessionStatus?) -> some View {
+    private func statusStrip(chatId: String, status: SessionStatus?) -> some View {
         TimelineView(.periodic(from: .now, by: 1)) { _ in
             HStack(spacing: 6) {
                 switch status {
                 case .working:
                     WorkingSpinner()
-                    let startedAt = sessionStartedAt(chat: chat)
+                    let startedAt = sessionStartedAt(chatId: chatId)
                     let elapsed = (nowMs() - startedAt) / 1000
-                    Text("\(Motion.flavourWord(seed: Motion.flavourSeed(chat.id), elapsedSecs: elapsed))…")
+                    Text("\(Motion.flavourWord(seed: Motion.flavourSeed(chatId), elapsedSecs: elapsed))\u{2026}")
                         .font(Theme.sans(12))
                         .foregroundStyle(Theme.textMuted)
                     Text(Motion.formatElapsed(elapsed))
@@ -248,8 +279,8 @@ struct SessionView: View {
         }
     }
 
-    private func sessionStartedAt(chat: Chat) -> Int64 {
-        let row = model.demo?.sessions[chat.id] ?? model.workspace?.sessions[chat.id]
+    private func sessionStartedAt(chatId: String) -> Int64 {
+        let row = model.demo?.sessions[chatId] ?? model.workspace?.sessions[chatId]
         return row?.startedAt ?? row?.updatedAt ?? nowMs()
     }
 }

@@ -1,7 +1,7 @@
 /**
  * End-to-end smoke test against a running `wrangler dev` instance
  * (AUTH_MODE=dev). Exercises the full design surface:
- *   1. two Loro peers join a session room and converge through the DO
+ *   1. two authenticated users join one session room and converge through the DO
  *   2. streamed text appends propagate live
  *   3. GET /tail returns the materialized L2 tail
  *   4. POST/GET /diff round-trips the sidecar
@@ -22,7 +22,8 @@ import { createHash, randomUUID } from "node:crypto";
 const base = process.argv[2] ?? "http://127.0.0.1:27640";
 const wsBase = base.replace(/^http/, "ws");
 const token = "smoke-user";
-const chatId = `smoke-${randomUUID().slice(0, 8)}`;
+const peerToken = "smoke-peer-user";
+const chatId = randomUUID();
 const deviceId = `smokedev-${randomUUID().slice(0, 8)}`;
 const orgId = `org-smoke-${randomUUID().slice(0, 8)}`;
 
@@ -68,7 +69,7 @@ m1.set("deviceId", "peer-a");
 docA.commit();
 ok("peer A joined + wrote");
 
-const clientB = new LoroWebsocketClient({ url: `${wsBase}/session/${chatId}/ws?token=${token}` });
+const clientB = new LoroWebsocketClient({ url: `${wsBase}/session/${chatId}/ws?token=${peerToken}` });
 await clientB.waitConnected();
 const adaptorB = new LoroAdaptor();
 await clientB.join({ roomId: chatId, crdtAdaptor: adaptorB });
@@ -90,11 +91,23 @@ await until(() => docA.getMap("meta").get("fromB") === true, "live B→A");
 ok("live update B→A");
 void t0;
 
-// ── wrong user rejected ───────────────────────────────────────────────────
+// ── cross-user session HTTP access ────────────────────────────────────────
 {
-  const res = await fetch(`${base}/tail/${chatId}?token=intruder`);
-  if (res.status !== 403) fail(`intruder tail expected 403, got ${res.status}`);
-  ok("ownership enforced (intruder 403)");
+  const [canonical, uppercaseAlias, invalidAlias] = await Promise.all([
+    fetch(`${base}/tail/${chatId}?token=${peerToken}`),
+    fetch(`${base}/tail/${chatId.toUpperCase()}?token=${peerToken}`),
+    fetch(`${base}/tail/not-a-session-uuid?token=${peerToken}`)
+  ]);
+  if (canonical.status !== 200) fail(`peer tail expected 200, got ${canonical.status}`);
+  if (uppercaseAlias.status !== 200) {
+    fail(`uppercase session alias expected 200, got ${uppercaseAlias.status}`);
+  }
+  if (invalidAlias.status !== 404) {
+    fail(`invalid session alias expected 404, got ${invalidAlias.status}`);
+  }
+  const [canonicalBody, uppercaseBody] = await Promise.all([canonical.text(), uppercaseAlias.text()]);
+  if (canonicalBody !== uppercaseBody) fail("uppercase session alias reached a different room");
+  ok("authenticated peer can read one canonical session room");
 }
 
 // ── tail ──────────────────────────────────────────────────────────────────
@@ -111,7 +124,7 @@ await new Promise((r) => setTimeout(r, 100));
 // ── diff sidecar ──────────────────────────────────────────────────────────
 {
   const diff = { chatId, deviceId: "peer-a", checkoutPath: "/tmp/x", patch: "diff --git a b", files: [], additions: 1, deletions: 0, truncated: false, publishedAt: Date.now() };
-  const post = await fetch(`${base}/diff/${chatId}?token=${token}`, {
+  const post = await fetch(`${base}/diff/${chatId}?token=${peerToken}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(diff)

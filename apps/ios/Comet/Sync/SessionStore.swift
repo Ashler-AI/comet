@@ -260,17 +260,17 @@ final class SessionStore {
 
     // MARK: Command plane (ledger rule 1: append-only, own entries only)
 
-    func sendRun(prompt: String, chat: Chat) {
+    func sendRun(prompt: String, chat: Chat?) {
         if offline {
             demoResponder?(prompt)
             return
         }
         let messageId = UUID().uuidString.lowercased()
         let request = RunRequest(prompt: prompt,
-                                 model: chat.config?.model,
-                                 reasoning: chat.config?.reasoning,
-                                 cwd: chat.cwd ?? "",
-                                 sandbox: chat.config?.sandbox ?? "workspace-write")
+                                 model: chat?.config?.model,
+                                 reasoning: chat?.config?.reasoning,
+                                 cwd: chat?.cwd ?? "",
+                                 sandbox: chat?.config?.sandbox ?? "workspace-write")
         queueCommand(kind: "run", payload: [
             "kind": "run",
             "request": encodableJSON(request),
