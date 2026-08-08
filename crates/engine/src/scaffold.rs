@@ -197,7 +197,6 @@ impl ScaffoldClient {
             .deployment_id
             .as_deref()
             .expect("validated deploymentId");
-        let session_id = scope.session_id.as_deref().expect("validated sessionId");
         let body = CreateSandboxBody {
             name,
             source: source_ref.map(|reference| CreateSandboxSource { reference }),
@@ -207,7 +206,6 @@ impl ScaffoldClient {
                 version: "scaffold.comet-runtime.v1",
                 project_id: &scope.project_id,
                 deployment_id,
-                session_id,
             },
         };
         let response: SandboxEnvelope = self
@@ -723,6 +721,17 @@ struct ScaffoldSandbox {
     last_activity_at: Option<String>,
     #[serde(default)]
     links: ScaffoldEnvironmentLinks,
+    comet_runtime_profile: Option<ScaffoldCometRuntimeProfile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScaffoldCometRuntimeProfile {
+    version: String,
+    project_id: String,
+    deployment_id: String,
+    session_id: String,
+    sandbox_id: String,
 }
 
 impl ScaffoldSandbox {
@@ -763,6 +772,33 @@ impl ScaffoldSandbox {
         // Validate required timestamps even though only last activity enters the projection.
         let _ = parse_rfc3339_ms(&self.created_at, "createdAt")?;
         let _ = parse_rfc3339_ms(&self.updated_at, "updatedAt")?;
+        let scope = if self.runtime_profile.as_deref() == Some("comet_remote") {
+            let profile = self.comet_runtime_profile.as_ref().ok_or_else(|| {
+                ScaffoldError::InvalidResponse(format!(
+                    "sandbox {} has no authoritative Comet runtime profile",
+                    self.id
+                ))
+            })?;
+            if profile.version != "scaffold.comet-runtime.v1"
+                || profile.project_id != scope.project_id
+                || Some(profile.deployment_id.as_str()) != scope.deployment_id.as_deref()
+                || profile.session_id != self.id
+                || profile.sandbox_id != self.id
+            {
+                return Err(ScaffoldError::InvalidResponse(format!(
+                    "sandbox {} returned a mismatched Comet runtime profile",
+                    self.id
+                )));
+            }
+            CollaborationScope {
+                project_id: profile.project_id.clone(),
+                deployment_id: Some(profile.deployment_id.clone()),
+                session_id: Some(profile.session_id.clone()),
+                unknown: Default::default(),
+            }
+        } else {
+            scope
+        };
         let lifecycle_epoch = self.lifecycle_epoch;
         Ok(SessionEnvironment {
             source: SessionEnvironmentSource::Scaffold {
@@ -813,7 +849,6 @@ struct CreateCometRuntimeProfile<'a> {
     version: &'static str,
     project_id: &'a str,
     deployment_id: &'a str,
-    session_id: &'a str,
 }
 
 #[derive(Debug, Serialize)]
@@ -1609,18 +1644,22 @@ mod tests {
         )
     }
 
+    fn comet_sandbox(status: &str) -> String {
+        sandbox(status).replace(
+            r#""runtimeProfile":"remote_code""#,
+            r#""runtimeProfile":"comet_remote","cometRuntimeProfile":{"version":"scaffold.comet-runtime.v1","projectId":"project-a","deploymentId":"deployment-a","sessionId":"sandbox-a","sandboxId":"sandbox-a"}"#,
+        )
+    }
+
     #[test]
     fn accepts_the_additive_comet_remote_profile_from_code_sandboxes() {
-        let envelope: SandboxEnvelope = serde_json::from_str(&sandbox("ready").replace(
-            r#""runtimeProfile":"remote_code""#,
-            r#""runtimeProfile":"comet_remote""#,
-        ))
-        .unwrap();
+        let envelope: SandboxEnvelope = serde_json::from_str(&comet_sandbox("ready")).unwrap();
         let environment = envelope.sandbox.into_environment(scope()).unwrap();
         assert_eq!(
             environment.source_ref.as_deref(),
             Some("387d6652abd642f0b85e8bd14f9131a9f23b7e70")
         );
+        assert_eq!(environment.scope.session_id.as_deref(), Some("sandbox-a"));
     }
 
     async fn mock_server(responses: Vec<String>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
@@ -1678,7 +1717,7 @@ mod tests {
         let responses = vec![
             listed,
             sandbox("ready"),
-            sandbox("creating"),
+            comet_sandbox("creating"),
             sandbox("paused"),
             sandbox("resuming"),
             sandbox("stopped"),
@@ -1696,7 +1735,7 @@ mod tests {
             .inspect("sandbox-a", &scope(), &cancellation)
             .await
             .unwrap();
-        client
+        let created = client
             .create(
                 &scope(),
                 Some("Comet"),
@@ -1707,6 +1746,7 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(created.scope.session_id.as_deref(), Some("sandbox-a"));
         client
             .pause("sandbox-a", &scope(), &cancellation)
             .await
@@ -1752,7 +1792,7 @@ mod tests {
         assert!(requests[2].contains(r#""version":"scaffold.comet-runtime.v1""#));
         assert!(requests[2].contains(r#""projectId":"project-a""#));
         assert!(requests[2].contains(r#""deploymentId":"deployment-a""#));
-        assert!(requests[2].contains(r#""sessionId":"session-a""#));
+        assert!(!requests[2].contains(r#""sessionId""#));
     }
 
     #[tokio::test]

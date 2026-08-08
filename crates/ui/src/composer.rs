@@ -4649,6 +4649,12 @@ impl Composer {
                     if let (Some(created_id), Some(attachment)) =
                         (sandbox_id.as_deref(), pending_attachment.as_ref())
                     {
+                        let authoritative_scope = comet_proto::CollaborationScope {
+                            project_id: attachment.projection.project_id.clone(),
+                            deployment_id: Some(attachment.projection.deployment_id.clone()),
+                            session_id: Some(attachment.projection.session_id.clone()),
+                            unknown: Default::default(),
+                        };
                         loop {
                             let remaining =
                                 SCAFFOLD_DEMO_WAIT.saturating_sub(wait_started.elapsed());
@@ -4656,7 +4662,7 @@ impl Composer {
                                 break;
                             }
                             let inspect = crate::state::inspect_scaffold_session(
-                                &engine, created_id, &scope,
+                                &engine, created_id, &authoritative_scope,
                             );
                             let deadline = cx.background_executor().timer(remaining);
                             futures::pin_mut!(inspect);
