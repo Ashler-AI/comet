@@ -763,13 +763,14 @@ impl ScaffoldSandbox {
         // Validate required timestamps even though only last activity enters the projection.
         let _ = parse_rfc3339_ms(&self.created_at, "createdAt")?;
         let _ = parse_rfc3339_ms(&self.updated_at, "updatedAt")?;
-        let _ = self.lifecycle_epoch;
+        let lifecycle_epoch = self.lifecycle_epoch;
         Ok(SessionEnvironment {
             source: SessionEnvironmentSource::Scaffold {
                 sandbox_id: self.id,
                 region: self.selected_region.or(self.region),
                 lifecycle: self.status,
-                links: self.links,
+                lifecycle_epoch,
+                links: Box::new(self.links),
             },
             owner_principal,
             scope,
@@ -976,6 +977,7 @@ pub struct DeviceJoinGrantRequest {
     pub scope: CollaborationScope,
     pub sandbox_id: String,
     pub device_id: String,
+    pub lifecycle_epoch: u64,
     pub capabilities: Vec<String>,
     pub expires_in_seconds: u32,
 }
@@ -1052,6 +1054,7 @@ impl DeviceJoinGrantProvider for EdgeDeviceJoinGrantClient {
             session_id: &'a str,
             deployment_id: &'a str,
             sandbox_id: &'a str,
+            lifecycle_epoch: u64,
             capabilities: &'a [String],
             ttl_seconds: u32,
         }
@@ -1076,6 +1079,7 @@ impl DeviceJoinGrantProvider for EdgeDeviceJoinGrantClient {
             session_id,
             deployment_id,
             sandbox_id: &request.sandbox_id,
+            lifecycle_epoch: request.lifecycle_epoch,
             capabilities: &request.capabilities,
             ttl_seconds: request.expires_in_seconds,
         };
@@ -1292,7 +1296,7 @@ impl ScaffoldRuntime {
                     .client
                     .inspect(&sandbox_id, &scope, cancellation)
                     .await?;
-                let (lifecycle, _) = scaffold_source(&environment)?;
+                let (lifecycle, _, _) = scaffold_source(&environment)?;
                 if !matches!(
                     lifecycle,
                     comet_proto::ScaffoldLifecycle::Ready
@@ -1343,7 +1347,7 @@ impl ScaffoldRuntime {
         environment: &SessionEnvironment,
         cancellation: &CancellationToken,
     ) -> Result<(String, String, ScaffoldControlGrant), ScaffoldError> {
-        let (lifecycle, _) = scaffold_source(environment)?;
+        let (lifecycle, lifecycle_epoch, _) = scaffold_source(environment)?;
         if !matches!(
             lifecycle,
             comet_proto::ScaffoldLifecycle::Starting
@@ -1366,6 +1370,9 @@ impl ScaffoldRuntime {
             .as_deref()
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| ScaffoldError::InvalidScope("sessionId is required to attach".into()))?;
+        let lifecycle_epoch = lifecycle_epoch.ok_or_else(|| {
+            ScaffoldError::InvalidResponse("sandbox lifecycle epoch is required to attach".into())
+        })?;
 
         // Probe first so missing installations fail deterministically without minting a credential.
         let probe_argv = vec![
@@ -1390,12 +1397,13 @@ impl ScaffoldRuntime {
             return Err(ScaffoldError::CometNotInstalled);
         }
 
-        let device_id = format!("comet-scaffold-{sandbox_id}");
+        let device_id = format!("comet-scaffold-{sandbox_id}-e{lifecycle_epoch}");
         let request = DeviceJoinGrantRequest {
             principal_subject: environment.owner_principal.clone(),
             scope: scope.clone(),
             sandbox_id: sandbox_id.to_string(),
             device_id: device_id.clone(),
+            lifecycle_epoch,
             capabilities: vec![
                 CAPABILITY_SESSION_READ.into(),
                 CAPABILITY_SESSION_CHAT.into(),
@@ -1422,6 +1430,7 @@ impl ScaffoldRuntime {
             "deploymentId": deployment_id,
             "sessionId": session_id,
             "deviceId": device_id,
+            "lifecycleEpoch": lifecycle_epoch,
             "sandboxId": sandbox_id
         })
         .to_string();
@@ -1530,13 +1539,14 @@ impl ScaffoldRuntime {
 
 fn scaffold_source(
     environment: &SessionEnvironment,
-) -> Result<(comet_proto::ScaffoldLifecycle, &str), ScaffoldError> {
+) -> Result<(comet_proto::ScaffoldLifecycle, Option<u64>, &str), ScaffoldError> {
     match &environment.source {
         SessionEnvironmentSource::Scaffold {
             sandbox_id,
             lifecycle,
+            lifecycle_epoch,
             ..
-        } => Ok((*lifecycle, sandbox_id)),
+        } => Ok((*lifecycle, *lifecycle_epoch, sandbox_id)),
         SessionEnvironmentSource::Local => Err(ScaffoldError::InvalidResponse(
             "local environment has no Scaffold sandbox".into(),
         )),
@@ -1544,7 +1554,7 @@ fn scaffold_source(
 }
 
 fn environment_sandbox_id(environment: &SessionEnvironment) -> Result<&str, ScaffoldError> {
-    scaffold_source(environment).map(|(_, sandbox_id)| sandbox_id)
+    scaffold_source(environment).map(|(_, _, sandbox_id)| sandbox_id)
 }
 
 #[cfg(test)]
@@ -1595,7 +1605,7 @@ mod tests {
 
     fn sandbox(status: &str) -> String {
         format!(
-            r#"{{"sandbox":{{"id":"sandbox-a","status":"{status}","kind":"remote_code","runtimeProfile":"remote_code","region":"us-central1","sourceRef":"387d6652abd642f0b85e8bd14f9131a9f23b7e70","ownerEmail":"alice@example.com","createdAt":"2026-08-04T00:00:00Z","updatedAt":"2026-08-04T00:01:00Z","lastActivityAt":"2026-08-04T00:02:00Z","links":{{"terminal":"https://terminal.example"}}}}}}"#
+            r#"{{"sandbox":{{"id":"sandbox-a","lifecycleEpoch":1,"status":"{status}","kind":"remote_code","runtimeProfile":"remote_code","region":"us-central1","sourceRef":"387d6652abd642f0b85e8bd14f9131a9f23b7e70","ownerEmail":"alice@example.com","createdAt":"2026-08-04T00:00:00Z","updatedAt":"2026-08-04T00:01:00Z","lastActivityAt":"2026-08-04T00:02:00Z","links":{{"terminal":"https://terminal.example"}}}}}}"#
         )
     }
 
@@ -1779,7 +1789,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             result.attached_device_id.as_deref(),
-            Some("comet-scaffold-sandbox-a")
+            Some("comet-scaffold-sandbox-a-e1")
         );
         assert_eq!(result.run_id.as_deref(), Some("run-a"));
         assert_eq!(result.environment.owner_principal, "alice@example.com");
@@ -1840,9 +1850,11 @@ mod tests {
             "cg1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narrow_secret"
         );
         assert_eq!(bootstrap["deploymentId"], "deployment-a");
+        assert_eq!(bootstrap["lifecycleEpoch"], 1);
         let grant_body = requests[2].split_once("\r\n\r\n").unwrap().1;
         assert!(grant_body.contains(r#""sandboxId":"sandbox-a""#));
         assert!(grant_body.contains(r#""deploymentId":"deployment-a""#));
+        assert!(grant_body.contains(r#""lifecycleEpoch":1"#));
     }
     #[tokio::test]
     async fn omp_handoff_uses_one_use_raw_tar_and_verifies_without_starting_acp() {

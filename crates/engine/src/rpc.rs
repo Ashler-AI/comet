@@ -2414,6 +2414,7 @@ mod tests {
             expected_device_id: None,
             expected_session_id: None,
             expected_deployment_id: None,
+            expected_lifecycle_epoch: None,
             expected_sandbox_id: None,
         });
         let projection = project_collaboration_snapshot(&doc, &host, Some(&auth), None).unwrap();
