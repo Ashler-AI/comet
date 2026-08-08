@@ -257,7 +257,11 @@ impl EngineCore {
                 platform: std::env::consts::OS.to_string(),
                 project_scope: context.project_scope.to_string(),
                 user_id: context.user_id.to_string(),
-                edge: edge.clone(),
+                edge: context
+                    .runtime_profile
+                    .allows_workspace_room()
+                    .then(|| edge.clone())
+                    .flatten(),
             },
         )?;
         doc_host.set_workspace(workspace.clone());
@@ -393,7 +397,7 @@ impl EngineCore {
         let on_nudge: comet_rpc::NudgeHandler = Arc::new(move |chat_id: String| {
             // Opening the doc joins its room + syncs; drain fires on the change
             // subscription — the command executes with no standing per-chat socket.
-            match nudge_host.open(&chat_id) {
+            match nudge_host.open_for_nudge(&chat_id) {
                 Ok(_) => tracing::info!(chat = %chat_id, "nudge: chat doc opened"),
                 Err(err) => {
                     tracing::warn!(chat = %chat_id, error = %err, "nudge: open failed")

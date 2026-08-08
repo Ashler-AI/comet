@@ -267,6 +267,16 @@ pub enum PickerKind {
     HarnessModel,
     Traits,
 }
+fn is_pending_scaffold_selection(
+    selected_chat: Option<&str>,
+    pending_scaffold_chat: Option<&str>,
+) -> bool {
+    selected_chat.is_some() && selected_chat == pending_scaffold_chat
+}
+
+fn draft_config_applies(selected_chat: Option<&str>, pending_scaffold_chat: Option<&str>) -> bool {
+    selected_chat.is_none() || is_pending_scaffold_selection(selected_chat, pending_scaffold_chat)
+}
 
 pub struct Pickers {
     state: Entity<AppState>,
@@ -339,21 +349,30 @@ impl Pickers {
             | ComposerInputEvent::MentionDismiss => {}
         });
         // Chat selection / config changes must re-render the chips (child views
-        // only re-render on their own notify). A selection change also drops
-        // the draft picks — they belonged to the previous chat/new-chat canvas.
+        // only re-render on their own notify). A selection change normally
+        // drops draft picks so they cannot leak into another chat. The pending
+        // Scaffold chat is the exception: it is deliberately created before
+        // first send, and its draft must carry the chosen harness into that
+        // first prompt.
         let state_observe = cx.observe(&state, |this: &mut Self, state, cx| {
-            let selected = state.read(cx).selected_chat.clone();
+            let state = state.read(cx);
+            let selected = state.selected_chat.clone();
+            let pending_scaffold_chat = state
+                .scaffold_session_draft()
+                .map(|draft| draft.chat_id.as_str());
             if selected != this.draft_owner {
-                this.draft_owner = selected;
-                this.config.harness = None;
-                this.config.model = None;
-                this.config.reasoning = None;
-                this.config.model_options.clear();
+                this.draft_owner = selected.clone();
+                if !is_pending_scaffold_selection(selected.as_deref(), pending_scaffold_chat) {
+                    this.config.harness = None;
+                    this.config.model = None;
+                    this.config.reasoning = None;
+                    this.config.model_options.clear();
+                }
                 this.switch_error = None;
             }
             // A space switch invalidates the branch draft + cache — the folder
             // (and possibly the device) changed under them.
-            let space = state.read(cx).selected_space.clone();
+            let space = state.selected_space.clone();
             if space != this.space_owner {
                 this.space_owner = space;
                 this.config.branch = None;
@@ -443,9 +462,21 @@ impl Pickers {
         &self.config
     }
 
-    /// Harness is locked once the chat exists (feature-inventory §1.7).
+    /// Harness is locked once a persisted chat owns its run configuration.
+    /// A pending Scaffold chat is still a first-send draft even though its
+    /// local chat row already exists.
     fn harness_locked(&self, cx: &App) -> bool {
-        self.state.read(cx).selected_chat.is_some()
+        !self.draft_config_applies(cx)
+    }
+
+    fn draft_config_applies(&self, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        draft_config_applies(
+            state.selected_chat.as_deref(),
+            state
+                .scaffold_session_draft()
+                .map(|draft| draft.chat_id.as_str()),
+        )
     }
 
     fn engine(&self, cx: &App) -> Option<EngineHandle> {
@@ -463,11 +494,16 @@ impl Pickers {
         (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device)
     }
 
-    /// Effective harness: the selected chat owns its harness; otherwise use the
-    /// new-chat draft, remembered default, or first listed harness.
+    /// Effective harness: a persisted chat owns its harness; otherwise use the
+    /// first-send draft, remembered default, or first listed harness.
     fn effective_harness(&self, cx: &App) -> Option<HarnessId> {
         if let Some(chat) = self.state.read(cx).selected_chat_row() {
-            return chat.config.as_ref().map(|config| config.harness);
+            if let Some(config) = chat.config.as_ref() {
+                return Some(config.harness);
+            }
+            if !self.draft_config_applies(cx) {
+                return None;
+            }
         }
         if let Some(harness) = self.config.harness {
             return Some(harness);
@@ -492,14 +528,16 @@ impl Pickers {
             .and_then(|list| visible_harnesses(list).first().map(|d| d.id))
     }
 
-    /// Effective model id: the selected chat owns its persisted model; the
-    /// draft and remembered defaults apply only to the new-chat canvas.
+    /// Effective model id: a persisted chat owns its model; the draft and
+    /// remembered defaults also apply to a pending first-send Scaffold chat.
     fn effective_model_id<'a>(&'a self, cx: &'a App) -> Option<&'a str> {
         if let Some(chat) = self.state.read(cx).selected_chat_row() {
-            return chat
-                .config
-                .as_ref()
-                .and_then(|config| config.model.as_deref());
+            if let Some(config) = chat.config.as_ref() {
+                return config.model.as_deref();
+            }
+            if !self.draft_config_applies(cx) {
+                return None;
+            }
         }
         if let Some(id) = self.config.model.as_deref() {
             return Some(id);
@@ -514,9 +552,17 @@ impl Pickers {
     /// draft pick / chat config / remembered default, clamped to the selected
     /// model's ladder, falling back to the model's default level.
     fn effective_reasoning(&self, cx: &App) -> Option<ReasoningLevel> {
-        let explicit = match self.state.read(cx).selected_chat_row() {
-            Some(chat) => chat.config.as_ref().and_then(|config| config.reasoning),
-            None => self.config.reasoning.or(self.defaults.reasoning),
+        let chat_config = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .and_then(|chat| chat.config.as_ref());
+        let explicit = if let Some(config) = chat_config {
+            config.reasoning
+        } else if self.draft_config_applies(cx) {
+            self.config.reasoning.or(self.defaults.reasoning)
+        } else {
+            None
         };
         if self.selected_model(cx).is_none() {
             // Catalog not loaded yet: show the explicit value as-is (nothing
@@ -541,18 +587,21 @@ impl Pickers {
         }
     }
 
-    /// The explicit (non-default) option picks: the chat's persisted
-    /// selections for existing chats, the draft's for the new-chat canvas.
+    /// The explicit (non-default) option picks: the persisted chat's
+    /// selections, or the first-send draft's selections.
     fn explicit_options(&self, cx: &App) -> serde_json::Map<String, serde_json::Value> {
-        match self
+        if let Some(config) = self
             .state
             .read(cx)
             .selected_chat_row()
-            .and_then(|c| c.config.as_ref())
+            .and_then(|chat| chat.config.as_ref())
         {
-            Some(config) => config.model_options.clone(),
-            None => self.config.model_options.clone(),
+            return config.model_options.clone();
         }
+        if self.draft_config_applies(cx) {
+            return self.config.model_options.clone();
+        }
+        serde_json::Map::new()
     }
 
     /// The fully-resolved config the composer threads into the Run request and
@@ -915,9 +964,9 @@ impl Pickers {
     // ---- selections ----
 
     fn pick_ref(&mut self, row: RepoRef, cx: &mut Context<Self>) {
-        // Existing-session ref picks switch its checkout instead of updating
-        // the draft.
-        if self.state.read(cx).selected_chat_row().is_some() {
+        // Persisted-session ref picks switch its checkout. A pending Scaffold
+        // chat is still a first-send draft and must only update that draft.
+        if self.state.read(cx).selected_chat_row().is_some() && !self.draft_config_applies(cx) {
             self.switch_session_ref(row, cx);
             return;
         }
@@ -1587,9 +1636,10 @@ impl Pickers {
     }
 
     /// The composer footer row: checkout-kind on the
-    /// left, the ref selector right-aligned. `None` for non-git spaces. On an
-    /// existing session both sides are read-only labels ("Worktree" /
-    /// "Local checkout" + the chat's branch).
+    /// left, the ref selector right-aligned. `None` for non-git spaces. On a
+    /// persisted session both sides are read-only labels ("Worktree" /
+    /// "Local checkout" + the chat's branch). A pending Scaffold chat remains
+    /// editable until its first send commits the run configuration.
     pub fn render_footer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
         // A selected chat whose workspace row hasn't synced yet (the moment
@@ -1599,10 +1649,15 @@ impl Pickers {
         let (space, session) = {
             let state = self.state.read(cx);
             let space = state.selected_space_row().cloned()?;
-            let session = state
-                .selected_chat
-                .as_ref()
-                .and_then(|_| state.selected_chat_row().cloned());
+            let selected_chat = state.selected_chat.as_deref();
+            let pending_scaffold_chat = state
+                .scaffold_session_draft()
+                .map(|draft| draft.chat_id.as_str());
+            let session = if draft_config_applies(selected_chat, pending_scaffold_chat) {
+                None
+            } else {
+                selected_chat.and_then(|_| state.selected_chat_row().cloned())
+            };
             (space, session)
         };
         if !space.git_detected {
@@ -2652,6 +2707,24 @@ impl Render for Pickers {
 mod tests {
     use super::*;
     use comet_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+
+    #[test]
+    fn pending_scaffold_chat_keeps_first_send_draft_config() {
+        assert!(draft_config_applies(None, None));
+        assert!(draft_config_applies(
+            Some("scaffold-chat"),
+            Some("scaffold-chat")
+        ));
+        assert!(is_pending_scaffold_selection(
+            Some("scaffold-chat"),
+            Some("scaffold-chat")
+        ));
+        assert!(!draft_config_applies(Some("ordinary-chat"), None));
+        assert!(!draft_config_applies(
+            Some("ordinary-chat"),
+            Some("different-scaffold-chat")
+        ));
+    }
 
     #[test]
     fn traits_summary_formats_non_defaults() {

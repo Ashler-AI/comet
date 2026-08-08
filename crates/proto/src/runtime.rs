@@ -41,6 +41,13 @@ impl RuntimeProfile {
     pub fn allows_agent_accounts(self) -> bool {
         self == Self::LocalController
     }
+
+    /// Project-wide workspace rooms are a local-controller discovery surface.
+    /// A Scaffold host is already bound to one exact session-room grant and must
+    /// not bootstrap a broader room with that credential.
+    pub fn allows_workspace_room(self) -> bool {
+        self != Self::ScaffoldHost
+    }
 }
 
 #[cfg(test)]
@@ -56,6 +63,7 @@ mod tests {
         assert!(!RuntimeProfile::ScaffoldHost.allows_scaffold_control());
         assert!(!RuntimeProfile::ScaffoldHost.allows_session_import());
         assert!(!RuntimeProfile::ScaffoldHost.allows_agent_accounts());
+        assert!(!RuntimeProfile::ScaffoldHost.allows_workspace_room());
     }
 
     #[test]
@@ -73,5 +81,6 @@ mod tests {
         assert!(RuntimeProfile::LocalController.allows_scaffold_control());
         assert!(RuntimeProfile::LocalController.allows_session_import());
         assert!(RuntimeProfile::LocalController.allows_agent_accounts());
+        assert!(RuntimeProfile::LocalController.allows_workspace_room());
     }
 }

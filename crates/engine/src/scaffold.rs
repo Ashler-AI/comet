@@ -716,6 +716,7 @@ struct ScaffoldSandbox {
     runtime_profile: Option<String>,
     region: Option<String>,
     selected_region: Option<String>,
+    source_ref: Option<String>,
     owner_email: Option<String>,
     created_at: String,
     updated_at: String,
@@ -772,6 +773,7 @@ impl ScaffoldSandbox {
             },
             owner_principal,
             scope,
+            source_ref: self.source_ref,
             last_activity_at,
             unknown: Default::default(),
         })
@@ -1593,7 +1595,7 @@ mod tests {
 
     fn sandbox(status: &str) -> String {
         format!(
-            r#"{{"sandbox":{{"id":"sandbox-a","status":"{status}","kind":"remote_code","runtimeProfile":"remote_code","region":"us-central1","ownerEmail":"alice@example.com","createdAt":"2026-08-04T00:00:00Z","updatedAt":"2026-08-04T00:01:00Z","lastActivityAt":"2026-08-04T00:02:00Z","links":{{"terminal":"https://terminal.example"}}}}}}"#
+            r#"{{"sandbox":{{"id":"sandbox-a","status":"{status}","kind":"remote_code","runtimeProfile":"remote_code","region":"us-central1","sourceRef":"387d6652abd642f0b85e8bd14f9131a9f23b7e70","ownerEmail":"alice@example.com","createdAt":"2026-08-04T00:00:00Z","updatedAt":"2026-08-04T00:01:00Z","lastActivityAt":"2026-08-04T00:02:00Z","links":{{"terminal":"https://terminal.example"}}}}}}"#
         )
     }
 
@@ -1605,10 +1607,10 @@ mod tests {
         ))
         .unwrap();
         let environment = envelope.sandbox.into_environment(scope()).unwrap();
-        assert!(matches!(
-            environment.source,
-            SessionEnvironmentSource::Scaffold { .. }
-        ));
+        assert_eq!(
+            environment.source_ref.as_deref(),
+            Some("387d6652abd642f0b85e8bd14f9131a9f23b7e70")
+        );
     }
 
     async fn mock_server(responses: Vec<String>) -> (String, tokio::task::JoinHandle<Vec<String>>) {

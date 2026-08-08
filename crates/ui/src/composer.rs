@@ -36,7 +36,7 @@ use comet_rpc::{RpcError, methods};
 
 use crate::attachments::{self, StagedAttachment};
 use crate::motion;
-use crate::pickers::Pickers;
+use crate::pickers::{CheckoutPlan, Pickers};
 use crate::state::{AppState, Indicator};
 use crate::theme::Theme;
 
@@ -79,6 +79,14 @@ pub const DRAG_SCROLL_FRAME_MS: u64 = 16;
 /// Maximum time the first prompt waits for its Scaffold sandbox and remote
 /// Comet host. Failure is surfaced; the prompt never falls back to local.
 const SCAFFOLD_DEMO_WAIT: Duration = Duration::from_secs(10 * 60);
+
+fn scaffold_source_ref(plan: &CheckoutPlan) -> Option<&str> {
+    match plan {
+        CheckoutPlan::CurrentCheckout { branch } => branch.as_deref(),
+        CheckoutPlan::ReuseWorktree { branch, .. } => Some(branch.as_str()),
+        CheckoutPlan::NewWorktree { base } => base.as_deref(),
+    }
+}
 
 /// Hysteresis slack for the expanded→compact flip: once expanded, the composer
 /// only collapses when the text is comfortably narrower than the compact
@@ -4536,6 +4544,9 @@ impl Composer {
             return;
         }
         let scaffold_demo = scaffold_draft.is_some();
+        let requested_scaffold_source_ref = scaffold_demo
+            .then(|| scaffold_source_ref(&plan).map(str::to_string))
+            .flatten();
         let scaffold_scope = scaffold_draft
             .as_ref()
             .map(|draft| draft.collaboration_scope());
@@ -4666,13 +4677,17 @@ impl Composer {
             let result: Result<(), String> = async {
                 let mut control_route = control_route;
                 let mut host_device_id = host_device_id;
+                let mut attached_scaffold_source_ref = requested_scaffold_source_ref.clone();
                 if let Some(scope) = scaffold_scope {
                     let wait_started = Instant::now();
                     let mut sandbox_id = None;
                     let mut pending_attachment = None;
                     let mut last_error = None;
-                    let launch =
-                        crate::state::create_and_attach_scaffold_session(&engine, &scope);
+                    let launch = crate::state::create_and_attach_scaffold_session(
+                        &engine,
+                        &scope,
+                        requested_scaffold_source_ref.as_deref(),
+                    );
                     let deadline = cx.background_executor().timer(SCAFFOLD_DEMO_WAIT);
                     futures::pin_mut!(launch);
                     match futures::future::select(launch, deadline).await {
@@ -4744,6 +4759,10 @@ impl Composer {
                                     break;
                                 };
                                 host_device_id = Some(attachment.owner_device_id.clone());
+                                attached_scaffold_source_ref = attachment
+                                    .source_ref
+                                    .clone()
+                                    .or(attached_scaffold_source_ref);
                                 control_route = Some(ControlRoute {
                                     session_id: attachment.projection.session_id.clone(),
                                     owner_device_id: attachment.owner_device_id.clone(),
@@ -4793,13 +4812,10 @@ impl Composer {
                     })
                     .ok();
                 }
-                // Resolve the working directory: existing chats keep theirs;
-                // new chats run per the checkout plan: the
-                // space's folder as-is, an EXISTING worktree of the picked ref
-                // (a plain cwd override — multiple sessions share one
-                // worktree), or a fresh isolated worktree created off the
-                // picked base ref (CreateWorktree on send, targeted at the
-                // space's device; the RPC relay-forwards).
+                // Resolve the execution checkout. Local sessions may reuse a
+                // local path. Scaffold sessions instead target the attached
+                // device and use only sandbox-relative paths; a fresh checkout
+                // is created from the control-plane-returned source ref.
                 let mut cwd = if scaffold_attached {
                     ".".to_string()
                 } else if is_new {
@@ -4815,40 +4831,64 @@ impl Composer {
                 // it from the first frame (it read "Select ref" until the
                 // host's diff reconciler got around to stamping the branch).
                 let mut chat_branch: Option<String> = None;
-                if is_new && !scaffold_demo {
+                if is_new || scaffold_demo {
                     match &plan {
-                        crate::pickers::CheckoutPlan::CurrentCheckout { branch } => {
+                        CheckoutPlan::CurrentCheckout { branch } => {
                             chat_branch = branch.clone();
                         }
-                        crate::pickers::CheckoutPlan::ReuseWorktree { path, branch } => {
-                            cwd = path.clone();
-                            worktree_cwd = Some(path.clone());
+                        CheckoutPlan::ReuseWorktree { path, branch } => {
                             chat_branch = Some(branch.clone());
+                            if !scaffold_attached {
+                                cwd = path.clone();
+                                worktree_cwd = Some(path.clone());
+                            }
                         }
-                        crate::pickers::CheckoutPlan::NewWorktree { base } => {
+                        CheckoutPlan::NewWorktree { base } => {
                             chat_branch = base.clone();
-                            if let (Some(repo_path), Some(base)) = (&space_path, base) {
-                                let mut params = serde_json::json!({
-                                    "repoPath": repo_path,
-                                    "branch": base,
-                                });
-                                if space_remote
-                                    && let Some(object) = params.as_object_mut()
-                                {
-                                    object.insert(
-                                        "targetDeviceId".into(),
-                                        serde_json::Value::String(device_id.clone()),
-                                    );
+                            if let Some(base) = base {
+                                let repo_path = if scaffold_attached {
+                                    Some(".".to_string())
+                                } else {
+                                    space_path.clone()
+                                };
+                                let worktree_base = if scaffold_attached {
+                                    attached_scaffold_source_ref
+                                        .clone()
+                                        .unwrap_or_else(|| base.clone())
+                                } else {
+                                    base.clone()
+                                };
+                                if let Some(repo_path) = repo_path {
+                                    let mut params = serde_json::json!({
+                                        "repoPath": repo_path,
+                                        "branch": worktree_base,
+                                    });
+                                    let target_device_id = if scaffold_attached {
+                                        host_device_id.clone()
+                                    } else if space_remote {
+                                        Some(device_id.clone())
+                                    } else {
+                                        None
+                                    };
+                                    if let (Some(target_device_id), Some(object)) =
+                                        (target_device_id, params.as_object_mut())
+                                    {
+                                        object.insert(
+                                            "targetDeviceId".into(),
+                                            serde_json::Value::String(target_device_id),
+                                        );
+                                    }
+                                    let value = engine
+                                        .client()
+                                        .call(methods::CREATE_WORKTREE, params)
+                                        .await
+                                        .map_err(|e| format!("Worktree failed: {e}"))?;
+                                    let worktree: comet_proto::Worktree =
+                                        serde_json::from_value(value)
+                                            .map_err(|e| format!("Worktree reply malformed: {e}"))?;
+                                    cwd = worktree.path.clone();
+                                    worktree_cwd = Some(worktree.path);
                                 }
-                                let value = engine
-                                    .client()
-                                    .call(methods::CREATE_WORKTREE, params)
-                                    .await
-                                    .map_err(|e| format!("Worktree failed: {e}"))?;
-                                let worktree: comet_proto::Worktree = serde_json::from_value(value)
-                                    .map_err(|e| format!("Worktree reply malformed: {e}"))?;
-                                cwd = worktree.path.clone();
-                                worktree_cwd = Some(worktree.path);
                             }
                         }
                     }
@@ -5998,6 +6038,29 @@ mod tests {
         assert!(should_queue_steer(true, false, false));
         assert!(!should_queue_steer(false, false, false));
         assert!(!should_queue_steer(true, true, true));
+    }
+
+    #[test]
+    fn scaffold_source_ref_follows_the_selected_checkout() {
+        assert_eq!(
+            scaffold_source_ref(&CheckoutPlan::CurrentCheckout {
+                branch: Some("main".into()),
+            }),
+            Some("main")
+        );
+        assert_eq!(
+            scaffold_source_ref(&CheckoutPlan::ReuseWorktree {
+                path: "/tmp/worktree".into(),
+                branch: "feat/identity".into(),
+            }),
+            Some("feat/identity")
+        );
+        assert_eq!(
+            scaffold_source_ref(&CheckoutPlan::NewWorktree {
+                base: Some("feat/identity".into()),
+            }),
+            Some("feat/identity")
+        );
     }
 
     #[test]

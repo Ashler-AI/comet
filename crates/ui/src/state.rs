@@ -377,6 +377,7 @@ pub(crate) struct ScaffoldSessionAttachment {
     pub grant_id: String,
     pub owner_device_id: String,
     pub actor_subject: String,
+    pub source_ref: Option<String>,
 }
 
 /// Start the staging sandbox without coupling creation to remote Comet
@@ -384,11 +385,12 @@ pub(crate) struct ScaffoldSessionAttachment {
 pub(crate) async fn create_scaffold_session(
     handle: &EngineHandle,
     scope: &CollaborationScope,
+    source_ref: Option<&str>,
 ) -> Result<String, RpcError> {
     let create = ScaffoldEnvironmentControl::Create {
         scope: scope.clone(),
         name: Some("Comet Scaffold session".into()),
-        source_ref: None,
+        source_ref: source_ref.map(str::to_string),
         region: None,
         runtime_mode: Some(ScaffoldRuntimeMode::Compose),
     };
@@ -471,6 +473,7 @@ pub(crate) async fn attach_scaffold_session(
         .await?;
     let attached: ScaffoldEnvironmentControlResult =
         serde_json::from_value(value).map_err(|err| RpcError::Failed(err.to_string()))?;
+    let source_ref = attached.environment.source_ref.clone();
     let SessionEnvironmentSource::Scaffold {
         sandbox_id: attached_sandbox_id,
         ..
@@ -526,6 +529,7 @@ pub(crate) async fn attach_scaffold_session(
         grant_id: grant.id,
         owner_device_id,
         actor_subject: attached.environment.owner_principal,
+        source_ref,
     })
 }
 /// Create the sandbox and immediately dispatch its supervised Comet bootstrap.
@@ -534,8 +538,9 @@ pub(crate) async fn attach_scaffold_session(
 pub(crate) async fn create_and_attach_scaffold_session(
     handle: &EngineHandle,
     scope: &CollaborationScope,
+    source_ref: Option<&str>,
 ) -> Result<(String, ScaffoldSessionAttachment), RpcError> {
-    let sandbox_id = create_scaffold_session(handle, scope).await?;
+    let sandbox_id = create_scaffold_session(handle, scope, source_ref).await?;
     let attachment = attach_scaffold_session(handle, &sandbox_id, scope.clone()).await?;
     Ok((sandbox_id, attachment))
 }
@@ -2167,6 +2172,12 @@ mod tests {
                 .get("operation")
                 .and_then(serde_json::Value::as_str)
                 .expect("typed Scaffold operation");
+            if operation == "create" {
+                assert_eq!(
+                    params.get("source_ref").and_then(serde_json::Value::as_str),
+                    Some("feat/comet-identity-integration")
+                );
+            }
             self.operations
                 .lock()
                 .expect("Scaffold operation log")
@@ -2190,6 +2201,7 @@ mod tests {
                     "links": {}
                 },
                 "ownerPrincipal": "accounts.google.com:ready@example.com",
+                "sourceRef": "387d6652abd642f0b85e8bd14f9131a9f23b7e70",
                 "scope": {
                     "projectId": "ashler-staging",
                     "deploymentId": "ashler-staging",
@@ -2284,9 +2296,13 @@ mod tests {
             unknown: Default::default(),
         };
 
-        let (sandbox_id, attachment) = create_and_attach_scaffold_session(&handle, &scope)
-            .await
-            .unwrap();
+        let (sandbox_id, attachment) = create_and_attach_scaffold_session(
+            &handle,
+            &scope,
+            Some("feat/comet-identity-integration"),
+        )
+        .await
+        .unwrap();
         assert_eq!(sandbox_id, "sandbox-ready");
         assert_eq!(
             operations
@@ -2314,6 +2330,10 @@ mod tests {
         assert_eq!(
             attachment.actor_subject,
             "accounts.google.com:ready@example.com"
+        );
+        assert_eq!(
+            attachment.source_ref.as_deref(),
+            Some("387d6652abd642f0b85e8bd14f9131a9f23b7e70")
         );
     }
 

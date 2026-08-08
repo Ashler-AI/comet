@@ -356,6 +356,8 @@ pub struct SessionEnvironment {
     pub owner_principal: String,
     pub scope: CollaborationScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity_at: Option<i64>,
     #[serde(flatten, default)]
     pub unknown: UnknownFields,

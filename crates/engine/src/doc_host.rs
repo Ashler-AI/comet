@@ -905,6 +905,21 @@ impl DocHost {
         self.open_projection(chat_id, None)
     }
 
+    /// Return an existing projection-aware handle for a relay nudge, or open an
+    /// ordinary local handle when no controller has attached this chat yet.
+    ///
+    /// Reopening an attached Scaffold chat through `open()` would discard the
+    /// trusted room projection and reject the nudge before it can be queued.
+    pub(crate) fn open_for_nudge(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
+        let handle = lock(&self.inner.handles).get(chat_id).cloned();
+        if let Some(handle) = handle {
+            handle.touch();
+            self.start_room_join(handle.clone());
+            return Ok(handle);
+        }
+        self.open(chat_id)
+    }
+
     /// Open a chat against an exact Scaffold room selected by the control-plane
     /// attach result. Scope is allowed only when its session id is this document's
     /// id; unscoped callers retain the ordinary local s3 projection.
@@ -2893,6 +2908,16 @@ mod authority_tests {
             .find(|entry| entry.id == exact_id)
             .unwrap();
         assert_eq!(host.command_grant_authorization(&exact_entry), Some(true));
+        let nudged_handle = host.open_for_nudge("session-a").unwrap();
+        assert!(Arc::ptr_eq(&exact_handle, &nudged_handle));
+        assert_eq!(
+            nudged_handle.room_projection.as_ref(),
+            Some(&SessionRoomProjection {
+                project_id: "project-a".into(),
+                deployment_id: "deployment-a".into(),
+                session_id: "session-a".into(),
+            })
+        );
         host.open_projection(
             "session-b",
             Some(&SessionRoomProjection {
