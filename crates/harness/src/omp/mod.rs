@@ -1311,9 +1311,23 @@ pub(crate) async fn run_acp(
 
         let response = loop {
             tokio::select! {
+                // Biased: a delivered final response must win over the EOF
+                // already queued behind it — agents that exit right after
+                // `end_turn` are ending cleanly, not crashing.
+                biased;
                 response = &mut prompt => match response {
                     Ok(response) => break response,
                     Err(error) => {
+                        // Prefer the richer crash context (exit status +
+                        // stderr tail) when the child is already gone.
+                        let error = match child.try_wait() {
+                            Ok(Some(status)) => HarnessError::Protocol(crate::crash_message(
+                                options.process_label,
+                                Some(status),
+                                &stderr_tail,
+                            )),
+                            _ => error,
+                        };
                         tracing::warn!(
                             target: "comet_harness::omp",
                             process = options.process_label,
@@ -1444,11 +1458,15 @@ pub(crate) async fn run_acp(
             return Ok(());
         }
         if acp_closed {
-            return Err(HarnessError::Protocol(crate::crash_message(
-                options.process_label,
-                child.try_wait().ok().flatten(),
-                &stderr_tail,
-            )));
+            // The agent closed its stream after finishing the turn (end_turn
+            // received, Done delivered). Some ACP agents exit per conversation
+            // even when we run them persistently — a clean end, not a crash.
+            tracing::debug!(
+                target: "comet_harness::omp",
+                process = options.process_label,
+                "ACP stream closed after a completed turn; ending persistent session"
+            );
+            return Ok(());
         }
 
         let next_prompt = loop {
@@ -1475,6 +1493,17 @@ pub(crate) async fn run_acp(
                     return Ok(());
                 }
                 item = incoming.recv() => match item {
+                    Some(Incoming::Eof) | None => {
+                        // Stream closed while idle between turns: the previous
+                        // turn completed, so this is the same clean per-turn
+                        // exit as above — never a crash report.
+                        tracing::debug!(
+                            target: "comet_harness::omp",
+                            process = options.process_label,
+                            "ACP stream closed between turns; ending persistent session"
+                        );
+                        return Ok(());
+                    }
                     Some(item) => {
                         if !handle_session_incoming(
                             item,
@@ -1491,13 +1520,6 @@ pub(crate) async fn run_acp(
                                 &stderr_tail,
                             )));
                         }
-                    }
-                    None => {
-                        return Err(HarnessError::Protocol(crate::crash_message(
-                            options.process_label,
-                            child.try_wait().ok().flatten(),
-                            &stderr_tail,
-                        )));
                     }
                 },
                 _ = events.closed() => {
@@ -1850,8 +1872,17 @@ mod tests {
         );
     }
 
+    /// Serializes tests that interact through the process-global
+    /// `OMP_AUTH_BROKER_*` variables: `propagate_auth_broker_environment`
+    /// consumes (deletes) the single-use token file, so a builder call from a
+    /// parallel test inside the broker test's env window steals its token.
+    static BROKER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn scaffold_command_invokes_only_omp_acp_with_hardening() {
+        let _guard = BROKER_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let harness = OmpHarness::scaffold_host();
         let command = harness.command(Path::new("/usr/local/bin/omp"), "/workspace", true);
         let args: Vec<String> = command
@@ -1892,8 +1923,7 @@ mod tests {
 
     #[test]
     fn broker_configuration_is_environment_only_and_scaffold_stays_isolated() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK
+        let _guard = BROKER_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = tempfile::tempdir().unwrap();

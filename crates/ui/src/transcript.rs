@@ -3454,7 +3454,8 @@ mod tests {
             let projected: &str = "\u{00A0}@composer.rs\u{00A0}";
             projected
         });
-        assert_eq!(rows[0].version, (raw.len() as u64) << 1);
+        // Raw length in the high bits; delivery (Normal) and pending are zero.
+        assert_eq!(rows[0].version, (raw.len() as u64) << 3);
 
         entry.parts = vec![text_part("t0", "no mentions here")];
         let rows = rows_for_entry(&entry, false, &mut parse);

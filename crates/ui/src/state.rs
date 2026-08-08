@@ -1997,10 +1997,19 @@ mod tests {
         }
     }
 
-    /// A localhost port that was just free (bind :0, read, drop).
+    /// A localhost port that was just free — picked OUTSIDE the OS ephemeral
+    /// range (macOS: 49152+), which `:0` allocations and outbound sockets in
+    /// parallel test processes draw from. Binding `:0` and re-using the port
+    /// after drop raced those allocations in the free→bootstrap window.
     async fn free_port() -> u16 {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        listener.local_addr().unwrap().port()
+        let start = 20000 + (std::process::id() % 10000) as u16;
+        for offset in 0..2000 {
+            let port = start + offset;
+            if tokio::net::TcpListener::bind(("127.0.0.1", port)).await.is_ok() {
+                return port;
+            }
+        }
+        panic!("no free port in 20000-32000");
     }
 
     #[test]

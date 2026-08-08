@@ -137,7 +137,18 @@ mod tests {
         // The probe must not have stolen the lock from the holder.
         InstanceLock::acquire(dir.path()).expect_err("still held after probe");
         drop(lock);
-        assert_eq!(InstanceLock::holder(dir.path()), None, "released");
+        // `holder` is deliberately single-try, so a concurrent test's fork
+        // window (a child inherits the lock fd between fork and exec, keeping
+        // the flock alive a few ms) can transiently read as "running" — poll
+        // with the same budget `acquire` uses instead of asserting once.
+        let released = (0..40).any(|_| {
+            if InstanceLock::holder(dir.path()).is_none() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            false
+        });
+        assert!(released, "lock still reported held 1s after release");
     }
 
     #[test]
