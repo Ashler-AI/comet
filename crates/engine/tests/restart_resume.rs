@@ -124,8 +124,16 @@ impl Harness for RecordingHarness {
 fn assemble(dir: &std::path::Path, harness: RecordingHarness) -> EngineCore {
     let registry = HarnessRegistry::for_profile(RuntimeProfile::Mock);
     registry.register(Arc::new(harness));
-    EngineCore::assemble(dir, Arc::new(registry), HarnessId::Mock, None)
-        .expect("engine core assembles")
+    EngineCore::assemble_with_identity(
+        dir,
+        Arc::new(registry),
+        HarnessId::Mock,
+        None,
+        "ashler-local",
+        "dev-user",
+        RuntimeProfile::Mock,
+    )
+    .expect("engine core assembles")
 }
 
 fn queue_run(core: &EngineCore, prompt: &str, cwd: &str, message_id: &str) {

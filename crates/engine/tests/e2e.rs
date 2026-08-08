@@ -181,8 +181,16 @@ fn registry_with(harness: Arc<dyn Harness>) -> Arc<HarnessRegistry> {
 }
 
 fn assemble(dir: &std::path::Path, harness: Arc<dyn Harness>) -> EngineCore {
-    EngineCore::assemble(dir, registry_with(harness), HarnessId::Mock, None)
-        .expect("engine core assembles")
+    EngineCore::assemble_with_identity(
+        dir,
+        registry_with(harness),
+        HarnessId::Mock,
+        None,
+        "ashler-local",
+        "dev-user",
+        RuntimeProfile::Mock,
+    )
+    .expect("engine core assembles")
 }
 
 /// Queue a command into the chat doc the way a REMOTE viewer device would: an immutable
