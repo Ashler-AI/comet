@@ -113,7 +113,7 @@ impl Shell {
         let created: Vec<String> = self
             .state
             .read(cx)
-            .chats_in_space(space_id)
+            .chats_in_selected_source()
             .iter()
             .map(|c| c.id.clone())
             .collect();
@@ -123,6 +123,13 @@ impl Shell {
         }
     }
 
+    /// Open the new-session canvas in the current folder.
+    pub(super) fn open_new_session(&mut self, cx: &mut Context<Self>) {
+        self.route = Route::Chat;
+        self.state
+            .update(cx, |state, cx| state.select_chat(None, cx));
+        cx.notify();
+    }
     /// Close a tab = archive the session. Selection moves to a neighbor; the
     /// last tab lands on the new-session canvas.
     pub(super) fn close_session_tab(&mut self, chat_id: String, cx: &mut Context<Self>) {
@@ -288,9 +295,8 @@ impl Shell {
                             )
                             .into_any_element()
                     } else {
-                        // Working animates (the sidebar's miniaturized gradient
-                        // spinner) instead of a static pink dot; every other
-                        // non-idle status stays a dot.
+                        // A stable status dot keeps tab geometry unchanged
+                        // while the labeled transcript strip carries progress.
                         let dot = spaces::status_dot_color(status, &theme);
                         div()
                             .size(px(20.0))
@@ -298,18 +304,9 @@ impl Shell {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .when(status == ChatIndicator::Working, |el| {
-                                el.child(loaders::mini_gradient_spinner(
-                                    format!("tab-working-{id}"),
-                                    2.0,
-                                    cx.entity_id(),
-                                    cx,
-                                ))
+                            .when(status != ChatIndicator::Idle, |el| {
+                                el.child(div().size(px(6.0)).rounded_full().bg(dot))
                             })
-                            .when(
-                                !matches!(status, ChatIndicator::Idle | ChatIndicator::Working),
-                                |el| el.child(div().size(px(6.0)).rounded_full().bg(dot)),
-                            )
                             .into_any_element()
                     };
                     let tab_el = div()
@@ -445,10 +442,7 @@ impl Shell {
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
             .on_click(cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.route = Route::Chat;
-                this.state.update(cx, |s, cx| s.select_chat(None, cx));
-                cx.notify();
+                this.open_new_session(cx);
             }))
             .child(
                 icon(icons::PLUS)

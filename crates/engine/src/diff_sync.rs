@@ -168,33 +168,46 @@ impl CheckoutDiffSync {
 // ---------------------------------------------------------------------------
 
 async fn reconcile(inner: &Arc<DiffSyncInner>, chats: Vec<Chat>) {
-    // Group this device's cwd-bearing chats by canonical checkout identity.
-    let mut groups: HashMap<String, (CheckoutIdentity, Vec<Chat>)> = HashMap::new();
+    // Archived chats have no live surface, so they must not retain filesystem
+    // watchers or periodic diff capture. Resolve each cwd once: historical
+    // chats commonly share a checkout, and running git once per chat made
+    // startup work grow with the entire conversation history.
+    let mut chats_by_cwd: HashMap<PathBuf, Vec<Chat>> = HashMap::new();
     for chat in chats {
-        if chat.device_id != inner.device_id {
+        if chat.device_id != inner.device_id || chat.archived {
             continue;
         }
-        let Some(cwd) = chat.cwd.clone() else {
+        let Some(cwd) = chat.cwd.as_deref() else {
             continue;
         };
-        let identity = match inner.repos.checkout_identity(Path::new(&cwd)).await {
+        chats_by_cwd
+            .entry(PathBuf::from(cwd))
+            .or_default()
+            .push(chat);
+    }
+
+    let mut groups: HashMap<String, (CheckoutIdentity, Vec<Chat>)> = HashMap::new();
+    for (cwd, chats) in chats_by_cwd {
+        let identity = match inner.repos.checkout_identity(&cwd).await {
             Ok(identity) => identity,
             Err(err) => {
-                tracing::debug!(cwd = %cwd, error = %err, "diff-sync: not a checkout");
+                tracing::debug!(cwd = %cwd.display(), error = %err, "diff-sync: not a checkout");
                 continue;
             }
         };
-        // Stamp the row's checkoutId so every device groups this chat correctly.
-        if chat.checkout_id.as_deref() != Some(identity.id.as_str())
-            && let Err(err) = inner.workspace.set_chat_checkout(&chat.id, &identity.id)
-        {
-            tracing::debug!(chat = %chat.id, error = %err, "diff-sync: checkoutId write failed");
+        for chat in &chats {
+            // Stamp the row's checkoutId so every device groups this chat correctly.
+            if chat.checkout_id.as_deref() != Some(identity.id.as_str())
+                && let Err(err) = inner.workspace.set_chat_checkout(&chat.id, &identity.id)
+            {
+                tracing::debug!(chat = %chat.id, error = %err, "diff-sync: checkoutId write failed");
+            }
         }
         groups
             .entry(identity.id.clone())
             .or_insert_with(|| (identity, Vec::new()))
             .1
-            .push(chat);
+            .extend(chats);
     }
 
     // Close entries whose checkout no longer has chats; drop their published diff.
@@ -230,7 +243,7 @@ async fn reconcile(inner: &Arc<DiffSyncInner>, chats: Vec<Chat>) {
                     let _ = entry.kick_tx.send(()); // new chat needs a sidecar now
                 }
             }
-            None => add_entry(inner, identity, chats),
+            None => add_entry(inner, identity, chats).await,
         }
     }
 }
@@ -264,12 +277,47 @@ fn exceeds_watch_budget(root: &Path) -> bool {
     false
 }
 
-fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats: Vec<Chat>) {
+async fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats: Vec<Chat>) {
     let (kick_tx, kick_rx) = mpsc::unbounded_channel();
+    let watcher_identity = identity.clone();
+    let watcher_kick_tx = kick_tx.clone();
+    let watchers = match tokio::task::spawn_blocking(move || {
+        build_watchers(&watcher_identity, &watcher_kick_tx)
+    })
+    .await
+    {
+        Ok(watchers) => watchers,
+        Err(err) => {
+            tracing::warn!(checkout = %identity.root.display(), error = %err,
+                "diff-sync: watcher setup task failed");
+            Vec::new()
+        }
+    };
 
-    // Recursive watchers on the worktree root and (for linked worktrees) the git
-    // dir — HEAD/index churn and file edits both land here. Failures are fine:
-    // the initial + repair sync still keep the snapshot correct.
+    let entry = Arc::new(CheckoutEntry {
+        identity,
+        chats: Mutex::new(chats),
+        checksum: Mutex::new(None),
+        kick_tx: kick_tx.clone(),
+        _watchers: watchers,
+    });
+    lock(&inner.entries).insert(entry.identity.id.clone(), entry.clone());
+    tokio::spawn(entry_task(
+        Arc::downgrade(inner),
+        Arc::downgrade(&entry),
+        kick_rx,
+    ));
+    let _ = kick_tx.send(()); // initial snapshot
+}
+
+/// Build native filesystem watchers away from the async runtime. Both the
+/// bounded directory walk and notify's recursive registration perform blocking
+/// filesystem I/O; doing either on a Tokio worker delayed auth, IPC, and UI
+/// readiness for minutes on machines with many historical worktrees.
+fn build_watchers(
+    identity: &CheckoutIdentity,
+    kick_tx: &mpsc::UnboundedSender<()>,
+) -> Vec<notify::RecommendedWatcher> {
     let mut watchers = Vec::new();
     let mut targets: Vec<&PathBuf> = vec![&identity.root];
     if !identity.git_dir.starts_with(&identity.root) {
@@ -280,12 +328,8 @@ fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats: Vec<
         // has no way to prune subtrees. On a checkout carrying big dependency
         // trees (node_modules, vendored deps) that is tens of thousands of
         // watches: the watcher thread pegs a core just maintaining them — even
-        // with the tree completely idle — which starved a real device's whole
-        // async runtime (presence heartbeats and IPC stalled; it showed
-        // permanently offline). If the tree blows the budget, skip the live
-        // watch entirely; the 2-minute repair tick still keeps the diff
-        // correct, just not instantly. Bounded so the probe itself stays cheap
-        // on a pathological tree.
+        // with the tree completely idle. If the tree blows the budget, skip the
+        // live watch; the 2-minute repair tick still keeps the diff correct.
         if exceeds_watch_budget(target) {
             tracing::info!(path = %target.display(),
                 "diff-sync: tree too large to watch live; relying on the repair tick");
@@ -311,21 +355,7 @@ fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats: Vec<
             Err(err) => tracing::debug!(error = %err, "diff-sync: watcher create failed"),
         }
     }
-
-    let entry = Arc::new(CheckoutEntry {
-        identity,
-        chats: Mutex::new(chats),
-        checksum: Mutex::new(None),
-        kick_tx: kick_tx.clone(),
-        _watchers: watchers,
-    });
-    lock(&inner.entries).insert(entry.identity.id.clone(), entry.clone());
-    tokio::spawn(entry_task(
-        Arc::downgrade(inner),
-        Arc::downgrade(&entry),
-        kick_rx,
-    ));
-    let _ = kick_tx.send(()); // initial snapshot
+    watchers
 }
 
 /// Per-checkout task: trailing-debounce fs kicks, then compute + publish. Runs
@@ -356,6 +386,9 @@ async fn entry_task(
 // ---------------------------------------------------------------------------
 
 async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
+    // Capture the expected metadata before the async git read. A title-driven
+    // branch rename may complete while capture is in flight.
+    let chats = lock(&entry.chats).clone();
     let snapshot = match capture_diff(&inner.repos, &entry.identity.root).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
@@ -366,12 +399,17 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
     };
 
     // chat.branch upkeep — the git-dir watcher covers HEAD, so every snapshot
-    // reconciles mismatched rows (repair tick covers dropped events).
-    let chats = lock(&entry.chats).clone();
+    // reconciles mismatched rows (repair tick covers dropped events). The CAS
+    // prevents this capture from overwriting a newer title-driven branch.
     for chat in &chats {
-        if chat.branch.as_deref() != Some(snapshot.branch.as_str())
-            && let Err(err) = inner.workspace.set_chat_branch(&chat.id, &snapshot.branch)
-        {
+        if chat.branch.as_deref() == Some(snapshot.branch.as_str()) {
+            continue;
+        }
+        if let Err(err) = inner.workspace.compare_and_set_chat_branch(
+            &chat.id,
+            chat.branch.as_deref(),
+            &snapshot.branch,
+        ) {
             tracing::debug!(chat = %chat.id, error = %err, "diff-sync: branch write failed");
         }
     }

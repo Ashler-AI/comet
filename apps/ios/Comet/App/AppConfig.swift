@@ -6,63 +6,39 @@ import Foundation
 
 final class AppConfig: @unchecked Sendable {
     enum Mode: String {
-        case workos
+        case scaffold
         case dev
     }
 
     let edgeURL: URL
     let mode: Mode
     let userId: String
-    let orgId: String
+    let projectScope: String
     let deviceId: String
     let deviceName: String
 
-    private let lock = NSLock()
-    private var tokens: AuthTokens?
-    private var devBearer: String?
+    private let tokens: AuthTokens?
+    private let devBearer: String?
 
-    init(edgeURL: URL, mode: Mode, userId: String, orgId: String,
+    init(edgeURL: URL, mode: Mode, userId: String, projectScope: String,
          deviceId: String, deviceName: String,
          tokens: AuthTokens? = nil, devBearer: String? = nil) {
         self.edgeURL = edgeURL
         self.mode = mode
         self.userId = userId
-        self.orgId = orgId
+        self.projectScope = projectScope
         self.deviceId = deviceId
         self.deviceName = deviceName
         self.tokens = tokens
         self.devBearer = devBearer
     }
 
-    func updateTokens(_ new: AuthTokens) {
-        lock.lock(); defer { lock.unlock() }
-        tokens = new
-    }
-
-    /// Current bearer, refreshing the WorkOS access token when needed.
+    /// Current revocable Scaffold bearer. The control plane validates it on
+    /// every edge request, so no client-side refresh token exists.
     func currentToken() async -> String? {
         switch mode {
-        case .dev:
-            lock.lock(); defer { lock.unlock() }
-            return devBearer
-        case .workos:
-            lock.lock()
-            let current = tokens
-            lock.unlock()
-            guard let current else { return nil }
-            if !Self.isExpired(jwt: current.accessToken) {
-                return current.accessToken
-            }
-            let client = AuthClient(baseURL: edgeURL)
-            guard let refreshed = try? await client.refresh(refreshToken: current.refreshToken,
-                                                            organizationId: orgId) else {
-                roomLog.error("auth: token refresh failed; using expired access token (server will reject and rooms will redial)")
-                return current.accessToken  // let the server reject; backoff redials
-            }
-            updateTokens(refreshed)
-            Keychain.save(refreshed.accessToken, key: "accessToken")
-            Keychain.save(refreshed.refreshToken, key: "refreshToken")
-            return refreshed.accessToken
+        case .dev: return devBearer
+        case .scaffold: return tokens?.accessToken
         }
     }
 
@@ -74,7 +50,7 @@ final class AppConfig: @unchecked Sendable {
 
     func workspaceSocketURL() async -> URL? {
         guard let token = await currentToken() else { return nil }
-        var url = wsBase.appending(path: "workspace/\(orgId)/ws")
+        var url = wsBase.appending(path: "workspace/\(projectScope)/ws")
         url.append(queryItems: [URLQueryItem(name: "token", value: token)])
         return url
     }
@@ -82,23 +58,15 @@ final class AppConfig: @unchecked Sendable {
     func sessionSocketURL(chatId: String) async -> URL? {
         guard let token = await currentToken() else { return nil }
         var url = wsBase.appending(path: "session/\(chatId)/ws")
-        url.append(queryItems: [URLQueryItem(name: "token", value: token)])
+        url.append(queryItems: [
+            URLQueryItem(name: "token", value: token),
+            // Native Scaffold clients share the project's canonical deployment
+            // namespace with desktop engines and sandbox device credentials.
+            URLQueryItem(name: "deploymentId", value: projectScope),
+        ])
         return url
     }
 
-    /// Decode the JWT payload's `exp` (60s early-refresh margin). Unparseable
-    /// tokens read as non-expired — the server is the arbiter.
-    private static func isExpired(jwt: String) -> Bool {
-        let segments = jwt.split(separator: ".")
-        guard segments.count == 3 else { return false }
-        var base64 = String(segments[1]).replacingOccurrences(of: "-", with: "+")
-            .replacingOccurrences(of: "_", with: "/")
-        while base64.count % 4 != 0 { base64 += "=" }
-        guard let data = Data(base64Encoded: base64),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let exp = obj["exp"] as? TimeInterval else { return false }
-        return Date().timeIntervalSince1970 > exp - 60
-    }
 
     /// GET /device/{deviceId}/status → whether the device's relay HOST socket
     /// is currently attached (distinct from workspace presence).

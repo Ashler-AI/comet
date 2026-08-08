@@ -11,11 +11,10 @@
 //! - Notifications map to [`AgentEvent`]s: agentMessage/reasoning deltas (both
 //!   `delta`/`textDelta` spellings), item lifecycles → typed ToolCall/ToolResult,
 //!   `thread/tokenUsage/updated` → Usage, turn/completed|failed|aborted → Done.
-//! - Approvals: the wire policy is always `"never"` — parity with the Claude
-//!   adapter's auto-approve-everything (unattended runs; the sandbox is the
-//!   guardrail). Stray `item/commandExecution/requestApproval` +
-//!   `item/fileChange/requestApproval` still round-trip through
-//!   [`RunControls::request_input`] as a synthesized yes/no question.
+//! - Approvals: Comet keeps ordinary runs in YOLO mode with Codex's granular
+//!   policy: sandbox and rules gates stay off, while provider elicitations,
+//!   explicit permission grants, and skill safety checks route through the
+//!   shared [`RunControls::request_input`] surface.
 //! - Steering: `turn/steer { expectedTurnId }` into the live turn; a rejected
 //!   steer (the turn-completed race) is queued and delivered as the next
 //!   `turn/start` on the same thread. The session is persistent across turns
@@ -47,6 +46,7 @@ use comet_proto::{
     UserInputAnswer, UserInputQuestion,
 };
 
+use crate::approval::{elicitation_questions, elicitation_response};
 use crate::{Harness, HarnessError, RunControls};
 use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
 use normalize::{
@@ -407,14 +407,19 @@ async fn run_session(session: Session) {
     } = controls;
     let request_input = Arc::new(request_input);
 
-    // ---- wire params ------------------------------------------------------
-    // Parity with the Claude adapter, which auto-approves every `can_use_tool`
-    // regardless of `auto_approve` (comet sessions run unattended; the sandbox
-    // is the guardrail): never surface wire approvals. "on-request" turned
-    // every command into a yes/no question (user report: "asking me for
-    // approval at every step"). The approval-as-input plumbing below stays for
-    // stray requests and a future explicit permission-mode setting.
-    let approval_policy = "never";
+    // Ordinary command/rule gates stay unattended, but `"never"` also
+    // suppresses provider elicitations and explicit permission grants before
+    // they can reach the client. Granular YOLO preserves only those
+    // provider-owned safety boundaries.
+    let approval_policy = json!({
+        "granular": {
+            "sandbox_approval": false,
+            "rules": false,
+            "mcp_elicitations": true,
+            "request_permissions": true,
+            "skill_approval": true,
+        }
+    });
     let effort = to_effort(request.reasoning);
     // Service tier rides thread-start and every turn (mirrors the Codex IDE
     // client). "default" means Standard — omit it entirely.
@@ -428,7 +433,8 @@ async fn run_session(session: Session) {
     let start_params = {
         let mut p = serde_json::Map::new();
         p.insert("cwd".into(), Value::String(request.cwd.clone()));
-        p.insert("approvalPolicy".into(), approval_policy.into());
+        p.insert("approvalPolicy".into(), approval_policy.clone());
+        p.insert("approvalsReviewer".into(), "user".into());
         p.insert("sandbox".into(), sandbox_mode(request.sandbox).into());
         if let Some(model) = &request.model {
             p.insert("model".into(), Value::String(model.clone()));
@@ -514,7 +520,8 @@ async fn run_session(session: Session) {
         let mut p = serde_json::Map::new();
         p.insert("threadId".into(), Value::String(thread_id.clone()));
         p.insert("input".into(), json!([{ "type": "text", "text": text }]));
-        p.insert("approvalPolicy".into(), approval_policy.into());
+        p.insert("approvalPolicy".into(), approval_policy.clone());
+        p.insert("approvalsReviewer".into(), "user".into());
         p.insert(
             "sandboxPolicy".into(),
             sandbox_policy_value(request.sandbox),
@@ -784,14 +791,7 @@ async fn run_session(session: Session) {
                 },
 
                 Some(Incoming::Request { id, method, params }) => {
-                    handle_server_request(
-                        &client,
-                        id,
-                        &method,
-                        &params,
-                        request.auto_approve,
-                        &request_input,
-                    );
+                    handle_server_request(&client, id, &method, &params, &request_input);
                 }
 
                 // stdout EOF or reader gone: the app server exited.
@@ -999,65 +999,180 @@ type RequestInputFn = Box<
         + Sync,
 >;
 
-/// Serve one server→client request. Approval requests round-trip through
-/// `request_input` as a synthesized yes/no question (in a subtask so the
-/// message loop keeps flowing); with `auto_approve` they're accepted outright
-/// (belt to the wire-level `approvalPolicy: "never"`). Anything else is
-/// rejected as unsupported so the server never wedges awaiting a reply.
+/// Serve one server→client request through the engine's shared input bridge.
+/// Codex's granular policy suppresses ordinary sandbox/rule gates, so every
+/// request that still reaches this boundary is provider-owned and must be
+/// shown. A dropped input sender fails closed.
 fn handle_server_request(
     client: &RpcClient,
     id: Value,
     method: &str,
     params: &Value,
-    auto_approve: bool,
     request_input: &Arc<RequestInputFn>,
 ) {
-    let is_approval = matches!(
-        method,
-        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
-    );
-    if !is_approval {
-        tracing::debug!(
-            target: "comet_harness::codex",
-            "unhandled server request: {method}"
-        );
-        client.respond_error(&id, -32601, &format!("unsupported method: {method}"));
-        return;
-    }
-    if auto_approve {
-        client.respond(&id, json!({ "decision": "accept" }));
+    let questions = match method {
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            vec![approval_question(method, params)]
+        }
+        "item/permissions/requestApproval" => vec![permission_question(params)],
+        "item/tool/requestUserInput" => tool_input_questions(params),
+        "mcpServer/elicitation/request" => elicitation_questions(params),
+        _ => {
+            tracing::debug!(
+                target: "comet_harness::codex",
+                "unhandled server request: {method}"
+            );
+            client.respond_error(&id, -32601, &format!("unsupported method: {method}"));
+            return;
+        }
+    };
+    if questions.is_empty() {
+        client.respond(&id, json!({ "answers": {} }));
         return;
     }
 
-    let question = approval_question(method, params);
     let client = client.clone();
     let request_input = Arc::clone(request_input);
+    let method = method.to_owned();
+    let params = params.clone();
     tokio::spawn(async move {
-        // The engine's input bridge owns the `InputRequested`/`InputResolved`
-        // lifecycle (it mints the request id the resolver is parked under);
-        // emitting our own copy here doubled the doc's input part with an id
-        // `respond_input` could never match.
-        //
-        // A dropped sender (caller went away) degrades to a decline so the
-        // agent is unblocked — never silently allowed.
-        let answers = (request_input)(vec![question.clone()])
-            .await
-            .unwrap_or_default();
-        let accept = answers.iter().any(|a| {
-            a.question_id == question.id && a.labels.iter().any(|l| l.eq_ignore_ascii_case("yes"))
-        });
+        // The engine owns `InputRequested`/`InputResolved`; emitting copies
+        // here creates an unanswerable duplicate transcript part.
+        let answers = (request_input)(questions.clone()).await.unwrap_or_default();
         client.respond(
             &id,
-            json!({ "decision": if accept { "accept" } else { "decline" } }),
+            server_request_response(&method, &params, &questions, &answers),
         );
     });
 }
 
-/// Synthesize the yes/no question an approval request surfaces to the user.
+fn server_request_response(
+    method: &str,
+    params: &Value,
+    questions: &[UserInputQuestion],
+    answers: &[UserInputAnswer],
+) -> Value {
+    match method {
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => json!({
+            "decision": if answer_is_accept(&questions[0].id, answers) {
+                "accept"
+            } else {
+                "decline"
+            }
+        }),
+        "item/permissions/requestApproval" => {
+            let permissions = if answer_is_accept(&questions[0].id, answers) {
+                params
+                    .get("permissions")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}))
+            } else {
+                json!({})
+            };
+            json!({ "permissions": permissions, "scope": "turn" })
+        }
+        "item/tool/requestUserInput" => {
+            let answers = questions
+                .iter()
+                .map(|question| {
+                    (
+                        question.id.clone(),
+                        json!({ "answers": answer_labels(&question.id, answers) }),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>();
+            json!({ "answers": answers })
+        }
+        "mcpServer/elicitation/request" => elicitation_response(params, questions, answers),
+        _ => json!({}),
+    }
+}
+
+fn answer_is_accept(question_id: &str, answers: &[UserInputAnswer]) -> bool {
+    answer_labels(question_id, answers).iter().any(|label| {
+        matches!(
+            label.to_ascii_lowercase().as_str(),
+            "yes" | "allow" | "approve" | "accept" | "continue"
+        )
+    })
+}
+
+fn answer_labels<'a>(question_id: &str, answers: &'a [UserInputAnswer]) -> &'a [String] {
+    answers
+        .iter()
+        .find(|answer| answer.question_id == question_id)
+        .map(|answer| answer.labels.as_slice())
+        .unwrap_or_default()
+}
+
+fn tool_input_questions(params: &Value) -> Vec<UserInputQuestion> {
+    params
+        .get("questions")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .map(|question| {
+            let secret = question.get("isSecret").and_then(Value::as_bool) == Some(true);
+            UserInputQuestion {
+                id: question
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(new_message_id),
+                header: question
+                    .get("header")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Provider request")
+                    .into(),
+                question: if secret {
+                    "This request needs secret input, which Comet can’t collect safely.".into()
+                } else {
+                    question
+                        .get("question")
+                        .and_then(Value::as_str)
+                        .unwrap_or("The provider needs input.")
+                        .into()
+                },
+                options: if secret {
+                    vec!["Cancel".into()]
+                } else {
+                    question
+                        .get("options")
+                        .and_then(Value::as_array)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|option| option.get("label").and_then(Value::as_str))
+                        .map(str::to_owned)
+                        .collect()
+                },
+                multi_select: false,
+            }
+        })
+        .collect()
+}
+
+fn permission_question(params: &Value) -> UserInputQuestion {
+    UserInputQuestion {
+        id: new_message_id(),
+        header: "Grant access".into(),
+        question: params
+            .get("reason")
+            .and_then(Value::as_str)
+            .filter(|reason| !reason.is_empty())
+            .unwrap_or("Codex requested additional access.")
+            .into(),
+        options: vec!["Yes".into(), "No".into()],
+        multi_select: false,
+    }
+}
+
+/// Synthesize the yes/no question a command or file approval surfaces.
 fn approval_question(method: &str, params: &Value) -> UserInputQuestion {
     let (header, question) = if method.contains("commandExecution") {
         let command = match params.get("command") {
-            Some(Value::String(s)) => s.clone(),
+            Some(Value::String(command)) => command.clone(),
             Some(Value::Array(parts)) => parts
                 .iter()
                 .filter_map(Value::as_str)
@@ -1077,10 +1192,10 @@ fn approval_question(method: &str, params: &Value) -> UserInputQuestion {
         let paths: Vec<&str> = params
             .get("changes")
             .and_then(Value::as_array)
-            .map(|a| a.as_slice())
+            .map(Vec::as_slice)
             .unwrap_or_default()
             .iter()
-            .filter_map(|c| c.get("path").and_then(Value::as_str))
+            .filter_map(|change| change.get("path").and_then(Value::as_str))
             .collect();
         (
             "Approve file change".to_owned(),

@@ -23,6 +23,7 @@ pub mod icons;
 pub mod loaders;
 pub mod markdown;
 pub mod motion;
+pub mod multiplayer;
 pub mod pickers;
 pub mod popover;
 pub mod rail;
@@ -69,7 +70,7 @@ fn register_fonts(cx: &App) {
     }
 }
 
-pub use comet_proto::HarnessId;
+pub use comet_proto::{HarnessId, RuntimeProfile};
 pub use state::EngineBootConfig;
 
 /// Everything the headed binary passes in (config/env resolution lives in
@@ -84,13 +85,18 @@ pub struct UiConfig {
     pub edge_url: String,
     /// Edge bearer; `None` runs offline.
     pub edge_token: Option<String>,
-    /// Workspace org override for explicit dev-mode runs.
-    pub org_id: Option<String>,
-    /// WorkOS client id; `Some` makes the embedded headed engine require a
-    /// production session before opening identity-scoped stores.
-    pub workos_client_id: Option<String>,
+    /// Operator-configured Scaffold project/deployment boundary.
+    pub project_scope: String,
+    /// Trusted deployment namespace for a Scaffold-host SessionRoom.
+    pub deployment_id: Option<String>,
+    /// Scaffold control-plane origin; `None` keeps explicit local mode.
+    pub scaffold_url: Option<String>,
+    /// Optional deep link supplied by an installed-app launcher.
+    pub initial_url: Option<String>,
     /// Harness for doc-command runs until per-chat config lands (M4).
     pub default_harness: HarnessId,
+    /// Server-enforced capabilities for the embedded engine.
+    pub runtime_profile: RuntimeProfile,
 }
 
 impl UiConfig {
@@ -100,15 +106,16 @@ impl UiConfig {
             ipc_port: self.ipc_port,
             edge_url: self.edge_url.clone(),
             edge_token: self.edge_token.clone(),
-            org_id: self.org_id.clone(),
-            workos_client_id: self.workos_client_id.clone(),
+            project_scope: self.project_scope.clone(),
+            deployment_id: self.deployment_id.clone(),
+            scaffold_url: self.scaffold_url.clone(),
             default_harness: self.default_harness,
+            runtime_profile: self.runtime_profile,
         }
     }
 }
 
-/// What a dock-icon reopen needs to rebuild the main window after ⌘W closed it
-/// (macOS keeps the process alive with just the menu bar, like zed).
+/// What a dock-icon reopen needs to rebuild the main window after it closes.
 struct ReopenState {
     state: gpui::Entity<state::AppState>,
     boot: EngineBootConfig,
@@ -120,10 +127,16 @@ impl gpui::Global for ReopenState {}
 /// connect-or-embed), 1320×880 window (min 900×600) with [`shell::Shell`] as the
 /// root view, boot splash overlaid until the engine reports ready.
 pub fn run_app(config: UiConfig) {
+    use futures::StreamExt as _;
+
     let app = gpui_platform::application().with_assets(icons::Assets);
-    // Dock-icon click with no window (⌘W closed it): rebuild the main window
-    // around the still-running engine — zed does the same via `on_reopen`
-    // (crates/zed/src/main.rs `app.on_reopen`).
+    let (open_url_tx, mut open_url_rx) = futures::channel::mpsc::unbounded::<String>();
+    app.on_open_urls(move |urls| {
+        for url in urls {
+            let _ = open_url_tx.unbounded_send(url);
+        }
+    });
+    // around the still-running engine via GPUI's reopen callback.
     app.on_reopen(|cx| {
         if cx.windows().is_empty()
             && let Some(reopen) = cx.try_global::<ReopenState>()
@@ -135,6 +148,7 @@ pub fn run_app(config: UiConfig) {
     app.run(move |cx: &mut App| {
         // NB: pinned-rev API — `gpui_tokio::init(cx)` free function (not `Tokio::init`).
         gpui_tokio::init(cx);
+        cx.register_url_scheme("comet").detach();
         register_fonts(cx);
         // Appearance before anything paints: the theme global has to be the
         // final one on the very first frame, or the window flashes the wrong
@@ -151,6 +165,31 @@ pub fn run_app(config: UiConfig) {
 
         let state = cx.new(|_| state::AppState::new());
         state::AppState::bootstrap(state.clone(), config.boot(), cx);
+        if let Some(invitation) = config
+            .initial_url
+            .as_deref()
+            .and_then(comet_proto::CometInvitation::parse_deep_link)
+        {
+            state.update(cx, |state, cx| state.open_invitation(invitation, cx));
+        }
+        let invitation_state = state.clone();
+        let invitation_boot = config.boot();
+        cx.spawn(async move |cx| {
+            while let Some(url) = open_url_rx.next().await {
+                let Some(invitation) = comet_proto::CometInvitation::parse_deep_link(&url) else {
+                    tracing::warn!(%url, "ignored invalid Comet invitation URL");
+                    continue;
+                };
+                cx.update(|cx| {
+                    invitation_state.update(cx, |state, cx| state.open_invitation(invitation, cx));
+                    if cx.windows().is_empty() {
+                        open_main_window(invitation_state.clone(), invitation_boot.clone(), cx);
+                    }
+                    cx.activate(true);
+                });
+            }
+        })
+        .detach();
 
         // Graceful teardown: an in-process engine drains live runs and flushes
         // doc snapshots before the process exits (remote engines outlive us).
@@ -175,7 +214,7 @@ pub fn run_app(config: UiConfig) {
         open_main_window(state, config.boot(), cx);
         // Native menu bar — macOS gets the standard app menu (About/Services/
         // Hide/Quit ⌘Q), Edit clipboard verbs routed to the focused input, and
-        // a Window menu (⌘M/⌘W). Without this, `NSApp.mainMenu` stays nil: no
+        // a Window menu (⌘M/⇧⌘W). Without this, `NSApp.mainMenu` stays nil: no
         // Cmd+Q, and nothing for the system menu bar to show. Set after
         // `open_main_window` because `Shell::new` ran `apply_keymap`
         // synchronously, so `set_menus` reads the final bindings for the ⌘-key
@@ -187,7 +226,7 @@ pub fn run_app(config: UiConfig) {
 
 /// Open the 1320×880 main window (min 900×600) with [`shell::Shell`] as the
 /// root view. Called at boot and again from `on_reopen` if the dock icon is
-/// clicked after ⌘W closed the window.
+/// clicked after the window closed.
 fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig, cx: &mut App) {
     // comet window geometry: 1320×880, min 900×600 (feature-inventory §1.1).
     let bounds = Bounds::centered(None, size(px(1320.), px(880.)), cx);
@@ -196,13 +235,10 @@ fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(900.), px(600.))),
             // `kind` is deliberately left at its default `WindowKind::Normal`
-            // (gpui platform.rs WindowOptions::default), which on macOS maps
-            // to `NSNormalWindowLevel` (gpui_macos window.rs) — same as zed's
-            // main window. Nothing here raises the window level or touches
-            // presentation options; the "menu bar never appears" symptom came
-            // from the missing `set_menus` call (nil `NSApp.mainMenu`), not
-            // from window kind/level, and `appears_transparent` only affects
-            // the titlebar, not the menu bar.
+            // (`WindowOptions::default`), which maps to the platform's normal
+            // application window level. Nothing here raises the window or
+            // changes presentation options; `appears_transparent` affects only
+            // the titlebar.
             // macOS: frameless-inset chrome like the original Electron app
             // (`titleBarStyle: "hiddenInset"`, traffic lights at 14,15 —
             // feature-inventory §1.1). No title text — the strip is

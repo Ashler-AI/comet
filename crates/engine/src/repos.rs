@@ -459,7 +459,7 @@ impl Repos {
     }
 
     /// Switch the checkout at `cwd` (a main folder OR a linked worktree) to
-    /// `ref_name` — the t3code `switchRef` port: an existing local branch is
+    /// `switchRef` behavior: an existing local branch is
     /// checked out directly; a remote-only branch gets a local tracking
     /// branch (`checkout --track origin/<ref>`). A dirty tree or a branch
     /// already checked out in another worktree fails with git's own message.
@@ -565,7 +565,7 @@ impl Repos {
         let checkout = self.checkout_identity(&path).await?;
         Ok(Worktree {
             repo_path: repo_path.to_string_lossy().to_string(),
-            path: path.to_string_lossy().to_string(),
+            path: checkout.root.to_string_lossy().to_string(),
             branch: branch_name,
             name,
             checkout_id: Some(checkout.id),
@@ -873,14 +873,18 @@ fn compare_file_matches(
         .then_with(|| featured_a.cmp(featured_b))
         .then_with(|| score_a.cmp(score_b))
         .then_with(|| {
-            empty_query
-                .then(|| path_a.split('/').count().cmp(&path_b.split('/').count()))
-                .unwrap_or(std::cmp::Ordering::Equal)
+            if empty_query {
+                path_a.split('/').count().cmp(&path_b.split('/').count())
+            } else {
+                std::cmp::Ordering::Equal
+            }
         })
         .then_with(|| {
-            empty_query
-                .then(|| dir_a.cmp(dir_b))
-                .unwrap_or_else(|| dir_b.cmp(dir_a))
+            if empty_query {
+                dir_a.cmp(dir_b)
+            } else {
+                dir_b.cmp(dir_a)
+            }
         })
         .then_with(|| path_a.len().cmp(&path_b.len()))
         .then_with(|| path_a.cmp(path_b))

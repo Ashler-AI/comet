@@ -25,16 +25,13 @@ use comet_sync::{DocsStore, RoomClient};
 use crate::doc_host::EdgeConfig;
 use crate::{EngineError, now_ms};
 
-/// Snapshot row id in the local `DocsStore` (chat ids never collide with it).
-/// `workspace2` = the spaces-overhaul destructive break: the legacy `workspace`
-/// row is simply never read again. (The per-user room break — `ws2/{orgId}` →
-/// `ws3/{orgId}/{userId}` — needed no row-id bump: the local store itself moved
-/// to `orgs/{org}/{user}/`, so the old snapshot is unreachable anyway.)
-pub const WORKSPACE_DOC_ID: &str = "workspace2";
-/// Legacy (pre-spaces) snapshot row — best-effort deleted on open.
-const LEGACY_WORKSPACE_DOC_ID: &str = "workspace";
-/// Org used when none is configured (matches the edge's dev-mode `user@org` bearers).
-pub const DEFAULT_ORG_ID: &str = "dev-org";
+/// Snapshot row id in the local `DocsStore`. `workspace3` marks the cutover to
+/// a Scaffold project-scoped shared workspace room; old private snapshots stay
+/// isolated in the prior identity layout.
+pub const WORKSPACE_DOC_ID: &str = "workspace3";
+/// Legacy snapshot row removed on open.
+const LEGACY_WORKSPACE_DOC_ID: &str = "workspace2";
+pub const DEFAULT_PROJECT_SCOPE: &str = "ashler-local";
 /// User used when none is configured (dev mode without a bearer).
 pub const DEFAULT_USER_ID: &str = "dev-user";
 /// Ephemeral presence refresh cadence.
@@ -110,12 +107,10 @@ pub struct WorkspaceHostConfig {
     pub device_name: String,
     /// `std::env::consts::OS`-style platform string.
     pub platform: String,
-    pub org_id: String,
-    /// The signed-in user — workspace docs are per-user (`ws3/{orgId}/{userId}`):
-    /// spaces/sessions are private to their owner, never org-visible.
+    pub project_scope: String,
+    /// Verified principal used for provenance inside the shared project room.
     pub user_id: String,
-    /// When present, the host joins `/workspace/{orgId}/ws`. `None` = fully offline
-    /// (local snapshots only; the doc still drives everything device-side).
+    /// When present, the host joins `/workspace/{projectScope}/ws`.
     pub edge: Option<EdgeConfig>,
 }
 
@@ -205,7 +200,8 @@ impl WorkspaceHost {
         let sub = doc.doc().subscribe_root(Arc::new(move |_diff| {
             changed_tx.send_modify(|v| *v = v.wrapping_add(1));
         }));
-        let state = doc.read_all()?;
+        let mut state = doc.read_all()?;
+        state.session_refs = doc.read_session_refs_for(&config.user_id)?;
         let (chats_tx, _) = watch::channel(state.chats);
         let (devices_tx, _) = watch::channel(state.devices);
         let (sessions_tx, _) = watch::channel(state.sessions);
@@ -237,18 +233,20 @@ impl WorkspaceHost {
         Ok(host)
     }
 
+    pub fn project_scope(&self) -> &str {
+        &self.inner.config.project_scope
+    }
+
     /// Edge room join — offline-tolerant: a failed join logs and stays local-first.
     fn join_room(&self) {
         let Some(edge) = &self.inner.config.edge else {
             return;
         };
-        let org_id = self.inner.config.org_id.clone();
-        // Per-dial URL provider: the bearer is re-read on every (re)connect.
-        let url = edge.room_url(format!("/workspace/{org_id}/ws"));
-        // `ws3/{orgId}/{userId}` = the per-user privacy room (must match the
-        // edge's join id, which it derives from the caller's own auth claim —
-        // a mismatched user can never join).
-        let room_id = format!("ws3/{}/{}", org_id, self.inner.config.user_id);
+        let project_scope = self.inner.config.project_scope.clone();
+        // Per-dial URL provider: the bearer is re-read on every reconnect.
+        let url = edge.room_url(format!("/workspace/{project_scope}/ws"));
+        // Must match the edge's project-authorized shared workspace namespace.
+        let room_id = format!("ws4/{project_scope}");
         let room_doc = self.inner.doc.doc().clone();
         let device_id = self.inner.config.device_id.clone();
         let weak = Arc::downgrade(&self.inner);
@@ -376,19 +374,23 @@ impl WorkspaceHost {
     /// Add an exact-id pointer to a global session without creating a local
     /// chat host row. Repeated adds preserve the original membership timestamp.
     pub fn upsert_session_ref(&self, chat_id: &str) -> Result<SessionRef, EngineError> {
-        if let Some(existing) = self.inner.doc.session_ref(chat_id)? {
+        let user_id = &self.inner.config.user_id;
+        if let Some(existing) = self.inner.doc.session_ref(user_id, chat_id)? {
             return Ok(existing);
         }
         let session_ref = SessionRef {
             chat_id: chat_id.to_string(),
             added_at: Utc::now(),
         };
-        self.inner.doc.upsert_session_ref(&session_ref)?;
+        self.inner.doc.upsert_session_ref(user_id, &session_ref)?;
         Ok(session_ref)
     }
 
     pub fn remove_session_ref(&self, chat_id: &str) -> Result<bool, EngineError> {
-        Ok(self.inner.doc.remove_session_ref(chat_id)?)
+        Ok(self
+            .inner
+            .doc
+            .remove_session_ref(&self.inner.config.user_id, chat_id)?)
     }
 
     /// WatchSessions source: remote devices' rows from the workspace doc merged with
@@ -428,7 +430,11 @@ impl WorkspaceHost {
     pub fn is_host(&self, chat_id: &str) -> bool {
         match self.inner.doc.chat(chat_id) {
             Ok(Some(chat)) => chat.device_id == self.inner.config.device_id,
-            Ok(None) => match self.inner.doc.session_ref(chat_id) {
+            Ok(None) => match self
+                .inner
+                .doc
+                .session_ref(&self.inner.config.user_id, chat_id)
+            {
                 Ok(Some(_)) => false,
                 Ok(None) => true,
                 Err(err) => {
@@ -454,7 +460,12 @@ impl WorkspaceHost {
     /// cwd claims a space *at the worktree path*, not the repo root — acceptable
     /// for tooling-only (raw doc command) traffic.
     pub fn claim_chat(&self, chat_id: &str, cwd: Option<&str>) -> Result<(), EngineError> {
-        if self.inner.doc.chat(chat_id)?.is_some() || self.inner.doc.session_ref(chat_id)?.is_some()
+        if self.inner.doc.chat(chat_id)?.is_some()
+            || self
+                .inner
+                .doc
+                .session_ref(&self.inner.config.user_id, chat_id)?
+                .is_some()
         {
             return Ok(());
         }
@@ -764,11 +775,26 @@ impl WorkspaceHost {
     pub fn set_chat_branch(&self, chat_id: &str, branch: &str) -> Result<bool, EngineError> {
         Ok(self.inner.doc.set_chat_branch(chat_id, branch)?)
     }
+    pub fn compare_and_set_chat_branch(
+        &self,
+        chat_id: &str,
+        expected: Option<&str>,
+        branch: &str,
+    ) -> Result<bool, EngineError> {
+        Ok(self
+            .inner
+            .doc
+            .compare_and_set_chat_branch(chat_id, expected, branch)?)
+    }
 
     /// Retarget a chat onto another folder (mid-session switch to an existing
     /// worktree). Resume is cwd-scoped — the next run there starts fresh.
     pub fn set_chat_cwd(&self, chat_id: &str, cwd: &str) -> Result<bool, EngineError> {
         Ok(self.inner.doc.set_chat_cwd(chat_id, cwd)?)
+    }
+
+    pub fn set_chat_space(&self, chat_id: &str, space_id: &str) -> Result<bool, EngineError> {
+        Ok(self.inner.doc.set_chat_space(chat_id, space_id)?)
     }
 
     /// Canonical checkout identity for the chat's cwd (diff grouping key).
@@ -800,7 +826,10 @@ impl WorkspaceHost {
 
 impl WorkspaceHostInner {
     fn publish(&self) {
-        match self.doc.read_all() {
+        match self.doc.read_all().and_then(|mut state| {
+            state.session_refs = self.doc.read_session_refs_for(&self.config.user_id)?;
+            Ok(state)
+        }) {
             Ok(mut state) => {
                 self.overlay_presence(&mut state.devices);
                 // send_replace, NOT send: `watch::Sender::send` drops the value when

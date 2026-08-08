@@ -83,6 +83,71 @@ pub struct ChatConfig {
     pub sandbox: SandboxLevel,
 }
 
+/// A harness-native session found in this device's local CLI stores.
+///
+/// The source path stays engine-private. The opaque `id` is passed back to
+/// `AttachLocalSession`, which re-resolves it against the current local scan.
+/// Capability flags distinguish resumable native sessions (currently OMP and
+/// Prime Agent) from history-only imports (Claude Code, Codex, and OpenCode).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalSessionCandidate {
+    pub id: String,
+    /// Deterministic Comet chat id used for idempotent imports.
+    pub chat_id: String,
+    pub harness: HarnessId,
+    pub session_id: String,
+    pub cwd: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningLevel>,
+    /// Epoch milliseconds.
+    pub created_at: i64,
+    /// Epoch milliseconds.
+    pub updated_at: i64,
+    /// False for metadata-only candidates: attach is an explicit ownership action.
+    pub live_attachable: bool,
+    /// A new controlled process can load/resume the exact native session id.
+    pub resumable: bool,
+    /// Comet can import history but cannot resume this source directly.
+    pub history_only: bool,
+    /// Concurrent writer ownership when a source supports a reliable probe;
+    /// `None` means unknown or not applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy_elsewhere: Option<bool>,
+}
+
+/// Exact, content-addressed capture of an OMP native session file.
+///
+/// This is a local-controller handoff payload: the platform uploads `bytes`
+/// under `sha256`, preserves `native_session_id` and `cwd` as trusted metadata,
+/// and materializes the bytes in the destination OMP session store before ACP
+/// continuation. The source filesystem path is deliberately not exposed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OmpSessionArtifact {
+    pub native_session_id: String,
+    pub cwd: String,
+    /// Slash-separated path below the configured OMP `sessions` directory.
+    /// The receiver materializes `bytes` at this exact relative path.
+    pub storage_relative_path: String,
+    /// Lowercase SHA-256 of `bytes`.
+    pub sha256: String,
+    pub byte_count: u64,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalSessionAttachResult {
+    pub chat_id: String,
+    pub space_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Chat {
@@ -299,13 +364,10 @@ pub struct UserProfile {
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum AuthState {
     SignedOut,
-    NeedsOrganization {
-        user: UserProfile,
-    },
     #[serde(rename_all = "camelCase")]
     SignedIn {
         user: UserProfile,
-        org_id: Option<String>,
+        project_scope: String,
     },
 }
 

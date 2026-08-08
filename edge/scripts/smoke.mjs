@@ -6,11 +6,9 @@
  *   3. GET /tail returns the materialized L2 tail
  *   4. POST/GET /diff round-trips the sidecar
  *   5. ephemeral (%EPH) presence relays between peers
- *   6. device room relays client↔host frames and serves sidecar slots
- *   7. R2 attachments: PUT (hash verified) then GET
- *   8. workspace room (`ws3/{orgId}/{userId}`): one user's devices converge;
- *      teammates in the same org are isolated (per-user docs); wrong org 403
- *   9. absorbed /auth routes: 501 without WORKOS_API_KEY; cli callback page
+ *   6. device room relays client/host frames and serves sidecar slots
+ *   7. R2 attachment hash verification and round-trip
+ *   8. reconnect from an existing version vector catches up incrementally
  *
  * Usage: node scripts/smoke.mjs [baseUrl]   (default http://127.0.0.1:27640)
  */
@@ -25,7 +23,6 @@ const token = "smoke-user";
 const peerToken = "smoke-peer-user";
 const chatId = randomUUID();
 const deviceId = `smokedev-${randomUUID().slice(0, 8)}`;
-const orgId = `org-smoke-${randomUUID().slice(0, 8)}`;
 
 const fail = (msg) => {
   console.error(`✗ ${msg}`);
@@ -150,66 +147,6 @@ await new Promise((r) => setTimeout(r, 100));
   ok("ephemeral presence relay");
 }
 
-// ── workspace room: per-user docs — one user's devices converge, teammates
-//    in the same org are isolated ─────────────────────────────────────────
-{
-  // Dev-mode org claim: token `userId@orgId`. The room id is derived at the
-  // edge from the caller's OWN user claim: `ws3/{orgId}/{userId}`.
-  const roomA = `ws3/${orgId}/alice`;
-  const deviceA1 = new LoroWebsocketClient({
-    url: `${wsBase}/workspace/${orgId}/ws?token=alice@${orgId}`
-  });
-  await deviceA1.waitConnected();
-  const wsAdaptorA1 = new LoroAdaptor();
-  await deviceA1.join({ roomId: roomA, crdtAdaptor: wsAdaptorA1 });
-  const wsDocA = wsAdaptorA1.getDoc();
-  wsDocA.getMap("meta").set("chatId", roomA);
-  wsDocA.getMap("chats").set("chat-1", { title: "hello" });
-  wsDocA.commit();
-
-  // A SECOND DEVICE of the same user joins the same per-user room and
-  // backfills.
-  const deviceA2 = new LoroWebsocketClient({
-    url: `${wsBase}/workspace/${orgId}/ws?token=alice@${orgId}`
-  });
-  await deviceA2.waitConnected();
-  const wsAdaptorA2 = new LoroAdaptor();
-  await deviceA2.join({ roomId: roomA, crdtAdaptor: wsAdaptorA2 });
-  await until(
-    () => wsAdaptorA2.getDoc().getMap("chats").get("chat-1") !== undefined,
-    "workspace second-device backfill"
-  );
-  ok("workspace room: one user's devices converge");
-
-  // A TEAMMATE (same org, different user) lands in their OWN empty room —
-  // alice's spaces/sessions must be invisible to bob.
-  const memberB = new LoroWebsocketClient({
-    url: `${wsBase}/workspace/${orgId}/ws?token=bob@${orgId}`
-  });
-  await memberB.waitConnected();
-  const wsAdaptorB = new LoroAdaptor();
-  await memberB.join({ roomId: `ws3/${orgId}/bob`, crdtAdaptor: wsAdaptorB });
-  await new Promise((resolve) => setTimeout(resolve, 400)); // any (wrong) backfill gets a beat
-  if (wsAdaptorB.getDoc().getMap("chats").get("chat-1") !== undefined) {
-    fail("teammate must NOT see another user's workspace doc");
-  }
-  ok("workspace room: teammates isolated (per-user docs)");
-  memberB.close();
-  deviceA2.close();
-
-  // Wrong org claim rejected at the Worker.
-  const wrongOrg = await fetch(`${base}/workspace/${orgId}/tail?token=mallory@org-other`);
-  if (wrongOrg.status !== 403) fail(`wrong-org tail expected 403, got ${wrongOrg.status}`);
-  // No org claim at all is rejected too.
-  const noOrg = await fetch(`${base}/workspace/${orgId}/tail?token=${token}`);
-  if (noOrg.status !== 403) fail(`no-org tail expected 403, got ${noOrg.status}`);
-  // A member can read the workspace tail (empty messages — shape only).
-  const memberTail = await fetch(`${base}/workspace/${orgId}/tail?token=alice@${orgId}`);
-  if (memberTail.status !== 200) fail(`member workspace tail ${memberTail.status}`);
-  ok("workspace room: org membership enforced (403 for outsiders)");
-
-  deviceA1.close();
-}
 
 // ── device room ───────────────────────────────────────────────────────────
 {
@@ -336,33 +273,6 @@ await new Promise((r) => setTimeout(r, 100));
   ok("R2 attachments (hash-verified put/get)");
 }
 
-// ── absorbed auth routes ──────────────────────────────────────────────────
-{
-  // Dev instances have no WORKOS_API_KEY: secret-bearing routes answer 501
-  // (matching the old apps/server behavior when WorkOS is unconfigured).
-  const exchange = await fetch(`${base}/auth/exchange`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ code: "test" })
-  });
-  if (exchange.status !== 501) fail(`auth exchange expected 501 in dev, got ${exchange.status}`);
-  const refresh = await fetch(`${base}/auth/refresh`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ refreshToken: "test" })
-  });
-  if (refresh.status !== 501) fail(`auth refresh expected 501 in dev, got ${refresh.status}`);
-  ok("auth exchange/refresh answer 501 without WORKOS_API_KEY");
-
-  // The headless callback needs no WorkOS config: it just renders state.code.
-  const cb = await fetch(`${base}/auth/cli/callback?code=abc123&state=xyz789`);
-  if (cb.status !== 200) fail(`cli callback ${cb.status}`);
-  const page = await cb.text();
-  if (!page.includes("xyz789.abc123")) fail("cli callback paste code missing");
-  const cbBad = await fetch(`${base}/auth/cli/callback`);
-  if (cbBad.status !== 400) fail(`cli callback without code expected 400, got ${cbBad.status}`);
-  ok("auth cli callback renders paste code");
-}
 
 // ── reconnect: new client with existing state catches up incrementally ───
 {

@@ -247,13 +247,17 @@ async fn handle_socket(stream: tokio::net::TcpStream, state: Arc<Mutex<RelayStat
 
 struct TestService {
     label: String,
+    /// Device id this host serves under — the LinkCache readiness probe
+    /// requires an exact `LocalDevice` identity round-trip before caching.
+    device_id: String,
     active_streams: Arc<AtomicUsize>,
 }
 
 impl TestService {
-    fn new(label: &str) -> Arc<Self> {
+    fn new(label: &str, device_id: &str) -> Arc<Self> {
         Arc::new(Self {
             label: label.into(),
+            device_id: device_id.into(),
             active_streams: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -272,6 +276,9 @@ impl RpcService for TestService {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
         match method {
             methods::LIST_HARNESSES => Ok(RpcReply::Value(serde_json::json!([]))),
+            methods::LOCAL_DEVICE => Ok(RpcReply::Value(
+                serde_json::json!({ "deviceId": self.device_id }),
+            )),
             "Echo" => Ok(RpcReply::Value(
                 serde_json::json!({ "host": self.label, "params": params }),
             )),
@@ -333,7 +340,7 @@ fn noop_nudge() -> comet_rpc::NudgeHandler {
 #[tokio::test]
 async fn relay_serves_multiple_clients_end_to_end() {
     let relay = FakeRelay::start().await;
-    let service = TestService::new("host-a");
+    let service = TestService::new("host-a", "dev-a");
     let _host = HostRelay::spawn(relay_config(&relay.edge_url(), 100), service, noop_nudge());
     relay.wait_host_connected().await;
 
@@ -378,7 +385,7 @@ async fn relay_serves_multiple_clients_end_to_end() {
 #[tokio::test]
 async fn client_disconnect_tears_down_virtual_conn() {
     let relay = FakeRelay::start().await;
-    let service = TestService::new("host-a");
+    let service = TestService::new("host-a", "dev-a");
     let active = service.active_streams.clone();
     let _host = HostRelay::spawn(relay_config(&relay.edge_url(), 100), service, noop_nudge());
     relay.wait_host_connected().await;
@@ -421,7 +428,7 @@ async fn host_offline_fails_fast_and_cools_down() {
     assert!(err.to_string().contains("backing off"), "got: {err}");
 
     // After the cooldown a host is up — dial succeeds and clears the slate.
-    let service = TestService::new("host-a");
+    let service = TestService::new("host-a", "dev-a");
     let _host = HostRelay::spawn(relay_config(&relay.edge_url(), 100), service, noop_nudge());
     relay.wait_host_connected().await;
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -458,7 +465,7 @@ async fn presence_reset_clears_cooldown_immediately() {
 
     // Host comes up and its presence heartbeat clears the backoff — the next
     // call dials immediately.
-    let service = TestService::new("host-a");
+    let service = TestService::new("host-a", "dev-a");
     let _host = HostRelay::spawn(relay_config(&relay.edge_url(), 100), service, noop_nudge());
     relay.wait_host_connected().await;
     links.reset_cooldown("dev-a");
@@ -475,7 +482,7 @@ async fn presence_reset_clears_cooldown_immediately() {
 #[tokio::test]
 async fn host_supersede_drops_old_links_and_recovers() {
     let relay = FakeRelay::start().await;
-    let service = TestService::new("host-a");
+    let service = TestService::new("host-a", "dev-a");
     let _host = HostRelay::spawn(relay_config(&relay.edge_url(), 100), service, noop_nudge());
     relay.wait_host_connected().await;
 
@@ -529,7 +536,7 @@ async fn host_supersede_drops_old_links_and_recovers() {
 #[tokio::test]
 async fn nudges_reach_the_host_callback() {
     let relay = FakeRelay::start().await;
-    let service = TestService::new("host-a");
+    let service = TestService::new("host-a", "dev-a");
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     let on_nudge: comet_rpc::NudgeHandler = Arc::new(move |chat_id| {
         let _ = tx.send(chat_id);
@@ -557,7 +564,7 @@ async fn live_edge_relay_round_trip() {
     let token = std::env::var("COMET_EDGE_TOKEN").unwrap_or_else(|_| "relay-live-test".into());
     let device_id = format!("relay-live-{}", uuid::Uuid::new_v4());
 
-    let service = TestService::new("live-host");
+    let service = TestService::new("live-host", &device_id);
     let mut config = HostRelayConfig::new(
         edge_url.clone(),
         device_id.clone(),

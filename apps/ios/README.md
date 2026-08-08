@@ -24,11 +24,12 @@ desktop's pulldown-cmark config).
 
 ### Connecting
 
-- **WorkOS**: enter the edge URL, open the sign-in page on any device, paste
-  the code it shows (`/auth/exchange`), pick an org (`/auth/refresh` re-scopes
-  the token with the `org_id` claim).
-- **Dev**: against an `AUTH_MODE=dev` edge (e.g. `wrangler dev`), enter a user
-  id + org id; the bearer is `userId@orgId`.
+- **Production**: Comet discovers Scaffold's OAuth metadata, dynamically
+  registers the native client, completes authorization-code + PKCE S256 in the
+  system browser, validates the issued `sc_rc_` bearer, and joins the
+  deployment's verified project scope.
+- **Dev**: against a local `AUTH_MODE=dev` edge, launch with a user id +
+  project scope; the bearer is `userId@projectScope`.
 - **Demo mode**: fully offline dataset with a scripted streaming reply —
   explore the UI with no infrastructure. Launch args for screenshot rigs:
   `-demo [-route chat:<id>|space:<id>] [-stream]`.
@@ -42,9 +43,9 @@ Sync/
   RoomClient.swift      room.rs port: join with oplog VV, snapshot backfill,
                         resubmit-from-server-VV, DocUpdate+Ack, fragments,
                         %EPH presence sub-room, ping/pong lease, backoff
-  WorkspaceStore.swift  ws3/{org}/{user} mirror: devices/spaces/chats/sessions
-                        rows, presence heartbeats, viewer-side writes
-                        (createChat, archive, lastSeenAt, own device row)
+  WorkspaceStore.swift  ws4/{projectScope} mirror: project-shared
+                        devices/spaces/chats/sessions plus principal-scoped
+                        session refs and viewer-side writes
   SessionStore.swift    session doc mirror: entries/parts (continuations
                         joined), command ledger appends (rule 1), host nudge
 Markdown/

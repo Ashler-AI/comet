@@ -1,8 +1,8 @@
 //! `comet daemon …` — install/manage `comet headless` as a background service:
 //! a systemd **user** unit on Linux (the VPS deployment target), a launchd
-//! LaunchAgent on macOS. The unit runs the current executable with the
-//! `COMET_*` environment captured at install time, so
-//! `COMET_EDGE_URL=… comet daemon install` bakes that override in.
+//! LaunchAgent on macOS. The unit captures only the allowlisted non-secret
+//! runtime overrides below. Authentication comes from Comet's protected session
+//! store, never a service-file bearer.
 //!
 //! Auth is decoupled: the service loads the session `comet login` persisted and
 //! exits with "run `comet login` first" otherwise (`terminal_sign_in`'s non-TTY
@@ -13,7 +13,7 @@ use std::process::Command;
 
 use anyhow::{Context, bail};
 
-const LAUNCHD_LABEL: &str = "sh.zeron.comet";
+const LAUNCHD_LABEL: &str = "ai.ashler.comet";
 /// Same unit name the curl|sh installer (`edge/src/install.sh`) writes, so
 /// `comet daemon …` manages that installation rather than a competing copy.
 const SYSTEMD_UNIT: &str = "comet-native.service";
@@ -25,10 +25,10 @@ const CAPTURED_ENV: &[&str] = &[
     "PATH",
     "COMET_DATA_DIR",
     "COMET_EDGE_URL",
-    "COMET_EDGE_TOKEN",
-    "COMET_ORG_ID",
-    "COMET_WORKOS_CLIENT_ID",
-    "COMET_WORKOS_API_BASE",
+    "COMET_PROJECT_SCOPE",
+    "COMET_SCAFFOLD_URL",
+    "COMET_OAUTH_SCOPES",
+    "COMET_SESSION_CAPABILITIES",
     "COMET_IPC_PORT",
     "COMET_CALLBACK_PORT",
     "COMET_HARNESS",
@@ -227,7 +227,7 @@ fn render_systemd_unit(exe: &Path, env: &[(String, String)]) -> String {
     // fail-fast exit (5 × RestartSec=5 lands inside the 60s window) — otherwise
     // a signed-out daemon restart-loops forever.
     let mut unit = String::from(
-        "[Unit]\nDescription=Comet native headless engine\nAfter=network-online.target\n\
+        "[Unit]\nDescription=Ashler Comet headless engine\nAfter=network-online.target\n\
          StartLimitIntervalSec=60\nStartLimitBurst=5\n\n[Service]\n",
     );
     for (key, value) in env {
@@ -236,7 +236,7 @@ fn render_systemd_unit(exe: &Path, env: &[(String, String)]) -> String {
         unit.push_str(&format!("Environment=\"{key}={value}\"\n"));
     }
     unit.push_str(&format!(
-        "ExecStart={} headless\nRestart=on-failure\nRestartSec=5\nEnvironmentFile=-%h/.comet-native/env\n\n[Install]\nWantedBy=default.target\n",
+        "ExecStart={} headless\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
         systemd_exec_path(exe)
     ));
     unit
@@ -395,7 +395,8 @@ mod tests {
         // Inner quotes escaped so systemd re-parses the value verbatim.
         assert!(unit.contains("Environment=\"RUST_LOG=info,comet=\\\"debug\\\"\"\n"));
         assert!(unit.contains("Restart=on-failure"));
-        assert!(unit.contains("EnvironmentFile=-%h/.comet-native/env"));
+        assert!(!unit.contains("EnvironmentFile="));
+        assert!(!CAPTURED_ENV.contains(&"COMET_RELEASES_AUTHORIZATION"));
         assert!(unit.contains("WantedBy=default.target"));
     }
 
@@ -427,7 +428,7 @@ mod tests {
             &[("COMET_EDGE_URL".into(), "https://e?a=1&b=2".into())],
             Path::new("/Users/x/.comet-native/daemon.log"),
         );
-        assert!(plist.contains("<key>Label</key><string>sh.zeron.comet</string>"));
+        assert!(plist.contains("<key>Label</key><string>ai.ashler.comet</string>"));
         // XML-escaped exe path and env value.
         assert!(plist.contains("<string>/Users/x/comet &amp; co/comet</string>"));
         assert!(plist.contains("<string>https://e?a=1&amp;b=2</string>"));

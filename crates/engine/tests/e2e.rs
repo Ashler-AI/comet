@@ -11,19 +11,22 @@ use futures::stream::BoxStream;
 
 use comet_doc::{
     MessagePart, MessageRole, MessageStatus, SegmentWriter, SessionCommandEntry,
-    SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry,
+    SessionCommandPayload, SessionCommandStatus, SessionControlAction, SessionDoc,
+    SessionMessageEntry,
 };
 use comet_engine::{EngineCore, HarnessRegistry, RunJournal};
 use comet_harness::mock::MockHarness;
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
-    SessionStatus, SteeringMode, ToolCall,
+    AgentEvent, AgentSessionSource, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest,
+    RuntimeProfile, SandboxLevel, SessionStatus, SteeringMode, ToolCall,
 };
 use comet_sync::DocsStore;
 
 const CHAT: &str = "chat-e2e";
 const VIEWER: &str = "viewer-device";
+const SESSION: &str = "session-e2e";
+const EXECUTION_KEY: &str = "chat-e2e::session::session-e2e";
 
 fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
@@ -70,6 +73,7 @@ fn mock_script() -> Vec<AgentEvent> {
         AgentEvent::ToolResult {
             id: "tool-1".into(),
             is_error: false,
+            output: Some("wrote 6 bytes".into()),
         },
         done(DoneStatus::Completed),
     ]
@@ -81,6 +85,7 @@ struct ScriptedHarness {
     script: Vec<AgentEvent>,
     step_delay: Duration,
     hang_until_interrupt: bool,
+    steering_mode: SteeringMode,
 }
 
 #[async_trait]
@@ -95,7 +100,7 @@ impl Harness for ScriptedHarness {
         true
     }
     fn steering_mode(&self) -> SteeringMode {
-        SteeringMode::StepBoundary
+        self.steering_mode
     }
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
         &[ReasoningLevel::Medium]
@@ -114,6 +119,10 @@ impl Harness for ScriptedHarness {
         let hang = self.hang_until_interrupt;
         let token = controls.interrupt.clone();
         tokio::spawn(async move {
+            // Keep the whole control set alive for the run. In particular,
+            // dropping the steering receiver would make the engine treat the
+            // live harness as non-steerable before the boundary is reached.
+            let _controls = controls;
             for event in script {
                 if tx.send(Ok(event)).await.is_err() {
                     return;
@@ -132,15 +141,146 @@ impl Harness for ScriptedHarness {
     }
 }
 
+struct QueuedFollowupHarness {
+    release_first_turn: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+    received: tokio::sync::mpsc::UnboundedSender<String>,
+    steering_mode: SteeringMode,
+}
+
+#[async_trait]
+impl Harness for QueuedFollowupHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+
+    fn display_name(&self) -> &str {
+        "Queued followup"
+    }
+
+    fn supports_steering(&self) -> bool {
+        true
+    }
+
+    fn steering_mode(&self) -> SteeringMode {
+        self.steering_mode
+    }
+
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(Vec::new())
+    }
+
+    async fn run(
+        &self,
+        _request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let release = self
+            .release_first_turn
+            .lock()
+            .unwrap()
+            .take()
+            .expect("one run");
+        let received = self.received.clone();
+        let (events, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut steering = controls.steering;
+            let _ = events.send(Ok(AgentEvent::SessionStarted {
+                harness: HarnessId::Mock,
+                model: "mock-1".into(),
+                tools: Vec::new(),
+                cwd: "/tmp".into(),
+                session_id: "queued-followup-session".into(),
+                assistant_message_id: "a-1".into(),
+            }));
+            let _ = events.send(Ok(AgentEvent::TextDelta {
+                text: "first turn active".into(),
+            }));
+            let _ = release.await;
+            let _ = events.send(Ok(done(DoneStatus::Completed)));
+            let Some(followup) = steering.recv().await else {
+                return;
+            };
+            let _ = received.send(followup.prompt);
+            let _ = events.send(Ok(AgentEvent::Steered {
+                assistant_message_id: Some("a-1".into()),
+                next_assistant_message_id: Some("a-2".into()),
+            }));
+            let _ = events.send(Ok(AgentEvent::TextDelta {
+                text: "second turn complete".into(),
+            }));
+            let _ = events.send(Ok(done(DoneStatus::Completed)));
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        })
+        .boxed())
+    }
+}
+
+struct FailingDispatchHarness;
+
+#[async_trait]
+impl Harness for FailingDispatchHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+
+    fn display_name(&self) -> &str {
+        "Failing dispatch"
+    }
+
+    fn supports_steering(&self) -> bool {
+        false
+    }
+
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::StepBoundary
+    }
+
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[]
+    }
+
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+
+    async fn run(
+        &self,
+        _request: RunRequest,
+        _controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        Err(HarnessError::Protocol(
+            "dispatch transport unavailable".into(),
+        ))
+    }
+}
+
 fn registry_with(harness: Arc<dyn Harness>) -> Arc<HarnessRegistry> {
-    let registry = HarnessRegistry::new();
+    let registry = HarnessRegistry::for_profile(RuntimeProfile::Mock);
     registry.register(harness);
     Arc::new(registry)
 }
 
+/// Identity is pinned (`assemble_with_identity`, not env-reading `assemble`):
+/// these tests seed and inspect `projects/ashler-local/dev-user` directly, so
+/// they must stay hermetic under a developer shell that exports a real
+/// `$COMET_PROJECT_SCOPE` / `$COMET_USER_ID`.
 fn assemble(dir: &std::path::Path, harness: Arc<dyn Harness>) -> EngineCore {
-    EngineCore::assemble(dir, registry_with(harness), HarnessId::Mock, None)
-        .expect("engine core assembles")
+    EngineCore::assemble_with_identity(
+        dir,
+        registry_with(harness),
+        HarnessId::Mock,
+        None,
+        "ashler-local",
+        "dev-user",
+        RuntimeProfile::Mock,
+    )
+    .expect("engine core assembles")
 }
 
 /// Queue a command into the chat doc the way a REMOTE viewer device would: an immutable
@@ -166,6 +306,77 @@ fn queue_as_viewer(doc: &SessionDoc, id: &str, payload: SessionCommandPayload) {
         resolution: None,
     })
     .expect("queue command");
+}
+
+fn controller_payload(
+    core: &EngineCore,
+    alias: &str,
+    payload: SessionCommandPayload,
+) -> SessionCommandPayload {
+    let action = match payload {
+        SessionCommandPayload::Run {
+            request,
+            message_id,
+        } => SessionControlAction::Start {
+            request,
+            message_id,
+        },
+        SessionCommandPayload::Steer { prompt, message_id } => {
+            SessionControlAction::Steer { prompt, message_id }
+        }
+        SessionCommandPayload::Queue { prompt, message_id } => {
+            SessionControlAction::Queue { prompt, message_id }
+        }
+        SessionCommandPayload::Interrupt {} => SessionControlAction::Stop {},
+        SessionCommandPayload::RespondInput {
+            request_id,
+            answers,
+        } => SessionControlAction::RespondInput {
+            request_id,
+            answers,
+        },
+        SessionCommandPayload::PeerMessage { .. } => {
+            panic!("controller_payload does not accept peer messages")
+        }
+        SessionCommandPayload::Control { .. } => {
+            panic!("controller_payload accepts an unscoped test action")
+        }
+    };
+    let device_id = core.doc_host.device_id().to_string();
+    let auth = core.auth();
+    let state = auth.state();
+    let actor_subject = state.user().expect("development auth identity").id.clone();
+    SessionCommandPayload::Control {
+        session_id: SESSION.into(),
+        owner_device_id: device_id.clone(),
+        actor_device_id: device_id,
+        actor_subject,
+        grant_id: format!("grant-{alias}"),
+        source: AgentSessionSource::Local,
+        action: Box::new(action),
+    }
+}
+
+/// Queue through the authenticated local RPC path while targeting one concrete agent session.
+/// The returned id is server-minted and is the command ledger lookup key.
+async fn queue_as_controller(
+    core: &EngineCore,
+    alias: &str,
+    payload: SessionCommandPayload,
+) -> String {
+    let command = controller_payload(core, alias, payload);
+    let client = comet_rpc::memory_client(core.rpc_service());
+    let queued = client
+        .call(
+            comet_rpc::methods::QUEUE_COMMAND,
+            serde_json::json!({"chatId": CHAT, "command": command}),
+        )
+        .await
+        .expect("queue authenticated session command");
+    queued["commandId"]
+        .as_str()
+        .expect("server-minted command id")
+        .to_string()
 }
 
 async fn wait_for<F>(mut predicate: F, what: &str)
@@ -223,21 +434,22 @@ async fn queued_run_command_executes_end_to_end() {
             script: mock_script(),
         }),
     );
-    let handle = core.doc_host.open(CHAT).unwrap();
+    let _handle = core.doc_host.open(CHAT).unwrap();
 
     // Live event subscription (journal replay + broadcast) before anything runs.
-    let (replayed, mut live) = core.sessions.subscribe(CHAT, 0).unwrap();
+    let (replayed, mut live) = core.sessions.subscribe(EXECUTION_KEY, 0).unwrap();
     assert!(replayed.is_empty());
 
-    // A viewer device queues the run command into the doc.
-    queue_as_viewer(
-        handle.doc(),
+    // An authenticated controller targets one concrete agent session.
+    let command_id = queue_as_controller(
+        &core,
         "cmd-run-1",
         SessionCommandPayload::Run {
             request: run_request("do the thing"),
             message_id: "msg-user-1".into(),
         },
-    );
+    )
+    .await;
 
     // The host executor picks it up, runs the harness, and the doc settles.
     wait_for(
@@ -291,14 +503,32 @@ async fn queued_run_command_executes_end_to_end() {
         other => panic!("unexpected second part {other:?}"),
     }
 
+    // The expanded-chip detail comes from the journal: the full input the doc
+    // stripped, plus the harness-captured output.
+    let detail = core
+        .sessions
+        .tool_call_detail(EXECUTION_KEY, "tool-1")
+        .unwrap()
+        .expect("journal saw tool-1");
+    assert_eq!(detail.input.as_deref(), Some("/tmp/x\n\nSECRET"));
+    assert_eq!(detail.output.as_deref(), Some("wrote 6 bytes"));
+    assert!(detail.resolved);
+    assert!(!detail.is_error);
+    assert_eq!(
+        core.sessions
+            .tool_call_detail(EXECUTION_KEY, "nope")
+            .unwrap(),
+        None
+    );
+
     // Command outcome written by the host (sole outcome writer).
     assert_eq!(
-        command_status(&core, "cmd-run-1"),
+        command_status(&core, &command_id),
         Some((SessionCommandStatus::Applied, None))
     );
 
     // Journal replay: the full script in order, terminal Done last.
-    let replay = core.sessions.subscribe(CHAT, 0).unwrap().0;
+    let replay = core.sessions.subscribe(EXECUTION_KEY, 0).unwrap().0;
     assert_eq!(replay.len(), mock_script().len());
     assert!(matches!(
         replay.last().map(|j| &j.event),
@@ -320,8 +550,121 @@ async fn queued_run_command_executes_end_to_end() {
 
     // Final session status: Idle.
     assert_eq!(
-        core.sessions.session_status(CHAT).map(|s| s.status),
+        core.sessions
+            .session_status(EXECUTION_KEY)
+            .map(|s| s.status),
         Some(SessionStatus::Idle)
+    );
+}
+
+#[tokio::test]
+async fn new_input_unsettles_an_archived_chat() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(MockHarness {
+            script: mock_script(),
+        }),
+    );
+    core.workspace.claim_chat(CHAT, Some("/tmp")).unwrap();
+    assert!(core.workspace.set_chat_archived(CHAT, true).unwrap());
+    assert!(
+        core.workspace
+            .doc()
+            .chat(CHAT)
+            .unwrap()
+            .is_some_and(|chat| chat.archived)
+    );
+
+    let command_id = queue_as_controller(
+        &core,
+        "cmd-unsettle",
+        SessionCommandPayload::Run {
+            request: run_request("continue this session"),
+            message_id: "msg-unsettle".into(),
+        },
+    )
+    .await;
+    wait_for(
+        || {
+            command_status(&core, &command_id)
+                .is_some_and(|(status, _)| status != SessionCommandStatus::Pending)
+        },
+        "unsettled session command",
+    )
+    .await;
+
+    assert!(
+        core.workspace
+            .doc()
+            .chat(CHAT)
+            .unwrap()
+            .is_some_and(|chat| !chat.archived),
+        "new input must return a settled session to the active list"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_failure_resolves_durable_command_and_audit() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(FailingDispatchHarness));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    let command_id = queue_as_controller(
+        &core,
+        "cmd-dispatch-failure",
+        SessionCommandPayload::Run {
+            request: run_request("cannot dispatch"),
+            message_id: "msg-dispatch-failure".into(),
+        },
+    )
+    .await;
+
+    wait_for(
+        || {
+            command_status(&core, &command_id)
+                .is_some_and(|(status, _)| status != SessionCommandStatus::Pending)
+        },
+        "failed dispatch command outcome",
+    )
+    .await;
+
+    let (status, resolution) = command_status(&core, &command_id).unwrap();
+    assert_eq!(status, SessionCommandStatus::Rejected);
+    assert!(
+        resolution
+            .as_deref()
+            .is_some_and(|reason| reason.contains("dispatch transport unavailable"))
+    );
+    let transcript = entries(&core);
+    assert!(
+        transcript.iter().any(|entry| {
+            entry.role == MessageRole::Assistant
+                && entry.parts.iter().any(|part| {
+                    matches!(
+                        part,
+                        MessagePart::Error { message, .. }
+                            if message.contains("dispatch transport unavailable")
+                    )
+                })
+        }),
+        "pre-stream dispatch failure must be visible in the transcript"
+    );
+    let audit_id = format!("audit/{command_id}");
+    let snapshot = handle.doc().collaboration_snapshot().unwrap();
+    let audit = snapshot
+        .publications
+        .iter()
+        .find(|publication| publication.id == audit_id)
+        .expect("command-derived audit publication");
+    let comet_proto::PublicationValue::Audit(audit) = &audit.value else {
+        panic!("command audit publication has wrong kind");
+    };
+    assert_eq!(audit.result, comet_proto::AuditResult::Rejected);
+    assert!(
+        audit
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("dispatch transport unavailable"))
     );
 }
 
@@ -334,20 +677,22 @@ async fn session_status_transitions_idle_working_idle() {
             script: mock_script(),
             step_delay: Duration::from_millis(40),
             hang_until_interrupt: false,
+            steering_mode: SteeringMode::StepBoundary,
         }),
     );
     let mut watch = core.sessions.watch_sessions();
     assert!(watch.borrow().is_empty(), "no sessions before dispatch");
 
-    let handle = core.doc_host.open(CHAT).unwrap();
-    queue_as_viewer(
-        handle.doc(),
+    let _handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_controller(
+        &core,
         "cmd-run-status",
         SessionCommandPayload::Run {
             request: run_request("go"),
             message_id: "m-1".into(),
         },
-    );
+    )
+    .await;
 
     let mut seen = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -380,20 +725,22 @@ async fn interrupt_stamps_streaming_entry_aborted() {
             }],
             step_delay: Duration::from_millis(5),
             hang_until_interrupt: true,
+            steering_mode: SteeringMode::StepBoundary,
         }),
     );
-    let handle = core.doc_host.open(CHAT).unwrap();
-    queue_as_viewer(
-        handle.doc(),
+    let _handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_controller(
+        &core,
         "cmd-run-hang",
         SessionCommandPayload::Run {
             request: run_request("hang"),
             message_id: "m-1".into(),
         },
-    );
+    )
+    .await;
 
-    // Wait until the streaming entry is visibly in the doc, then interrupt via a
-    // viewer-queued durable command (based_on = the streaming entry = current turn).
+    // Wait until the streaming entry is visibly in the doc, then interrupt the
+    // selected agent session through its scoped durable command.
     wait_for(
         || {
             entries(&core)
@@ -403,11 +750,8 @@ async fn interrupt_stamps_streaming_entry_aborted() {
         "streaming entry",
     )
     .await;
-    queue_as_viewer(
-        handle.doc(),
-        "cmd-int-1",
-        SessionCommandPayload::Interrupt {},
-    );
+    let interrupt_id =
+        queue_as_controller(&core, "cmd-int-1", SessionCommandPayload::Interrupt {}).await;
 
     wait_for(
         || {
@@ -429,17 +773,267 @@ async fn interrupt_stamps_streaming_entry_aborted() {
         MessagePart::Text { text, .. } => assert_eq!(text, "partial output"),
         other => panic!("unexpected part {other:?}"),
     }
+    wait_for(
+        || {
+            command_status(&core, &interrupt_id)
+                .is_some_and(|(status, _)| status != SessionCommandStatus::Pending)
+        },
+        "interrupt command outcome",
+    )
+    .await;
     assert_eq!(
-        command_status(&core, "cmd-int-1"),
+        command_status(&core, &interrupt_id),
         Some((SessionCommandStatus::Applied, None))
     );
     // Journal closed with a Done — nothing left to recover.
-    let journal = RunJournal::open(dir.path().join("orgs/dev-org/dev-user/journals")).unwrap();
+    let journal =
+        RunJournal::open(dir.path().join("projects/ashler-local/dev-user/journals")).unwrap();
     assert!(journal.stale_sessions().unwrap().is_empty());
     assert_eq!(
-        core.sessions.session_status(CHAT).map(|s| s.status),
+        core.sessions
+            .session_status(EXECUTION_KEY)
+            .map(|s| s.status),
         Some(SessionStatus::Idle)
     );
+}
+
+#[tokio::test]
+async fn explicit_queue_waits_for_the_next_turn_across_step_boundary_harnesses() {
+    let dir = tempfile::tempdir().unwrap();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (received_tx, mut received_rx) = tokio::sync::mpsc::unbounded_channel();
+    let core = assemble(
+        dir.path(),
+        Arc::new(QueuedFollowupHarness {
+            release_first_turn: Arc::new(std::sync::Mutex::new(Some(release_rx))),
+            received: received_tx,
+            steering_mode: SteeringMode::StepBoundary,
+        }),
+    );
+    let _handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_controller(
+        &core,
+        "cmd-run-before-queue",
+        SessionCommandPayload::Run {
+            request: run_request("start"),
+            message_id: "m-1".into(),
+        },
+    )
+    .await;
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|entry| {
+                entry
+                    .parts
+                    .iter()
+                    .any(|part| matches!(part, MessagePart::Text { text, .. } if text == "first turn active"))
+            })
+        },
+        "first turn to become active",
+    )
+    .await;
+
+    let queue_command_id = queue_as_controller(
+        &core,
+        "cmd-queue-followup",
+        SessionCommandPayload::Queue {
+            prompt: "wait until next turn".into(),
+            message_id: Some("m-queued".into()),
+        },
+    )
+    .await;
+    wait_for(
+        || {
+            command_status(&core, &queue_command_id)
+                .is_some_and(|(status, _)| status != SessionCommandStatus::Pending)
+        },
+        "queue command outcome",
+    )
+    .await;
+    assert_eq!(
+        command_status(&core, &queue_command_id),
+        Some((
+            SessionCommandStatus::Applied,
+            Some("queued for the next turn".into())
+        ))
+    );
+    assert!(matches!(
+        received_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert_eq!(
+        entries_now(&core)
+            .iter()
+            .find(|entry| entry.id == "m-queued")
+            .and_then(|entry| entry.status),
+        Some(MessageStatus::Queued)
+    );
+
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), received_rx.recv())
+            .await
+            .unwrap(),
+        Some("wait until next turn".into())
+    );
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .find(|entry| entry.id == "m-queued")
+                .is_some_and(|entry| entry.status == Some(MessageStatus::Complete))
+        },
+        "queued message to become delivered",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn turn_boundary_steer_is_displayed_as_queued_until_acknowledged() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: vec![AgentEvent::TextDelta {
+                text: "still working".into(),
+            }],
+            step_delay: Duration::from_millis(5),
+            hang_until_interrupt: true,
+            steering_mode: SteeringMode::TurnBoundary,
+        }),
+    );
+    let _handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_controller(
+        &core,
+        "cmd-run-turn-boundary",
+        SessionCommandPayload::Run {
+            request: run_request("start"),
+            message_id: "m-1".into(),
+        },
+    )
+    .await;
+    wait_for(
+        || {
+            core.sessions
+                .session_status(EXECUTION_KEY)
+                .is_some_and(|session| session.status == SessionStatus::Working)
+        },
+        "turn-boundary run to start",
+    )
+    .await;
+
+    let steer_command_id = queue_as_controller(
+        &core,
+        "cmd-steer-turn-boundary",
+        SessionCommandPayload::Steer {
+            prompt: "change direction".into(),
+            message_id: Some("m-2".into()),
+        },
+    )
+    .await;
+    wait_for(
+        || {
+            command_status(&core, &steer_command_id)
+                .is_some_and(|(status, _)| status != SessionCommandStatus::Pending)
+        },
+        "turn-boundary steer acknowledgement",
+    )
+    .await;
+    assert_eq!(
+        command_status(&core, &steer_command_id),
+        Some((
+            SessionCommandStatus::Applied,
+            Some("queued for the next turn boundary".into())
+        ))
+    );
+    assert_eq!(
+        entries_now(&core)
+            .iter()
+            .find(|entry| entry.id == "m-2")
+            .and_then(|entry| entry.status),
+        Some(MessageStatus::Queued)
+    );
+
+    core.sessions.interrupt(EXECUTION_KEY).await.unwrap();
+}
+
+#[tokio::test]
+async fn turn_boundary_steer_becomes_active_when_the_harness_acknowledges_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (received_tx, mut received_rx) = tokio::sync::mpsc::unbounded_channel();
+    let core = assemble(
+        dir.path(),
+        Arc::new(QueuedFollowupHarness {
+            release_first_turn: Arc::new(std::sync::Mutex::new(Some(release_rx))),
+            received: received_tx,
+            steering_mode: SteeringMode::TurnBoundary,
+        }),
+    );
+    let _handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_controller(
+        &core,
+        "cmd-run-before-turn-boundary-steer",
+        SessionCommandPayload::Run {
+            request: run_request("start"),
+            message_id: "m-1".into(),
+        },
+    )
+    .await;
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|entry| {
+                entry
+                    .parts
+                    .iter()
+                    .any(|part| matches!(part, MessagePart::Text { text, .. } if text == "first turn active"))
+            })
+        },
+        "first turn to become active",
+    )
+    .await;
+
+    queue_as_controller(
+        &core,
+        "cmd-turn-boundary-steer",
+        SessionCommandPayload::Steer {
+            prompt: "change direction next".into(),
+            message_id: Some("m-turn-steer".into()),
+        },
+    )
+    .await;
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .find(|entry| entry.id == "m-turn-steer")
+                .is_some_and(|entry| entry.status == Some(MessageStatus::Queued))
+        },
+        "turn-boundary steer to remain queued",
+    )
+    .await;
+    assert!(matches!(
+        received_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), received_rx.recv())
+            .await
+            .unwrap(),
+        Some("change direction next".into())
+    );
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .find(|entry| entry.id == "m-turn-steer")
+                .is_some_and(|entry| entry.status == Some(MessageStatus::Steered))
+        },
+        "turn-boundary steer acknowledgement",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -451,20 +1045,21 @@ async fn steer_with_no_live_run_falls_back_to_new_turn() {
             script: mock_script(),
         }),
     );
-    let handle = core.doc_host.open(CHAT).unwrap();
+    let _handle = core.doc_host.open(CHAT).unwrap();
 
-    queue_as_viewer(
-        handle.doc(),
+    let first_command_id = queue_as_controller(
+        &core,
         "cmd-run-1",
         SessionCommandPayload::Run {
             request: run_request("first"),
             message_id: "m-1".into(),
         },
-    );
+    )
+    .await;
     wait_for(
         || {
             matches!(
-                command_status(&core, "cmd-run-1"),
+                command_status(&core, &first_command_id),
                 Some((SessionCommandStatus::Applied, _))
             )
         },
@@ -472,32 +1067,38 @@ async fn steer_with_no_live_run_falls_back_to_new_turn() {
     )
     .await;
     wait_for(
-        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        || {
+            core.sessions
+                .session_status(EXECUTION_KEY)
+                .map(|s| s.status)
+                == Some(SessionStatus::Idle)
+        },
         "first run settled",
     )
     .await;
 
     // No live run anymore (mock finishes instantly): a steer command must fall back to
     // dispatch-as-next-turn, per comet's executor.
-    queue_as_viewer(
-        handle.doc(),
+    let steer_command_id = queue_as_controller(
+        &core,
         "cmd-steer-1",
         SessionCommandPayload::Steer {
             prompt: "also do this".into(),
             message_id: Some("m-2".into()),
         },
-    );
+    )
+    .await;
     wait_for(
         || {
             matches!(
-                command_status(&core, "cmd-steer-1"),
+                command_status(&core, &steer_command_id),
                 Some((SessionCommandStatus::Applied, Some(_)))
             )
         },
         "steer fallback applied",
     )
     .await;
-    let (status, resolution) = command_status(&core, "cmd-steer-1").unwrap();
+    let (status, resolution) = command_status(&core, &steer_command_id).unwrap();
     assert_eq!(status, SessionCommandStatus::Applied);
     assert_eq!(resolution.as_deref(), Some("queued as new turn"));
 
@@ -529,7 +1130,7 @@ async fn processed_commands_are_skipped_on_redelivery() {
     // Simulate a crash AFTER mark-processed but BEFORE execute/outcome: the ledger has
     // the id, the doc still says pending.
     {
-        let store = DocsStore::open(dir.path().join("orgs/dev-org/dev-user")).unwrap();
+        let store = DocsStore::open(dir.path().join("projects/ashler-local/dev-user")).unwrap();
         assert!(store.mark_processed("cmd-crashed").unwrap());
     }
 
@@ -563,7 +1164,7 @@ async fn processed_commands_are_skipped_on_redelivery() {
     assert!(core.sessions.session_status(CHAT).is_none());
 
     // Direct ledger-evaluation check: re-evaluating a processed command = Skip.
-    let store = DocsStore::open(dir.path().join("orgs/dev-org/dev-user")).unwrap();
+    let store = DocsStore::open(dir.path().join("projects/ashler-local/dev-user")).unwrap();
     let commands = handle.doc().read_commands().unwrap();
     let entry = commands.iter().find(|c| c.id == "cmd-crashed").unwrap();
     let is_processed = |id: &str| store.is_processed(id).unwrap_or(false);
@@ -591,7 +1192,8 @@ async fn recover_stale_journal_stamps_aborted_on_boot() {
     // Craft the crash state: a journal without a terminal Done + a doc snapshot whose
     // assistant entry is still `streaming`.
     {
-        let journal = RunJournal::open(dir.path().join("orgs/dev-org/dev-user/journals")).unwrap();
+        let journal =
+            RunJournal::open(dir.path().join("projects/ashler-local/dev-user/journals")).unwrap();
         journal
             .append(
                 CHAT,
@@ -623,7 +1225,7 @@ async fn recover_stale_journal_stamps_aborted_on_boot() {
             }])
             .unwrap();
         // No finish — the "process" dies here with the entry still streaming.
-        let store = DocsStore::open(dir.path().join("orgs/dev-org/dev-user")).unwrap();
+        let store = DocsStore::open(dir.path().join("projects/ashler-local/dev-user")).unwrap();
         store
             .save_snapshot(CHAT, &doc.export_snapshot().unwrap())
             .unwrap();
@@ -647,7 +1249,8 @@ async fn recover_stale_journal_stamps_aborted_on_boot() {
     }
 
     // Journal closed with a synthetic Done{interrupted}; no longer stale.
-    let journal = RunJournal::open(dir.path().join("orgs/dev-org/dev-user/journals")).unwrap();
+    let journal =
+        RunJournal::open(dir.path().join("projects/ashler-local/dev-user/journals")).unwrap();
     assert!(journal.stale_sessions().unwrap().is_empty());
     let (_, last) = journal.last_event(CHAT).unwrap().unwrap();
     assert!(matches!(
@@ -715,11 +1318,14 @@ async fn rpc_surface_over_in_memory_transport() {
     assert_eq!(initial, serde_json::json!({ "reset": [] }));
 
     // QueueCommand (as this device's composer would over IPC).
-    let command = serde_json::to_value(SessionCommandPayload::Run {
-        request: run_request("via rpc"),
-        message_id: "m-rpc-1".into(),
-    })
-    .unwrap();
+    let command = controller_payload(
+        &core,
+        "rpc-run",
+        SessionCommandPayload::Run {
+            request: run_request("via rpc"),
+            message_id: "m-rpc-1".into(),
+        },
+    );
     let queued = client
         .call(
             comet_rpc::methods::QUEUE_COMMAND,
@@ -826,20 +1432,23 @@ async fn respond_input_resolves_pending_question() {
 
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(dir.path(), Arc::new(AskingHarness));
-    let handle = core.doc_host.open(CHAT).unwrap();
-    queue_as_viewer(
-        handle.doc(),
+    let _handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_controller(
+        &core,
         "cmd-run-ask",
         SessionCommandPayload::Run {
             request: run_request("ask me"),
             message_id: "m-1".into(),
         },
-    );
+    )
+    .await;
 
     // The input request surfaces: status AwaitingInput + an unresolved input part.
     wait_for(
         || {
-            core.sessions.session_status(CHAT).map(|s| s.status)
+            core.sessions
+                .session_status(EXECUTION_KEY)
+                .map(|s| s.status)
                 == Some(SessionStatus::AwaitingInput)
         },
         "awaiting input",
@@ -873,8 +1482,8 @@ async fn respond_input_resolves_pending_question() {
             })
         })
         .unwrap();
-    queue_as_viewer(
-        handle.doc(),
+    let answer_command_id = queue_as_controller(
+        &core,
         "cmd-answer-1",
         SessionCommandPayload::RespondInput {
             request_id,
@@ -883,7 +1492,8 @@ async fn respond_input_resolves_pending_question() {
                 labels: vec!["b".into()],
             }],
         },
-    );
+    )
+    .await;
 
     wait_for(
         || {
@@ -898,7 +1508,7 @@ async fn respond_input_resolves_pending_question() {
     )
     .await;
     assert_eq!(
-        command_status(&core, "cmd-answer-1"),
+        command_status(&core, &answer_command_id),
         Some((SessionCommandStatus::Applied, None))
     );
     // The input part is marked resolved in the doc.
@@ -910,7 +1520,12 @@ async fn respond_input_resolves_pending_question() {
     // The run task writes the Complete entry BEFORE settling the status row —
     // wait for the transition instead of asserting the instant in between.
     wait_for(
-        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        || {
+            core.sessions
+                .session_status(EXECUTION_KEY)
+                .map(|s| s.status)
+                == Some(SessionStatus::Idle)
+        },
         "session to settle idle",
     )
     .await;
@@ -979,18 +1594,21 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
 
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(dir.path(), Arc::new(AskingHarness));
-    let handle = core.doc_host.open(CHAT).unwrap();
-    queue_as_viewer(
-        handle.doc(),
+    let _handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_controller(
+        &core,
         "cmd-run-wrong",
         SessionCommandPayload::Run {
             request: run_request("ask me"),
             message_id: "m-1".into(),
         },
-    );
+    )
+    .await;
     wait_for(
         || {
-            core.sessions.session_status(CHAT).map(|s| s.status)
+            core.sessions
+                .session_status(EXECUTION_KEY)
+                .map(|s| s.status)
                 == Some(SessionStatus::AwaitingInput)
         },
         "awaiting input",
@@ -1015,8 +1633,8 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
     .await;
 
     // A wrong-id answer: rejected with a resolution, question still live.
-    queue_as_viewer(
-        handle.doc(),
+    let bogus_command_id = queue_as_controller(
+        &core,
         "cmd-answer-bogus",
         SessionCommandPayload::RespondInput {
             request_id: "bogus-id".into(),
@@ -1025,17 +1643,18 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
                 labels: vec!["a".into()],
             }],
         },
-    );
+    )
+    .await;
     wait_for(
         || {
-            command_status(&core, "cmd-answer-bogus")
+            command_status(&core, &bogus_command_id)
                 .is_some_and(|(s, _)| s != SessionCommandStatus::Pending)
         },
         "bogus answer processed",
     )
     .await;
     assert_eq!(
-        command_status(&core, "cmd-answer-bogus"),
+        command_status(&core, &bogus_command_id),
         Some((
             SessionCommandStatus::Rejected,
             Some("no pending input request".into())
@@ -1044,7 +1663,9 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
     // The run is still waiting and the part is still unresolved — the
     // QuestionPanel keeps presenting the real request.
     assert_eq!(
-        core.sessions.session_status(CHAT).map(|s| s.status),
+        core.sessions
+            .session_status(EXECUTION_KEY)
+            .map(|s| s.status),
         Some(SessionStatus::AwaitingInput)
     );
     let request_id = entries(&core)
@@ -1062,8 +1683,8 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
         .expect("question still live after rejected answer");
 
     // The correct answer still resumes and completes the run.
-    queue_as_viewer(
-        handle.doc(),
+    queue_as_controller(
+        &core,
         "cmd-answer-right",
         SessionCommandPayload::RespondInput {
             request_id,
@@ -1072,7 +1693,8 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
                 labels: vec!["b".into()],
             }],
         },
-    );
+    )
+    .await;
     wait_for(
         || {
             entries_now(&core).iter().any(|e| {
@@ -1086,7 +1708,9 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
     )
     .await;
     assert_eq!(
-        core.sessions.session_status(CHAT).map(|s| s.status),
+        core.sessions
+            .session_status(EXECUTION_KEY)
+            .map(|s| s.status),
         Some(SessionStatus::Idle)
     );
 }
@@ -1162,18 +1786,21 @@ async fn interrupt_unblocks_a_run_awaiting_input() {
 
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(dir.path(), Arc::new(BlockingHarness));
-    let handle = core.doc_host.open(CHAT).unwrap();
-    queue_as_viewer(
-        handle.doc(),
+    let _handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_controller(
+        &core,
         "cmd-run-block",
         SessionCommandPayload::Run {
             request: run_request("ask and block"),
             message_id: "m-1".into(),
         },
-    );
+    )
+    .await;
     wait_for(
         || {
-            core.sessions.session_status(CHAT).map(|s| s.status)
+            core.sessions
+                .session_status(EXECUTION_KEY)
+                .map(|s| s.status)
                 == Some(SessionStatus::AwaitingInput)
         },
         "awaiting input",
@@ -1200,7 +1827,7 @@ async fn interrupt_unblocks_a_run_awaiting_input() {
     // Interrupt while blocked: settles promptly (well under the 3s grace —
     // the unparked resolver lets the harness wind down on its own).
     let start = std::time::Instant::now();
-    core.sessions.interrupt(CHAT).await.unwrap();
+    core.sessions.interrupt(EXECUTION_KEY).await.unwrap();
     assert!(
         start.elapsed() < std::time::Duration::from_secs(3),
         "interrupt settled via the unparked resolver, not the grace timeout"
@@ -1228,14 +1855,15 @@ async fn interrupt_unblocks_a_run_awaiting_input() {
     }));
 
     // And the session is usable: the next run completes.
-    queue_as_viewer(
-        handle.doc(),
+    queue_as_controller(
+        &core,
         "cmd-run-second",
         SessionCommandPayload::Run {
             request: run_request("second run"),
             message_id: "m-2".into(),
         },
-    );
+    )
+    .await;
     wait_for(
         || {
             entries_now(&core).iter().any(|e| {
@@ -1326,19 +1954,22 @@ async fn harness_emitted_input_twin_is_dropped_and_answer_resumes() {
 
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(dir.path(), Arc::new(DoubleEmitHarness));
-    let handle = core.doc_host.open(CHAT).unwrap();
-    queue_as_viewer(
-        handle.doc(),
+    let _handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_controller(
+        &core,
         "cmd-run-twin",
         SessionCommandPayload::Run {
             request: run_request("ask me twice"),
             message_id: "m-1".into(),
         },
-    );
+    )
+    .await;
 
     wait_for(
         || {
-            core.sessions.session_status(CHAT).map(|s| s.status)
+            core.sessions
+                .session_status(EXECUTION_KEY)
+                .map(|s| s.status)
                 == Some(SessionStatus::AwaitingInput)
         },
         "awaiting input",
@@ -1390,8 +2021,8 @@ async fn harness_emitted_input_twin_is_dropped_and_answer_resumes() {
             })
         })
         .unwrap();
-    queue_as_viewer(
-        handle.doc(),
+    let answer_command_id = queue_as_controller(
+        &core,
         "cmd-answer-twin",
         SessionCommandPayload::RespondInput {
             request_id,
@@ -1400,7 +2031,8 @@ async fn harness_emitted_input_twin_is_dropped_and_answer_resumes() {
                 labels: vec!["a".into()],
             }],
         },
-    );
+    )
+    .await;
 
     // The run resumes and completes; the chip flips to resolved.
     wait_for(
@@ -1416,7 +2048,7 @@ async fn harness_emitted_input_twin_is_dropped_and_answer_resumes() {
     )
     .await;
     assert_eq!(
-        command_status(&core, "cmd-answer-twin"),
+        command_status(&core, &answer_command_id),
         Some((SessionCommandStatus::Applied, None))
     );
     assert!(entries(&core).iter().any(|e| {
@@ -1427,7 +2059,12 @@ async fn harness_emitted_input_twin_is_dropped_and_answer_resumes() {
     // The run task writes the Complete entry BEFORE settling the status row —
     // wait for the transition instead of asserting the instant in between.
     wait_for(
-        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        || {
+            core.sessions
+                .session_status(EXECUTION_KEY)
+                .map(|s| s.status)
+                == Some(SessionStatus::Idle)
+        },
         "session to settle idle",
     )
     .await;
@@ -1438,9 +2075,9 @@ async fn harness_emitted_input_twin_is_dropped_and_answer_resumes() {
 // the prompt-embedded refs (the persisted transport) and the staged paths.
 // ---------------------------------------------------------------------------
 
-/// Delegates to a scripted mock but records every RunRequest the engine hands
-/// over (the chat run AND the auto-title run share the harness) — proves
-/// `attachments` survives doc-queue → executor → harness.
+/// Delegates to a scripted mock and records every RunRequest the engine hands
+/// over, proving attachments survive doc-queue → executor → harness without an
+/// auxiliary title-generation run.
 struct CapturingHarness {
     script: Vec<AgentEvent>,
     seen: Arc<std::sync::Mutex<Vec<RunRequest>>>,
@@ -1530,15 +2167,16 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
     );
     let mut request = run_request(&prompt);
     request.attachments = vec![path.clone()];
-    let handle = core.doc_host.open(CHAT).unwrap();
-    queue_as_viewer(
-        handle.doc(),
+    let _handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_controller(
+        &core,
         "cmd-att-1",
         SessionCommandPayload::Run {
             request,
             message_id: "msg-att-1".into(),
         },
-    );
+    )
+    .await;
     wait_for(
         || {
             entries_now(&core).iter().any(|e| {
@@ -1562,14 +2200,11 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
         other => panic!("unexpected user part {other:?}"),
     }
 
-    // The harness saw the staged paths on the request itself (the chat run —
-    // NOT the auto-title run, which fires at dispatch now, embeds the user
-    // prompt in its wrapper, and legitimately carries no attachments).
+    // Local deterministic titling never allocates a second harness request.
     let requests = seen.lock().unwrap().clone();
-    let chat_run = requests
-        .iter()
-        .find(|r| r.prompt.contains("what color is this?") && !r.prompt.contains("word title"))
-        .expect("chat run reached the harness");
+    assert_eq!(requests.len(), 1);
+    let chat_run = &requests[0];
+    assert!(chat_run.prompt.contains("what color is this?"));
     assert_eq!(chat_run.attachments, vec![path.clone()]);
     assert!(chat_run.prompt.contains(&path));
 
@@ -1604,12 +2239,14 @@ async fn real_claude_sees_uploaded_image_inline() {
 
     let core = EngineCore::assemble(
         &dir,
-        Arc::new(comet_engine::default_registry()),
+        Arc::new(comet_engine::default_registry(
+            comet_proto::RuntimeProfile::LocalController,
+        )),
         HarnessId::ClaudeCode,
         None,
     )
     .expect("engine core assembles");
-    // Pre-title the chat so the auto-titler doesn't spend a second model call.
+    // Pin the title so this test remains focused on the production harness path.
     core.workspace
         .create_chat(CHAT, &core.device_id, None, Some("/tmp".into()))
         .expect("create chat row");
@@ -1744,15 +2381,16 @@ async fn empty_reasoning_deltas_are_heartbeats_not_journal_noise() {
     });
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(dir.path(), Arc::new(MockHarness { script }));
-    let handle = core.doc_host.open(CHAT).unwrap();
-    queue_as_viewer(
-        handle.doc(),
+    let _handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_controller(
+        &core,
         "cmd-hb-1",
         SessionCommandPayload::Run {
             request: run_request("hb"),
             message_id: "msg-hb-1".into(),
         },
-    );
+    )
+    .await;
     wait_for(
         || {
             entries(&core)
@@ -1763,7 +2401,7 @@ async fn empty_reasoning_deltas_are_heartbeats_not_journal_noise() {
     )
     .await;
     // Journal replay: the 40 empties were filtered; real content survived.
-    let replay = core.sessions.subscribe(CHAT, 0).unwrap().0;
+    let replay = core.sessions.subscribe(EXECUTION_KEY, 0).unwrap().0;
     let empties = replay
         .iter()
         .filter(|j| matches!(&j.event, AgentEvent::ReasoningDelta { text } if text.is_empty()))

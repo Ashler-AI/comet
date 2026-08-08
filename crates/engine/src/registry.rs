@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use serde::{Deserialize, Serialize};
 
 use comet_harness::{Harness, HarnessError, mock::MockHarness};
-use comet_proto::{AgentEvent, DoneStatus, HarnessId, ReasoningLevel, SteeringMode};
+use comet_proto::{
+    AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RuntimeProfile, SteeringMode,
+};
 
 /// What `ListHarnesses` reports per harness.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +46,7 @@ enum Slot {
 pub struct HarnessRegistry {
     slots: Mutex<HashMap<HarnessId, Slot>>,
     order: Mutex<Vec<HarnessId>>,
+    profile: RuntimeProfile,
 }
 
 impl Default for HarnessRegistry {
@@ -54,9 +57,14 @@ impl Default for HarnessRegistry {
 
 impl HarnessRegistry {
     pub fn new() -> Self {
+        Self::for_profile(RuntimeProfile::LocalController)
+    }
+
+    pub fn for_profile(profile: RuntimeProfile) -> Self {
         Self {
             slots: Mutex::new(HashMap::new()),
             order: Mutex::new(Vec::new()),
+            profile,
         }
     }
 
@@ -94,6 +102,12 @@ impl HarnessRegistry {
     }
 
     pub fn resolve(&self, id: HarnessId) -> Result<Arc<dyn Harness>, HarnessError> {
+        if !self.profile.allows_harness(id) {
+            return Err(HarnessError::NotInstalled(format!(
+                "{id:?} is disabled by {:?}",
+                self.profile
+            )));
+        }
         let mut slots = self.slots();
         match slots.get(&id) {
             Some(Slot::Ready(harness)) => Ok(harness.clone()),
@@ -111,6 +125,7 @@ impl HarnessRegistry {
         let slots = self.slots();
         self.order()
             .iter()
+            .filter(|id| self.profile.allows_harness(**id))
             .filter_map(|id| match slots.get(id) {
                 Some(Slot::Ready(harness)) => Some(describe(harness.as_ref())),
                 Some(Slot::Lazy { descriptor, .. }) => Some(descriptor.clone()),
@@ -123,11 +138,11 @@ impl HarnessRegistry {
 /// The production registry: MockHarness (hidden from production pickers) plus a lazy
 /// `claude-code` slot resolved through `comet_harness` on first use (subprocess
 /// discovery only happens when a run/model call actually needs it).
-pub fn default_registry() -> HarnessRegistry {
+pub fn default_registry(profile: RuntimeProfile) -> HarnessRegistry {
     // Warm the login-shell PATH snapshot in the background so the first
     // claude/codex resolve doesn't pay the shell-startup latency inline.
     comet_harness::shell_env::prewarm();
-    let registry = HarnessRegistry::new();
+    let registry = HarnessRegistry::for_profile(profile);
     registry.register(Arc::new(MockHarness {
         script: vec![
             AgentEvent::TextDelta {
@@ -145,6 +160,9 @@ pub fn default_registry() -> HarnessRegistry {
             AgentEvent::ToolResult {
                 id: "mock-tool-1".into(),
                 is_error: false,
+                output: Some(
+                    "   Compiling comet-engine v0.1.0\n    Finished `test` profile in 4.2s\n     Running unittests src/lib.rs\n\ntest result: ok. 148 passed; 0 failed; 0 ignored".into(),
+                ),
             },
             AgentEvent::ToolCall {
                 id: "mock-tool-2".into(),
@@ -156,6 +174,9 @@ pub fn default_registry() -> HarnessRegistry {
             AgentEvent::ToolResult {
                 id: "mock-tool-2".into(),
                 is_error: false,
+                output: Some(
+                    "a1b2c3d (HEAD -> main) fold: coalesce doc commits\n9f8e7d6 engine: journal replay dedupe\n5c4b3a2 ui: stick-to-bottom spring".into(),
+                ),
             },
             AgentEvent::TextDelta {
                 text: "The `SegmentWriter` appends into `LoroText` so the oplog stays RLE-merged:\n\n```rust\nfolded = fold_event_into_parts(&folded, &event);\nwriter.sync(&folded)?; // 120ms coalesced commits\n```\n\nSynced to every device through the session room. *Mock harness reporting in.*".into(),
@@ -210,6 +231,49 @@ pub fn default_registry() -> HarnessRegistry {
         },
         Box::new(|| Ok(Arc::new(comet_harness::CodexHarness::new()) as Arc<dyn Harness>)),
     );
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Omp,
+            name: "OMP".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: vec![
+                ReasoningLevel::Minimal,
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max,
+            ],
+        },
+        Box::new(move || {
+            let harness = if profile == RuntimeProfile::ScaffoldHost {
+                comet_harness::OmpHarness::scaffold_host()
+            } else {
+                comet_harness::OmpHarness::new()
+            };
+            Ok(Arc::new(harness) as Arc<dyn Harness>)
+        }),
+    );
+    if profile != RuntimeProfile::ScaffoldHost {
+        registry.register_lazy(
+            HarnessDescriptor {
+                id: HarnessId::PrimeAgent,
+                name: "Prime Agent".into(),
+                supports_steering: true,
+                steering_mode: SteeringMode::TurnBoundary,
+                reasoning_levels: vec![
+                    ReasoningLevel::Minimal,
+                    ReasoningLevel::Low,
+                    ReasoningLevel::Medium,
+                    ReasoningLevel::High,
+                    ReasoningLevel::XHigh,
+                    ReasoningLevel::Max,
+                ],
+            },
+            Box::new(|| Ok(Arc::new(comet_harness::PrimeAgentHarness::new()) as Arc<dyn Harness>)),
+        );
+    }
     registry
 }
 
@@ -220,7 +284,7 @@ mod tests {
     #[test]
     fn lazy_slot_lists_without_resolving() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let registry = HarnessRegistry::new();
+        let registry = HarnessRegistry::for_profile(RuntimeProfile::Mock);
         let calls = Arc::new(AtomicUsize::new(0));
         let counted = calls.clone();
         registry.register_lazy(
@@ -249,14 +313,19 @@ mod tests {
     }
 
     #[test]
-    fn default_registry_lists_mock_claude_and_codex_slots() {
-        let registry = default_registry();
+    fn default_registry_lists_local_claude_and_codex_slots() {
+        let registry = default_registry(RuntimeProfile::LocalController);
         let ids: Vec<HarnessId> = registry.descriptors().iter().map(|d| d.id).collect();
         assert_eq!(
             ids,
-            vec![HarnessId::Mock, HarnessId::ClaudeCode, HarnessId::Codex]
+            vec![
+                HarnessId::ClaudeCode,
+                HarnessId::Codex,
+                HarnessId::Omp,
+                HarnessId::PrimeAgent,
+            ]
         );
-        assert!(registry.resolve(HarnessId::Mock).is_ok());
+        assert!(registry.resolve(HarnessId::Mock).is_err());
         assert!(registry.resolve(HarnessId::ClaudeCode).is_ok());
         // A codex-configured chat resolves the right harness (construction is
         // cheap; CLI discovery is deferred to models()/run()).
@@ -272,7 +341,7 @@ mod tests {
     /// as-is here; flagged for its own pass.)
     #[test]
     fn codex_lazy_descriptor_matches_resolved_harness() {
-        let registry = default_registry();
+        let registry = default_registry(RuntimeProfile::LocalController);
         let before = registry
             .descriptors()
             .into_iter()
@@ -288,5 +357,77 @@ mod tests {
         assert_eq!(before.supports_steering, after.supports_steering);
         assert_eq!(before.steering_mode, after.steering_mode);
         assert_eq!(before.reasoning_levels, after.reasoning_levels);
+    }
+
+    #[test]
+    fn omp_catalog_advertises_turn_boundary_queueing_before_resolve() {
+        let registry = default_registry(RuntimeProfile::LocalController);
+        let omp = registry
+            .descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor.id == HarnessId::Omp)
+            .unwrap();
+
+        assert!(omp.supports_steering);
+        assert_eq!(omp.steering_mode, SteeringMode::TurnBoundary);
+    }
+
+    #[test]
+    fn prime_agent_catalog_advertises_turn_boundary_queueing_before_resolve() {
+        let registry = default_registry(RuntimeProfile::LocalController);
+        let prime_agent = registry
+            .descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor.id == HarnessId::PrimeAgent)
+            .unwrap();
+
+        assert!(prime_agent.supports_steering);
+        assert_eq!(prime_agent.steering_mode, SteeringMode::TurnBoundary);
+    }
+    #[test]
+    fn scaffold_profile_rejects_crafted_local_dispatch_without_calling_factory() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let registry = HarnessRegistry::for_profile(RuntimeProfile::ScaffoldHost);
+        let calls = Arc::new(AtomicUsize::new(0));
+        for id in [HarnessId::ClaudeCode, HarnessId::Codex] {
+            let calls = calls.clone();
+            registry.register_lazy(
+                HarnessDescriptor {
+                    id,
+                    name: format!("forbidden-{id:?}"),
+                    supports_steering: false,
+                    steering_mode: SteeringMode::TurnBoundary,
+                    reasoning_levels: vec![],
+                },
+                Box::new(move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err(HarnessError::Protocol("factory must not run".into()))
+                }),
+            );
+            assert!(registry.resolve(id).is_err());
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no forbidden process factory ran"
+        );
+    }
+
+    #[test]
+    fn scaffold_profile_rejects_local_harnesses_at_registry_boundary() {
+        let registry = default_registry(RuntimeProfile::ScaffoldHost);
+        assert_eq!(
+            registry
+                .descriptors()
+                .iter()
+                .map(|descriptor| descriptor.id)
+                .collect::<Vec<_>>(),
+            vec![HarnessId::Omp],
+            "scoped hosts expose exactly the OMP execution route"
+        );
+        assert!(registry.resolve(HarnessId::ClaudeCode).is_err());
+        assert!(registry.resolve(HarnessId::Codex).is_err());
+        assert!(registry.resolve(HarnessId::Mock).is_err());
+        assert!(registry.resolve(HarnessId::Omp).is_ok());
     }
 }

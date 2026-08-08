@@ -7,6 +7,11 @@ use serde::{Deserialize, Serialize};
 pub enum HarnessId {
     ClaudeCode,
     Codex,
+    Omp,
+    PrimeAgent,
+    /// Imported OpenCode history provenance; no executable harness is registered.
+    #[serde(rename = "opencode")]
+    OpenCode,
     Cursor,
     /// Test harness; never shown in production pickers.
     Mock,
@@ -60,6 +65,50 @@ pub struct Model {
     pub options: Vec<ModelOption>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OmpAdvisorConfig {
+    pub enabled: bool,
+    pub model: String,
+    pub subagents: bool,
+    pub sync_backlog: OmpAdvisorSyncBacklog,
+    pub immune_turns: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OmpAdvisorSyncBacklog {
+    #[serde(rename = "off")]
+    Off,
+    #[serde(rename = "1")]
+    One,
+    #[serde(rename = "3")]
+    Three,
+    #[serde(rename = "5")]
+    Five,
+}
+
+impl OmpAdvisorSyncBacklog {
+    pub const ALL: [Self; 4] = [Self::Off, Self::One, Self::Three, Self::Five];
+
+    pub const fn value(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::One => "1",
+            Self::Three => "3",
+            Self::Five => "5",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessCommand {
+    pub name: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_hint: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelOption {
@@ -76,6 +125,10 @@ pub struct ModelOptionChoice {
     pub label: String,
 }
 
+const fn default_auto_approve() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunRequest {
@@ -87,7 +140,7 @@ pub struct RunRequest {
     pub model_options: serde_json::Map<String, serde_json::Value>,
     pub cwd: String,
     pub sandbox: SandboxLevel,
-    #[serde(default)]
+    #[serde(default = "default_auto_approve")]
     pub auto_approve: bool,
     /// Harness-native session id to resume, if any.
     pub resume: Option<String>,
@@ -99,6 +152,26 @@ pub struct RunRequest {
     /// content blocks. Additive + serde-defaulted for wire compat.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentActivityStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentActivity {
+    pub id: String,
+    pub role: String,
+    pub status: AgentActivityStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// A decoded tool invocation, reduced to the fields each kind renders.
@@ -148,6 +221,12 @@ pub enum ToolCall {
         #[serde(default)]
         items: Vec<TodoItem>,
     },
+    /// One or more OMP task subagents. Repeated tool-call updates refresh this
+    /// list in place so Comet can show pending/running/terminal activity rather
+    /// than collapsing delegation into an opaque generic tool.
+    Agent {
+        agents: Vec<AgentActivity>,
+    },
     Mcp {
         server: String,
         tool: String,
@@ -159,6 +238,25 @@ pub enum ToolCall {
         #[serde(skip_serializing_if = "Option::is_none")]
         input: Option<serde_json::Value>,
     },
+}
+
+/// Cap on captured tool output (journal-line hygiene: a single `cargo test`
+/// dump must not balloon the append-only run journal). Adapters truncate at a
+/// char boundary via [`truncate_tool_output`].
+pub const TOOL_OUTPUT_CAP_BYTES: usize = 48 * 1024;
+
+/// Enforce [`TOOL_OUTPUT_CAP_BYTES`] on a captured output, marking the cut.
+pub fn truncate_tool_output(mut text: String) -> String {
+    if text.len() <= TOOL_OUTPUT_CAP_BYTES {
+        return text;
+    }
+    let mut end = TOOL_OUTPUT_CAP_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str("\n… [output truncated]");
+    text
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -211,6 +309,9 @@ pub enum AgentEvent {
         session_id: String,
         assistant_message_id: String,
     },
+    SessionTitleChanged {
+        title: String,
+    },
     TextDelta {
         text: String,
     },
@@ -230,6 +331,13 @@ pub enum AgentEvent {
     ToolResult {
         id: String,
         is_error: bool,
+        /// Harness-reported tool output (plain text, capped at
+        /// [`TOOL_OUTPUT_CAP_BYTES`] by the capturing adapter). Journal-only:
+        /// never folded into doc parts — the transcript fetches it on demand
+        /// via `ToolCallDetail`. Serde-defaulted so old journal lines and old
+        /// peers stay readable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
     },
     /// Kept as a harness passthrough (rate-limit probes); never persisted to docs.
     #[serde(rename_all = "camelCase")]
@@ -296,6 +404,21 @@ mod tests {
         let round: RunRequest =
             serde_json::from_value(serde_json::to_value(&req).unwrap()).unwrap();
         assert_eq!(round.attachments, vec!["/tmp/a.png".to_string()]);
+    }
+
+    #[test]
+    fn run_request_defaults_to_auto_approve_but_preserves_explicit_opt_out() {
+        let defaulted: RunRequest = serde_json::from_str(
+            r#"{"prompt":"p","model":null,"reasoning":null,"cwd":".","sandbox":"workspace-write","resume":null}"#,
+        )
+        .unwrap();
+        assert!(defaulted.auto_approve);
+
+        let explicit: RunRequest = serde_json::from_str(
+            r#"{"prompt":"p","model":null,"reasoning":null,"cwd":".","sandbox":"workspace-write","autoApprove":false,"resume":null}"#,
+        )
+        .unwrap();
+        assert!(!explicit.auto_approve);
     }
 
     #[test]

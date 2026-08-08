@@ -53,11 +53,14 @@ case "$turnline" in
   # Verify the turn/start + thread/start params the harness must send.
   for want in '"method":"turn/start"' '"effort":"ultra"' '"model":"gpt-5.6-sol"' \
     '"networkAccess":true' '"type":"workspaceWrite"' \
-    '"approvalPolicy":"never"' '"summary":"auto"' \
-    '"serviceTier":"fast"'; do
+    '"mcp_elicitations":true' '"request_permissions":true' \
+    '"rules":false' '"sandbox_approval":false' '"skill_approval":true' \
+    '"approvalsReviewer":"user"' '"summary":"auto"' '"serviceTier":"fast"'; do
     has "$turnline" "$want" || { fail_turn "$tid" "turn param missing: $want"; exit 0; }
   done
-  for want in '"approvalPolicy":"never"' '"sandbox":"workspace-write"' '"cwd":"/tmp"' \
+  for want in '"mcp_elicitations":true' '"request_permissions":true' \
+    '"rules":false' '"sandbox_approval":false' '"skill_approval":true' \
+    '"approvalsReviewer":"user"' '"sandbox":"workspace-write"' '"cwd":"/tmp"' \
     '"serviceTier":"fast"'; do
     has "$thread_line" "$want" || { fail_turn "$tid" "thread param missing: $want"; exit 0; }
   done
@@ -131,13 +134,16 @@ case "$turnline" in
   ;;
 
 *scenario:approve*)
-  # Wire policy is always "never" (unattended parity with the Claude
-  # adapter); the requests below are the STRAY-approval path, which must
-  # still round-trip as input questions.
-  has "$thread_line" '"approvalPolicy":"never"' ||
-    { fail_turn "$tid" "thread approvalPolicy should be never"; exit 0; }
-  has "$turnline" '"approvalPolicy":"never"' ||
-    { fail_turn "$tid" "turn approvalPolicy should be never"; exit 0; }
+  # Comet stays unattended for ordinary sandbox/rule gates, but preserves the
+  # provider's explicit safety, permission, and elicitation requests.
+  for line in "$thread_line" "$turnline"; do
+    for want in '"mcp_elicitations":true' '"request_permissions":true' \
+      '"rules":false' '"sandbox_approval":false' '"skill_approval":true' \
+      '"approvalsReviewer":"user"'; do
+      has "$line" "$want" ||
+        { fail_turn "$tid" "provider approval policy missing: $want"; exit 0; }
+    done
+  done
   emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
   emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'
   emit '{"id":101,"method":"item/commandExecution/requestApproval","params":{"itemId":"c1","command":"rm -rf /tmp/x"}}'
@@ -148,6 +154,18 @@ case "$turnline" in
   read -r a2 || exit 1
   { has "$a2" '"id":102' && has "$a2" '"decision":"accept"'; } ||
     { emit '{"method":"turn/failed","params":{"turn":{"id":"t-1","error":{"message":"file approval not accepted"}}}}'; exit 0; }
+  emit '{"id":103,"method":"item/permissions/requestApproval","params":{"itemId":"p1","reason":"Connect to the provider","permissions":{"network":{"enabled":true}}}}'
+  read -r a3 || exit 1
+  { has "$a3" '"id":103' && has "$a3" '"permissions":{"network":{"enabled":true}}' && has "$a3" '"scope":"turn"'; } ||
+    { emit '{"method":"turn/failed","params":{"turn":{"id":"t-1","error":{"message":"permission grant not accepted"}}}}'; exit 0; }
+  emit '{"id":104,"method":"item/tool/requestUserInput","params":{"itemId":"q1","questions":[{"id":"safety","header":"Safety check","question":"Continue with this provider?","options":[{"label":"Continue","description":"Proceed"},{"label":"Cancel","description":"Stop"}]}]}}'
+  read -r a4 || exit 1
+  { has "$a4" '"id":104' && has "$a4" '"safety":{"answers":["Continue"]}'; } ||
+    { emit '{"method":"turn/failed","params":{"turn":{"id":"t-1","error":{"message":"tool input not returned"}}}}'; exit 0; }
+  emit '{"id":105,"method":"mcpServer/elicitation/request","params":{"serverName":"provider","message":"Choose a provider region.","mode":"form","requestedSchema":{"type":"object","required":["region"],"properties":{"region":{"type":"string","title":"Region","enum":["East","West"]}}}}}'
+  read -r a5 || exit 1
+  { has "$a5" '"id":105' && has "$a5" '"action":"accept"' && has "$a5" '"content":{"region":"East"}'; } ||
+    { emit '{"method":"turn/failed","params":{"turn":{"id":"t-1","error":{"message":"MCP elicitation not accepted"}}}}'; exit 0; }
   emit '{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}'
   ;;
 

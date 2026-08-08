@@ -11,7 +11,7 @@
 //! containing one drops to full reparses. The parity unit tests stream corpora
 //! through both paths and assert equality.
 
-use std::ops::Range;
+use std::{borrow::Cow, ops::Range};
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag};
 
@@ -28,6 +28,14 @@ pub struct InlineStyle {
     pub strikethrough: bool,
     /// Destination URL when inside a link.
     pub link: Option<String>,
+    /// TeX math delimited by `$…$` or `$$…$$`.
+    pub math: Option<MathStyle>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MathStyle {
+    Inline,
+    Display,
 }
 
 /// One run of identically-styled inline text.
@@ -45,6 +53,9 @@ pub enum Block {
     },
     Heading {
         level: u8,
+        runs: Vec<InlineRun>,
+    },
+    DisplayMath {
         runs: Vec<InlineRun>,
     },
     CodeBlock {
@@ -105,12 +116,83 @@ impl BlockTree {
 // ---------------------------------------------------------------------------
 
 fn options() -> Options {
-    Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS
+    Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_MATH
+}
+/// pulldown-cmark recognizes dollar-delimited math only. OMP transcripts also
+/// use the conventional TeX display delimiters on their own lines. Normalize
+/// those two-byte markers to `$$` before parsing so event offsets remain valid.
+/// Fenced code is intentionally left byte-for-byte unchanged.
+fn normalize_tex_display_delimiters(source: &str) -> Cow<'_, str> {
+    let mut replacements = Vec::new();
+    let mut fence: Option<(u8, usize)> = None;
+    let mut offset = 0usize;
+
+    for chunk in source.split_inclusive('\n') {
+        let line = chunk.strip_suffix('\n').unwrap_or(chunk);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let leading_spaces = line.bytes().take_while(|byte| *byte == b' ').count();
+        let trimmed_start = &line[leading_spaces..];
+        let fence_run = if leading_spaces <= 3 {
+            trimmed_start
+                .as_bytes()
+                .first()
+                .copied()
+                .filter(|marker| matches!(marker, b'`' | b'~'))
+                .map(|marker| {
+                    let run = trimmed_start
+                        .bytes()
+                        .take_while(|byte| *byte == marker)
+                        .count();
+                    (marker, run, &trimmed_start[run..])
+                })
+        } else {
+            None
+        };
+
+        if let Some((marker, minimum_run)) = fence {
+            if fence_run.is_some_and(|(candidate, run, rest)| {
+                candidate == marker && run >= minimum_run && rest.trim().is_empty()
+            }) {
+                fence = None;
+            }
+            offset += chunk.len();
+            continue;
+        }
+
+        if let Some((marker, run, _)) = fence_run
+            && run >= 3
+        {
+            fence = Some((marker, run));
+            offset += chunk.len();
+            continue;
+        }
+
+        let marker = trimmed_start.trim_end_matches([' ', '\t']);
+        if matches!(marker, r"\[" | r"\]") {
+            replacements.push(offset + leading_spaces);
+        }
+        offset += chunk.len();
+    }
+
+    if replacements.is_empty() {
+        return Cow::Borrowed(source);
+    }
+
+    let mut normalized = source.as_bytes().to_vec();
+    for at in replacements {
+        normalized[at] = b'$';
+        normalized[at + 1] = b'$';
+    }
+    Cow::Owned(String::from_utf8(normalized).expect("ASCII substitutions preserve UTF-8"))
 }
 
 /// Parse a whole source into a [`BlockTree`].
 pub fn parse_full(source: &str) -> BlockTree {
-    let events: Vec<(Event, Range<usize>)> = Parser::new_ext(source, options())
+    let normalized = normalize_tex_display_delimiters(source);
+    let events: Vec<(Event, Range<usize>)> = Parser::new_ext(normalized.as_ref(), options())
         .into_offset_iter()
         .collect();
     let mut cur = Cursor {
@@ -192,11 +274,10 @@ fn parse_started_block(cur: &mut Cursor) -> Vec<Block> {
         return Vec::new();
     };
     match tag {
-        Tag::Paragraph => {
-            vec![Block::Paragraph {
-                runs: parse_inline_container(cur, &InlineStyle::default()),
-            }]
-        }
+        Tag::Paragraph => vec![paragraph_block(parse_inline_container(
+            cur,
+            &InlineStyle::default(),
+        ))],
         Tag::Heading { level, .. } => vec![Block::Heading {
             level: heading_level(level),
             runs: parse_inline_container(cur, &InlineStyle::default()),
@@ -288,6 +369,27 @@ fn parse_started_block(cur: &mut Cursor) -> Vec<Block> {
     }
 }
 
+fn paragraph_block(mut runs: Vec<InlineRun>) -> Block {
+    if matches!(
+        runs.as_slice(),
+        [InlineRun {
+            style: InlineStyle {
+                math: Some(MathStyle::Display),
+                ..
+            },
+            ..
+        }]
+    ) {
+        let trimmed = runs[0].text.trim();
+        if trimmed.len() != runs[0].text.len() {
+            runs[0].text = trimmed.to_string();
+        }
+        Block::DisplayMath { runs }
+    } else {
+        Block::Paragraph { runs }
+    }
+}
+
 /// Parse a block sequence until the container's `End` (consumed). Bare inline
 /// events (tight list items) accumulate into an implicit paragraph.
 fn parse_block_sequence(cur: &mut Cursor) -> Vec<Block> {
@@ -317,9 +419,7 @@ fn parse_block_sequence(cur: &mut Cursor) -> Vec<Block> {
 
 fn flush_paragraph(out: &mut Vec<Block>, acc: &mut Vec<InlineRun>) {
     if !acc.is_empty() {
-        out.push(Block::Paragraph {
-            runs: merge_runs(std::mem::take(acc)),
-        });
+        out.push(paragraph_block(merge_runs(std::mem::take(acc))));
     }
 }
 
@@ -392,6 +492,16 @@ fn parse_inline_event(cur: &mut Cursor, runs: &mut Vec<InlineRun>, style: &Inlin
     };
     match event {
         Event::Text(t) => push(runs, t.into_string(), style.clone()),
+        Event::InlineMath(t) => {
+            let mut s = style.clone();
+            s.math = Some(MathStyle::Inline);
+            push(runs, t.into_string(), s);
+        }
+        Event::DisplayMath(t) => {
+            let mut s = style.clone();
+            s.math = Some(MathStyle::Display);
+            push(runs, t.into_string(), s);
+        }
         Event::Code(t) => {
             let mut s = style.clone();
             s.code = true;
@@ -603,7 +713,7 @@ impl IncrementalParser {
         // rules and tables have no inline tail to mend.
         if matches!(
             last.block,
-            Block::CodeBlock { .. } | Block::Rule | Block::Table { .. }
+            Block::CodeBlock { .. } | Block::DisplayMath { .. } | Block::Rule | Block::Table { .. }
         ) {
             return;
         }
@@ -668,6 +778,7 @@ mod tests {
         "    indented code line one\n    line two\n\npara\n",
         "para with <span>inline html</span> inside\n\n<div>\nblock html\n</div>\n",
         "###### deep heading\n\n#### h4\n",
+        "Inline $x^2$.\n\n$$\n6 \\times 7 + 6 \\times 5 = 72\n$$\n",
     ];
 
     #[test]
@@ -779,6 +890,49 @@ mod tests {
     }
 
     #[test]
+    fn display_and_inline_math_are_preserved_without_delimiters() {
+        let tree = parse_full(
+            "That produced an observed initial envelope of:\n\n$$\n6 \\times 7 + 6 \\times 5 = 72\n$$\n\nInline $n^2$.\n",
+        );
+        assert_eq!(tree.len(), 3);
+        let Block::DisplayMath { runs } = &tree.blocks[1].block else {
+            panic!("expected display math");
+        };
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].text, "6 \\times 7 + 6 \\times 5 = 72");
+        assert_eq!(runs[0].style.math, Some(MathStyle::Display));
+
+        let Block::Paragraph { runs } = &tree.blocks[2].block else {
+            panic!("expected inline-math paragraph");
+        };
+        let math = runs
+            .iter()
+            .find(|run| run.style.math == Some(MathStyle::Inline))
+            .expect("inline math run");
+        assert_eq!(math.text, "n^2");
+    }
+
+    #[test]
+    fn tex_display_delimiters_are_normalized_outside_code_fences() {
+        let tree = parse_full(
+            "Before.\n\n\\[\nB_1 < R_1 \\approx B_2 < R_2\n\\]\n\n```text\n\\[\nnot math\n\\]\n```\n",
+        );
+        assert_eq!(tree.len(), 3);
+
+        let Block::DisplayMath { runs } = &tree.blocks[1].block else {
+            panic!("expected TeX display delimiters to produce display math");
+        };
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].text, "B_1 < R_1 \\approx B_2 < R_2");
+        assert_eq!(runs[0].style.math, Some(MathStyle::Display));
+
+        let Block::CodeBlock { code, .. } = &tree.blocks[2].block else {
+            panic!("expected fenced code block");
+        };
+        assert_eq!(code, "\\[\nnot math\n\\]");
+    }
+
+    #[test]
     fn nested_lists_and_tight_items() {
         let tree = parse_full("- a\n  - a1\n  - a2\n- b\n");
         let Block::List {
@@ -862,6 +1016,11 @@ mod tests {
                 }
                 Block::BlockQuote { children } => children.iter().for_each(|c| walk(c, out)),
                 Block::List { items, .. } => items.iter().flatten().for_each(|c| walk(c, out)),
+                Block::DisplayMath { runs } => {
+                    for r in runs {
+                        out.push_str(&r.text);
+                    }
+                }
                 _ => {}
             }
         }

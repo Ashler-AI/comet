@@ -24,4 +24,4 @@ pub const TERMINAL_OUTPUT_BATCH_MS: u64 = 12;
 /// Default TTL for durable commands.
 pub const COMMAND_DEFAULT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 /// Current session doc schema version (`meta.schemaVersion`).
-pub const SESSION_SCHEMA_VERSION: u32 = 1;
+pub const SESSION_SCHEMA_VERSION: u32 = comet_proto::COLLABORATION_SCHEMA_VERSION;

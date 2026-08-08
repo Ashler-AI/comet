@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
-use comet_doc::{CommandBasedOn, SessionCommandEntry, SessionCommandPayload, SessionCommandStatus};
+use comet_doc::{SessionCommandPayload, SessionCommandStatus};
 use comet_engine::{EngineCore, HarnessRegistry};
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
@@ -22,8 +22,6 @@ use comet_proto::{
     SessionStatus, SteeringMode,
 };
 use comet_rpc::methods;
-
-const VIEWER: &str = "viewer-device";
 
 /// Scripted harness: emits SessionStarted + text + Done with a per-event delay (so
 /// `Working` is observable across the bridge).
@@ -97,13 +95,13 @@ impl Harness for ScriptedHarness {
 fn registry() -> Arc<HarnessRegistry> {
     let registry = HarnessRegistry::new();
     registry.register(Arc::new(ScriptedHarness {
-        id: HarnessId::Mock,
+        id: HarnessId::ClaudeCode,
         text: "Hello",
         step_delay: Duration::from_millis(60),
     }));
     registry.register(Arc::new(ScriptedHarness {
-        id: HarnessId::Cursor,
-        text: "From cursor",
+        id: HarnessId::Codex,
+        text: "From codex",
         step_delay: Duration::from_millis(10),
     }));
     Arc::new(registry)
@@ -113,7 +111,8 @@ fn registry() -> Arc<HarnessRegistry> {
 fn assemble(dir: &std::path::Path, device_id: &str) -> EngineCore {
     std::fs::create_dir_all(dir).expect("create data dir");
     std::fs::write(dir.join("device-id"), device_id).expect("write device id");
-    EngineCore::assemble(dir, registry(), HarnessId::Mock, None).expect("engine core assembles")
+    EngineCore::assemble(dir, registry(), HarnessId::ClaudeCode, None)
+        .expect("engine core assembles")
 }
 
 /// The in-memory room: cross-import workspace-doc updates between two engines on a
@@ -126,6 +125,28 @@ fn bridge(a: &EngineCore, b: &EngineCore) -> tokio::task::JoinHandle<()> {
         loop {
             tick.tick().await;
             for (from, to) in [(da.doc(), db.doc()), (db.doc(), da.doc())] {
+                if let Ok(update) = from.export(loro::ExportMode::updates(&to.oplog_vv()))
+                    && !update.is_empty()
+                {
+                    let _ = to.import(&update);
+                }
+            }
+        }
+    })
+}
+
+/// Cross-import one session document between two engines, mirroring the
+/// authenticated SessionRoom relay used by imported sessions.
+fn bridge_session(a: &EngineCore, b: &EngineCore, chat_id: &str) -> tokio::task::JoinHandle<()> {
+    let a_handle = a.doc_host.open(chat_id).expect("open session on A");
+    let b_handle = b.doc_host.open(chat_id).expect("open session on B");
+    let da = a_handle.doc().doc().clone();
+    let db = b_handle.doc().doc().clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(20));
+        loop {
+            tick.tick().await;
+            for (from, to) in [(&da, &db), (&db, &da)] {
                 if let Ok(update) = from.export(loro::ExportMode::updates(&to.oplog_vv()))
                     && !update.is_empty()
                 {
@@ -164,25 +185,17 @@ fn run_request(prompt: &str) -> RunRequest {
     }
 }
 
-/// Queue a run command into a chat doc the way a remote viewer would (ledger rule 1).
-fn queue_run(core: &EngineCore, chat_id: &str, command_id: &str, message_id: &str) {
-    let handle = core.doc_host.open(chat_id).expect("open chat");
-    let now = chrono::Utc::now().timestamp_millis();
-    handle
-        .doc()
-        .queue_command(&SessionCommandEntry {
-            id: command_id.into(),
-            payload: SessionCommandPayload::Run {
+/// Queue a run through the device-local API. This persists local provenance;
+/// remotely authored commands use the grant-bearing `Control::Start` path.
+fn queue_run(core: &EngineCore, chat_id: &str, message_id: &str) {
+    core.doc_host
+        .queue_command(
+            chat_id,
+            SessionCommandPayload::Run {
                 request: run_request("go do it"),
                 message_id: message_id.into(),
             },
-            issued_by: VIEWER.into(),
-            issued_at: now,
-            based_on: None::<CommandBasedOn>,
-            expires_at: None,
-            status: SessionCommandStatus::Pending,
-            resolution: None,
-        })
+        )
         .expect("queue command");
 }
 
@@ -254,7 +267,7 @@ async fn two_engines_share_a_workspace() {
     .await;
 
     // Run on A: B's workspace view shows the session Working, then Idle.
-    queue_run(&a, "chat-1", "cmd-run-1", "m-1");
+    queue_run(&a, "chat-1", "m-1");
     let b_status = |wanted: SessionStatus| {
         let doc = b.workspace.doc_arc();
         move || {
@@ -339,6 +352,106 @@ async fn two_engines_share_a_workspace() {
 }
 
 #[tokio::test]
+async fn imported_session_chat_executes_on_its_remote_host() {
+    const TARGET: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let a = assemble(dir_a.path(), "dev-a");
+    let b = assemble(dir_b.path(), "dev-b");
+    let workspace_link = bridge(&a, &b);
+    let client_a = comet_rpc::memory_client(a.rpc_service());
+    let client_b = comet_rpc::memory_client(b.rpc_service());
+
+    client_b
+        .call(
+            methods::MUTATE,
+            serde_json::json!({
+                "op": "createSpace", "spaceId": "space-b", "deviceId": "dev-b", "path": "/tmp"
+            }),
+        )
+        .await
+        .expect("create target space");
+    client_b
+        .call(
+            methods::MUTATE,
+            serde_json::json!({
+                "op": "createChat", "chatId": TARGET, "spaceId": "space-b"
+            }),
+        )
+        .await
+        .expect("create target chat");
+    wait_for(
+        || {
+            a.workspace
+                .doc()
+                .chat(TARGET)
+                .ok()
+                .flatten()
+                .is_some_and(|chat| chat.device_id == "dev-b")
+        },
+        "target ownership on sender",
+    )
+    .await;
+
+    client_a
+        .call(
+            methods::ADD_SESSION_REF,
+            serde_json::json!({ "chatId": TARGET }),
+        )
+        .await
+        .expect("import remote session");
+    wait_for(
+        || {
+            b.workspace
+                .doc()
+                .read_session_refs()
+                .unwrap_or_default()
+                .iter()
+                .any(|session_ref| session_ref.chat_id == TARGET)
+        },
+        "imported membership on target host",
+    )
+    .await;
+
+    let session_link = bridge_session(&a, &b, TARGET);
+    a.doc_host
+        .queue_command(
+            TARGET,
+            SessionCommandPayload::Queue {
+                prompt: "remote collaborator message".into(),
+                message_id: Some("remote-message".into()),
+            },
+        )
+        .expect("queue imported session message");
+    let target_handle = b.doc_host.open(TARGET).unwrap();
+    let target_doc = target_handle.doc();
+    wait_for(
+        || {
+            target_doc
+                .read_commands()
+                .unwrap_or_default()
+                .iter()
+                .any(|command| command.status == SessionCommandStatus::Applied)
+        },
+        "remote chat command execution",
+    )
+    .await;
+    assert!(
+        target_doc
+            .read_entries()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.id == "remote-message"),
+        "the remote host must persist the collaborator's user turn"
+    );
+
+    workspace_link.abort();
+    session_link.abort();
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test]
 async fn claim_on_first_command_creates_the_chat_row() {
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();
@@ -347,7 +460,7 @@ async fn claim_on_first_command_creates_the_chat_row() {
     let link = bridge(&a, &b);
 
     // No CreateChat: the first run command claims the chat under A's device id.
-    queue_run(&a, "chat-claimed", "cmd-claim-1", "m-1");
+    queue_run(&a, "chat-claimed", "m-1");
     wait_for(
         || {
             b.workspace
@@ -404,7 +517,7 @@ async fn imported_session_ref_watches_and_never_claims_host_placement() {
         "imported session must remain non-hosted"
     );
 
-    queue_run(&core, SESSION_ID, "cmd-imported", "m-imported");
+    queue_run(&core, SESSION_ID, "m-imported");
     tokio::time::sleep(Duration::from_millis(200)).await;
     let handle = core.doc_host.open(SESSION_ID).unwrap();
     assert_eq!(
@@ -444,7 +557,7 @@ async fn non_host_engine_leaves_remote_chats_commands_alone() {
     a.workspace
         .create_chat("chat-remote", "space-remote", None, None)
         .expect("create remote-hosted chat row");
-    queue_run(&a, "chat-remote", "cmd-remote-1", "m-1");
+    queue_run(&a, "chat-remote", "m-1");
 
     tokio::time::sleep(Duration::from_millis(400)).await;
     let handle = a.doc_host.open("chat-remote").expect("open chat");
@@ -468,7 +581,7 @@ async fn non_host_engine_leaves_remote_chats_commands_alone() {
 #[tokio::test]
 async fn chat_config_selects_the_run_harness() {
     let dir_a = tempfile::tempdir().unwrap();
-    let a = assemble(dir_a.path(), "dev-a"); // default harness = Mock ("Hello")
+    let a = assemble(dir_a.path(), "dev-a"); // default harness = Claude Code ("Hello")
 
     a.workspace
         .create_space("space-cfg", "dev-a", "/tmp/cfg", None, false)
@@ -478,7 +591,7 @@ async fn chat_config_selects_the_run_harness() {
             "chat-cfg",
             "space-cfg",
             Some(ChatConfig {
-                harness: HarnessId::Cursor,
+                harness: HarnessId::Codex,
                 model: None,
                 reasoning: None,
                 model_options: Default::default(),
@@ -487,15 +600,15 @@ async fn chat_config_selects_the_run_harness() {
             None,
         )
         .expect("create configured chat");
-    queue_run(&a, "chat-cfg", "cmd-cfg-1", "m-1");
+    queue_run(&a, "chat-cfg", "m-1");
 
-    // The configured harness (Cursor, "From cursor") ran — not the default Mock.
+    // The configured harness (Codex, "From codex") ran — not the default Claude Code.
     let handle = a.doc_host.open("chat-cfg").expect("open chat");
     wait_for(
         || {
             handle.doc().read_entries().unwrap_or_default().iter().any(|e| {
                 e.parts.iter().any(
-                    |p| matches!(p, comet_doc::MessagePart::Text { text, .. } if text == "From cursor"),
+                    |p| matches!(p, comet_doc::MessagePart::Text { text, .. } if text == "From codex"),
                 )
             })
         },
@@ -529,8 +642,16 @@ async fn two_engines_converge_through_a_real_workspace_room() {
             base.clone(),
             format!("{user}@{org}"),
         ));
-        EngineCore::assemble_with_identity(dir, registry(), HarnessId::Mock, edge, &org, user)
-            .expect("engine core assembles")
+        EngineCore::assemble_with_identity(
+            dir,
+            registry(),
+            HarnessId::ClaudeCode,
+            edge,
+            &org,
+            user,
+            comet_proto::RuntimeProfile::Mock,
+        )
+        .expect("engine core assembles")
     };
 
     // Workspace docs are per-user (`ws3/{org}/{user}`): convergence is across

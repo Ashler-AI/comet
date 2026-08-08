@@ -25,8 +25,8 @@ use comet_doc::{
 use comet_engine::{EngineCore, HarnessRegistry, RunJournal};
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
-    SteeringMode,
+    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, RuntimeProfile,
+    SandboxLevel, SteeringMode,
 };
 use comet_sync::DocsStore;
 
@@ -121,11 +121,27 @@ impl Harness for RecordingHarness {
     }
 }
 
+/// Identity is pinned (`assemble_with_identity`, not env-reading `assemble`):
+/// the crash-recovery tests seed `projects/ashler-local/dev-user` directly, so
+/// they must stay hermetic under a developer shell that exports a real
+/// `$COMET_PROJECT_SCOPE` / `$COMET_USER_ID`.
 fn assemble(dir: &std::path::Path, harness: RecordingHarness) -> EngineCore {
-    let registry = HarnessRegistry::new();
+    let registry = HarnessRegistry::for_profile(RuntimeProfile::Mock);
     registry.register(Arc::new(harness));
-    EngineCore::assemble(dir, Arc::new(registry), HarnessId::Mock, None)
-        .expect("engine core assembles")
+    assemble_registry(dir, Arc::new(registry))
+}
+
+fn assemble_registry(dir: &std::path::Path, registry: Arc<HarnessRegistry>) -> EngineCore {
+    EngineCore::assemble_with_identity(
+        dir,
+        registry,
+        HarnessId::Mock,
+        None,
+        "ashler-local",
+        "dev-user",
+        RuntimeProfile::Mock,
+    )
+    .expect("engine core assembles")
 }
 
 fn queue_run(core: &EngineCore, prompt: &str, cwd: &str, message_id: &str) {
@@ -188,9 +204,8 @@ fn stored_harness_session(core: &EngineCore) -> Option<(String, Option<String>)>
         .map(|id| (id, chat.harness_session_cwd))
 }
 
-/// Create + name the chat row up front so the auto-titler (which runs its own
-/// harness request after a completed exchange on an UNTITLED chat) stays out
-/// of the recorded request log.
+/// Create + name the chat row up front so recorded state stays focused on
+/// restart/resume behavior rather than deterministic local titling.
 fn pre_title(core: &EngineCore) {
     core.workspace
         .create_space("space-restart", &core.device_id, "/tmp", None, false)
@@ -320,7 +335,7 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
     //   the only copy of the harness session id (the debounced workspace-row
     //   write never landed).
     {
-        let store = DocsStore::open(dir.join("orgs/dev-org/dev-user")).unwrap();
+        let store = DocsStore::open(dir.join("projects/ashler-local/dev-user")).unwrap();
         let doc = SessionDoc::init(CHAT).unwrap();
         doc.push_message(&SessionMessageEntry {
             id: "msg-user-1".into(),
@@ -352,7 +367,8 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
             .save_snapshot(CHAT, &doc.export_snapshot().unwrap())
             .unwrap();
 
-        let journal = RunJournal::open(dir.join("orgs/dev-org/dev-user/journals")).unwrap();
+        let journal =
+            RunJournal::open(dir.join("projects/ashler-local/dev-user/journals")).unwrap();
         journal
             .append(
                 CHAT,
@@ -392,7 +408,7 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[1].status, Some(MessageStatus::Aborted));
     // … and closed the stale journal with a synthetic Done.
-    let journal = RunJournal::open(dir.join("orgs/dev-org/dev-user/journals")).unwrap();
+    let journal = RunJournal::open(dir.join("projects/ashler-local/dev-user/journals")).unwrap();
     assert!(matches!(
         journal.last_event(CHAT).unwrap(),
         Some((_, AgentEvent::Done { .. }))
@@ -445,7 +461,7 @@ impl Harness for PersistentHarness {
     }
     async fn run(
         &self,
-        request: RunRequest,
+        _request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         *self.runs_started.lock().unwrap() += 1;
@@ -512,12 +528,11 @@ async fn persistent_session_serves_multiple_turns_on_one_child() {
     std::fs::create_dir_all(&dir).unwrap();
 
     let runs_started = Arc::new(Mutex::new(0usize));
-    let registry = HarnessRegistry::new();
+    let registry = HarnessRegistry::for_profile(RuntimeProfile::Mock);
     registry.register(Arc::new(PersistentHarness {
         runs_started: runs_started.clone(),
     }));
-    let core = EngineCore::assemble(&dir, Arc::new(registry), HarnessId::Mock, None)
-        .expect("engine core assembles");
+    let core = assemble_registry(&dir, Arc::new(registry));
     pre_title(&core);
 
     queue_run(&core, "first", "/tmp", "msg-user-1");
@@ -566,7 +581,7 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
         .unwrap()
         .as_millis() as i64;
     {
-        let store = DocsStore::open(dir.join("orgs/dev-org/dev-user")).unwrap();
+        let store = DocsStore::open(dir.join("projects/ashler-local/dev-user")).unwrap();
         let doc = SessionDoc::init(CHAT).unwrap();
         doc.push_message(&SessionMessageEntry {
             id: "msg-user-1".into(),
@@ -598,7 +613,8 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
             .save_snapshot(CHAT, &doc.export_snapshot().unwrap())
             .unwrap();
 
-        let journal = RunJournal::open(dir.join("orgs/dev-org/dev-user/journals")).unwrap();
+        let journal =
+            RunJournal::open(dir.join("projects/ashler-local/dev-user/journals")).unwrap();
         journal
             .append(
                 CHAT,
@@ -663,7 +679,6 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
         1
     );
     // The revived run continues the journal-recovered harness conversation.
-    // (An auto-title request may precede it — titling fires at dispatch.)
     let recorded = requests.lock().unwrap().clone();
     let revived = recorded
         .iter()
@@ -792,7 +807,9 @@ async fn real_claude_remembers_codeword_across_engine_restart() {
     let assemble_real = || {
         EngineCore::assemble(
             &dir,
-            Arc::new(comet_engine::default_registry()),
+            Arc::new(comet_engine::default_registry(
+                comet_proto::RuntimeProfile::LocalController,
+            )),
             HarnessId::ClaudeCode,
             None,
         )
@@ -800,7 +817,7 @@ async fn real_claude_remembers_codeword_across_engine_restart() {
     };
 
     let core = assemble_real();
-    pre_title(&core); // keep the auto-titler from spending a second model call
+    pre_title(&core); // keep title changes out of this restart-focused scenario
     core.doc_host
         .queue_command(
             CHAT,

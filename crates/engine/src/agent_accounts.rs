@@ -940,7 +940,7 @@ impl AgentAccounts {
         }
         #[cfg(target_os = "macos")]
         {
-            return keychain::read_credentials().await;
+            keychain::read_credentials().await
         }
         #[cfg(not(target_os = "macos"))]
         (None, None)
@@ -1294,6 +1294,9 @@ fn harness_slug(harness: HarnessId) -> &'static str {
     match harness {
         HarnessId::ClaudeCode => "claude-code",
         HarnessId::Codex => "codex",
+        HarnessId::Omp => "omp",
+        HarnessId::PrimeAgent => "prime-agent",
+        HarnessId::OpenCode => "opencode",
         HarnessId::Cursor => "cursor",
         HarnessId::Mock => "mock",
     }

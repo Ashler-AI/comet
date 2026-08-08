@@ -52,7 +52,9 @@ fn assemble(dir: &Path) -> EngineCore {
     std::fs::create_dir_all(dir).expect("data dir");
     EngineCore::assemble(
         dir,
-        Arc::new(HarnessRegistry::new()),
+        Arc::new(HarnessRegistry::for_profile(
+            comet_proto::RuntimeProfile::Mock,
+        )),
         comet_proto::HarnessId::Mock,
         None,
     )
@@ -140,11 +142,9 @@ async fn repos_round_trip_add_branches_worktrees() {
     );
     assert!(PathBuf::from(&worktree.path).join("a.txt").exists());
     assert!(worktree.checkout_id.is_some());
-    assert!(
-        worktree
-            .path
-            .starts_with(&*tmp.path().join("data").to_string_lossy())
-    );
+    let canonical_data_root =
+        std::fs::canonicalize(tmp.path().join("data")).expect("canonical data root");
+    assert!(Path::new(&worktree.path).starts_with(canonical_data_root));
     let branches = repos
         .branches(&repo_dir)
         .await
@@ -544,6 +544,40 @@ async fn diff_sync_publishes_and_updates_chat_branch() {
     core.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_sync_ignores_archived_chats() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir).await;
+    std::fs::write(repo_dir.join("a.txt"), "one\ntwo\nedited\n").expect("dirty tree");
+
+    let core = assemble(&tmp.path().join("data"));
+    core.workspace
+        .create_space(
+            "space-archived",
+            &core.device_id,
+            &repo_dir.to_string_lossy(),
+            None,
+            true,
+        )
+        .expect("space row");
+    core.workspace
+        .create_chat("chat-archived", "space-archived", None, None)
+        .expect("chat row");
+    core.workspace
+        .set_chat_archived("chat-archived", true)
+        .expect("archive chat");
+
+    core.diff_sync.reconcile_now().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    assert!(
+        core.diff_sync.watch_diffs().borrow().is_empty(),
+        "archived chats must not retain a live checkout diff"
+    );
+    core.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // Terminals
 // ---------------------------------------------------------------------------
@@ -675,10 +709,9 @@ async fn terminal_guards_input_size_and_cwd() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rpc_dispatch_for_m5_methods() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    // EngineCore's Repos resolves the worktree root from the env; keep test
-    // worktrees out of $HOME. (Process-global — this is the only test that sets it.)
-    unsafe { std::env::set_var("COMET_WORKTREES_DIR", tmp.path().join("worktrees")) };
-    let core = assemble(&tmp.path().join("data"));
+    let data_dir = tmp.path().join("data");
+    let mut core = assemble(&data_dir);
+    core.repos = test_repos(&data_dir);
     let client = comet_rpc::memory_client(core.rpc_service());
 
     // CreateRepo → ListRepos.

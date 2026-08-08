@@ -11,7 +11,6 @@ import SwiftUI
 final class AppModel {
     enum Phase {
         case signedOut
-        case pickingOrg(AuthTokens, [AuthOrg])
         case ready
     }
 
@@ -23,10 +22,10 @@ final class AppModel {
     private var config: AppConfig?
 
     // Persisted connection settings.
-    @ObservationIgnored @AppStorage("edgeURL") var edgeURLString = "https://edge.comet.zeron.sh"
-    @ObservationIgnored @AppStorage("authMode") var authModeRaw = AppConfig.Mode.workos.rawValue
+    @ObservationIgnored @AppStorage("edgeURL") var edgeURLString = "https://comet.internal.ashler.com"
+    @ObservationIgnored @AppStorage("authMode") var authModeRaw = AppConfig.Mode.scaffold.rawValue
     @ObservationIgnored @AppStorage("userId") var storedUserId = ""
-    @ObservationIgnored @AppStorage("orgId") var storedOrgId = ""
+    @ObservationIgnored @AppStorage("projectScope") var storedProjectScope = ""
     @ObservationIgnored @AppStorage("deviceId") var storedDeviceId = ""
 
     var deviceId: String {
@@ -62,7 +61,7 @@ final class AppModel {
         override("-setedge") { edgeURLString = $0 }
         override("-setmode") { authModeRaw = $0 }
         override("-setuser") { storedUserId = $0 }
-        override("-setorg") { storedOrgId = $0 }
+        override("-setproject") { storedProjectScope = $0 }
         if args.contains("-bench") {
             Task { await BenchRunner.run() }
             return
@@ -114,63 +113,55 @@ final class AppModel {
             launchAutosend = args.contains("-autosend")
             return
         }
-        guard let url = URL(string: edgeURLString), !storedUserId.isEmpty, !storedOrgId.isEmpty else {
-            return
-        }
-        let mode = AppConfig.Mode(rawValue: authModeRaw) ?? .workos
+        guard let url = URL(string: edgeURLString),
+              !storedUserId.isEmpty,
+              !storedProjectScope.isEmpty else { return }
+        let mode = AppConfig.Mode(rawValue: authModeRaw) ?? .scaffold
         switch mode {
         case .dev:
-            connect(url: url, mode: .dev, userId: storedUserId, orgId: storedOrgId,
-                    tokens: nil, devBearer: devBearer(userId: storedUserId, orgId: storedOrgId))
-        case .workos:
-            guard let access = Keychain.load(key: "accessToken"),
-                  let refresh = Keychain.load(key: "refreshToken") else { return }
-            connect(url: url, mode: .workos, userId: storedUserId, orgId: storedOrgId,
-                    tokens: AuthTokens(accessToken: access, refreshToken: refresh), devBearer: nil)
+            connect(url: url, mode: .dev, userId: storedUserId,
+                    projectScope: storedProjectScope, tokens: nil,
+                    devBearer: devBearer(userId: storedUserId, projectScope: storedProjectScope))
+        case .scaffold:
+            guard let access = Keychain.load(key: "accessToken") else { return }
+            connect(url: url, mode: .scaffold, userId: storedUserId,
+                    projectScope: storedProjectScope,
+                    tokens: AuthTokens(accessToken: access), devBearer: nil)
         }
     }
 
     // MARK: Sign-in flows
 
-    /// WorkOS paste-code exchange. Returns the org list for the picker (or
-    /// connects straight away when exactly one org exists).
-    func signIn(edgeURL: URL, code: String) async throws {
-        let client = AuthClient(baseURL: edgeURL)
-        let (user, tokens) = try await client.exchange(code: code)
+    func beginSignIn(scaffoldURL: URL, redirectURI: String) async throws -> OAuthFlow {
+        try await AuthClient(scaffoldURL: scaffoldURL).beginSignIn(redirectURI: redirectURI)
+    }
+
+    func completeSignIn(
+        edgeURL: URL,
+        scaffoldURL: URL,
+        projectScope: String,
+        flow: OAuthFlow,
+        callbackURL: URL
+    ) async throws {
+        let (user, tokens) = try await AuthClient(scaffoldURL: scaffoldURL)
+            .completeSignIn(flow: flow, callbackURL: callbackURL)
+        Keychain.save(tokens.accessToken, key: "accessToken")
         edgeURLString = edgeURL.absoluteString
-        authModeRaw = AppConfig.Mode.workos.rawValue
+        authModeRaw = AppConfig.Mode.scaffold.rawValue
         storedUserId = user.id
-        let orgs = try await client.orgs(accessToken: tokens.accessToken)
-        if let only = orgs.first, orgs.count == 1 {
-            try await selectOrg(only, tokens: tokens)
-        } else if orgs.isEmpty {
-            throw AuthError.http(403, "No organizations for this account")
-        } else {
-            phase = .pickingOrg(tokens, orgs)
-        }
+        storedProjectScope = projectScope
+        connect(url: edgeURL, mode: .scaffold, userId: user.id,
+                projectScope: projectScope, tokens: tokens, devBearer: nil)
     }
 
-    func selectOrg(_ org: AuthOrg, tokens: AuthTokens) async throws {
-        guard let url = URL(string: edgeURLString) else { return }
-        // Re-scope the access token to the org (adds the org_id claim).
-        let client = AuthClient(baseURL: url)
-        let scoped = try await client.refresh(refreshToken: tokens.refreshToken,
-                                              organizationId: org.organizationId)
-        Keychain.save(scoped.accessToken, key: "accessToken")
-        Keychain.save(scoped.refreshToken, key: "refreshToken")
-        storedOrgId = org.organizationId
-        connect(url: url, mode: .workos, userId: storedUserId, orgId: org.organizationId,
-                tokens: scoped, devBearer: nil)
-    }
-
-    /// Dev-mode edge (AUTH_MODE=dev): bearer = "userId@orgId".
-    func signInDev(edgeURL: URL, userId: String, orgId: String) {
+    /// Local development edge: bearer = "userId@projectScope".
+    func signInDev(edgeURL: URL, userId: String, projectScope: String) {
         edgeURLString = edgeURL.absoluteString
         authModeRaw = AppConfig.Mode.dev.rawValue
         storedUserId = userId
-        storedOrgId = orgId
-        connect(url: edgeURL, mode: .dev, userId: userId, orgId: orgId,
-                tokens: nil, devBearer: devBearer(userId: userId, orgId: orgId))
+        storedProjectScope = projectScope
+        connect(url: edgeURL, mode: .dev, userId: userId, projectScope: projectScope,
+                tokens: nil, devBearer: devBearer(userId: userId, projectScope: projectScope))
     }
 
     func enterDemoMode() {
@@ -187,22 +178,21 @@ final class AppModel {
         config = nil
         demo = nil
         Keychain.delete(key: "accessToken")
-        Keychain.delete(key: "refreshToken")
         DocDisk.wipeAll()  // local doc state belongs to the signed-in identity
         storedUserId = ""
-        storedOrgId = ""
+        storedProjectScope = ""
         phase = .signedOut
     }
 
-    private func devBearer(userId: String, orgId: String) -> String {
-        orgId.isEmpty ? userId : "\(userId)@\(orgId)"
+    private func devBearer(userId: String, projectScope: String) -> String {
+        projectScope.isEmpty ? userId : "\(userId)@\(projectScope)"
     }
 
-    private func connect(url: URL, mode: AppConfig.Mode, userId: String, orgId: String,
+    private func connect(url: URL, mode: AppConfig.Mode, userId: String, projectScope: String,
                          tokens: AuthTokens?, devBearer: String?) {
-        let config = AppConfig(edgeURL: url, mode: mode, userId: userId, orgId: orgId,
-                               deviceId: deviceId, deviceName: deviceName,
-                               tokens: tokens, devBearer: devBearer)
+        let config = AppConfig(edgeURL: url, mode: mode, userId: userId,
+                               projectScope: projectScope, deviceId: deviceId,
+                               deviceName: deviceName, tokens: tokens, devBearer: devBearer)
         self.config = config
         let store = WorkspaceStore(config: config)
         workspace = store

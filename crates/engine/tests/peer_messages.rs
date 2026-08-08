@@ -13,8 +13,8 @@ use comet_doc::{
 use comet_engine::{EngineCore, HarnessRegistry};
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
-    AgentEvent, ChatConfig, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
-    SteeringMode,
+    AgentEvent, ChatConfig, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest,
+    RuntimeProfile, SandboxLevel, SteeringMode,
 };
 use comet_rpc::methods;
 use tokio::sync::Mutex;
@@ -92,7 +92,7 @@ fn assemble(dir: &std::path::Path) -> (EngineCore, RequestLog) {
     std::fs::create_dir_all(dir).expect("create data dir");
     std::fs::write(dir.join("device-id"), "peer-test-device").expect("write device id");
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let registry = HarnessRegistry::new();
+    let registry = HarnessRegistry::for_profile(RuntimeProfile::Mock);
     registry.register(Arc::new(RecordingHarness {
         requests: requests.clone(),
         run_number: AtomicU64::new(1),
@@ -216,10 +216,11 @@ async fn send_auto_refs_foreign_target_and_dedupes_caller_command_id() {
     assert_eq!(first["commandId"], COMMAND);
     assert_eq!(first["threadId"], COMMAND);
 
+    let user_id = core.auth().user_id().expect("development user id");
     let session_ref = core
         .workspace
         .doc()
-        .session_ref(TARGET)
+        .session_ref(&user_id, TARGET)
         .expect("read target membership")
         .expect("target auto-ref");
     assert_eq!(session_ref.chat_id, TARGET);

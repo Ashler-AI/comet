@@ -1,6 +1,6 @@
 //! M5c integration: agent-account slot mechanics (claude-swap), uploads
-//! chunk→commit→readback + path jail, chat auto-titling with the mock harness,
-//! and the RPC dispatch for each new method over the memory transport.
+//! chunk→commit→readback + path jail, deterministic local chat titling, and
+//! the RPC dispatch for each new method over the memory transport.
 //!
 //! Account tests use explicit `AgentAccountsConfig` paths under a tempdir (never
 //! the real `~/.claude` / `~/.codex`), so they are hermetic and parallel-safe.
@@ -18,7 +18,9 @@ use comet_engine::{
     worktree_branch_from_title,
 };
 use comet_harness::mock::MockHarness;
-use comet_proto::{AgentAccountsSnapshot, AgentEvent, DoneStatus, HarnessId, SandboxLevel};
+use comet_proto::{
+    AgentAccountsSnapshot, AgentEvent, DoneStatus, HarnessId, RuntimeProfile, SandboxLevel,
+};
 use comet_rpc::methods;
 
 // ---------------------------------------------------------------------------
@@ -113,10 +115,27 @@ fn account_emails(snapshot: &AgentAccountsSnapshot, harness: HarnessId) -> Vec<(
 }
 
 fn assemble_with_mock(dir: &Path, script: Vec<AgentEvent>) -> EngineCore {
+    assemble_with_profile(dir, script, RuntimeProfile::Mock)
+}
+
+fn assemble_with_profile(
+    dir: &Path,
+    script: Vec<AgentEvent>,
+    profile: RuntimeProfile,
+) -> EngineCore {
     std::fs::create_dir_all(dir).expect("data dir");
-    let registry = HarnessRegistry::new();
+    let registry = HarnessRegistry::for_profile(profile);
     registry.register(Arc::new(MockHarness { script }));
-    EngineCore::assemble(dir, Arc::new(registry), HarnessId::Mock, None).expect("engine assembles")
+    EngineCore::assemble_with_identity(
+        dir,
+        Arc::new(registry),
+        HarnessId::Mock,
+        None,
+        "test-project",
+        "test-user",
+        profile,
+    )
+    .expect("engine assembles")
 }
 
 async fn git(cwd: &Path, args: &[&str]) {
@@ -527,6 +546,9 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
             AgentEvent::TextDelta {
                 text: "Fix Login Flow".into(),
             },
+            AgentEvent::SessionTitleChanged {
+                title: "OMP Generated Name".into(),
+            },
             AgentEvent::Done {
                 status: DoneStatus::Completed,
                 result: None,
@@ -568,19 +590,26 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         .await
         .expect("dispatch");
 
-    // The mock's scripted reply doubles as the titling model's output.
-    let chat = wait_for("chat title", || {
+    // The first prompt supplies Comet's immediate provisional title and branch.
+    // A later ACP session-info update replaces only that provisional chat title.
+    let chat = wait_for("harness chat title", || {
         core.workspace
             .doc()
             .chat(chat_id)
             .ok()
             .flatten()
-            .filter(|c| c.title.as_deref().is_some_and(|t| !t.is_empty()))
+            .filter(|c| {
+                c.title.as_deref() == Some("OMP Generated Name")
+                    && c.branch.as_deref() == Some("comet/please-fix-the-login-flow")
+            })
     })
     .await;
-    assert_eq!(chat.title.as_deref(), Some("Fix Login Flow"));
+    assert_eq!(chat.title.as_deref(), Some("OMP Generated Name"));
     // Branch renamed from the title, chat row updated to match.
-    assert_eq!(chat.branch.as_deref(), Some("comet/fix-login-flow"));
+    assert_eq!(
+        chat.branch.as_deref(),
+        Some("comet/please-fix-the-login-flow")
+    );
     let head = tokio::process::Command::new("git")
         .args(["branch", "--show-current"])
         .current_dir(&worktree.path)
@@ -589,7 +618,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         .expect("git");
     assert_eq!(
         String::from_utf8_lossy(&head.stdout).trim(),
-        "comet/fix-login-flow"
+        "comet/please-fix-the-login-flow"
     );
 
     // A titled chat is never re-titled: rename, run again, title sticks.
@@ -695,7 +724,11 @@ async fn rename_worktree_branch_guards_and_collisions() {
 #[tokio::test]
 async fn rpc_dispatch_for_m5c_methods() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let core = assemble_with_mock(&tmp.path().join("data"), Vec::new());
+    let core = assemble_with_profile(
+        &tmp.path().join("data"),
+        Vec::new(),
+        RuntimeProfile::LocalController,
+    );
     let client = comet_rpc::memory_client(core.rpc_service());
 
     // Uploads: chunk → commit → readback over the wire.

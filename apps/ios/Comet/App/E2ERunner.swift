@@ -29,7 +29,7 @@ enum E2ERunner {
         try? FileManager.default.removeItem(at: logURL)
         log("start")
         model.signInDev(edgeURL: URL(string: "http://localhost:8787")!,
-                        userId: "devuser", orgId: "dev-org")
+                        userId: "devuser", projectScope: "dev-org")
 
         // 1. Workspace room: wait for connection + the engine's device row.
         guard let workspace = model.workspace else {
@@ -139,16 +139,15 @@ extension E2ERunner {
     @MainActor
     static func runLive(model: AppModel) async {
         try? FileManager.default.removeItem(at: logURL)
-        log("live start edge=\(model.edgeURLString) mode=\(model.authModeRaw) user=\(model.storedUserId.prefix(18)) org=\(model.storedOrgId.prefix(18))")
+        log("live start edge=\(model.edgeURLString) mode=\(model.authModeRaw) user=\(model.storedUserId.prefix(18)) project=\(model.storedProjectScope.prefix(18))")
         let workspace = await poll(timeout: 25, label: "workspace connect") {
             model.workspace?.connected == true ? model.workspace : nil
         }
         guard let workspace else {
             log("FAIL workspace never connected: store=\(model.workspace != nil) "
                 + "userId=\(model.storedUserId.isEmpty ? "EMPTY" : "set") "
-                + "orgId=\(model.storedOrgId.isEmpty ? "EMPTY" : "set") "
+                + "projectScope=\(model.storedProjectScope.isEmpty ? "EMPTY" : "set") "
                 + "access=\(Keychain.load(key: "accessToken") != nil) "
-                + "refresh=\(Keychain.load(key: "refreshToken") != nil) "
                 + "mode=\(model.authModeRaw)")
             return
         }

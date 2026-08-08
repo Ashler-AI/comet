@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CrdtType, MessageType, decode, type JoinRequest } from "loro-protocol";
-import { AUTH_USER_HEADER, type Env } from "./env";
+import {
+  AUTH_CAPABILITIES_HEADER,
+  AUTH_PROJECT_HEADER,
+  AUTH_USER_HEADER,
+  type Env
+} from "./env";
 import { canonicalSessionId, SessionRoom } from "./session-room";
 
 type SqlRow = Record<string, SqlStorageValue>;
@@ -83,10 +88,13 @@ class CapturingSocket {
   close(): void {}
 }
 
+const PROJECT_SCOPE = "project-a";
+const CAPABILITIES = ["session.read", "session.chat", "session.files", "session.control"];
+
 interface JoinState {
-  /** Legacy attachment field used here to identify distinct authenticated
-   * callers; authorization intentionally ignores it. */
   userId: string;
+  projectScope: string;
+  capabilities: string[];
   rooms: string[];
   deviceId?: string;
 }
@@ -118,6 +126,8 @@ const makeRoom = (sql = new MemorySql()): { room: SessionRoom; sql: MemorySql } 
 const authedRequest = (path: string, userId: string, init: RequestInit = {}): Request => {
   const headers = new Headers(init.headers);
   headers.set(AUTH_USER_HEADER, userId);
+  headers.set(AUTH_PROJECT_HEADER, PROJECT_SCOPE);
+  headers.set(AUTH_CAPABILITIES_HEADER, CAPABILITIES.join(" "));
   return new Request(`https://room.test${path}`, { ...init, headers });
 };
 
@@ -131,7 +141,12 @@ const joinRequest = (roomId: string): JoinRequest => ({
 
 const join = async (room: SessionRoom, userId: string, roomId: string): Promise<CapturingSocket> => {
   const socket = new CapturingSocket();
-  const state: JoinState = { userId, rooms: [] };
+  const state: JoinState = {
+    userId,
+    projectScope: PROJECT_SCOPE,
+    capabilities: CAPABILITIES,
+    rooms: []
+  };
   socket.serializeAttachment(state);
   await (room as unknown as SessionRoomInternals).handleJoin(
     socket as unknown as WebSocket,
@@ -161,18 +176,16 @@ describe("SessionRoom chat authorization", () => {
     vi.useRealTimers();
   });
 
-  it("lets different authenticated users join a room with legacy owner metadata", async () => {
+  it("lets different authenticated users join within one project scope", async () => {
     const { room, sql } = makeRoom();
-    sql.meta.set("owner", "legacy-owner");
 
     await join(room, "user-a", "shared-chat");
     await join(room, "user-b", "shared-chat");
+    expect(sql.meta.get("owner")).toBe(PROJECT_SCOPE);
   });
 
-  it("lets different authenticated users mutate and read every routed chat surface", async () => {
-    const { room, sql } = makeRoom();
-    sql.meta.set("owner", "legacy-owner");
-
+  it("lets different authenticated users mutate and read every authorized chat surface", async () => {
+    const { room } = makeRoom();
     const firstWrite = await room.fetch(
       authedRequest("/diff", "user-a", {
         method: "POST",
@@ -230,15 +243,15 @@ describe("SessionRoom chat authorization", () => {
     }
   });
 
-  it("keeps an unclaimed room live and empty without creating an owner claim", async () => {
+  it("claims an empty room for the verified project on first join", async () => {
     const { room, sql } = makeRoom();
 
     const emptyTail = await room.fetch(authedRequest("/tail", "user-a"));
-    expect(emptyTail.status).toBe(200);
+    expect(emptyTail.status).toBe(404);
     await join(room, "user-a", "new-shared-chat");
 
     expect(sql.meta.get("chatId")).toBe("new-shared-chat");
-    expect(sql.meta.has("owner")).toBe(false);
+    expect(sql.meta.get("owner")).toBe(PROJECT_SCOPE);
   });
 });
 

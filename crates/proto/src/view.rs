@@ -146,10 +146,8 @@ pub enum GatePhase {
     Loading,
     /// Engine unreachable and embedding failed.
     Failed(String),
-    /// Engine up, but signed out — show the sign-in card.
+    /// Engine is signed out.
     SignIn,
-    /// Signed in but no organization selected — "Create your workspace".
-    OrgGate,
     /// Render the shell.
     Ready,
 }
@@ -162,41 +160,48 @@ pub fn gate_phase(connection: &ConnectionStatus, auth: Option<&AuthState>) -> Ga
         ConnectionStatus::Failed(err) => GatePhase::Failed(err.clone()),
         ConnectionStatus::Ready => match auth {
             Some(AuthState::SignedOut) => GatePhase::SignIn,
-            Some(AuthState::NeedsOrganization { .. }) => GatePhase::OrgGate,
             _ => GatePhase::Ready,
         },
     }
 }
 
-/// Parse an `AuthStatus` frame tolerantly. The engine currently serializes its
-/// own enum (`{"_tag": "SignedIn", ...}`) while the proto type expects
-/// `{"state": "signedIn", ...}` — accept both so either side can converge
-/// without breaking a viewport.
+/// Parse AuthStatus while accepting the previous organization-shaped frame as
+/// a migration input. New frames always carry `projectScope`.
 pub fn parse_auth_state(value: &serde_json::Value) -> Option<AuthState> {
     if let Ok(state) = serde_json::from_value::<AuthState>(value.clone()) {
         return Some(state);
     }
-    let tag = value.get("_tag").and_then(|t| t.as_str())?;
-    let user = || -> Option<crate::UserProfile> {
-        let u = value.get("user")?;
-        Some(crate::UserProfile {
-            id: u.get("id")?.as_str()?.to_string(),
-            email: u.get("email")?.as_str()?.to_string(),
-            name: u.get("name").and_then(|n| n.as_str()).map(str::to_string),
-        })
-    };
-    match tag {
-        "SignedOut" => Some(AuthState::SignedOut),
-        "NeedsOrganization" => Some(AuthState::NeedsOrganization { user: user()? }),
-        "SignedIn" => Some(AuthState::SignedIn {
-            user: user()?,
-            org_id: value
-                .get("orgId")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-        }),
-        _ => None,
+    let tag = value
+        .get("state")
+        .or_else(|| value.get("_tag"))
+        .and_then(|tag| tag.as_str())?;
+    if matches!(
+        tag,
+        "signedOut" | "SignedOut" | "needsOrganization" | "NeedsOrganization"
+    ) {
+        return Some(AuthState::SignedOut);
     }
+    if !matches!(tag, "signedIn" | "SignedIn") {
+        return None;
+    }
+    let user = value.get("user")?;
+    let profile = crate::UserProfile {
+        id: user.get("id")?.as_str()?.to_string(),
+        email: user.get("email")?.as_str()?.to_string(),
+        name: user
+            .get("name")
+            .and_then(|name| name.as_str())
+            .map(str::to_string),
+    };
+    let project_scope = value
+        .get("projectScope")
+        .or_else(|| value.get("orgId"))
+        .and_then(|scope| scope.as_str())?
+        .to_string();
+    Some(AuthState::SignedIn {
+        user: profile,
+        project_scope,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +327,42 @@ pub fn tool_chip_content(call: &crate::ToolCall) -> (&'static str, String) {
     (label, single_line(&detail))
 }
 
+fn agent_activity_detail(agents: &[crate::AgentActivity]) -> String {
+    use crate::AgentActivityStatus;
+    if let [agent] = agents {
+        let status = match agent.status {
+            AgentActivityStatus::Pending => "pending",
+            AgentActivityStatus::Running => "running",
+            AgentActivityStatus::Completed => "completed",
+            AgentActivityStatus::Failed => "failed",
+            AgentActivityStatus::Cancelled => "cancelled",
+        };
+        return format!("{} · {} · {status}", agent.id, agent.role);
+    }
+    let active = agents
+        .iter()
+        .filter(|agent| {
+            matches!(
+                agent.status,
+                AgentActivityStatus::Pending | AgentActivityStatus::Running
+            )
+        })
+        .count();
+    if active > 0 {
+        format!("{} agents · {active} active", agents.len())
+    } else {
+        let failed = agents
+            .iter()
+            .filter(|agent| agent.status == AgentActivityStatus::Failed)
+            .count();
+        if failed > 0 {
+            format!("{} agents · {failed} failed", agents.len())
+        } else {
+            format!("{} agents · completed", agents.len())
+        }
+    }
+}
+
 fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
     use crate::ToolCall;
     match call {
@@ -346,8 +387,60 @@ fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
             let done = items.iter().filter(|i| i.done).count();
             ("Todo", format!("{done}/{} done", items.len()))
         }
+        ToolCall::Agent { agents } => (
+            if agents.len() == 1 { "Agent" } else { "Agents" },
+            agent_activity_detail(agents),
+        ),
         ToolCall::Mcp { server, tool, .. } => ("MCP", format!("{server} · {tool}")),
         ToolCall::Unknown { name, .. } => ("Tool", name.clone()),
+    }
+}
+
+/// The full (multiline) input of a tool call for the expanded detail pane —
+/// unlike [`tool_chip_content`] this is NOT single-lined: an `Exec` shows the
+/// whole script, a write shows its content, an unknown/MCP tool its raw JSON
+/// args. `None` when the call carries nothing beyond the chip line.
+pub fn tool_call_input_text(call: &crate::ToolCall) -> Option<String> {
+    use crate::ToolCall;
+    fn pretty(value: &serde_json::Value) -> String {
+        serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+    }
+    match call {
+        ToolCall::Exec { command } => Some(command.clone()),
+        ToolCall::ReadFile { path } => Some(path.clone()),
+        ToolCall::WriteFile { path, content } => Some(match content {
+            Some(content) => format!("{path}\n\n{content}"),
+            None => path.clone(),
+        }),
+        ToolCall::EditFile {
+            path,
+            old_string,
+            new_string,
+        } => {
+            let mut out = path.clone();
+            if let Some(old) = old_string {
+                out.push_str("\n\n--- old\n");
+                out.push_str(old);
+            }
+            if let Some(new) = new_string {
+                out.push_str("\n\n+++ new\n");
+                out.push_str(new);
+            }
+            Some(out)
+        }
+        ToolCall::ApplyPatch { path } => path.clone(),
+        ToolCall::Search { pattern, path } => Some(match path {
+            Some(path) => format!("{pattern} in {path}"),
+            None => pattern.clone(),
+        }),
+        ToolCall::Glob { pattern } => Some(pattern.clone()),
+        ToolCall::WebFetch { url, prompt } => Some(match prompt {
+            Some(prompt) => format!("{url}\n\n{prompt}"),
+            None => url.clone(),
+        }),
+        ToolCall::WebSearch { query } => Some(query.clone()),
+        ToolCall::Todo { .. } | ToolCall::Agent { .. } => None,
+        ToolCall::Mcp { input, .. } | ToolCall::Unknown { input, .. } => input.as_ref().map(pretty),
     }
 }
 
@@ -363,6 +456,7 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
     let mut searches = 0usize;
     let mut fetches = 0usize;
     let mut todos = 0usize;
+    let mut agents = 0usize;
     let mut other = 0usize;
     let mut failed = 0usize;
     for (call, is_error) in tools {
@@ -388,6 +482,7 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
             }
             ToolCall::WebFetch { .. } => fetches += 1,
             ToolCall::Todo { .. } => todos += 1,
+            ToolCall::Agent { agents: activity } => agents += activity.len(),
             ToolCall::Mcp { .. } | ToolCall::Unknown { .. } => other += 1,
         }
     }
@@ -410,6 +505,9 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
     if todos > 0 {
         segments.push("updated todos".to_string());
     }
+    if agents > 0 {
+        segments.push(format!("used {}", plural(agents, "agent", "agents")));
+    }
     if other > 0 {
         segments.push(format!("called {}", plural(other, "tool", "tools")));
     }
@@ -426,6 +524,78 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
         summary.replace_range(0..1, &upper);
     }
     summary
+}
+
+#[cfg(test)]
+mod agent_activity_tests {
+    use super::*;
+    use crate::{AgentActivity, AgentActivityStatus, ToolCall};
+
+    fn activity(status: AgentActivityStatus) -> ToolCall {
+        ToolCall::Agent {
+            agents: vec![AgentActivity {
+                id: "PleasantBeetle".into(),
+                role: "scout".into(),
+                status,
+                model: Some("anthropic/claude-opus-5:xhigh".into()),
+            }],
+        }
+    }
+
+    #[test]
+    fn activity_chip_reports_identity_role_and_lifecycle() {
+        assert_eq!(
+            tool_chip_content(&activity(AgentActivityStatus::Running)),
+            ("Agent", "PleasantBeetle · scout · running".to_string())
+        );
+        assert_eq!(
+            tool_group_summary(&[(activity(AgentActivityStatus::Completed), false)]),
+            "Used 1 agent"
+        );
+    }
+
+    #[test]
+    fn detail_input_text_keeps_full_multiline_inputs() {
+        assert_eq!(
+            tool_call_input_text(&ToolCall::Exec {
+                command: "set -e\ncargo test".into()
+            })
+            .as_deref(),
+            Some("set -e\ncargo test")
+        );
+        assert_eq!(
+            tool_call_input_text(&ToolCall::WriteFile {
+                path: "/x".into(),
+                content: Some("body".into()),
+            })
+            .as_deref(),
+            Some("/x\n\nbody")
+        );
+        // Unknown tools render their raw JSON args (the omp harness shape).
+        let input = tool_call_input_text(&ToolCall::Unknown {
+            name: "Reading files".into(),
+            input: Some(serde_json::json!({ "path": "a.rs" })),
+        })
+        .expect("json input");
+        assert!(input.contains("\"path\": \"a.rs\""));
+        // Nothing beyond the chip line for todo/agent chips.
+        assert_eq!(
+            tool_call_input_text(&ToolCall::Todo { items: vec![] }),
+            None
+        );
+    }
+
+    #[test]
+    fn tool_output_truncation_marks_the_cut_at_a_char_boundary() {
+        let long = "é".repeat(crate::TOOL_OUTPUT_CAP_BYTES); // 2 bytes each
+        let capped = crate::truncate_tool_output(long);
+        assert!(capped.len() <= crate::TOOL_OUTPUT_CAP_BYTES + "\n… [output truncated]".len());
+        assert!(capped.ends_with("… [output truncated]"));
+        assert_eq!(
+            crate::truncate_tool_output("short".into()),
+            "short".to_string()
+        );
+    }
 }
 
 /// The status-dot palette, as oklch triples (L, C, H°).
@@ -449,7 +619,7 @@ pub mod dot {
 // Checkout selection (new sessions)
 // ---------------------------------------------------------------------------
 
-/// Where a new session runs (t3code's env-mode: `local | worktree`).
+/// Where a new session runs (`local | worktree`).
 ///
 /// "Current worktree" is deliberately **not** a third mode — it is `Local` when
 /// the picked ref already happens to be materialized as a worktree, in which
@@ -494,7 +664,7 @@ pub fn checkout_plan(kind: CheckoutKind, picked: Option<&crate::RepoRef>) -> Che
     }
 }
 
-/// Label of the checkout-kind trigger (t3code `resolveEnvModeLabel`).
+/// Label of the checkout-kind trigger.
 pub fn checkout_label(kind: CheckoutKind, picked: Option<&crate::RepoRef>) -> &'static str {
     match kind {
         CheckoutKind::NewWorktree => "New worktree",

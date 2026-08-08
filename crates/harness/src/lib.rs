@@ -14,8 +14,8 @@ use tokio::sync::{mpsc, oneshot};
 pub use tokio_util::sync::CancellationToken;
 
 use comet_proto::{
-    AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode, UserInputAnswer,
-    UserInputQuestion,
+    AgentEvent, HarnessCommand, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode,
+    UserInputAnswer, UserInputQuestion,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -29,6 +29,7 @@ pub enum HarnessError {
 }
 
 /// A steer prompt pushed into a live run; delivered at the harness's steering boundary.
+#[derive(Debug, Clone)]
 pub struct SteerMessage {
     pub prompt: String,
     pub message_id: Option<String>,
@@ -66,6 +67,9 @@ pub trait Harness: Send + Sync {
     fn steering_mode(&self) -> SteeringMode;
     fn reasoning_levels(&self) -> &[ReasoningLevel];
     async fn models(&self) -> Result<Vec<Model>, HarnessError>;
+    async fn commands(&self, _cwd: &str) -> Result<Vec<HarnessCommand>, HarnessError> {
+        Ok(Vec::new())
+    }
     /// Run one (persistent) session; the stream ends with `AgentEvent::Done`.
     async fn run(
         &self,
@@ -74,10 +78,40 @@ pub trait Harness: Send + Sync {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError>;
 }
 
+mod approval;
 pub mod claude;
 pub mod codex;
 pub mod mock;
+pub mod omp;
+pub mod prime_agent;
 pub mod shell_env;
+
+/// Product-curated model set shared by ACP-backed harness catalogs.
+///
+/// Exact ids keep renamed/legacy variants out. GPT-5.6 is admitted by family
+/// prefix because both Codex and Prime publish multiple current profiles.
+pub(crate) fn is_curated_comet_model(model_id: &str) -> bool {
+    let is_gpt_56_family = |prefix: &str| {
+        model_id == prefix
+            || model_id
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| suffix.starts_with('-'))
+    };
+    is_gpt_56_family("openai-codex/gpt-5.6")
+        || is_gpt_56_family("prime-inference/openai/gpt-5.6")
+        || matches!(
+            model_id,
+            "anthropic/claude-opus-5"
+                | "anthropic/claude-sonnet-5"
+                | "anthropic/claude-fable-5"
+                | "prime-inference/anthropic/claude-opus-5"
+                | "prime-inference/anthropic/claude-sonnet-5"
+                | "prime-inference/anthropic/claude-fable-5"
+                | "prime-inference/moonshotai/kimi-k3"
+                | "prime-inference/x-ai/grok-4.20"
+                | "prime-inference/x-ai/grok-4.20-multi-agent"
+        )
+}
 
 /// Bin directories where npm-installed CLIs land under Node version managers.
 /// GUI launches never see these on PATH — the managers shape PATH in shell
@@ -227,7 +261,8 @@ pub(crate) fn crash_message(
 
 pub use claude::ClaudeHarness;
 pub use codex::CodexHarness;
-
+pub use omp::OmpHarness;
+pub use prime_agent::PrimeAgentHarness;
 #[cfg(test)]
 mod run_context_tests {
     use super::{RunContext, apply_run_context};
