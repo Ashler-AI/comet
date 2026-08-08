@@ -126,14 +126,28 @@ async fn fake_omp_proves_acp_only_execution_and_event_mapping() {
             "spawned forbidden harness: {argv}"
         );
     }
-    assert!(events.contains(&AgentEvent::SessionStarted {
-        harness: HarnessId::Omp,
-        model: "default".into(),
-        tools: vec![],
-        cwd: String::new(),
-        session_id: "omp-session-1".into(),
-        assistant_message_id: "acp-omp-session-1".into(),
-    }));
+    let assistant_message_id = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::SessionStarted {
+                harness: HarnessId::Omp,
+                model,
+                tools,
+                cwd,
+                session_id,
+                assistant_message_id,
+            } if model == "default"
+                && tools.is_empty()
+                && cwd.is_empty()
+                && session_id == "omp-session-1" =>
+            {
+                Some(assistant_message_id)
+            }
+            _ => None,
+        })
+        .expect("OMP session start");
+    assert!(assistant_message_id.starts_with("acp-omp-session-1-"));
+    assert!(assistant_message_id.ends_with("-0"));
     assert!(
         events.contains(&AgentEvent::ReasoningDelta {
             text: "thinking".into()
@@ -148,7 +162,8 @@ async fn fake_omp_proves_acp_only_execution_and_event_mapping() {
     );
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "tool-1".into(),
-        is_error: false
+        is_error: false,
+        output: Some("# README".into()),
     }));
     assert_eq!(
         events.last(),
@@ -410,15 +425,17 @@ async fn missing_writer_probe_fails_closed_before_spawning_omp() {
 }
 
 #[tokio::test]
-async fn persistent_run_reuses_one_acp_session_for_sequential_prompts() {
+async fn persistent_run_queues_steer_while_acp_prompt_is_active() {
     let _env = env_lock().await;
     let temp = tempfile::tempdir().unwrap();
     let prompt_log = temp.path().join("prompts");
     let session_log = temp.path().join("sessions");
+    let prompt_gate = temp.path().join("prompt-gate");
     unsafe {
         std::env::set_var("OMP_ARGV_LOG", temp.path().join("argv"));
         std::env::set_var("OMP_PROMPT_LOG", &prompt_log);
         std::env::set_var("OMP_SESSION_LOG", &session_log);
+        std::env::set_var("OMP_PROMPT_GATE", &prompt_gate);
     }
     let harness = OmpHarness::new().with_executable(fixture_path());
     assert!(harness.supports_steering());
@@ -436,6 +453,21 @@ async fn persistent_run_reuses_one_acp_session_for_sequential_prompts() {
         .run(request(None), controls)
         .await
         .expect("persistent run starts");
+    for _ in 0..100 {
+        if prompt_log.is_file() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(prompt_log.is_file(), "first ACP prompt did not start");
+    steer_tx
+        .send(SteerMessage {
+            prompt: "follow up".into(),
+            message_id: Some("user-follow-up".into()),
+        })
+        .await
+        .unwrap();
+    std::fs::write(&prompt_gate, b"release").unwrap();
     let mut events = Vec::new();
     loop {
         let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
@@ -450,13 +482,6 @@ async fn persistent_run_reuses_one_acp_session_for_sequential_prompts() {
         }
     }
 
-    steer_tx
-        .send(SteerMessage {
-            prompt: "follow up".into(),
-            message_id: Some("user-follow-up".into()),
-        })
-        .await
-        .unwrap();
     loop {
         let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
             .await
@@ -504,6 +529,7 @@ async fn persistent_run_reuses_one_acp_session_for_sequential_prompts() {
     unsafe {
         std::env::remove_var("OMP_PROMPT_LOG");
         std::env::remove_var("OMP_SESSION_LOG");
+        std::env::remove_var("OMP_PROMPT_GATE");
     }
 }
 

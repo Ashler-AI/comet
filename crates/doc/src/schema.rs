@@ -596,6 +596,8 @@ fn status_str(status: MessageStatus) -> &'static str {
         MessageStatus::Streaming => "streaming",
         MessageStatus::Complete => "complete",
         MessageStatus::Aborted => "aborted",
+        MessageStatus::Queued => "queued",
+        MessageStatus::Steered => "steered",
     }
 }
 
@@ -1025,6 +1027,7 @@ mod tests {
             &AgentEvent::ToolResult {
                 id: "tool-1".into(),
                 is_error: false,
+                output: None,
             },
         );
         writer.sync(&folded).unwrap();

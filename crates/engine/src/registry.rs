@@ -160,6 +160,9 @@ pub fn default_registry(profile: RuntimeProfile) -> HarnessRegistry {
             AgentEvent::ToolResult {
                 id: "mock-tool-1".into(),
                 is_error: false,
+                output: Some(
+                    "   Compiling comet-engine v0.1.0\n    Finished `test` profile in 4.2s\n     Running unittests src/lib.rs\n\ntest result: ok. 148 passed; 0 failed; 0 ignored".into(),
+                ),
             },
             AgentEvent::ToolCall {
                 id: "mock-tool-2".into(),
@@ -171,6 +174,9 @@ pub fn default_registry(profile: RuntimeProfile) -> HarnessRegistry {
             AgentEvent::ToolResult {
                 id: "mock-tool-2".into(),
                 is_error: false,
+                output: Some(
+                    "a1b2c3d (HEAD -> main) fold: coalesce doc commits\n9f8e7d6 engine: journal replay dedupe\n5c4b3a2 ui: stick-to-bottom spring".into(),
+                ),
             },
             AgentEvent::TextDelta {
                 text: "The `SegmentWriter` appends into `LoroText` so the oplog stays RLE-merged:\n\n```rust\nfolded = fold_event_into_parts(&folded, &event);\nwriter.sync(&folded)?; // 120ms coalesced commits\n```\n\nSynced to every device through the session room. *Mock harness reporting in.*".into(),
@@ -229,7 +235,7 @@ pub fn default_registry(profile: RuntimeProfile) -> HarnessRegistry {
         HarnessDescriptor {
             id: HarnessId::Omp,
             name: "OMP".into(),
-            supports_steering: false,
+            supports_steering: true,
             steering_mode: SteeringMode::TurnBoundary,
             reasoning_levels: vec![
                 ReasoningLevel::Minimal,
@@ -254,7 +260,7 @@ pub fn default_registry(profile: RuntimeProfile) -> HarnessRegistry {
             HarnessDescriptor {
                 id: HarnessId::PrimeAgent,
                 name: "Prime Agent".into(),
-                supports_steering: false,
+                supports_steering: true,
                 steering_mode: SteeringMode::TurnBoundary,
                 reasoning_levels: vec![
                     ReasoningLevel::Minimal,
@@ -351,6 +357,32 @@ mod tests {
         assert_eq!(before.supports_steering, after.supports_steering);
         assert_eq!(before.steering_mode, after.steering_mode);
         assert_eq!(before.reasoning_levels, after.reasoning_levels);
+    }
+
+    #[test]
+    fn omp_catalog_advertises_turn_boundary_queueing_before_resolve() {
+        let registry = default_registry(RuntimeProfile::LocalController);
+        let omp = registry
+            .descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor.id == HarnessId::Omp)
+            .unwrap();
+
+        assert!(omp.supports_steering);
+        assert_eq!(omp.steering_mode, SteeringMode::TurnBoundary);
+    }
+
+    #[test]
+    fn prime_agent_catalog_advertises_turn_boundary_queueing_before_resolve() {
+        let registry = default_registry(RuntimeProfile::LocalController);
+        let prime_agent = registry
+            .descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor.id == HarnessId::PrimeAgent)
+            .unwrap();
+
+        assert!(prime_agent.supports_steering);
+        assert_eq!(prime_agent.steering_mode, SteeringMode::TurnBoundary);
     }
     #[test]
     fn scaffold_profile_rejects_crafted_local_dispatch_without_calling_factory() {

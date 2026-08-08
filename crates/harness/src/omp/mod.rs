@@ -47,6 +47,10 @@ const AUTH_BROKER_TOKEN_FILE_ENV: &str = "OMP_AUTH_BROKER_TOKEN_FILE";
 const OMP_SESSION_DIRECTORY_SCAN_LIMIT: usize = 10_000;
 const OMP_SESSION_HEADER_BYTES: u64 = 64 * 1024;
 
+fn acp_assistant_message_id(session_id: &str, run_nonce: &uuid::Uuid, turn_number: u64) -> String {
+    format!("acp-{session_id}-{run_nonce}-{turn_number}")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdvisorConfigUpdate {
     Enabled(bool),
@@ -1238,7 +1242,10 @@ pub(crate) async fn run_acp(
     } else {
         reported_session_id
     };
-    let mut assistant_message_id = format!("acp-{session_id}");
+    let message_id_run_nonce = uuid::Uuid::new_v4();
+    let mut turn_number = 0_u64;
+    let mut assistant_message_id =
+        acp_assistant_message_id(&session_id, &message_id_run_nonce, turn_number);
     if events
         .send(Ok(AgentEvent::SessionStarted {
             harness: options.harness,
@@ -1283,7 +1290,6 @@ pub(crate) async fn run_acp(
     let mut queued_prompts = VecDeque::new();
     let mut steering_open = true;
     let mut prompt_blocks = first_prompt;
-    let mut turn_number = 0_u64;
     let mut acp_closed = false;
 
     loop {
@@ -1305,9 +1311,23 @@ pub(crate) async fn run_acp(
 
         let response = loop {
             tokio::select! {
+                // Biased: a delivered final response must win over the EOF
+                // already queued behind it — agents that exit right after
+                // `end_turn` are ending cleanly, not crashing.
+                biased;
                 response = &mut prompt => match response {
                     Ok(response) => break response,
                     Err(error) => {
+                        // Prefer the richer crash context (exit status +
+                        // stderr tail) when the child is already gone.
+                        let error = match child.try_wait() {
+                            Ok(Some(status)) => HarnessError::Protocol(crate::crash_message(
+                                options.process_label,
+                                Some(status),
+                                &stderr_tail,
+                            )),
+                            _ => error,
+                        };
                         tracing::warn!(
                             target: "comet_harness::omp",
                             process = options.process_label,
@@ -1438,11 +1458,15 @@ pub(crate) async fn run_acp(
             return Ok(());
         }
         if acp_closed {
-            return Err(HarnessError::Protocol(crate::crash_message(
-                options.process_label,
-                child.try_wait().ok().flatten(),
-                &stderr_tail,
-            )));
+            // The agent closed its stream after finishing the turn (end_turn
+            // received, Done delivered). Some ACP agents exit per conversation
+            // even when we run them persistently — a clean end, not a crash.
+            tracing::debug!(
+                target: "comet_harness::omp",
+                process = options.process_label,
+                "ACP stream closed after a completed turn; ending persistent session"
+            );
+            return Ok(());
         }
 
         let next_prompt = loop {
@@ -1469,6 +1493,17 @@ pub(crate) async fn run_acp(
                     return Ok(());
                 }
                 item = incoming.recv() => match item {
+                    Some(Incoming::Eof) | None => {
+                        // Stream closed while idle between turns: the previous
+                        // turn completed, so this is the same clean per-turn
+                        // exit as above — never a crash report.
+                        tracing::debug!(
+                            target: "comet_harness::omp",
+                            process = options.process_label,
+                            "ACP stream closed between turns; ending persistent session"
+                        );
+                        return Ok(());
+                    }
                     Some(item) => {
                         if !handle_session_incoming(
                             item,
@@ -1486,13 +1521,6 @@ pub(crate) async fn run_acp(
                             )));
                         }
                     }
-                    None => {
-                        return Err(HarnessError::Protocol(crate::crash_message(
-                            options.process_label,
-                            child.try_wait().ok().flatten(),
-                            &stderr_tail,
-                        )));
-                    }
                 },
                 _ = events.closed() => {
                     let _ = child.kill().await;
@@ -1502,7 +1530,8 @@ pub(crate) async fn run_acp(
         };
 
         turn_number += 1;
-        let next_assistant_message_id = format!("acp-{session_id}-{turn_number}");
+        let next_assistant_message_id =
+            acp_assistant_message_id(&session_id, &message_id_run_nonce, turn_number);
         if events
             .send(Ok(AgentEvent::Steered {
                 assistant_message_id: Some(assistant_message_id),
@@ -1633,6 +1662,31 @@ fn handle_elicitation_request(
 
 fn content_text(content: &Value) -> Option<&str> {
     content.get("text").and_then(Value::as_str)
+}
+
+/// Tool output text from a terminal `tool_call_update`. OMP's completed
+/// update carries the accumulated output as `rawOutput.content:
+/// [{type:"text", text}]` (observed live; the `content` field echoes the
+/// INPUT first, so `rawOutput` is the clean source). Non-conforming shapes
+/// degrade to the raw JSON so an unfamiliar tool still shows something.
+fn tool_output_text(update: &Value) -> Option<String> {
+    let raw = update.get("rawOutput")?;
+    if let Some(text) = raw.as_str() {
+        return (!text.is_empty()).then(|| text.to_string());
+    }
+    if let Some(blocks) = raw.get("content").and_then(Value::as_array) {
+        let joined = blocks
+            .iter()
+            .filter_map(content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !joined.is_empty() {
+            return Some(joined);
+        }
+    }
+    (!raw.is_null()).then(|| {
+        serde_json::to_string_pretty(raw).unwrap_or_else(|_| raw.to_string())
+    })
 }
 
 fn agent_activity_status(status: &str) -> AgentActivityStatus {
@@ -1792,6 +1846,8 @@ fn normalize_update(params: &Value, harness: HarnessId) -> Option<AgentEvent> {
                 matches!(status, "completed" | "failed").then(|| AgentEvent::ToolResult {
                     id,
                     is_error: status == "failed",
+                    output: tool_output_text(update)
+                        .map(comet_proto::truncate_tool_output),
                 })
             }
         }
@@ -1805,7 +1861,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resumed_acp_runs_use_distinct_assistant_message_ids() {
+        let session_id = "same-durable-session";
+        let first_run = uuid::Uuid::from_u128(1);
+        let resumed_run = uuid::Uuid::from_u128(2);
+
+        assert_ne!(
+            acp_assistant_message_id(session_id, &first_run, 0),
+            acp_assistant_message_id(session_id, &resumed_run, 0)
+        );
+    }
+
+    /// Serializes tests that interact through the process-global
+    /// `OMP_AUTH_BROKER_*` variables: `propagate_auth_broker_environment`
+    /// consumes (deletes) the single-use token file, so a builder call from a
+    /// parallel test inside the broker test's env window steals its token.
+    static BROKER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
     fn scaffold_command_invokes_only_omp_acp_with_hardening() {
+        let _guard = BROKER_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let harness = OmpHarness::scaffold_host();
         let command = harness.command(Path::new("/usr/local/bin/omp"), "/workspace", true);
         let args: Vec<String> = command
@@ -1846,8 +1923,7 @@ mod tests {
 
     #[test]
     fn broker_configuration_is_environment_only_and_scaffold_stays_isolated() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK
+        let _guard = BROKER_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = tempfile::tempdir().unwrap();
@@ -2022,7 +2098,25 @@ mod tests {
             ),
             Some(AgentEvent::ToolResult {
                 id: "t1".into(),
-                is_error: true
+                is_error: true,
+                output: None,
+            })
+        );
+        // The observed completed-update shape: output rides `rawOutput.content`
+        // as text blocks (`content` echoes the input first — never used).
+        assert_eq!(
+            normalize_update(
+                &json!({"update":{
+                    "sessionUpdate":"tool_call_update","toolCallId":"t2","status":"completed",
+                    "rawOutput": {"content":[{"type":"text","text":"hello\n/tmp"}], "details":{}},
+                    "content": [{"type":"content","content":{"type":"text","text":"$ echo hello"}}]
+                }}),
+                HarnessId::Omp,
+            ),
+            Some(AgentEvent::ToolResult {
+                id: "t2".into(),
+                is_error: false,
+                output: Some("hello\n/tmp".into()),
             })
         );
     }

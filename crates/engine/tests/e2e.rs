@@ -73,6 +73,7 @@ fn mock_script() -> Vec<AgentEvent> {
         AgentEvent::ToolResult {
             id: "tool-1".into(),
             is_error: false,
+            output: Some("wrote 6 bytes".into()),
         },
         done(DoneStatus::Completed),
     ]
@@ -84,6 +85,7 @@ struct ScriptedHarness {
     script: Vec<AgentEvent>,
     step_delay: Duration,
     hang_until_interrupt: bool,
+    steering_mode: SteeringMode,
 }
 
 #[async_trait]
@@ -98,7 +100,7 @@ impl Harness for ScriptedHarness {
         true
     }
     fn steering_mode(&self) -> SteeringMode {
-        SteeringMode::StepBoundary
+        self.steering_mode
     }
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
         &[ReasoningLevel::Medium]
@@ -117,6 +119,10 @@ impl Harness for ScriptedHarness {
         let hang = self.hang_until_interrupt;
         let token = controls.interrupt.clone();
         tokio::spawn(async move {
+            // Keep the whole control set alive for the run. In particular,
+            // dropping the steering receiver would make the engine treat the
+            // live harness as non-steerable before the boundary is reached.
+            let _controls = controls;
             for event in script {
                 if tx.send(Ok(event)).await.is_err() {
                     return;
@@ -127,6 +133,86 @@ impl Harness for ScriptedHarness {
                 token.cancelled().await;
                 let _ = tx.send(Ok(done(DoneStatus::Interrupted))).await;
             }
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        })
+        .boxed())
+    }
+}
+
+struct QueuedFollowupHarness {
+    release_first_turn: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+    received: tokio::sync::mpsc::UnboundedSender<String>,
+    steering_mode: SteeringMode,
+}
+
+#[async_trait]
+impl Harness for QueuedFollowupHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+
+    fn display_name(&self) -> &str {
+        "Queued followup"
+    }
+
+    fn supports_steering(&self) -> bool {
+        true
+    }
+
+    fn steering_mode(&self) -> SteeringMode {
+        self.steering_mode
+    }
+
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(Vec::new())
+    }
+
+    async fn run(
+        &self,
+        _request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let release = self
+            .release_first_turn
+            .lock()
+            .unwrap()
+            .take()
+            .expect("one run");
+        let received = self.received.clone();
+        let (events, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut steering = controls.steering;
+            let _ = events.send(Ok(AgentEvent::SessionStarted {
+                harness: HarnessId::Mock,
+                model: "mock-1".into(),
+                tools: Vec::new(),
+                cwd: "/tmp".into(),
+                session_id: "queued-followup-session".into(),
+                assistant_message_id: "a-1".into(),
+            }));
+            let _ = events.send(Ok(AgentEvent::TextDelta {
+                text: "first turn active".into(),
+            }));
+            let _ = release.await;
+            let _ = events.send(Ok(done(DoneStatus::Completed)));
+            let Some(followup) = steering.recv().await else {
+                return;
+            };
+            let _ = received.send(followup.prompt);
+            let _ = events.send(Ok(AgentEvent::Steered {
+                assistant_message_id: Some("a-1".into()),
+                next_assistant_message_id: Some("a-2".into()),
+            }));
+            let _ = events.send(Ok(AgentEvent::TextDelta {
+                text: "second turn complete".into(),
+            }));
+            let _ = events.send(Ok(done(DoneStatus::Completed)));
         });
         Ok(futures::stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|event| (event, rx))
@@ -180,9 +266,21 @@ fn registry_with(harness: Arc<dyn Harness>) -> Arc<HarnessRegistry> {
     Arc::new(registry)
 }
 
+/// Identity is pinned (`assemble_with_identity`, not env-reading `assemble`):
+/// these tests seed and inspect `projects/ashler-local/dev-user` directly, so
+/// they must stay hermetic under a developer shell that exports a real
+/// `$COMET_PROJECT_SCOPE` / `$COMET_USER_ID`.
 fn assemble(dir: &std::path::Path, harness: Arc<dyn Harness>) -> EngineCore {
-    EngineCore::assemble(dir, registry_with(harness), HarnessId::Mock, None)
-        .expect("engine core assembles")
+    EngineCore::assemble_with_identity(
+        dir,
+        registry_with(harness),
+        HarnessId::Mock,
+        None,
+        "ashler-local",
+        "dev-user",
+        RuntimeProfile::Mock,
+    )
+    .expect("engine core assembles")
 }
 
 /// Queue a command into the chat doc the way a REMOTE viewer device would: an immutable
@@ -225,6 +323,9 @@ fn controller_payload(
         },
         SessionCommandPayload::Steer { prompt, message_id } => {
             SessionControlAction::Steer { prompt, message_id }
+        }
+        SessionCommandPayload::Queue { prompt, message_id } => {
+            SessionControlAction::Queue { prompt, message_id }
         }
         SessionCommandPayload::Interrupt {} => SessionControlAction::Stop {},
         SessionCommandPayload::RespondInput {
@@ -399,6 +500,24 @@ async fn queued_run_command_executes_end_to_end() {
         other => panic!("unexpected second part {other:?}"),
     }
 
+    // The expanded-chip detail comes from the journal: the full input the doc
+    // stripped, plus the harness-captured output.
+    let detail = core
+        .sessions
+        .tool_call_detail(EXECUTION_KEY, "tool-1")
+        .unwrap()
+        .expect("journal saw tool-1");
+    assert_eq!(detail.input.as_deref(), Some("/tmp/x\n\nSECRET"));
+    assert_eq!(detail.output.as_deref(), Some("wrote 6 bytes"));
+    assert!(detail.resolved);
+    assert!(!detail.is_error);
+    assert_eq!(
+        core.sessions
+            .tool_call_detail(EXECUTION_KEY, "nope")
+            .unwrap(),
+        None
+    );
+
     // Command outcome written by the host (sole outcome writer).
     assert_eq!(
         command_status(&core, &command_id),
@@ -555,6 +674,7 @@ async fn session_status_transitions_idle_working_idle() {
             script: mock_script(),
             step_delay: Duration::from_millis(40),
             hang_until_interrupt: false,
+            steering_mode: SteeringMode::StepBoundary,
         }),
     );
     let mut watch = core.sessions.watch_sessions();
@@ -602,6 +722,7 @@ async fn interrupt_stamps_streaming_entry_aborted() {
             }],
             step_delay: Duration::from_millis(5),
             hang_until_interrupt: true,
+            steering_mode: SteeringMode::StepBoundary,
         }),
     );
     let _handle = core.doc_host.open(CHAT).unwrap();
@@ -671,6 +792,245 @@ async fn interrupt_stamps_streaming_entry_aborted() {
             .map(|s| s.status),
         Some(SessionStatus::Idle)
     );
+}
+
+#[tokio::test]
+async fn explicit_queue_waits_for_the_next_turn_across_step_boundary_harnesses() {
+    let dir = tempfile::tempdir().unwrap();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (received_tx, mut received_rx) = tokio::sync::mpsc::unbounded_channel();
+    let core = assemble(
+        dir.path(),
+        Arc::new(QueuedFollowupHarness {
+            release_first_turn: Arc::new(std::sync::Mutex::new(Some(release_rx))),
+            received: received_tx,
+            steering_mode: SteeringMode::StepBoundary,
+        }),
+    );
+    let _handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_controller(
+        &core,
+        "cmd-run-before-queue",
+        SessionCommandPayload::Run {
+            request: run_request("start"),
+            message_id: "m-1".into(),
+        },
+    )
+    .await;
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|entry| {
+                entry
+                    .parts
+                    .iter()
+                    .any(|part| matches!(part, MessagePart::Text { text, .. } if text == "first turn active"))
+            })
+        },
+        "first turn to become active",
+    )
+    .await;
+
+    let queue_command_id = queue_as_controller(
+        &core,
+        "cmd-queue-followup",
+        SessionCommandPayload::Queue {
+            prompt: "wait until next turn".into(),
+            message_id: Some("m-queued".into()),
+        },
+    )
+    .await;
+    wait_for(
+        || {
+            command_status(&core, &queue_command_id)
+                .is_some_and(|(status, _)| status != SessionCommandStatus::Pending)
+        },
+        "queue command outcome",
+    )
+    .await;
+    assert_eq!(
+        command_status(&core, &queue_command_id),
+        Some((
+            SessionCommandStatus::Applied,
+            Some("queued for the next turn".into())
+        ))
+    );
+    assert!(matches!(
+        received_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert_eq!(
+        entries_now(&core)
+            .iter()
+            .find(|entry| entry.id == "m-queued")
+            .and_then(|entry| entry.status),
+        Some(MessageStatus::Queued)
+    );
+
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), received_rx.recv())
+            .await
+            .unwrap(),
+        Some("wait until next turn".into())
+    );
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .find(|entry| entry.id == "m-queued")
+                .is_some_and(|entry| entry.status == Some(MessageStatus::Complete))
+        },
+        "queued message to become delivered",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn turn_boundary_steer_is_displayed_as_queued_until_acknowledged() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: vec![AgentEvent::TextDelta {
+                text: "still working".into(),
+            }],
+            step_delay: Duration::from_millis(5),
+            hang_until_interrupt: true,
+            steering_mode: SteeringMode::TurnBoundary,
+        }),
+    );
+    let _handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_controller(
+        &core,
+        "cmd-run-turn-boundary",
+        SessionCommandPayload::Run {
+            request: run_request("start"),
+            message_id: "m-1".into(),
+        },
+    )
+    .await;
+    wait_for(
+        || {
+            core.sessions
+                .session_status(EXECUTION_KEY)
+                .is_some_and(|session| session.status == SessionStatus::Working)
+        },
+        "turn-boundary run to start",
+    )
+    .await;
+
+    let steer_command_id = queue_as_controller(
+        &core,
+        "cmd-steer-turn-boundary",
+        SessionCommandPayload::Steer {
+            prompt: "change direction".into(),
+            message_id: Some("m-2".into()),
+        },
+    )
+    .await;
+    wait_for(
+        || {
+            command_status(&core, &steer_command_id)
+                .is_some_and(|(status, _)| status != SessionCommandStatus::Pending)
+        },
+        "turn-boundary steer acknowledgement",
+    )
+    .await;
+    assert_eq!(
+        command_status(&core, &steer_command_id),
+        Some((
+            SessionCommandStatus::Applied,
+            Some("queued for the next turn boundary".into())
+        ))
+    );
+    assert_eq!(
+        entries_now(&core)
+            .iter()
+            .find(|entry| entry.id == "m-2")
+            .and_then(|entry| entry.status),
+        Some(MessageStatus::Queued)
+    );
+
+    core.sessions.interrupt(EXECUTION_KEY).await.unwrap();
+}
+
+#[tokio::test]
+async fn turn_boundary_steer_becomes_active_when_the_harness_acknowledges_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (received_tx, mut received_rx) = tokio::sync::mpsc::unbounded_channel();
+    let core = assemble(
+        dir.path(),
+        Arc::new(QueuedFollowupHarness {
+            release_first_turn: Arc::new(std::sync::Mutex::new(Some(release_rx))),
+            received: received_tx,
+            steering_mode: SteeringMode::TurnBoundary,
+        }),
+    );
+    let _handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_controller(
+        &core,
+        "cmd-run-before-turn-boundary-steer",
+        SessionCommandPayload::Run {
+            request: run_request("start"),
+            message_id: "m-1".into(),
+        },
+    )
+    .await;
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|entry| {
+                entry
+                    .parts
+                    .iter()
+                    .any(|part| matches!(part, MessagePart::Text { text, .. } if text == "first turn active"))
+            })
+        },
+        "first turn to become active",
+    )
+    .await;
+
+    queue_as_controller(
+        &core,
+        "cmd-turn-boundary-steer",
+        SessionCommandPayload::Steer {
+            prompt: "change direction next".into(),
+            message_id: Some("m-turn-steer".into()),
+        },
+    )
+    .await;
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .find(|entry| entry.id == "m-turn-steer")
+                .is_some_and(|entry| entry.status == Some(MessageStatus::Queued))
+        },
+        "turn-boundary steer to remain queued",
+    )
+    .await;
+    assert!(matches!(
+        received_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), received_rx.recv())
+            .await
+            .unwrap(),
+        Some("change direction next".into())
+    );
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .find(|entry| entry.id == "m-turn-steer")
+                .is_some_and(|entry| entry.status == Some(MessageStatus::Steered))
+        },
+        "turn-boundary steer acknowledgement",
+    )
+    .await;
 }
 
 #[tokio::test]

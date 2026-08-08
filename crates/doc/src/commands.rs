@@ -22,6 +22,7 @@ use crate::constants::COMMAND_DEFAULT_TTL_MS;
 pub enum SessionCommandKind {
     Run,
     Steer,
+    Queue,
     Interrupt,
     RespondInput,
     Control,
@@ -46,6 +47,10 @@ pub enum SessionControlAction {
         message_id: String,
     },
     Steer {
+        prompt: String,
+        message_id: Option<String>,
+    },
+    Queue {
         prompt: String,
         message_id: Option<String>,
     },
@@ -83,9 +88,10 @@ pub enum SessionControlAction {
 impl SessionControlAction {
     pub fn required_capability(&self) -> &'static str {
         match self {
-            Self::Start { .. } | Self::Steer { .. } | Self::RespondInput { .. } => {
-                comet_proto::CAPABILITY_SESSION_CHAT
-            }
+            Self::Start { .. }
+            | Self::Steer { .. }
+            | Self::Queue { .. }
+            | Self::RespondInput { .. } => comet_proto::CAPABILITY_SESSION_CHAT,
             Self::AnnotationCreate { .. }
             | Self::AnnotationEdit { .. }
             | Self::AnnotationResolve { .. } => comet_proto::CAPABILITY_SESSION_ANNOTATE,
@@ -107,6 +113,11 @@ pub enum SessionCommandPayload {
     },
     #[serde(rename_all = "camelCase")]
     Steer {
+        prompt: String,
+        message_id: Option<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    Queue {
         prompt: String,
         message_id: Option<String>,
     },
@@ -134,6 +145,7 @@ impl SessionCommandPayload {
         match self {
             SessionCommandPayload::Run { .. } => SessionCommandKind::Run,
             SessionCommandPayload::Steer { .. } => SessionCommandKind::Steer,
+            SessionCommandPayload::Queue { .. } => SessionCommandKind::Queue,
             SessionCommandPayload::Interrupt {} => SessionCommandKind::Interrupt,
             SessionCommandPayload::RespondInput { .. } => SessionCommandKind::RespondInput,
             SessionCommandPayload::Control { .. } => SessionCommandKind::Control,
@@ -198,11 +210,13 @@ impl SessionCommandEntry {
         match &self.payload {
             SessionCommandPayload::Run { .. } => "start",
             SessionCommandPayload::Steer { .. } => "steer",
+            SessionCommandPayload::Queue { .. } => "queue",
             SessionCommandPayload::Interrupt {} => "stop",
             SessionCommandPayload::RespondInput { .. } => "respondInput",
             SessionCommandPayload::Control { action, .. } => match action.as_ref() {
                 SessionControlAction::Start { .. } => "start",
                 SessionControlAction::Steer { .. } => "steer",
+                SessionControlAction::Queue { .. } => "queue",
                 SessionControlAction::RespondInput { .. } => "respondInput",
                 SessionControlAction::Pause {} => "pause",
                 SessionControlAction::Resume {} => "resume",

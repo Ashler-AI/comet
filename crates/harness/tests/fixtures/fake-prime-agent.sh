@@ -57,6 +57,9 @@ while IFS= read -r line; do
       printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"sessionId\":\"prime-acp-session\"}}"
       ;;
     session/prompt)
+      if [ -n "${PRIME_PROMPT_LOG:-}" ]; then
+        printf '%s\n' "$line" >> "$PRIME_PROMPT_LOG"
+      fi
       if [ -n "${PRIME_LONG_TOOL_GATE:-}" ]; then
         printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"prime-acp-session","update":{"sessionUpdate":"tool_call","toolCallId":"long-tool","title":"Long operation","status":"in_progress"}}}'
         while [ ! -f "$PRIME_LONG_TOOL_GATE" ]; do
@@ -73,7 +76,9 @@ while IFS= read -r line; do
       fi
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"prime-acp-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello from prime"}}}}'
       printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"stopReason\":\"end_turn\"}}"
-      exit 0
+      if [ -z "${PRIME_KEEP_OPEN:-}" ]; then
+        exit 0
+      fi
       ;;
     session/cancel)
       exit 0

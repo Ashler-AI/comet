@@ -121,11 +121,27 @@ impl Harness for RecordingHarness {
     }
 }
 
+/// Identity is pinned (`assemble_with_identity`, not env-reading `assemble`):
+/// the crash-recovery tests seed `projects/ashler-local/dev-user` directly, so
+/// they must stay hermetic under a developer shell that exports a real
+/// `$COMET_PROJECT_SCOPE` / `$COMET_USER_ID`.
 fn assemble(dir: &std::path::Path, harness: RecordingHarness) -> EngineCore {
     let registry = HarnessRegistry::for_profile(RuntimeProfile::Mock);
     registry.register(Arc::new(harness));
-    EngineCore::assemble(dir, Arc::new(registry), HarnessId::Mock, None)
-        .expect("engine core assembles")
+    assemble_registry(dir, Arc::new(registry))
+}
+
+fn assemble_registry(dir: &std::path::Path, registry: Arc<HarnessRegistry>) -> EngineCore {
+    EngineCore::assemble_with_identity(
+        dir,
+        registry,
+        HarnessId::Mock,
+        None,
+        "ashler-local",
+        "dev-user",
+        RuntimeProfile::Mock,
+    )
+    .expect("engine core assembles")
 }
 
 fn queue_run(core: &EngineCore, prompt: &str, cwd: &str, message_id: &str) {
@@ -516,8 +532,7 @@ async fn persistent_session_serves_multiple_turns_on_one_child() {
     registry.register(Arc::new(PersistentHarness {
         runs_started: runs_started.clone(),
     }));
-    let core = EngineCore::assemble(&dir, Arc::new(registry), HarnessId::Mock, None)
-        .expect("engine core assembles");
+    let core = assemble_registry(&dir, Arc::new(registry));
     pre_title(&core);
 
     queue_run(&core, "first", "/tmp", "msg-user-1");

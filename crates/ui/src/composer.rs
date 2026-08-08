@@ -25,11 +25,12 @@ use gpui::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use comet_doc::{
-    MessagePart, MessageRole, SessionCommandPayload, SessionControlAction, SessionMessageEntry,
+    MessagePart, MessageRole, MessageStatus, SessionCommandPayload, SessionControlAction,
+    SessionMessageEntry,
 };
 use comet_proto::{
     AgentSessionSource, ChatConfig, FileSearchMatch, HarnessCommand, HarnessId, RunRequest,
-    SandboxLevel, ScaffoldLifecycle, UserInputAnswer, UserInputQuestion,
+    SandboxLevel, ScaffoldLifecycle, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 use comet_rpc::{RpcError, methods};
 
@@ -385,6 +386,34 @@ pub enum SendButtonMode {
     Starting,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmitDelivery {
+    Send,
+    Steer,
+    Queue,
+}
+
+fn submit_delivery(run_live: bool, queue_requested: bool) -> SubmitDelivery {
+    match (run_live, queue_requested) {
+        (true, true) => SubmitDelivery::Queue,
+        (true, false) => SubmitDelivery::Steer,
+        (false, _) => SubmitDelivery::Send,
+    }
+}
+
+fn optimistic_message_status(
+    delivery: SubmitDelivery,
+    steering_mode: Option<SteeringMode>,
+) -> Option<MessageStatus> {
+    match (delivery, steering_mode) {
+        (SubmitDelivery::Send, _) => None,
+        (SubmitDelivery::Queue, _) | (SubmitDelivery::Steer, Some(SteeringMode::TurnBoundary)) => {
+            Some(MessageStatus::Queued)
+        }
+        (SubmitDelivery::Steer, _) => Some(MessageStatus::Steered),
+    }
+}
+
 pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
     match (run_live, has_text) {
         (false, _) => SendButtonMode::Send,
@@ -626,6 +655,7 @@ actions!(
         Paste,
         Newline,
         Submit,
+        QueueSubmit,
         Undo,
         Redo,
         MentionTab,
@@ -1094,6 +1124,15 @@ pub fn init(cx: &mut App) {
     let ctx = Some("Composer");
     let mut bindings = vec![
         KeyBinding::new("enter", Submit, ctx),
+        KeyBinding::new(
+            if cfg!(target_os = "macos") {
+                "cmd-enter"
+            } else {
+                "ctrl-enter"
+            },
+            QueueSubmit,
+            ctx,
+        ),
         KeyBinding::new("tab", MentionTab, ctx),
         KeyBinding::new("escape", MentionEscape, ctx),
         KeyBinding::new("shift-enter", Newline, ctx),
@@ -1238,6 +1277,7 @@ pub fn init(cx: &mut App) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComposerInputEvent {
     Submitted,
+    QueueSubmitted,
     Edited,
     CursorMoved,
     ViewportChanged,
@@ -2148,6 +2188,14 @@ impl ComposerInput {
             ComposerInputEvent::MentionAccept
         } else {
             ComposerInputEvent::Submitted
+        });
+    }
+
+    fn queue_submit(&mut self, _: &QueueSubmit, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(if self.mention_has_selection {
+            ComposerInputEvent::MentionAccept
+        } else {
+            ComposerInputEvent::QueueSubmitted
         });
     }
 
@@ -3139,6 +3187,7 @@ impl Render for ComposerInput {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::submit))
+            .on_action(cx.listener(Self::queue_submit))
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
@@ -3429,6 +3478,7 @@ impl Composer {
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
         let input_events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Submitted => this.on_submit(cx),
+            ComposerInputEvent::QueueSubmitted => this.on_queue_submit(cx),
             ComposerInputEvent::Edited | ComposerInputEvent::CursorMoved => {
                 this.on_input_edited(cx)
             }
@@ -4410,16 +4460,24 @@ impl Composer {
             SendButtonMode::Starting => {}
             SendButtonMode::Stop => self.interrupt(cx),
             _ if text.is_empty() && self.staged().is_empty() => {}
-            SendButtonMode::Send => self.send(text, false, cx),
-            SendButtonMode::Steer => self.send(text, true, cx),
+            SendButtonMode::Send => self.send(text, submit_delivery(false, false), cx),
+            SendButtonMode::Steer => self.send(text, submit_delivery(true, false), cx),
         }
     }
 
-    /// Queue a Run (or Steer) doc command with an optimistic echo. New chats
-    /// thread the picked config in: worktree creation (when the isolated toggle
-    /// is on), `Mutate createChat` with the `ChatConfig` + cwd, and the model /
-    /// reasoning / options on the Run request itself (§1.7).
-    fn send(&mut self, text: String, steer: bool, cx: &mut Context<Self>) {
+    fn on_queue_submit(&mut self, cx: &mut Context<Self>) {
+        if self.wizard.is_some() || !self.run_live(cx) {
+            self.on_submit(cx);
+            return;
+        }
+        let text = self.input.read(cx).text().trim().to_string();
+        if text.is_empty() && self.staged().is_empty() {
+            return;
+        }
+        self.send(text, submit_delivery(true, true), cx);
+    }
+
+    fn send(&mut self, text: String, delivery: SubmitDelivery, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.failure = Some("Engine not connected".into());
             cx.notify();
@@ -4541,6 +4599,13 @@ impl Composer {
         } else {
             text.clone()
         };
+        let effective_delivery = if is_new {
+            SubmitDelivery::Send
+        } else {
+            delivery
+        };
+        let steering_mode = self.pickers.read(cx).steering_mode(cx);
+        let echo_status = optimistic_message_status(effective_delivery, steering_mode);
 
         // Optimistic echo (client-minted id doubles as the persisted message id,
         // so the doc frame dedups it away).
@@ -4553,7 +4618,7 @@ impl Composer {
             }],
             created_at,
             device_id: "local".into(),
-            status: None,
+            status: echo_status,
             continuation_of: None,
         };
         self.state.update(cx, |s, cx| {
@@ -4576,7 +4641,8 @@ impl Composer {
         });
         cx.notify();
 
-        let steer_cmd = steer && !is_new;
+        let steer_cmd = effective_delivery == SubmitDelivery::Steer;
+        let queue_cmd = effective_delivery == SubmitDelivery::Queue;
         let restore_text = text.clone();
         let err_chat_id = chat_id.clone();
         let err_message_id = message_id.clone();
@@ -4899,7 +4965,7 @@ impl Composer {
                         }],
                         created_at,
                         device_id: "local".into(),
-                        status: None,
+                        status: echo_status,
                         continuation_of: None,
                     };
                     let echo_chat_id = chat_id.clone();
@@ -4930,6 +4996,11 @@ impl Composer {
                             request: run_request(),
                             message_id: message_id.clone(),
                         }
+                    } else if queue_cmd {
+                        SessionControlAction::Queue {
+                            prompt: content.clone(),
+                            message_id: Some(message_id.clone()),
+                        }
                     } else {
                         SessionControlAction::Steer {
                             prompt: content.clone(),
@@ -4944,6 +5015,11 @@ impl Composer {
                         grant_id: route.grant_id,
                         source: route.source,
                         action: Box::new(action),
+                    }
+                } else if queue_cmd {
+                    SessionCommandPayload::Queue {
+                        prompt: content.clone(),
+                        message_id: Some(message_id.clone()),
                     }
                 } else if steer_cmd {
                     SessionCommandPayload::Steer {
@@ -6514,6 +6590,25 @@ mod tests {
         assert_eq!(send_button_mode(false, true), SendButtonMode::Send);
         assert_eq!(send_button_mode(true, true), SendButtonMode::Steer);
         assert_eq!(send_button_mode(true, false), SendButtonMode::Stop);
+    }
+
+    #[test]
+    fn followup_delivery_defaults_to_steer_and_modifier_queues() {
+        assert_eq!(submit_delivery(true, false), SubmitDelivery::Steer);
+        assert_eq!(submit_delivery(true, true), SubmitDelivery::Queue);
+        assert_eq!(submit_delivery(false, true), SubmitDelivery::Send);
+        assert_eq!(
+            optimistic_message_status(SubmitDelivery::Steer, Some(SteeringMode::StepBoundary)),
+            Some(MessageStatus::Steered)
+        );
+        assert_eq!(
+            optimistic_message_status(SubmitDelivery::Steer, Some(SteeringMode::TurnBoundary)),
+            Some(MessageStatus::Queued)
+        );
+        assert_eq!(
+            optimistic_message_status(SubmitDelivery::Queue, Some(SteeringMode::StepBoundary)),
+            Some(MessageStatus::Queued)
+        );
     }
 
     #[test]

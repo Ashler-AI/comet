@@ -48,6 +48,11 @@ while IFS= read -r line; do
       ;;
     session/prompt)
       [ -z "${OMP_PROMPT_LOG:-}" ] || printf '%s\n' "$line" >> "$OMP_PROMPT_LOG"
+      if [ -n "${OMP_PROMPT_GATE:-}" ]; then
+        while [ ! -f "$OMP_PROMPT_GATE" ]; do
+          sleep 0.1
+        done
+      fi
       if [ -n "${OMP_PROMPT_ERROR_DETAILS:-}" ]; then
         printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"error\":{\"code\":-32603,\"message\":\"Internal error\",\"data\":{\"details\":\"$OMP_PROMPT_ERROR_DETAILS\"}}}"
         continue
@@ -75,7 +80,7 @@ while IFS= read -r line; do
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"omp-session-1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"thinking"}}}}'
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"omp-session-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello from omp"}}}}'
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"omp-session-1","update":{"sessionUpdate":"tool_call","toolCallId":"tool-1","title":"Read file","rawInput":{"path":"README.md"}}}}'
-      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"omp-session-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tool-1","status":"completed"}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"omp-session-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tool-1","status":"completed","rawOutput":{"content":[{"type":"text","text":"# README"}],"details":{}}}}}'
       printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"stopReason\":\"end_turn\"}}"
       ;;
     session/cancel)

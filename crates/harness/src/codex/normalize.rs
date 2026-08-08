@@ -85,7 +85,11 @@ fn tool_lifecycle(phase: Phase, id: String, call: ToolCall, is_error: bool) -> V
                 id: id.clone(),
                 call,
             },
-            AgentEvent::ToolResult { id, is_error },
+            AgentEvent::ToolResult {
+                id,
+                is_error,
+                output: None,
+            },
         ],
     }
 }
@@ -133,9 +137,16 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
                 let exit_code = field(item, &["exitCode", "exit_code"])
                     .and_then(Value::as_i64)
                     .unwrap_or(0);
+                // The completed item carries the command's combined
+                // stdout/stderr as `aggregatedOutput`.
+                let output = field(item, &["aggregatedOutput", "aggregated_output"])
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .map(|text| comet_proto::truncate_tool_output(text.to_string()));
                 vec![AgentEvent::ToolResult {
                     id,
                     is_error: status == "failed" || exit_code != 0,
+                    output,
                 }]
             }
         },
@@ -175,10 +186,18 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
                     },
                 }]
             }
-            Phase::Completed => vec![AgentEvent::ToolResult {
-                id,
-                is_error: status == "failed",
-            }],
+            Phase::Completed => {
+                let output = item
+                    .get("result")
+                    .filter(|v| !v.is_null())
+                    .map(|v| serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()))
+                    .map(comet_proto::truncate_tool_output);
+                vec![AgentEvent::ToolResult {
+                    id,
+                    is_error: status == "failed",
+                    output,
+                }]
+            }
         },
         "webSearch" | "web_search" => tool_lifecycle(
             phase,
@@ -240,13 +259,15 @@ mod tests {
         );
         let completed = map_item(
             Phase::Completed,
-            &json!({"type": "command_execution", "id": "c1", "status": "completed", "exit_code": 2}),
+            &json!({"type": "command_execution", "id": "c1", "status": "completed",
+                    "exit_code": 2, "aggregatedOutput": "ls: nope\n"}),
         );
         assert_eq!(
             completed,
             vec![AgentEvent::ToolResult {
                 id: "c1".into(),
                 is_error: true,
+                output: Some("ls: nope\n".into()),
             }]
         );
     }
@@ -285,7 +306,8 @@ mod tests {
                 },
                 AgentEvent::ToolResult {
                     id: "f2".into(),
-                    is_error: true
+                    is_error: true,
+                    output: None,
                 },
             ]
         );

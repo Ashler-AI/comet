@@ -330,6 +330,13 @@ struct ReadAttachmentChunkParams {
     offset: u64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolCallDetailParams {
+    chat_id: String,
+    tool_id: String,
+}
+
 /// The Mutate surface (feature-inventory §2 DataRpc), tagged by `op`.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase")]
@@ -1041,6 +1048,9 @@ fn forwardable(method: &str) -> bool {
             | methods::UPLOAD_CHUNK
             | methods::UPLOAD_COMMIT
             | methods::READ_ATTACHMENT_CHUNK
+            // Tool details come from the run journal on the device that ran
+            // the turn.
+            | methods::TOOL_CALL_DETAIL
             // Updates report/apply on the device whose binary they concern.
             | methods::UPDATE_STATUS
             | methods::APPLY_UPDATE
@@ -1903,6 +1913,27 @@ impl RpcService for EngineRpc {
                     .read_chunk(&p.path, p.offset, &roots)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&chunk)
+            }
+            methods::TOOL_CALL_DETAIL => {
+                let p: ToolCallDetailParams = parse_params(params)?;
+                let sessions = self.sessions.clone();
+                // Whole-journal replay is sync file I/O — off the reactor.
+                let detail = tokio::task::spawn_blocking(move || {
+                    sessions.tool_call_detail(&p.chat_id, &p.tool_id)
+                })
+                .await
+                .map_err(|err| RpcError::Failed(format!("tool detail scan failed: {err}")))?
+                .map_err(|err| RpcError::Failed(err.to_string()))?;
+                match detail {
+                    Some(d) => RpcReply::value(&serde_json::json!({
+                        "found": true,
+                        "input": d.input,
+                        "output": d.output,
+                        "isError": d.is_error,
+                        "resolved": d.resolved,
+                    })),
+                    None => RpcReply::value(&serde_json::json!({ "found": false })),
+                }
             }
             other => Err(RpcError::UnknownMethod(other.to_string())),
         }

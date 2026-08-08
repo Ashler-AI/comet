@@ -117,12 +117,22 @@ pub fn diff_transcript(
     prev: &[SessionMessageEntry],
     next: &[SessionMessageEntry],
 ) -> TranscriptFrame {
-    let prev_by_id: std::collections::HashMap<&str, (usize, &SessionMessageEntry)> = prev
-        .iter()
-        .enumerate()
-        .map(|(i, e)| (e.id.as_str(), (i, e)))
-        .collect();
-    let next_ids: std::collections::HashSet<&str> = next.iter().map(|e| e.id.as_str()).collect();
+    let mut prev_by_id =
+        std::collections::HashMap::<&str, (usize, &SessionMessageEntry)>::with_capacity(prev.len());
+    for (index, entry) in prev.iter().enumerate() {
+        if prev_by_id
+            .insert(entry.id.as_str(), (index, entry))
+            .is_some()
+        {
+            return TranscriptFrame::reset(next);
+        }
+    }
+    let mut next_ids = std::collections::HashSet::<&str>::with_capacity(next.len());
+    for entry in next {
+        if !next_ids.insert(entry.id.as_str()) {
+            return TranscriptFrame::reset(next);
+        }
+    }
 
     let remove: Vec<String> = prev
         .iter()
@@ -192,6 +202,35 @@ pub fn apply_transcript_frame(
             remove,
             count,
         } => {
+            let mut current_ids = std::collections::HashSet::<&str>::with_capacity(current.len());
+            if let Some(duplicate) = current
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .find(|id| !current_ids.insert(*id))
+            {
+                return Err(TranscriptDesync(format!(
+                    "duplicate current entry id {duplicate}"
+                )));
+            }
+            drop(current_ids);
+            let mut operation_ids =
+                std::collections::HashSet::<&str>::with_capacity(remove.len() + upsert.len());
+            for id in &remove {
+                if !operation_ids.insert(id.as_str()) {
+                    return Err(TranscriptDesync(format!(
+                        "duplicate delta operation for entry {id}"
+                    )));
+                }
+            }
+            for TranscriptUpsert { entry, .. } in &upsert {
+                if !operation_ids.insert(entry.id.as_str()) {
+                    return Err(TranscriptDesync(format!(
+                        "duplicate delta operation for entry {}",
+                        entry.id
+                    )));
+                }
+            }
+            drop(operation_ids);
             if !remove.is_empty() {
                 let gone: std::collections::HashSet<&str> =
                     remove.iter().map(String::as_str).collect();
@@ -364,6 +403,34 @@ mod tests {
             diff_transcript(&prev, &next),
             TranscriptFrame::Reset { .. }
         ));
+    }
+
+    #[test]
+    fn duplicate_ids_force_reset_before_delta_can_reorder() {
+        let first = entry("duplicate", "first");
+        let middle = entry("middle", "middle");
+        let second = entry("duplicate", "second");
+        let inserted = entry("inserted", "inserted");
+        let prev = vec![first.clone(), middle.clone(), second.clone()];
+        let next = vec![first, middle, second, inserted];
+
+        assert!(matches!(
+            diff_transcript(&prev, &next),
+            TranscriptFrame::Reset { .. }
+        ));
+    }
+
+    #[test]
+    fn delta_rejects_a_legacy_transcript_with_duplicate_ids() {
+        let frame = TranscriptFrame::Delta {
+            upsert: vec![],
+            append: vec![],
+            remove: vec![],
+            count: 2,
+        };
+        let mut current = vec![entry("duplicate", "first"), entry("duplicate", "second")];
+
+        assert!(apply_transcript_frame(&mut current, frame).is_err());
     }
 
     #[test]

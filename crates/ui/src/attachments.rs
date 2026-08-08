@@ -342,7 +342,10 @@ pub fn stage_pasted_text(text: String) -> StagedAttachment {
 // Upload (state.ts uploadAttachment) + read-back (state.ts readAttachmentImage)
 // ---------------------------------------------------------------------------
 
-fn with_target(mut params: serde_json::Value, target_device_id: Option<&str>) -> serde_json::Value {
+pub(crate) fn with_target(
+    mut params: serde_json::Value,
+    target_device_id: Option<&str>,
+) -> serde_json::Value {
     if let (Some(target), Some(map)) = (target_device_id, params.as_object_mut()) {
         map.insert("targetDeviceId".into(), target.into());
     }
@@ -360,7 +363,7 @@ const READ_CHUNK_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Race an RPC against `timeout` on the gpui background executor (these
 /// futures run under `cx.spawn`, so tokio's timer reactor isn't available).
-async fn call_with_timeout(
+pub(crate) async fn call_with_timeout(
     engine: &EngineHandle,
     executor: &BackgroundExecutor,
     method: &str,

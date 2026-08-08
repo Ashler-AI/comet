@@ -145,7 +145,8 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
     }));
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "c1".into(),
-        is_error: true
+        is_error: true,
+        output: None,
     }));
 
     // fileChange (single add): WriteFile, refreshed at completion.
@@ -165,7 +166,8 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
     );
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "f1".into(),
-        is_error: false
+        is_error: false,
+        output: None,
     }));
 
     // mcpToolCall with failed status.
@@ -179,7 +181,8 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
     }));
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "mcp1".into(),
-        is_error: true
+        is_error: true,
+        output: None,
     }));
 
     // webSearch lifecycle.
@@ -191,7 +194,8 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
     }));
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "w1".into(),
-        is_error: false
+        is_error: false,
+        output: None,
     }));
 
     // Completion-only todoList still opens and closes the lifecycle.
@@ -212,7 +216,8 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
     }));
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "td1".into(),
-        is_error: false
+        is_error: false,
+        output: None,
     }));
 
     // Streamed agentMessage must not re-emit its completed text…

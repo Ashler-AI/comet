@@ -396,6 +396,56 @@ fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
     }
 }
 
+/// The full (multiline) input of a tool call for the expanded detail pane —
+/// unlike [`tool_chip_content`] this is NOT single-lined: an `Exec` shows the
+/// whole script, a write shows its content, an unknown/MCP tool its raw JSON
+/// args. `None` when the call carries nothing beyond the chip line.
+pub fn tool_call_input_text(call: &crate::ToolCall) -> Option<String> {
+    use crate::ToolCall;
+    fn pretty(value: &serde_json::Value) -> String {
+        serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+    }
+    match call {
+        ToolCall::Exec { command } => Some(command.clone()),
+        ToolCall::ReadFile { path } => Some(path.clone()),
+        ToolCall::WriteFile { path, content } => Some(match content {
+            Some(content) => format!("{path}\n\n{content}"),
+            None => path.clone(),
+        }),
+        ToolCall::EditFile {
+            path,
+            old_string,
+            new_string,
+        } => {
+            let mut out = path.clone();
+            if let Some(old) = old_string {
+                out.push_str("\n\n--- old\n");
+                out.push_str(old);
+            }
+            if let Some(new) = new_string {
+                out.push_str("\n\n+++ new\n");
+                out.push_str(new);
+            }
+            Some(out)
+        }
+        ToolCall::ApplyPatch { path } => path.clone(),
+        ToolCall::Search { pattern, path } => Some(match path {
+            Some(path) => format!("{pattern} in {path}"),
+            None => pattern.clone(),
+        }),
+        ToolCall::Glob { pattern } => Some(pattern.clone()),
+        ToolCall::WebFetch { url, prompt } => Some(match prompt {
+            Some(prompt) => format!("{url}\n\n{prompt}"),
+            None => url.clone(),
+        }),
+        ToolCall::WebSearch { query } => Some(query.clone()),
+        ToolCall::Todo { .. } | ToolCall::Agent { .. } => None,
+        ToolCall::Mcp { input, .. } | ToolCall::Unknown { input, .. } => {
+            input.as_ref().map(pretty)
+        }
+    }
+}
+
 /// The ToolGroup summary line — "Ran 3 commands · edited 2 files".
 ///
 /// Takes `(call, is_error)` pairs so each viewport can keep its own row model;
@@ -503,6 +553,46 @@ mod agent_activity_tests {
         assert_eq!(
             tool_group_summary(&[(activity(AgentActivityStatus::Completed), false)]),
             "Used 1 agent"
+        );
+    }
+
+    #[test]
+    fn detail_input_text_keeps_full_multiline_inputs() {
+        assert_eq!(
+            tool_call_input_text(&ToolCall::Exec {
+                command: "set -e\ncargo test".into()
+            })
+            .as_deref(),
+            Some("set -e\ncargo test")
+        );
+        assert_eq!(
+            tool_call_input_text(&ToolCall::WriteFile {
+                path: "/x".into(),
+                content: Some("body".into()),
+            })
+            .as_deref(),
+            Some("/x\n\nbody")
+        );
+        // Unknown tools render their raw JSON args (the omp harness shape).
+        let input = tool_call_input_text(&ToolCall::Unknown {
+            name: "Reading files".into(),
+            input: Some(serde_json::json!({ "path": "a.rs" })),
+        })
+        .expect("json input");
+        assert!(input.contains("\"path\": \"a.rs\""));
+        // Nothing beyond the chip line for todo/agent chips.
+        assert_eq!(tool_call_input_text(&ToolCall::Todo { items: vec![] }), None);
+    }
+
+    #[test]
+    fn tool_output_truncation_marks_the_cut_at_a_char_boundary() {
+        let long = "é".repeat(crate::TOOL_OUTPUT_CAP_BYTES); // 2 bytes each
+        let capped = crate::truncate_tool_output(long);
+        assert!(capped.len() <= crate::TOOL_OUTPUT_CAP_BYTES + "\n… [output truncated]".len());
+        assert!(capped.ends_with("… [output truncated]"));
+        assert_eq!(
+            crate::truncate_tool_output("short".into()),
+            "short".to_string()
         );
     }
 }

@@ -240,6 +240,25 @@ pub enum ToolCall {
     },
 }
 
+/// Cap on captured tool output (journal-line hygiene: a single `cargo test`
+/// dump must not balloon the append-only run journal). Adapters truncate at a
+/// char boundary via [`truncate_tool_output`].
+pub const TOOL_OUTPUT_CAP_BYTES: usize = 48 * 1024;
+
+/// Enforce [`TOOL_OUTPUT_CAP_BYTES`] on a captured output, marking the cut.
+pub fn truncate_tool_output(mut text: String) -> String {
+    if text.len() <= TOOL_OUTPUT_CAP_BYTES {
+        return text;
+    }
+    let mut end = TOOL_OUTPUT_CAP_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str("\n… [output truncated]");
+    text
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TodoItem {
@@ -312,6 +331,13 @@ pub enum AgentEvent {
     ToolResult {
         id: String,
         is_error: bool,
+        /// Harness-reported tool output (plain text, capped at
+        /// [`TOOL_OUTPUT_CAP_BYTES`] by the capturing adapter). Journal-only:
+        /// never folded into doc parts — the transcript fetches it on demand
+        /// via `ToolCallDetail`. Serde-defaulted so old journal lines and old
+        /// peers stay readable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
     },
     /// Kept as a harness passthrough (rate-limit probes); never persisted to docs.
     #[serde(rename_all = "camelCase")]

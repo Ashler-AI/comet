@@ -20,6 +20,7 @@ cargo build -p comet -q
 
 echo "▸ starting engine daemon on :$IPC"
 env COMET_DATA_DIR="$DAEMON_DIR" COMET_IPC_PORT=$IPC COMET_HARNESS=mock \
+  COMET_EDGE_TOKEN=demo-token COMET_EDGE_URL=http://127.0.0.1:9 \
   ${DELAY:+COMET_MOCK_DELAY_MS=$DELAY} RUST_LOG=warn \
   ./target/debug/comet headless &
 DAEMON_PID=$!
@@ -62,4 +63,5 @@ if [[ ! -f "$DAEMON_DIR/.demo-seeded" ]]; then
 fi
 
 echo "▸ opening comet (composer is live — type into it; --slow shows streaming)"
-COMET_DATA_DIR="$UI_DIR" COMET_IPC_PORT=$IPC RUST_LOG=warn ./target/debug/comet
+COMET_DATA_DIR="$UI_DIR" COMET_IPC_PORT=$IPC COMET_EDGE_TOKEN=demo-token \
+  COMET_EDGE_URL=http://127.0.0.1:9 RUST_LOG=warn ./target/debug/comet

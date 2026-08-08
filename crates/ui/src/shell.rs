@@ -666,10 +666,6 @@ fn right_drawer_overlay(viewport: gpui::Size<Pixels>, drawer: impl IntoElement) 
     .into_any_element()
 }
 
-fn stop_selection_action_mouse_down(_: &MouseDownEvent, _: &mut Window, cx: &mut App) {
-    cx.stop_propagation();
-}
-
 fn annotation_prompt_context(annotation: &comet_proto::SemanticAnnotation) -> String {
     match annotation
         .anchor
@@ -2042,7 +2038,7 @@ impl Shell {
             .cloned()
     }
 
-    fn save_annotation(&mut self, cx: &mut Context<Self>) {
+    fn save_annotation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(inspector) = self.annotation_inspector.as_ref() else {
             return;
         };
@@ -2057,6 +2053,25 @@ impl Shell {
         let is_new = inspector.is_new;
         let mut annotation = inspector.annotation.clone();
         annotation.body = body.clone();
+
+        if is_new {
+            // Ordinary chat runs do not publish an AgentSessionRecord. The
+            // comment still belongs in the next prompt; collaboration sessions
+            // additionally persist the durable annotation.
+            if let Some(session) = self.annotation_session(cx) {
+                self.queue_control(
+                    session,
+                    SessionControlAction::AnnotationCreate {
+                        annotation: annotation.clone(),
+                    },
+                    "Add comment",
+                    cx,
+                );
+            }
+            self.append_annotation_to_prompt(annotation, window, cx);
+            return;
+        }
+
         let Some(session) = self.annotation_session(cx) else {
             if let Some(inspector) = self.annotation_inspector.as_mut() {
                 inspector.error = Some("No agent session".into());
@@ -2064,22 +2079,16 @@ impl Shell {
             cx.notify();
             return;
         };
-        let (action, label) = if is_new {
-            (
-                SessionControlAction::AnnotationCreate { annotation },
-                "Add comment",
-            )
-        } else {
-            (
-                SessionControlAction::AnnotationEdit {
-                    annotation_id: annotation.id,
-                    body: Some(body),
-                    anchor: None,
-                },
-                "Edit comment",
-            )
-        };
-        self.queue_control(session, action, label, cx);
+        self.queue_control(
+            session,
+            SessionControlAction::AnnotationEdit {
+                annotation_id: annotation.id,
+                body: Some(body),
+                anchor: None,
+            },
+            "Edit comment",
+            cx,
+        );
         self.annotation_inspector = None;
     }
 
@@ -2192,6 +2201,7 @@ impl Shell {
     ) {
         let now = Utc::now().timestamp_millis();
         let required = action.required_capability();
+        let reveal_activity = required != comet_proto::CAPABILITY_SESSION_ANNOTATE;
         let resolved = {
             let state = self.state.read(cx);
             let snapshot = state.collaboration.as_ref();
@@ -2255,7 +2265,9 @@ impl Shell {
             state: ControlFeedbackState::Pending,
             detail: None,
         });
-        self.activity_open = true;
+        if reveal_activity {
+            self.activity_open = true;
+        }
         let command = SessionCommandPayload::Control {
             session_id: session.session_id.clone(),
             owner_device_id: session.owner_device_id.clone(),
@@ -5045,7 +5057,9 @@ impl Shell {
                         actions.child(
                             popover::btn_primary(&theme, if is_new { "Comment" } else { "Save" })
                                 .id("annotation-save")
-                                .on_click(cx.listener(|this, _, _, cx| this.save_annotation(cx))),
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.save_annotation(window, cx)
+                                })),
                         )
                     }),
             )
@@ -5323,9 +5337,9 @@ impl Shell {
                                 .child(
                                     popover::btn_primary(&theme, "Save")
                                         .id("annotation-save")
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.save_annotation(cx)),
-                                        ),
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.save_annotation(window, cx)
+                                        })),
                                 )
                                 .when(!is_new, |actions| {
                                     actions.child(
@@ -5378,46 +5392,56 @@ impl Shell {
         let theme = Theme::of(cx);
         let left = pointer_x.clamp(12.0, (f32::from(viewport.width) - 116.0).max(12.0));
         let top = (pointer_y + 10.0).clamp(12.0, (f32::from(viewport.height) - 42.0).max(12.0));
-        Some(
-            div()
-                .id("selection-comment")
-                .absolute()
-                .left(px(left))
-                .top(px(top))
-                .h(px(32.0))
-                .px(px(12.0))
-                .rounded_full()
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.surface_raised)
-                .shadow_md()
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .cursor_pointer()
-                .hover(|style| style.bg(theme.surface_raised_hover))
-                .on_mouse_down(MouseButton::Left, stop_selection_action_mouse_down)
-                .on_click(cx.listener(move |this, _, _, cx| {
+        let action = div()
+            .id("selection-comment")
+            .h(px(32.0))
+            .px(px(12.0))
+            .rounded_full()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.surface_raised)
+            .shadow_md()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .occlude()
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.surface_raised_hover))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    tracing::warn!("SELECTION_COMMENT_ACTION_MOUSE_DOWN");
+                    cx.stop_propagation();
                     this.open_selection_annotation(
                         message_id.clone(),
                         exact.clone(),
                         gpui::point(px(left), px(top + 38.0)),
                         cx,
                     )
-                }))
-                .child(
-                    icon(icons::CHAT_ROUND_LINE)
-                        .size(px(14.0))
-                        .text_color(theme.text_muted),
-                )
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme.text)
-                        .child(SharedString::from("Comment")),
-                )
-                .into_any_element(),
+                }),
+            )
+            .child(
+                icon(icons::CHAT_ROUND_LINE)
+                    .size(px(14.0))
+                    .text_color(theme.text_muted),
+            )
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text)
+                    .child(SharedString::from("Comment")),
+            )
+            .into_any_element();
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .position(gpui::point(px(left), px(top)))
+                    .anchor(gpui::Anchor::TopLeft)
+                    .child(action),
+            )
+            .priority(1)
+            .into_any_element(),
         )
     }
 
@@ -7561,33 +7585,46 @@ mod tests {
     }
 
     struct SelectionCommentActionProbe {
-        parent_mouse_down: Rc<Cell<bool>>,
+        underlying_mouse_down: Rc<Cell<bool>>,
         popover_open: Rc<Cell<bool>>,
     }
 
     impl Render for SelectionCommentActionProbe {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            let parent_mouse_down = self.parent_mouse_down.clone();
+            let underlying_mouse_down = self.underlying_mouse_down.clone();
             let popover_open = self.popover_open.clone();
             let is_open = self.popover_open.get();
             div()
                 .size_full()
-                .on_mouse_down(MouseButton::Left, move |_, _, _| {
-                    parent_mouse_down.set(true);
-                })
                 .child(
                     div()
-                        .id("selection-comment-action-probe")
-                        .debug_selector(|| "SELECTION_COMMENT_ACTION".into())
                         .absolute()
-                        .left(px(100.0))
-                        .top(px(100.0))
-                        .size(px(120.0))
-                        .on_mouse_down(MouseButton::Left, stop_selection_action_mouse_down)
-                        .on_click(move |_, window, _| {
-                            popover_open.set(true);
-                            window.refresh();
+                        .left(px(80.0))
+                        .top(px(80.0))
+                        .size(px(160.0))
+                        .on_mouse_down(MouseButton::Left, move |_, _, _| {
+                            underlying_mouse_down.set(true);
                         }),
+                )
+                .child(
+                    gpui::deferred(
+                        gpui::anchored()
+                            .position(gpui::point(px(100.0), px(100.0)))
+                            .anchor(gpui::Anchor::TopLeft)
+                            .child(
+                                div()
+                                    .id("selection-comment-action-probe")
+                                    .debug_selector(|| "SELECTION_COMMENT_ACTION".into())
+                                    .size(px(120.0))
+                                    .occlude()
+                                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                        cx.stop_propagation();
+                                        popover_open.set(true);
+                                        window.refresh();
+                                    }),
+                            ),
+                    )
+                    .priority(1),
                 )
                 .when(is_open, |root| {
                     root.child(popover::menu_at(
@@ -7621,13 +7658,13 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         cx.update(|cx| Theme::install(crate::theme::Appearance::Dark, cx));
-        let parent_mouse_down = Rc::new(Cell::new(false));
+        let underlying_mouse_down = Rc::new(Cell::new(false));
         let popover_open = Rc::new(Cell::new(false));
         let window = cx.open_window(gpui::size(px(400.0), px(300.0)), {
-            let parent_mouse_down = parent_mouse_down.clone();
+            let underlying_mouse_down = underlying_mouse_down.clone();
             let popover_open = popover_open.clone();
             move |_, _| SelectionCommentActionProbe {
-                parent_mouse_down,
+                underlying_mouse_down,
                 popover_open,
             }
         });
@@ -7646,8 +7683,8 @@ mod tests {
             "comment popover should render after the action is clicked"
         );
         assert!(
-            !parent_mouse_down.get(),
-            "comment action must not let the transcript clear its selection"
+            !underlying_mouse_down.get(),
+            "comment action must block the transcript hitbox beneath it"
         );
     }
 
