@@ -107,10 +107,10 @@ pub mod methods {
     /// Checkout-diff stream for the target device's chats (DataRpc,
     /// relay-forwardable — diffs are produced where the checkout lives).
     pub const WATCH_CHECKOUT_DIFFS: &str = "WatchCheckoutDiffs";
-    // Agent accounts (ControlRpc, relay-forwardable — CLI logins are per-device).
+    // Shared Agent Auth account pool (ControlRpc, never device-targeted).
     pub const LIST_AGENT_ACCOUNTS: &str = "ListAgentAccounts";
-    pub const ACTIVATE_AGENT_ACCOUNT: &str = "ActivateAgentAccount";
-    pub const FORGET_AGENT_ACCOUNT: &str = "ForgetAgentAccount";
+    pub const MIGRATE_AGENT_ACCOUNT: &str = "MigrateAgentAccount";
+    pub const REVOKE_AGENT_ACCOUNT: &str = "RevokeAgentAccount";
     pub const START_AGENT_LOGIN: &str = "StartAgentLogin";
     pub const COMPLETE_AGENT_LOGIN: &str = "CompleteAgentLogin";
     pub const POLL_AGENT_LOGIN: &str = "PollAgentLogin";

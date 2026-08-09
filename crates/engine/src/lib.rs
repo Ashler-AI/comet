@@ -16,6 +16,7 @@ pub mod agent_accounts;
 pub mod auth;
 pub mod diff_sync;
 pub mod doc_host;
+mod inference_relay;
 pub mod instance_lock;
 pub mod local_sessions;
 pub mod omp_session_artifact;
@@ -360,6 +361,7 @@ impl EngineCore {
     }
 
     pub fn set_scaffold_runtime(&self, scaffold: ScaffoldRuntime) {
+        self.agent_accounts.set_remote(scaffold.client());
         *self
             .scaffold
             .lock()
@@ -588,6 +590,8 @@ impl Engine {
         {
             let bearer: Arc<dyn comet_rpc::TokenSource> = Arc::new(auth.clone());
             let client = ScaffoldClient::new(scaffold_url, project_scope.clone(), bearer.clone())?;
+            core.sessions
+                .set_inference_relay(inference_relay::InferenceRelay::start(client.clone())?);
             let grants = Arc::new(EdgeDeviceJoinGrantClient::new(&config.edge_url, bearer)?);
             core.set_scaffold_runtime(ScaffoldRuntime::new(
                 client,

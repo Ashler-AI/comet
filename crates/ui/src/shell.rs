@@ -1405,7 +1405,7 @@ impl Shell {
             _state_observation: observation,
             _composer_events: composer_events,
         };
-        shell.refresh_account_usage(true, cx);
+        shell.refresh_account_usage(cx);
         shell
     }
 
@@ -1433,7 +1433,7 @@ impl Shell {
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
         if self.account_usage_loaded_at.is_none() && !self.account_usage_loading {
-            self.refresh_account_usage(true, cx);
+            self.refresh_account_usage(cx);
         }
         if self.session_import_open {
             self.sync_session_import_sections(cx);
@@ -1709,7 +1709,7 @@ impl Shell {
         changes
     }
 
-    fn refresh_account_usage(&mut self, force: bool, cx: &mut Context<Self>) {
+    fn refresh_account_usage(&mut self, cx: &mut Context<Self>) {
         if self.account_usage_loading {
             return;
         }
@@ -1721,10 +1721,7 @@ impl Shell {
         self.account_usage_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
-                .call(
-                    methods::LIST_AGENT_ACCOUNTS,
-                    serde_json::json!({ "forceUsage": force }),
-                )
+                .call(methods::LIST_AGENT_ACCOUNTS, serde_json::json!({}))
                 .await;
             this.update(cx, |shell, cx| {
                 shell.account_usage_loading = false;
@@ -4996,16 +4993,12 @@ impl Shell {
                         row.child(
                             popover::btn_ghost(&theme, "Open", "open-session-link")
                                 .id("open-session-link")
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.open_session_link(cx)),
-                                ),
+                                .on_click(cx.listener(|this, _, _, cx| this.open_session_link(cx))),
                         )
                         .child(
                             popover::btn_primary(&theme, "Copy link")
                                 .id("copy-session-link")
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.copy_session_link(cx)),
-                                ),
+                                .on_click(cx.listener(|this, _, _, cx| this.copy_session_link(cx))),
                         )
                     }),
             )
@@ -5738,7 +5731,11 @@ impl Shell {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.copy_chat_session_id(&copy_id, cx);
                         }))
-                        .child(icon(icons::COPY).size(px(16.0)).text_color(theme.text_muted))
+                        .child(
+                            icon(icons::COPY)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
                         .child(SharedString::from("Copy session ID")),
                 )
                 .child(
@@ -6060,13 +6057,21 @@ impl Shell {
             snapshot
                 .accounts
                 .iter()
-                .find(|account| account.active && Some(account.harness) == preferred_harness)
+                .find(|account| {
+                    !account.migration_available && Some(account.harness) == preferred_harness
+                })
                 .or_else(|| {
                     snapshot.accounts.iter().find(|account| {
-                        account.active && account.harness == comet_proto::HarnessId::Codex
+                        !account.migration_available
+                            && account.harness == comet_proto::HarnessId::Codex
                     })
                 })
-                .or_else(|| snapshot.accounts.iter().find(|account| account.active))
+                .or_else(|| {
+                    snapshot
+                        .accounts
+                        .iter()
+                        .find(|account| !account.migration_available)
+                })
                 .map(|account| {
                     let provider = crate::multiplayer::harness_label(account.harness);
                     let identity = account
@@ -7324,7 +7329,8 @@ impl Render for Shell {
         {
             window.focus(&inspector.input.focus_handle(cx), cx);
         }
-        if std::mem::take(&mut self.annotation_submit_pending) && self.annotation_inspector.is_some()
+        if std::mem::take(&mut self.annotation_submit_pending)
+            && self.annotation_inspector.is_some()
         {
             // Save mutates the composer and moves focus — deferred out of the
             // draw rather than run mid-render.

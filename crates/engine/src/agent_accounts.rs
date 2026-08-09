@@ -1,34 +1,13 @@
-//! AgentAccounts — the Claude Code / Codex CLI logins on this device
-//! (feature-inventory §3.7 "Agent accounts"; port of comet's `agent-accounts.ts`).
+//! Shared Agent Auth account pool and one-time local credential migration.
 //!
-//! Each CLI stores exactly one live login:
+//! Agent Auth is the durable authority. The local Claude Code and Codex stores
+//! are inspected only to capture credentials that predate the shared pool.
+//! Recovery snapshots remain under `{data_dir}/agent-accounts/` until Agent Auth
+//! acknowledges the matching import. Only then is the exact captured live
+//! credential removed; a changed or failed import never deletes local material.
 //!
-//! - **Claude Code** — credentials in `~/.claude/.credentials.json`
-//!   (`$CLAUDE_CONFIG_DIR` relocates the dir) or, on macOS, the Keychain item
-//!   `Claude Code-credentials`; the account identity (`oauthAccount`, `userID`)
-//!   lives in `~/.claude.json`.
-//! - **Codex** — `$CODEX_HOME/auth.json` (default `~/.codex`): a ChatGPT OAuth
-//!   token set (identity inside the `id_token` JWT) or a raw API key.
-//!
-//! Claude-swap mechanics:
-//!
-//! 1. **Detect** the live login of each CLI and auto-snapshot it into a slot
-//!    under `{data_dir}/agent-accounts/{harness}/{slotId}.json` — the current
-//!    session is always backed up before any swap, and refreshed tokens stay
-//!    current.
-//! 2. **Swap** (`activate`): overwrite the CLI's credential store (and, for
-//!    Claude, merge the identity back into `~/.claude.json`) with a saved slot.
-//! 3. **Add** (`start_login`…): drive an OAuth flow for a NEW account without
-//!    touching the live one. Claude uses the public PKCE code flow (paste-code);
-//!    Codex spawns `codex login` against a throwaway `CODEX_HOME` and polls
-//!    until its loopback callback lands.
-//!
-//! Usage probes: both providers expose the rate-limit view their own CLIs render
-//! (`/usage` in Claude Code, `/status` in Codex). Unlike comet (fetch on every
-//! list, 60s cache), native only hits the network when `force_usage` is set —
-//! the default list stays offline-fast and deterministic; the UI passes
-//! `forceUsage` on page mount/refresh. Cached results (60s TTL) are served to
-//! non-forced lists in between.
+//! New-account OAuth flows also import directly into Agent Auth. They use
+//! isolated temporary state and never create a steady-state local account slot.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -48,6 +27,9 @@ use comet_proto::{
 };
 
 use crate::repos::home_dir;
+use crate::scaffold::{
+    AgentAccountCredentialImport, AgentAccountOAuthCredential, RemoteAgentAccount, ScaffoldClient,
+};
 use crate::{EngineError, new_id, now_ms};
 
 // Claude Code's public OAuth client (the one the CLI itself uses for the manual
@@ -57,13 +39,10 @@ const CLAUDE_REDIRECT: &str = "https://console.anthropic.com/oauth/code/callback
 const CLAUDE_SCOPES: &str = "org:create_api_key user:profile user:inference";
 const CLAUDE_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
 const CLAUDE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
-const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
-const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 
 #[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 
-const USAGE_TTL: Duration = Duration::from_secs(60);
 /// An abandoned login flow (dialog dismissed without Cancel) is reaped past this.
 const FLOW_TTL: Duration = Duration::from_secs(15 * 60);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(8);
@@ -72,7 +51,8 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(8);
 /// explicit in tests.
 #[derive(Debug, Clone)]
 pub struct AgentAccountsConfig {
-    /// Engine data dir; slots live under `{data_dir}/agent-accounts/`.
+    /// Engine data dir; pending migration recovery snapshots live under
+    /// `{data_dir}/agent-accounts/`.
     pub data_dir: PathBuf,
     /// Claude config dir (`$CLAUDE_CONFIG_DIR` or `~/.claude`) — holds `.credentials.json`.
     pub claude_config_dir: PathBuf,
@@ -132,23 +112,21 @@ struct SlotProfile {
     auth_kind: AgentAuthKind,
 }
 
-/// One saved login (`{slotId}.json`), same field surface as comet's slot files.
+/// A credential recovery snapshot retained until Agent Auth acknowledges import.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Slot {
     id: String,
     harness: HarnessId,
-    /// The provider-side identity the slot is keyed by (account uuid/email).
+    /// Provider-side identity used as Agent Auth's idempotency key.
     account_key: String,
     profile: SlotProfile,
-    /// Claude: the `.credentials.json`/Keychain payload. Codex: `auth.json`.
+    /// Claude: `.credentials.json`/Keychain payload. Codex: `auth.json`.
     credentials: serde_json::Value,
-    /// Claude only: `{oauthAccount, userID}` merged into `~/.claude.json` on swap.
+    /// Claude identity fields captured solely for exact-match cleanup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claude_config: Option<serde_json::Value>,
     saved_at: i64,
-    /// First time this account was saved — the STABLE sort key, so switching the
-    /// active account (which re-snapshots and bumps `saved_at`) never reorders.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     created_at: Option<i64>,
 }
@@ -194,18 +172,13 @@ impl LoginFlow {
 
 // ── service ─────────────────────────────────────────────────────────────────
 
-/// Cached usage probe result: the windows (or a remembered miss) + fetch time.
-type CachedUsage = (Option<Vec<AgentUsageWindow>>, Instant);
-
 struct Inner {
     config: AgentAccountsConfig,
     http: reqwest::Client,
     flows: Mutex<HashMap<String, LoginFlow>>,
-    /// `"{harness}:{accountKey}"` → cached usage windows.
-    usage_cache: Mutex<HashMap<String, CachedUsage>>,
-    /// Slots with a token refresh in flight — a second refresh of the same
-    /// (commonly single-use) refresh token would revoke the family.
-    inflight_refreshes: Mutex<std::collections::HashSet<String>>,
+    /// Present after authenticated controller startup. Every account operation
+    /// requires this client because Agent Auth is the sole authority.
+    remote: Mutex<Option<ScaffoldClient>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -240,22 +213,28 @@ impl AgentAccounts {
                 config,
                 http,
                 flows: Mutex::new(HashMap::new()),
-                usage_cache: Mutex::new(HashMap::new()),
-                inflight_refreshes: Mutex::new(std::collections::HashSet::new()),
+                remote: Mutex::new(None),
             }),
         }
     }
 
-    // ── list ────────────────────────────────────────────────────────────────
+    pub fn set_remote(&self, client: ScaffoldClient) {
+        *lock(&self.inner.remote) = Some(client);
+    }
 
-    /// Detect both CLIs, auto-snapshot the live logins, and assemble the view.
-    pub async fn list(&self, force_usage: bool) -> Result<AgentAccountsSnapshot, EngineError> {
-        if force_usage {
-            lock(&self.inner.usage_cache).clear();
-        }
-        let mut warnings: Vec<AgentAccountWarning> = Vec::new();
-        let mut active_keys: HashMap<HarnessId, String> = HashMap::new();
-        let mut unreadable: HashMap<HarnessId, Detected> = HashMap::new();
+    // ── authoritative list and local migration ─────────────────────────────
+
+    fn remote(&self) -> Result<ScaffoldClient, EngineError> {
+        lock(&self.inner.remote).clone().ok_or_else(|| {
+            EngineError::Other("Agent Auth is unavailable. Sign in to Comet and retry.".into())
+        })
+    }
+
+    /// List the shared Agent Auth pool and any OAuth recovery snapshots that
+    /// still need an explicit one-time import.
+    pub async fn list(&self) -> Result<AgentAccountsSnapshot, EngineError> {
+        let remote = self.remote()?;
+        let mut warnings = Vec::new();
 
         let (claude, claude_warning) = self.detect_claude().await;
         if let Some(message) = claude_warning {
@@ -265,192 +244,254 @@ impl AgentAccounts {
             });
         }
         if let Some(detected) = claude {
-            active_keys.insert(HarnessId::ClaudeCode, detected.account_key.clone());
-            if detected.credentials.is_some() {
-                self.snapshot_detected(HarnessId::ClaudeCode, &detected)?;
-            } else {
-                unreadable.insert(HarnessId::ClaudeCode, detected);
-            }
+            self.snapshot_detected(HarnessId::ClaudeCode, &detected)?;
         }
         if let Some(detected) = self.detect_codex() {
-            active_keys.insert(HarnessId::Codex, detected.account_key.clone());
-            self.snapshot_detected(HarnessId::Codex, &detected)?;
+            if detected.profile.auth_kind == AgentAuthKind::Oauth {
+                self.snapshot_detected(HarnessId::Codex, &detected)?;
+            } else {
+                warnings.push(AgentAccountWarning {
+                    harness: HarnessId::Codex,
+                    message: "API key logins remain local and cannot be migrated to the shared account pool."
+                        .into(),
+                });
+            }
         }
 
-        // Stable presentation order: provider, then slot creation order (never
-        // active-first — switching must not reshuffle the cards).
-        let mut accounts: Vec<AgentAccount> = Vec::new();
-        for harness in [HarnessId::ClaudeCode, HarnessId::Codex] {
-            let active_key = active_keys.get(&harness).cloned();
-            let slots = self.read_slots(harness);
-            for slot in &slots {
-                let active = active_key.as_deref() == Some(slot.account_key.as_str());
-                let usage = self.usage_for(harness, slot, active, force_usage).await;
-                accounts.push(AgentAccount {
-                    id: slot.id.clone(),
-                    harness,
-                    email: Some(slot.profile.email.clone()),
-                    plan_label: slot.profile.plan.clone(),
-                    active,
-                    usage_windows: usage.unwrap_or_default(),
-                    display_name: slot.profile.display_name.clone(),
-                    organization: slot.profile.organization.clone(),
-                    auth_kind: Some(slot.profile.auth_kind),
-                    switchable: true,
-                    saved_at: Some(slot.saved_at),
-                });
-            }
-            // A live login whose credentials we couldn't read has no slot — still
-            // show it (active, but not re-activatable until the Keychain relents).
-            if let Some(u) = unreadable.get(&harness)
-                && !slots.iter().any(|s| s.account_key == u.account_key)
+        let remote_accounts = remote
+            .list_agent_accounts()
+            .await
+            .map_err(|error| EngineError::Other(format!("Agent Auth: {error}")))?;
+        let mut accounts = remote_accounts
+            .iter()
+            .filter_map(remote_account_for_view)
+            .collect::<Vec<_>>();
+
+        for remote_account in &remote_accounts {
+            if remote_account.status != "connected"
+                && let Some(harness) = harness_for_provider(&remote_account.provider)
             {
-                accounts.push(AgentAccount {
-                    id: slot_id_for(harness, &u.account_key),
+                warnings.push(AgentAccountWarning {
                     harness,
-                    email: Some(u.profile.email.clone()),
-                    plan_label: u.profile.plan.clone(),
-                    active: true,
-                    usage_windows: Vec::new(),
-                    display_name: u.profile.display_name.clone(),
-                    organization: u.profile.organization.clone(),
-                    auth_kind: Some(u.profile.auth_kind),
-                    switchable: false,
-                    saved_at: None,
+                    message: format!(
+                        "{} needs attention before it can serve new turns.",
+                        remote_account.email.as_deref().unwrap_or("This account")
+                    ),
                 });
             }
         }
+
+        for harness in [HarnessId::ClaudeCode, HarnessId::Codex] {
+            for slot in self.read_slots(harness) {
+                if slot.profile.auth_kind != AgentAuthKind::Oauth {
+                    warnings.push(AgentAccountWarning {
+                        harness,
+                        message: "API key logins cannot be migrated to the shared account pool."
+                            .into(),
+                    });
+                    continue;
+                }
+
+                let acknowledged = remote_accounts.iter().any(|account| {
+                    harness_for_provider(&account.provider) == Some(harness)
+                        && account.provider_account_id == slot.account_key
+                });
+                if acknowledged {
+                    if let Err(error) = self.remove_matching_live_credential(&slot).await {
+                        warnings.push(AgentAccountWarning {
+                            harness,
+                            message: format!(
+                                "The account is shared, but its local credential could not be removed: {error}"
+                            ),
+                        });
+                        continue;
+                    }
+                    if let Err(error) = self.delete_slot(&slot) {
+                        warnings.push(AgentAccountWarning {
+                            harness,
+                            message: format!(
+                                "The account is shared, but local recovery data could not be removed: {error}"
+                            ),
+                        });
+                    }
+                    continue;
+                }
+
+                accounts.push(AgentAccount {
+                    id: slot.id,
+                    harness,
+                    email: Some(slot.profile.email),
+                    plan_label: slot.profile.plan,
+                    usage_windows: Vec::new(),
+                    display_name: slot.profile.display_name,
+                    organization: slot.profile.organization,
+                    auth_kind: Some(slot.profile.auth_kind),
+                    migration_available: true,
+                });
+            }
+        }
+
         Ok(AgentAccountsSnapshot { accounts, warnings })
     }
 
-    // ── swap ────────────────────────────────────────────────────────────────
-
-    /// Swap the CLI's live login to a saved slot. Detection runs first, so the
-    /// CURRENT login is snapshotted into its slot before being overwritten (the
-    /// claude-swap trick — a swap never strands the session it replaces).
-    pub async fn activate(
+    /// Import one recovery snapshot. A missing snapshot is treated as already
+    /// migrated so retries remain idempotent after acknowledged cleanup.
+    pub async fn migrate(
         &self,
         harness: HarnessId,
         account_id: &str,
     ) -> Result<AgentAccountsSnapshot, EngineError> {
-        self.list(false).await?;
-        let slot = self
+        if !matches!(harness, HarnessId::ClaudeCode | HarnessId::Codex) {
+            return Err(EngineError::Other(format!(
+                "agent account migration is not supported for {harness:?}"
+            )));
+        }
+        let remote = self.remote()?;
+        let Some(slot) = self
             .read_slots(harness)
             .into_iter()
-            .find(|s| s.id == account_id)
-            .ok_or_else(|| {
-                EngineError::Other(
-                    "That saved login no longer exists — refresh and try again.".into(),
-                )
-            })?;
-        match harness {
-            HarnessId::ClaudeCode => self.activate_claude(&slot).await?,
-            HarnessId::Codex => self.activate_codex(&slot)?,
+            .find(|slot| slot.id == account_id)
+        else {
+            return self.list().await;
+        };
+
+        self.import_slot(&remote, &slot).await?;
+        self.remove_matching_live_credential(&slot).await?;
+        self.delete_slot(&slot)?;
+        self.list().await
+    }
+
+    /// Revoke an Agent Auth account.
+    pub async fn revoke(&self, account_id: &str) -> Result<AgentAccountsSnapshot, EngineError> {
+        if account_id.trim().is_empty() {
+            return Err(EngineError::Other("Unknown shared account.".into()));
+        }
+        let remote = self.remote()?;
+        remote
+            .revoke_agent_account(account_id)
+            .await
+            .map_err(|error| EngineError::Other(format!("Agent Auth removal failed: {error}")))?;
+        self.list().await
+    }
+
+    async fn import_slot(&self, remote: &ScaffoldClient, slot: &Slot) -> Result<(), EngineError> {
+        let import = account_import_for_slot(slot)?;
+        let acknowledged = remote
+            .import_agent_account(&import)
+            .await
+            .map_err(|error| EngineError::Other(format!("Agent Auth import failed: {error}")))?;
+        if harness_for_provider(&acknowledged.provider) != Some(slot.harness)
+            || acknowledged.provider_account_id != slot.account_key
+        {
+            return Err(EngineError::Other(
+                "Agent Auth acknowledged a different account; local credentials were preserved."
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn delete_slot(&self, slot: &Slot) -> Result<(), EngineError> {
+        let file = self.slots_dir(slot.harness)?.join(format!(
+            "{}.json",
+            slot_id_for(slot.harness, &slot.account_key)
+        ));
+        if file.exists() {
+            std::fs::remove_file(file)?;
+        }
+        Ok(())
+    }
+
+    async fn remove_matching_live_credential(&self, slot: &Slot) -> Result<(), EngineError> {
+        match slot.harness {
+            HarnessId::Codex => {
+                let Some(detected) = self.detect_codex() else {
+                    return Ok(());
+                };
+                if !credential_matches(slot, &detected) {
+                    return Ok(());
+                }
+                let file = self.inner.config.codex_auth_file();
+                if read_json(&file).as_ref() == Some(&slot.credentials) {
+                    std::fs::remove_file(file)?;
+                }
+            }
+            HarnessId::ClaudeCode => {
+                let (Some(detected), _) = self.detect_claude().await else {
+                    return Ok(());
+                };
+                if !credential_matches(slot, &detected) {
+                    return Ok(());
+                }
+
+                let config_file = &self.inner.config.claude_config_file;
+                let original_config = read_json(config_file);
+                if let Some(mut cleaned) = original_config.clone()
+                    && let (Some(map), Some(captured)) =
+                        (cleaned.as_object_mut(), slot.claude_config.as_ref())
+                {
+                    if map.get("oauthAccount") == captured.get("oauthAccount") {
+                        map.remove("oauthAccount");
+                    }
+                    if map.get("userID") == captured.get("userID") {
+                        map.remove("userID");
+                    }
+                    write_file_atomic(config_file, cleaned.to_string().as_bytes(), false)?;
+                }
+
+                let credentials_file = self.inner.config.claude_creds_file();
+                let delete_result = if credentials_file.exists() {
+                    if read_json(&credentials_file).as_ref() != Some(&slot.credentials) {
+                        if let Some(original) = original_config.as_ref() {
+                            let _ = write_file_atomic(
+                                config_file,
+                                original.to_string().as_bytes(),
+                                false,
+                            );
+                        }
+                        return Ok(());
+                    }
+                    std::fs::remove_file(credentials_file).map_err(EngineError::from)
+                } else {
+                    #[cfg(target_os = "macos")]
+                    {
+                        let (current, _) = keychain::read_credentials().await;
+                        if current.as_ref() != Some(&slot.credentials) {
+                            if let Some(original) = original_config.as_ref() {
+                                let _ = write_file_atomic(
+                                    config_file,
+                                    original.to_string().as_bytes(),
+                                    false,
+                                );
+                            }
+                            return Ok(());
+                        }
+                        keychain::delete_credentials().await
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        Ok(())
+                    }
+                };
+                if let Err(error) = delete_result {
+                    if let Some(original) = original_config.as_ref() {
+                        let _ =
+                            write_file_atomic(config_file, original.to_string().as_bytes(), false);
+                    }
+                    return Err(error);
+                }
+            }
             other => {
                 return Err(EngineError::Other(format!(
-                    "agent accounts are not supported for {other:?}"
+                    "agent account migration is not supported for {other:?}"
                 )));
             }
         }
-        self.list(false).await
+        Ok(())
     }
-
-    async fn activate_claude(&self, slot: &Slot) -> Result<(), EngineError> {
-        self.write_claude_credentials(&slot.credentials).await?;
-        // Merge the identity back into ~/.claude.json — everything else (caches,
-        // project history, onboarding flags) is left untouched, which is all
-        // Claude Code needs to treat this as a fresh login.
-        //
-        // GUARD the merge: a parse failure on an EXISTING file means "don't touch
-        // it", not "start fresh" — writing only our identity fields would destroy
-        // the user's entire Claude config. Only a missing file may start from {}.
-        let file = &self.inner.config.claude_config_file;
-        let cfg = read_json(file);
-        if cfg.is_none() && file.exists() {
-            return Err(EngineError::Other(
-                "~/.claude.json exists but could not be parsed — not switching to avoid wiping \
-                 it. Fix or remove the file and try again."
-                    .into(),
-            ));
-        }
-        let mut merged = cfg.unwrap_or_else(|| serde_json::json!({}));
-        let map = merged.as_object_mut().ok_or_else(|| {
-            EngineError::Other("~/.claude.json is not a JSON object — not switching.".into())
-        })?;
-        let (oauth_account, user_id) = match &slot.claude_config {
-            Some(cc) => (cc.get("oauthAccount").cloned(), cc.get("userID").cloned()),
-            None => (None, None),
-        };
-        map.insert(
-            "oauthAccount".into(),
-            oauth_account.unwrap_or_else(|| {
-                serde_json::json!({
-                    "accountUuid": slot.account_key,
-                    "emailAddress": slot.profile.email,
-                    "organizationName": slot.profile.organization,
-                    "displayName": slot.profile.display_name,
-                })
-            }),
-        );
-        match user_id.filter(|v| v.is_string()) {
-            Some(user_id) => {
-                map.insert("userID".into(), user_id);
-            }
-            None => {
-                map.remove("userID");
-            }
-        }
-        // Atomic: Claude Code rewrites this file frequently — a torn write from
-        // our side must never be readable as "empty config".
-        write_file_atomic(file, merged.to_string().as_bytes(), false)
-    }
-
-    fn activate_codex(&self, slot: &Slot) -> Result<(), EngineError> {
-        std::fs::create_dir_all(&self.inner.config.codex_home)?;
-        let json = serde_json::to_string_pretty(&slot.credentials)
-            .map_err(|e| EngineError::Other(format!("serialize codex auth: {e}")))?;
-        write_file_atomic(&self.inner.config.codex_auth_file(), json.as_bytes(), true)
-    }
-
-    // ── forget ──────────────────────────────────────────────────────────────
-
-    pub async fn forget(
-        &self,
-        harness: HarnessId,
-        account_id: &str,
-    ) -> Result<AgentAccountsSnapshot, EngineError> {
-        // Reject anything that isn't a slot id (16 lowercase hex) BEFORE touching
-        // the filesystem: `account_id` is a raw RPC string that becomes a path,
-        // so a crafted id (`../../…`) must never reach `remove_file`.
-        if account_id.len() != 16
-            || !account_id
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
-            return Err(EngineError::Other("Unknown account.".into()));
-        }
-        let snapshot = self.list(false).await?;
-        let active = snapshot
-            .accounts
-            .iter()
-            .any(|a| a.harness == harness && a.id == account_id && a.active);
-        if active {
-            return Err(EngineError::Other(
-                "That's the live login — switch to another account first (it would just be \
-                 re-detected)."
-                    .into(),
-            ));
-        }
-        let file = self.slots_dir(harness)?.join(format!("{account_id}.json"));
-        if file.exists() {
-            std::fs::remove_file(&file)?;
-        }
-        self.list(false).await
-    }
-
-    // ── add-account OAuth flows ─────────────────────────────────────────────
 
     pub async fn start_login(&self, harness: HarnessId) -> Result<AgentLoginStart, EngineError> {
+        let _ = self.remote()?;
         self.sweep_flows();
         match harness {
             HarnessId::ClaudeCode => Ok(self.start_claude_login()),
@@ -507,8 +548,8 @@ impl AgentAccounts {
         }
 
         let login_id = new_id();
-        // A throwaway CODEX_HOME isolates the new login completely — the live
-        // ~/.codex session is never touched until the user explicitly switches.
+        // A throwaway CODEX_HOME isolates the new login completely. Agent Auth
+        // receives the credential before this directory is reclaimed.
         let home = self
             .inner
             .config
@@ -626,8 +667,8 @@ impl AgentAccounts {
         })
     }
 
-    /// Exchange the pasted `code#state` for tokens and save the account as a slot
-    /// (the live login is untouched — switching is an explicit, separate act).
+    /// Exchange the pasted `code#state` for tokens and import the account
+    /// directly into Agent Auth without touching the live Claude login.
     pub async fn complete_login(
         &self,
         login_id: &str,
@@ -767,10 +808,10 @@ impl AgentAccounts {
             }
         }
 
-        self.write_slot(&Slot {
+        let slot = Slot {
             id: slot_id_for(HarnessId::ClaudeCode, &account_uuid),
             harness: HarnessId::ClaudeCode,
-            account_key: account_uuid.clone(),
+            account_key: account_uuid,
             profile: SlotProfile {
                 email,
                 display_name,
@@ -782,9 +823,11 @@ impl AgentAccounts {
             claude_config: Some(serde_json::json!({ "oauthAccount": oauth_account })),
             saved_at: now_ms(),
             created_at: None,
-        })?;
+        };
+        let remote = self.remote()?;
+        self.import_slot(&remote, &slot).await?;
         lock(&self.inner.flows).remove(login_id);
-        self.list(false).await
+        self.list().await
     }
 
     pub async fn poll_login(&self, login_id: &str) -> Result<AgentLoginPoll, EngineError> {
@@ -806,7 +849,11 @@ impl AgentAccounts {
             }) => (home.clone(), exit.clone(), output.clone()),
         };
         if let Some(detected) = read_json(&home.join("auth.json")).and_then(parse_codex_auth) {
-            self.snapshot_detected(HarnessId::Codex, &detected)?;
+            let slot = slot_from_detected(HarnessId::Codex, &detected).ok_or_else(|| {
+                EngineError::Other("Codex returned no usable credentials.".into())
+            })?;
+            let remote = self.remote()?;
+            self.import_slot(&remote, &slot).await?;
             self.cancel_login(login_id);
             return Ok(AgentLoginPoll {
                 status: AgentLoginStatus::Done,
@@ -913,21 +960,19 @@ impl AgentAccounts {
         read_json(&self.inner.config.codex_auth_file()).and_then(parse_codex_auth)
     }
 
-    /// Persist a detected login into its slot (refreshing stored tokens).
-    fn snapshot_detected(&self, harness: HarnessId, d: &Detected) -> Result<(), EngineError> {
-        let Some(credentials) = &d.credentials else {
+    /// Persist an OAuth credential only as pending import recovery data.
+    fn snapshot_detected(
+        &self,
+        harness: HarnessId,
+        detected: &Detected,
+    ) -> Result<(), EngineError> {
+        if detected.profile.auth_kind != AgentAuthKind::Oauth {
+            return Ok(());
+        }
+        let Some(slot) = slot_from_detected(harness, detected) else {
             return Ok(());
         };
-        self.write_slot(&Slot {
-            id: slot_id_for(harness, &d.account_key),
-            harness,
-            account_key: d.account_key.clone(),
-            profile: d.profile.clone(),
-            credentials: credentials.clone(),
-            claude_config: d.claude_config.clone(),
-            saved_at: now_ms(),
-            created_at: None,
-        })
+        self.write_slot(&slot)
     }
 
     // ── Claude credential store (Keychain on macOS, file elsewhere) ─────────
@@ -944,28 +989,6 @@ impl AgentAccounts {
         }
         #[cfg(not(target_os = "macos"))]
         (None, None)
-    }
-
-    async fn write_claude_credentials(
-        &self,
-        credentials: &serde_json::Value,
-    ) -> Result<(), EngineError> {
-        let json = credentials.to_string();
-        #[cfg(target_os = "macos")]
-        {
-            // claude-swap's primitive: update the Keychain item in place — but only
-            // when no credentials FILE exists (the file wins when present).
-            if !self.inner.config.claude_creds_file().exists() {
-                return keychain::write_credentials(&json).await;
-            }
-        }
-        std::fs::create_dir_all(&self.inner.config.claude_config_dir)?;
-        // Atomic + owner-only from birth — live tokens.
-        write_file_atomic(
-            &self.inner.config.claude_creds_file(),
-            json.as_bytes(),
-            true,
-        )
     }
 
     // ── slot files ──────────────────────────────────────────────────────────
@@ -989,24 +1012,28 @@ impl AgentAccounts {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            // One malformed slot file must skip THAT slot, not brick the page.
-            if let Some(slot) = std::fs::read_to_string(&path)
+            // One malformed or misplaced snapshot must not brick the page.
+            if let Some(mut slot) = std::fs::read_to_string(&path)
                 .ok()
                 .and_then(|raw| serde_json::from_str::<Slot>(&raw).ok())
             {
+                if slot.harness != harness {
+                    continue;
+                }
+                slot.id = slot_id_for(harness, &slot.account_key);
                 slots.push(slot);
             }
         }
-        // Creation order — stable across switches (saved_at churns on every
-        // auto-snapshot; created_at never does).
-        slots.sort_by_key(|s| s.created_at.unwrap_or(s.saved_at));
+        // Old slot files are consumed in their stable creation order.
+        slots.sort_by_key(|slot| slot.created_at.unwrap_or(slot.saved_at));
         slots
     }
 
     fn write_slot(&self, slot: &Slot) -> Result<(), EngineError> {
-        let file = self
-            .slots_dir(slot.harness)?
-            .join(format!("{}.json", slot.id));
+        let file = self.slots_dir(slot.harness)?.join(format!(
+            "{}.json",
+            slot_id_for(slot.harness, &slot.account_key)
+        ));
         let existing: Option<Slot> = std::fs::read_to_string(&file)
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok());
@@ -1021,188 +1048,151 @@ impl AgentAccounts {
         // crash mid-write must never leave torn JSON.
         write_file_atomic(&file, json.as_bytes(), true)
     }
+}
 
-    // ── remaining usage ─────────────────────────────────────────────────────
-
-    async fn usage_for(
-        &self,
-        harness: HarnessId,
-        slot: &Slot,
-        is_active: bool,
-        force: bool,
-    ) -> Option<Vec<AgentUsageWindow>> {
-        let key = format!("{}:{}", harness_slug(harness), slot.account_key);
-        if let Some((usage, at)) = lock(&self.inner.usage_cache).get(&key)
-            && at.elapsed() < USAGE_TTL
-        {
-            return usage.clone();
-        }
-        if !force {
-            // Non-forced lists never hit the network (see module docs).
-            return None;
-        }
-        let usage = match harness {
-            HarnessId::ClaudeCode => self.claude_usage(slot, is_active).await,
-            HarnessId::Codex => self.codex_usage(slot).await,
-            _ => None,
-        };
-        lock(&self.inner.usage_cache).insert(key, (usage.clone(), Instant::now()));
-        usage
-    }
-
-    async fn claude_usage(&self, slot: &Slot, is_active: bool) -> Option<Vec<AgentUsageWindow>> {
-        let oauth = slot.credentials.get("claudeAiOauth")?;
-        let mut access_token = str_field(oauth, "accessToken")?;
-        let expires_at = oauth.get("expiresAt").and_then(|v| v.as_i64());
-        if let Some(expires_at) = expires_at
-            && expires_at < now_ms() + 30_000
-        {
-            if is_active {
-                // The CLI owns this token pair — rotating its refresh token out
-                // from under a running Claude Code could force a re-login.
-                return None;
-            }
-            access_token = self.refresh_claude_slot(slot).await?;
-        }
-        let body: serde_json::Value = self
-            .inner
-            .http
-            .get(CLAUDE_USAGE_URL)
-            .bearer_auth(&access_token)
-            .header("anthropic-beta", "oauth-2025-04-20")
-            .send()
-            .await
-            .ok()?
-            .error_for_status()
-            .ok()?
-            .json()
-            .await
-            .ok()?;
-        let mut windows = Vec::new();
-        for (key, label) in [("five_hour", "Session"), ("seven_day", "Week")] {
-            if let Some(w) = body.get(key)
-                && let Some(utilization) = w.get("utilization").and_then(|v| v.as_f64())
-            {
-                windows.push(AgentUsageWindow {
-                    label: label.to_string(),
-                    used_fraction: (utilization / 100.0) as f32,
-                    resets_at: parse_when(w.get("resets_at")),
-                });
-            }
-        }
-        (!windows.is_empty()).then_some(windows)
-    }
-
-    async fn codex_usage(&self, slot: &Slot) -> Option<Vec<AgentUsageWindow>> {
-        let tokens = slot.credentials.get("tokens")?;
-        // api-key mode has no ChatGPT rate windows.
-        let access_token = str_field(tokens, "access_token")?;
-        let body: serde_json::Value = self
-            .inner
-            .http
-            .get(CODEX_USAGE_URL)
-            .bearer_auth(&access_token)
-            .header(
-                "chatgpt-account-id",
-                str_field(tokens, "account_id").unwrap_or_default(),
-            )
-            .send()
-            .await
-            .ok()?
-            .error_for_status()
-            .ok()?
-            .json()
-            .await
-            .ok()?;
-        let rl = body.get("rate_limit")?;
-        let mut windows = Vec::new();
-        for key in ["primary_window", "secondary_window"] {
-            if let Some(w) = rl.get(key)
-                && let Some(used) = w.get("used_percent").and_then(|v| v.as_f64())
-            {
-                let span = w
-                    .get("limit_window_seconds")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                windows.push(AgentUsageWindow {
-                    label: if span > 86_400 { "Week" } else { "Session" }.to_string(),
-                    used_fraction: (used / 100.0) as f32,
-                    resets_at: parse_when(w.get("reset_at")),
-                });
-            }
-        }
-        (!windows.is_empty()).then_some(windows)
-    }
-
-    /// Refresh a saved Claude slot's expired access token so its usage stays
-    /// queryable. NEVER called for the active login. Single-flight per slot:
-    /// OAuth refresh tokens are commonly single-use, and a concurrent second
-    /// POST of the same one would revoke the family and brick the slot.
-    async fn refresh_claude_slot(&self, slot: &Slot) -> Option<String> {
-        if !lock(&self.inner.inflight_refreshes).insert(slot.id.clone()) {
-            return None;
-        }
-        let result = self.refresh_claude_slot_once(slot).await;
-        lock(&self.inner.inflight_refreshes).remove(&slot.id);
-        result
-    }
-
-    async fn refresh_claude_slot_once(&self, slot: &Slot) -> Option<String> {
-        let oauth = slot.credentials.get("claudeAiOauth")?.clone();
-        let refresh_token = str_field(&oauth, "refreshToken")?;
-        let body: serde_json::Value = self
-            .inner
-            .http
-            .post(CLAUDE_TOKEN_URL)
-            .json(&serde_json::json!({
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "client_id": CLAUDE_CLIENT_ID,
-            }))
-            .send()
-            .await
-            .ok()?
-            .error_for_status()
-            .ok()?
-            .json()
-            .await
-            .ok()?;
-        let access_token = str_field(&body, "access_token")?;
-        let expires_in = body
-            .get("expires_in")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(3600);
-        let mut updated = oauth;
-        if let Some(map) = updated.as_object_mut() {
-            map.insert("accessToken".into(), serde_json::json!(access_token));
-            map.insert(
-                "refreshToken".into(),
-                serde_json::json!(str_field(&body, "refresh_token").unwrap_or(refresh_token)),
-            );
-            map.insert(
-                "expiresAt".into(),
-                serde_json::json!(now_ms() + expires_in * 1000),
-            );
-        }
-        let mut refreshed = slot.clone();
-        refreshed.credentials = serde_json::json!({ "claudeAiOauth": updated });
-        refreshed.saved_at = now_ms();
-        if let Err(err) = self.write_slot(&refreshed) {
-            tracing::warn!(slot = %slot.id, error = %err, "refreshed slot write failed");
-        }
-        Some(access_token)
+fn harness_for_provider(provider: &str) -> Option<HarnessId> {
+    match provider {
+        "openai" => Some(HarnessId::Codex),
+        "anthropic" => Some(HarnessId::ClaudeCode),
+        _ => None,
     }
 }
 
-// ── macOS Keychain (documented here; compiled only on macOS) ────────────────
+fn remote_account_for_view(account: &RemoteAgentAccount) -> Option<AgentAccount> {
+    let harness = harness_for_provider(&account.provider)?;
+    let usage_windows = account
+        .usage_fraction
+        .map(|used_fraction| AgentUsageWindow {
+            label: "Subscription".into(),
+            used_fraction,
+            resets_at: account
+                .reset_at
+                .as_deref()
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&Utc)),
+        })
+        .into_iter()
+        .collect();
+    Some(AgentAccount {
+        id: account.id.clone(),
+        harness,
+        email: account.email.clone(),
+        plan_label: account.plan.clone(),
+        usage_windows,
+        display_name: account.display_name.clone(),
+        organization: account.organization.clone(),
+        auth_kind: Some(AgentAuthKind::Oauth),
+        migration_available: false,
+    })
+}
+
+fn credential_matches(slot: &Slot, detected: &Detected) -> bool {
+    slot.account_key == detected.account_key
+        && detected.credentials.as_ref() == Some(&slot.credentials)
+}
+fn slot_from_detected(harness: HarnessId, detected: &Detected) -> Option<Slot> {
+    Some(Slot {
+        id: slot_id_for(harness, &detected.account_key),
+        harness,
+        account_key: detected.account_key.clone(),
+        profile: detected.profile.clone(),
+        credentials: detected.credentials.clone()?,
+        claude_config: detected.claude_config.clone(),
+        saved_at: now_ms(),
+        created_at: None,
+    })
+}
+
+fn account_import_for_slot(slot: &Slot) -> Result<AgentAccountCredentialImport, EngineError> {
+    let (provider, capabilities, access_token, refresh_token, expires_at, scopes) =
+        match slot.harness {
+            HarnessId::ClaudeCode => {
+                let oauth = slot.credentials.get("claudeAiOauth").ok_or_else(|| {
+                    EngineError::Other("Claude OAuth credentials are incomplete.".into())
+                })?;
+                let access_token = str_field(oauth, "accessToken").ok_or_else(|| {
+                    EngineError::Other("Claude OAuth access token is missing.".into())
+                })?;
+                let refresh_token = str_field(oauth, "refreshToken").ok_or_else(|| {
+                    EngineError::Other("Claude OAuth refresh token is missing.".into())
+                })?;
+                let expires_at = oauth
+                    .get("expiresAt")
+                    .and_then(|value| value.as_i64())
+                    .and_then(DateTime::<Utc>::from_timestamp_millis)
+                    .unwrap_or_else(|| Utc::now() + chrono::Duration::hours(1))
+                    .to_rfc3339();
+                let scopes = oauth
+                    .get("scopes")
+                    .and_then(|value| value.as_array())
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|value| value.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (
+                    "anthropic",
+                    vec!["claude-*".into()],
+                    access_token,
+                    refresh_token,
+                    expires_at,
+                    scopes,
+                )
+            }
+            HarnessId::Codex => {
+                let tokens = slot.credentials.get("tokens").ok_or_else(|| {
+                    EngineError::Other("Only ChatGPT OAuth accounts can be migrated.".into())
+                })?;
+                let access_token = str_field(tokens, "access_token").ok_or_else(|| {
+                    EngineError::Other("ChatGPT OAuth access token is missing.".into())
+                })?;
+                let refresh_token = str_field(tokens, "refresh_token").ok_or_else(|| {
+                    EngineError::Other("ChatGPT OAuth refresh token is missing.".into())
+                })?;
+                let expires_at = jwt_claims(&access_token)
+                    .and_then(|claims| claims.get("exp").and_then(|value| value.as_i64()))
+                    .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0))
+                    .unwrap_or_else(|| Utc::now() + chrono::Duration::hours(1))
+                    .to_rfc3339();
+                (
+                    "openai",
+                    vec!["gpt-*".into()],
+                    access_token,
+                    refresh_token,
+                    expires_at,
+                    Vec::new(),
+                )
+            }
+            other => {
+                return Err(EngineError::Other(format!(
+                    "agent account migration is not supported for {other:?}"
+                )));
+            }
+        };
+    Ok(AgentAccountCredentialImport {
+        provider: provider.into(),
+        provider_account_id: slot.account_key.clone(),
+        email: Some(slot.profile.email.clone()),
+        display_name: slot.profile.display_name.clone(),
+        organization: slot.profile.organization.clone(),
+        plan: slot.profile.plan.clone(),
+        capabilities,
+        credential: AgentAccountOAuthCredential {
+            access_token,
+            refresh_token,
+            expires_at,
+            scopes,
+        },
+    })
+}
+
+// ── macOS Keychain ─────────────────────────────────────────────────────────
 //
-// Claude Code stores its credentials in the login Keychain under the service
-// `Claude Code-credentials`, account = the current username. Reads use
-// `security find-generic-password` — two-step (existence probe needs no
-// authorization, then `-w` for the secret) so a user denial is distinguishable
-// from "not logged in". Writes use `add-generic-password -U` (update in place).
-// Every call is bounded at 15s: an unanswered Keychain consent dialog blocks
-// `security` INDEFINITELY, and this runs on every list.
+// Reads discover a pending migration. Deletes happen only after Agent Auth
+// acknowledges import and the live credential still exactly matches its
+// recovery snapshot.
 #[cfg(target_os = "macos")]
 mod keychain {
     use super::*;
@@ -1246,14 +1236,13 @@ mod keychain {
             return (
                 None,
                 Some(
-                    "A Claude Code login exists, but macOS Keychain denied access to it — \
-                     approve the prompt (choose “Always Allow”) and refresh to enable switching."
+                    "A Claude Code login exists, but macOS Keychain denied access. Approve the prompt and refresh to migrate it."
                         .into(),
                 ),
             );
         }
         match serde_json::from_str(stdout.trim()) {
-            Ok(creds) => (Some(creds), None),
+            Ok(credentials) => (Some(credentials), None),
             Err(_) => (
                 None,
                 Some("The Claude Code Keychain entry could not be parsed.".into()),
@@ -1261,23 +1250,20 @@ mod keychain {
         }
     }
 
-    pub(super) async fn write_credentials(json: &str) -> Result<(), EngineError> {
+    pub(super) async fn delete_credentials() -> Result<(), EngineError> {
         let (ok, _, stderr) = exec(&[
-            "add-generic-password",
-            "-U",
+            "delete-generic-password",
             "-a",
             &account(),
             "-s",
             KEYCHAIN_SERVICE,
-            "-w",
-            json,
         ])
         .await;
         if ok {
             Ok(())
         } else {
             Err(EngineError::Other(format!(
-                "Keychain write failed: {}",
+                "Keychain delete failed: {}",
                 if stderr.trim().is_empty() {
                     "unknown error"
                 } else {
@@ -1424,17 +1410,6 @@ fn parse_codex_auth(auth: serde_json::Value) -> Option<Detected> {
     })
 }
 
-/// ISO string (Claude) or unix seconds (Codex) → timestamp.
-fn parse_when(value: Option<&serde_json::Value>) -> Option<DateTime<Utc>> {
-    match value? {
-        serde_json::Value::Number(n) => DateTime::<Utc>::from_timestamp(n.as_i64()?, 0),
-        serde_json::Value::String(s) => DateTime::parse_from_rfc3339(s)
-            .ok()
-            .map(|t| t.with_timezone(&Utc)),
-        _ => None,
-    }
-}
-
 fn scan_openai_url(output: &str) -> Option<String> {
     let start = output.find("https://auth.openai.com/")?;
     let rest = &output[start..];
@@ -1490,6 +1465,131 @@ fn write_file_atomic(file: &Path, bytes: &[u8], secret: bool) -> Result<(), Engi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_config(root: &Path) -> AgentAccountsConfig {
+        AgentAccountsConfig {
+            data_dir: root.join("data"),
+            claude_config_dir: root.join("claude"),
+            claude_config_file: root.join("claude.json"),
+            codex_home: root.join("codex"),
+        }
+    }
+
+    fn codex_oauth(account_id: &str, access_token: &str) -> serde_json::Value {
+        let header = BASE64_URL.encode(br#"{"alg":"none"}"#);
+        let claims = BASE64_URL.encode(
+            serde_json::json!({
+                "email": "person@example.com",
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": account_id,
+                    "chatgpt_plan_type": "plus"
+                }
+            })
+            .to_string(),
+        );
+        serde_json::json!({
+            "tokens": {
+                "id_token": format!("{header}.{claims}.x"),
+                "access_token": access_token,
+                "refresh_token": format!("refresh-{access_token}"),
+                "account_id": account_id
+            }
+        })
+    }
+
+    #[test]
+    fn imports_carry_provider_scoped_capabilities() {
+        let codex = parse_codex_auth(codex_oauth("account-1", "access-1"))
+            .and_then(|detected| slot_from_detected(HarnessId::Codex, &detected))
+            .expect("codex slot");
+        let codex_import = account_import_for_slot(&codex).expect("codex import");
+        assert_eq!(codex_import.provider, "openai");
+        assert_eq!(codex_import.capabilities, ["gpt-*"]);
+
+        let claude = Slot {
+            id: "local-claude".into(),
+            harness: HarnessId::ClaudeCode,
+            account_key: "account-2".into(),
+            profile: SlotProfile {
+                email: "person@example.com".into(),
+                display_name: None,
+                organization: None,
+                plan: None,
+                auth_kind: AgentAuthKind::Oauth,
+            },
+            credentials: serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "access-2",
+                    "refreshToken": "refresh-2",
+                    "expiresAt": 4_102_444_800_000i64,
+                    "scopes": ["user:inference"]
+                }
+            }),
+            claude_config: None,
+            saved_at: now_ms(),
+            created_at: None,
+        };
+        let claude_import = account_import_for_slot(&claude).expect("claude import");
+        assert_eq!(claude_import.provider, "anthropic");
+        assert_eq!(claude_import.capabilities, ["claude-*"]);
+        assert_eq!(claude_import.credential.scopes, ["user:inference"]);
+    }
+
+    #[tokio::test]
+    async fn acknowledged_cleanup_is_idempotent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tmp.path());
+        std::fs::create_dir_all(&config.codex_home).expect("codex home");
+        let credential = codex_oauth("account-1", "access-1");
+        std::fs::write(config.codex_auth_file(), credential.to_string()).expect("auth");
+        let detected = parse_codex_auth(credential).expect("detected");
+        let slot = slot_from_detected(HarnessId::Codex, &detected).expect("slot");
+        let accounts = AgentAccounts::new(config.clone());
+        accounts.write_slot(&slot).expect("snapshot");
+
+        accounts
+            .remove_matching_live_credential(&slot)
+            .await
+            .expect("first cleanup");
+        accounts.delete_slot(&slot).expect("first snapshot cleanup");
+        accounts
+            .remove_matching_live_credential(&slot)
+            .await
+            .expect("repeated cleanup");
+        accounts
+            .delete_slot(&slot)
+            .expect("repeated snapshot cleanup");
+
+        assert!(!config.codex_auth_file().exists());
+        assert!(
+            !config
+                .root_dir()
+                .join("codex")
+                .join(format!("{}.json", slot.id))
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_preserves_a_changed_live_credential() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tmp.path());
+        std::fs::create_dir_all(&config.codex_home).expect("codex home");
+        let captured = codex_oauth("account-1", "captured-access");
+        let detected = parse_codex_auth(captured).expect("detected");
+        let slot = slot_from_detected(HarnessId::Codex, &detected).expect("slot");
+        let changed = codex_oauth("account-1", "new-live-access");
+        std::fs::write(config.codex_auth_file(), changed.to_string()).expect("auth");
+        let accounts = AgentAccounts::new(config.clone());
+
+        accounts
+            .remove_matching_live_credential(&slot)
+            .await
+            .expect("mismatch is not an error");
+
+        let remaining = read_json(&config.codex_auth_file()).expect("live credential remains");
+        assert_eq!(remaining, changed);
+    }
 
     #[test]
     fn plan_labels() {

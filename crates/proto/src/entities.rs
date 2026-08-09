@@ -374,27 +374,25 @@ pub enum AuthState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentAccount {
+    /// Agent Auth account id, or the deterministic local migration id while
+    /// `migration_available` is true.
     pub id: String,
     pub harness: HarnessId,
     pub email: Option<String>,
     pub plan_label: Option<String>,
-    pub active: bool,
     #[serde(default)]
     pub usage_windows: Vec<AgentUsageWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub organization: Option<String>,
-    /// How the CLI is signed in (`oauth` account vs raw `api-key`).
+    /// How a discovered local CLI is signed in. Agent Auth accounts are OAuth.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_kind: Option<AgentAuthKind>,
-    /// False for a live login whose credentials we could not read (e.g. macOS
-    /// Keychain denied) — shown, but not re-activatable.
+    /// True only for a credential recovery snapshot waiting for explicit import
+    /// into the shared Agent Auth pool.
     #[serde(default)]
-    pub switchable: bool,
-    /// Epoch millis of the slot's last snapshot.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub saved_at: Option<i64>,
+    pub migration_available: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -404,7 +402,8 @@ pub enum AgentAuthKind {
     ApiKey,
 }
 
-/// Everything the Accounts settings page renders, rebuilt after every mutation.
+/// Everything the Accounts settings page renders from the shared Agent Auth
+/// pool, plus local credentials still waiting for one-time migration.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentAccountsSnapshot {

@@ -225,6 +225,8 @@ struct Inner {
     peer_waiters: Mutex<HashMap<(String, String), LivePeerWaiter>>,
     /// Deterministic local auto-titler, wired at engine assembly; absent in bare tests.
     titles: OnceLock<crate::titles::TitleGenerator>,
+    /// Per-run loopback inference routes backed by centrally held Agent Auth credentials.
+    inference_relay: OnceLock<crate::inference_relay::InferenceRelay>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -259,6 +261,7 @@ impl SessionsEngine {
                 harness_sessions: Mutex::new(HashMap::new()),
                 peer_waiters: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
+                inference_relay: OnceLock::new(),
             }),
         }
     }
@@ -272,6 +275,10 @@ impl SessionsEngine {
     /// Wire the local chat auto-titler (called once at engine assembly).
     pub fn set_titles(&self, titles: crate::titles::TitleGenerator) {
         let _ = self.inner.titles.set(titles);
+    }
+
+    pub(crate) fn set_inference_relay(&self, relay: crate::inference_relay::InferenceRelay) {
+        let _ = self.inner.inference_relay.set(relay);
     }
 
     fn doc_handle(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
@@ -510,6 +517,14 @@ impl SessionsEngine {
         }
 
         let harness = self.inner.registry.resolve(harness_id)?;
+        let inference = if let Some(relay) = self.inner.inference_relay.get() {
+            relay
+                .prepare(chat_id, harness_id, request.model.as_deref())
+                .await?
+        } else {
+            None
+        };
+        let inference_token = inference.as_ref().map(|route| route.token.clone());
         let handle = self.doc_handle(chat_id)?;
         handle.write_user_message(&user_id, &request.prompt, now_ms())?;
 
@@ -554,6 +569,7 @@ impl SessionsEngine {
             context: Some(RunContext {
                 session_id: chat_id.to_string(),
                 ipc_port: self.inner.ipc_port,
+                inference,
             }),
         };
 
@@ -590,6 +606,11 @@ impl SessionsEngine {
         let stream = match harness.run(request.clone(), controls).await {
             Ok(stream) => stream,
             Err(err) => {
+                if let (Some(relay), Some(token)) =
+                    (self.inner.inference_relay.get(), inference_token.as_deref())
+                {
+                    relay.remove(token).await;
+                }
                 let message = err.to_string();
                 let error_event = AgentEvent::Error {
                     message: message.clone(),
@@ -647,6 +668,7 @@ impl SessionsEngine {
                 user_message_id: user_id,
                 resume_injected,
             },
+            inference_token,
         ));
         Ok(run_id)
     }
@@ -1290,6 +1312,7 @@ async fn drive_run(
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
     mut cancel_rx: watch::Receiver<bool>,
     resume_state: RunResumeState,
+    inference_token: Option<String>,
 ) {
     let device_id = inner.device_id.clone();
     // Retained for resume ownership and the one-shot failed-resume retry.
@@ -1468,6 +1491,11 @@ async fn drive_run(
             );
             inner.forget_harness_session(&chat_id);
             inner.remove_run(&chat_id, &run_id);
+            if let (Some(relay), Some(token)) =
+                (inner.inference_relay.get(), inference_token.as_deref())
+            {
+                relay.remove(token).await;
+            }
             let engine = SessionsEngine {
                 inner: inner.clone(),
             };
@@ -1720,6 +1748,9 @@ async fn drive_run(
     };
     inner.remove_run(&chat_id, &run_id);
     inner.set_status(&chat_id, final_status, false);
+    if let (Some(relay), Some(token)) = (inner.inference_relay.get(), inference_token.as_deref()) {
+        relay.remove(token).await;
+    }
 
     if interrupted {
         for followup in deferred_followups {

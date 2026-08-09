@@ -99,6 +99,84 @@ pub struct ScaffoldClient {
     bearer: Arc<dyn TokenSource>,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentAccountCredentialImport {
+    pub provider: String,
+    pub provider_account_id: String,
+    pub email: Option<String>,
+    pub display_name: Option<String>,
+    pub organization: Option<String>,
+    pub plan: Option<String>,
+    pub capabilities: Vec<String>,
+    pub credential: AgentAccountOAuthCredential,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentAccountOAuthCredential {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_at: String,
+    pub scopes: Vec<String>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RemoteAgentAccount {
+    pub id: String,
+    pub provider: String,
+    pub provider_account_id: String,
+    pub email: Option<String>,
+    pub display_name: Option<String>,
+    pub organization: Option<String>,
+    pub plan: Option<String>,
+    pub status: String,
+    pub usage_fraction: Option<f32>,
+    pub reset_at: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Deserialize)]
+struct RemoteAgentAccountsEnvelope {
+    accounts: Vec<RemoteAgentAccount>,
+}
+
+#[derive(Deserialize)]
+struct RemoteAgentAccountEnvelope {
+    account: RemoteAgentAccount,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentInferenceGrantRequest {
+    pub logical_session_id: String,
+    pub provider: String,
+    pub model: String,
+    pub harness: String,
+    pub lifecycle_epoch: u64,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentInferenceGrantBinding {
+    pub owner_subject: String,
+    pub logical_session_id: String,
+    pub provider: String,
+    pub model: String,
+    pub harness: String,
+    pub source: String,
+    pub lifecycle_epoch: u64,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentInferenceGrant {
+    pub token: String,
+    pub expires_at: String,
+    pub binding: AgentInferenceGrantBinding,
+}
+
 impl fmt::Debug for ScaffoldClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ScaffoldClient")
@@ -137,6 +215,151 @@ impl ScaffoldClient {
 
     pub fn project_scope(&self) -> &str {
         &self.project_scope
+    }
+
+    pub(crate) async fn list_agent_accounts(
+        &self,
+    ) -> Result<Vec<RemoteAgentAccount>, ScaffoldError> {
+        let url = self
+            .origin
+            .join("/api/agent-accounts")
+            .expect("static account list path");
+        let response: RemoteAgentAccountsEnvelope = self
+            .request(
+                Method::GET,
+                url,
+                Option::<&()>::None,
+                &CancellationToken::new(),
+            )
+            .await?;
+        Ok(response.accounts)
+    }
+
+    pub(crate) async fn import_agent_account(
+        &self,
+        account: &AgentAccountCredentialImport,
+    ) -> Result<RemoteAgentAccount, ScaffoldError> {
+        let url = self
+            .origin
+            .join("/api/agent-accounts/import")
+            .expect("static account import path");
+        let response: RemoteAgentAccountEnvelope = self
+            .request(Method::POST, url, Some(account), &CancellationToken::new())
+            .await?;
+        Ok(response.account)
+    }
+
+    pub(crate) async fn revoke_agent_account(&self, account_id: &str) -> Result<(), ScaffoldError> {
+        let mut url = self
+            .origin
+            .join("/api/agent-accounts/")
+            .expect("static account revoke path");
+        url.path_segments_mut()
+            .expect("Scaffold origin is hierarchical")
+            .push(account_id);
+        let _: Value = self
+            .request(
+                Method::DELETE,
+                url,
+                Option::<&()>::None,
+                &CancellationToken::new(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn issue_agent_inference_grant(
+        &self,
+        request: &AgentInferenceGrantRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<AgentInferenceGrant, ScaffoldError> {
+        let url = self
+            .origin
+            .join("/api/agent-auth/grants")
+            .expect("static inference grant path");
+        self.request(Method::POST, url, Some(request), cancellation)
+            .await
+    }
+
+    pub(crate) async fn proxy_agent_inference(
+        &self,
+        endpoint: &str,
+        grant: &AgentInferenceGrant,
+        request_id: &str,
+        mut headers: reqwest::header::HeaderMap,
+        content_length: u64,
+        body: reqwest::Body,
+        cancellation: &CancellationToken,
+    ) -> Result<reqwest::Response, ScaffoldError> {
+        let path = match endpoint {
+            "responses" => "/api/agent-auth/v1/responses",
+            "messages" => "/api/agent-auth/v1/messages",
+            _ => {
+                return Err(ScaffoldError::InvalidResponse(
+                    "unsupported inference endpoint".into(),
+                ));
+            }
+        };
+        for name in [
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HOST,
+            reqwest::header::CONTENT_LENGTH,
+            reqwest::header::CONNECTION,
+        ] {
+            headers.remove(name);
+        }
+        for name in [
+            "x-agent-auth-owner-subject",
+            "x-agent-auth-session-id",
+            "x-agent-auth-provider",
+            "x-agent-auth-model",
+            "x-agent-auth-harness",
+            "x-agent-auth-source",
+            "x-agent-auth-lifecycle-epoch",
+            "x-agent-auth-request-id",
+            "x-agent-auth-internal-secret",
+        ] {
+            headers.remove(name);
+        }
+        let url = self.origin.join(path).expect("static inference proxy path");
+        let request = self
+            .http
+            .post(url)
+            .headers(headers)
+            .bearer_auth(&grant.token)
+            .header("x-agent-auth-owner-subject", &grant.binding.owner_subject)
+            .header("x-agent-auth-session-id", &grant.binding.logical_session_id)
+            .header("x-agent-auth-provider", &grant.binding.provider)
+            .header("x-agent-auth-model", &grant.binding.model)
+            .header("x-agent-auth-harness", &grant.binding.harness)
+            .header("x-agent-auth-source", &grant.binding.source)
+            .header(
+                "x-agent-auth-lifecycle-epoch",
+                grant.binding.lifecycle_epoch.to_string(),
+            )
+            .header("x-agent-auth-request-id", request_id)
+            .header(reqwest::header::CONTENT_LENGTH, content_length)
+            .body(body);
+        tokio::select! {
+            response = request.send() => response.map_err(ScaffoldError::Transport),
+            () = cancellation.cancelled() => Err(ScaffoldError::Cancelled),
+        }
+    }
+
+    pub(crate) async fn revoke_agent_inference_grants(
+        &self,
+        logical_session_id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ScaffoldError> {
+        let url = self
+            .origin
+            .join("api/agent-auth/grants/revoke")
+            .expect("static Agent Auth grant revocation path");
+        let body = serde_json::json!({ "logicalSessionId": logical_session_id });
+        let _: serde_json::Value = self
+            .request(Method::POST, url, Some(&body), cancellation)
+            .await?;
+        Ok(())
     }
 
     pub async fn list(
@@ -1218,6 +1441,10 @@ impl ScaffoldRuntime {
                 watch_tx,
             }),
         }
+    }
+
+    pub(crate) fn client(&self) -> ScaffoldClient {
+        self.inner.client.clone()
     }
 
     pub fn watch(&self) -> watch::Receiver<ScaffoldEnvironmentSnapshot> {

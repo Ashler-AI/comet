@@ -29,11 +29,10 @@
 //!   (replay then live tail), `WriteTerminal {terminalId, data}`, `ResizeTerminal`,
 //!   `CloseTerminal`. M5 is single-user local: per-user owner checks land with
 //!   real multi-account auth in M6.
-//! - Agent accounts (§3.7): `ListAgentAccounts {forceUsage?}` →
-//!   `AgentAccountsSnapshot`, `ActivateAgentAccount`/`ForgetAgentAccount`
-//!   `{harness, accountId}` → snapshot, `StartAgentLogin {harness}` →
-//!   `{loginId, url, mode}`, `CompleteAgentLogin {loginId, code}` → snapshot,
-//!   `PollAgentLogin {loginId}`, `CancelAgentLogin {loginId}`.
+//! - Shared Agent Auth accounts: `ListAgentAccounts` → `AgentAccountsSnapshot`,
+//!   `MigrateAgentAccount {harness, accountId}` / `RevokeAgentAccount
+//!   {accountId}` → snapshot, plus the add-account login flow. Account methods
+//!   are global and never accept `targetDeviceId`.
 //! - Uploads (§3.7): `UploadChunk {uploadId, data, seq?}`,
 //!   `UploadCommit {uploadId, fileName}` → `{path}`,
 //!   `ReadAttachmentChunk {path, offset}` → `{name, mimeType, data, nextOffset,
@@ -300,15 +299,14 @@ struct ResizeTerminalParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ListAgentAccountsParams {
-    #[serde(default)]
-    force_usage: Option<bool>,
+struct MigrateAgentAccountParams {
+    harness: HarnessId,
+    account_id: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AgentAccountParams {
-    harness: HarnessId,
+struct RevokeAgentAccountParams {
     account_id: String,
 }
 
@@ -1089,15 +1087,6 @@ fn forwardable(method: &str) -> bool {
             | methods::WRITE_TERMINAL
             | methods::RESIZE_TERMINAL
             | methods::CLOSE_TERMINAL
-            // Agent accounts are per-device CLI logins (the device switcher
-            // retargets which device's logins are shown).
-            | methods::LIST_AGENT_ACCOUNTS
-            | methods::ACTIVATE_AGENT_ACCOUNT
-            | methods::FORGET_AGENT_ACCOUNT
-            | methods::START_AGENT_LOGIN
-            | methods::COMPLETE_AGENT_LOGIN
-            | methods::POLL_AGENT_LOGIN
-            | methods::CANCEL_AGENT_LOGIN
             // Uploads/attachments target the chat's host device (the agent reads
             // the committed file from that device's disk).
             | methods::UPLOAD_CHUNK
@@ -2108,30 +2097,29 @@ impl RpcService for EngineRpc {
             }
             methods::LIST_AGENT_ACCOUNTS => {
                 self.require_agent_accounts()?;
-                let p: ListAgentAccountsParams = parse_params(params)?;
                 let snapshot = self
                     .agent_accounts
-                    .list(p.force_usage.unwrap_or(false))
+                    .list()
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&snapshot)
             }
-            methods::ACTIVATE_AGENT_ACCOUNT => {
+            methods::MIGRATE_AGENT_ACCOUNT => {
                 self.require_agent_accounts()?;
-                let p: AgentAccountParams = parse_params(params)?;
+                let p: MigrateAgentAccountParams = parse_params(params)?;
                 let snapshot = self
                     .agent_accounts
-                    .activate(p.harness, &p.account_id)
+                    .migrate(p.harness, &p.account_id)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&snapshot)
             }
-            methods::FORGET_AGENT_ACCOUNT => {
+            methods::REVOKE_AGENT_ACCOUNT => {
                 self.require_agent_accounts()?;
-                let p: AgentAccountParams = parse_params(params)?;
+                let p: RevokeAgentAccountParams = parse_params(params)?;
                 let snapshot = self
                     .agent_accounts
-                    .forget(p.harness, &p.account_id)
+                    .revoke(&p.account_id)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&snapshot)
@@ -2235,19 +2223,20 @@ impl RpcService for EngineRpc {
 mod tests {
     use super::*;
 
-    /// The UI's Switch/Forget calls send `{id, accountId, harness}` (+ optional
-    /// `targetDeviceId`); the extra fields must be tolerated, `accountId` wins.
     #[test]
-    fn agent_account_params_accept_ui_shape() {
-        let p: AgentAccountParams = parse_params(serde_json::json!({
-            "id": "acct-1",
+    fn agent_account_params_accept_global_shapes() {
+        let migrate: MigrateAgentAccountParams = parse_params(serde_json::json!({
             "accountId": "acct-1",
             "harness": "claude-code",
-            "targetDeviceId": "dev-2",
         }))
-        .expect("ui param shape");
-        assert_eq!(p.account_id, "acct-1");
-        assert_eq!(p.harness, HarnessId::ClaudeCode);
+        .expect("migrate account params");
+        assert_eq!(migrate.account_id, "acct-1");
+        assert_eq!(migrate.harness, HarnessId::ClaudeCode);
+
+        let revoke: RevokeAgentAccountParams =
+            parse_params(serde_json::json!({ "accountId": "acct-1" }))
+                .expect("revoke account params");
+        assert_eq!(revoke.account_id, "acct-1");
     }
 
     #[test]
