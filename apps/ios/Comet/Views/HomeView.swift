@@ -1,7 +1,9 @@
-// Home — the mobile shell. The desktop sidebar's Spaces, Sessions, and Shared
-// sections become the phone's home screen. Tabs-as-sessions don't fit a phone;
-// a space opens into its own session list instead, and close=archive becomes
-// swipe-to-archive while Shared removal drops only workspace membership.
+// Home — the mobile shell. The desktop sidebar's Spaces and Sessions sections
+// become the phone's home screen. Tabs-as-sessions don't fit a phone; a space
+// opens into its own session list instead, and close=archive becomes
+// swipe-to-archive. Imported memberships (sessions shared from another user's
+// workspace, joined via a `comet://invite/…` link) close out the same Sessions
+// list as globe rows; swipe-to-remove drops only workspace membership.
 
 import SwiftUI
 
@@ -15,14 +17,12 @@ struct HomeView: View {
     @Environment(AppModel.self) private var model
     @State private var path: [Route] = []
     @State private var showNewSpace = false
-    @State private var showAddSharedSession = false
 
     var body: some View {
         NavigationStack(path: $path) {
             List {
                 spacesSection
                 sessionsSection
-                sharedSessionsSection
             }
             .listStyle(.plain)
             .environment(\.defaultMinListRowHeight, 10)
@@ -77,13 +77,15 @@ struct HomeView: View {
                     path.append(.space(spaceId))
                 }
             }
-            .sheet(isPresented: $showAddSharedSession) {
-                AddSharedSessionSheet { chatId in
-                    path.append(.chat(chatId))
-                }
-            }
             .task(id: (model.overviewChats.map(\.id) + model.sharedSessionRefs.map(\.chatId)).joined()) {
                 model.preloadSessions()
+            }
+            .onChange(of: model.launchRoute) { _, route in
+                // Live one-click invite while Home is already up (cold-start
+                // routes land via onAppear below).
+                guard let route else { return }
+                model.launchRoute = nil
+                path.append(route)
             }
             .onAppear {
                 if let route = model.launchRoute {
@@ -137,7 +139,8 @@ struct HomeView: View {
     private var sessionsSection: some View {
         Section {
             let chats = model.overviewChats
-            if chats.isEmpty {
+            let refs = model.sharedSessionRefs
+            if chats.isEmpty && refs.isEmpty {
                 Text("No sessions yet")
                     .font(Theme.sans(12))
                     .foregroundStyle(Theme.textFaint)
@@ -164,22 +167,8 @@ struct HomeView: View {
                 }
             }
             .motionAnimation(Motion.resort, value: chats.map(\.id))
-        } header: {
-            sectionHeader("Sessions")
-        }
-    }
-    // MARK: Shared sessions
-
-    private var sharedSessionsSection: some View {
-        Section {
-            let refs = model.sharedSessionRefs
-            if refs.isEmpty {
-                Text("No shared sessions")
-                    .font(Theme.sans(12))
-                    .foregroundStyle(Theme.textFaint)
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
-            }
+            // Imported memberships without a workspace chat row — the same
+            // list, globe rows; removal drops only workspace membership.
             ForEach(refs) { sessionRef in
                 Button {
                     path.append(.chat(sessionRef.chatId))
@@ -199,24 +188,9 @@ struct HomeView: View {
                 }
             }
         } header: {
-            HStack {
-                sectionHeader("Shared")
-                Spacer()
-                Button {
-                    showAddSharedSession = true
-                } label: {
-                    Image(systemName: "plus.circle")
-                        .font(.system(size: 13, weight: .medium))
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(Theme.textMuted)
-                .accessibilityLabel("Add shared session")
-            }
-            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 3, trailing: 16))
+            sectionHeader("Sessions")
         }
     }
-
-
     private func sectionHeader(_ title: String) -> some View {
         Text(title)
             .font(Theme.sans(11, weight: .medium))
@@ -377,69 +351,6 @@ struct SharedSessionRow: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 7)
         .contentShape(RoundedRectangle(cornerRadius: 8))
-    }
-}
-
-struct AddSharedSessionSheet: View {
-    @Environment(AppModel.self) private var model
-    @Environment(\.dismiss) private var dismiss
-    let onAdded: (String) -> Void
-
-    @State private var sessionId = ""
-    @State private var error: String?
-    @FocusState private var focused: Bool
-
-    var body: some View {
-        NavigationStack {
-            VStack(alignment: .leading, spacing: 14) {
-                Text("Paste the exact global session UUID.")
-                    .font(Theme.sans(12))
-                    .foregroundStyle(Theme.textMuted)
-                TextField("Session UUID", text: $sessionId)
-                    .font(Theme.mono(13))
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .submitLabel(.go)
-                    .focused($focused)
-                    .onSubmit(add)
-                    .padding(.horizontal, 12)
-                    .frame(height: 42)
-                    .background(whiteAlpha(0.06), in: RoundedRectangle(cornerRadius: 10))
-                if let error {
-                    Text(error)
-                        .font(Theme.sans(11))
-                        .foregroundStyle(Theme.danger)
-                }
-                Spacer()
-            }
-            .padding(20)
-            .background(SheetStyle.panel)
-            .navigationTitle("Add shared session")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { dismiss() }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Add", action: add)
-                        .disabled(sessionId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }
-            }
-        }
-        .presentationDetents([.medium])
-        .presentationDragIndicator(.visible)
-        .presentationCornerRadius(32)
-        .preferredColorScheme(.dark)
-        .onAppear { focused = true }
-    }
-
-    private func add() {
-        guard let sessionRef = model.addSessionRef(sessionId) else {
-            error = "Enter a valid session UUID"
-            return
-        }
-        dismiss()
-        onAdded(sessionRef.chatId)
     }
 }
 

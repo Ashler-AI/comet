@@ -19,6 +19,11 @@ struct CometApp: App {
                 // for status/markdown, never chrome.
                 .tint(Theme.text)
                 .background(Theme.bg)
+                // One-click session invitations (`comet://invite/…`) — the
+                // same deep link the desktop copies from the invite dialog.
+                .onOpenURL { url in
+                    model.openInvitation(url: url)
+                }
                 .onChange(of: scenePhase) { _, phase in
                     if phase == .background {
                         model.flushDocs()

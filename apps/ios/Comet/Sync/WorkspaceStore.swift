@@ -210,20 +210,22 @@ final class WorkspaceStore {
 
     // MARK: Derived views
 
-    /// state.rs `overview_chats`: every non-archived, non-imported chat of a
-    /// live space, attention-sorted.
+    /// state.rs `overview_chats`: every non-archived chat of a live space,
+    /// attention-sorted. A chat row always wins over a membership ref — the
+    /// row carries the context (status, harness, branch) a bare ref lacks.
     var overviewChats: [Chat] {
         let liveSpaceIds = Set(spaces.map(\.id))
-        let importedIds = Set(sessionRefs.map(\.chatId))
         let live = chats.filter {
-            !$0.archived
-                && !importedIds.contains($0.id)
-                && $0.spaceId.map(liveSpaceIds.contains) == true
+            !$0.archived && $0.spaceId.map(liveSpaceIds.contains) == true
         }
         return sortActive(live)
     }
-    /// Exact session ids this principal explicitly imported.
-    var sharedSessionRefs: [SessionRef] { sessionRefs }
+    /// Imported memberships with no workspace chat row — sessions genuinely
+    /// foreign to this workspace. Row-backed refs are served by `overviewChats`.
+    var sharedSessionRefs: [SessionRef] {
+        let rowIds = Set(chats.map(\.id))
+        return sessionRefs.filter { !rowIds.contains($0.chatId) }
+    }
 
 
     /// A space's owned sessions, in the sidebar's Sessions order (recency).
@@ -233,10 +235,7 @@ final class WorkspaceStore {
     /// no tabs — a space opens into the same list, with the same rows, as the
     /// Sessions section — so it follows that list's ordering instead.
     func chats(in spaceId: String) -> [Chat] {
-        let importedIds = Set(sessionRefs.map(\.chatId))
-        return sortActive(chats.filter {
-            !$0.archived && !importedIds.contains($0.id) && $0.spaceId == spaceId
-        })
+        sortActive(chats.filter { !$0.archived && $0.spaceId == spaceId })
     }
 
     func indicator(for chat: Chat) -> ChatIndicator {
