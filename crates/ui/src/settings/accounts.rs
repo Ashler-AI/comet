@@ -78,8 +78,8 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
 
 /// Provider cards in display order.
 pub const PROVIDERS: [(HarnessId, &str); 2] = [
-    (HarnessId::ClaudeCode, "Claude Code"),
-    (HarnessId::Codex, "Codex"),
+    (HarnessId::ClaudeCode, "Anthropic"),
+    (HarnessId::Codex, "OpenAI"),
 ];
 
 /// Accounts of one provider in authoritative server order. Pure.
@@ -159,7 +159,7 @@ enum LoginFlow {
 }
 
 impl LoginFlow {
-    /// Dialog title (comet: "Add Claude account" / "Add Codex account").
+    /// Dialog title for the provider account being added.
     fn title(&self) -> &'static str {
         let harness = match self {
             LoginFlow::Starting { harness }
@@ -167,8 +167,8 @@ impl LoginFlow {
             | LoginFlow::Browser { harness, .. } => *harness,
         };
         match harness {
-            HarnessId::Codex => "Add Codex account",
-            _ => "Add Claude account",
+            HarnessId::Codex => "Add OpenAI account",
+            _ => "Add Anthropic account",
         }
     }
 }
@@ -178,6 +178,8 @@ pub struct AccountsPage {
     snapshot: Loadable<AgentAccountsSnapshot>,
     /// Account id with an in-flight migration or revoke.
     busy_account: Option<String>,
+    /// Shared account awaiting explicit removal confirmation.
+    pending_revoke: Option<AgentAccount>,
     login: Option<LoginFlow>,
     error: Option<SharedString>,
     code_input: Entity<ComposerInput>,
@@ -210,6 +212,7 @@ impl AccountsPage {
             state,
             snapshot: Loadable::Idle,
             busy_account: None,
+            pending_revoke: None,
             login: None,
             error: None,
             code_input,
@@ -260,6 +263,9 @@ impl AccountsPage {
         account: &AgentAccount,
         cx: &mut Context<Self>,
     ) {
+        if self.busy_account.is_some() {
+            return;
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
@@ -282,6 +288,26 @@ impl AccountsPage {
             .ok();
         }));
         cx.notify();
+    }
+
+    fn request_revoke(&mut self, account: AgentAccount, cx: &mut Context<Self>) {
+        if self.busy_account.is_some() {
+            return;
+        }
+        self.pending_revoke = Some(account);
+        cx.notify();
+    }
+
+    fn cancel_revoke(&mut self, cx: &mut Context<Self>) {
+        self.pending_revoke = None;
+        cx.notify();
+    }
+
+    fn confirm_revoke(&mut self, cx: &mut Context<Self>) {
+        let Some(account) = self.pending_revoke.take() else {
+            return;
+        };
+        self.account_action(methods::REVOKE_AGENT_ACCOUNT, &account, cx);
     }
 
     // ---- add-account flows ----
@@ -675,7 +701,7 @@ impl AccountsPage {
                 .when(is_busy, |el| el.opacity(0.5))
                 .hover(|s| s.bg(crate::theme::ink(0.06)).text_color(theme.text))
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.account_action(methods::REVOKE_AGENT_ACCOUNT, &action_account, cx);
+                    this.request_revoke(action_account.clone(), cx);
                 }))
                 .child(
                     crate::icons::icon(crate::icons::TRASH_BIN_MINIMALISTIC)
@@ -756,6 +782,41 @@ impl AccountsPage {
                     .child(actions),
             )
             .into_any_element()
+    }
+
+    fn render_revoke_dialog(
+        &mut self,
+        viewport: gpui::Size<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        self.pending_revoke.as_ref()?;
+        let theme = Theme::of(cx).clone();
+        let card = popover::dialog_card(&theme)
+            .child(popover::dialog_title(&theme, "Remove this account?"))
+            .child(div().mt(px(6.0)).child(popover::dialog_body(
+                &theme,
+                "New turns will stop using it immediately.",
+            )))
+            .child(
+                div()
+                    .mt(px(16.0))
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap(px(8.0))
+                    .child(
+                        popover::btn_ghost(&theme, "Cancel", "account-revoke-cancel")
+                            .id("account-revoke-cancel")
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel_revoke(cx))),
+                    )
+                    .child(
+                        popover::btn_danger(&theme, "Remove")
+                            .id("account-revoke-confirm")
+                            .on_click(cx.listener(|this, _, _, cx| this.confirm_revoke(cx))),
+                    ),
+            )
+            .into_any_element();
+        Some(popover::modal("remove-account-dialog", viewport, card))
     }
 
     fn render_login_dialog(
@@ -1276,7 +1337,11 @@ impl Render for AccountsPage {
         use crate::settings::widgets;
         let theme = Theme::of(cx).clone();
         let now = Utc::now();
-        let dialog = self.render_login_dialog(window.viewport_size(), cx);
+        let dialog = if self.pending_revoke.is_some() {
+            self.render_revoke_dialog(window.viewport_size(), cx)
+        } else {
+            self.render_login_dialog(window.viewport_size(), cx)
+        };
         let refreshing = matches!(self.snapshot, Loadable::Loading);
         let account_count = self
             .snapshot
@@ -1495,7 +1560,7 @@ impl Render for AccountsPage {
                     )
                     .child(widgets::page_subtitle(
                         &theme,
-                        "Accounts shared by Comet, OMP, and Scaffold.",
+                        "One account pool for local agents and Scaffold.",
                     ))
                     .when_some(self.error.clone(), |el, message| {
                         el.child(
@@ -1519,8 +1584,8 @@ impl Render for AccountsPage {
                             .line_height(px(19.0))
                             .text_color(theme.text_muted.opacity(0.6))
                             .child(SharedString::from(
-                                "Comet stores these accounts centrally. Agents receive only \
-                                 short-lived access for each run.",
+                                "Accounts are encrypted centrally. Agents receive only short-lived, \
+                                 session-scoped grants.",
                             )),
                     ),
             )

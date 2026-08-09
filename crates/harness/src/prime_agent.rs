@@ -28,7 +28,6 @@ const REASONING_LEVELS: &[ReasoningLevel] = &[
     ReasoningLevel::XHigh,
     ReasoningLevel::Max,
 ];
-const PRIME_AGENT_AUTH_GATEWAY: &str = include_str!("prime_agent_auth_gateway.ts");
 
 fn resolve_prime_agent_executable() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("PRIME_AGENT_EXECUTABLE").filter(|value| !value.is_empty())
@@ -72,27 +71,6 @@ fn prime_config_dir() -> PathBuf {
                 .map(|home| PathBuf::from(home).join(".prime/agent"))
         })
         .unwrap_or_else(|| PathBuf::from(".prime/agent"))
-}
-
-fn bundled_auth_gateway_extension() -> Result<Option<PathBuf>, HarnessError> {
-    let discovered = prime_config_dir().join("extensions/omp-auth-gateway.ts");
-    if discovered.is_file() {
-        return Ok(None);
-    }
-    let directory = prime_config_dir().join("comet-runtime");
-    std::fs::create_dir_all(&directory)?;
-    let path = directory.join("prime-agent-auth-gateway.ts");
-    let current = std::fs::read(&path).ok();
-    if current.as_deref() != Some(PRIME_AGENT_AUTH_GATEWAY.as_bytes()) {
-        std::fs::write(&path, PRIME_AGENT_AUTH_GATEWAY)?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(Some(path))
 }
 
 fn reasoning_arg(level: ReasoningLevel) -> &'static str {
@@ -335,16 +313,17 @@ impl Harness for PrimeAgentHarness {
         let executable = self.resolve_executable()?;
         let preloaded_session_id = request.resume.clone();
         let mut command = self.command(&executable, &request.cwd);
-        if controls
+        if let Some(provider) = controls
             .context
             .as_ref()
             .and_then(|context| context.inference.as_ref())
-            .is_some()
+            .and_then(|inference| crate::auth_gateway::provider(&inference.provider))
         {
             command.env("PRIME_AGENT_MANAGE_AUTH_ROUTER", "0");
-            if let Some(extension) = bundled_auth_gateway_extension()? {
+            if let Some(extension) = crate::auth_gateway::install_extension(&prime_config_dir())? {
                 command.arg("--extension").arg(extension);
             }
+            command.args(["--provider", provider]);
         }
         crate::apply_run_context(&mut command, controls.context.as_ref());
         let reported_session_dir = if let Some(resume) = request.resume.as_deref() {
@@ -355,7 +334,13 @@ impl Harness for PrimeAgentHarness {
             command.arg("--session-dir").arg(&session_dir);
             Some(session_dir)
         };
-        if let Some(model) = request.model.as_deref().filter(|model| *model != "default") {
+        let model = controls
+            .context
+            .as_ref()
+            .and_then(|context| context.inference.as_ref())
+            .map(|inference| inference.model.as_str())
+            .or_else(|| request.model.as_deref().filter(|model| *model != "default"));
+        if let Some(model) = model {
             command.args(["--model", model]);
         }
         if let Some(reasoning) = request.reasoning {
@@ -482,14 +467,6 @@ prime-inference z-ai/glm-5.2 1.0M 262.1K yes no\n",
                 .unwrap()
                 .contains("authorization is not verified")
         );
-    }
-
-    #[test]
-    fn bundles_a_credential_free_loopback_gateway_adapter() {
-        assert!(PRIME_AGENT_AUTH_GATEWAY.contains("OMP_AUTH_GATEWAY_TOKEN"));
-        assert!(PRIME_AGENT_AUTH_GATEWAY.contains("http://127.0.0.1:4000"));
-        assert!(!PRIME_AGENT_AUTH_GATEWAY.contains("sk-"));
-        assert!(!PRIME_AGENT_AUTH_GATEWAY.contains("refreshToken"));
     }
 
     #[test]

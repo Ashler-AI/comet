@@ -35,7 +35,7 @@ use comet_proto::{
     ToolCall, UserInputQuestion,
 };
 
-use crate::{Harness, HarnessError, RunControls};
+use crate::{Harness, HarnessError, InferenceRoute, RunControls};
 use rpc::{Incoming, RpcClient};
 
 const ACP_PROTOCOL_VERSION: i64 = 1;
@@ -262,6 +262,36 @@ fn omp_session_dirs(scaffold_host: bool) -> Vec<PathBuf> {
     );
     dirs.push(agent_dir.join("sessions"));
     dirs
+}
+
+fn omp_agent_dir(scaffold_host: bool) -> PathBuf {
+    omp_session_dirs(scaffold_host)
+        .into_iter()
+        .next()
+        .and_then(|sessions| sessions.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from(".omp/agent"))
+}
+
+fn configure_inference_gateway(
+    command: &mut Command,
+    agent_dir: &Path,
+    inference: &InferenceRoute,
+) -> Result<(), HarnessError> {
+    let provider = crate::auth_gateway::provider(&inference.provider).ok_or_else(|| {
+        HarnessError::Protocol(format!(
+            "unsupported shared inference provider: {}",
+            inference.provider
+        ))
+    })?;
+    if let Some(extension) = crate::auth_gateway::install_extension(agent_dir)? {
+        command.arg("--extension").arg(extension);
+    }
+    let model = inference
+        .model
+        .rsplit_once('/')
+        .map_or(inference.model.as_str(), |(_, model)| model);
+    command.args(["--model", &format!("{provider}/{model}")]);
+    Ok(())
 }
 
 fn session_file_has_id(path: &Path, session_id: &str) -> bool {
@@ -859,6 +889,17 @@ impl Harness for OmpHarness {
         self.ensure_resume_has_no_writer(request.resume.as_deref())?;
         let mut command = self.run_command(&executable, &request);
         crate::apply_run_context(&mut command, controls.context.as_ref());
+        if let Some(inference) = controls
+            .context
+            .as_ref()
+            .and_then(|context| context.inference.as_ref())
+        {
+            configure_inference_gateway(
+                &mut command,
+                &omp_agent_dir(self.scaffold_host),
+                inference,
+            )?;
+        }
         let mut child = command.spawn().map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 HarnessError::NotInstalled(executable.display().to_string())
@@ -1961,6 +2002,43 @@ mod tests {
             .map(|value| value.to_string_lossy().into_owned())
             .collect();
         assert_eq!(args, ["--mode", "rpc", "--approval-mode", "yolo"]);
+    }
+
+    #[test]
+    fn shared_inference_uses_an_explicit_gateway_extension_and_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut request = run_request(None);
+        request.model = Some("gpt-5.6-sol".into());
+        let mut command =
+            OmpHarness::scaffold_host().run_command(Path::new("/usr/local/bin/omp"), &request);
+        configure_inference_gateway(
+            &mut command,
+            temp.path(),
+            &InferenceRoute {
+                base_url: "http://127.0.0.1:41234".into(),
+                token: "local-inference-token".into(),
+                provider: "openai".into(),
+                model: "gpt-5.6-sol".into(),
+            },
+        )
+        .unwrap();
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        let extension = temp.path().join("comet-runtime/agent-auth-gateway.ts");
+        assert!(extension.is_file());
+        assert!(args.windows(2).any(|pair| {
+            pair == [
+                "--extension".to_string(),
+                extension.to_string_lossy().into_owned(),
+            ]
+        }));
+        assert_eq!(
+            &args[args.len() - 2..],
+            ["--model", "comet-openai/gpt-5.6-sol"]
+        );
     }
 
     #[test]

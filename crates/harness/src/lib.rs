@@ -99,6 +99,7 @@ pub trait Harness: Send + Sync {
 }
 
 mod approval;
+mod auth_gateway;
 pub mod claude;
 pub mod codex;
 pub mod mock;
@@ -200,15 +201,22 @@ pub(crate) fn apply_run_context(cmd: &mut tokio::process::Command, context: Opti
     // Never inherit a stale context from the engine's own launch environment.
     cmd.env_remove("COMET_SESSION_ID")
         .env_remove("COMET_IPC_PORT")
-        .env_remove("COMET_INFERENCE_TOKEN");
+        .env_remove("COMET_INFERENCE_TOKEN")
+        .env_remove("PRIME_AGENT_AUTH_GATEWAY_URL")
+        .env_remove("OMP_AUTH_GATEWAY_URL")
+        .env_remove("OMP_AUTH_GATEWAY_TOKEN");
     if let Some(context) = context {
         cmd.env("COMET_SESSION_ID", &context.session_id)
             .env("COMET_IPC_PORT", context.ipc_port.to_string());
         if let Some(inference) = &context.inference {
-            cmd.env("COMET_INFERENCE_TOKEN", &inference.token)
-                .env("OMP_AUTH_BROKER_URL", &inference.base_url)
-                .env("OMP_AUTH_BROKER_TOKEN", &inference.token)
+            // OMP_AUTH_BROKER_* is OMP's credential-vault protocol, not an
+            // inference gateway. Shared Comet runs instead load the bundled
+            // provider adapter below and must not leak an inherited vault.
+            cmd.env_remove("OMP_AUTH_BROKER_URL")
+                .env_remove("OMP_AUTH_BROKER_TOKEN")
+                .env("COMET_INFERENCE_TOKEN", &inference.token)
                 .env("PRIME_AGENT_AUTH_GATEWAY_URL", &inference.base_url)
+                .env("OMP_AUTH_GATEWAY_URL", &inference.base_url)
                 .env("OMP_AUTH_GATEWAY_TOKEN", &inference.token);
             match inference.provider.as_str() {
                 "openai" => {
@@ -365,9 +373,15 @@ mod run_context_tests {
             Some("local-inference-token")
         );
         assert_eq!(
-            configured_env(&cmd, "OMP_AUTH_BROKER_TOKEN").as_deref(),
+            configured_env(&cmd, "OMP_AUTH_GATEWAY_URL").as_deref(),
+            Some("http://127.0.0.1:41234")
+        );
+        assert_eq!(
+            configured_env(&cmd, "OMP_AUTH_GATEWAY_TOKEN").as_deref(),
             Some("local-inference-token")
         );
+        assert_eq!(configured_env(&cmd, "OMP_AUTH_BROKER_URL"), None);
+        assert_eq!(configured_env(&cmd, "OMP_AUTH_BROKER_TOKEN"), None);
         assert!(!format!("{route:?}").contains("local-inference-token"));
     }
 

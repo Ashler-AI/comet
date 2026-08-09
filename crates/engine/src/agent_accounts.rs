@@ -1063,7 +1063,7 @@ fn remote_account_for_view(account: &RemoteAgentAccount) -> Option<AgentAccount>
     let usage_windows = account
         .usage_fraction
         .map(|used_fraction| AgentUsageWindow {
-            label: "Subscription".into(),
+            label: "Usage".into(),
             used_fraction,
             resets_at: account
                 .reset_at

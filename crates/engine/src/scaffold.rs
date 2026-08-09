@@ -134,7 +134,6 @@ pub(crate) struct RemoteAgentAccount {
     pub status: String,
     pub usage_fraction: Option<f32>,
     pub reset_at: Option<String>,
-    pub updated_at: String,
 }
 
 #[derive(Deserialize)]
@@ -167,6 +166,9 @@ pub(crate) struct AgentInferenceGrantBinding {
     pub harness: String,
     pub source: String,
     pub lifecycle_epoch: u64,
+    pub backend: String,
+    pub account_id: Option<String>,
+    pub account_generation: Option<u64>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -175,6 +177,21 @@ pub(crate) struct AgentInferenceGrant {
     pub token: String,
     pub expires_at: String,
     pub binding: AgentInferenceGrantBinding,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentInferenceFailureReport<'a> {
+    failure_class: &'a str,
+    response_started: bool,
+    retry_after_seconds: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentInferenceFailureResponse {
+    retry: bool,
+    grant: Option<AgentInferenceGrant>,
 }
 
 impl fmt::Debug for ScaffoldClient {
@@ -344,6 +361,51 @@ impl ScaffoldClient {
             response = request.send() => response.map_err(ScaffoldError::Transport),
             () = cancellation.cancelled() => Err(ScaffoldError::Cancelled),
         }
+    }
+
+    pub(crate) async fn report_agent_inference_failure(
+        &self,
+        grant: &AgentInferenceGrant,
+        failure_class: &str,
+        response_started: bool,
+        retry_after_seconds: Option<u64>,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<AgentInferenceGrant>, ScaffoldError> {
+        let url = self
+            .origin
+            .join("/api/agent-auth/grants/failure")
+            .expect("static inference failure path");
+        let request = self
+            .http
+            .post(url)
+            .bearer_auth(&grant.token)
+            .header("x-agent-auth-owner-subject", &grant.binding.owner_subject)
+            .header("x-agent-auth-session-id", &grant.binding.logical_session_id)
+            .header("x-agent-auth-provider", &grant.binding.provider)
+            .header("x-agent-auth-model", &grant.binding.model)
+            .header("x-agent-auth-harness", &grant.binding.harness)
+            .header("x-agent-auth-source", &grant.binding.source)
+            .header(
+                "x-agent-auth-lifecycle-epoch",
+                grant.binding.lifecycle_epoch.to_string(),
+            )
+            .json(&AgentInferenceFailureReport {
+                failure_class,
+                response_started,
+                retry_after_seconds,
+            });
+        let response = tokio::select! {
+            response = request.send() => response?,
+            () = cancellation.cancelled() => return Err(ScaffoldError::Cancelled),
+        };
+        let status = response.status();
+        let bytes = response.bytes().await?;
+        if !status.is_success() {
+            return Err(api_error(status, &bytes));
+        }
+        let reported: AgentInferenceFailureResponse = serde_json::from_slice(&bytes)
+            .map_err(|error| ScaffoldError::InvalidResponse(error.to_string()))?;
+        Ok(reported.retry.then_some(reported.grant).flatten())
     }
 
     pub(crate) async fn revoke_agent_inference_grants(

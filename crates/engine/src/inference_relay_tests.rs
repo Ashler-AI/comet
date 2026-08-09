@@ -62,6 +62,9 @@ mod tests {
                                             "harness": input["harness"],
                                             "source": "comet-local",
                                             "lifecycleEpoch": input["lifecycleEpoch"],
+                                            "backend": "oauth",
+                                            "accountId": "account-1",
+                                            "accountGeneration": 1,
                                         }
                                     })
                                 }
@@ -104,6 +107,127 @@ mod tests {
                             Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(
                                 response.to_string(),
                             ))))
+                        }
+                    });
+                    hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+        origin
+    }
+
+    #[derive(Debug)]
+    struct FailoverCapture {
+        path: String,
+        authorization: String,
+        request_id: Option<String>,
+        body: Value,
+    }
+
+    async fn failover_control_plane(
+        captured: mpsc::UnboundedSender<FailoverCapture>,
+    ) -> String {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let captured = captured.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |request: Request<Incoming>| {
+                        let captured = captured.clone();
+                        async move {
+                            let path = request.uri().path().to_string();
+                            let headers = request.headers().clone();
+                            let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                            let body = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
+                            let expires_at =
+                                (Utc::now() + TimeDelta::minutes(5)).to_rfc3339();
+                            let (status, response) = match path.as_str() {
+                                "/api/agent-auth/grants" => (
+                                    StatusCode::CREATED,
+                                    json!({
+                                        "token": "remote-account-1",
+                                        "expiresAt": expires_at,
+                                        "binding": {
+                                            "ownerSubject": "owner-1",
+                                            "logicalSessionId": "session-failover",
+                                            "provider": "openai",
+                                            "model": "gpt-5.6-sol",
+                                            "harness": "codex",
+                                            "source": "comet-local",
+                                            "lifecycleEpoch": 1,
+                                            "backend": "oauth",
+                                            "accountId": "account-1",
+                                            "accountGeneration": 1,
+                                        }
+                                    }),
+                                ),
+                                "/api/agent-auth/grants/failure" => {
+                                    captured.send(FailoverCapture {
+                                        path,
+                                        authorization: headers[AUTHORIZATION]
+                                            .to_str()
+                                            .unwrap()
+                                            .to_string(),
+                                        request_id: None,
+                                        body,
+                                    }).unwrap();
+                                    (
+                                        StatusCode::OK,
+                                        json!({
+                                            "retry": true,
+                                            "grant": {
+                                                "token": "remote-account-2",
+                                                "expiresAt": expires_at,
+                                                "binding": {
+                                                    "ownerSubject": "owner-1",
+                                                    "logicalSessionId": "session-failover",
+                                                    "provider": "openai",
+                                                    "model": "gpt-5.6-sol",
+                                                    "harness": "codex",
+                                                    "source": "comet-local",
+                                                    "lifecycleEpoch": 1,
+                                                    "backend": "oauth",
+                                                    "accountId": "account-2",
+                                                    "accountGeneration": 1,
+                                                }
+                                            }
+                                        }),
+                                    )
+                                }
+                                "/api/agent-auth/v1/responses" => {
+                                    let authorization =
+                                        headers[AUTHORIZATION].to_str().unwrap().to_string();
+                                    captured.send(FailoverCapture {
+                                        path,
+                                        authorization: authorization.clone(),
+                                        request_id: headers.get("x-agent-auth-request-id")
+                                            .and_then(|value| value.to_str().ok())
+                                            .map(str::to_string),
+                                        body,
+                                    }).unwrap();
+                                    if authorization == "Bearer remote-account-1" {
+                                        (
+                                            StatusCode::TOO_MANY_REQUESTS,
+                                            json!({ "error": { "code": "usage_limit_reached" } }),
+                                        )
+                                    } else {
+                                        (StatusCode::OK, json!({ "ok": true }))
+                                    }
+                                }
+                                other => panic!("unexpected failover control-plane path {other}"),
+                            };
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(status)
+                                    .header(CONTENT_TYPE, "application/json")
+                                    .body(Full::new(Bytes::from(response.to_string())))
+                                    .unwrap(),
+                            )
                         }
                     });
                     hyper::server::conn::http1::Builder::new()
@@ -181,6 +305,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(removed.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn replays_an_unstarted_429_through_the_next_sticky_account() {
+        let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
+        let origin = failover_control_plane(captured_tx).await;
+        let client = ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap();
+        let relay = InferenceRelay::start(client).unwrap();
+        let route = relay
+            .prepare("session-failover", HarnessId::Codex, Some("gpt-5.6-sol"))
+            .await
+            .unwrap()
+            .unwrap();
+        let payload = json!({ "model": "gpt-5.6-sol", "input": "replay exactly once" });
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/responses", route.base_url))
+            .bearer_auth(&route.token)
+            .header("x-request-id", "failover-request")
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.json::<Value>().await.unwrap(), json!({ "ok": true }));
+
+        let first = captured_rx.recv().await.unwrap();
+        let report = captured_rx.recv().await.unwrap();
+        let second = captured_rx.recv().await.unwrap();
+        assert_eq!(first.path, "/api/agent-auth/v1/responses");
+        assert_eq!(first.authorization, "Bearer remote-account-1");
+        assert_eq!(first.request_id.as_deref(), Some("failover-request"));
+        assert_eq!(first.body, payload);
+        assert_eq!(report.path, "/api/agent-auth/grants/failure");
+        assert_eq!(report.authorization, "Bearer remote-account-1");
+        assert_eq!(report.body["failureClass"], "account_exhausted");
+        assert_eq!(report.body["responseStarted"], false);
+        assert_eq!(second.authorization, "Bearer remote-account-2");
+        assert_eq!(second.request_id, first.request_id);
+        assert_eq!(second.body, first.body);
+
+        let later = reqwest::Client::new()
+            .post(format!("{}/v1/responses", route.base_url))
+            .bearer_auth(&route.token)
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(later.status(), reqwest::StatusCode::OK);
+        let later_capture = captured_rx.recv().await.unwrap();
+        assert_eq!(later_capture.authorization, "Bearer remote-account-2");
     }
 
     #[tokio::test]

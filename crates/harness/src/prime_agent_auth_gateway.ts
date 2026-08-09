@@ -80,8 +80,8 @@ export default async function cometAuthGateway(pi: ExtensionAPI) {
   );
 
   if (anthropicModels.length > 0) {
-    pi.registerProvider("anthropic", {
-      name: "Anthropic",
+    pi.registerProvider("comet-anthropic", {
+      name: "Comet Anthropic",
       baseUrl: gatewayUrl,
       apiKey: TOKEN_ENV,
       api: "anthropic-messages",
@@ -91,8 +91,8 @@ export default async function cometAuthGateway(pi: ExtensionAPI) {
   }
 
   if (openaiModels.length > 0) {
-    pi.registerProvider("openai-codex", {
-      name: "OpenAI Codex",
+    pi.registerProvider("comet-openai", {
+      name: "Comet OpenAI",
       baseUrl: `${gatewayUrl}/v1`,
       apiKey: TOKEN_ENV,
       api: "openai-responses",
@@ -109,12 +109,12 @@ export default async function cometAuthGateway(pi: ExtensionAPI) {
     ) {
       return;
     }
-    if (ctx.model?.provider !== "anthropic" && ctx.model?.provider !== "openai-codex") return;
+    if (ctx.model?.provider !== "comet-anthropic" && ctx.model?.provider !== "comet-openai") return;
     const payload = event.payload as Record<string, unknown>;
     const sessionId = ctx.sessionManager.getSessionId();
     if (!sessionId) return;
 
-    if (ctx.model.provider === "openai-codex") {
+    if (ctx.model.provider === "comet-openai") {
       if (typeof payload.prompt_cache_key === "string") return;
       return { ...payload, prompt_cache_key: sessionId };
     }

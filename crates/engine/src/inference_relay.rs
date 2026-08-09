@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::error::Error;
+use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener as StdTcpListener};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -15,8 +16,11 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::json;
+use tempfile::TempPath;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio_util::io::ReaderStream;
 
 use comet_harness::InferenceRoute;
 use comet_proto::HarnessId;
@@ -27,6 +31,21 @@ use crate::{EngineError, new_id};
 const MAX_REQUEST_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CONNECTIONS: usize = 64;
 const REFRESH_SKEW_SECONDS: i64 = 60;
+const MAX_FAILOVER_ATTEMPTS: usize = 4;
+
+struct RequestSpool {
+    path: TempPath,
+    content_length: u64,
+}
+
+impl RequestSpool {
+    async fn body(&self) -> io::Result<reqwest::Body> {
+        let file = tokio::fs::File::open(&self.path).await?;
+        Ok(reqwest::Body::wrap_stream(ReaderStream::new(
+            file.take(self.content_length),
+        )))
+    }
+}
 
 type BoxError = Box<dyn Error + Send + Sync>;
 type RelayBody = UnsyncBoxBody<Bytes, BoxError>;
@@ -289,20 +308,17 @@ impl InferenceRelay {
             .filter(|value| !value.is_empty() && value.len() <= 128)
             .map(str::to_string)
             .unwrap_or_else(new_id);
-        let mut observed = 0_u64;
-        let body_stream = request.into_body().into_data_stream().map(move |chunk| {
-            let bytes = chunk.map_err(std::io::Error::other)?;
-            observed = observed.saturating_add(bytes.len() as u64);
-            if observed > content_length || observed > MAX_REQUEST_BYTES {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "inference request exceeded declared length",
-                ));
+        let spool = match spool_request_body(request.into_body(), content_length).await {
+            Ok(spool) => spool,
+            Err(error) => {
+                tracing::warn!(err = %error, "inference relay rejected request body");
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "inference_body_invalid" }),
+                );
             }
-            Ok::<_, std::io::Error>(bytes)
-        });
-        let body = reqwest::Body::wrap_stream(body_stream);
-        let grant = match self.current_grant(&route).await {
+        };
+        let mut grant = match self.current_grant(&route).await {
             Ok(grant) => grant,
             Err(error) => {
                 tracing::warn!(err = %error, "inference relay grant refresh failed");
@@ -312,30 +328,86 @@ impl InferenceRelay {
                 );
             }
         };
-        let upstream = match self
-            .inner
-            .client
-            .proxy_agent_inference(
-                endpoint,
-                &grant,
-                &request_id,
-                sanitize_request_headers(headers),
-                content_length,
-                body,
-                &comet_harness::CancellationToken::new(),
-            )
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                tracing::warn!(err = %error, "inference relay upstream failed");
+        let cancellation = comet_harness::CancellationToken::new();
+        let sanitized_headers = sanitize_request_headers(headers);
+        let mut failovers = 0_usize;
+        loop {
+            let body = match spool.body().await {
+                Ok(body) => body,
+                Err(error) => {
+                    tracing::warn!(err = %error, "inference relay could not replay request body");
+                    return json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({ "error": "inference_body_unavailable" }),
+                    );
+                }
+            };
+            let upstream = match self
+                .inner
+                .client
+                .proxy_agent_inference(
+                    endpoint,
+                    &grant,
+                    &request_id,
+                    sanitized_headers.clone(),
+                    content_length,
+                    body,
+                    &cancellation,
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::warn!(err = %error, "inference relay upstream failed");
+                    return json_response(
+                        StatusCode::BAD_GATEWAY,
+                        json!({ "error": "inference_upstream_unavailable" }),
+                    );
+                }
+            };
+            let Some(failure_class) = retryable_failure(&grant, upstream.status()) else {
+                return stream_response(upstream);
+            };
+            let retry_after_seconds = upstream
+                .headers()
+                .get(hyper::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok());
+            let replacement = self
+                .inner
+                .client
+                .report_agent_inference_failure(
+                    &grant,
+                    failure_class,
+                    false,
+                    retry_after_seconds,
+                    &cancellation,
+                )
+                .await;
+            let replacement = match replacement {
+                Ok(Some(replacement)) => replacement,
+                Ok(None) => return stream_response(upstream),
+                Err(error) => {
+                    tracing::warn!(err = %error, "inference relay failure report was rejected");
+                    return stream_response(upstream);
+                }
+            };
+            if let Err(error) = self
+                .replace_current_grant(&route, replacement.clone())
+                .await
+            {
+                tracing::warn!(err = %error, "inference relay replacement grant was invalid");
                 return json_response(
-                    StatusCode::BAD_GATEWAY,
-                    json!({ "error": "inference_upstream_unavailable" }),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    json!({ "error": "agent_auth_unavailable" }),
                 );
             }
-        };
-        stream_response(upstream)
+            if failovers >= MAX_FAILOVER_ATTEMPTS {
+                return stream_response(upstream);
+            }
+            failovers += 1;
+            grant = replacement;
+        }
     }
 
     async fn current_grant(&self, route: &Route) -> Result<AgentInferenceGrant, EngineError> {
@@ -360,6 +432,66 @@ impl InferenceRelay {
         }
         Ok(current.grant.clone())
     }
+
+    async fn replace_current_grant(
+        &self,
+        route: &Route,
+        grant: AgentInferenceGrant,
+    ) -> Result<(), EngineError> {
+        let expires_at = validate_grant(&grant, &route.request)?;
+        *route.grant.lock().await = GrantState { grant, expires_at };
+        Ok(())
+    }
+}
+
+async fn spool_request_body(body: Incoming, content_length: u64) -> io::Result<RequestSpool> {
+    let (file, path) = tokio::task::spawn_blocking(|| -> io::Result<_> {
+        Ok(tempfile::NamedTempFile::new()?.into_parts())
+    })
+    .await
+    .map_err(io::Error::other)??;
+    let mut file = tokio::fs::File::from_std(file);
+    let mut stream = body.into_data_stream();
+    let mut observed = 0_u64;
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(io::Error::other)?;
+        observed = observed.checked_add(bytes.len() as u64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "inference request length overflow",
+            )
+        })?;
+        if observed > content_length || observed > MAX_REQUEST_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "inference request exceeded declared length",
+            ));
+        }
+        file.write_all(&bytes).await?;
+    }
+    if observed != content_length {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "inference request did not match declared length",
+        ));
+    }
+    file.flush().await?;
+    drop(file);
+    Ok(RequestSpool {
+        path,
+        content_length,
+    })
+}
+
+fn retryable_failure(grant: &AgentInferenceGrant, status: StatusCode) -> Option<&'static str> {
+    if grant.binding.backend != "oauth" {
+        return None;
+    }
+    match status {
+        StatusCode::TOO_MANY_REQUESTS => Some("account_exhausted"),
+        StatusCode::UNAUTHORIZED => Some("authentication_required"),
+        _ => None,
+    }
 }
 
 fn validate_grant(
@@ -375,6 +507,8 @@ fn validate_grant(
         || binding.harness != request.harness
         || binding.source != "comet-local"
         || binding.lifecycle_epoch != request.lifecycle_epoch
+        || !matches!(binding.backend.as_str(), "oauth" | "bifrost")
+        || (binding.backend == "oauth" && binding.account_id.is_none())
     {
         return Err(EngineError::Other(
             "Agent Auth returned a mismatched inference grant".into(),
