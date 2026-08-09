@@ -229,6 +229,25 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Redial cadence ceiling once the edge has ANSWERED with an HTTP rejection
+/// (403 foreign scope, 404 unroutable room): the answer stays identical until
+/// something about the session or credential changes, so hammering at the
+/// 30s transport cap only spams the Worker and the logs (2026-08 field logs:
+/// 1.3k warns from three such chats). Mirrors the workspace room's 15-minute
+/// probe cadence; a system wake still resets to the fast base. 401 stays on
+/// the fast cap — the next dial re-reads the bearer, so an expired token
+/// heals within one refresh.
+const REJECTED_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Backoff ceiling for one failed session-room dial: policy rejections crawl,
+/// transport faults keep the fast reconnect cap.
+fn join_retry_cap(err: &comet_sync::SyncError) -> std::time::Duration {
+    match err {
+        comet_sync::SyncError::HttpRejected(403 | 404) => REJECTED_RETRY_CAP,
+        _ => crate::workspace_host::JOIN_RETRY_CAP,
+    }
+}
+
 /// Bind durable local authority to the complete immutable portion of a command.
 /// The SQLite row is written only after an authenticated local grant authorizes
 /// this exact entry, so a synced peer cannot reuse an id with altered payload.
@@ -822,14 +841,13 @@ impl DocHost {
         &self.inner.config.device_id
     }
 
+    /// The session UUID is the only global room address (edge
+    /// `canonicalSessionId`, edge/src/session-room.ts): an imported local
+    /// reference dialing `/session/local-chat-…/ws` hits a route the Worker
+    /// can never serve, so the join loop would retry a permanent 404 forever.
+    /// Those docs stay local regardless of which controller they acquire.
     fn chat_allows_room_join(&self, chat_id: &str) -> bool {
-        if !chat_id.starts_with("local-chat-") {
-            return true;
-        }
-        self.workspace()
-            .and_then(|workspace| workspace.doc().chat(chat_id).ok().flatten())
-            .and_then(|chat| chat.harness_session_id)
-            .is_some_and(|session_id| !session_id.trim().is_empty())
+        !chat_id.starts_with("local-chat-")
     }
 
     fn start_room_join(&self, handle: Arc<ChatDocHandle>) {
@@ -860,7 +878,8 @@ impl DocHost {
                 if weak.upgrade().is_none() {
                     return;
                 }
-                match RoomClient::connect_via(url.clone(), &chat, room_doc.clone()).await {
+                let cap = match RoomClient::connect_via(url.clone(), &chat, room_doc.clone()).await
+                {
                     Ok(client) => {
                         let Some(handle) = weak.upgrade() else {
                             return;
@@ -876,11 +895,12 @@ impl DocHost {
                             backoff_ms = backoff.as_millis() as u64,
                             "session room join failed; retrying"
                         );
+                        join_retry_cap(&err)
                     }
-                }
+                };
                 tokio::select! {
                     _ = tokio::time::sleep(backoff + crate::workspace_host::join_retry_jitter()) => {
-                        backoff = (backoff * 2).min(crate::workspace_host::JOIN_RETRY_CAP);
+                        backoff = (backoff * 2).min(cap);
                     }
                     _ = wake.recv() => {
                         backoff = crate::workspace_host::JOIN_RETRY_BASE;
@@ -890,8 +910,9 @@ impl DocHost {
         });
     }
 
-    /// Start room supervision for an already-open chat after it acquires a
-    /// native controller. History-only local imports remain local until then.
+    /// Start room supervision for an already-open chat (e.g. once a native run
+    /// claims it). Imported `local-chat-…` docs are never eligible — see
+    /// [`Self::chat_allows_room_join`].
     pub(crate) fn ensure_room_for_chat(&self, chat_id: &str) {
         let handle = lock(&self.inner.handles).get(chat_id).cloned();
         if let Some(handle) = handle {
@@ -2563,7 +2584,7 @@ mod authority_tests {
     use loro::LoroMap;
 
     #[tokio::test]
-    async fn history_only_local_chat_requires_native_controller_for_room_join() {
+    async fn imported_local_chats_never_join_edge_rooms() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DocsStore::open(dir.path()).unwrap());
         let workspace = WorkspaceHost::open(
@@ -2595,20 +2616,12 @@ mod authority_tests {
         host.set_workspace(workspace.clone());
 
         assert!(!host.chat_allows_room_join("local-chat-history"));
-        let restarted_host = DocHost::new(
-            store,
-            DocHostConfig {
-                device_id: "device-a".into(),
-                default_harness: HarnessId::Mock,
-                edge: None,
-            },
-        );
-        restarted_host.set_workspace(workspace.clone());
-        assert!(!restarted_host.chat_allows_room_join("local-chat-history"));
+        // Acquiring a native controller must NOT unlock a room join: the edge
+        // routes only session-UUID room names, so `/session/local-chat-…/ws`
+        // is a permanent 404 the join loop would otherwise retry forever.
         workspace.set_chat_harness_session("local-chat-history", "native-a", "/tmp");
-        assert!(host.chat_allows_room_join("local-chat-history"));
-        assert!(restarted_host.chat_allows_room_join("local-chat-history"));
-        assert!(host.chat_allows_room_join("ordinary-chat"));
+        assert!(!host.chat_allows_room_join("local-chat-history"));
+        assert!(host.chat_allows_room_join("f38fe3c9-c235-4e3c-a50e-b2223653dd66"));
     }
 
     #[tokio::test]
@@ -3290,6 +3303,26 @@ mod edge_url_tests {
         assert_eq!(
             url,
             "wss://edge.example/session/session-a/ws?token=secret&device=device-a&deploymentId=deployment-a"
+        );
+    }
+
+    #[test]
+    fn policy_rejections_throttle_while_transport_faults_stay_fast() {
+        use comet_sync::SyncError;
+        // The edge answered: the verdict won't change until the session or
+        // credential does — crawl instead of hammering the Worker.
+        assert_eq!(join_retry_cap(&SyncError::HttpRejected(403)), REJECTED_RETRY_CAP);
+        assert_eq!(join_retry_cap(&SyncError::HttpRejected(404)), REJECTED_RETRY_CAP);
+        // An expired bearer heals on the very next dial (the URL provider
+        // re-reads the token), so 401 keeps the fast reconnect cap…
+        assert_eq!(
+            join_retry_cap(&SyncError::HttpRejected(401)),
+            crate::workspace_host::JOIN_RETRY_CAP
+        );
+        // …and so do genuine transport faults.
+        assert_eq!(
+            join_retry_cap(&SyncError::WebSocket("dial timeout".into())),
+            crate::workspace_host::JOIN_RETRY_CAP
         );
     }
 }

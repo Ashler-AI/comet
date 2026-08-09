@@ -5591,7 +5591,6 @@ impl Shell {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
-                    tracing::warn!("SELECTION_COMMENT_ACTION_MOUSE_DOWN");
                     cx.stop_propagation();
                     this.open_selection_annotation(
                         message_id.clone(),

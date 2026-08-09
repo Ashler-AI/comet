@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use gpui::{App, Context, Entity, Task};
+use gpui::{App, AsyncApp, Context, Entity, Task, WeakEntity};
 use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
@@ -628,6 +628,12 @@ pub struct AppState {
     pub data_dir: Option<PathBuf>,
     runtime_profile: RuntimeProfile,
     engine: Option<EngineHandle>,
+    /// Boot config retained so a closed RPC transport can re-run the
+    /// probe-or-embed bootstrap (`on_engine_closed`).
+    boot_config: Option<EngineBootConfig>,
+    /// Quit in progress: the drained in-process engine's closing streams must
+    /// not trigger the reconnect supervisor mid-shutdown.
+    shutting_down: bool,
     watch_tasks: Vec<Task<()>>,
     transcript_task: Option<Task<()>>,
     collaboration_task: Option<Task<()>>,
@@ -689,6 +695,8 @@ impl AppState {
             data_dir: None,
             runtime_profile: RuntimeProfile::LocalController,
             engine: None,
+            boot_config: None,
+            shutting_down: false,
             watch_tasks: Vec::new(),
             transcript_task: None,
             collaboration_task: None,
@@ -1323,11 +1331,13 @@ impl AppState {
         let data_dir = config.data_dir.clone();
         let runtime_profile = config.runtime_profile;
         let scaffold_scope = configured_scaffold_scope(&config);
+        let boot_config = config.clone();
         state.update(cx, |s, cx| {
             s.connection = ConnectionStatus::Connecting;
             s.data_dir = Some(data_dir);
             s.runtime_profile = runtime_profile;
             s.scaffold_scope = scaffold_scope;
+            s.boot_config = Some(boot_config);
             cx.notify();
         });
         let boot = Tokio::spawn(cx, EngineHandle::bootstrap(config));
@@ -1413,6 +1423,54 @@ impl AppState {
                 Some(spawn_collaboration_watch(cx, handle, chat_id, projection));
         }
         cx.notify();
+    }
+
+    /// A watch task saw the RPC transport die ([`RpcError::Closed`]). First
+    /// caller wins: flip back to Connecting and re-run the probe-or-embed
+    /// bootstrap — a restarted daemon is reattached, a vanished one is
+    /// replaced by an embedded engine. Without this the app is a zombie:
+    /// standing watches end silently and the transcript watch retries a dead
+    /// socket every 2s forever.
+    fn on_engine_closed(&mut self, cx: &mut Context<Self>) {
+        let Some(config) = self.reconnect_config() else {
+            return;
+        };
+        let old_engine = self.engine.take();
+        let entity = cx.entity();
+        cx.defer(move |cx| {
+            if let Some(old) = old_engine {
+                // Graceful for an in-process engine (releases the IPC port
+                // ahead of the re-probe); a no-op for a remote daemon.
+                Tokio::spawn(cx, async move { old.shutdown().await }).detach();
+            }
+            AppState::bootstrap(entity, config, cx);
+        });
+        cx.notify();
+    }
+
+    /// Guard half of the reconnect supervisor: only an attached, non-quitting
+    /// app with a retained boot config reconnects. The winner flips the status
+    /// to Connecting, collapsing concurrent detectors into one bootstrap.
+    fn reconnect_config(&mut self) -> Option<EngineBootConfig> {
+        if self.shutting_down || !matches!(self.connection, ConnectionStatus::Ready) {
+            return None; // already reconnecting, failed, or quitting
+        }
+        let config = self.boot_config.clone()?;
+        tracing::warn!("engine RPC connection closed; re-probing");
+        self.connection = ConnectionStatus::Connecting;
+        Some(config)
+    }
+
+    /// Async-context entry for watch tasks reporting a closed connection.
+    fn engine_connection_lost(this: &WeakEntity<AppState>, cx: &mut AsyncApp) {
+        this.update(cx, |state, cx| state.on_engine_closed(cx)).ok();
+    }
+
+    /// Mark the quit in progress and hand back the engine for teardown, so
+    /// its closing streams can't restart a fresh engine mid-shutdown.
+    pub fn begin_shutdown(&mut self) -> Option<EngineHandle> {
+        self.shutting_down = true;
+        self.engine.clone()
     }
 
     pub fn selected_scaffold_control_grant_id(&self) -> Option<&str> {
@@ -1906,6 +1964,10 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
             .await
         {
             Ok(rx) => rx,
+            Err(RpcError::Closed) => {
+                AppState::engine_connection_lost(&this, cx);
+                return;
+            }
             Err(err) => {
                 tracing::debug!(error = %err, "chats watch unavailable");
                 return;
@@ -1935,8 +1997,22 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
                 cx.notify();
             });
             if alive.is_err() {
-                break;
+                return;
             }
+        }
+        // Stream ended with the entity alive: dead transport, or a
+        // server-side end (an engine that doesn't serve the method replies
+        // with an err frame that just closes the stream). Only a dead
+        // transport reconnects — any unary reply, even "unknown method",
+        // proves the connection is still alive.
+        if matches!(
+            handle
+                .client()
+                .call(methods::LOCAL_DEVICE, serde_json::json!({}))
+                .await,
+            Err(RpcError::Closed)
+        ) {
+            AppState::engine_connection_lost(&this, cx);
         }
     })
 }
@@ -1954,6 +2030,10 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
             .await
         {
             Ok(rx) => rx,
+            Err(RpcError::Closed) => {
+                AppState::engine_connection_lost(&this, cx);
+                return;
+            }
             Err(err) => {
                 tracing::debug!(method, error = %err, "watch unavailable");
                 return;
@@ -1972,8 +2052,18 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
                 cx.notify();
             });
             if alive.is_err() {
-                break;
+                return;
             }
+        }
+        // See spawn_chats_watch: reconnect only on a provably dead transport.
+        if matches!(
+            handle
+                .client()
+                .call(methods::LOCAL_DEVICE, serde_json::json!({}))
+                .await,
+            Err(RpcError::Closed)
+        ) {
+            AppState::engine_connection_lost(&this, cx);
         }
     })
 }
@@ -2015,11 +2105,11 @@ fn spawn_transcript_watch(
         // Outer loop: a delta desync (missed frame) resubscribes immediately
         // and the fresh stream's opening reset heals the copy; a subscribe
         // failure, malformed frame, or stream end retries on a delay. Every
-        // path re-enters the loop — a return here freezes the transcript
-        // with no banner and no heal short of an app restart (this watch and
-        // its engine-side room are the ONLY transcript delivery path). The
-        // task itself is dropped by select_chat/apply_chats when the chat is
-        // deselected or deleted, so retrying can't outlive relevance.
+        // path re-enters the loop except a dead transport, which hands off to
+        // the reconnect supervisor (attach_engine re-spawns this watch for the
+        // selected chat once the engine is back). The task itself is dropped
+        // by select_chat/apply_chats when the chat is deselected or deleted,
+        // so retrying can't outlive relevance.
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
         'resubscribe: loop {
             let params = serde_json::json!({
@@ -2032,6 +2122,13 @@ fn spawn_transcript_watch(
                 .await
             {
                 Ok(rx) => rx,
+                Err(RpcError::Closed) => {
+                    // No resubscribe can heal a dead transport; without the
+                    // handoff this arm retried every 2s for hours (~8k warns
+                    // per zombie session in the field).
+                    AppState::engine_connection_lost(&this, cx);
+                    return;
+                }
                 Err(err) => {
                     tracing::warn!(%chat_id, error = %err, "transcript watch failed; retrying");
                     if this.update(cx, |_, _| {}).is_err() {
@@ -2101,6 +2198,12 @@ fn spawn_collaboration_watch(
                 .await
             {
                 Ok(rx) => rx,
+                Err(RpcError::Closed) => {
+                    // Dead transport — hand off to the reconnect supervisor;
+                    // attach_engine re-spawns this watch after reconnect.
+                    AppState::engine_connection_lost(&this, cx);
+                    return;
+                }
                 Err(err) => {
                     tracing::warn!(%chat_id, error = %err, "collaboration watch failed; retrying");
                     if this.update(cx, |_, _| {}).is_err() {
@@ -2565,6 +2668,50 @@ mod tests {
                 .expect("Scaffold operation log")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn reconnect_supervisor_gates_flips_and_dedupes() {
+        let config = EngineBootConfig {
+            data_dir: PathBuf::from("/tmp/comet-reconnect-test"),
+            ipc_port: 0,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None, // offline
+            project_scope: "test".into(),
+            deployment_id: None,
+            scaffold_url: None,
+            default_harness: HarnessId::Mock,
+            runtime_profile: RuntimeProfile::Mock,
+        };
+        let mut state = AppState::new();
+
+        // Closure before the first attach (still Connecting) never reconnects.
+        state.boot_config = Some(config);
+        assert!(state.reconnect_config().is_none());
+
+        // An attached app reconnects: the first detector wins and flips the
+        // status back to Connecting…
+        state.connection = ConnectionStatus::Ready;
+        assert!(state.reconnect_config().is_some());
+        assert!(
+            matches!(state.connection, ConnectionStatus::Connecting),
+            "a closed transport must flip the app back to Connecting"
+        );
+        // …so the other watch tasks noticing the same dead transport collapse
+        // into that one bootstrap instead of racing their own.
+        assert!(state.reconnect_config().is_none());
+
+        // Quit guard: after begin_shutdown the drained engine's closing
+        // streams must not restart a fresh engine mid-teardown.
+        state.connection = ConnectionStatus::Ready;
+        assert!(state.begin_shutdown().is_none()); // no engine attached here
+        assert!(state.reconnect_config().is_none());
+        assert!(matches!(state.connection, ConnectionStatus::Ready));
+
+        // A state that never bootstrapped has no config to reboot with.
+        let mut blank = AppState::new();
+        blank.connection = ConnectionStatus::Ready;
+        assert!(blank.reconnect_config().is_none());
     }
 
     #[test]

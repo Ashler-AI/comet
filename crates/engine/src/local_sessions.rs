@@ -338,7 +338,6 @@ fn materialize_discovered(
     }
     if candidate.resumable {
         workspace.set_chat_harness_session(&chat_id, &candidate.session_id, &candidate.cwd);
-        doc_host.ensure_room_for_chat(&chat_id);
     }
     if existing
         .as_ref()
