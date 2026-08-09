@@ -166,6 +166,7 @@ pub(crate) struct AgentInferenceGrantBinding {
     pub harness: String,
     pub source: String,
     pub lifecycle_epoch: u64,
+    pub environment: String,
     pub backend: String,
     pub account_id: Option<String>,
     pub account_generation: Option<u64>,
@@ -332,6 +333,7 @@ impl ScaffoldClient {
             "x-agent-auth-model",
             "x-agent-auth-harness",
             "x-agent-auth-source",
+            "x-agent-auth-environment",
             "x-agent-auth-lifecycle-epoch",
             "x-agent-auth-request-id",
             "x-agent-auth-internal-secret",
@@ -349,6 +351,7 @@ impl ScaffoldClient {
             .header("x-agent-auth-provider", &grant.binding.provider)
             .header("x-agent-auth-model", &grant.binding.model)
             .header("x-agent-auth-harness", &grant.binding.harness)
+            .header("x-agent-auth-environment", &grant.binding.environment)
             .header("x-agent-auth-source", &grant.binding.source)
             .header(
                 "x-agent-auth-lifecycle-epoch",
@@ -385,6 +388,7 @@ impl ScaffoldClient {
             .header("x-agent-auth-model", &grant.binding.model)
             .header("x-agent-auth-harness", &grant.binding.harness)
             .header("x-agent-auth-source", &grant.binding.source)
+            .header("x-agent-auth-environment", &grant.binding.environment)
             .header(
                 "x-agent-auth-lifecycle-epoch",
                 grant.binding.lifecycle_epoch.to_string(),

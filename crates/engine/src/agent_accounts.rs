@@ -292,31 +292,6 @@ impl AgentAccounts {
                     continue;
                 }
 
-                let acknowledged = remote_accounts.iter().any(|account| {
-                    harness_for_provider(&account.provider) == Some(harness)
-                        && account.provider_account_id == slot.account_key
-                });
-                if acknowledged {
-                    if let Err(error) = self.remove_matching_live_credential(&slot).await {
-                        warnings.push(AgentAccountWarning {
-                            harness,
-                            message: format!(
-                                "The account is shared, but its local credential could not be removed: {error}"
-                            ),
-                        });
-                        continue;
-                    }
-                    if let Err(error) = self.delete_slot(&slot) {
-                        warnings.push(AgentAccountWarning {
-                            harness,
-                            message: format!(
-                                "The account is shared, but local recovery data could not be removed: {error}"
-                            ),
-                        });
-                    }
-                    continue;
-                }
-
                 accounts.push(AgentAccount {
                     id: slot.id,
                     harness,

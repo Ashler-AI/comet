@@ -507,6 +507,7 @@ fn validate_grant(
         || binding.harness != request.harness
         || binding.source != "comet-local"
         || binding.lifecycle_epoch != request.lifecycle_epoch
+        || binding.environment != "local"
         || !matches!(binding.backend.as_str(), "oauth" | "bifrost")
         || (binding.backend == "oauth" && binding.account_id.is_none())
     {
