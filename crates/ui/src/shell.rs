@@ -1801,6 +1801,16 @@ impl Shell {
         cx.notify();
     }
 
+    /// Open the invite dialog for one particular session row. Selecting the
+    /// chat first keeps the dialog on its single source of truth (the
+    /// selected chat) — the same landing an accepted deep link produces.
+    fn open_invite_for(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        self.chat_menu = None;
+        self.state
+            .update(cx, |state, cx| state.select_chat(Some(chat_id), cx));
+        self.open_invite(cx);
+    }
+
     fn toggle_command_palette(&mut self, cx: &mut Context<Self>) {
         self.command_palette_open = !self.command_palette_open;
 
@@ -2151,16 +2161,27 @@ impl Shell {
     }
 
     fn session_link(&self, cx: &App) -> Option<String> {
+        let chat_id = self.state.read(cx).selected_chat.clone()?;
+        self.session_link_for(&chat_id, cx)
+    }
+
+    /// The `comet://invite/…` one-click join link for one chat's agent
+    /// session, if a currently-valid capability grant names it. The grant id
+    /// in the link is routing identity only — command authority is still
+    /// verified against the room projection when the invitee joins.
+    fn session_link_for(&self, chat_id: &str, cx: &App) -> Option<String> {
         let state = self.state.read(cx);
-        let chat_id = state.selected_chat.as_deref()?;
         let snapshot = state.collaboration.as_ref()?;
         let principal = snapshot.principal.as_ref()?;
-        let session = state.selected_agent_session().or_else(|| {
-            snapshot
-                .sessions
-                .iter()
-                .find(|session| session.chat_id == chat_id)
-        })?;
+        let session = state
+            .selected_agent_session()
+            .filter(|session| session.chat_id == chat_id)
+            .or_else(|| {
+                snapshot
+                    .sessions
+                    .iter()
+                    .find(|session| session.chat_id == chat_id)
+            })?;
         let now = Utc::now().timestamp_millis();
         let valid_for_session = |grant: &&comet_proto::CapabilityGrant| {
             grant.principal_subject == principal.subject
@@ -2200,6 +2221,33 @@ impl Shell {
         };
         cx.open_url(&link);
         self.link_feedback = Some("Link opened".into());
+        cx.notify();
+    }
+
+    /// Copy a chat's global session id — the address other sessions use to
+    /// reach it (`comet session add/read/send`).
+    fn copy_chat_session_id(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        self.chat_menu = None;
+        cx.write_to_clipboard(ClipboardItem::new_string(chat_id.to_owned()));
+        cx.notify();
+    }
+
+    /// Copy a chat's `comet://invite/…` one-click join link, when a live
+    /// grant makes one available.
+    fn copy_chat_invite_link(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        self.chat_menu = None;
+        if let Some(link) = self.session_link_for(chat_id, cx) {
+            cx.write_to_clipboard(ClipboardItem::new_string(link));
+        }
+        cx.notify();
+    }
+
+    fn copy_selected_session_id(&mut self, cx: &mut Context<Self>) {
+        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(chat_id));
+        self.link_feedback = Some("Session ID copied".into());
         cx.notify();
     }
 
@@ -4982,8 +5030,31 @@ impl Shell {
         viewport: gpui::Size<Pixels>,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let link = self.session_link(cx)?;
+        let chat_id = self.state.read(cx).selected_chat.clone()?;
+        let link = self.session_link_for(&chat_id, cx);
         let theme = Theme::of(cx).clone();
+        let section_label = |text: &'static str| {
+            div()
+                .mt(px(Theme::SPACE_MD))
+                .text_size(px(10.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.text_faint)
+                .child(SharedString::from(text))
+        };
+        let value_box = |value: SharedString| {
+            div()
+                .mt(px(Theme::SPACE_XS))
+                .px(px(Theme::SPACE_SM))
+                .py(px(Theme::SPACE_SM))
+                .rounded(px(Theme::CONTROL_RADIUS))
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.bg)
+                .text_size(px(11.0))
+                .text_color(theme.text_muted)
+                .overflow_hidden()
+                .child(value)
+        };
         let card = popover::dialog_card(&theme)
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" {
@@ -4994,22 +5065,24 @@ impl Shell {
             .child(popover::dialog_title(&theme, "Invite teammate"))
             .child(div().mt(px(Theme::SPACE_SM)).child(popover::dialog_body(
                 &theme,
-                "Share this link with someone who can access this Scaffold session.",
+                "Share the link for one-click join, or the session ID other \
+                 sessions use to reach this one (comet session …).",
             )))
-            .child(
-                div()
-                    .mt(px(Theme::SPACE_MD))
-                    .px(px(Theme::SPACE_SM))
-                    .py(px(Theme::SPACE_SM))
-                    .rounded(px(Theme::CONTROL_RADIUS))
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.bg)
+            .child(section_label("Session ID"))
+            .child(value_box(SharedString::from(chat_id.clone())))
+            .child(section_label("Invite link"))
+            .child(match link.clone() {
+                Some(link) => value_box(SharedString::from(link)).into_any_element(),
+                None => div()
+                    .mt(px(Theme::SPACE_XS))
                     .text_size(px(11.0))
-                    .text_color(theme.text_muted)
-                    .overflow_hidden()
-                    .child(SharedString::from(link)),
-            )
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from(
+                        "No shareable grant for this session yet — the link \
+                         appears once the session is joinable.",
+                    ))
+                    .into_any_element(),
+            })
             .when_some(self.link_feedback.clone(), |el, feedback| {
                 el.child(
                     div()
@@ -5034,15 +5107,28 @@ impl Shell {
                             })),
                     )
                     .child(
-                        popover::btn_ghost(&theme, "Open", "open-session-link")
-                            .id("open-session-link")
-                            .on_click(cx.listener(|this, _, _, cx| this.open_session_link(cx))),
+                        popover::btn_ghost(&theme, "Copy ID", "copy-session-id")
+                            .id("copy-session-id")
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.copy_selected_session_id(cx)),
+                            ),
                     )
-                    .child(
-                        popover::btn_primary(&theme, "Copy link")
-                            .id("copy-session-link")
-                            .on_click(cx.listener(|this, _, _, cx| this.copy_session_link(cx))),
-                    ),
+                    .when(link.is_some(), |row| {
+                        row.child(
+                            popover::btn_ghost(&theme, "Open", "open-session-link")
+                                .id("open-session-link")
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.open_session_link(cx)),
+                                ),
+                        )
+                        .child(
+                            popover::btn_primary(&theme, "Copy link")
+                                .id("copy-session-link")
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.copy_session_link(cx)),
+                                ),
+                        )
+                    }),
             )
             .into_any_element();
         Some(popover::modal("invite-dialog", viewport, card))
@@ -5680,6 +5766,10 @@ impl Shell {
             let archive_id = chat_id.clone();
             let delete_id = chat_id.clone();
             let unread_id = chat_id.clone();
+            let copy_id = chat_id.clone();
+            let link_id = chat_id.clone();
+            let invite_id = chat_id.clone();
+            let has_invite_link = self.session_link_for(&chat_id, cx).is_some();
             let (is_settled, unread_toggle) = {
                 let state = self.state.read(cx);
                 let chat = state.chats.iter().find(|chat| chat.id == chat_id);
@@ -5760,6 +5850,44 @@ impl Shell {
                             } else {
                                 "Mark as unread"
                             })),
+                    )
+                })
+                .child(popover::menu_separator())
+                .child(
+                    popover::menu_row(&theme, false, format!("chat-menu-copy-id-{chat_id}"))
+                        .id("chat-menu-copy-id")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.copy_chat_session_id(&copy_id, cx);
+                        }))
+                        .child(icon(icons::COPY).size(px(16.0)).text_color(theme.text_muted))
+                        .child(SharedString::from("Copy session ID")),
+                )
+                .child(
+                    popover::menu_row(&theme, false, format!("chat-menu-invite-{chat_id}"))
+                        .id("chat-menu-invite")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_invite_for(invite_id.clone(), cx);
+                        }))
+                        .child(
+                            icon(icons::ADD_CIRCLE)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(SharedString::from("Invite…")),
+                )
+                .when(has_invite_link, |menu| {
+                    menu.child(
+                        popover::menu_row(&theme, false, format!("chat-menu-copy-link-{chat_id}"))
+                            .id("chat-menu-copy-link")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.copy_chat_invite_link(&link_id, cx);
+                            }))
+                            .child(
+                                icon(icons::GLOBAL)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Copy invite link")),
                     )
                 })
                 .child(popover::menu_separator())
