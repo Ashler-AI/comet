@@ -1,11 +1,15 @@
-//! OMP harness adapter over Agent Client Protocol (ACP) stdio.
+//! OMP harness adapter over OMP's native RPC mode (`omp --mode rpc`).
 //!
-//! Comet owns execution through `omp acp`; OMP's read-only `models --json`
-//! command supplies the selectable provider/model catalog.
-//! One ACP child and session stay alive across turn-boundary steering until
-//! Comet closes the steering mailbox or interrupts the run.
+//! Comet owns execution through JSONL frames on the child's stdio; OMP's
+//! read-only `models --json` command supplies the selectable provider/model
+//! catalog. One persistent child serves every turn, and mid-turn followups
+//! steer the live turn between tool calls (step-boundary semantics) instead
+//! of queueing behind it — the reason this adapter left ACP, whose
+//! `session/prompt` is strictly turn-serial. The ACP client in [`rpc`] and
+//! the [`run_acp`] loop remain solely for Prime Agent.
 
 pub(crate) mod rpc;
+pub(crate) mod rpc_mode;
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -53,6 +57,22 @@ const OMP_SESSION_HEADER_BYTES: u64 = 64 * 1024;
 
 fn acp_assistant_message_id(session_id: &str, run_nonce: &uuid::Uuid, turn_number: u64) -> String {
     format!("acp-{session_id}-{run_nonce}-{turn_number}")
+}
+
+/// OMP's `--thinking` flag ladder (off|minimal|low|medium|high|xhigh|max).
+/// Levels above OMP's ladder clamp to max.
+fn thinking_flag(level: ReasoningLevel) -> &'static str {
+    match level {
+        ReasoningLevel::Minimal => "minimal",
+        ReasoningLevel::Low => "low",
+        ReasoningLevel::Medium => "medium",
+        ReasoningLevel::High => "high",
+        ReasoningLevel::XHigh => "xhigh",
+        ReasoningLevel::Max
+        | ReasoningLevel::Ultra
+        | ReasoningLevel::Ultracode
+        | ReasoningLevel::Ultrathink => "max",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -540,14 +560,17 @@ impl OmpHarness {
         command
     }
 
-    fn acp_command(
+    /// The persistent RPC-mode child that owns a run: JSONL frames on stdio,
+    /// hardened the same way the ACP lane was (yolo approvals; scaffold hosts
+    /// run the isolated profile with discovery disabled).
+    fn rpc_mode_command(
         &self,
         executable: &Path,
         cwd: &str,
         include_auth_broker_token: bool,
     ) -> Command {
         let mut command = self.base_command(executable, cwd, include_auth_broker_token);
-        command.args(["acp", "--approval-mode", "yolo"]);
+        command.args(["--mode", "rpc", "--approval-mode", "yolo"]);
         if self.scaffold_host {
             command.args([
                 "--profile",
@@ -560,11 +583,25 @@ impl OmpHarness {
         command
     }
 
-    fn command(&self, executable: &Path, cwd: &str, _auto_approve: bool) -> Command {
-        self.acp_command(executable, cwd, true)
+    /// A run's child command: model, thinking level, and resume are pinned as
+    /// CLI flags so the session opens fully configured — RPC mode needs no
+    /// in-band configure stage.
+    fn run_command(&self, executable: &Path, request: &RunRequest) -> Command {
+        let mut command = self.rpc_mode_command(executable, &request.cwd, true);
+        if let Some(model) = request.model.as_deref().filter(|model| *model != "default") {
+            command.args(["--model", model]);
+        }
+        if let Some(reasoning) = request.reasoning {
+            command.args(["--thinking", thinking_flag(reasoning)]);
+        }
+        if let Some(resume) = request.resume.as_deref() {
+            command.args(["--resume", resume]);
+        }
+        command
     }
+
     fn command_catalog_command(&self, executable: &Path, cwd: &str) -> Command {
-        let mut command = self.acp_command(executable, cwd, false);
+        let mut command = self.rpc_mode_command(executable, cwd, false);
         command.arg("--no-session");
         command
     }
@@ -727,35 +764,6 @@ fn models_from_catalog(bytes: &[u8]) -> Result<Vec<Model>, HarnessError> {
         .collect())
 }
 
-fn commands_from_update(params: &Value) -> Option<Vec<HarnessCommand>> {
-    let update = params.get("update")?;
-    if update.get("sessionUpdate").and_then(Value::as_str) != Some("available_commands_update") {
-        return None;
-    }
-    Some(
-        update
-            .get("availableCommands")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|command| {
-                Some(HarnessCommand {
-                    name: command.get("name")?.as_str()?.to_string(),
-                    description: command
-                        .get("description")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    input_hint: command
-                        .pointer("/input/hint")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                })
-            })
-            .collect(),
-    )
-}
-
 #[async_trait]
 impl Harness for OmpHarness {
     fn id(&self) -> HarnessId {
@@ -767,8 +775,11 @@ impl Harness for OmpHarness {
     fn supports_steering(&self) -> bool {
         true
     }
+    /// RPC-mode prompts carry `streamingBehavior: "steer"`: OMP checks
+    /// steering between tool calls (default `interruptMode: "immediate"`), so
+    /// followups alter the live turn instead of queueing behind it.
     fn steering_mode(&self) -> SteeringMode {
-        SteeringMode::TurnBoundary
+        SteeringMode::StepBoundary
     }
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
         &[]
@@ -811,56 +822,32 @@ impl Harness for OmpHarness {
         let stdin = child
             .stdin
             .take()
-            .ok_or_else(|| HarnessError::Protocol("OMP ACP child has no stdin".into()))?;
+            .ok_or_else(|| HarnessError::Protocol("OMP RPC child has no stdin".into()))?;
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| HarnessError::Protocol("OMP ACP child has no stdout".into()))?;
-        let (client, mut incoming) = RpcClient::new(stdin, stdout);
-        let result = tokio::time::timeout(Duration::from_secs(10), async {
-            client
-                .request(
-                    "initialize",
-                    json!({
-                        "protocolVersion": ACP_PROTOCOL_VERSION,
-                        "clientCapabilities": {
-                            "elicitation": { "form": {}, "url": {} }
-                        },
-                        "clientInfo": {
-                            "name": "ashler-comet",
-                            "version": env!("CARGO_PKG_VERSION")
-                        }
-                    }),
-                )
-                .await?;
-            client
-                .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
-                .await?;
-            loop {
-                match incoming.recv().await {
-                    Some(Incoming::Notification { method, params })
-                        if method == "session/update" =>
-                    {
-                        if let Some(commands) = commands_from_update(&params) {
-                            return Ok(commands);
-                        }
-                    }
-                    Some(Incoming::Request { id, .. }) => {
-                        client.respond_error(&id, -32601, "unsupported ACP client method");
-                    }
-                    Some(Incoming::Eof) | None => {
-                        return Err(HarnessError::Protocol(
-                            "OMP ACP command catalog closed before advertising commands".into(),
-                        ));
-                    }
-                    _ => {}
+            .ok_or_else(|| HarnessError::Protocol("OMP RPC child has no stdout".into()))?;
+        let stderr_tail = crate::StderrTail::default();
+        if let Some(stderr) = child.stderr.take() {
+            let tail = stderr_tail.clone();
+            tokio::spawn(async move {
+                let mut lines = tokio::io::BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tail.push(&line);
                 }
-            }
-        })
+            });
+        }
+        let (client, frames) = rpc_mode::RpcModeClient::new(stdin, stdout);
+        rpc_mode::command_catalog(
+            rpc_mode::RpcModeProcess {
+                child,
+                client,
+                frames,
+                stderr_tail,
+            },
+            Duration::from_secs(10),
+        )
         .await
-        .map_err(|_| HarnessError::Protocol("OMP command catalog timed out".into()))?;
-        let _ = child.kill().await;
-        result
     }
 
     async fn run(
@@ -870,7 +857,7 @@ impl Harness for OmpHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let executable = self.resolve_executable()?;
         self.ensure_resume_has_no_writer(request.resume.as_deref())?;
-        let mut command = self.command(&executable, &request.cwd, request.auto_approve);
+        let mut command = self.run_command(&executable, &request);
         crate::apply_run_context(&mut command, controls.context.as_ref());
         let mut child = command.spawn().map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -882,11 +869,11 @@ impl Harness for OmpHarness {
         let stdin = child
             .stdin
             .take()
-            .ok_or_else(|| HarnessError::Protocol("OMP ACP child has no stdin".into()))?;
+            .ok_or_else(|| HarnessError::Protocol("OMP RPC child has no stdin".into()))?;
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| HarnessError::Protocol("OMP ACP child has no stdout".into()))?;
+            .ok_or_else(|| HarnessError::Protocol("OMP RPC child has no stdout".into()))?;
         let stderr_tail = crate::StderrTail::default();
         if let Some(stderr) = child.stderr.take() {
             let tail = stderr_tail.clone();
@@ -897,23 +884,25 @@ impl Harness for OmpHarness {
                 }
             });
         }
-        let (client, incoming) = RpcClient::new(stdin, stdout);
+        let (client, frames) = rpc_mode::RpcModeClient::new(stdin, stdout);
         let (events, receiver) = mpsc::channel(256);
         let interrupt_grace = self.interrupt_grace;
+        let expected_resume = request.resume.clone();
         tokio::spawn(async move {
-            if let Err(error) = run_acp(
-                AcpProcess::new(child, client, incoming, stderr_tail),
+            if let Err(error) = rpc_mode::run_rpc(
+                rpc_mode::RpcModeProcess {
+                    child,
+                    client,
+                    frames,
+                    stderr_tail,
+                },
                 request,
                 controls,
                 events.clone(),
                 interrupt_grace,
-                AcpRunOptions {
-                    harness: HarnessId::Omp,
-                    process_label: "OMP ACP",
-                    preloaded_session_id: None,
-                    reported_session_dir: None,
-                    configure_session: true,
-                    persistent: true,
+                rpc_mode::RpcRunOptions {
+                    process_label: "OMP RPC",
+                    expected_resume,
                 },
             )
             .await
@@ -1559,7 +1548,7 @@ pub(crate) async fn run_acp(
     }
 }
 
-type RequestInputFn = Box<
+pub(crate) type RequestInputFn = Box<
     dyn Fn(
             Vec<UserInputQuestion>,
         ) -> tokio::sync::oneshot::Receiver<Vec<comet_proto::UserInputAnswer>>
@@ -1698,7 +1687,7 @@ fn tool_output_text(update: &Value) -> Option<String> {
     (!raw.is_null()).then(|| serde_json::to_string_pretty(raw).unwrap_or_else(|_| raw.to_string()))
 }
 
-fn agent_activity_status(status: &str) -> AgentActivityStatus {
+pub(crate) fn agent_activity_status(status: &str) -> AgentActivityStatus {
     match status {
         "pending" => AgentActivityStatus::Pending,
         "completed" | "done" | "idle" => AgentActivityStatus::Completed,
@@ -1887,18 +1876,19 @@ mod tests {
     static BROKER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
-    fn scaffold_command_invokes_only_omp_acp_with_hardening() {
+    fn scaffold_command_invokes_only_omp_rpc_mode_with_hardening() {
         let _guard = BROKER_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let harness = OmpHarness::scaffold_host();
-        let command = harness.command(Path::new("/usr/local/bin/omp"), "/workspace", true);
+        let command = harness.rpc_mode_command(Path::new("/usr/local/bin/omp"), "/workspace", true);
         let args: Vec<String> = command
             .as_std()
             .get_args()
             .map(|value| value.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(args.first().map(String::as_str), Some("acp"));
+        assert_eq!(args.first().map(String::as_str), Some("--mode"));
+        assert_eq!(args.get(1).map(String::as_str), Some("rpc"));
         for required in [
             "--approval-mode",
             "yolo",
@@ -1917,16 +1907,60 @@ mod tests {
         );
     }
 
+    fn run_request(resume: Option<&str>) -> RunRequest {
+        RunRequest {
+            prompt: "test".into(),
+            model: None,
+            reasoning: None,
+            model_options: serde_json::Map::new(),
+            cwd: "/workspace".into(),
+            sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
+            auto_approve: true,
+            resume: resume.map(str::to_string),
+            attachments: Vec::new(),
+        }
+    }
+
     #[test]
-    fn command_keeps_yolo_for_a_legacy_approval_opt_out() {
-        let command =
-            OmpHarness::new().command(Path::new("/usr/local/bin/omp"), "/workspace", false);
+    fn run_command_stays_yolo_and_threads_run_flags() {
+        let request = RunRequest {
+            model: Some("anthropic/claude-haiku-4-5".into()),
+            reasoning: Some(ReasoningLevel::XHigh),
+            ..run_request(Some("session-1"))
+        };
+        let command = OmpHarness::new().run_command(Path::new("/usr/local/bin/omp"), &request);
         let args: Vec<String> = command
             .as_std()
             .get_args()
             .map(|value| value.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(args, ["acp", "--approval-mode", "yolo"]);
+        assert_eq!(
+            args,
+            [
+                "--mode",
+                "rpc",
+                "--approval-mode",
+                "yolo",
+                "--model",
+                "anthropic/claude-haiku-4-5",
+                "--thinking",
+                "xhigh",
+                "--resume",
+                "session-1",
+            ]
+        );
+    }
+
+    #[test]
+    fn run_command_omits_default_model_and_absent_flags() {
+        let command =
+            OmpHarness::new().run_command(Path::new("/usr/local/bin/omp"), &run_request(None));
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["--mode", "rpc", "--approval-mode", "yolo"]);
     }
 
     #[test]
@@ -1958,10 +1992,10 @@ mod tests {
         }));
         assert!(
             token_file.exists(),
-            "command discovery must preserve the token for the persistent ACP child"
+            "command discovery must preserve the token for the persistent RPC child"
         );
 
-        let command = OmpHarness::scaffold_host().command(
+        let command = OmpHarness::scaffold_host().rpc_mode_command(
             Path::new("/usr/local/bin/omp"),
             "/workspace",
             true,
@@ -1974,7 +2008,8 @@ mod tests {
         assert_eq!(
             args,
             [
-                "acp",
+                "--mode",
+                "rpc",
                 "--approval-mode",
                 "yolo",
                 "--profile",
@@ -2025,7 +2060,7 @@ mod tests {
                 .unwrap();
         }
         unsafe { std::env::set_var(AUTH_BROKER_TOKEN_FILE_ENV, &insecure_file) };
-        let insecure = OmpHarness::scaffold_host().command(
+        let insecure = OmpHarness::scaffold_host().rpc_mode_command(
             Path::new("/usr/local/bin/omp"),
             "/workspace",
             true,

@@ -21,70 +21,79 @@ if [ "${1:-}" = "models" ]; then
   printf '%s\n' '{"models":[{"selector":"openai-codex/gpt-5.6-sol","name":"GPT-5.6 Sol","provider":"openai-codex","providerName":"OpenAI Codex","contextWindow":1000000,"maxTokens":262144,"thinking":["low","high","xhigh"]}]}'
   exit 0
 fi
-[ "${1:-}" = "acp" ] || exit 91
+[ "${1:-}" = "--mode" ] && [ "${2:-}" = "rpc" ] || exit 91
+
+SESSION_ID="omp-session-1"
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--resume" ]; then
+    SESSION_ID="$arg"
+  fi
+  prev="$arg"
+done
+
+printf '%s\n' '{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2],"maxFrameBytes":1048576,"maxReassembledFrameBytes":67108864}'
+printf '%s\n' '{"type":"available_commands_update","commands":[{"name":"ralplan","description":"Plan with consensus","input":{"hint":"goal"}},{"name":"security","description":"Run security review"}]}'
+
+finish_turn() {
+  printf '%s\n' '{"type":"message_end","message":{"role":"assistant","stopReason":"stop","usage":{"input":6,"output":4,"cacheRead":100,"cacheWrite":0,"totalTokens":110}}}'
+  printf '%s\n' '{"type":"agent_end","isTerminal":true,"messages":[]}'
+}
+
+turn_open=0
 while IFS= read -r line; do
-  method=$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
-  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-  case "$method" in
-    initialize)
-      case "$line" in
-        *'"elicitation":{"form":{},"url":{}}'*) ;;
-        *) exit 92 ;;
-      esac
-      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":true,\"sessionCapabilities\":{\"resume\":{}}}}}"
+  type=$(printf '%s' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$type" in
+    negotiate_protocol)
+      printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"negotiate_protocol\",\"success\":true}"
       ;;
-    session/new)
-      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"sessionId\":\"omp-session-1\",\"configOptions\":[{\"id\":\"model\",\"currentValue\":\"openai-codex/gpt-5.6-sol\"},{\"id\":\"thinking\",\"currentValue\":\"high\"}]}}"
-      [ -z "${OMP_SESSION_LOG:-}" ] || printf '%s\n' "session/new" >> "$OMP_SESSION_LOG"
-      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"omp-session-1","update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"ralplan","description":"Plan with consensus","input":{"hint":"goal"}},{"name":"security","description":"Run security review"}]}}}'
+    get_state)
+      [ -z "${OMP_SESSION_LOG:-}" ] || printf '%s\n' "get_state" >> "$OMP_SESSION_LOG"
+      printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"get_state\",\"success\":true,\"data\":{\"sessionId\":\"$SESSION_ID\",\"model\":{\"provider\":\"openai-codex\",\"id\":\"gpt-5.6-sol\"},\"todoPhases\":[]}}"
       ;;
-    session/load|session/resume)
-      [ -z "${OMP_METHOD_LOG:-}" ] || printf '%s\n' "$method" >> "$OMP_METHOD_LOG"
-      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{}}"
-      ;;
-    session/set_config_option)
-      [ -z "${OMP_CONFIG_LOG:-}" ] || printf '%s\n' "$line" >> "$OMP_CONFIG_LOG"
-      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"configOptions\":[]}}"
-      ;;
-    session/prompt)
+    prompt)
       [ -z "${OMP_PROMPT_LOG:-}" ] || printf '%s\n' "$line" >> "$OMP_PROMPT_LOG"
-      if [ -n "${OMP_PROMPT_GATE:-}" ]; then
-        while [ ! -f "$OMP_PROMPT_GATE" ]; do
-          sleep 0.1
-        done
-      fi
       if [ -n "${OMP_PROMPT_ERROR_DETAILS:-}" ]; then
-        printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"error\":{\"code\":-32603,\"message\":\"Internal error\",\"data\":{\"details\":\"$OMP_PROMPT_ERROR_DETAILS\"}}}"
+        printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"prompt\",\"success\":false,\"error\":\"$OMP_PROMPT_ERROR_DETAILS\"}"
+        continue
+      fi
+      printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"prompt\",\"success\":true,\"data\":{\"agentInvoked\":true}}"
+      if [ "$turn_open" = "1" ]; then
+        # A steer landing in the live turn: the same turn absorbs it and
+        # settles with a single agent_end.
+        printf '%s\n' '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"steered reply"}}'
+        finish_turn
+        turn_open=0
         continue
       fi
       case "$line" in
         *scenario:elicitation*)
-          printf '%s\n' '{"jsonrpc":"2.0","id":900,"method":"session/request_permission","params":{"toolCall":{"title":"Provider connection"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"},{"optionId":"reject","name":"Reject","kind":"reject_once"}]}}'
-          IFS= read -r permission || exit 1
-          if ! has "$permission" '"id":900' ||
-            ! has "$permission" '"outcome":"selected"' ||
-            ! has "$permission" '"optionId":"allow-once"'; then
-            printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"error\":{\"code\":-32603,\"message\":\"provider permission was not accepted\"}}"
-            continue
+          printf '%s\n' '{"type":"extension_ui_request","id":"ui-1","method":"confirm","title":"Provider connection","message":"Allow the provider connection?"}'
+          IFS= read -r confirmation || exit 1
+          if ! has "$confirmation" '"id":"ui-1"' || ! has "$confirmation" '"confirmed":true'; then
+            exit 93
           fi
-          printf '%s\n' '{"jsonrpc":"2.0","id":901,"method":"elicitation/create","params":{"message":"Choose a provider region.","mode":"form","requestedSchema":{"type":"object","required":["region"],"properties":{"region":{"type":"string","title":"Region","enum":["East","West"]}}}}}'
-          IFS= read -r answer || exit 1
-          if ! has "$answer" '"id":901' ||
-            ! has "$answer" '"action":"accept"' ||
-            ! has "$answer" '"content":{"region":"East"}'; then
-            printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"error\":{\"code\":-32603,\"message\":\"provider elicitation was not accepted\"}}"
-            continue
+          printf '%s\n' '{"type":"extension_ui_request","id":"ui-2","method":"select","title":"Region","message":"Choose a provider region.","options":["East","West"]}'
+          IFS= read -r selection || exit 1
+          if ! has "$selection" '"id":"ui-2"' || ! has "$selection" '"value":"East"'; then
+            exit 94
           fi
           ;;
       esac
-      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"omp-session-1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"thinking"}}}}'
-      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"omp-session-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello from omp"}}}}'
-      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"omp-session-1","update":{"sessionUpdate":"tool_call","toolCallId":"tool-1","title":"Read file","rawInput":{"path":"README.md"}}}}'
-      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"omp-session-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tool-1","status":"completed","rawOutput":{"content":[{"type":"text","text":"# README"}],"details":{}}}}}'
-      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"stopReason\":\"end_turn\"}}"
+      printf '%s\n' '{"type":"agent_start"}'
+      printf '%s\n' '{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"thinking"}}'
+      printf '%s\n' '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"hello from omp"}}'
+      if [ -n "${OMP_STEER_SCENARIO:-}" ]; then
+        turn_open=1
+        continue
+      fi
+      printf '%s\n' '{"type":"tool_execution_start","toolCallId":"tool-1","toolName":"read","args":{"path":"README.md"},"intent":"Read file"}'
+      printf '%s\n' '{"type":"tool_execution_end","toolCallId":"tool-1","toolName":"read","isError":false,"result":{"content":[{"type":"text","text":"# README"}],"details":{}}}'
+      finish_turn
       ;;
-    session/cancel)
-      exit 0
+    abort)
+      printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"abort\",\"success\":true}"
       ;;
   esac
 done

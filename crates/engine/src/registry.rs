@@ -236,7 +236,7 @@ pub fn default_registry(profile: RuntimeProfile) -> HarnessRegistry {
             id: HarnessId::Omp,
             name: "OMP".into(),
             supports_steering: true,
-            steering_mode: SteeringMode::TurnBoundary,
+            steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: vec![
                 ReasoningLevel::Minimal,
                 ReasoningLevel::Low,
@@ -360,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn omp_catalog_advertises_turn_boundary_queueing_before_resolve() {
+    fn omp_catalog_advertises_step_boundary_steering_before_resolve() {
         let registry = default_registry(RuntimeProfile::LocalController);
         let omp = registry
             .descriptors()
@@ -369,7 +369,7 @@ mod tests {
             .unwrap();
 
         assert!(omp.supports_steering);
-        assert_eq!(omp.steering_mode, SteeringMode::TurnBoundary);
+        assert_eq!(omp.steering_mode, SteeringMode::StepBoundary);
     }
 
     #[test]

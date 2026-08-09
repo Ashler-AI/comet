@@ -92,7 +92,7 @@ async fn model_and_command_catalogs_come_from_omp() {
 }
 
 #[tokio::test]
-async fn fake_omp_proves_acp_only_execution_and_event_mapping() {
+async fn fake_omp_proves_rpc_mode_execution_and_event_mapping() {
     let _env = env_lock().await;
     let temp = tempfile::tempdir().unwrap();
     let argv_log = temp.path().join("argv");
@@ -109,14 +109,16 @@ async fn fake_omp_proves_acp_only_execution_and_event_mapping() {
     let events = tokio::time::timeout(
         Duration::from_secs(10),
         stream
-            .map(|event| event.expect("valid ACP event"))
+            .map(|event| event.expect("valid RPC event"))
             .collect::<Vec<_>>(),
     )
     .await
     .expect("fake completes");
 
     let argv = std::fs::read_to_string(argv_log).unwrap();
-    assert_eq!(argv.lines().next(), Some("acp"));
+    let mut lines = argv.lines();
+    assert_eq!(lines.next(), Some("--mode"));
+    assert_eq!(lines.next(), Some("rpc"));
     assert!(
         argv.contains("--approval-mode\nyolo\n"),
         "Comet OMP runs must explicitly select yolo approval mode: {argv}"
@@ -137,7 +139,7 @@ async fn fake_omp_proves_acp_only_execution_and_event_mapping() {
                 cwd,
                 session_id,
                 assistant_message_id,
-            } if model == "default"
+            } if model == "openai-codex/gpt-5.6-sol"
                 && tools.is_empty()
                 && cwd.is_empty()
                 && session_id == "omp-session-1" =>
@@ -147,7 +149,7 @@ async fn fake_omp_proves_acp_only_execution_and_event_mapping() {
             _ => None,
         })
         .expect("OMP session start");
-    assert!(assistant_message_id.starts_with("acp-omp-session-1-"));
+    assert!(assistant_message_id.starts_with("omp-rpc-omp-session-1-"));
     assert!(assistant_message_id.ends_with("-0"));
     assert!(
         events.contains(&AgentEvent::ReasoningDelta {
@@ -161,11 +163,27 @@ async fn fake_omp_proves_acp_only_execution_and_event_mapping() {
         }),
         "events: {events:?}"
     );
+    assert!(
+        events.contains(&AgentEvent::ToolCall {
+            id: "tool-1".into(),
+            call: comet_proto::ToolCall::ReadFile {
+                path: "README.md".into()
+            },
+        }),
+        "RPC tool names must map to native call kinds: {events:?}"
+    );
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "tool-1".into(),
         is_error: false,
         output: Some("# README".into()),
     }));
+    assert!(
+        events.contains(&AgentEvent::Usage {
+            input_tokens: 106,
+            output_tokens: 4,
+        }),
+        "assistant message_end usage must surface: {events:?}"
+    );
     assert_eq!(
         events.last(),
         Some(&AgentEvent::Done {
@@ -178,7 +196,7 @@ async fn fake_omp_proves_acp_only_execution_and_event_mapping() {
 }
 
 #[tokio::test]
-async fn acp_provider_elicitation_round_trips_through_shared_input() {
+async fn rpc_ui_dialogs_round_trip_through_shared_input() {
     let _env = env_lock().await;
     let temp = tempfile::tempdir().unwrap();
     unsafe {
@@ -215,7 +233,7 @@ async fn acp_provider_elicitation_round_trips_through_shared_input() {
     let events = tokio::time::timeout(
         Duration::from_secs(10),
         stream
-            .map(|event| event.expect("valid ACP event"))
+            .map(|event| event.expect("valid RPC event"))
             .collect::<Vec<_>>(),
     )
     .await
@@ -227,8 +245,8 @@ async fn acp_provider_elicitation_round_trips_through_shared_input() {
     ]
     .concat();
     assert_eq!(asked.len(), 2, "{events:?}");
-    assert_eq!(asked[0].header, "Permission");
-    assert_eq!(asked[0].options, ["Allow once", "Reject"]);
+    assert_eq!(asked[0].header, "Provider connection");
+    assert_eq!(asked[0].options, ["Continue", "Cancel"]);
     assert_eq!(asked[1].header, "Region");
     assert_eq!(asked[1].options, ["East", "West"]);
     assert!(matches!(
@@ -241,13 +259,12 @@ async fn acp_provider_elicitation_round_trips_through_shared_input() {
 }
 
 #[tokio::test]
-async fn selected_model_and_reasoning_are_applied_before_prompting() {
+async fn selected_model_and_reasoning_ride_the_spawn_flags() {
     let _env = env_lock().await;
     let temp = tempfile::tempdir().unwrap();
-    let config_log = temp.path().join("config");
+    let argv_log = temp.path().join("argv");
     unsafe {
-        std::env::set_var("OMP_CONFIG_LOG", &config_log);
-        std::env::set_var("OMP_ARGV_LOG", temp.path().join("argv"));
+        std::env::set_var("OMP_ARGV_LOG", &argv_log);
     }
     let harness = OmpHarness::new().with_executable(fixture_path());
     let mut request = request(None);
@@ -257,39 +274,32 @@ async fn selected_model_and_reasoning_are_applied_before_prompting() {
     tokio::time::timeout(
         Duration::from_secs(10),
         stream
-            .map(|event| event.expect("valid ACP event"))
+            .map(|event| event.expect("valid RPC event"))
             .collect::<Vec<_>>(),
     )
     .await
     .expect("fake completes");
 
-    let requests: Vec<serde_json::Value> = std::fs::read_to_string(config_log)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0]["method"], "session/set_config_option");
-    assert_eq!(requests[0]["params"]["configId"], "model");
-    assert_eq!(requests[0]["params"]["value"], "openai-codex/gpt-5.6-sol");
-    assert_eq!(requests[1]["params"]["configId"], "thinking");
-    assert_eq!(requests[1]["params"]["value"], "xhigh");
-    unsafe {
-        std::env::remove_var("OMP_CONFIG_LOG");
-    }
+    let argv = std::fs::read_to_string(argv_log).unwrap();
+    assert!(
+        argv.contains("--model\nopenai-codex/gpt-5.6-sol\n"),
+        "model must be pinned at spawn: {argv}"
+    );
+    assert!(
+        argv.contains("--thinking\nxhigh\n"),
+        "thinking level must be pinned at spawn: {argv}"
+    );
 }
 
 #[tokio::test]
-async fn resume_uses_the_requested_acp_session_id() {
+async fn resume_pins_the_requested_session_at_spawn() {
     let _env = env_lock().await;
     let temp = tempfile::tempdir().unwrap();
-    let method_log = temp.path().join("method");
     let argv_log = temp.path().join("argv");
     let session_dir = temp.path().join("sessions");
     write_omp_session(&session_dir, "resume-session");
     unsafe {
         std::env::set_var("OMP_ARGV_LOG", &argv_log);
-        std::env::set_var("OMP_METHOD_LOG", &method_log);
         std::env::set_var("OMP_WRITER_STATE", "inactive");
     }
     let harness = OmpHarness::new()
@@ -303,7 +313,7 @@ async fn resume_uses_the_requested_acp_session_id() {
     let events = tokio::time::timeout(
         Duration::from_secs(10),
         stream
-            .map(|event| event.expect("valid ACP event"))
+            .map(|event| event.expect("valid RPC event"))
             .collect::<Vec<_>>(),
     )
     .await
@@ -314,13 +324,12 @@ async fn resume_uses_the_requested_acp_session_id() {
         )),
         "events: {events:?}"
     );
-    assert_eq!(
-        std::fs::read_to_string(method_log).unwrap().trim(),
-        "session/load",
-        "OMP's advertised stable load path must be used for a materialized handoff"
+    let argv = std::fs::read_to_string(argv_log).unwrap();
+    assert!(
+        argv.contains("--resume\nresume-session\n"),
+        "resume must be pinned at spawn: {argv}"
     );
     unsafe {
-        std::env::remove_var("OMP_METHOD_LOG");
         std::env::remove_var("OMP_WRITER_STATE");
     }
 }
@@ -427,17 +436,16 @@ async fn missing_writer_probe_fails_closed_before_spawning_omp() {
 }
 
 #[tokio::test]
-async fn persistent_run_queues_steer_while_acp_prompt_is_active() {
+async fn persistent_run_steers_the_live_turn() {
     let _env = env_lock().await;
     let temp = tempfile::tempdir().unwrap();
     let prompt_log = temp.path().join("prompts");
     let session_log = temp.path().join("sessions");
-    let prompt_gate = temp.path().join("prompt-gate");
     unsafe {
         std::env::set_var("OMP_ARGV_LOG", temp.path().join("argv"));
         std::env::set_var("OMP_PROMPT_LOG", &prompt_log);
         std::env::set_var("OMP_SESSION_LOG", &session_log);
-        std::env::set_var("OMP_PROMPT_GATE", &prompt_gate);
+        std::env::set_var("OMP_STEER_SCENARIO", "1");
     }
     let harness = OmpHarness::new().with_executable(fixture_path());
     assert!(harness.supports_steering());
@@ -462,7 +470,7 @@ async fn persistent_run_queues_steer_while_acp_prompt_is_active() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(prompt_log.is_file(), "first ACP prompt did not start");
+    assert!(prompt_log.is_file(), "first RPC prompt did not start");
     steer_tx
         .send(SteerMessage {
             prompt: "follow up".into(),
@@ -470,27 +478,13 @@ async fn persistent_run_queues_steer_while_acp_prompt_is_active() {
         })
         .await
         .unwrap();
-    std::fs::write(&prompt_gate, b"release").unwrap();
     let mut events = Vec::new();
     loop {
         let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
             .await
-            .expect("first turn completes")
+            .expect("steered turn completes")
             .expect("stream remains open")
-            .expect("valid first-turn event");
-        let done = matches!(event, AgentEvent::Done { .. });
-        events.push(event);
-        if done {
-            break;
-        }
-    }
-
-    loop {
-        let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
-            .await
-            .expect("second turn completes")
-            .expect("stream remains open for second turn")
-            .expect("valid second-turn event");
+            .expect("valid steered-turn event");
         let done = matches!(event, AgentEvent::Done { .. });
         events.push(event);
         if done {
@@ -501,43 +495,60 @@ async fn persistent_run_queues_steer_while_acp_prompt_is_active() {
     assert!(
         tokio::time::timeout(Duration::from_secs(10), stream.next())
             .await
-            .expect("mailbox closure reaps ACP child")
+            .expect("mailbox closure reaps the RPC child")
             .is_none()
     );
 
-    let first_done = events
-        .iter()
-        .position(|event| matches!(event, AgentEvent::Done { .. }))
-        .unwrap();
+    // The steer altered the LIVE turn: exactly one Done, with the steering
+    // boundary and the steered output landing before it — not queued behind it.
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Done { .. }))
+            .count(),
+        1,
+        "a mid-turn steer must not split the turn: {events:?}"
+    );
     let boundary = events
         .iter()
         .position(|event| matches!(event, AgentEvent::Steered { .. }))
-        .unwrap();
-    let second_done = events
+        .expect("steering boundary");
+    let steered_output = events
         .iter()
-        .rposition(|event| matches!(event, AgentEvent::Done { .. }))
+        .position(
+            |event| matches!(event, AgentEvent::TextDelta { text } if text == "steered reply"),
+        )
+        .expect("steered output");
+    let done = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::Done { .. }))
         .unwrap();
     assert!(
-        first_done < boundary && boundary < second_done,
+        boundary < steered_output && steered_output < done,
         "events: {events:?}"
     );
     assert_eq!(
         std::fs::read_to_string(session_log).unwrap(),
-        "session/new\n",
-        "one ACP session must serve both turns"
+        "get_state\n",
+        "one RPC session must serve the whole run"
     );
     let prompts = std::fs::read_to_string(prompt_log).unwrap();
     assert_eq!(prompts.lines().count(), 2);
-    assert!(prompts.lines().nth(1).unwrap().contains("follow up"));
+    let steer_line = prompts.lines().nth(1).unwrap();
+    assert!(steer_line.contains("follow up"));
+    assert!(
+        steer_line.contains("\"streamingBehavior\":\"steer\""),
+        "steers must ride the steering path: {steer_line}"
+    );
     unsafe {
         std::env::remove_var("OMP_PROMPT_LOG");
         std::env::remove_var("OMP_SESSION_LOG");
-        std::env::remove_var("OMP_PROMPT_GATE");
+        std::env::remove_var("OMP_STEER_SCENARIO");
     }
 }
 
 #[tokio::test]
-async fn acp_error_details_reach_the_harness_error() {
+async fn rpc_error_details_reach_the_harness_error() {
     let _env = env_lock().await;
     let temp = tempfile::tempdir().unwrap();
     unsafe {
@@ -555,11 +566,11 @@ async fn acp_error_details_reach_the_harness_error() {
     let error = loop {
         match tokio::time::timeout(Duration::from_secs(10), stream.next())
             .await
-            .expect("ACP error arrives")
+            .expect("RPC error arrives")
         {
             Some(Err(error)) => break error,
             Some(Ok(_)) => {}
-            None => panic!("stream closed without the ACP error"),
+            None => panic!("stream closed without the RPC error"),
         }
     };
     let message = error.to_string();
@@ -567,4 +578,96 @@ async fn acp_error_details_reach_the_harness_error() {
     assert!(message.contains("billing limit reached"));
     assert!(!message.ends_with("Internal error"));
     unsafe { std::env::remove_var("OMP_PROMPT_ERROR_DETAILS") };
+}
+
+/// Live smoke against the installed omp CLI: one streamed turn, a parked
+/// followup as the next turn, and a clean mailbox-close teardown.
+#[tokio::test]
+#[ignore = "requires installed+authenticated omp CLI; spends tokens"]
+async fn real_omp_streams_turns_over_rpc_mode() {
+    let temp = tempfile::tempdir().unwrap();
+    let (steer_tx, steer_rx) = mpsc::channel(4);
+    let controls = RunControls {
+        request_input: Box::new(|_| {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(Vec::new());
+            rx
+        }),
+        steering: steer_rx,
+        interrupt: CancellationToken::new(),
+        context: None,
+    };
+    let mut run_request = request(None);
+    run_request.prompt = "Reply with exactly: done".into();
+    run_request.model = Some("anthropic/claude-haiku-4-5".into());
+    run_request.cwd = temp.path().to_string_lossy().into_owned();
+    let harness = OmpHarness::new();
+    let mut stream = harness
+        .run(run_request, controls)
+        .await
+        .expect("run starts");
+
+    let mut session_id = None;
+    let mut first_turn = String::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(120), stream.next())
+            .await
+            .expect("first turn completes")
+            .expect("stream remains open")
+            .expect("valid live event");
+        match event {
+            AgentEvent::SessionStarted { session_id: id, .. } => session_id = Some(id),
+            AgentEvent::TextDelta { text } => first_turn.push_str(&text),
+            AgentEvent::Done { status, .. } => {
+                assert_eq!(status, DoneStatus::Completed);
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(session_id.is_some(), "live session id missing");
+    assert!(first_turn.contains("done"), "first turn text: {first_turn}");
+
+    // Parked followup: the persistent child serves the next turn immediately.
+    steer_tx
+        .send(SteerMessage {
+            prompt: "Reply with exactly: again".into(),
+            message_id: None,
+        })
+        .await
+        .unwrap();
+    let mut saw_boundary = false;
+    let mut second_turn = String::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(120), stream.next())
+            .await
+            .expect("second turn completes")
+            .expect("stream remains open for the followup")
+            .expect("valid live event");
+        match event {
+            AgentEvent::Steered { .. } => saw_boundary = true,
+            AgentEvent::TextDelta { text } => second_turn.push_str(&text),
+            AgentEvent::Done { status, .. } => {
+                assert_eq!(status, DoneStatus::Completed);
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_boundary,
+        "parked followup must cross a steering boundary"
+    );
+    assert!(
+        second_turn.contains("again"),
+        "second turn text: {second_turn}"
+    );
+
+    drop(steer_tx);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(15), stream.next())
+            .await
+            .expect("mailbox closure reaps the live RPC child")
+            .is_none()
+    );
 }
