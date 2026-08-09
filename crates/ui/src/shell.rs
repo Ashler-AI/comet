@@ -602,13 +602,6 @@ struct RenameChatDialog {
     focus_pending: bool,
     _events: Subscription,
 }
-/// Exact-id import dialog for a global session room.
-struct AddSharedSessionDialog {
-    input: Entity<ComposerInput>,
-    focus_pending: bool,
-    error: Option<SharedString>,
-    _events: Subscription,
-}
 
 /// Optimistic audit row for a remotely-owned control. The collaboration
 /// publication reconciles this to Applied/Rejected without hiding it.
@@ -1096,8 +1089,6 @@ pub struct Shell {
     rename_dialog: Option<RenameChatDialog>,
     /// Chat id awaiting delete confirmation.
     delete_confirm: Option<String>,
-    /// Exact-id shared-session import dialog.
-    add_shared_session: Option<AddSharedSessionDialog>,
     /// Space-row context menu: (space id, window position).
     space_menu: Option<(String, Point<Pixels>)>,
     rename_space_dialog: Option<RenameSpaceDialog>,
@@ -1339,7 +1330,6 @@ impl Shell {
             chat_menu: None,
             rename_dialog: None,
             delete_confirm: None,
-            add_shared_session: None,
             space_menu: None,
             rename_space_dialog: None,
             delete_space_confirm: None,
@@ -2690,80 +2680,8 @@ impl Shell {
             }
         }));
     }
-    fn open_add_shared_session(&mut self, cx: &mut Context<Self>) {
-        let input = cx.new(|cx| ComposerInput::new("Session UUID", cx));
-        let events = cx.subscribe(&input, |this: &mut Shell, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Submitted) {
-                this.submit_add_shared_session(cx);
-            }
-        });
-        self.add_shared_session = Some(AddSharedSessionDialog {
-            input,
-            focus_pending: true,
-            error: None,
-            _events: events,
-        });
-        cx.notify();
-    }
-
-    fn submit_add_shared_session(&mut self, cx: &mut Context<Self>) {
-        let Some(dialog) = self.add_shared_session.as_mut() else {
-            return;
-        };
-        let raw = dialog.input.read(cx).text().trim().to_string();
-        let Ok(parsed) = uuid::Uuid::parse_str(&raw) else {
-            dialog.error = Some("Enter a valid session UUID".into());
-            cx.notify();
-            return;
-        };
-        let chat_id = parsed.hyphenated().to_string();
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            dialog.error = Some("Engine not connected".into());
-            cx.notify();
-            return;
-        };
-        let state = self.state.clone();
-        self.add_shared_session = None;
-        self.session_ref_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(
-                    methods::ADD_SESSION_REF,
-                    serde_json::json!({ "chatId": chat_id }),
-                )
-                .await;
-            match result {
-                Ok(value) => match serde_json::from_value::<comet_proto::SessionRef>(value) {
-                    Ok(session_ref) => {
-                        state.update(cx, |state, cx| {
-                            let mut refs = state.session_refs.clone();
-                            refs.retain(|item| item.chat_id != session_ref.chat_id);
-                            refs.push(session_ref);
-                            state.apply_session_refs(refs);
-                            state.select_chat(Some(chat_id), cx);
-                        });
-                    }
-                    Err(err) => {
-                        this.update(cx, |shell, cx| {
-                            shell.sidebar_notice =
-                                Some(format!("Import returned invalid data: {err}").into());
-                            cx.notify();
-                        })
-                        .ok();
-                    }
-                },
-                Err(err) => {
-                    this.update(cx, |shell, cx| {
-                        shell.sidebar_notice = Some(format!("Import failed: {err}").into());
-                        cx.notify();
-                    })
-                    .ok();
-                }
-            }
-        }));
-        cx.notify();
-    }
-
+    /// Drop an imported membership pin (the ✕ on a Shared row). One-click
+    /// invite links are the only path that creates these pins now.
     fn remove_shared_session(&mut self, chat_id: String, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.sidebar_notice = Some("Engine not connected".into());
@@ -3464,7 +3382,16 @@ impl Shell {
             )
             .into_any_element()
     }
-    fn render_shared_rows(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    /// Imported memberships without a workspace chat row — globe rows carrying
+    /// the transcript-learned title. They join the main Sessions list (keyed
+    /// for its resort FLIP); row-backed sessions render as normal chat rows.
+    fn render_shared_rows(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<(String, f32, AnyElement)> {
+        /// Estimated row height feeding the resort glide (py 6×2 + two lines).
+        const SHARED_ROW_HEIGHT: f32 = 45.0;
         let now = Utc::now();
         let selected = self.state.read(cx).selected_chat.clone();
         let rows: Vec<(String, SharedString, SharedString)> = {
@@ -3482,6 +3409,7 @@ impl Shell {
         };
         rows.into_iter()
             .map(|(chat_id, title, added)| {
+                let key = format!("g:{chat_id}");
                 let select_id = chat_id.clone();
                 let remove_id = chat_id.clone();
                 let is_selected = selected.as_deref() == Some(chat_id.as_str());
@@ -3490,7 +3418,7 @@ impl Shell {
                 } else {
                     crate::theme::wash(0.0)
                 };
-                div()
+                let element = div()
                     .id(SharedString::from(format!("shared-{chat_id}")))
                     .flex()
                     .items_center()
@@ -3552,7 +3480,8 @@ impl Shell {
                                     .text_color(theme.text_faint),
                             ),
                     )
-                    .into_any_element()
+                    .into_any_element();
+                (key, SHARED_ROW_HEIGHT, element)
             })
             .collect()
     }
@@ -4105,7 +4034,10 @@ impl Shell {
         // Keyed rows: (stable key, estimated height, element) — the key + height
         // list drives the §1.6 resort FLIP diff below (attention-bucket
         // promotions glide; cleared rows just go).
-        let keyed: Vec<(String, f32, AnyElement)> = self.render_active_rows(theme, cx);
+        let mut keyed: Vec<(String, f32, AnyElement)> = self.render_active_rows(theme, cx);
+        // Imported memberships (globe rows) close out the same Sessions list —
+        // no separate Shared section; the FLIP diff keys them like any row.
+        keyed.extend(self.render_shared_rows(theme, cx));
         let settled_items: Vec<AnyElement> = self
             .render_settled_rows(theme, cx)
             .into_iter()
@@ -4182,7 +4114,6 @@ impl Shell {
         let user_menu = self.render_user_menu(user_line.clone(), user_email.clone(), theme, cx);
 
         let spaces_section = self.render_spaces_section(theme, cx);
-        let shared_items = self.render_shared_rows(theme, cx);
         let (can_start_scaffold, starting_scaffold, scaffold_error) = {
             let state = self.state.read(cx);
             let starting = state.scaffold_session_creating()
@@ -4281,56 +4212,6 @@ impl Shell {
                     .child(SharedString::from("Sessions")),
             )
             .child(session_actions);
-        let shared_header = div()
-            .px(px(Theme::SPACE_SM))
-            .pt(px(12.0))
-            .pb(px(4.0))
-            .flex()
-            .items_center()
-            .child(
-                div()
-                    .flex_1()
-                    .text_size(px(11.0))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text_muted.opacity(0.6))
-                    .child(SharedString::from("Shared")),
-            )
-            .child(
-                div()
-                    .id("add-shared-session")
-                    .size(px(24.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(6.0))
-                    .cursor_pointer()
-                    .hover(|el| el.bg(theme.glass_hover()))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.open_add_shared_session(cx);
-                    }))
-                    .child(
-                        icon(icons::ADD_CIRCLE)
-                            .size(px(14.0))
-                            .text_color(theme.text_muted),
-                    ),
-            );
-        let shared_section = if shared_items.is_empty() {
-            div()
-                .px(px(Theme::SPACE_SM))
-                .pb(px(Theme::SPACE_SM))
-                .text_size(px(12.0))
-                .text_color(theme.text_faint)
-                .child(SharedString::from("No shared sessions"))
-                .into_any_element()
-        } else {
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(SIDEBAR_LIST_GAP))
-                .pb(px(Theme::SPACE_SM))
-                .children(shared_items)
-                .into_any_element()
-        };
         let settled_header = div()
             .px(px(Theme::SPACE_SM))
             .pt(px(12.0))
@@ -4399,8 +4280,6 @@ impl Shell {
                                         .child(SharedString::from("No active sessions")),
                                 )
                             })
-                            .child(shared_header)
-                            .child(shared_section)
                             .when(has_settled_sessions, |el| {
                                 el.child(settled_header).child(
                                     div()
@@ -5954,63 +5833,6 @@ impl Shell {
                 )
                 .into_any_element();
             overlays.push(popover::modal("rename-chat-dialog", viewport, card));
-        }
-        if let Some(dialog) = &mut self.add_shared_session {
-            if std::mem::take(&mut dialog.focus_pending) {
-                window.focus(&dialog.input.focus_handle(cx), cx);
-            }
-            let input = dialog.input.clone();
-            let error = dialog.error.clone();
-            let card = popover::dialog_card(&theme)
-                .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
-                    if ev.keystroke.key == "escape" {
-                        this.add_shared_session = None;
-                        cx.notify();
-                    }
-                }))
-                .child(popover::dialog_title(&theme, "Add shared session"))
-                .child(div().mt(px(6.0)).child(popover::dialog_body(
-                    &theme,
-                    "Paste the exact global session UUID.",
-                )))
-                .child(
-                    div()
-                        .mt(px(12.0))
-                        .child(popover::dialog_field(input.into_any_element())),
-                )
-                .when_some(error, |el, error| {
-                    el.child(
-                        div()
-                            .mt(px(6.0))
-                            .text_size(px(11.0))
-                            .text_color(theme.danger)
-                            .child(error),
-                    )
-                })
-                .child(
-                    div()
-                        .mt(px(16.0))
-                        .flex()
-                        .justify_end()
-                        .gap(px(8.0))
-                        .child(
-                            popover::btn_ghost(&theme, "Cancel", "add-shared-cancel")
-                                .id("add-shared-cancel")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.add_shared_session = None;
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            popover::btn_primary(&theme, "Add")
-                                .id("add-shared-confirm")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.submit_add_shared_session(cx);
-                                })),
-                        ),
-                )
-                .into_any_element();
-            overlays.push(popover::modal("add-shared-session-dialog", viewport, card));
         }
 
         overlays.extend(self.render_space_overlays(viewport, window, cx));

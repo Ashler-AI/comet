@@ -42,6 +42,9 @@ final class AppModel {
     /// Deep-link target applied by HomeView on first appearance (set by launch
     /// args in demo mode; simulator-driven screenshots use it).
     var launchRoute: Route?
+    /// Invitation accepted before the workspace connected (cold-start URL);
+    /// pinned and routed the moment `phase` reaches `.ready`.
+    private var pendingInviteChatId: String?
     /// Screenshot rig: "newsession" / "newspace" presents that sheet on arrival.
     var launchSheet: String?
     /// Screenshot rig: auto-send a canned prompt from the new-session canvas.
@@ -167,6 +170,7 @@ final class AppModel {
     func enterDemoMode() {
         demo = DemoDataset.standard()
         phase = .ready
+        drainPendingInvite()
     }
 
     func signOut() {
@@ -198,6 +202,7 @@ final class AppModel {
         workspace = store
         store.start()
         phase = .ready
+        drainPendingInvite()
     }
 
     // MARK: Unified data accessors (demo or live — one path for views)
@@ -214,8 +219,14 @@ final class AppModel {
         }
         return workspace?.overviewChats ?? []
     }
+    /// Imported memberships with no chat row — a chat row always wins and
+    /// renders as a normal session row with full context.
     var sharedSessionRefs: [SessionRef] {
-        demo != nil ? demoSessionRefs : (workspace?.sharedSessionRefs ?? [])
+        if let demo {
+            let rowIds = Set(demo.chats.map(\.id))
+            return demoSessionRefs.filter { !rowIds.contains($0.chatId) }
+        }
+        return workspace?.sharedSessionRefs ?? []
     }
 
     func sessionRef(id: String) -> SessionRef? {
@@ -244,6 +255,44 @@ final class AppModel {
             return
         }
         workspace?.removeSessionRef(chatId: chatId)
+    }
+
+    // MARK: One-click invitations
+
+    /// `comet://invite/{chatId}/{sessionId}/{grantId}` — the desktop's
+    /// one-click join link (`CometInvitation`). The session/grant ids route
+    /// engine command authority; a viewport needs only the chat id: pin
+    /// membership when the workspace has no chat row, then open the session.
+    func openInvitation(url: URL) {
+        guard let chatId = Self.invitationChatId(url) else { return }
+        pendingInviteChatId = chatId
+        drainPendingInvite()
+    }
+
+    private func drainPendingInvite() {
+        guard phase == .ready, let chatId = pendingInviteChatId else { return }
+        pendingInviteChatId = nil
+        if chat(id: chatId) == nil {
+            addSessionRef(chatId)
+        }
+        launchRoute = .chat(chatId)
+    }
+
+    /// Mirrors `comet_proto::CometInvitation::parse_deep_link`: exactly three
+    /// non-empty `[A-Za-z0-9._-]{1,256}` segments, no query or fragment.
+    static func invitationChatId(_ url: URL) -> String? {
+        let prefix = "comet://invite/"
+        guard url.absoluteString.hasPrefix(prefix) else { return nil }
+        let path = String(url.absoluteString.dropFirst(prefix.count))
+        guard !path.contains("?"), !path.contains("#") else { return nil }
+        let segments = path.split(separator: "/", omittingEmptySubsequences: false)
+        let valid = segments.count == 3 && segments.allSatisfy { segment in
+            !segment.isEmpty && segment.count <= 256 && segment.allSatisfy {
+                ($0.isASCII && ($0.isLetter || $0.isNumber)) || $0 == "-" || $0 == "_" || $0 == "."
+            }
+        }
+        guard valid else { return nil }
+        return String(segments[0])
     }
 
 

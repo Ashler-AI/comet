@@ -590,6 +590,11 @@ pub struct AppState {
     /// Grant named by the accepted deep link. It remains a routing identity;
     /// command authority is still checked against the verified projection.
     pub selected_invitation_grant: Option<String>,
+    /// Verified invite membership awaiting its `AddSessionRef` pin — set once
+    /// the deep link's grant checks out against the room projection and the
+    /// session has no workspace chat row. Drained wherever a `Context` and the
+    /// engine handle are both in reach.
+    pending_session_pin: Option<String>,
     /// Trusted per-chat room scopes returned by Scaffold Attach. Absence is
     /// intentional: ordinary local sessions continue to use legacy s3 rooms.
     room_projections: HashMap<String, SessionRoomProjection>,
@@ -669,6 +674,7 @@ impl AppState {
             selected_agent_session: None,
             pending_invitation: None,
             selected_invitation_grant: None,
+            pending_session_pin: None,
             room_projections: HashMap::new(),
             scaffold_control_grants: HashMap::new(),
             pending_scaffold_session: None,
@@ -923,6 +929,17 @@ impl AppState {
             return true;
         };
         self.selected_invitation_grant = Some(grant.id.clone());
+        // The one-click link is the whole membership flow: once the grant
+        // verifies and the session has no workspace chat row, pin the imported
+        // room so it survives restarts (`drain_session_pin` issues the RPC).
+        if !self.has_chat_row(&invitation.chat_id)
+            && !self
+                .session_refs
+                .iter()
+                .any(|session_ref| session_ref.chat_id == invitation.chat_id)
+        {
+            self.pending_session_pin = Some(invitation.chat_id.clone());
+        }
         self.pending_invitation = None;
         true
     }
@@ -1081,6 +1098,7 @@ impl AppState {
         if self.selected_chat.as_deref() == Some(chat_id.as_str()) {
             if let Some(snapshot) = self.collaboration.clone() {
                 self.apply_pending_invitation(&snapshot);
+                self.drain_session_pin(cx);
             }
             cx.notify();
         } else {
@@ -1088,24 +1106,77 @@ impl AppState {
         }
     }
 
+    /// Issue the `AddSessionRef` pin recorded by a verified invitation. The
+    /// merged result lands immediately (the `WatchSessionRefs` frame carrying
+    /// it is the durable source); a lost engine keeps the pin armed for the
+    /// next snapshot.
+    fn drain_session_pin(&mut self, cx: &mut Context<Self>) {
+        let Some(chat_id) = self.pending_session_pin.clone() else {
+            return;
+        };
+        let Some(handle) = self.engine().cloned() else {
+            return;
+        };
+        self.pending_session_pin = None;
+        cx.spawn(async move |this, cx| {
+            let result = handle
+                .client()
+                .call(
+                    methods::ADD_SESSION_REF,
+                    serde_json::json!({ "chatId": chat_id.clone() }),
+                )
+                .await;
+            match result.map(serde_json::from_value::<SessionRef>) {
+                Ok(Ok(session_ref)) => {
+                    this.update(cx, |state, cx| {
+                        let mut refs = state.session_refs.clone();
+                        refs.retain(|item| item.chat_id != session_ref.chat_id);
+                        refs.push(session_ref);
+                        state.apply_session_refs(refs);
+                        cx.notify();
+                    })
+                    .ok();
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!(chat = %chat_id, error = %err, "membership pin returned invalid data");
+                }
+                Err(err) => {
+                    tracing::warn!(chat = %chat_id, error = %err, "membership pin failed");
+                }
+            }
+        })
+        .detach();
+    }
+
     // ---- queries ----
 
-    /// Non-archived, locally-owned chats in sidebar order. An exact session
-    /// import remains Shared even when the project workspace also contains
-    /// that session's non-owning chat row.
+    /// Non-archived chats in sidebar order. A chat row always renders in its
+    /// space, even when an exact-id membership pin names the same session —
+    /// the row carries the context (status, harness, branch) a bare ref lacks.
     pub fn visible_chats(&self) -> impl Iterator<Item = &Chat> {
-        self.chats
-            .iter()
-            .filter(|chat| !chat.archived && !self.is_shared_session(&chat.id))
+        self.chats.iter().filter(|chat| !chat.archived)
     }
+    /// Imported memberships with no workspace chat row — sessions genuinely
+    /// foreign to this workspace. Row-backed pins are served by the normal
+    /// space list instead.
     pub fn shared_session_refs(&self) -> impl Iterator<Item = &SessionRef> {
-        self.session_refs.iter()
-    }
-
-    pub fn is_shared_session(&self, chat_id: &str) -> bool {
         self.session_refs
             .iter()
-            .any(|session_ref| session_ref.chat_id == chat_id)
+            .filter(|session_ref| !self.has_chat_row(&session_ref.chat_id))
+    }
+
+    /// An imported session room without a local chat row: transcript comes
+    /// from the room, sends go over steer, attachments are unavailable.
+    pub fn is_shared_session(&self, chat_id: &str) -> bool {
+        !self.has_chat_row(chat_id)
+            && self
+                .session_refs
+                .iter()
+                .any(|session_ref| session_ref.chat_id == chat_id)
+    }
+
+    fn has_chat_row(&self, chat_id: &str) -> bool {
+        self.chats.iter().any(|chat| chat.id == chat_id)
     }
 
     pub fn shared_session_title(&self, chat_id: &str) -> String {
@@ -2051,6 +2122,7 @@ fn spawn_collaboration_watch(
                     .update(cx, |state, cx| {
                         if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
                             state.apply_collaboration(snapshot);
+                            state.drain_session_pin(cx);
                             cx.notify();
                         }
                     })
@@ -3169,6 +3241,9 @@ mod tests {
             Some("grant-invited")
         );
         assert!(state.pending_invitation.is_none());
+        // No chat row for the invited session: verified membership arms the
+        // sidebar pin that replaces the manual exact-id import dialog.
+        assert_eq!(state.pending_session_pin.as_deref(), Some("chat-a"));
     }
     #[test]
     fn imported_membership_keeps_selection_without_a_chat_row() {
@@ -3219,7 +3294,7 @@ mod tests {
     }
 
     #[test]
-    fn imported_membership_stays_shared_when_project_doc_contains_chat_row() {
+    fn chat_row_wins_over_imported_membership() {
         let chat_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
         let mut state = AppState::new();
         state.apply_session_refs(vec![SessionRef {
@@ -3228,8 +3303,14 @@ mod tests {
         }]);
         state.apply_chats(vec![chat(chat_id, 1, None)]);
 
+        // The row carries space/status/harness context — it renders in the
+        // normal sidebar; the membership pin stays out of the Shared list.
+        assert_eq!(state.shared_session_refs().count(), 0);
+        assert_eq!(state.visible_chats().count(), 1);
+        assert!(!state.is_shared_session(chat_id));
+
+        state.apply_chats(Vec::new());
         assert_eq!(state.shared_session_refs().count(), 1);
-        assert_eq!(state.visible_chats().count(), 0);
         assert!(state.is_shared_session(chat_id));
     }
 }
