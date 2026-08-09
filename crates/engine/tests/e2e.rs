@@ -1037,6 +1037,158 @@ async fn turn_boundary_steer_becomes_active_when_the_harness_acknowledges_it() {
 }
 
 #[tokio::test]
+async fn run_routed_to_parked_session_is_plain_delivered_input() {
+    // Reported repro: the turn finished (parked persistent session), the user
+    // sends a normal message. It must land as plain delivered input — not
+    // "Steering the model" — even though it rides the steering mailbox.
+    let dir = tempfile::tempdir().unwrap();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (received_tx, mut received_rx) = tokio::sync::mpsc::unbounded_channel();
+    let core = assemble(
+        dir.path(),
+        Arc::new(QueuedFollowupHarness {
+            release_first_turn: Arc::new(std::sync::Mutex::new(Some(release_rx))),
+            received: received_tx,
+            steering_mode: SteeringMode::StepBoundary,
+        }),
+    );
+    let _handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_controller(
+        &core,
+        "cmd-run-before-park",
+        SessionCommandPayload::Run {
+            request: run_request("start"),
+            message_id: "m-1".into(),
+        },
+    )
+    .await;
+    release_tx.send(()).unwrap();
+    wait_for(
+        || {
+            core.sessions
+                .session_status(EXECUTION_KEY)
+                .is_some_and(|session| session.status == SessionStatus::Idle)
+        },
+        "first turn to park",
+    )
+    .await;
+
+    queue_as_controller(
+        &core,
+        "cmd-run-while-parked",
+        SessionCommandPayload::Run {
+            request: run_request("next thing"),
+            message_id: "m-2".into(),
+        },
+    )
+    .await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), received_rx.recv())
+            .await
+            .unwrap(),
+        Some("next thing".into())
+    );
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .find(|entry| entry.id == "m-2")
+                .is_some_and(|entry| entry.status == Some(MessageStatus::Complete))
+        },
+        "parked run message to be plain delivered",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn steer_routed_to_parked_session_is_plain_delivered_input() {
+    // A turn-boundary (OMP-shaped) parked session acknowledges its next-prompt
+    // pickup with a Steered event. That ack must not flip a parked delivery to
+    // "steering": only steers that found an active turn are acknowledged.
+    let dir = tempfile::tempdir().unwrap();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (received_tx, mut received_rx) = tokio::sync::mpsc::unbounded_channel();
+    let core = assemble(
+        dir.path(),
+        Arc::new(QueuedFollowupHarness {
+            release_first_turn: Arc::new(std::sync::Mutex::new(Some(release_rx))),
+            received: received_tx,
+            steering_mode: SteeringMode::TurnBoundary,
+        }),
+    );
+    let _handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_controller(
+        &core,
+        "cmd-run-before-parked-steer",
+        SessionCommandPayload::Run {
+            request: run_request("start"),
+            message_id: "m-1".into(),
+        },
+    )
+    .await;
+    release_tx.send(()).unwrap();
+    wait_for(
+        || {
+            core.sessions
+                .session_status(EXECUTION_KEY)
+                .is_some_and(|session| session.status == SessionStatus::Idle)
+        },
+        "first turn to park",
+    )
+    .await;
+
+    let steer_command_id = queue_as_controller(
+        &core,
+        "cmd-steer-while-parked",
+        SessionCommandPayload::Steer {
+            prompt: "after the turn".into(),
+            message_id: Some("m-2".into()),
+        },
+    )
+    .await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), received_rx.recv())
+            .await
+            .unwrap(),
+        Some("after the turn".into())
+    );
+    // Parked delivery is a plain new turn, not a queued boundary steer.
+    wait_for(
+        || {
+            command_status(&core, &steer_command_id)
+                .is_some_and(|(status, _)| status != SessionCommandStatus::Pending)
+        },
+        "parked steer command outcome",
+    )
+    .await;
+    assert_eq!(
+        command_status(&core, &steer_command_id),
+        Some((SessionCommandStatus::Applied, None))
+    );
+    // Wait past the harness's Steered acknowledgement (second turn text) to
+    // prove the ack did not restamp the parked delivery.
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|entry| {
+                entry
+                    .parts
+                    .iter()
+                    .any(|part| matches!(part, MessagePart::Text { text, .. } if text == "second turn complete"))
+            })
+        },
+        "second turn to complete",
+    )
+    .await;
+    assert_eq!(
+        entries_now(&core)
+            .iter()
+            .find(|entry| entry.id == "m-2")
+            .and_then(|entry| entry.status),
+        Some(MessageStatus::Complete)
+    );
+}
+
+#[tokio::test]
 async fn steer_with_no_live_run_falls_back_to_new_turn() {
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(

@@ -23,8 +23,8 @@ use comet_doc::{
 use comet_proto::{
     AgentSessionRecord, AuditEvent, AuditResult, COLLABORATION_SCHEMA_VERSION, CapabilityGrant,
     FileTargetReference, HarnessId, MessageProvenance, ModelHandoff, PublicationRecord,
-    PublicationValue, SemanticAnchor, SemanticAnnotation, SessionRoomProjection, SteeringMode,
-    UserInputAnswer, UserInputQuestion, VerifiedCapabilityGrantEnvelope,
+    PublicationValue, SemanticAnchor, SemanticAnnotation, SessionRoomProjection, UserInputAnswer,
+    UserInputQuestion, VerifiedCapabilityGrantEnvelope,
 };
 use comet_sync::{DocsStore, RoomClient};
 
@@ -2242,13 +2242,11 @@ impl DocHost {
             .steer(execution_key, prompt, message_id.clone())
             .await?
         {
-            SteerOutcome::Accepted(SteeringMode::StepBoundary) => {
-                Ok((SessionCommandStatus::Applied, None))
-            }
-            SteerOutcome::Accepted(SteeringMode::TurnBoundary) => Ok((
+            SteerOutcome::Accepted(MessageStatus::Queued) => Ok((
                 SessionCommandStatus::Applied,
                 Some("queued for the next turn boundary".into()),
             )),
+            SteerOutcome::Accepted(_) => Ok((SessionCommandStatus::Applied, None)),
             SteerOutcome::NotSteerable => {
                 // No live steerable run: the durable command still delivers to
                 // the selected session as its next turn.

@@ -65,8 +65,11 @@ pub struct JournaledEvent {
 /// Outcome of a steer attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SteerOutcome {
-    /// Accepted into the live run's steering mailbox at the harness's boundary.
-    Accepted(SteeringMode),
+    /// Accepted into the live run's mailbox; carries the stamped user-message
+    /// delivery state — `Steered` (altered the active turn), `Queued` (waits
+    /// for the turn boundary), or `Complete` (parked run, delivered as the
+    /// next turn immediately).
+    Accepted(MessageStatus),
     /// No live steerable run — the caller should dispatch the prompt as a new turn.
     NotSteerable,
 }
@@ -156,8 +159,9 @@ struct RunHandle {
     /// Explicit next-turn followups. Unlike the harness steering mailbox, this
     /// queue is not visible to step-boundary harnesses until the current Done.
     queued_followups: VecDeque<SteerMessage>,
-    /// Turn-boundary steers accepted by the mailbox but not yet handed to the
-    /// harness as a new prompt. The matching `Steered` event acknowledges them FIFO.
+    /// Turn-boundary steers accepted into a live turn's mailbox but not yet
+    /// handed to the harness as a new prompt. Only steers that found an active
+    /// turn are tracked; the matching `Steered` event acknowledges them FIFO.
     pending_turn_boundary_steers: VecDeque<SteerMessage>,
     /// Harness-level cancellation (protocol interrupt + child teardown).
     interrupt_token: CancellationToken,
@@ -166,6 +170,33 @@ struct RunHandle {
     cancel: watch::Sender<bool>,
     engine_tx: mpsc::UnboundedSender<AgentEvent>,
     pending_inputs: PendingInputs,
+}
+
+impl RunHandle {
+    /// Delivery state for a prompt just accepted into this run's mailbox.
+    ///
+    /// A parked persistent session (`!was_turn_active`) is already at the
+    /// next-turn boundary: the prompt starts that turn immediately as plain
+    /// delivered input — nothing is being steered. Mid-turn, a step-boundary
+    /// harness alters the active turn now (`Steered`); a turn-boundary harness
+    /// has only accepted a future prompt (`Queued`) until it acknowledges the
+    /// pickup with a `Steered` event.
+    fn mailbox_message_status(
+        &mut self,
+        was_turn_active: bool,
+        message: SteerMessage,
+    ) -> MessageStatus {
+        if !was_turn_active {
+            return MessageStatus::Complete;
+        }
+        match self.steering_mode {
+            SteeringMode::StepBoundary => MessageStatus::Steered,
+            SteeringMode::TurnBoundary => {
+                self.pending_turn_boundary_steers.push_back(message);
+                MessageStatus::Queued
+            }
+        }
+    }
 }
 
 struct Inner {
@@ -433,31 +464,38 @@ impl SessionsEngine {
         message_id: Option<String>,
         inject_resume: bool,
     ) -> Result<String, EngineError> {
+        let user_id = message_id.unwrap_or_else(new_id);
         let routed = {
             let mut runs = lock(&self.inner.runs);
             runs.get_mut(chat_id).map(|handle| {
+                let was_turn_active = handle.turn_active;
                 handle.turn_active = true;
-                (
-                    handle.run_id.clone(),
-                    handle.steerable,
-                    handle.steer_tx.clone(),
-                )
+                if !handle.steerable {
+                    return None;
+                }
+                let message = SteerMessage {
+                    prompt: request.prompt.clone(),
+                    message_id: Some(user_id.clone()),
+                };
+                if handle.steer_tx.try_send(message.clone()).is_err() {
+                    return None;
+                }
+                let status = handle.mailbox_message_status(was_turn_active, message);
+                Some((handle.run_id.clone(), status))
             })
         };
-        if let Some((run_id, steerable, steer_tx)) = routed {
-            let message = SteerMessage {
-                prompt: request.prompt.clone(),
-                message_id: message_id.clone(),
-            };
-            if steerable && steer_tx.try_send(message).is_ok() {
-                let user_id = message_id.unwrap_or_else(new_id);
+        if let Some(mailbox) = routed {
+            if let Some((run_id, status)) = mailbox {
                 let handle = self.doc_handle(chat_id)?;
                 handle.write_user_message_with_status(
                     &user_id,
                     &request.prompt,
                     now_ms(),
-                    MessageStatus::Steered,
+                    status,
                 )?;
+                // The optimistic echo may already exist with a composer-guessed
+                // steer status. Stamp the engine-authoritative state over it.
+                handle.doc_arc().set_message_status(&user_id, status)?;
                 // Working BEFORE the lastMessageAt bump: both ride the
                 // workspace doc from this one peer, so causal order makes it
                 // impossible for an observer to hold [new message, old status]
@@ -473,7 +511,6 @@ impl SessionsEngine {
 
         let harness = self.inner.registry.resolve(harness_id)?;
         let handle = self.doc_handle(chat_id)?;
-        let user_id = message_id.unwrap_or_else(new_id);
         handle.write_user_message(&user_id, &request.prompt, now_ms())?;
 
         // Engine-owned resume (comet sessions.ts:736 — every dispatch read the
@@ -616,6 +653,8 @@ impl SessionsEngine {
 
     /// Push a steer prompt into the live run's mailbox. `NotSteerable` when no live
     /// steerable run exists — the caller (command executor) dispatches a new turn.
+    /// A parked persistent run accepts the prompt as its next turn immediately;
+    /// that is a plain delivery, never a steer of an active turn.
     pub async fn steer(
         &self,
         chat_id: &str,
@@ -627,33 +666,31 @@ impl SessionsEngine {
             prompt: prompt.to_string(),
             message_id: Some(user_id.clone()),
         };
-        let steering_mode = {
+        let status = {
             let mut runs = lock(&self.inner.runs);
             let Some(handle) = runs.get_mut(chat_id).filter(|handle| handle.steerable) else {
                 return Ok(SteerOutcome::NotSteerable);
             };
+            let was_turn_active = handle.turn_active;
             handle.turn_active = true;
             if handle.steer_tx.try_send(message.clone()).is_err() {
                 return Ok(SteerOutcome::NotSteerable);
             }
-            if handle.steering_mode == SteeringMode::TurnBoundary {
-                handle.pending_turn_boundary_steers.push_back(message);
-            }
-            handle.steering_mode
-        };
-        // Step-boundary harnesses can alter the active turn immediately.
-        // Turn-boundary harnesses have only accepted a future prompt so far.
-        let status = match steering_mode {
-            SteeringMode::StepBoundary => MessageStatus::Steered,
-            SteeringMode::TurnBoundary => MessageStatus::Queued,
+            handle.mailbox_message_status(was_turn_active, message)
         };
         let handle = self.doc_handle(chat_id)?;
         handle.write_user_message_with_status(&user_id, prompt, now_ms(), status)?;
         // The optimistic echo may already exist with a generic steer status.
         // Stamp the harness-authoritative state instead of preserving that guess.
         handle.doc_arc().set_message_status(&user_id, status)?;
+        if status == MessageStatus::Complete {
+            // Parked delivery starts the next turn now. Working must land
+            // before the lastMessageAt bump (same causal-order rule as
+            // dispatch — no phantom "completed" flash for remote observers).
+            self.set_status(chat_id, SessionStatus::Working, false);
+        }
         self.inner.note_message(chat_id, prompt);
-        Ok(SteerOutcome::Accepted(steering_mode))
+        Ok(SteerOutcome::Accepted(status))
     }
 
     /// Hold a followup outside the harness mailbox until the active turn is
@@ -1458,6 +1495,11 @@ async fn drive_run(
             let acknowledged = {
                 let mut runs = lock(&inner.runs);
                 runs.get_mut(&chat_id).and_then(|handle| {
+                    // A Steered event means the harness is producing again —
+                    // e.g. it self-continued from an internally queued prompt
+                    // at a turn boundary. Keep turn_active truthful so a
+                    // followup arriving now is not mistaken for parked input.
+                    handle.turn_active = true;
                     (handle.steering_mode == SteeringMode::TurnBoundary)
                         .then(|| handle.pending_turn_boundary_steers.pop_front())
                         .flatten()
