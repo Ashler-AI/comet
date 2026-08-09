@@ -12,10 +12,13 @@
 #
 # Installs the self-contained native binary to ~/.comet-native/app, puts
 # `comet` on PATH, and — once signed in — runs it as a systemd user service.
+# After the comet install it bootstraps any missing agent CLIs (OMP, Claude
+# Code, Codex). Bootstrap failures never abort the comet install; set
+# COMET_SKIP_AGENT_BOOTSTRAP=1 to skip the phase in managed environments.
 set -eu
 
-# OMP is an independently released ACP runtime. Its macOS bootstrap is explicit
-# because it downloads an executable from the official upstream GitHub release.
+# OMP is an independently released ACP runtime. Its bootstrap downloads an
+# executable from the official upstream GitHub release, pinned by sha256.
 OMP_VERSION=17.2.9
 OMP_RELEASE_BASE="https://github.com/can1357/oh-my-pi/releases/download/v$OMP_VERSION"
 
@@ -30,24 +33,38 @@ sha256_file() {
   fi
 }
 
-install_omp_macos() {
-  [ "$(uname -s)" = Darwin ] || {
-    echo "ashler comet install: --install-omp is currently for macOS only" >&2
-    exit 1
-  }
-  case "$(uname -m)" in
-    arm64 | aarch64)
-      asset=omp-darwin-arm64
-      expected=3f9c44c465da8428b5a81a0c9cdac22ced982319fe93d534914cb61838a63118
-      ;;
-    x86_64 | amd64)
-      asset=omp-darwin-x64
-      expected=35c36f893a68feb6df3a61ff9359bb6ad13a5534687bb0396508aabc69c5f347
-      ;;
+install_omp() {
+  omp_arch="$(uname -m)"
+  case "$omp_arch" in
+    arm64 | aarch64) omp_arch=arm64 ;;
+    x86_64 | amd64) omp_arch=x64 ;;
     *)
-      echo "ashler comet install: unsupported macOS architecture '$(uname -m)'" >&2
+      echo "ashler comet install: unsupported architecture '$omp_arch' for OMP" >&2
       exit 1
       ;;
+  esac
+  case "$(uname -s)" in
+    Darwin) asset="omp-darwin-$omp_arch" ;;
+    Linux)
+      # Alpine and friends ship musl; everything else gets the glibc build.
+      if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
+        asset="omp-linux-musl-$omp_arch"
+      else
+        asset="omp-linux-$omp_arch"
+      fi
+      ;;
+    *)
+      echo "ashler comet install: unsupported OS '$(uname -s)' for OMP" >&2
+      exit 1
+      ;;
+  esac
+  case "$asset" in
+    omp-darwin-arm64)     expected=3f9c44c465da8428b5a81a0c9cdac22ced982319fe93d534914cb61838a63118 ;;
+    omp-darwin-x64)       expected=35c36f893a68feb6df3a61ff9359bb6ad13a5534687bb0396508aabc69c5f347 ;;
+    omp-linux-arm64)      expected=e3c4b0a96dbe14f68a65aa4158bdc15252a0fc352691517fb2a07bf85e97e283 ;;
+    omp-linux-x64)        expected=4f7aeb33b2f347c11a5ac8c73630e31d02c0a3eef3693468880b9f5e8f02a02b ;;
+    omp-linux-musl-arm64) expected=e2606e23c422849668e9927b0d9e952818dca145c09cc327b66f17522923258d ;;
+    omp-linux-musl-x64)   expected=f08e14ec39d92774e3080e6c32038ed8d0d8ab9daa396991a08ae52128789933 ;;
   esac
 
   destination="${OMP_INSTALL_PATH:-$HOME/.local/bin/omp}"
@@ -65,7 +82,10 @@ install_omp_macos() {
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   echo "downloading official OMP $OMP_VERSION ($asset)…"
-  curl -fL --proto '=https' --tlsv1.2 "$OMP_RELEASE_BASE/$asset" -o "$tmp/omp"
+  curl -fL --proto '=https' --tlsv1.2 "$OMP_RELEASE_BASE/$asset" -o "$tmp/omp" || {
+    echo "ashler comet install: download failed for official OMP $OMP_VERSION $asset" >&2
+    exit 1
+  }
   actual="$(sha256_file "$tmp/omp")"
   [ "$actual" = "$expected" ] || {
     echo "ashler comet install: checksum mismatch for official OMP $OMP_VERSION $asset" >&2
@@ -80,12 +100,12 @@ install_omp_macos() {
 case "${1:-}" in
   --install-omp)
     [ "$#" -eq 1 ] || { echo "usage: install.sh --install-omp" >&2; exit 2; }
-    install_omp_macos
+    install_omp
     exit 0
     ;;
   --help|-h)
     echo "usage: install.sh [--install-omp]"
-    echo "  --install-omp  explicitly install/validate pinned official OMP on macOS"
+    echo "  --install-omp  explicitly install/validate the pinned official OMP release"
     exit 0
     ;;
   "") ;;
@@ -211,8 +231,41 @@ else
 fi
 
 # --- agent CLIs ---------------------------------------------------------------
-command -v claude >/dev/null 2>&1 || \
-  echo "note: Claude Code CLI is optional. Install it through Ashler-approved tooling."
+# Bootstrap missing agent CLIs. Anything already present is left alone —
+# updates are handled in-app now (`omp update` etc.). Failures here must not
+# abort a successful comet install, so every step is guarded.
+if [ "${COMET_SKIP_AGENT_BOOTSTRAP:-0}" = 1 ]; then
+  echo "note: COMET_SKIP_AGENT_BOOTSTRAP=1 — skipping agent CLI bootstrap."
+else
+  omp_destination="${OMP_INSTALL_PATH:-$HOME/.local/bin/omp}"
+  if ! command -v omp >/dev/null 2>&1 && [ ! -e "$omp_destination" ]; then
+    echo "bootstrapping OMP ${OMP_VERSION}…"
+    # Subshell keeps install_omp's exit/trap out of the main install.
+    ( install_omp ) \
+      || echo "warn: OMP bootstrap failed — rerun later with: install.sh --install-omp" >&2
+  fi
+
+  if ! command -v claude >/dev/null 2>&1; then
+    echo "bootstrapping Claude Code…"
+    # Staged to a file so a failed download can't masquerade as an empty
+    # script, and </dev/null so the installer can't consume our stdin when
+    # this script itself arrives over a pipe.
+    claude_sh="$(mktemp)"
+    { curl -fsSL https://claude.ai/install.sh -o "$claude_sh" && bash "$claude_sh" </dev/null; } \
+      || echo "warn: Claude Code bootstrap failed — rerun later with: curl -fsSL https://claude.ai/install.sh | bash" >&2
+    rm -f "$claude_sh"
+  fi
+
+  if ! command -v codex >/dev/null 2>&1; then
+    if command -v npm >/dev/null 2>&1; then
+      echo "bootstrapping Codex…"
+      npm install -g @openai/codex \
+        || echo "warn: Codex bootstrap failed — rerun later with: npm install -g @openai/codex" >&2
+    else
+      echo "note: codex needs npm and was skipped — install Node.js, then: npm install -g @openai/codex"
+    fi
+  fi
+fi
 
 case ":$PATH:" in
   *":$HOME/.local/bin:"*) path_hint="" ;;

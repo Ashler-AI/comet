@@ -84,6 +84,12 @@ fn resolve_claude_executable() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.exists())
 }
 
+/// The installed `claude` executable, if any — the engine's update inventory
+/// resolves through the same candidate chain runs use.
+pub fn installed_executable() -> Option<PathBuf> {
+    resolve_claude_executable()
+}
+
 fn option_is_on(options: &serde_json::Map<String, Value>, key: &str) -> bool {
     match options.get(key) {
         Some(Value::Bool(b)) => *b,

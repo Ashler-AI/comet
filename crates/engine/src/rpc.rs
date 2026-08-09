@@ -320,6 +320,20 @@ struct StartAgentLoginParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct UpdateHarnessParams {
+    /// Updater spec id ("omp" | "claude-code" | "codex"), as reported in
+    /// `UpdateStatus.harnesses`.
+    harness: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetHarnessAutoUpdateParams {
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct LoginIdParams {
     login_id: String,
 }
@@ -1090,6 +1104,9 @@ fn forwardable(method: &str) -> bool {
             | methods::UPDATE_STATUS
             | methods::APPLY_UPDATE
             | methods::STAGE_UPDATE
+            // Agent-CLI updates and their auto-refresh pref are per-device too.
+            | methods::UPDATE_HARNESS
+            | methods::SET_HARNESS_AUTO_UPDATE
     )
 }
 
@@ -1889,6 +1906,20 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
                 RpcReply::value(&serde_json::json!({ "ok": true, "version": version }))
             }
+            methods::UPDATE_HARNESS => {
+                let p: UpdateHarnessParams = parse_params(params)?;
+                let status = self
+                    .updater()?
+                    .update_harness(&p.harness)
+                    .await
+                    .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                RpcReply::value(&status)
+            }
+            methods::SET_HARNESS_AUTO_UPDATE => {
+                let p: SetHarnessAutoUpdateParams = parse_params(params)?;
+                self.updater()?.set_harness_auto_update(p.enabled);
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
             methods::MUTATE => {
                 let p: MutateParams = parse_params(params)?;
                 self.mutate(p)?;
@@ -2237,6 +2268,8 @@ mod tests {
         assert!(!forwardable(methods::LOCAL_DEVICE));
         assert!(!forwardable(methods::QUEUE_COMMAND));
         assert!(forwardable(methods::SEARCH_FILES));
+        assert!(forwardable(methods::UPDATE_HARNESS));
+        assert!(forwardable(methods::SET_HARNESS_AUTO_UPDATE));
         assert!(!forwardable(methods::SEND_PEER_MESSAGE));
         assert!(!forwardable(methods::REPLY_PEER_MESSAGE));
         assert!(!forwardable(methods::WAIT_PEER_REPLY));

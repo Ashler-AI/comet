@@ -608,7 +608,19 @@ impl Engine {
             config.data_dir.clone(),
             Some(quiescent),
             update_access_token,
+            harness_update_specs(),
         ));
+        // The "on update" contract: the first boot of a NEW Comet version
+        // refreshes the local agent CLIs through their own updaters (opt out
+        // via the Settings toggle or COMET_UPDATE_HARNESSES=0). Boot-time, not
+        // restart-time — every apply path (bundle swap, symlink swap + service
+        // restart, installer re-run) funnels through exactly one first boot.
+        if comet_update::version_transition(&config.data_dir)
+            && let Some(updater) = core.updater()
+            && updater.harness_auto_update()
+        {
+            updater.spawn_post_update_refresh();
+        }
         tracing::info!(device_id = %core.device_id, "engine core assembled");
 
         let host_relay = edge.as_ref().map(|edge| {
@@ -667,6 +679,46 @@ impl Engine {
         runtime.shutdown().await;
         Ok(())
     }
+}
+
+/// The agent CLIs the release checker tracks: resolution through
+/// `comet-harness`'s candidate chains (login-shell PATH, version-manager
+/// bins), "latest" from each vendor's public channel, applies via each CLI's
+/// own self-updater — Comet never swaps a vendor binary itself.
+fn harness_update_specs() -> Vec<comet_update::HarnessSpec> {
+    use comet_update::{HarnessSpec, ReleaseChannel};
+    vec![
+        HarnessSpec {
+            id: "omp",
+            name: "OMP",
+            resolve: Arc::new(comet_harness::omp::installed_executable),
+            channel: ReleaseChannel::GitHub {
+                repo: "can1357/oh-my-pi",
+            },
+            self_update_args: &["update"],
+            min_version: Some(comet_harness::omp::MIN_OMP_VERSION),
+        },
+        HarnessSpec {
+            id: "claude-code",
+            name: "Claude Code",
+            resolve: Arc::new(comet_harness::claude::installed_executable),
+            channel: ReleaseChannel::Npm {
+                package: "@anthropic-ai/claude-code",
+            },
+            self_update_args: &["update"],
+            min_version: None,
+        },
+        HarnessSpec {
+            id: "codex",
+            name: "Codex",
+            resolve: Arc::new(comet_harness::codex::installed_executable),
+            channel: ReleaseChannel::Npm {
+                package: "@openai/codex",
+            },
+            self_update_args: &["update"],
+            min_version: None,
+        },
+    ]
 }
 
 /// Ctrl-C or SIGTERM. systemd/launchd stop (and the auto-updater's service

@@ -2,8 +2,11 @@
 //! (Claude Code, Codex) with account rows — email, plan badge, Active, usage
 //! meters (indigo → amber ≥80% → red ≥95%, reset time), Switch / Forget — plus
 //! the add-account dialogs (paste-code and browser-poll flows) and
-//! account-shaped loading skeletons. Comet retargets devices from the settings
-//! sidebar (`targetDeviceId` passthrough kept plumbed, unused single-device).
+//! account-shaped loading skeletons, and the "Agent versions" section (agent
+//! CLI versions from the `UpdateStatus` stream, per-harness Update buttons,
+//! the update-agents-after-Comet-updates toggle). Comet retargets devices
+//! from the settings sidebar (`targetDeviceId` passthrough kept plumbed,
+//! unused single-device).
 //!
 //! The accounts RPC surface is being implemented engine-side in parallel —
 //! every call here surfaces failures as inline UI states rather than assuming
@@ -14,6 +17,7 @@ use gpui::{
     AnyElement, Context, Entity, Hsla, SharedString, Subscription, Task, Window, div, prelude::*,
     px,
 };
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use comet_proto::{
@@ -21,6 +25,7 @@ use comet_proto::{
     AgentLoginStatus, HarnessId,
 };
 use comet_rpc::methods;
+use comet_update::HarnessStatus;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::motion::{AnimationExt as _, COMET_PULSE};
@@ -132,6 +137,47 @@ pub fn provider_accounts(
     accounts
 }
 
+/// "vX.Y.Z" — tolerate an already-prefixed version string. Pure.
+pub fn version_label(version: &str) -> String {
+    if version.starts_with('v') {
+        version.to_string()
+    } else {
+        format!("v{version}")
+    }
+}
+
+/// What the right edge of an agent-version row offers. Pure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HarnessAction<'a> {
+    /// Installed agent is below Comet's compatibility floor — danger-toned,
+    /// still clickable (the fix IS the update).
+    UpdateRequired { latest: Option<&'a str> },
+    /// A newer version exists.
+    Update { latest: Option<&'a str> },
+    /// Installed and current.
+    UpToDate,
+    /// Not installed — nothing actionable to show.
+    Nothing,
+}
+
+/// Row action for one [`HarnessStatus`]: required beats available beats
+/// up-to-date; an uninstalled agent shows nothing. Pure.
+pub fn harness_action(status: &HarnessStatus) -> HarnessAction<'_> {
+    if status.update_required {
+        HarnessAction::UpdateRequired {
+            latest: status.latest_version.as_deref(),
+        }
+    } else if status.update_available {
+        HarnessAction::Update {
+            latest: status.latest_version.as_deref(),
+        }
+    } else if status.installed_version.is_some() {
+        HarnessAction::UpToDate
+    } else {
+        HarnessAction::Nothing
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entity
 // ---------------------------------------------------------------------------
@@ -189,6 +235,15 @@ pub struct AccountsPage {
     load_task: Option<Task<()>>,
     action_task: Option<Task<()>>,
     poll_task: Option<Task<()>>,
+    /// Harness ids with an in-flight `UpdateHarness` — self-updaters can take
+    /// minutes, so each harness tracks its own flag (no timeout UI; the RPC
+    /// resolves or fails).
+    updating_harnesses: HashSet<String>,
+    /// Last `UpdateHarness` failure per harness id — dismissed on retry.
+    harness_errors: HashMap<String, SharedString>,
+    /// One task per harness so concurrent updates don't cancel each other.
+    harness_tasks: HashMap<String, Task<()>>,
+    auto_update_task: Option<Task<()>>,
     _observe: Subscription,
     _code_events: Subscription,
 }
@@ -215,6 +270,10 @@ impl AccountsPage {
             load_task: None,
             action_task: None,
             poll_task: None,
+            updating_harnesses: HashSet::new(),
+            harness_errors: HashMap::new(),
+            harness_tasks: HashMap::new(),
+            auto_update_task: None,
             _observe: observe,
             _code_events: code_events,
         };
@@ -663,6 +722,63 @@ impl AccountsPage {
                 }
             }));
         }
+        cx.notify();
+    }
+
+    /// Run one agent CLI's self-updater on the engine's device. The button
+    /// reads "Updating…" until the RPC resolves; success just clears the flag
+    /// — the authoritative refresh arrives over the `UpdateStatus` stream.
+    fn update_harness(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.updating_harnesses.contains(&id) {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.updating_harnesses.insert(id.clone());
+        // Retry dismisses the previous failure.
+        self.harness_errors.remove(&id);
+        let params = serde_json::json!({ "harness": id });
+        let task_id = id.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::UPDATE_HARNESS, params).await;
+            this.update(cx, |page, cx| {
+                page.updating_harnesses.remove(&task_id);
+                if let Err(err) = result {
+                    page.harness_errors
+                        .insert(task_id.clone(), format!("{err}").into());
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.harness_tasks.insert(id, task);
+        cx.notify();
+    }
+
+    /// Persist the "update agents after Comet updates" toggle. Optimistic:
+    /// the local frame flips now, the next `UpdateStatus` frame confirms (or
+    /// corrects, if the engine-side write failed).
+    fn set_harness_auto_update(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.state.update(cx, |state, cx| {
+            if let Some(update) = &mut state.update {
+                update.harness_auto_update = enabled;
+            }
+            cx.notify();
+        });
+        let params = serde_json::json!({ "enabled": enabled });
+        self.auto_update_task = Some(cx.spawn(async move |_, _| {
+            if let Err(err) = engine
+                .client()
+                .call(methods::SET_HARNESS_AUTO_UPDATE, params)
+                .await
+            {
+                tracing::debug!(error = %err, "SetHarnessAutoUpdate failed (next frame corrects)");
+            }
+        }));
         cx.notify();
     }
 
@@ -1166,6 +1282,270 @@ impl AccountsPage {
             .child(inner.opacity(0.55 + 0.35 * motion::pulse_wave(delta)))
             .into_any_element()
     }
+
+    /// One agent-version row: name, installed version (or "Not installed"),
+    /// the resolved executable path, and the right-anchored update affordance
+    /// — same geometry and hairlines as the account rows above.
+    fn render_harness_row(
+        &self,
+        harness: &HarnessStatus,
+        ix: usize,
+        first: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::settings::widgets;
+        let updating = self.updating_harnesses.contains(&harness.id);
+        let error = self.harness_errors.get(&harness.id).cloned();
+        let name: SharedString = harness.name.clone().into();
+        let version: SharedString = match &harness.installed_version {
+            Some(version) => version_label(version).into(),
+            None => "Not installed".into(),
+        };
+        let version_tone = theme
+            .text_muted
+            .opacity(if harness.installed_version.is_some() {
+                0.65
+            } else {
+                0.5
+            });
+
+        // The right-edge affordance. "Update required" stays clickable — the
+        // update IS the fix — but wears the page's danger tone (error_strip
+        // palette) because the installed agent is below Comet's floor.
+        let control: Option<AnyElement> = match harness_action(harness) {
+            HarnessAction::UpdateRequired { latest } => {
+                let label: SharedString = if updating {
+                    "Updating…".into()
+                } else {
+                    match latest {
+                        Some(v) => format!("Update required — {}", version_label(v)).into(),
+                        None => "Update required".into(),
+                    }
+                };
+                let id = harness.id.clone();
+                Some(
+                    div()
+                        .id(("harness-update-required", ix))
+                        .rounded(px(6.0))
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .border_1()
+                        .border_color(theme.danger.opacity(0.2))
+                        .bg(theme.danger.opacity(0.06))
+                        .text_size(px(11.5))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.danger_muted.opacity(0.9))
+                        .cursor_pointer()
+                        .when(updating, |el| el.opacity(0.5))
+                        .hover(|s| s.bg(theme.danger.opacity(0.12)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.update_harness(id.clone(), cx);
+                        }))
+                        .child(label)
+                        .into_any_element(),
+                )
+            }
+            HarnessAction::Update { latest } => {
+                let label = if updating {
+                    "Updating…".to_string()
+                } else {
+                    match latest {
+                        Some(v) => format!("Update to {}", version_label(v)),
+                        None => "Update".to_string(),
+                    }
+                };
+                let id = harness.id.clone();
+                Some(
+                    crate::popover::btn_primary(theme, &label)
+                        .id(("harness-update", ix))
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .rounded(px(6.0))
+                        .text_size(px(11.5))
+                        .when(updating, |el| el.opacity(0.5))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.update_harness(id.clone(), cx);
+                        }))
+                        .into_any_element(),
+                )
+            }
+            HarnessAction::UpToDate => Some(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(theme.text_muted.opacity(0.55))
+                    .child(SharedString::from("Up to date"))
+                    .into_any_element(),
+            ),
+            HarnessAction::Nothing => None,
+        };
+
+        div()
+            .px(px(20.0))
+            .py(px(14.0))
+            .when(!first, |el| el.border_t_1().border_color(theme.border))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(12.0))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(widgets::row_title(theme, name))
+                    .child(
+                        div()
+                            .mt(px(3.0))
+                            .text_size(px(11.5))
+                            .text_color(version_tone)
+                            .child(version),
+                    )
+                    .when_some(harness.path.clone(), |el, path| {
+                        el.child(
+                            div()
+                                .mt(px(2.0))
+                                .truncate()
+                                .text_size(px(10.5))
+                                .font_family(theme.font_mono.clone())
+                                .text_color(theme.text_muted.opacity(0.4))
+                                .child(SharedString::from(path)),
+                        )
+                    })
+                    .when_some(error, |el, message| {
+                        el.child(
+                            div()
+                                .mt(px(4.0))
+                                .text_size(px(11.5))
+                                .text_color(theme.danger_muted.opacity(0.85))
+                                .child(message),
+                        )
+                    }),
+            )
+            .children(control.map(|control| div().flex_none().child(control)))
+            .into_any_element()
+    }
+
+    /// The "Update agents after Comet updates" row: title + description left,
+    /// a 36×20 pill toggle right (the advisor settings toggle idiom).
+    fn render_auto_update_row(
+        &self,
+        enabled: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .px(px(20.0))
+            .py(px(14.0))
+            .border_t_1()
+            .border_color(theme.border)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(20.0))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .child(SharedString::from("Update agents after Comet updates")),
+                    )
+                    .child(
+                        div()
+                            .mt(px(3.0))
+                            .text_size(px(11.5))
+                            .line_height(px(17.0))
+                            .text_color(theme.text_muted.opacity(0.7))
+                            .child(SharedString::from(
+                                "Runs each agent's own updater whenever Comet finishes \
+                                 updating itself.",
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .id("harness-auto-update")
+                    .flex_none()
+                    .w(px(36.0))
+                    .h(px(20.0))
+                    .p(px(2.0))
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .when(enabled, |toggle| toggle.justify_end().bg(theme.accent))
+                    .when(!enabled, |toggle| {
+                        toggle.justify_start().bg(crate::theme::ink(0.12))
+                    })
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_harness_auto_update(!enabled, cx);
+                    }))
+                    .child(
+                        div()
+                            .size(px(16.0))
+                            .rounded_full()
+                            .bg(theme.bg)
+                            .border_1()
+                            .border_color(theme.border),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The "Agent versions" section: one row per harness from the engine's
+    /// `UpdateStatus` stream, then the auto-update toggle. Absent status or
+    /// an empty list renders nothing.
+    fn render_versions_section(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        use crate::settings::widgets;
+        // Local device only: the UpdateStatus stream subscribed at bootstrap
+        // is the local engine's, so a retargeted page would show stale facts.
+        if self.target_device.is_some() {
+            return None;
+        }
+        let update = self.state.read(cx).update.clone()?;
+        if update.harnesses.is_empty() {
+            return None;
+        }
+        let rows: Vec<AnyElement> = update
+            .harnesses
+            .iter()
+            .enumerate()
+            .map(|(ix, harness)| self.render_harness_row(harness, ix, ix == 0, theme, cx))
+            .collect();
+        Some(
+            div()
+                .mt(px(24.0))
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .text_size(px(14.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text)
+                        .child(SharedString::from("Agent versions")),
+                )
+                .child(
+                    widgets::section_card(theme)
+                        .mt(px(8.0))
+                        .children(rows)
+                        .child(self.render_auto_update_row(
+                            update.harness_auto_update,
+                            theme,
+                            cx,
+                        )),
+                )
+                .into_any_element(),
+        )
+    }
 }
 
 impl Render for AccountsPage {
@@ -1361,6 +1741,7 @@ impl Render for AccountsPage {
                     .collect()
             }
         };
+        let versions = self.render_versions_section(&theme, cx);
 
         div()
             .id("accounts-page")
@@ -1416,6 +1797,7 @@ impl Render for AccountsPage {
                         )
                     })
                     .children(sections)
+                    .children(versions)
                     // Footer note (comet: `mt-6 text-[12px] leading-relaxed
                     // text-muted-foreground/60`).
                     .child(
@@ -1527,5 +1909,46 @@ mod tests {
         assert_eq!(ids, ["c2", "c1"], "active account leads");
         assert_eq!(provider_accounts(&snapshot, HarnessId::Codex).len(), 1);
         assert!(provider_accounts(&snapshot, HarnessId::Cursor).is_empty());
+    }
+
+    #[test]
+    fn version_labels_are_v_prefixed_once() {
+        assert_eq!(version_label("1.2.3"), "v1.2.3");
+        assert_eq!(version_label("v1.2.3"), "v1.2.3");
+    }
+
+    #[test]
+    fn harness_action_precedence() {
+        let status = |installed: Option<&str>, available: bool, required: bool| HarnessStatus {
+            id: "omp".into(),
+            name: "OMP".into(),
+            path: installed.map(|_| "/usr/local/bin/omp".into()),
+            installed_version: installed.map(str::to_string),
+            latest_version: Some("2.0.0".into()),
+            update_available: available,
+            update_required: required,
+        };
+        // Required wins even when available is also set.
+        assert_eq!(
+            harness_action(&status(Some("1.0.0"), true, true)),
+            HarnessAction::UpdateRequired {
+                latest: Some("2.0.0")
+            }
+        );
+        assert_eq!(
+            harness_action(&status(Some("1.0.0"), true, false)),
+            HarnessAction::Update {
+                latest: Some("2.0.0")
+            }
+        );
+        assert_eq!(
+            harness_action(&status(Some("2.0.0"), false, false)),
+            HarnessAction::UpToDate
+        );
+        // Not installed → nothing actionable on the right edge.
+        assert_eq!(
+            harness_action(&status(None, false, false)),
+            HarnessAction::Nothing
+        );
     }
 }

@@ -96,6 +96,12 @@ fn resolve_codex_executable() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.exists())
 }
 
+/// The installed `codex` executable, if any — the engine's update inventory
+/// resolves through the same candidate chain runs use.
+pub fn installed_executable() -> Option<PathBuf> {
+    resolve_codex_executable()
+}
+
 /// True when `cwd` is a LINKED git worktree whose checked-out branch name
 /// contains '/' — the exact shape that trips codex's sandbox worktree-mount
 /// derivation (see the escalation in [`CodexHarness::run`]). Pure filesystem

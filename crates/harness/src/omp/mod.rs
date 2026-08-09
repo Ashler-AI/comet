@@ -35,6 +35,10 @@ use crate::{Harness, HarnessError, RunControls};
 use rpc::{Incoming, RpcClient};
 
 const ACP_PROTOCOL_VERSION: i64 = 1;
+/// Oldest OMP this engine can drive — the floor behind the "Update required"
+/// state in Settings → Agents. Tracks the version this release was verified
+/// against (also the installer's pinned bootstrap).
+pub const MIN_OMP_VERSION: &str = "17.2.9";
 const ACP_INITIALIZE_DEADLINE: Duration = Duration::from_secs(15);
 const ACP_SESSION_DEADLINE: Duration = Duration::from_secs(30);
 const ACP_CONFIGURE_DEADLINE: Duration = Duration::from_secs(15);
@@ -330,6 +334,12 @@ fn resolve_omp_executable() -> Option<PathBuf> {
             .map(|dir| dir.join(executable)),
     );
     candidates.into_iter().find(|path| path.exists())
+}
+
+/// The installed `omp` executable, if any — the engine's update inventory
+/// resolves through the same candidate chain runs use.
+pub fn installed_executable() -> Option<PathBuf> {
+    resolve_omp_executable()
 }
 
 fn propagate_auth_broker_environment(
@@ -1138,7 +1148,8 @@ pub(crate) async fn run_acp(
     .await?;
     if initialized.get("protocolVersion").and_then(Value::as_i64) != Some(ACP_PROTOCOL_VERSION) {
         return Err(HarnessError::Protocol(format!(
-            "{} protocol version mismatch",
+            "{} protocol version mismatch — this OMP and Comet are out of step; \
+             run `omp update` (or update it from Settings → Agents) or update Comet",
             options.process_label
         )));
     }

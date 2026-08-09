@@ -133,6 +133,13 @@ pub mod methods {
     pub const APPLY_UPDATE: &str = "ApplyUpdate";
     /// Download and verify the newest macOS app bundle on the target device.
     pub const STAGE_UPDATE: &str = "StageUpdate";
+    /// Run a local agent CLI's own self-updater (`omp update`, `claude
+    /// update`, `codex update`) on the target device; replies with the
+    /// refreshed `HarnessStatus` row.
+    pub const UPDATE_HARNESS: &str = "UpdateHarness";
+    /// Persist whether agent CLIs auto-refresh after a Comet update lands on
+    /// the target device.
+    pub const SET_HARNESS_AUTO_UPDATE: &str = "SetHarnessAutoUpdate";
 }
 
 /// Shared parameters for `AddSessionRef` and `RemoveSessionRef`.
