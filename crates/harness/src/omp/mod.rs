@@ -12,6 +12,7 @@ pub(crate) mod rpc;
 pub(crate) mod rpc_mode;
 
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::future::Future;
 use std::io::{BufRead as _, BufReader, Read as _};
 use std::path::{Path, PathBuf};
@@ -392,10 +393,28 @@ pub fn installed_executable() -> Option<PathBuf> {
     resolve_omp_executable()
 }
 
+#[derive(Clone, Default)]
+struct AuthBrokerEnvironment {
+    url: Option<OsString>,
+    token: Option<OsString>,
+    token_file: Option<OsString>,
+}
+
+impl AuthBrokerEnvironment {
+    fn from_process() -> Self {
+        Self {
+            url: std::env::var_os(AUTH_BROKER_URL_ENV),
+            token: std::env::var_os(AUTH_BROKER_TOKEN_ENV),
+            token_file: std::env::var_os(AUTH_BROKER_TOKEN_FILE_ENV),
+        }
+    }
+}
+
 fn propagate_auth_broker_environment(
     command: &mut Command,
     scaffold_host: bool,
     include_token: bool,
+    environment: &AuthBrokerEnvironment,
 ) {
     command.env_remove(AUTH_BROKER_TOKEN_FILE_ENV);
     if scaffold_host {
@@ -413,7 +432,7 @@ fn propagate_auth_broker_environment(
     if !include_token {
         command.env_remove(AUTH_BROKER_TOKEN_ENV);
     }
-    if let Some(url) = std::env::var_os(AUTH_BROKER_URL_ENV).filter(|value| !value.is_empty()) {
+    if let Some(url) = environment.url.as_ref().filter(|value| !value.is_empty()) {
         command.env(AUTH_BROKER_URL_ENV, url);
     }
     if !include_token {
@@ -423,13 +442,15 @@ fn propagate_auth_broker_environment(
     // must never accept that long-lived credential and can use only its
     // single-use token file projection.
     if !scaffold_host
-        && let Some(token) =
-            std::env::var_os(AUTH_BROKER_TOKEN_ENV).filter(|value| !value.is_empty())
+        && let Some(token) = environment.token.as_ref().filter(|value| !value.is_empty())
     {
         command.env(AUTH_BROKER_TOKEN_ENV, token);
         return;
     }
-    let Some(path) = std::env::var_os(AUTH_BROKER_TOKEN_FILE_ENV).filter(|value| !value.is_empty())
+    let Some(path) = environment
+        .token_file
+        .as_ref()
+        .filter(|value| !value.is_empty())
     else {
         return;
     };
@@ -468,6 +489,7 @@ pub struct OmpHarness {
     interrupt_grace: Duration,
     session_dirs: Option<Vec<PathBuf>>,
     session_writer_probe: Option<PathBuf>,
+    auth_broker_environment: Option<AuthBrokerEnvironment>,
 }
 
 impl Default for OmpHarness {
@@ -478,6 +500,7 @@ impl Default for OmpHarness {
             interrupt_grace: Duration::from_secs(3),
             session_dirs: None,
             session_writer_probe: None,
+            auth_broker_environment: None,
         }
     }
 }
@@ -496,6 +519,12 @@ impl OmpHarness {
 
     pub fn with_executable(mut self, executable: impl Into<PathBuf>) -> Self {
         self.executable = Some(executable.into());
+        self
+    }
+
+    #[cfg(test)]
+    fn with_auth_broker_environment(mut self, environment: AuthBrokerEnvironment) -> Self {
+        self.auth_broker_environment = Some(environment);
         self
     }
 
@@ -574,10 +603,15 @@ impl OmpHarness {
     ) -> Command {
         let mut command = Command::new(executable);
         crate::compose_child_path(&mut command, executable);
+        let auth_broker_environment = self
+            .auth_broker_environment
+            .clone()
+            .unwrap_or_else(AuthBrokerEnvironment::from_process);
         propagate_auth_broker_environment(
             &mut command,
             self.scaffold_host,
             include_auth_broker_token,
+            &auth_broker_environment,
         );
         if !cwd.is_empty() {
             command.current_dir(cwd);
@@ -1910,18 +1944,10 @@ mod tests {
         );
     }
 
-    /// Serializes tests that interact through the process-global
-    /// `OMP_AUTH_BROKER_*` variables: `propagate_auth_broker_environment`
-    /// consumes (deletes) the single-use token file, so a builder call from a
-    /// parallel test inside the broker test's env window steals its token.
-    static BROKER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn scaffold_command_invokes_only_omp_rpc_mode_with_hardening() {
-        let _guard = BROKER_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let harness = OmpHarness::scaffold_host();
+        let harness = OmpHarness::scaffold_host()
+            .with_auth_broker_environment(AuthBrokerEnvironment::default());
         let command = harness.rpc_mode_command(Path::new("/usr/local/bin/omp"), "/workspace", true);
         let args: Vec<String> = command
             .as_std()
@@ -2043,9 +2069,6 @@ mod tests {
 
     #[test]
     fn broker_configuration_is_environment_only_and_scaffold_stays_isolated() {
-        let _guard = BROKER_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = tempfile::tempdir().unwrap();
         let token_file = temp.path().join("broker.token");
         std::fs::write(&token_file, "super-secret-token\n").unwrap();
@@ -2054,13 +2077,14 @@ mod tests {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
-        unsafe {
-            std::env::set_var(AUTH_BROKER_URL_ENV, "https://broker.example.test");
-            std::env::set_var(AUTH_BROKER_TOKEN_ENV, "workstation-token-must-not-leak");
-            std::env::set_var(AUTH_BROKER_TOKEN_FILE_ENV, &token_file);
-        }
-        let catalog_command = OmpHarness::scaffold_host()
-            .command_catalog_command(Path::new("/usr/local/bin/omp"), "/workspace");
+        let harness =
+            OmpHarness::scaffold_host().with_auth_broker_environment(AuthBrokerEnvironment {
+                url: Some("https://broker.example.test".into()),
+                token: Some("workstation-token-must-not-leak".into()),
+                token_file: Some(token_file.clone().into_os_string()),
+            });
+        let catalog_command =
+            harness.command_catalog_command(Path::new("/usr/local/bin/omp"), "/workspace");
         let catalog_process = catalog_command.as_std();
         assert!(catalog_process.get_envs().any(|(key, value)| {
             key == std::ffi::OsStr::new(AUTH_BROKER_TOKEN_ENV) && value.is_none()
@@ -2073,11 +2097,7 @@ mod tests {
             "command discovery must preserve the token for the persistent RPC child"
         );
 
-        let command = OmpHarness::scaffold_host().rpc_mode_command(
-            Path::new("/usr/local/bin/omp"),
-            "/workspace",
-            true,
-        );
+        let command = harness.rpc_mode_command(Path::new("/usr/local/bin/omp"), "/workspace", true);
         let process = command.as_std();
         let args: Vec<_> = process
             .get_args()
@@ -2137,12 +2157,13 @@ mod tests {
             std::fs::set_permissions(&insecure_file, std::fs::Permissions::from_mode(0o644))
                 .unwrap();
         }
-        unsafe { std::env::set_var(AUTH_BROKER_TOKEN_FILE_ENV, &insecure_file) };
-        let insecure = OmpHarness::scaffold_host().rpc_mode_command(
-            Path::new("/usr/local/bin/omp"),
-            "/workspace",
-            true,
-        );
+        let insecure = OmpHarness::scaffold_host()
+            .with_auth_broker_environment(AuthBrokerEnvironment {
+                url: Some("https://broker.example.test".into()),
+                token: Some("workstation-token-must-not-leak".into()),
+                token_file: Some(insecure_file.clone().into_os_string()),
+            })
+            .rpc_mode_command(Path::new("/usr/local/bin/omp"), "/workspace", true);
         assert!(insecure.as_std().get_envs().any(|(key, value)| {
             key == std::ffi::OsStr::new(AUTH_BROKER_TOKEN_ENV) && value.is_none()
         }));
@@ -2150,11 +2171,6 @@ mod tests {
             !insecure_file.exists(),
             "rejected token files must still be removed"
         );
-        unsafe {
-            std::env::remove_var(AUTH_BROKER_URL_ENV);
-            std::env::remove_var(AUTH_BROKER_TOKEN_ENV);
-            std::env::remove_var(AUTH_BROKER_TOKEN_FILE_ENV);
-        }
     }
 
     #[test]

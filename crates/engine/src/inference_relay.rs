@@ -3,6 +3,7 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener as StdTcpListener};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
@@ -59,7 +60,7 @@ struct Inner {
     client: ScaffoldClient,
     port: u16,
     routes: Mutex<HashMap<String, Arc<Route>>>,
-    lifecycle_epochs: Mutex<HashMap<String, u64>>,
+    next_lifecycle_epoch: AtomicU64,
 }
 
 struct Route {
@@ -92,12 +93,12 @@ fn inference_binding(
     if selected.is_empty() {
         return None;
     }
-    if let Some(model) = selected.strip_prefix("anthropic/") {
-        return (!model.is_empty()).then(|| ("anthropic", model.to_string()));
-    }
-    if let Some(model) = selected.strip_prefix("openai-codex/") {
-        return (!model.is_empty()).then(|| ("openai", model.to_string()));
-    }
+    let provider_model = selected
+        .rsplit_once('/')
+        .map(|(_, model)| model)
+        .filter(|model| !model.is_empty())
+        .unwrap_or(selected.as_str())
+        .to_string();
     let provider = if selected.to_ascii_lowercase().contains("claude")
         || selected.to_ascii_lowercase().contains("anthropic")
     {
@@ -105,7 +106,7 @@ fn inference_binding(
     } else {
         "openai"
     };
-    Some((provider, selected))
+    Some((provider, provider_model))
 }
 
 impl InferenceRelay {
@@ -118,7 +119,7 @@ impl InferenceRelay {
                 client,
                 port,
                 routes: Mutex::new(HashMap::new()),
-                lifecycle_epochs: Mutex::new(HashMap::new()),
+                next_lifecycle_epoch: AtomicU64::new(0),
             }),
         };
         let runtime_listener = TcpListener::from_std(listener)?;
@@ -146,10 +147,10 @@ impl InferenceRelay {
                 return Ok(None);
             }
         };
-        let lifecycle_epoch = lock(&self.inner.lifecycle_epochs)
-            .get(logical_session_id)
-            .copied()
-            .unwrap_or(0)
+        let lifecycle_epoch = self
+            .inner
+            .next_lifecycle_epoch
+            .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
         let request = AgentInferenceGrantRequest {
             logical_session_id: logical_session_id.to_string(),
@@ -167,7 +168,6 @@ impl InferenceRelay {
                 EngineError::Other(format!("Agent Auth grant issuance failed: {error}"))
             })?;
         let expires_at = validate_grant(&grant, &request)?;
-        lock(&self.inner.lifecycle_epochs).insert(logical_session_id.to_string(), lifecycle_epoch);
         let local_token = format!("{}{}", new_id().replace('-', ""), new_id().replace('-', ""));
         let route = InferenceRoute {
             base_url: format!("http://127.0.0.1:{}", self.inner.port),
@@ -509,7 +509,8 @@ fn validate_grant(
         || binding.lifecycle_epoch != request.lifecycle_epoch
         || binding.environment != "local"
         || !matches!(binding.backend.as_str(), "oauth" | "bifrost")
-        || (binding.backend == "oauth" && binding.account_id.is_none())
+        || (binding.backend == "oauth"
+            && (binding.account_id.is_none() || binding.account_generation.is_none()))
     {
         return Err(EngineError::Other(
             "Agent Auth returned a mismatched inference grant".into(),

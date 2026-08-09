@@ -486,11 +486,15 @@ mod tests {
             Some(("anthropic", "claude-opus-5".into()))
         );
         assert_eq!(
+            inference_binding(HarnessId::PrimeAgent, Some("openai/gpt-5.6-sol")),
+            Some(("openai", "gpt-5.6-sol".into()))
+        );
+        assert_eq!(
             inference_binding(
                 HarnessId::PrimeAgent,
                 Some("prime-inference/x-ai/grok-4.20")
             ),
-            Some(("openai", "prime-inference/x-ai/grok-4.20".into()))
+            Some(("openai", "grok-4.20".into()))
         );
     }
 

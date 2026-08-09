@@ -495,6 +495,7 @@ impl ScaffoldClient {
                 version: "scaffold.comet-runtime.v1",
                 project_id: &scope.project_id,
                 deployment_id,
+                session_id: scope.session_id.as_deref().expect("validated sessionId"),
             },
         };
         let response: SandboxEnvelope = self
@@ -1071,7 +1072,7 @@ impl ScaffoldSandbox {
             if profile.version != "scaffold.comet-runtime.v1"
                 || profile.project_id != scope.project_id
                 || Some(profile.deployment_id.as_str()) != scope.deployment_id.as_deref()
-                || profile.session_id != self.id
+                || Some(profile.session_id.as_str()) != scope.session_id.as_deref()
                 || profile.sandbox_id != self.id
             {
                 return Err(ScaffoldError::InvalidResponse(format!(
@@ -1138,6 +1139,7 @@ struct CreateCometRuntimeProfile<'a> {
     version: &'static str,
     project_id: &'a str,
     deployment_id: &'a str,
+    session_id: &'a str,
 }
 
 #[derive(Debug, Serialize)]
@@ -1926,7 +1928,7 @@ mod tests {
         CollaborationScope {
             project_id: "project-a".into(),
             deployment_id: Some("deployment-a".into()),
-            session_id: Some("session-a".into()),
+            session_id: Some("011664b5-3660-4fe6-83a2-3647fa6a2f65".into()),
             unknown: Default::default(),
         }
     }
@@ -1940,7 +1942,7 @@ mod tests {
     fn comet_sandbox(status: &str) -> String {
         sandbox(status).replace(
             r#""runtimeProfile":"remote_code""#,
-            r#""runtimeProfile":"comet_remote","cometRuntimeProfile":{"version":"scaffold.comet-runtime.v1","projectId":"project-a","deploymentId":"deployment-a","sessionId":"sandbox-a","sandboxId":"sandbox-a"}"#,
+            r#""runtimeProfile":"comet_remote","cometRuntimeProfile":{"version":"scaffold.comet-runtime.v1","projectId":"project-a","deploymentId":"deployment-a","sessionId":"011664b5-3660-4fe6-83a2-3647fa6a2f65","sandboxId":"sandbox-a"}"#,
         )
     }
 
@@ -1952,7 +1954,10 @@ mod tests {
             environment.source_ref.as_deref(),
             Some("387d6652abd642f0b85e8bd14f9131a9f23b7e70")
         );
-        assert_eq!(environment.scope.session_id.as_deref(), Some("sandbox-a"));
+        assert_eq!(
+            environment.scope.session_id.as_deref(),
+            Some("011664b5-3660-4fe6-83a2-3647fa6a2f65")
+        );
     }
 
     async fn mock_server(responses: Vec<String>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
@@ -2039,7 +2044,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(created.scope.session_id.as_deref(), Some("sandbox-a"));
+        assert_eq!(
+            created.scope.session_id.as_deref(),
+            Some("011664b5-3660-4fe6-83a2-3647fa6a2f65")
+        );
         client
             .pause("sandbox-a", &scope(), &cancellation)
             .await
@@ -2085,7 +2093,7 @@ mod tests {
         assert!(requests[2].contains(r#""version":"scaffold.comet-runtime.v1""#));
         assert!(requests[2].contains(r#""projectId":"project-a""#));
         assert!(requests[2].contains(r#""deploymentId":"deployment-a""#));
-        assert!(!requests[2].contains(r#""sessionId""#));
+        assert!(requests[2].contains(r#""sessionId":"011664b5-3660-4fe6-83a2-3647fa6a2f65""#));
     }
 
     #[tokio::test]
@@ -2131,7 +2139,7 @@ mod tests {
             Some(SessionRoomProjection {
                 project_id: "project-a".into(),
                 deployment_id: "deployment-a".into(),
-                session_id: "session-a".into(),
+                session_id: "011664b5-3660-4fe6-83a2-3647fa6a2f65".into(),
             })
         );
         assert_eq!(
