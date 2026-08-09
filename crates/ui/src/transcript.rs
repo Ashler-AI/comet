@@ -2639,13 +2639,14 @@ fn user_mention_text(
     let styled = StyledText::new(text.clone()).with_runs(runs);
     let layout = styled.layout().clone();
     let selection_key: SharedString = format!("{}#user:0", row_id).into();
+    let mention_text = text.clone();
     let selectable = render::selectable_styled_text(selection_key, text, styled, theme);
     let wash = theme.code_wash;
     let underlay = canvas(
         |_, _, _| (),
         move |_, _, window, _| {
             for span in mentions.iter() {
-                for rect in render::range_rects(&layout, &span.range, 0.0, 2.0) {
+                for rect in render::range_rects(&layout, &mention_text, &span.range, 0.0, 2.0) {
                     window.paint_quad(quad(
                         rect,
                         px(5.0),

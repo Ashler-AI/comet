@@ -649,6 +649,9 @@ struct AnnotationInspector {
     /// Window-space origin for a compact transcript-selection comment pop-up.
     /// Other annotation entry points keep using the full inspector drawer.
     popup_origin: Option<Point<Pixels>>,
+    /// Holds the input's event subscription for the inspector's lifetime —
+    /// Enter (Submit) saves the comment like the Comment/Save button.
+    _input_sub: gpui::Subscription,
 }
 
 fn right_drawer_overlay(viewport: gpui::Size<Pixels>, drawer: impl IntoElement) -> AnyElement {
@@ -1156,6 +1159,9 @@ pub struct Shell {
     /// Set by comment controls; consumed on the next render after the drawer
     /// mounts so typing lands in the note input rather than the composer.
     annotation_focus_pending: bool,
+    /// Set when the note input's Submit action fires (Enter); consumed on the
+    /// next render, where the window needed by `save_annotation` is in hand.
+    annotation_submit_pending: bool,
     control_tasks: Vec<Task<()>>,
     /// Outside-click dismissal instant — suppresses the trigger click that
     /// follows the same mouse-down from instantly reopening the menu.
@@ -1368,6 +1374,7 @@ impl Shell {
             control_feedback: Vec::new(),
             annotation_inspector: None,
             annotation_focus_pending: false,
+            annotation_submit_pending: false,
             control_tasks: Vec::new(),
             user_menu_dismissed_at: None,
             sidebar_notice: None,
@@ -1972,6 +1979,21 @@ impl Shell {
         });
         let input = cx.new(|cx| ComposerInput::new("Add a comment…", cx));
         input.update(cx, |input, cx| input.set_text(annotation.body.clone(), cx));
+        // Enter (the input's own Submit action) saves like the Comment/Save
+        // button. `save_annotation` needs the window, which subscriptions
+        // don't carry — the render hook consumes the flag with one in hand.
+        let input_sub = cx.subscribe(
+            &input,
+            |this: &mut Shell, _, event: &ComposerInputEvent, cx| {
+                if matches!(
+                    event,
+                    ComposerInputEvent::Submitted | ComposerInputEvent::QueueSubmitted
+                ) {
+                    this.annotation_submit_pending = true;
+                    cx.notify();
+                }
+            },
+        );
         self.annotation_inspector = Some(AnnotationInspector {
             annotation,
             session_id,
@@ -1979,6 +2001,7 @@ impl Shell {
             input,
             error: None,
             popup_origin: None,
+            _input_sub: input_sub,
         });
         self.annotation_focus_pending = true;
         self.activity_open = false;
@@ -7350,6 +7373,15 @@ impl Render for Shell {
             && let Some(inspector) = &self.annotation_inspector
         {
             window.focus(&inspector.input.focus_handle(cx), cx);
+        }
+        if std::mem::take(&mut self.annotation_submit_pending) && self.annotation_inspector.is_some()
+        {
+            // Save mutates the composer and moves focus — deferred out of the
+            // draw rather than run mid-render.
+            let shell = cx.entity();
+            window.defer(cx, move |window, cx| {
+                shell.update(cx, |shell, cx| shell.save_annotation(window, cx));
+            });
         }
         if matches!(gate, GatePhase::Ready)
             && matches!(self.route, Route::Chat)

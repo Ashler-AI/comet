@@ -1241,8 +1241,13 @@ fn selectable_layout_element(
         move |_, _, window, _| {
             if let Some(wash) = code_wash {
                 for range in &code_ranges {
-                    for rect in range_rects(&layout, range, INLINE_CODE_PAD_X, INLINE_CODE_INSET_Y)
-                    {
+                    for rect in range_rects(
+                        &layout,
+                        &flat_text,
+                        range,
+                        INLINE_CODE_PAD_X,
+                        INLINE_CODE_INSET_Y,
+                    ) {
                         window.paint_quad(quad(
                             rect,
                             px(INLINE_CODE_RADIUS),
@@ -1255,7 +1260,7 @@ fn selectable_layout_element(
                 }
             }
             if let Some(range) = super::selection::wash_range(&sel_key) {
-                for rect in range_rects(&layout, &range, 0.0, 0.0) {
+                for rect in range_rects(&layout, &flat_text, &range, 0.0, 0.0) {
                     window.paint_quad(quad(
                         rect,
                         px(0.0),
@@ -1419,31 +1424,53 @@ pub(crate) fn selection_mouse_up(position: gpui::Point<gpui::Pixels>) -> Option<
 
 /// The wash boxes for one byte range: one box per visual line the range
 /// covers (soft wraps split it), in window coordinates from the laid-out
-/// text's own geometry. `pad_x` overhangs the box horizontally (inline code);
-/// `inset_y` shrinks it vertically — both 0 for a selection wash, which wants
-/// full-line-height boxes that tile seamlessly across wrapped rows.
+/// text's own geometry. `text` is the layout's source string — it tells hard
+/// `\n` breaks from soft wraps at row boundaries. `pad_x` overhangs the box
+/// horizontally (inline code); `inset_y` shrinks it vertically — both 0 for
+/// a selection wash, which wants full-line-height boxes that tile seamlessly
+/// across wrapped rows.
 pub(crate) fn range_rects(
     layout: &gpui::TextLayout,
+    text: &str,
     range: &Range<usize>,
     pad_x: f32,
     inset_y: f32,
 ) -> Vec<Bounds<gpui::Pixels>> {
     let mut rects = Vec::new();
     let line_height = layout.line_height();
+    let left_edge = layout.bounds().origin.x;
     let mut cur = range.start;
+    // gpui positions a soft-wrap boundary index at the END of the row before
+    // it, so a row opened by one can't take its origin from
+    // `position_for_index(cur)` — that would drop the row's first character
+    // from the wash. It takes x from the element's left edge and y from the
+    // first following index that is unambiguously on the row instead.
+    let mut wrapped = false;
     // Walk the range one visual row at a time: find the furthest index that
     // still sits on the current row (binary search over glyph positions).
     let mut guard = 0;
     while cur < range.end && guard < 256 {
         guard += 1;
-        let Some(p1) = layout.position_for_index(cur) else {
-            break;
+        let p1 = if wrapped {
+            let mut probe = cur + 1;
+            while probe < range.end && !text.is_char_boundary(probe) {
+                probe += 1;
+            }
+            let Some(p) = layout.position_for_index(probe) else {
+                break;
+            };
+            point(left_edge, p.y)
+        } else {
+            let Some(p) = layout.position_for_index(cur) else {
+                break;
+            };
+            p
         };
-        // `seg_end` closes the wash on this row; `next` is the first index on
-        // the following row (strict progress even though a row-end index's
-        // position still reports the earlier row).
-        let (seg_end, next) = match layout.position_for_index(range.end) {
-            Some(pe) if pe.y == p1.y => (range.end, range.end),
+        // `seg_end` closes the wash on this row: the largest index whose
+        // position still reports this row's y (a trailing soft-wrap boundary
+        // index does — at the row's right edge, exactly what the box needs).
+        let seg_end = match layout.position_for_index(range.end) {
+            Some(pe) if pe.y == p1.y => range.end,
             _ => {
                 // Largest ix on this row (probes stay on char boundaries only
                 // at the ends; intermediate probes just need a y).
@@ -1455,10 +1482,11 @@ pub(crate) fn range_rects(
                         _ => hi = mid,
                     }
                 }
-                (lo, hi)
+                lo
             }
         };
         if let Some(p2) = layout.position_for_index(seg_end)
+            && p2.y == p1.y
             && p2.x > p1.x
         {
             rects.push(Bounds::new(
@@ -1469,10 +1497,21 @@ pub(crate) fn range_rects(
                 ),
             ));
         }
-        if next <= cur {
+        if seg_end >= range.end {
             break;
         }
-        cur = next;
+        if text.as_bytes().get(seg_end) == Some(&b'\n') {
+            // Hard break: skip the newline; the next index positions cleanly
+            // at the following row's start.
+            cur = seg_end + 1;
+            wrapped = false;
+        } else if seg_end > cur || !wrapped {
+            // Soft wrap: the boundary character itself opens the next row.
+            cur = seg_end;
+            wrapped = true;
+        } else {
+            break;
+        }
     }
     rects
 }
@@ -1928,5 +1967,64 @@ mod tests {
         ];
         let flat = flatten_runs(&runs, &theme, false);
         assert_eq!(flat.links, vec![(0..9, "https://x.dev".to_string())]);
+    }
+
+    #[gpui::test]
+    fn wrapped_selection_wash_rows_start_at_the_left_edge(cx: &mut gpui::TestAppContext) {
+        // Regression: `position_for_index` reports a soft-wrap boundary index
+        // at the END of the previous row, so the row walk used to resume each
+        // continuation row one character in — its first glyph went unwashed.
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        const TEXT: &str = "alpha beta gamma delta epsilon zeta";
+        const LINE_HEIGHT: f32 = 20.0;
+
+        struct WrapProbe {
+            layout: Rc<RefCell<Option<gpui::TextLayout>>>,
+        }
+        impl gpui::Render for WrapProbe {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                let styled = StyledText::new(TEXT);
+                *self.layout.borrow_mut() = Some(styled.layout().clone());
+                // The test text system advances 0.6em per char: 6px at 10px —
+                // a 100px column wraps the sentence across several rows.
+                div()
+                    .w(px(100.0))
+                    .text_size(px(10.0))
+                    .line_height(px(LINE_HEIGHT))
+                    .child(styled)
+            }
+        }
+
+        let layout = Rc::new(RefCell::new(None));
+        let window = cx.open_window(gpui::size(px(400.0), px(300.0)), {
+            let layout = layout.clone();
+            move |_, _| WrapProbe { layout }
+        });
+        cx.run_until_parked();
+        let _visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let layout = layout.borrow().clone().expect("probe rendered its text");
+
+        let rects = range_rects(&layout, TEXT, &(0..TEXT.len()), 0.0, 0.0);
+        assert!(
+            rects.len() >= 2,
+            "the probe text must soft-wrap; got {} row(s)",
+            rects.len()
+        );
+        let left = layout.bounds().origin.x;
+        assert_eq!(rects[0].origin.x, left);
+        for rect in &rects[1..] {
+            // Continuation rows wash flush from the element's left edge —
+            // including the wrap-boundary character that opens the row.
+            assert_eq!(rect.origin.x, left);
+        }
+        for pair in rects.windows(2) {
+            assert_eq!(pair[1].origin.y - pair[0].origin.y, px(LINE_HEIGHT));
+        }
     }
 }
