@@ -3539,18 +3539,18 @@ impl Composer {
             _input_events: input_events,
         };
         // Dev knob: pre-stage attachments (drop/paste can't be synthesized on
-        // a rig) — `COMET_ATTACH=/path/a.png[,/path/b.png]`, and
-        // `COMET_ATTACH_PREVIEW=1` boots with the first one's lightbox open.
+        // a rig) — `COMET_ATTACH=/path/file[,/path/folder]`, and
+        // `COMET_ATTACH_PREVIEW=1` boots with the first image's lightbox open.
         if let Ok(spec) = std::env::var("COMET_ATTACH") {
             let staged: Vec<StagedAttachment> = spec
                 .split(',')
                 .filter(|s| !s.trim().is_empty())
-                .filter_map(|path| {
-                    match attachments::stage_file(std::path::Path::new(path.trim())) {
-                        Ok(att) => Some(att),
+                .flat_map(|path| {
+                    match attachments::stage_selected_path(std::path::Path::new(path.trim())) {
+                        Ok(attachments) => attachments,
                         Err(err) => {
                             tracing::warn!(%path, error = %err, "COMET_ATTACH stage failed");
-                            None
+                            Vec::new()
                         }
                     }
                 })
@@ -3561,7 +3561,7 @@ impl Composer {
                     .find_map(|att| att.image().map(|image| (att, image)))
             {
                 composer.preview = Some(attachments::PreviewImage {
-                    name: first.name.clone().into(),
+                    name: first.display_name.clone().into(),
                     image: image.clone(),
                 });
             }
@@ -3608,17 +3608,15 @@ impl Composer {
         cx.notify();
     }
 
-    /// Stage image files (picker / drop / pasted paths). Non-images are
-    /// skipped silently (matching the original's `image/*` filter); read
-    /// failures and oversize files surface in the failure notice.
+    /// Stage files or folders selected by the picker, dropped, or pasted from
+    /// the file manager. Folders expand recursively into deterministic,
+    /// folder-relative attachments. Images get thumbnails; other regular files
+    /// get document tiles. Failures surface in the composer notice.
     pub(crate) fn add_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         let mut staged = Vec::new();
         for path in &paths {
-            if attachments::format_by_extension(path).is_none() {
-                continue;
-            }
-            match attachments::stage_file(path) {
-                Ok(att) => staged.push(att),
+            match attachments::stage_selected_path(path) {
+                Ok(attachments) => staged.extend(attachments),
                 Err(message) => {
                     self.failure = Some(message.into());
                     cx.notify();
@@ -3639,12 +3637,12 @@ impl Composer {
     }
 
     /// Drop a deleted chat's per-chat composer state — staged attachments hold
-    /// raw image bytes, and a deleted chat's stage could never be sent again.
+    /// raw file bytes, and a deleted chat's stage could never be sent again.
     pub fn purge_chat(&mut self, chat_id: &str) {
         self.attachments.remove(chat_id);
     }
 
-    /// Staged attachment strip: 56px image thumbnails or text-file tiles with
+    /// Staged attachment strip: 56px image thumbnails or document tiles with
     /// a remove button revealed on hover. Images open the full-size preview.
     fn render_attachment_strip(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let staged = self.staged();
@@ -3662,7 +3660,7 @@ impl Composer {
             let group: SharedString = format!("composer-att-{}", att.id).into();
             let attachment: gpui::AnyElement = if let Some(image) = att.image() {
                 let preview = attachments::PreviewImage {
-                    name: att.name.clone().into(),
+                    name: att.display_name.clone().into(),
                     image: image.clone(),
                 };
                 div()
@@ -3681,7 +3679,7 @@ impl Composer {
                     .into_any_element()
             } else {
                 div()
-                    .id(("composer-att-text", ix))
+                    .id(("composer-att-file", ix))
                     .size(px(STRIP_THUMB))
                     .rounded(px(8.0))
                     .border_1()
@@ -3699,9 +3697,12 @@ impl Composer {
                     )
                     .child(
                         div()
+                            .max_w(px(STRIP_THUMB - 8.0))
+                            .overflow_hidden()
+                            .truncate()
                             .text_size(px(9.0))
                             .text_color(theme.text_muted)
-                            .child("Pasted text"),
+                            .child(att.display_basename().to_string()),
                     )
                     .into_any_element()
             };
@@ -3741,12 +3742,11 @@ impl Composer {
         Some(strip)
     }
 
-    /// Paperclip: the native image picker (the original's hidden
-    /// `<input type=file accept=image/* multiple>`).
+    /// Paperclip: the native multi-file and folder picker.
     fn open_file_picker(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
-            directories: false,
+            directories: true,
             multiple: true,
             prompt: Some("Attach".into()),
         });
@@ -4589,10 +4589,10 @@ impl Composer {
         // Attachment-only sends echo the placeholder body used after upload,
         // so the bubble never renders empty while the files are staging.
         let echo_text = if text.is_empty() && !staged.is_empty() {
-            if staged.iter().all(StagedAttachment::is_text) {
-                attachments::TEXT_ATTACHMENT_ONLY_TEXT.to_string()
-            } else {
+            if staged.iter().all(|attachment| attachment.image().is_some()) {
                 attachments::ATTACHMENT_ONLY_TEXT.to_string()
+            } else {
+                attachments::FILE_ATTACHMENT_ONLY_TEXT.to_string()
             }
         } else {
             text.clone()
@@ -4906,11 +4906,11 @@ impl Composer {
                 // Stage every attachment on the host device (sequential — the
                 // chunks share one channel), then thread typed refs into the
                 // persisted prompt. Only images enter RunRequest.attachments;
-                // pasted text is opened from the explicit local path.
+                // all other files are opened from their explicit local paths.
                 let mut content = text.clone();
                 let mut attachment_paths: Vec<String> = Vec::new();
                 let mut image_paths: Vec<String> = Vec::new();
-                let mut text_paths: Vec<String> = Vec::new();
+                let mut file_paths: Vec<String> = Vec::new();
                 if !staged.is_empty() {
                     for att in &staged {
                         match attachments::upload_attachment(
@@ -4923,7 +4923,7 @@ impl Composer {
                         {
                             Ok(path) => attachment_paths.push(path),
                             Err(err) => {
-                                tracing::warn!(name = %att.name, error = %err, "attachment upload failed");
+                                tracing::warn!(name = %att.display_name, error = %err, "attachment upload failed");
                                 return Err(
                                     "Couldn't upload the attachment — the device may be offline."
                                         .to_string(),
@@ -4938,23 +4938,23 @@ impl Composer {
                             attachments::seed_attachment(
                                 &seed_device,
                                 path,
-                                &att.name,
+                                &att.display_name,
                                 image.clone(),
                             );
                             if seed_device != device_id {
                                 attachments::seed_attachment(
                                     &device_id,
                                     path,
-                                    &att.name,
+                                    &att.display_name,
                                     image.clone(),
                                 );
                             }
                         } else {
-                            text_paths.push(path.clone());
+                            file_paths.push(path.clone());
                         }
                     }
                     content =
-                        attachments::with_attachment_files(&text, &image_paths, &text_paths);
+                        attachments::with_attachment_files(&text, &image_paths, &file_paths);
                     // Refresh the echo in place with the attachment refs
                     // (same id, same clock — the bubble grows its thumbnails
                     // without flickering).
