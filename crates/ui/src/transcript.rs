@@ -408,6 +408,9 @@ pub fn rows_for_entry(
                 is_error,
                 resolved,
             } => {
+                if id == comet_proto::OMP_GOAL_STATE_CALL_ID {
+                    continue;
+                }
                 pending_group.push(ToolItem {
                     id: id.clone().into(),
                     call: call.clone(),

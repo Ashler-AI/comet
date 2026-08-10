@@ -268,6 +268,16 @@ pub enum PickerKind {
     Traits,
 }
 
+/// Command catalogs vary by harness, repository, and owning device: project
+/// commands and skills are discovered from `cwd`, while remote hosts can have a
+/// different OMP installation and plugin set.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CommandCatalogKey {
+    harness: HarnessId,
+    cwd: String,
+    target: Option<String>,
+}
+
 pub struct Pickers {
     state: Entity<AppState>,
     config: DraftConfig,
@@ -285,7 +295,7 @@ pub struct Pickers {
     open: Option<PickerKind>,
     harnesses: Loadable<Vec<HarnessDescriptor>>,
     models: HashMap<HarnessId, Loadable<Vec<Model>>>,
-    commands: HashMap<HarnessId, Loadable<Vec<HarnessCommand>>>,
+    commands: HashMap<CommandCatalogKey, Loadable<Vec<HarnessCommand>>>,
     refs: Loadable<Vec<RepoRef>>,
     /// Space id the `refs` slot belongs to (invalidated on space change).
     refs_space: Option<String>,
@@ -783,10 +793,19 @@ impl Pickers {
             .unwrap_or_default()
     }
 
+    fn command_catalog_key(&self, harness: HarnessId, cx: &App) -> CommandCatalogKey {
+        CommandCatalogKey {
+            harness,
+            cwd: self.command_cwd(cx),
+            target: self.space_target(cx),
+        }
+    }
+
     fn ensure_commands(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+        let key = self.command_catalog_key(harness, cx);
         if self
             .commands
-            .get(&harness)
+            .get(&key)
             .is_some_and(|slot| !matches!(slot, Loadable::Idle))
         {
             return;
@@ -794,17 +813,15 @@ impl Pickers {
         let Some(engine) = self.engine(cx) else {
             return;
         };
-        let target = self.space_target(cx);
-        let cwd = self.command_cwd(cx);
-        self.commands.insert(harness, Loadable::Loading);
+        let mut params = serde_json::json!({ "harness": key.harness, "cwd": key.cwd });
+        if let (Some(target), Some(object)) = (&key.target, params.as_object_mut()) {
+            object.insert(
+                "targetDeviceId".into(),
+                serde_json::Value::String(target.clone()),
+            );
+        }
+        self.commands.insert(key.clone(), Loadable::Loading);
         cx.spawn(async move |this, cx| {
-            let mut params = serde_json::json!({ "harness": harness, "cwd": cwd });
-            if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
-                object.insert(
-                    "targetDeviceId".into(),
-                    serde_json::Value::String(target.clone()),
-                );
-            }
             let result = engine
                 .client()
                 .call(methods::LIST_HARNESS_COMMANDS, params)
@@ -817,7 +834,7 @@ impl Pickers {
                     },
                     Err(err) => Loadable::Error(err.to_string()),
                 };
-                pickers.commands.insert(harness, loaded);
+                pickers.commands.insert(key, loaded);
                 cx.notify();
             })
             .ok();
@@ -833,8 +850,12 @@ impl Pickers {
     }
 
     pub fn harness_commands<'a>(&'a self, cx: &App) -> &'a [HarnessCommand] {
-        self.effective_harness(cx)
-            .and_then(|harness| self.commands.get(&harness))
+        let Some(harness) = self.effective_harness(cx) else {
+            return &[];
+        };
+        let key = self.command_catalog_key(harness, cx);
+        self.commands
+            .get(&key)
             .and_then(Loadable::ready)
             .map(Vec::as_slice)
             .unwrap_or_default()

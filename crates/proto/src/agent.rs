@@ -102,11 +102,27 @@ impl OmpAdvisorSyncBacklog {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct HarnessCommandSubcommand {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HarnessCommand {
     pub name: String,
     pub description: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subcommands: Vec<HarnessCommandSubcommand>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -173,6 +189,11 @@ pub struct AgentActivity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 }
+
+/// Hidden transcript carrier for OMP's session-level goal state. The UI keeps
+/// it out of the conversation while using the persisted part for sidebar state.
+pub const OMP_GOAL_STATE_CALL_ID: &str = "omp-goal-state";
+pub const OMP_GOAL_STATE_CALL_NAME: &str = "omp_goal_state";
 
 /// A decoded tool invocation, reduced to the fields each kind renders.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

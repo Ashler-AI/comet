@@ -3311,8 +3311,14 @@ mod edge_url_tests {
         use comet_sync::SyncError;
         // The edge answered: the verdict won't change until the session or
         // credential does — crawl instead of hammering the Worker.
-        assert_eq!(join_retry_cap(&SyncError::HttpRejected(403)), REJECTED_RETRY_CAP);
-        assert_eq!(join_retry_cap(&SyncError::HttpRejected(404)), REJECTED_RETRY_CAP);
+        assert_eq!(
+            join_retry_cap(&SyncError::HttpRejected(403)),
+            REJECTED_RETRY_CAP
+        );
+        assert_eq!(
+            join_retry_cap(&SyncError::HttpRejected(404)),
+            REJECTED_RETRY_CAP
+        );
         // An expired bearer heals on the very next dial (the URL provider
         // re-reads the token), so 401 keeps the fast reconnect cap…
         assert_eq!(
