@@ -37,7 +37,7 @@ use comet_rpc::{RpcError, methods};
 use crate::attachments::{self, StagedAttachment};
 use crate::motion;
 use crate::pickers::Pickers;
-use crate::state::{AppState, Indicator};
+use crate::state::{AppState, Indicator, latest_active_omp_goal};
 use crate::theme::Theme;
 
 // ---------------------------------------------------------------------------
@@ -5582,6 +5582,77 @@ impl Composer {
             .into_any_element()
     }
 
+    fn render_active_goal_indicator(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let goal = latest_active_omp_goal(&self.state.read(cx).transcript)?;
+        let status: SharedString = goal.status.replace('-', " ").into();
+        let objective: SharedString = goal.objective.into();
+        Some(
+            div()
+                .id("composer-active-omp-goal")
+                .mx(px(4.0))
+                .h(px(32.0))
+                .flex_none()
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(theme.accent.opacity(0.16))
+                .bg(theme.accent.opacity(0.055))
+                .px(px(9.0))
+                .flex()
+                .items_center()
+                .gap(px(7.0))
+                .child(div().size(px(6.0)).rounded_full().bg(theme.accent))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(10.5))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme.accent)
+                        .child("OMP goal"),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(10.5))
+                        .text_color(theme.text)
+                        .child(objective),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(9.5))
+                        .text_color(theme.text_faint)
+                        .child(status),
+                )
+                .child(
+                    div()
+                        .id("composer-drop-omp-goal")
+                        .size(px(22.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(6.0))
+                        .cursor_pointer()
+                        .hover(|element| element.bg(theme.glass_hover()))
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.submit_command("/goal drop", cx)),
+                        )
+                        .child(
+                            crate::icons::icon(crate::icons::CLOSE)
+                                .size(px(10.0))
+                                .text_color(theme.text_faint),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_send_button(
         &mut self,
         mode: SendButtonMode,
@@ -5762,6 +5833,7 @@ impl Render for Composer {
         let expanded = self.expanded_mode;
 
         let failure = self.failure.clone();
+        let active_goal = self.render_active_goal_indicator(&theme, cx);
         // Centered composer column (comet `mx-auto w-full max-w-3xl`).
         let container = div()
             .w_full()
@@ -5827,7 +5899,8 @@ impl Render for Composer {
                         )
                         .child(div().min_w_0().child(message)),
                 )
-            });
+            })
+            .children(active_goal);
 
         if wizard_active {
             let wizard = self.render_wizard(cx);

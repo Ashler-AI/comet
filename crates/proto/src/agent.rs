@@ -125,6 +125,34 @@ pub struct HarnessCommand {
     pub source: Option<String>,
 }
 
+/// OMP executes `/goal` over RPC but current releases omit this TUI-backed
+/// command from `available_commands_update`. Both the harness adapter and the
+/// UI's cold-catalog fallback use one canonical command contract.
+pub fn omp_goal_command() -> HarnessCommand {
+    HarnessCommand {
+        name: "goal".into(),
+        description: "Toggle goal mode (persistent autonomous objective for this session)".into(),
+        input_hint: Some("[objective]".into()),
+        aliases: Vec::new(),
+        subcommands: [
+            ("set", "Set or replace the goal", Some("<objective>")),
+            ("show", "Show current goal details", None),
+            ("pause", "Pause the current goal", None),
+            ("resume", "Resume a paused goal", None),
+            ("drop", "Drop the current goal", None),
+            ("budget", "Adjust the token budget", Some("<N|off>")),
+        ]
+        .into_iter()
+        .map(|(name, description, usage)| HarnessCommandSubcommand {
+            name: name.into(),
+            description: description.into(),
+            usage: usage.map(str::to_string),
+        })
+        .collect(),
+        source: Some("builtin".into()),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelOption {

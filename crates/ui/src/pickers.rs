@@ -278,6 +278,28 @@ struct CommandCatalogKey {
     target: Option<String>,
 }
 
+fn complete_command_catalog(
+    harness: HarnessId,
+    mut commands: Vec<HarnessCommand>,
+) -> Vec<HarnessCommand> {
+    if harness == HarnessId::Omp && !commands.iter().any(|command| command.name == "goal") {
+        commands.push(comet_proto::omp_goal_command());
+    }
+    commands
+}
+
+fn command_catalog_or_fallback<'a>(
+    harness: HarnessId,
+    loaded: Option<&'a Vec<HarnessCommand>>,
+    omp_fallback: &'a HarnessCommand,
+) -> &'a [HarnessCommand] {
+    match loaded {
+        Some(commands) => commands,
+        None if harness == HarnessId::Omp => std::slice::from_ref(omp_fallback),
+        None => &[],
+    }
+}
+
 pub struct Pickers {
     state: Entity<AppState>,
     config: DraftConfig,
@@ -296,6 +318,9 @@ pub struct Pickers {
     harnesses: Loadable<Vec<HarnessDescriptor>>,
     models: HashMap<HarnessId, Loadable<Vec<Model>>>,
     commands: HashMap<CommandCatalogKey, Loadable<Vec<HarnessCommand>>>,
+    /// Synchronous cold-start metadata: `/goal` stays discoverable while the
+    /// repository/device-specific OMP catalog is still loading.
+    omp_command_fallback: HarnessCommand,
     refs: Loadable<Vec<RepoRef>>,
     /// Space id the `refs` slot belongs to (invalidated on space change).
     refs_space: Option<String>,
@@ -412,6 +437,7 @@ impl Pickers {
             harnesses: Loadable::Idle,
             models: HashMap::new(),
             commands: HashMap::new(),
+            omp_command_fallback: comet_proto::omp_goal_command(),
             refs: Loadable::Idle,
             refs_space: None,
             active: 0,
@@ -829,7 +855,9 @@ impl Pickers {
             this.update(cx, |pickers, cx| {
                 let loaded = match result {
                     Ok(value) => match serde_json::from_value::<Vec<HarnessCommand>>(value) {
-                        Ok(commands) => Loadable::Ready(commands),
+                        Ok(commands) => {
+                            Loadable::Ready(complete_command_catalog(key.harness, commands))
+                        }
                         Err(err) => Loadable::Error(err.to_string()),
                     },
                     Err(err) => Loadable::Error(err.to_string()),
@@ -854,11 +882,11 @@ impl Pickers {
             return &[];
         };
         let key = self.command_catalog_key(harness, cx);
-        self.commands
-            .get(&key)
-            .and_then(Loadable::ready)
-            .map(Vec::as_slice)
-            .unwrap_or_default()
+        command_catalog_or_fallback(
+            harness,
+            self.commands.get(&key).and_then(Loadable::ready),
+            &self.omp_command_fallback,
+        )
     }
 
     /// ListRefs for the selected SPACE's folder — targeted at the space's
@@ -2872,5 +2900,29 @@ mod tests {
         // …and opted back in by COMET_HARNESS=mock (the e2e rig).
         assert_eq!(visible_harnesses_impl(&mixed, true).len(), 2);
         assert_eq!(visible_harnesses_impl(&mixed, true)[0].id, HarnessId::Mock);
+    }
+
+    #[test]
+    fn omp_goal_is_available_before_and_after_the_dynamic_catalog_loads() {
+        let fallback = comet_proto::omp_goal_command();
+        assert_eq!(
+            command_catalog_or_fallback(HarnessId::Omp, None, &fallback)[0].name,
+            "goal"
+        );
+        assert!(command_catalog_or_fallback(HarnessId::ClaudeCode, None, &fallback).is_empty());
+
+        let merged = complete_command_catalog(
+            HarnessId::Omp,
+            vec![HarnessCommand {
+                name: "goal".into(),
+                description: "Runtime metadata".into(),
+                input_hint: None,
+                aliases: Vec::new(),
+                subcommands: Vec::new(),
+                source: Some("builtin".into()),
+            }],
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].description, "Runtime metadata");
     }
 }

@@ -101,6 +101,60 @@ async fn model_and_command_catalogs_come_from_omp() {
 }
 
 #[tokio::test]
+async fn goal_command_ack_refreshes_state_without_goal_updated() {
+    let _env = env_lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("OMP_ARGV_LOG", temp.path().join("argv"));
+        std::env::set_var("OMP_OMIT_GOAL_EVENTS", "1");
+    }
+    let harness = OmpHarness::new().with_executable(fixture_path());
+    let mut run_request = request(None);
+    run_request.prompt = "/goal set Persistent editor indicator".into();
+    let stream = harness
+        .run(run_request, controls())
+        .await
+        .expect("run starts");
+    let events = tokio::time::timeout(
+        Duration::from_secs(10),
+        stream
+            .map(|event| event.expect("valid RPC event"))
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .expect("goal command completes");
+
+    let goal = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolCall {
+                id,
+                call:
+                    comet_proto::ToolCall::Unknown {
+                        input: Some(input), ..
+                    },
+            } if id == comet_proto::OMP_GOAL_STATE_CALL_ID => input.get("goal"),
+            _ => None,
+        })
+        .next_back()
+        .expect("refreshed goal state");
+    assert_eq!(
+        goal.get("objective").and_then(serde_json::Value::as_str),
+        Some("Persistent editor indicator")
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        }
+    )));
+    unsafe {
+        std::env::remove_var("OMP_OMIT_GOAL_EVENTS");
+    }
+}
+
+#[tokio::test]
 async fn fake_omp_proves_rpc_mode_execution_and_event_mapping() {
     let _env = env_lock().await;
     let temp = tempfile::tempdir().unwrap();

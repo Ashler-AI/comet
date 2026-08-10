@@ -37,6 +37,55 @@ use comet_proto::{
     SessionRoomProjection, Space,
 };
 use comet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActiveHarnessGoal {
+    pub objective: String,
+    pub status: String,
+}
+
+/// The newest normalized OMP goal-state carrier wins, including a null goal
+/// emitted by `/goal drop`. The transcript persists this hidden part, so every
+/// editor surface can project the active goal after navigation or restart.
+pub(crate) fn latest_active_omp_goal(entries: &[SessionMessageEntry]) -> Option<ActiveHarnessGoal> {
+    for part in entries
+        .iter()
+        .rev()
+        .flat_map(|entry| entry.parts.iter().rev())
+    {
+        let MessagePart::Tool {
+            id,
+            call:
+                comet_proto::ToolCall::Unknown {
+                    name,
+                    input: Some(input),
+                },
+            ..
+        } = part
+        else {
+            continue;
+        };
+        if id != comet_proto::OMP_GOAL_STATE_CALL_ID
+            || name != comet_proto::OMP_GOAL_STATE_CALL_NAME
+        {
+            continue;
+        }
+        let goal = input.get("goal")?;
+        let objective = goal
+            .get("objective")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|objective| !objective.is_empty())?
+            .to_string();
+        let status = goal
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("active")
+            .to_string();
+        return Some(ActiveHarnessGoal { objective, status });
+    }
+    None
+}
 /// Hidden compatibility artifact from the removed virtual Scaffold space.
 /// The synced data remains untouched; the headed app no longer presents it.
 const LEGACY_SCAFFOLD_SPACE_ID_PREFIX: &str = "comet-scaffold-space-";

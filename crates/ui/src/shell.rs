@@ -43,8 +43,11 @@ use crate::settings::{
     Density, KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
     SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
 };
+#[cfg(test)]
+use crate::state::ActiveHarnessGoal;
 use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, GatePhase, Indicator, format_time_ago,
+    latest_active_omp_goal,
 };
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
@@ -696,52 +699,6 @@ fn latest_goal_items(
             } => Some(items.as_slice()),
             _ => None,
         })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ActiveHarnessGoal {
-    objective: String,
-    status: String,
-}
-
-fn latest_active_omp_goal(entries: &[comet_doc::SessionMessageEntry]) -> Option<ActiveHarnessGoal> {
-    for part in entries
-        .iter()
-        .rev()
-        .flat_map(|entry| entry.parts.iter().rev())
-    {
-        let comet_doc::MessagePart::Tool {
-            id,
-            call:
-                comet_proto::ToolCall::Unknown {
-                    name,
-                    input: Some(input),
-                },
-            ..
-        } = part
-        else {
-            continue;
-        };
-        if id != comet_proto::OMP_GOAL_STATE_CALL_ID
-            || name != comet_proto::OMP_GOAL_STATE_CALL_NAME
-        {
-            continue;
-        }
-        let goal = input.get("goal")?;
-        let objective = goal
-            .get("objective")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|objective| !objective.is_empty())?
-            .to_string();
-        let status = goal
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("active")
-            .to_string();
-        return Some(ActiveHarnessGoal { objective, status });
-    }
-    None
 }
 
 #[derive(Debug, Clone, PartialEq)]
