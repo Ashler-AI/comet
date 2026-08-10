@@ -31,9 +31,10 @@ for arg in "$@"; do
   fi
   prev="$arg"
 done
+ACTIVE_GOAL="${OMP_ACTIVE_GOAL:-}"
 
 printf '%s\n' '{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2],"maxFrameBytes":1048576,"maxReassembledFrameBytes":67108864}'
-if [ -n "${OMP_ACTIVE_GOAL:-}" ]; then
+if [ -n "$ACTIVE_GOAL" ]; then
   printf '%s\n' '{"type":"available_commands_update","commands":[{"name":"goal","description":"Toggle goal mode","input":{"hint":"[objective]"},"subcommands":[{"name":"set","description":"Set or replace the goal","usage":"<objective>"},{"name":"drop","description":"Drop the current goal"}]},{"name":"ralplan","description":"Plan with consensus","input":{"hint":"goal"}},{"name":"security","description":"Run security review"}]}'
 else
   printf '%s\n' '{"type":"available_commands_update","commands":[{"name":"ralplan","description":"Plan with consensus","input":{"hint":"goal"}},{"name":"security","description":"Run security review"}]}'
@@ -54,8 +55,8 @@ while IFS= read -r line; do
       ;;
     get_state)
       [ -z "${OMP_SESSION_LOG:-}" ] || printf '%s\n' "get_state" >> "$OMP_SESSION_LOG"
-      if [ -n "${OMP_ACTIVE_GOAL:-}" ]; then
-        printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"get_state\",\"success\":true,\"data\":{\"sessionId\":\"$SESSION_ID\",\"model\":{\"provider\":\"openai-codex\",\"id\":\"gpt-5.6-sol\"},\"todoPhases\":[],\"goalMode\":{\"enabled\":true,\"mode\":\"active\",\"goal\":{\"id\":\"goal-1\",\"objective\":\"Verify Comet sidebar integration\",\"status\":\"active\"}}}}"
+      if [ -n "$ACTIVE_GOAL" ]; then
+        printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"get_state\",\"success\":true,\"data\":{\"sessionId\":\"$SESSION_ID\",\"model\":{\"provider\":\"openai-codex\",\"id\":\"gpt-5.6-sol\"},\"todoPhases\":[],\"goalMode\":{\"enabled\":true,\"mode\":\"active\",\"goal\":{\"id\":\"goal-1\",\"objective\":\"$ACTIVE_GOAL\",\"status\":\"active\"}}}}"
       else
         printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"get_state\",\"success\":true,\"data\":{\"sessionId\":\"$SESSION_ID\",\"model\":{\"provider\":\"openai-codex\",\"id\":\"gpt-5.6-sol\"},\"todoPhases\":[]}}"
       fi
@@ -66,12 +67,21 @@ while IFS= read -r line; do
         printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"prompt\",\"success\":false,\"error\":\"$OMP_PROMPT_ERROR_DETAILS\"}"
         continue
       fi
-      printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"prompt\",\"success\":true,\"data\":{\"agentInvoked\":true}}"
-      if has "$line" '/goal drop'; then
-        printf '%s\n' '{"type":"goal_updated","goal":null}'
-        finish_turn
+      if has "$line" '/goal set'; then
+        ACTIVE_GOAL="Persistent editor indicator"
+        printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"prompt\",\"success\":true,\"data\":{\"agentInvoked\":false}}"
+        if [ -z "${OMP_OMIT_GOAL_EVENTS:-}" ]; then
+          printf '%s\n' '{"type":"goal_updated","goal":{"id":"goal-1","objective":"Persistent editor indicator","status":"active"}}'
+        fi
         continue
       fi
+      if has "$line" '/goal drop'; then
+        ACTIVE_GOAL=""
+        printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"prompt\",\"success\":true,\"data\":{\"agentInvoked\":false}}"
+        [ -n "${OMP_OMIT_GOAL_EVENTS:-}" ] || printf '%s\n' '{"type":"goal_updated","goal":null}'
+        continue
+      fi
+      printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"prompt\",\"success\":true,\"data\":{\"agentInvoked\":true}}"
       if [ "$turn_open" = "1" ]; then
         # A steer landing in the live turn: the same turn absorbs it and
         # settles with a single agent_end.

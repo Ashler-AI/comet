@@ -528,31 +528,6 @@ fn goal_state_event_from_frame(frame: &Value) -> Option<AgentEvent> {
     })
 }
 
-fn omp_goal_command() -> HarnessCommand {
-    HarnessCommand {
-        name: "goal".into(),
-        description: "Toggle goal mode (persistent autonomous objective for this session)".into(),
-        input_hint: Some("[objective]".into()),
-        aliases: Vec::new(),
-        subcommands: [
-            ("set", "Set or replace the goal", Some("<objective>")),
-            ("show", "Show current goal details", None),
-            ("pause", "Pause the current goal", None),
-            ("resume", "Resume a paused goal", None),
-            ("drop", "Drop the current goal", None),
-            ("budget", "Adjust the token budget", Some("<N|off>")),
-        ]
-        .into_iter()
-        .map(|(name, description, usage)| HarnessCommandSubcommand {
-            name: name.into(),
-            description: description.into(),
-            usage: usage.map(str::to_string),
-        })
-        .collect(),
-        source: Some("builtin".into()),
-    }
-}
-
 fn commands_from_frame(frame: &Value) -> Option<Vec<HarnessCommand>> {
     let mut commands = frame
         .get("commands")?
@@ -609,7 +584,7 @@ fn commands_from_frame(frame: &Value) -> Option<Vec<HarnessCommand>> {
     // commands from `available_commands_update`. Keep runtime metadata when
     // OMP starts advertising it; otherwise expose the executable command.
     if !commands.iter().any(|command| command.name == "goal") {
-        commands.push(omp_goal_command());
+        commands.push(comet_proto::omp_goal_command());
     }
     Some(commands)
 }
@@ -720,6 +695,27 @@ pub(crate) struct RpcRunOptions {
     /// The resume id the caller passed to `--resume`; the reported session id
     /// must resolve to it or the run fails (the engine then retries fresh).
     pub expected_resume: Option<String>,
+}
+#[derive(Debug)]
+struct PendingPrompt {
+    id: String,
+    refresh_goal_state: bool,
+}
+
+impl PendingPrompt {
+    fn new(id: String, prompt: &str) -> Self {
+        Self {
+            id,
+            refresh_goal_state: is_goal_command(prompt),
+        }
+    }
+}
+
+fn is_goal_command(prompt: &str) -> bool {
+    let Some(rest) = prompt.trim_start().strip_prefix("/goal") else {
+        return false;
+    };
+    rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace)
 }
 
 /// Drive one persistent RPC-mode session: first prompt, streamed turns,
@@ -860,9 +856,12 @@ pub(crate) async fn run_rpc(
 
     // Stage 4: first prompt. The ack is immediate (acceptance, not
     // completion); its response is matched inline by the session loop below.
-    let mut outstanding_prompts = vec![client.send_command(
-        "prompt",
-        prompt_fields(&request.prompt, image_content(&request.attachments)),
+    let mut outstanding_prompts = vec![PendingPrompt::new(
+        client.send_command(
+            "prompt",
+            prompt_fields(&request.prompt, image_content(&request.attachments)),
+        ),
+        &request.prompt,
     )];
 
     let mut steering_open = true;
@@ -1031,8 +1030,8 @@ pub(crate) async fn run_rpc(
                     }
                     "response" => {
                         let id = frame.get("id").and_then(Value::as_str).unwrap_or("");
-                        if let Some(index) = outstanding_prompts.iter().position(|p| p == id) {
-                            outstanding_prompts.swap_remove(index);
+                        if let Some(index) = outstanding_prompts.iter().position(|prompt| prompt.id == id) {
+                            let prompt = outstanding_prompts.swap_remove(index);
                             if frame.get("success").and_then(Value::as_bool) != Some(true) {
                                 let message = frame
                                     .get("error")
@@ -1044,6 +1043,27 @@ pub(crate) async fn run_rpc(
                                     "{} prompt failed: {message}",
                                     options.process_label
                                 )));
+                            }
+                            // Goal commands mutate session state synchronously but OMP
+                            // 17.2.9 does not reliably emit `goal_updated` over RPC.
+                            // Snapshot after the ack so the editor indicator appears
+                            // immediately and `/goal drop` clears persisted state.
+                            if prompt.refresh_goal_state {
+                                match client.request("get_state", Map::new()).await {
+                                    Ok(state) => {
+                                        let event = goal_state_event_from_session_state(&state)
+                                            .unwrap_or_else(|| goal_state_event(Value::Null, None));
+                                        if events.send(Ok(event)).await.is_err() {
+                                            let _ = child.kill().await;
+                                            return Ok(());
+                                        }
+                                    }
+                                    Err(error) => tracing::warn!(
+                                        target: "comet_harness::omp",
+                                        %error,
+                                        "goal command state refresh failed"
+                                    ),
+                                }
                             }
                             // Local-only prompt: completed without agent events.
                             if frame.pointer("/data/agentInvoked").and_then(Value::as_bool)
@@ -1115,9 +1135,10 @@ pub(crate) async fn run_rpc(
                         return Ok(());
                     }
                     done_emitted = false;
-                    outstanding_prompts.push(
+                    outstanding_prompts.push(PendingPrompt::new(
                         client.send_command("prompt", prompt_fields(&message.prompt, Vec::new())),
-                    );
+                        &message.prompt,
+                    ));
                 }
                 None => steering_open = false,
             },
