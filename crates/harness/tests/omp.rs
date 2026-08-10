@@ -85,10 +85,19 @@ async fn model_and_command_catalogs_come_from_omp() {
     );
 
     let commands = harness.commands("").await.expect("command catalog");
-    assert_eq!(commands.len(), 2);
+    assert_eq!(commands.len(), 3);
     assert_eq!(commands[0].name, "ralplan");
     assert_eq!(commands[0].input_hint.as_deref(), Some("goal"));
     assert_eq!(commands[1].name, "security");
+    assert_eq!(commands[2].name, "goal");
+    assert_eq!(
+        commands[2]
+            .subcommands
+            .iter()
+            .map(|subcommand| subcommand.name.as_str())
+            .collect::<Vec<_>>(),
+        ["set", "show", "pause", "resume", "drop", "budget"]
+    );
 }
 
 #[tokio::test]

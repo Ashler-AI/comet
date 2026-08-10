@@ -528,60 +528,90 @@ fn goal_state_event_from_frame(frame: &Value) -> Option<AgentEvent> {
     })
 }
 
+fn omp_goal_command() -> HarnessCommand {
+    HarnessCommand {
+        name: "goal".into(),
+        description: "Toggle goal mode (persistent autonomous objective for this session)".into(),
+        input_hint: Some("[objective]".into()),
+        aliases: Vec::new(),
+        subcommands: [
+            ("set", "Set or replace the goal", Some("<objective>")),
+            ("show", "Show current goal details", None),
+            ("pause", "Pause the current goal", None),
+            ("resume", "Resume a paused goal", None),
+            ("drop", "Drop the current goal", None),
+            ("budget", "Adjust the token budget", Some("<N|off>")),
+        ]
+        .into_iter()
+        .map(|(name, description, usage)| HarnessCommandSubcommand {
+            name: name.into(),
+            description: description.into(),
+            usage: usage.map(str::to_string),
+        })
+        .collect(),
+        source: Some("builtin".into()),
+    }
+}
+
 fn commands_from_frame(frame: &Value) -> Option<Vec<HarnessCommand>> {
-    Some(
-        frame
-            .get("commands")?
-            .as_array()?
-            .iter()
-            .filter_map(|command| {
-                Some(HarnessCommand {
-                    name: command.get("name")?.as_str()?.to_string(),
-                    description: command
-                        .get("description")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    input_hint: command
-                        .pointer("/input/hint")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    aliases: command
-                        .get("aliases")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect(),
-                    subcommands: command
-                        .get("subcommands")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|subcommand| {
-                            Some(HarnessCommandSubcommand {
-                                name: subcommand.get("name")?.as_str()?.to_string(),
-                                description: subcommand
-                                    .get("description")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                usage: subcommand
-                                    .get("usage")
-                                    .and_then(Value::as_str)
-                                    .map(str::to_string),
-                            })
+    let mut commands = frame
+        .get("commands")?
+        .as_array()?
+        .iter()
+        .filter_map(|command| {
+            Some(HarnessCommand {
+                name: command.get("name")?.as_str()?.to_string(),
+                description: command
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                input_hint: command
+                    .pointer("/input/hint")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                aliases: command
+                    .get("aliases")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect(),
+                subcommands: command
+                    .get("subcommands")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|subcommand| {
+                        Some(HarnessCommandSubcommand {
+                            name: subcommand.get("name")?.as_str()?.to_string(),
+                            description: subcommand
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            usage: subcommand
+                                .get("usage")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
                         })
-                        .collect(),
-                    source: command
-                        .get("source")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                })
+                    })
+                    .collect(),
+                source: command
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
             })
-            .collect(),
-    )
+        })
+        .collect::<Vec<_>>();
+    // OMP 17.2.9 executes `/goal` in RPC mode but omits TUI-backed mode
+    // commands from `available_commands_update`. Keep runtime metadata when
+    // OMP starts advertising it; otherwise expose the executable command.
+    if !commands.iter().any(|command| command.name == "goal") {
+        commands.push(omp_goal_command());
+    }
+    Some(commands)
 }
 
 /// Bridge an RPC extension UI dialog onto Comet's question surface.
@@ -1369,6 +1399,39 @@ mod tests {
     }
 
     #[test]
+    fn command_catalog_adds_missing_goal_without_overriding_runtime_metadata() {
+        let commands = commands_from_frame(&json!({
+            "commands": [{ "name": "ralplan", "description": "Plan with consensus" }]
+        }))
+        .expect("commands");
+        let goal = commands
+            .iter()
+            .find(|command| command.name == "goal")
+            .expect("goal fallback");
+        assert_eq!(goal.input_hint.as_deref(), Some("[objective]"));
+        assert_eq!(
+            goal.subcommands
+                .iter()
+                .map(|subcommand| subcommand.name.as_str())
+                .collect::<Vec<_>>(),
+            ["set", "show", "pause", "resume", "drop", "budget"]
+        );
+
+        let commands = commands_from_frame(&json!({
+            "commands": [{ "name": "goal", "description": "Runtime goal metadata" }]
+        }))
+        .expect("commands");
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command.name == "goal")
+                .count(),
+            1
+        );
+        assert_eq!(commands[0].description, "Runtime goal metadata");
+    }
+
+    #[test]
     fn goal_updates_normalize_to_hidden_state_parts() {
         let event = goal_state_event_from_frame(&json!({
             "type": "goal_updated",
@@ -1433,7 +1496,7 @@ mod tests {
             ],
         });
         let commands = commands_from_frame(&frame).unwrap();
-        assert_eq!(commands.len(), 2);
+        assert_eq!(commands.len(), 3);
         assert_eq!(commands[0].name, "compact");
         assert_eq!(commands[0].aliases, ["shrink"]);
         assert_eq!(commands[0].input_hint.as_deref(), Some("<instructions>"));
