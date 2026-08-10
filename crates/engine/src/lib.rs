@@ -399,10 +399,13 @@ impl EngineCore {
             comet_rpc::HostRelayConfig::new(edge_url, self.device_id.clone(), Arc::new(auth));
         let nudge_host = self.doc_host.clone();
         let on_nudge: comet_rpc::NudgeHandler = Arc::new(move |chat_id: String| {
-            // Opening the doc joins its room + syncs; drain fires on the change
-            // subscription — the command executes with no standing per-chat socket.
-            match nudge_host.open_existing_or_local(&chat_id) {
-                Ok(_) => tracing::info!(chat = %chat_id, "nudge: chat doc opened"),
+            // Scaffold hosts must not open the legacy unprojected room while
+            // the verified grant frame is still in flight.
+            match nudge_host.open_for_nudge(&chat_id) {
+                Ok(Some(_)) => tracing::info!(chat = %chat_id, "nudge: chat doc opened"),
+                Ok(None) => {
+                    tracing::info!(chat = %chat_id, "nudge: waiting for verified room grant")
+                }
                 Err(err) => {
                     tracing::warn!(chat = %chat_id, error = %err, "nudge: open failed")
                 }

@@ -926,6 +926,45 @@ impl DocHost {
         self.open(chat_id)
     }
 
+    /// Open a nudged chat without allowing a Scaffold host to join an
+    /// unprojected room before its verified edge grant arrives.
+    pub(crate) fn open_for_nudge(
+        &self,
+        chat_id: &str,
+    ) -> Result<Option<Arc<ChatDocHandle>>, EngineError> {
+        if let Some(handle) = lock(&self.inner.handles).get(chat_id).cloned() {
+            handle.touch();
+            self.start_room_join(handle.clone());
+            return Ok(Some(handle));
+        }
+        if comet_proto::parse_scaffold_device_id(self.device_id()).is_none() {
+            return self.open(chat_id).map(Some);
+        }
+
+        let now = now_ms();
+        let projection = lock(&self.inner.trusted_grants)
+            .values()
+            .find_map(|trusted| {
+                let grant = &trusted.grant;
+                let deployment_id = grant.scope.deployment_id.as_deref()?;
+                (trusted.edge_derived
+                    && grant.scope.session_id.as_deref() == Some(chat_id)
+                    && grant.device_id.as_deref() == Some(self.device_id())
+                    && grant.granted_at <= now
+                    && grant.expires_at.is_some_and(|expires| now < expires)
+                    && grant.revoked_at.is_none())
+                .then(|| SessionRoomProjection {
+                    project_id: grant.scope.project_id.clone(),
+                    deployment_id: deployment_id.to_string(),
+                    session_id: chat_id.to_string(),
+                })
+            });
+        let Some(projection) = projection else {
+            return Ok(None);
+        };
+        self.open_projection(chat_id, Some(&projection)).map(Some)
+    }
+
     /// Open a chat against an exact Scaffold room selected by the control-plane
     /// attach result. Scope is allowed only when its session id is this document's
     /// id; unscoped callers retain the ordinary local s3 projection.
@@ -2885,6 +2924,10 @@ mod authority_tests {
             target_session_id: "session-a".into(),
             unknown: Default::default(),
         };
+        assert!(
+            host.open_for_nudge("session-a").unwrap().is_none(),
+            "a Scaffold host must defer nudges until the verified room grant arrives"
+        );
         host.ingest_verified_grant("session-a", &serde_json::to_vec(&envelope).unwrap())
             .unwrap();
         let exact = SessionCommandPayload::Control {
@@ -2917,7 +2960,10 @@ mod authority_tests {
             .find(|entry| entry.id == exact_id)
             .unwrap();
         assert_eq!(host.command_grant_authorization(&exact_entry), Some(true));
-        let nudged_handle = host.open_existing_or_local("session-a").unwrap();
+        let nudged_handle = host
+            .open_for_nudge("session-a")
+            .unwrap()
+            .expect("the verified room grant should route subsequent nudges");
         assert!(Arc::ptr_eq(&exact_handle, &nudged_handle));
         assert_eq!(
             nudged_handle.room_projection.as_ref(),
