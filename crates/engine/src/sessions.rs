@@ -286,7 +286,7 @@ impl SessionsEngine {
             self.inner.doc_host.get().ok_or_else(|| {
                 EngineError::Other("doc host not wired into sessions engine".into())
             })?;
-        host.open(chat_id)
+        host.open_existing_or_local(chat_id)
     }
 
     /// Register before appending the outbound command, closing the immediate
@@ -1823,5 +1823,65 @@ async fn drive_run(
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use comet_proto::SessionRoomProjection;
+    use comet_sync::DocsStore;
+
+    use crate::doc_host::DocHostConfig;
+    use crate::workspace_host::{WorkspaceHost, WorkspaceHostConfig};
+
+    #[tokio::test]
+    async fn sessions_reuse_an_existing_projected_chat_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let workspace = WorkspaceHost::open(
+            store.clone(),
+            WorkspaceHostConfig {
+                device_id: "comet-scaffold-sandbox-a-e1".into(),
+                device_name: "test".into(),
+                platform: "test".into(),
+                project_scope: "project-a".into(),
+                user_id: "accounts.google.com:owner@example.com".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "comet-scaffold-sandbox-a-e1".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        host.set_workspace(workspace);
+        let projected = host
+            .open_projection(
+                "session-a",
+                Some(&SessionRoomProjection {
+                    project_id: "project-a".into(),
+                    deployment_id: "deployment-a".into(),
+                    session_id: "session-a".into(),
+                }),
+            )
+            .unwrap();
+
+        let sessions = SessionsEngine::new(
+            "comet-scaffold-sandbox-a-e1".into(),
+            Arc::new(RunJournal::open(dir.path().join("journal")).unwrap()),
+            Arc::new(HarnessRegistry::new()),
+            27654,
+        );
+        sessions.set_doc_host(host);
+
+        let run_handle = sessions
+            .doc_handle("session-a")
+            .expect("session execution should preserve the projected room");
+        assert!(Arc::ptr_eq(&projected, &run_handle));
     }
 }
