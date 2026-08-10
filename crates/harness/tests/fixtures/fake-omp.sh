@@ -33,7 +33,11 @@ for arg in "$@"; do
 done
 
 printf '%s\n' '{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2],"maxFrameBytes":1048576,"maxReassembledFrameBytes":67108864}'
-printf '%s\n' '{"type":"available_commands_update","commands":[{"name":"ralplan","description":"Plan with consensus","input":{"hint":"goal"}},{"name":"security","description":"Run security review"}]}'
+if [ -n "${OMP_ACTIVE_GOAL:-}" ]; then
+  printf '%s\n' '{"type":"available_commands_update","commands":[{"name":"goal","description":"Toggle goal mode","input":{"hint":"[objective]"},"subcommands":[{"name":"set","description":"Set or replace the goal","usage":"<objective>"},{"name":"drop","description":"Drop the current goal"}]},{"name":"ralplan","description":"Plan with consensus","input":{"hint":"goal"}},{"name":"security","description":"Run security review"}]}'
+else
+  printf '%s\n' '{"type":"available_commands_update","commands":[{"name":"ralplan","description":"Plan with consensus","input":{"hint":"goal"}},{"name":"security","description":"Run security review"}]}'
+fi
 
 finish_turn() {
   printf '%s\n' '{"type":"message_end","message":{"role":"assistant","stopReason":"stop","usage":{"input":6,"output":4,"cacheRead":100,"cacheWrite":0,"totalTokens":110}}}'
@@ -50,7 +54,11 @@ while IFS= read -r line; do
       ;;
     get_state)
       [ -z "${OMP_SESSION_LOG:-}" ] || printf '%s\n' "get_state" >> "$OMP_SESSION_LOG"
-      printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"get_state\",\"success\":true,\"data\":{\"sessionId\":\"$SESSION_ID\",\"model\":{\"provider\":\"openai-codex\",\"id\":\"gpt-5.6-sol\"},\"todoPhases\":[]}}"
+      if [ -n "${OMP_ACTIVE_GOAL:-}" ]; then
+        printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"get_state\",\"success\":true,\"data\":{\"sessionId\":\"$SESSION_ID\",\"model\":{\"provider\":\"openai-codex\",\"id\":\"gpt-5.6-sol\"},\"todoPhases\":[],\"goalMode\":{\"enabled\":true,\"mode\":\"active\",\"goal\":{\"id\":\"goal-1\",\"objective\":\"Verify Comet sidebar integration\",\"status\":\"active\"}}}}"
+      else
+        printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"get_state\",\"success\":true,\"data\":{\"sessionId\":\"$SESSION_ID\",\"model\":{\"provider\":\"openai-codex\",\"id\":\"gpt-5.6-sol\"},\"todoPhases\":[]}}"
+      fi
       ;;
     prompt)
       [ -z "${OMP_PROMPT_LOG:-}" ] || printf '%s\n' "$line" >> "$OMP_PROMPT_LOG"
@@ -59,6 +67,11 @@ while IFS= read -r line; do
         continue
       fi
       printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"prompt\",\"success\":true,\"data\":{\"agentInvoked\":true}}"
+      if has "$line" '/goal drop'; then
+        printf '%s\n' '{"type":"goal_updated","goal":null}'
+        finish_turn
+        continue
+      fi
       if [ "$turn_open" = "1" ]; then
         # A steer landing in the live turn: the same turn absorbs it and
         # settles with a single agent_end.

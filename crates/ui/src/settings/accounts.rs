@@ -1537,11 +1537,7 @@ impl AccountsPage {
                     widgets::section_card(theme)
                         .mt(px(8.0))
                         .children(rows)
-                        .child(self.render_auto_update_row(
-                            update.harness_auto_update,
-                            theme,
-                            cx,
-                        )),
+                        .child(self.render_auto_update_row(update.harness_auto_update, theme, cx)),
                 )
                 .into_any_element(),
         )

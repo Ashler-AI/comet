@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use comet_proto::{AgentEvent, ToolCall, UserInputQuestion};
+use comet_proto::{AgentEvent, OMP_GOAL_STATE_CALL_NAME, ToolCall, UserInputQuestion};
 
 use crate::constants::MSG_INLINE_MAX;
 
@@ -253,8 +253,9 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
 
 /// Render-only privacy policy — strip heavy/sensitive tool inputs before a call enters the doc.
 ///
-/// Keeps: command / path / pattern / url / query / todo items / server+tool names.
-/// Drops: WriteFile content, EditFile old/new strings, WebFetch prompt, Mcp/Unknown input.
+/// Keeps: command / path / pattern / url / query / todo items / server+tool names,
+/// plus Comet's normalized OMP goal snapshot (the sidebar's persisted state).
+/// Drops: WriteFile content, EditFile old/new strings, WebFetch prompt, Mcp/other Unknown input.
 /// Full inputs remain only in the host's local run journal. Idempotent.
 pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
     match call {
@@ -276,6 +277,12 @@ pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
             tool: tool.clone(),
             input: None,
         },
+        ToolCall::Unknown { name, input } if name == OMP_GOAL_STATE_CALL_NAME => {
+            ToolCall::Unknown {
+                name: name.clone(),
+                input: input.clone(),
+            }
+        }
         ToolCall::Unknown { name, .. } => ToolCall::Unknown {
             name: name.clone(),
             input: None,
@@ -579,6 +586,18 @@ mod tests {
             }
         );
         assert_eq!(sanitize_tool_call(&clean), clean);
+    }
+
+    #[test]
+    fn sanitize_preserves_normalized_omp_goal_state() {
+        let call = ToolCall::Unknown {
+            name: OMP_GOAL_STATE_CALL_NAME.into(),
+            input: Some(serde_json::json!({
+                "goal": { "id": "g1", "objective": "Ship the sidebar", "status": "active" },
+                "state": { "enabled": true, "mode": "active" },
+            })),
+        };
+        assert_eq!(sanitize_tool_call(&call), call);
     }
 
     #[test]

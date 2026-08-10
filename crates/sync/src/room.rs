@@ -312,14 +312,14 @@ impl Connector for WsConnector {
             // this fetch and the handshake below can hang; the actor bounds
             // the whole dial with CONNECT_TIMEOUT.
             let url = provider.url().await?;
-            let (ws, _) = tokio_tungstenite::connect_async(&url).await.map_err(|e| {
-                match e {
+            let (ws, _) = tokio_tungstenite::connect_async(&url)
+                .await
+                .map_err(|e| match e {
                     tokio_tungstenite::tungstenite::Error::Http(response) => {
                         SyncError::HttpRejected(response.status().as_u16())
                     }
                     e => SyncError::WebSocket(e.to_string()),
-                }
-            })?;
+                })?;
             let (out_tx, out_rx) = mpsc::channel(64);
             let (in_tx, in_rx) = mpsc::channel(64);
             tokio::spawn(pump(ws, out_rx, in_tx));

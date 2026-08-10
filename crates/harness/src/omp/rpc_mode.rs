@@ -28,8 +28,9 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use comet_proto::{
-    AgentActivity, AgentActivityStatus, AgentEvent, DoneStatus, HarnessId, TodoItem, ToolCall,
-    UserInputQuestion,
+    AgentActivity, AgentActivityStatus, AgentEvent, DoneStatus, HarnessCommand,
+    HarnessCommandSubcommand, HarnessId, OMP_GOAL_STATE_CALL_ID, OMP_GOAL_STATE_CALL_NAME,
+    TodoItem, ToolCall, UserInputQuestion,
 };
 
 use crate::{HarnessError, RunControls};
@@ -37,6 +38,10 @@ use crate::{HarnessError, RunControls};
 const READY_DEADLINE: Duration = Duration::from_secs(15);
 const STATE_DEADLINE: Duration = Duration::from_secs(15);
 const INACTIVITY_LOG_INTERVAL: Duration = Duration::from_secs(300);
+/// Command metadata can change while skills, extensions, and MCP prompts finish
+/// startup. Keep the newest snapshot until the stream is briefly quiet instead
+/// of killing the catalog process after its first partial update.
+const COMMAND_CATALOG_SETTLE: Duration = Duration::from_secs(2);
 
 /// A frame from the RPC child that the session loop consumes: everything
 /// except responses to requests awaited through the pending map.
@@ -495,14 +500,42 @@ fn todo_items_from_state(state: &Value) -> Vec<TodoItem> {
         .collect()
 }
 
-fn commands_from_frame(frame: &Value) -> Option<Vec<comet_proto::HarnessCommand>> {
+fn goal_state_event(goal: Value, state: Option<Value>) -> AgentEvent {
+    AgentEvent::ToolCall {
+        id: OMP_GOAL_STATE_CALL_ID.into(),
+        call: ToolCall::Unknown {
+            name: OMP_GOAL_STATE_CALL_NAME.into(),
+            input: Some(json!({ "goal": goal, "state": state })),
+        },
+    }
+}
+
+fn goal_state_event_from_session_state(state: &Value) -> Option<AgentEvent> {
+    let goal_state = state
+        .get("goalMode")
+        .or_else(|| state.get("goal_mode"))?
+        .clone();
+    let goal = goal_state.get("goal").cloned().unwrap_or(Value::Null);
+    Some(goal_state_event(goal, Some(goal_state)))
+}
+
+fn goal_state_event_from_frame(frame: &Value) -> Option<AgentEvent> {
+    (frame.get("type").and_then(Value::as_str) == Some("goal_updated")).then(|| {
+        goal_state_event(
+            frame.get("goal").cloned().unwrap_or(Value::Null),
+            frame.get("state").cloned(),
+        )
+    })
+}
+
+fn commands_from_frame(frame: &Value) -> Option<Vec<HarnessCommand>> {
     Some(
         frame
             .get("commands")?
             .as_array()?
             .iter()
             .filter_map(|command| {
-                Some(comet_proto::HarnessCommand {
+                Some(HarnessCommand {
                     name: command.get("name")?.as_str()?.to_string(),
                     description: command
                         .get("description")
@@ -511,6 +544,38 @@ fn commands_from_frame(frame: &Value) -> Option<Vec<comet_proto::HarnessCommand>
                         .to_string(),
                     input_hint: command
                         .pointer("/input/hint")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    aliases: command
+                        .get("aliases")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect(),
+                    subcommands: command
+                        .get("subcommands")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|subcommand| {
+                            Some(HarnessCommandSubcommand {
+                                name: subcommand.get("name")?.as_str()?.to_string(),
+                                description: subcommand
+                                    .get("description")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                usage: subcommand
+                                    .get("usage")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string),
+                            })
+                        })
+                        .collect(),
+                    source: command
+                        .get("source")
                         .and_then(Value::as_str)
                         .map(str::to_string),
                 })
@@ -756,6 +821,12 @@ pub(crate) async fn run_rpc(
         let _ = child.kill().await;
         return Ok(());
     }
+    if let Some(goal_event) = goal_state_event_from_session_state(&state)
+        && events.send(Ok(goal_event)).await.is_err()
+    {
+        let _ = child.kill().await;
+        return Ok(());
+    }
 
     // Stage 4: first prompt. The ack is immediate (acceptance, not
     // completion); its response is matched inline by the session loop below.
@@ -861,6 +932,14 @@ pub(crate) async fn run_rpc(
                                 let _ = child.kill().await;
                                 return Ok(());
                             }
+                        }
+                    }
+                    "goal_updated" => {
+                        if let Some(event) = goal_state_event_from_frame(&frame)
+                            && events.send(Ok(event)).await.is_err()
+                        {
+                            let _ = child.kill().await;
+                            return Ok(());
                         }
                     }
                     "agent_end" => {
@@ -1053,34 +1132,54 @@ pub(crate) async fn run_rpc(
     }
 }
 
-/// One-shot command catalog: RPC mode pushes `available_commands_update` at
-/// startup; fall back to an explicit request if the push races the ready frame.
+/// One-shot command catalog. OMP emits a startup snapshot and may emit richer
+/// replacements as asynchronous command providers finish loading. Keep the
+/// latest snapshot until the stream settles; the explicit request is the
+/// fallback for runtimes that do not push an update.
 pub(crate) async fn command_catalog(
     mut process: RpcModeProcess,
     deadline: Duration,
-) -> Result<Vec<comet_proto::HarnessCommand>, HarnessError> {
+) -> Result<Vec<HarnessCommand>, HarnessError> {
     let result = tokio::time::timeout(deadline, async {
+        let mut latest = None;
+        let mut requested = false;
         loop {
-            match process.frames.recv().await {
-                Some(RpcFrame::Frame(frame)) => {
-                    match frame.get("type").and_then(Value::as_str) {
-                        Some("available_commands_update") => {
-                            if let Some(commands) = commands_from_frame(&frame) {
-                                return Ok(commands);
-                            }
-                        }
-                        Some("ready") => {
-                            // Also ask explicitly in case this runtime does not
-                            // push the catalog unprompted.
-                            let client = process.client.clone();
-                            tokio::spawn(async move {
-                                let _ = client.request("get_available_commands", Map::new()).await;
-                            });
-                        }
-                        _ => {}
-                    }
+            let received = if latest.is_some() {
+                match tokio::time::timeout(COMMAND_CATALOG_SETTLE, process.frames.recv()).await {
+                    Ok(received) => received,
+                    Err(_) => return Ok(latest.take().expect("catalog snapshot exists")),
                 }
+            } else {
+                process.frames.recv().await
+            };
+            match received {
+                Some(RpcFrame::Frame(frame)) => match frame.get("type").and_then(Value::as_str) {
+                    Some("available_commands_update") => {
+                        if let Some(commands) = commands_from_frame(&frame) {
+                            latest = Some(commands);
+                        }
+                    }
+                    Some("ready") if !requested => {
+                        requested = true;
+                        process
+                            .client
+                            .send_command("get_available_commands", Map::new());
+                    }
+                    Some("response")
+                        if frame.get("command").and_then(Value::as_str)
+                            == Some("get_available_commands")
+                            && frame.get("success").and_then(Value::as_bool) == Some(true) =>
+                    {
+                        if let Some(commands) = frame.get("data").and_then(commands_from_frame) {
+                            latest = Some(commands);
+                        }
+                    }
+                    _ => {}
+                },
                 Some(RpcFrame::Eof) | None => {
+                    if let Some(commands) = latest {
+                        return Ok(commands);
+                    }
                     return Err(HarnessError::Protocol(crate::crash_message(
                         "OMP RPC command catalog",
                         process.child.try_wait().ok().flatten(),
@@ -1270,18 +1369,77 @@ mod tests {
     }
 
     #[test]
-    fn command_catalog_maps_names_and_hints() {
+    fn goal_updates_normalize_to_hidden_state_parts() {
+        let event = goal_state_event_from_frame(&json!({
+            "type": "goal_updated",
+            "goal": {
+                "id": "g1",
+                "objective": "Ship the release",
+                "status": "active"
+            },
+            "state": {
+                "enabled": true,
+                "mode": "active"
+            }
+        }))
+        .expect("goal update");
+        assert_eq!(
+            event,
+            AgentEvent::ToolCall {
+                id: OMP_GOAL_STATE_CALL_ID.into(),
+                call: ToolCall::Unknown {
+                    name: OMP_GOAL_STATE_CALL_NAME.into(),
+                    input: Some(json!({
+                        "goal": {
+                            "id": "g1",
+                            "objective": "Ship the release",
+                            "status": "active"
+                        },
+                        "state": {
+                            "enabled": true,
+                            "mode": "active"
+                        }
+                    })),
+                },
+            }
+        );
+
+        assert!(
+            goal_state_event_from_frame(&json!({
+                "type": "goal_updated",
+                "goal": null
+            }))
+            .is_some()
+        );
+        assert!(goal_state_event_from_frame(&json!({ "type": "agent_end" })).is_none());
+    }
+
+    #[test]
+    fn command_catalog_maps_complete_metadata() {
         let frame = json!({
             "type": "available_commands_update",
             "commands": [
-                { "name": "compact", "description": "Compact the session", "input": { "hint": "<instructions>" } },
+                {
+                    "name": "compact",
+                    "aliases": ["shrink"],
+                    "description": "Compact the session",
+                    "input": { "hint": "<instructions>" },
+                    "source": "builtin",
+                    "subcommands": [
+                        { "name": "soft", "description": "Summarize locally", "usage": "[focus]" }
+                    ]
+                },
                 { "name": "help" },
             ],
         });
         let commands = commands_from_frame(&frame).unwrap();
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0].name, "compact");
+        assert_eq!(commands[0].aliases, ["shrink"]);
         assert_eq!(commands[0].input_hint.as_deref(), Some("<instructions>"));
+        assert_eq!(commands[0].source.as_deref(), Some("builtin"));
+        assert_eq!(commands[0].subcommands[0].name, "soft");
+        assert_eq!(commands[0].subcommands[0].usage.as_deref(), Some("[focus]"));
         assert_eq!(commands[1].description, "");
     }
 

@@ -3338,26 +3338,41 @@ fn mention_token(text: &str, cursor: usize) -> Option<MentionToken> {
         kind: marker.1,
     })
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HarnessCompletion {
+    value: String,
+    description: String,
+    input_hint: Option<String>,
+    source: Option<String>,
+}
 
-fn matching_commands(commands: &[HarnessCommand], token: &MentionToken) -> Vec<HarnessCommand> {
+fn command_name_matches(name: &str, query: &str, kind: CompletionKind) -> bool {
+    let prefix_matches = |candidate: &str| {
+        query.len() <= candidate.len()
+            && candidate
+                .get(..query.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(query))
+    };
+    let skill_name = name.strip_prefix("skill:");
+    match kind {
+        CompletionKind::Mention => prefix_matches(skill_name.unwrap_or(name)),
+        CompletionKind::Slash => prefix_matches(name) || skill_name.is_some_and(prefix_matches),
+    }
+}
+fn matching_commands(commands: &[HarnessCommand], token: &MentionToken) -> Vec<HarnessCompletion> {
     commands
         .iter()
         .filter(|command| {
-            let candidate = match token.kind {
-                CompletionKind::Mention => command.name.strip_prefix("skill:"),
-                CompletionKind::Slash => command
-                    .name
-                    .strip_prefix("skill:")
-                    .or(Some(command.name.as_str())),
-            };
-            candidate.is_some_and(|name| {
-                token.query.len() <= name.len()
-                    && name
-                        .get(..token.query.len())
-                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&token.query))
-            })
+            std::iter::once(command.name.as_str())
+                .chain(command.aliases.iter().map(String::as_str))
+                .any(|name| command_name_matches(name, &token.query, token.kind))
         })
-        .cloned()
+        .map(|command| HarnessCompletion {
+            value: command.name.clone(),
+            description: command.description.clone(),
+            input_hint: command.input_hint.clone(),
+            source: command.source.clone(),
+        })
         .collect()
 }
 
@@ -3365,7 +3380,7 @@ fn matching_commands(commands: &[HarnessCommand], token: &MentionToken) -> Vec<H
 struct FileMentionState {
     token: Option<MentionToken>,
     results: Vec<FileSearchMatch>,
-    commands: Vec<HarnessCommand>,
+    commands: Vec<HarnessCompletion>,
     active: Option<usize>,
     request: u64,
     loading: bool,
@@ -3413,6 +3428,7 @@ pub struct Composer {
     picker_task: Option<Task<()>>,
     mention_task: Option<Task<()>>,
     mention: FileMentionState,
+    completion_scroll: gpui::ScrollHandle,
     current_key: String,
     /// Explicit independently-owned agent target. `start_agent` keeps the
     /// composer in start mode even while a teammate's session is working.
@@ -3513,6 +3529,7 @@ impl Composer {
             picker_task: None,
             mention_task: None,
             mention: FileMentionState::default(),
+            completion_scroll: gpui::ScrollHandle::new(),
             current_key,
             agent_target: None,
             start_agent: false,
@@ -3573,6 +3590,12 @@ impl Composer {
                     .extend(staged);
             }
         }
+        // Command providers (project skills, extensions, MCP prompts) finish
+        // asynchronously. Warm the catalog before the first `/` or `@` so its
+        // settle window normally completes while the user is reading/typing.
+        composer
+            .pickers
+            .update(cx, |pickers, cx| pickers.prepare_harness_commands(cx));
         composer
     }
 
@@ -3581,6 +3604,19 @@ impl Composer {
     pub fn debug_open_model_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.pickers
             .update(cx, |pickers, cx| pickers.open_model_menu(window, cx));
+    }
+
+    /// Submit a harness command from another first-party surface, such as the
+    /// active-goal control in the workspace sidebar.
+    pub fn submit_command(&mut self, command: &str, cx: &mut Context<Self>) {
+        if self.wizard.is_some() {
+            self.failure = Some("Finish the current question before running a command".into());
+            cx.notify();
+            return;
+        }
+        self.input
+            .update(cx, |input, cx| input.set_text(command, cx));
+        self.on_submit(cx);
     }
 
     pub fn is_sending(&self) -> bool {
@@ -3789,6 +3825,9 @@ impl Composer {
         let count = self.mention.commands.len() + self.mention.results.len();
         self.mention.active =
             (count > 0).then_some(self.mention.active.unwrap_or(0).min(count - 1));
+        if let Some(active) = self.mention.active {
+            self.completion_scroll.scroll_to_item(active);
+        }
         self.sync_mention_controls(cx);
     }
 
@@ -3949,6 +3988,9 @@ impl Composer {
                         composer.mention.error = Some(mention_error_message(&err));
                     }
                 }
+                if let Some(active) = composer.mention.active {
+                    composer.completion_scroll.scroll_to_item(active);
+                }
                 composer.sync_mention_controls(cx);
                 cx.notify();
             })
@@ -3960,6 +4002,9 @@ impl Composer {
     fn move_mention(&mut self, delta: isize, cx: &mut Context<Self>) {
         let count = self.mention.commands.len() + self.mention.results.len();
         self.mention.active = crate::popover::menu_step(self.mention.active, count, delta);
+        if let Some(active) = self.mention.active {
+            self.completion_scroll.scroll_to_item(active);
+        }
         self.sync_mention_controls(cx);
         cx.notify();
     }
@@ -3984,7 +4029,7 @@ impl Composer {
             return;
         };
         if let Some(command) = self.mention.commands.get(active) {
-            let value = format!("/{}", command.name);
+            let value = format!("/{}", command.value);
             self.input.update(cx, |input, cx| {
                 input.replace_completion(token.range, &value, cx)
             });
@@ -4012,9 +4057,11 @@ impl Composer {
     ) -> Option<gpui::AnyElement> {
         let token = self.mention.token.as_ref()?;
         let mut card = crate::popover::popover_card(theme)
+            .id("completion-menu-scroll")
             .w(px(380.0))
             .max_h(px(280.0))
-            .overflow_hidden()
+            .overflow_y_scroll()
+            .track_scroll(&self.completion_scroll)
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_mention(cx)));
         let empty = self.mention.commands.is_empty() && self.mention.results.is_empty();
         if self.mention.loading && empty {
@@ -4032,8 +4079,12 @@ impl Composer {
                 match (token.kind, token.query.is_empty()) {
                     (CompletionKind::Slash, true) => "No commands available".into(),
                     (CompletionKind::Slash, false) => "No matching commands".into(),
-                    (CompletionKind::Mention, true) => "No files or skills available".into(),
-                    (CompletionKind::Mention, false) => "No matching files or skills".into(),
+                    (CompletionKind::Mention, true) => {
+                        "No files or harness commands available".into()
+                    }
+                    (CompletionKind::Mention, false) => {
+                        "No matching files or harness commands".into()
+                    }
                 }
             };
             card = card.child(
@@ -4051,10 +4102,15 @@ impl Composer {
         } else {
             for (ix, command) in self.mention.commands.iter().enumerate() {
                 let selected = self.mention.active == Some(ix);
-                let name = command.name.clone();
+                let name = command.value.clone();
                 let label = format!("/{name}");
                 let description = command.description.clone();
                 let input_hint = command.input_hint.clone();
+                let source = command.source.clone().map(|source| match source.as_str() {
+                    "mcp_prompt" => "MCP".to_string(),
+                    "builtin" => "built-in".to_string(),
+                    other => other.replace('_', " "),
+                });
                 card = card.child(
                     crate::popover::menu_row(theme, selected, format!("command-result-{ix}"))
                         .id(("command-result", ix))
@@ -4077,18 +4133,36 @@ impl Composer {
                                         .gap(px(8.0))
                                         .child(
                                             div()
+                                                .min_w_0()
+                                                .flex_1()
                                                 .truncate()
                                                 .text_size(px(12.5))
                                                 .text_color(theme.text)
                                                 .child(label),
                                         )
-                                        .children(input_hint.map(|hint| {
+                                        .child(
                                             div()
-                                                .flex_none()
-                                                .text_size(px(11.0))
-                                                .text_color(theme.text_faint)
-                                                .child(hint)
-                                        })),
+                                                .min_w_0()
+                                                .max_w(px(190.0))
+                                                .flex()
+                                                .items_center()
+                                                .justify_end()
+                                                .gap(px(6.0))
+                                                .children(source.map(|source| {
+                                                    div()
+                                                        .text_size(px(10.5))
+                                                        .text_color(theme.text_faint)
+                                                        .child(source)
+                                                }))
+                                                .children(input_hint.map(|hint| {
+                                                    div()
+                                                        .min_w_0()
+                                                        .truncate()
+                                                        .text_size(px(11.0))
+                                                        .text_color(theme.text_faint)
+                                                        .child(hint)
+                                                })),
+                                        ),
                                 )
                                 .child(
                                     div()
@@ -6110,24 +6184,30 @@ mod tests {
     }
 
     #[test]
-    fn command_completion_separates_slash_commands_from_mentionable_skills() {
+    fn command_completion_exposes_every_harness_command_from_slash_or_mention() {
         let commands = vec![
             HarnessCommand {
                 name: "ralplan".into(),
                 description: "Plan".into(),
                 input_hint: None,
+                aliases: vec!["consensus".into()],
+                subcommands: Vec::new(),
+                source: Some("builtin".into()),
             },
             HarnessCommand {
                 name: "skill:ralph".into(),
                 description: "Run Ralph".into(),
                 input_hint: None,
+                aliases: Vec::new(),
+                subcommands: Vec::new(),
+                source: Some("skill".into()),
             },
         ];
         let slash = mention_token("/ral", 4).unwrap();
         assert_eq!(
             matching_commands(&commands, &slash)
                 .into_iter()
-                .map(|command| command.name)
+                .map(|command| command.value)
                 .collect::<Vec<_>>(),
             vec!["ralplan", "skill:ralph"]
         );
@@ -6135,10 +6215,12 @@ mod tests {
         assert_eq!(
             matching_commands(&commands, &mention)
                 .into_iter()
-                .map(|command| command.name)
+                .map(|command| command.value)
                 .collect::<Vec<_>>(),
-            vec!["skill:ralph"]
+            vec!["ralplan", "skill:ralph"]
         );
+        let alias = mention_token("/con", 4).unwrap();
+        assert_eq!(matching_commands(&commands, &alias)[0].value, "ralplan");
     }
 
     #[test]

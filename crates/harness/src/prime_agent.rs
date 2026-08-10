@@ -133,6 +133,12 @@ fn commands_from_response(value: &Value) -> Vec<HarnessCommand> {
                     .unwrap_or_default()
                     .to_string(),
                 input_hint: None,
+                aliases: Vec::new(),
+                subcommands: Vec::new(),
+                source: command
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
             })
         })
         .collect();

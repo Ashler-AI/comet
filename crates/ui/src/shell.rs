@@ -698,6 +698,52 @@ fn latest_goal_items(
         })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveHarnessGoal {
+    objective: String,
+    status: String,
+}
+
+fn latest_active_omp_goal(entries: &[comet_doc::SessionMessageEntry]) -> Option<ActiveHarnessGoal> {
+    for part in entries
+        .iter()
+        .rev()
+        .flat_map(|entry| entry.parts.iter().rev())
+    {
+        let comet_doc::MessagePart::Tool {
+            id,
+            call:
+                comet_proto::ToolCall::Unknown {
+                    name,
+                    input: Some(input),
+                },
+            ..
+        } = part
+        else {
+            continue;
+        };
+        if id != comet_proto::OMP_GOAL_STATE_CALL_ID
+            || name != comet_proto::OMP_GOAL_STATE_CALL_NAME
+        {
+            continue;
+        }
+        let goal = input.get("goal")?;
+        let objective = goal
+            .get("objective")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|objective| !objective.is_empty())?
+            .to_string();
+        let status = goal
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("active")
+            .to_string();
+        return Some(ActiveHarnessGoal { objective, status });
+    }
+    None
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct GoalGroupData {
     label: Option<String>,
@@ -1762,6 +1808,11 @@ impl Shell {
             self.toggle_right_pane(cx);
         }
         cx.notify();
+    }
+
+    fn drop_active_omp_goal(&mut self, cx: &mut Context<Self>) {
+        self.composer
+            .update(cx, |composer, cx| composer.submit_command("/goal drop", cx));
     }
 
     fn toggle_focus_mode(&mut self, cx: &mut Context<Self>) {
@@ -4996,16 +5047,12 @@ impl Shell {
                         row.child(
                             popover::btn_ghost(&theme, "Open", "open-session-link")
                                 .id("open-session-link")
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.open_session_link(cx)),
-                                ),
+                                .on_click(cx.listener(|this, _, _, cx| this.open_session_link(cx))),
                         )
                         .child(
                             popover::btn_primary(&theme, "Copy link")
                                 .id("copy-session-link")
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.copy_session_link(cx)),
-                                ),
+                                .on_click(cx.listener(|this, _, _, cx| this.copy_session_link(cx))),
                         )
                     }),
             )
@@ -5737,7 +5784,11 @@ impl Shell {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.copy_chat_session_id(&copy_id, cx);
                         }))
-                        .child(icon(icons::COPY).size(px(16.0)).text_color(theme.text_muted))
+                        .child(
+                            icon(icons::COPY)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
                         .child(SharedString::from("Copy session ID")),
                 )
                 .child(
@@ -6036,9 +6087,12 @@ impl Shell {
             .filter(|branch| !branch.is_empty())
             .unwrap_or_else(|| "Worktree".to_string())
             .into();
-        let goal_groups = {
+        let (goal_groups, active_goal) = {
             let state = self.state.read(cx);
-            goal_group_rows(latest_goal_groups(&state.transcript))
+            (
+                goal_group_rows(latest_goal_groups(&state.transcript)),
+                latest_active_omp_goal(&state.transcript),
+            )
         };
         let goal_total = goal_groups
             .iter()
@@ -6261,6 +6315,73 @@ impl Shell {
                     ),
             )
             .children(usage_meter_rows);
+        let has_active_goal = active_goal.is_some();
+        let active_goal_element = active_goal.map(|goal| {
+            let status: SharedString = goal.status.replace('-', " ").into();
+            div()
+                .id("workspace-active-omp-goal")
+                .mb(px(8.0))
+                .p(px(9.0))
+                .rounded(px(9.0))
+                .bg(theme.element_hover)
+                .flex()
+                .items_start()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(3.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(theme.accent)
+                                        .child("OMP goal"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(9.5))
+                                        .text_color(theme.text_faint)
+                                        .child(status),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.text)
+                                .child(SharedString::from(goal.objective)),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("workspace-drop-omp-goal")
+                        .size(px(24.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(6.0))
+                        .hover(|el| el.bg(theme.glass_hover()))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.drop_active_omp_goal(cx);
+                        }))
+                        .child(
+                            icon(icons::CLOSE)
+                                .size(px(11.0))
+                                .text_color(theme.text_faint),
+                        ),
+                )
+        });
+
         let goals_section = div()
             .id("workspace-status-goals")
             .flex()
@@ -6302,7 +6423,8 @@ impl Shell {
                     .track_scroll(&self.workspace_goals_scroll)
                     .px(px(14.0))
                     .pb(px(10.0))
-                    .when(goal_total == 0, |el| {
+                    .children(active_goal_element)
+                    .when(goal_total == 0 && !has_active_goal, |el| {
                         el.child(
                             div()
                                 .pb(px(4.0))
@@ -7323,7 +7445,8 @@ impl Render for Shell {
         {
             window.focus(&inspector.input.focus_handle(cx), cx);
         }
-        if std::mem::take(&mut self.annotation_submit_pending) && self.annotation_inspector.is_some()
+        if std::mem::take(&mut self.annotation_submit_pending)
+            && self.annotation_inspector.is_some()
         {
             // Save mutates the composer and moves focus — deferred out of the
             // draw rather than run mid-render.
@@ -7765,6 +7888,45 @@ mod tests {
             annotation_prompt_context(&annotation),
             "Selected text:\nunsafe fallback\n\nComment:\nUse the typed helper here."
         );
+    }
+
+    #[test]
+    fn latest_active_omp_goal_obeys_the_newest_goal_update() {
+        let goal_entry = |id: &str, goal: serde_json::Value| comet_doc::SessionMessageEntry {
+            id: id.into(),
+            role: comet_doc::MessageRole::Assistant,
+            parts: vec![comet_doc::MessagePart::Tool {
+                id: comet_proto::OMP_GOAL_STATE_CALL_ID.into(),
+                call: comet_proto::ToolCall::Unknown {
+                    name: comet_proto::OMP_GOAL_STATE_CALL_NAME.into(),
+                    input: Some(serde_json::json!({ "goal": goal })),
+                },
+                is_error: false,
+                resolved: false,
+            }],
+            created_at: 0,
+            device_id: "device".into(),
+            status: Some(comet_doc::MessageStatus::Complete),
+            continuation_of: None,
+        };
+        let active = goal_entry(
+            "active",
+            serde_json::json!({
+                "id": "g1",
+                "objective": " Ship the release ",
+                "status": "active"
+            }),
+        );
+        assert_eq!(
+            latest_active_omp_goal(std::slice::from_ref(&active)),
+            Some(ActiveHarnessGoal {
+                objective: "Ship the release".into(),
+                status: "active".into(),
+            })
+        );
+
+        let dropped = goal_entry("dropped", serde_json::Value::Null);
+        assert_eq!(latest_active_omp_goal(&[active, dropped]), None);
     }
 
     #[test]
