@@ -6144,7 +6144,7 @@ impl Shell {
             comet_proto::HarnessId::Codex => icons::OPENAI_MARK,
             comet_proto::HarnessId::ClaudeCode => icons::CLAUDE_MARK,
             comet_proto::HarnessId::Cursor => icons::CURSOR_MARK,
-            _ => icons::COMET_LOGO,
+            _ => icons::CREW_MARK,
         };
         let account_icon_color = if account_harness == comet_proto::HarnessId::ClaudeCode {
             icons::claude_brand()
@@ -6549,9 +6549,8 @@ impl Shell {
                         .flex_col()
                         .items_center()
                         .child(
-                            icon(icons::COMET_LOGO)
-                                .w(px(41.9))
-                                .h(px(48.0))
+                            icon(icons::CREW_MARK)
+                                .size(px(48.0))
                                 .text_color(theme.text.opacity(0.09)),
                         )
                         .child(
@@ -6580,9 +6579,8 @@ impl Shell {
                 ))
                 .into_any_element()
         } else {
-            // New-chat canvas (comet index.tsx): the dim comet mark watermark
-            // (`h-12 text-foreground/[0.09]`) over the centered helper line —
-            // now naming the space the session will start in.
+            // New-chat canvas: the dim Crew mark watermark over the centered
+            // helper line, naming the space the session will start in.
             let helper: SharedString = if space_name.is_empty() {
                 "Send a message to start a new session.".into()
             } else {
@@ -6601,9 +6599,8 @@ impl Shell {
                         .flex_col()
                         .items_center()
                         .child(
-                            icon(icons::COMET_LOGO)
-                                .w(px(41.9))
-                                .h(px(48.0))
+                            icon(icons::CREW_MARK)
+                                .size(px(48.0))
                                 .text_color(theme.text.opacity(0.09)),
                         )
                         .child(
@@ -7059,9 +7056,8 @@ impl Shell {
                 .items_center()
                 .text_center()
                 .child(
-                    icon(icons::COMET_LOGO)
-                        .w(px(31.4))
-                        .h(px(36.0))
+                    icon(icons::CREW_MARK)
+                        .size(px(36.0))
                         .text_color(theme.text),
                 )
                 .child(

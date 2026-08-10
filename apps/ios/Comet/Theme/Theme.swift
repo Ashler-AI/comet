@@ -42,6 +42,8 @@ enum Theme {
     static let statusCompleted = oklch(0.765, 0.177, 163.223) // emerald-400
     /// Claude brand orange — kept even on the mono surface.
     static let claudeBrand = Color(red: 0xD9 / 255.0, green: 0x77 / 255.0, blue: 0x57 / 255.0)
+    /// Crew's live-core green (`brand-500`).
+    static let crewCore = Color(red: 0x09 / 255.0, green: 0xDE / 255.0, blue: 0x5E / 255.0)
 
     // ---- paint: markdown inline code (violet family) ----
     static let inlineCodeText = oklch(0.811, 0.111, 293.571)  // violet-300

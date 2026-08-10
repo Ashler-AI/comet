@@ -28,7 +28,7 @@ struct SignInView: View {
                 Spacer()
 
                 VStack(spacing: 24) {
-                    CometMark()
+                    CrewMark()
                         .frame(width: 72, height: 72)
                     VStack(spacing: 6) {
                         Text("Comet")
@@ -315,40 +315,57 @@ final class AuthSessionCoordinator: NSObject, ASWebAuthenticationPresentationCon
 }
 
 
-/// The actual comet mark — the desktop's 34-cell logo
-/// (crates/ui/assets/icons/comet-logo.svg), cells scaled from its 820×940
-/// viewbox and tinted by `color`.
-struct CometMark: View {
+/// The Crew mark from `assets/brand/crew-mark.svg`, rendered natively so the
+/// stones follow the current foreground while the live core keeps its brand green.
+struct CrewMark: View {
     var color: Color = Theme.text
 
-    /// (x, y) of each 100×100 rx16 cell in the 820×940 viewbox.
-    static let cells: [(CGFloat, CGFloat)] = [
-        (0, 600), (0, 720), (240, 840), (240, 720), (120, 840), (120, 600),
-        (240, 600), (0, 480), (0, 360), (480, 840), (480, 720), (120, 360),
-        (120, 240), (240, 360), (600, 720), (480, 600), (360, 360), (240, 240),
-        (600, 600), (720, 600), (720, 480), (240, 120), (600, 380), (720, 240),
-        (720, 0), (480, 240), (480, 0), (120, 480), (240, 480), (360, 840),
-        (360, 720), (360, 600), (360, 480), (120, 720),
-    ]
-
     var body: some View {
-        CometMarkShape()
-            .fill(color)
-            .aspectRatio(820 / 940, contentMode: .fit)
+        ZStack {
+            CrewStonesShape().fill(color)
+            CrewCoreShape().fill(Theme.crewCore)
+        }
+        .aspectRatio(1, contentMode: .fit)
     }
 }
 
-struct CometMarkShape: Shape {
+private struct CrewStonesShape: Shape {
     func path(in rect: CGRect) -> Path {
+        let scale = min(rect.width, rect.height) / 46
+        let dx = rect.minX + (rect.width - 46 * scale) / 2
+        let dy = rect.minY + (rect.height - 46 * scale) / 2
+        let radius = CGSize(width: 1.2 * scale, height: 1.2 * scale)
+        let stones: [CGRect] = [
+            CGRect(x: dx, y: dy, width: 34 * scale, height: 10 * scale),
+            CGRect(x: dx + 36 * scale, y: dy, width: 10 * scale, height: 34 * scale),
+            CGRect(x: dx + 12 * scale, y: dy + 36 * scale, width: 34 * scale, height: 10 * scale),
+            CGRect(x: dx, y: dy + 12 * scale, width: 10 * scale, height: 34 * scale),
+        ]
+
         var path = Path()
-        let scale = min(rect.width / 820, rect.height / 940)
-        let dx = rect.minX + (rect.width - 820 * scale) / 2
-        let dy = rect.minY + (rect.height - 940 * scale) / 2
-        for (x, y) in CometMark.cells {
-            let cell = CGRect(x: dx + x * scale, y: dy + y * scale,
-                              width: 100 * scale, height: 100 * scale)
-            path.addRoundedRect(in: cell, cornerSize: CGSize(width: 16 * scale, height: 16 * scale))
+        for stone in stones {
+            path.addRoundedRect(in: stone, cornerSize: radius)
         }
+        return path
+    }
+}
+
+private struct CrewCoreShape: Shape {
+    func path(in rect: CGRect) -> Path {
+        let scale = min(rect.width, rect.height) / 46
+        let dx = rect.minX + (rect.width - 46 * scale) / 2
+        let dy = rect.minY + (rect.height - 46 * scale) / 2
+        let core = CGRect(
+            x: dx + 18 * scale,
+            y: dy + 18 * scale,
+            width: 10 * scale,
+            height: 10 * scale
+        )
+        var path = Path()
+        path.addRoundedRect(
+            in: core,
+            cornerSize: CGSize(width: 1.2 * scale, height: 1.2 * scale)
+        )
         return path
     }
 }
