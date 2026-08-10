@@ -330,6 +330,10 @@ fn next_free_seq(dir: &Path) -> Result<u64, EngineError> {
         .unwrap_or(0))
 }
 
+/// Eight hash characters plus `-` leave 246 bytes in a 255-byte filename.
+/// Keep a little margin while retaining enough of encoded folder-relative names.
+const MAX_SANITIZED_FILE_NAME_BYTES: usize = 240;
+
 fn sanitize(file_name: &str) -> String {
     let base = Path::new(file_name)
         .file_name()
@@ -348,7 +352,7 @@ fn sanitize(file_name: &str) -> String {
     let tail: String = cleaned
         .chars()
         .rev()
-        .take(80)
+        .take(MAX_SANITIZED_FILE_NAME_BYTES)
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
@@ -384,5 +388,9 @@ mod tests {
         assert_eq!(sanitize("../../etc/passwd"), "passwd");
         assert_eq!(sanitize("my photo (1).png"), "my_photo__1_.png");
         assert_eq!(sanitize(""), "upload");
+        let long = format!("{}.pdf", "a".repeat(MAX_SANITIZED_FILE_NAME_BYTES));
+        let sanitized = sanitize(&long);
+        assert_eq!(sanitized.len(), MAX_SANITIZED_FILE_NAME_BYTES);
+        assert!(sanitized.ends_with(".pdf"));
     }
 }

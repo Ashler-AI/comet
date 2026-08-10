@@ -73,8 +73,8 @@ const CHIPS_TOP_PAD: f32 = 2.0;
 /// spec's 200ms plus margin. Past this the fold renders statically — an armed
 /// tween replays on remount, i.e. on every scroll-back-into-view.
 const FOLD_TWEEN_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
-/// User-bubble attachment thumbnails (user-attachments.tsx): 112×80 thumbs in
-/// a FIXED-height strip (load-state flips never shift the virtualizer).
+/// User-bubble attachment cards. Every card has a fixed footprint, so wrapped
+/// rows stay stable while image load states change.
 pub const ATT_THUMB_W: f32 = 112.0;
 pub const ATT_THUMB_H: f32 = 80.0;
 pub const ATT_STRIP_H: f32 = ATT_THUMB_H + 10.0;
@@ -223,8 +223,8 @@ pub enum RowKind {
         /// Image refs parsed out of the message text: thumbnails load from the
         /// owning device via ReadAttachmentChunk.
         attachments: Arc<Vec<crate::attachments::UserImageAttachment>>,
-        /// Large clipboard pastes uploaded as readable text files.
-        text_attachments: Arc<Vec<crate::attachments::UserTextAttachment>>,
+        /// Non-image files uploaded to the agent host.
+        file_attachments: Arc<Vec<crate::attachments::UserFileAttachment>>,
         /// Optimistic echo not yet confirmed by a doc frame.
         pending: bool,
         delivery: UserDelivery,
@@ -339,9 +339,9 @@ pub fn rows_for_entry(
             })
             .collect::<Vec<_>>()
             .join("\n\n");
-        // Attachment refs ride the plain text (the `withAttachments`
-        // transport); split them back out for the thumbnail strip.
-        let parsed = crate::attachments::parse_user_message_images(&raw);
+        // Attachment refs ride the plain text transport; split them back out
+        // for the image thumbnail and file-card strips.
+        let parsed = crate::attachments::parse_user_message_attachments(&raw);
         // File mentions render as chips here too, not just in the composer.
         // The projection is pure over the text, so the raw-length row version
         // below stays a valid cache/diff key.
@@ -362,7 +362,7 @@ pub fn rows_for_entry(
                 text: text.into(),
                 mentions: Arc::new(mentions),
                 attachments: Arc::new(parsed.attachments),
-                text_attachments: Arc::new(parsed.text_attachments),
+                file_attachments: Arc::new(parsed.file_attachments),
                 pending,
                 delivery,
             },
@@ -1740,15 +1740,15 @@ impl Transcript {
         let device_ids = self.attachment_device_ids(cx);
         let mut strip = div()
             .w_full()
-            .h(px(ATT_STRIP_H))
+            .min_h(px(ATT_STRIP_H))
             .flex()
             .flex_row()
+            .flex_wrap()
             .justify_end()
             .items_start()
             .gap(px(8.0))
-            .overflow_hidden()
             .px(px(4.0))
-            .pt(px(4.0));
+            .py(px(4.0));
         for (aix, att) in atts.iter().enumerate() {
             let state = self.attachment_state(&device_ids, &att.path, cx);
             let frame = div()
@@ -1807,28 +1807,28 @@ impl Transcript {
         strip.into_any_element()
     }
 
-    /// Right-aligned cards for large clipboard pastes uploaded as text files.
-    fn render_user_text_attachments(
+    /// Right-aligned cards for non-image files.
+    fn render_user_file_attachments(
         &self,
         row_id: &SharedString,
-        atts: &[crate::attachments::UserTextAttachment],
+        atts: &[crate::attachments::UserFileAttachment],
         theme: &Theme,
     ) -> AnyElement {
         let mut strip = div()
             .w_full()
-            .h(px(ATT_STRIP_H))
+            .min_h(px(ATT_STRIP_H))
             .flex()
             .flex_row()
+            .flex_wrap()
             .justify_end()
             .items_start()
             .gap(px(8.0))
-            .overflow_hidden()
             .px(px(4.0))
-            .pt(px(4.0));
+            .py(px(4.0));
         for (aix, att) in atts.iter().enumerate() {
             strip = strip.child(
                 div()
-                    .id(SharedString::from(format!("{row_id}#text-att{aix}")))
+                    .id(SharedString::from(format!("{row_id}#file-att{aix}")))
                     .flex_none()
                     .w(px(ATT_THUMB_W))
                     .h(px(ATT_THUMB_H))
@@ -1853,7 +1853,7 @@ impl Transcript {
                             .truncate()
                             .text_size(px(10.0))
                             .text_color(theme.text_muted)
-                            .child(att.name.clone()),
+                            .child(crate::attachments::display_basename(&att.name).to_string()),
                     ),
             );
         }
@@ -1942,12 +1942,12 @@ impl Transcript {
                 text,
                 mentions,
                 attachments,
-                text_attachments,
+                file_attachments,
                 pending,
                 delivery,
             } => {
                 let attachments = attachments.clone();
-                let text_attachments = text_attachments.clone();
+                let file_attachments = file_attachments.clone();
                 let text = text.clone();
                 let mentions = mentions.clone();
                 let pending = *pending;
@@ -1958,10 +1958,10 @@ impl Transcript {
                 if !attachments.is_empty() {
                     column = column.child(self.render_user_attachments(&row.id, &attachments, cx));
                 }
-                if !text_attachments.is_empty() {
-                    column = column.child(self.render_user_text_attachments(
+                if !file_attachments.is_empty() {
+                    column = column.child(self.render_user_file_attachments(
                         &row.id,
-                        &text_attachments,
+                        &file_attachments,
                         &theme,
                     ));
                 }
@@ -3483,7 +3483,7 @@ mod tests {
         let RowKind::User {
             text,
             attachments,
-            text_attachments,
+            file_attachments,
             ..
         } = &rows[0].kind
         else {
@@ -3493,8 +3493,8 @@ mod tests {
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].path, "/data/uploads/ab12-red.png");
         assert_eq!(attachments[0].name, "ab12-red.png");
-        assert_eq!(text_attachments.len(), 1);
-        assert_eq!(text_attachments[0].name, "pasted-text.txt");
+        assert_eq!(file_attachments.len(), 1);
+        assert_eq!(file_attachments[0].name, "pasted-text.txt");
 
         // Image-only send: no bubble text, refs parsed.
         let only = crate::attachments::with_attachments("", &["/a/p.png".to_string()]);
