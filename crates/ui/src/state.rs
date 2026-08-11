@@ -30,11 +30,11 @@ use serde::de::DeserializeOwned;
 use comet_doc::{MessagePart, MessageRole, SessionMessageEntry, TranscriptDesync, TranscriptFrame};
 use comet_engine::{Engine, EngineConfig, EngineRuntime, rpc::AuthRpc};
 use comet_proto::{
-    AuthState, Chat, ChatIndicator, CollaborationScope, CollaborationSnapshot, Device, HarnessId,
-    LocalSessionAttachResult, LocalSessionCandidate, MessageProvenance, ParticipantPresence,
-    RuntimeProfile, ScaffoldEnvironmentControl, ScaffoldEnvironmentControlResult,
-    ScaffoldLifecycle, ScaffoldRuntimeMode, Session, SessionEnvironmentSource, SessionRef,
-    SessionRoomProjection, Space,
+    AgentRoute, AuthState, Chat, ChatIndicator, CollaborationScope, CollaborationSnapshot, Device,
+    HarnessId, LocalSessionAttachResult, LocalSessionCandidate, MessageProvenance,
+    ParticipantPresence, RuntimeProfile, ScaffoldEnvironmentControl,
+    ScaffoldEnvironmentControlResult, ScaffoldLifecycle, ScaffoldRuntimeMode, Session,
+    SessionEnvironmentSource, SessionRef, SessionRoomProjection, Space,
 };
 use comet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
 /// Hidden compatibility artifact from the removed virtual Scaffold space.
@@ -386,6 +386,7 @@ pub(crate) async fn create_scaffold_session(
     handle: &EngineHandle,
     scope: &CollaborationScope,
     source_ref: Option<&str>,
+    agent_route: &AgentRoute,
 ) -> Result<(String, CollaborationScope), RpcError> {
     let create = ScaffoldEnvironmentControl::Create {
         scope: scope.clone(),
@@ -393,6 +394,7 @@ pub(crate) async fn create_scaffold_session(
         source_ref: source_ref.map(str::to_string),
         region: None,
         runtime_mode: Some(ScaffoldRuntimeMode::Compose),
+        agent_route: agent_route.clone(),
     };
     let value = handle
         .client()
@@ -545,9 +547,10 @@ pub(crate) async fn create_and_attach_scaffold_session(
     handle: &EngineHandle,
     scope: &CollaborationScope,
     source_ref: Option<&str>,
+    agent_route: &AgentRoute,
 ) -> Result<(String, ScaffoldSessionAttachment), RpcError> {
     let (sandbox_id, authoritative_scope) =
-        create_scaffold_session(handle, scope, source_ref).await?;
+        create_scaffold_session(handle, scope, source_ref, agent_route).await?;
     let attachment = attach_scaffold_session(handle, &sandbox_id, authoritative_scope).await?;
     Ok((sandbox_id, attachment))
 }
@@ -2161,7 +2164,10 @@ mod tests {
     // `SessionStatus` is only needed to build the fixtures below — the module
     // itself derives everything through `comet_proto::view`.
     use comet_proto::{SessionStatus, UserProfile};
-    use std::sync::Mutex as StdMutex;
+    use std::sync::{
+        Mutex as StdMutex,
+        atomic::{AtomicU16, Ordering},
+    };
 
     struct ReadyScaffoldRpc {
         operations: Arc<StdMutex<Vec<String>>>,
@@ -2183,6 +2189,15 @@ mod tests {
                 assert_eq!(
                     params.get("source_ref").and_then(serde_json::Value::as_str),
                     Some("feat/comet-identity-integration")
+                );
+                assert_eq!(
+                    params.get("agentRoute"),
+                    Some(&serde_json::json!({
+                        "provider": "openai",
+                        "model": "gpt-5.6-sol",
+                        "fallback": "disabled",
+                        "routingMode": "automatic",
+                    }))
                 );
             }
             self.operations
@@ -2245,10 +2260,12 @@ mod tests {
     /// range (macOS: 49152+), which `:0` allocations and outbound sockets in
     /// parallel test processes draw from. Binding `:0` and re-using the port
     /// after drop raced those allocations in the free→bootstrap window.
+    static NEXT_TEST_PORT_OFFSET: AtomicU16 = AtomicU16::new(0);
     async fn free_port() -> u16 {
         let start = 20000 + (std::process::id() % 10000) as u16;
-        for offset in 0..2000 {
-            let port = start + offset;
+        for _ in 0..2000 {
+            let offset = NEXT_TEST_PORT_OFFSET.fetch_add(1, Ordering::Relaxed);
+            let port = start + (offset % 2000);
             if tokio::net::TcpListener::bind(("127.0.0.1", port))
                 .await
                 .is_ok()
@@ -2308,6 +2325,7 @@ mod tests {
             &handle,
             &scope,
             Some("feat/comet-identity-integration"),
+            &AgentRoute::automatic(comet_proto::AgentProvider::OpenAi, "gpt-5.6-sol"),
         )
         .await
         .unwrap();
@@ -2964,6 +2982,7 @@ mod tests {
             harness: HarnessId::ClaudeCode,
             model: Some("claude-fable-5".into()),
             reasoning: Some(comet_proto::ReasoningLevel::XHigh),
+            agent_account_id: Some("opaque-account-id".into()),
             model_options: serde_json::Map::new(),
             sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
         };
@@ -2988,6 +3007,7 @@ mod tests {
                 harness: HarnessId::ClaudeCode,
                 model: None,
                 reasoning: None,
+                agent_account_id: None,
                 model_options: serde_json::Map::new(),
                 sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
             },

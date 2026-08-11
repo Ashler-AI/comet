@@ -29,8 +29,9 @@ use comet_doc::{
     SessionMessageEntry,
 };
 use comet_proto::{
-    AgentSessionSource, ChatConfig, FileSearchMatch, HarnessCommand, HarnessId, RunRequest,
-    SandboxLevel, ScaffoldLifecycle, SteeringMode, UserInputAnswer, UserInputQuestion,
+    AgentProvider, AgentRoute, AgentSessionSource, ChatConfig, FileSearchMatch, HarnessCommand,
+    HarnessId, RunRequest, SandboxLevel, ScaffoldLifecycle, SteeringMode, UserInputAnswer,
+    UserInputQuestion,
 };
 use comet_rpc::{RpcError, methods};
 
@@ -85,6 +86,90 @@ fn scaffold_source_ref(plan: &CheckoutPlan) -> Option<&str> {
         CheckoutPlan::CurrentCheckout { branch } => branch.as_deref(),
         CheckoutPlan::ReuseWorktree { branch, .. } => Some(branch.as_str()),
         CheckoutPlan::NewWorktree { base } => base.as_deref(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScaffoldAgentBinding {
+    route: AgentRoute,
+    /// OMP's immutable provider-qualified model identity. The control plane
+    /// receives the provider and provider-local model separately, while the
+    /// attached chat and every run use this exact selector.
+    model_id: String,
+}
+
+fn scaffold_agent_binding(
+    harness: Option<HarnessId>,
+    selected_model: Option<&str>,
+    agent_account_id: Option<&str>,
+) -> Option<ScaffoldAgentBinding> {
+    let harness = harness?;
+    if !matches!(
+        harness,
+        HarnessId::ClaudeCode | HarnessId::Codex | HarnessId::Omp | HarnessId::PrimeAgent
+    ) {
+        return None;
+    }
+    let selected = selected_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && *model != "default")?;
+    let lower = selected.to_ascii_lowercase();
+    let provider = match harness {
+        HarnessId::ClaudeCode if !lower.contains('/') => AgentProvider::Anthropic,
+        HarnessId::Codex if !lower.contains('/') => AgentProvider::OpenAi,
+        _ if lower.starts_with("anthropic/") => AgentProvider::Anthropic,
+        _ if lower.starts_with("openai/") || lower.starts_with("openai-codex/") => {
+            AgentProvider::OpenAi
+        }
+        _ => return None,
+    };
+    let model = selected
+        .rsplit_once('/')
+        .map(|(_, model)| model)
+        .unwrap_or(selected);
+    if model.is_empty() {
+        return None;
+    }
+    // Preserve catalog selectors verbatim. Native Claude Code and Codex
+    // catalogs use provider-local ids, so qualify those once at this boundary
+    // using the corresponding OMP catalog provider.
+    let model_id = if selected.contains('/') {
+        selected.to_string()
+    } else {
+        let qualifier = match provider {
+            AgentProvider::Anthropic => "anthropic",
+            AgentProvider::OpenAi => "openai-codex",
+        };
+        format!("{qualifier}/{model}")
+    };
+    let account_id = agent_account_id.map(str::trim).filter(|id| !id.is_empty());
+    let route = match account_id {
+        Some(account_id) => AgentRoute::pinned(provider, model, account_id),
+        None => AgentRoute::automatic(provider, model),
+    };
+    Some(ScaffoldAgentBinding { route, model_id })
+}
+
+fn scaffold_attached_chat_config(binding: &ScaffoldAgentBinding) -> ChatConfig {
+    ChatConfig {
+        harness: HarnessId::Omp,
+        model: Some(binding.model_id.clone()),
+        reasoning: None,
+        agent_account_id: binding.route.account_id.clone(),
+        model_options: Default::default(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+    }
+}
+
+fn scaffold_run_model(
+    attached: bool,
+    binding: Option<&ScaffoldAgentBinding>,
+    resolved_model: Option<&str>,
+) -> Option<String> {
+    if attached {
+        binding.map(|binding| binding.model_id.clone())
+    } else {
+        resolved_model.map(str::to_string)
     }
 }
 
@@ -4550,6 +4635,20 @@ impl Composer {
         let requested_scaffold_source_ref = scaffold_demo
             .then(|| scaffold_source_ref(&plan).map(str::to_string))
             .flatten();
+        let scaffold_agent_binding = if scaffold_demo {
+            let Some(binding) = scaffold_agent_binding(
+                resolved.harness,
+                resolved.model.as_deref(),
+                resolved.agent_account_id.as_deref(),
+            ) else {
+                self.failure = Some("Select a supported model before starting Scaffold".into());
+                cx.notify();
+                return;
+            };
+            Some(binding)
+        } else {
+            None
+        };
         let scaffold_scope = scaffold_draft
             .as_ref()
             .map(|draft| draft.collaboration_scope());
@@ -4690,6 +4789,10 @@ impl Composer {
                         &engine,
                         &scope,
                         requested_scaffold_source_ref.as_deref(),
+                        &scaffold_agent_binding
+                            .as_ref()
+                            .expect("Scaffold route is resolved before launch")
+                            .route,
                     );
                     let deadline = cx.background_executor().timer(SCAFFOLD_DEMO_WAIT);
                     futures::pin_mut!(launch);
@@ -4925,13 +5028,11 @@ impl Composer {
                             );
                         }
                         let config = if scaffold_attached {
-                            Some(ChatConfig {
-                                harness: HarnessId::Omp,
-                                model: None,
-                                reasoning: None,
-                                model_options: Default::default(),
-                                sandbox: SandboxLevel::WorkspaceWrite,
-                            })
+                            Some(scaffold_attached_chat_config(
+                                scaffold_agent_binding
+                                    .as_ref()
+                                    .expect("attached Scaffold session has a resolved route"),
+                            ))
                         } else {
                             resolved.chat_config()
                         };
@@ -5032,7 +5133,12 @@ impl Composer {
 
                 let run_request = || RunRequest {
                     prompt: content.clone(),
-                    model: resolved.model.clone(),
+                    model: scaffold_run_model(
+                        scaffold_attached,
+                        scaffold_agent_binding.as_ref(),
+                        resolved.model.as_deref(),
+                    ),
+                    agent_account_id: resolved.agent_account_id.clone(),
                     reasoning: resolved.reasoning,
                     model_options: resolved.model_options.clone(),
                     cwd: cwd.clone(),
@@ -6069,6 +6175,73 @@ mod tests {
                 base: Some("feat/identity".into()),
             }),
             Some("feat/identity")
+        );
+    }
+
+    #[test]
+    fn scaffold_openai_binding_persists_and_sends_exact_model_identity() {
+        let binding = scaffold_agent_binding(
+            Some(HarnessId::Codex),
+            Some("openai-codex/gpt-5.6-sol"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(binding.route.provider, AgentProvider::OpenAi);
+        assert_eq!(binding.route.model, "gpt-5.6-sol");
+        assert_eq!(binding.model_id, "openai-codex/gpt-5.6-sol");
+
+        let persisted = scaffold_attached_chat_config(&binding);
+        assert_eq!(persisted.harness, HarnessId::Omp);
+        assert_eq!(persisted.model.as_deref(), Some("openai-codex/gpt-5.6-sol"));
+        assert_eq!(
+            scaffold_run_model(true, Some(&binding), Some("wrong-model")).as_deref(),
+            persisted.model.as_deref()
+        );
+    }
+
+    #[test]
+    fn scaffold_anthropic_binding_persists_and_sends_exact_model_identity() {
+        let binding = scaffold_agent_binding(
+            Some(HarnessId::ClaudeCode),
+            Some("claude-opus-5"),
+            Some("opaque-account-id"),
+        )
+        .unwrap();
+        assert_eq!(binding.route.provider, AgentProvider::Anthropic);
+        assert_eq!(binding.route.model, "claude-opus-5");
+        assert_eq!(binding.model_id, "anthropic/claude-opus-5");
+
+        let persisted = scaffold_attached_chat_config(&binding);
+        assert_eq!(persisted.harness, HarnessId::Omp);
+        assert_eq!(persisted.model.as_deref(), Some("anthropic/claude-opus-5"));
+        assert_eq!(
+            persisted.agent_account_id.as_deref(),
+            Some("opaque-account-id")
+        );
+        assert_eq!(
+            scaffold_run_model(true, Some(&binding), Some("wrong-model")).as_deref(),
+            persisted.model.as_deref()
+        );
+    }
+
+    #[test]
+    fn scaffold_binding_rejects_non_oauth_models() {
+        assert!(
+            scaffold_agent_binding(
+                Some(HarnessId::OpenCode),
+                Some("gpt-5.6-sol"),
+                Some("opaque-account-id")
+            )
+            .is_none()
+        );
+        assert!(
+            scaffold_agent_binding(
+                Some(HarnessId::PrimeAgent),
+                Some("prime-inference/x-ai/grok-4.20"),
+                Some("opaque-account-id")
+            )
+            .is_none(),
+            "third-party models must not request an OAuth-backed Scaffold route"
         );
     }
 

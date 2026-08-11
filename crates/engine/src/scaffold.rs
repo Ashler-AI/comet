@@ -13,11 +13,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use comet_harness::CancellationToken;
 use comet_proto::{
-    CAPABILITY_SESSION_ANNOTATE, CAPABILITY_SESSION_CHAT, CAPABILITY_SESSION_CONTROL,
-    CAPABILITY_SESSION_ENVIRONMENT, CAPABILITY_SESSION_FILES, CAPABILITY_SESSION_READ,
-    CollaborationScope, OmpSessionArtifact, ScaffoldControlGrant, ScaffoldEnvironmentControl,
-    ScaffoldEnvironmentControlResult, ScaffoldEnvironmentLinks, ScaffoldEnvironmentSnapshot,
-    ScaffoldRuntimeMode, SessionEnvironment, SessionEnvironmentSource, SessionRoomProjection,
+    AgentRoute, AgentRouteReceipt, AgentRoutingMode, CAPABILITY_SESSION_ANNOTATE,
+    CAPABILITY_SESSION_CHAT, CAPABILITY_SESSION_CONTROL, CAPABILITY_SESSION_ENVIRONMENT,
+    CAPABILITY_SESSION_FILES, CAPABILITY_SESSION_READ, CollaborationScope, OmpSessionArtifact,
+    ScaffoldControlGrant, ScaffoldEnvironmentControl, ScaffoldEnvironmentControlResult,
+    ScaffoldEnvironmentLinks, ScaffoldEnvironmentSnapshot, ScaffoldRuntimeMode, SessionEnvironment,
+    SessionEnvironmentSource, SessionRoomProjection,
 };
 use comet_rpc::TokenSource;
 use reqwest::{Method, StatusCode, Url};
@@ -36,6 +37,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn routing_mode_value(mode: AgentRoutingMode) -> &'static str {
+    match mode {
+        AgentRoutingMode::Automatic => "automatic",
+        AgentRoutingMode::Pinned => "pinned",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +161,9 @@ pub(crate) struct AgentInferenceGrantRequest {
     pub provider: String,
     pub model: String,
     pub harness: String,
+    pub routing_mode: AgentRoutingMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_account_id: Option<String>,
     pub lifecycle_epoch: u64,
 }
 
@@ -164,6 +175,9 @@ pub(crate) struct AgentInferenceGrantBinding {
     pub provider: String,
     pub model: String,
     pub harness: String,
+    pub routing_mode: AgentRoutingMode,
+    #[serde(default)]
+    pub requested_account_id: Option<String>,
     pub source: String,
     pub lifecycle_epoch: u64,
     pub environment: String,
@@ -178,6 +192,16 @@ pub(crate) struct AgentInferenceGrant {
     pub token: String,
     pub expires_at: String,
     pub binding: AgentInferenceGrantBinding,
+}
+
+pub(crate) struct AgentInferenceProxyRequest<'a> {
+    pub endpoint: &'a str,
+    pub grant: &'a AgentInferenceGrant,
+    pub request_id: &'a str,
+    pub headers: reqwest::header::HeaderMap,
+    pub content_length: u64,
+    pub body: reqwest::Body,
+    pub cancellation: &'a CancellationToken,
 }
 
 #[derive(Serialize)]
@@ -274,6 +298,7 @@ impl ScaffoldClient {
             .expect("static account revoke path");
         url.path_segments_mut()
             .expect("Scaffold origin is hierarchical")
+            .pop_if_empty()
             .push(account_id);
         let _: Value = self
             .request(
@@ -301,14 +326,17 @@ impl ScaffoldClient {
 
     pub(crate) async fn proxy_agent_inference(
         &self,
-        endpoint: &str,
-        grant: &AgentInferenceGrant,
-        request_id: &str,
-        mut headers: reqwest::header::HeaderMap,
-        content_length: u64,
-        body: reqwest::Body,
-        cancellation: &CancellationToken,
+        proxy: AgentInferenceProxyRequest<'_>,
     ) -> Result<reqwest::Response, ScaffoldError> {
+        let AgentInferenceProxyRequest {
+            endpoint,
+            grant,
+            request_id,
+            mut headers,
+            content_length,
+            body,
+            cancellation,
+        } = proxy;
         let path = match endpoint {
             "responses" => "/api/agent-auth/v1/responses",
             "messages" => "/api/agent-auth/v1/messages",
@@ -336,12 +364,14 @@ impl ScaffoldClient {
             "x-agent-auth-environment",
             "x-agent-auth-lifecycle-epoch",
             "x-agent-auth-request-id",
+            "x-agent-auth-routing-mode",
+            "x-agent-auth-requested-account-id",
             "x-agent-auth-internal-secret",
         ] {
             headers.remove(name);
         }
         let url = self.origin.join(path).expect("static inference proxy path");
-        let request = self
+        let mut request = self
             .http
             .post(url)
             .headers(headers)
@@ -354,10 +384,18 @@ impl ScaffoldClient {
             .header("x-agent-auth-environment", &grant.binding.environment)
             .header("x-agent-auth-source", &grant.binding.source)
             .header(
+                "x-agent-auth-routing-mode",
+                routing_mode_value(grant.binding.routing_mode),
+            )
+            .header(
                 "x-agent-auth-lifecycle-epoch",
                 grant.binding.lifecycle_epoch.to_string(),
             )
-            .header("x-agent-auth-request-id", request_id)
+            .header("x-agent-auth-request-id", request_id);
+        if let Some(account_id) = &grant.binding.requested_account_id {
+            request = request.header("x-agent-auth-requested-account-id", account_id);
+        }
+        let request = request
             .header(reqwest::header::CONTENT_LENGTH, content_length)
             .body(body);
         tokio::select! {
@@ -378,7 +416,7 @@ impl ScaffoldClient {
             .origin
             .join("/api/agent-auth/grants/failure")
             .expect("static inference failure path");
-        let request = self
+        let mut request = self
             .http
             .post(url)
             .bearer_auth(&grant.token)
@@ -390,14 +428,21 @@ impl ScaffoldClient {
             .header("x-agent-auth-source", &grant.binding.source)
             .header("x-agent-auth-environment", &grant.binding.environment)
             .header(
+                "x-agent-auth-routing-mode",
+                routing_mode_value(grant.binding.routing_mode),
+            )
+            .header(
                 "x-agent-auth-lifecycle-epoch",
                 grant.binding.lifecycle_epoch.to_string(),
-            )
-            .json(&AgentInferenceFailureReport {
-                failure_class,
-                response_started,
-                retry_after_seconds,
-            });
+            );
+        if let Some(account_id) = &grant.binding.requested_account_id {
+            request = request.header("x-agent-auth-requested-account-id", account_id);
+        }
+        let request = request.json(&AgentInferenceFailureReport {
+            failure_class,
+            response_started,
+            retry_after_seconds,
+        });
         let response = tokio::select! {
             response = request.send() => response?,
             () = cancellation.cancelled() => return Err(ScaffoldError::Cancelled),
@@ -426,6 +471,44 @@ impl ScaffoldClient {
             .request(Method::POST, url, Some(&body), cancellation)
             .await?;
         Ok(())
+    }
+
+    pub(crate) async fn rebind_agent_inference_route(
+        &self,
+        logical_session_id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ScaffoldError> {
+        let url = self
+            .origin
+            .join("/api/agent-auth/grants/rebind")
+            .expect("static Agent Auth route rebind path");
+        let body = serde_json::json!({ "logicalSessionId": logical_session_id });
+        let _: serde_json::Value = self
+            .request(Method::POST, url, Some(&body), cancellation)
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn get_agent_route_receipt(
+        &self,
+        logical_session_id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<AgentRouteReceipt, ScaffoldError> {
+        if logical_session_id.trim().is_empty() {
+            return Err(ScaffoldError::InvalidScope(
+                "logicalSessionId is required".into(),
+            ));
+        }
+        let mut url = self
+            .origin
+            .join("/api/agent-auth/routes/")
+            .expect("static Agent Auth route receipt path");
+        url.path_segments_mut()
+            .expect("Scaffold origin is hierarchical")
+            .pop_if_empty()
+            .push(logical_session_id);
+        self.request(Method::GET, url, Option::<&()>::None, cancellation)
+            .await
     }
 
     pub async fn list(
@@ -472,16 +555,23 @@ impl ScaffoldClient {
         response.sandbox.into_environment(scope.clone())
     }
 
-    pub async fn create(
+    pub(crate) async fn create(
         &self,
         scope: &CollaborationScope,
-        name: Option<&str>,
-        source_ref: Option<&str>,
-        region: Option<&str>,
-        runtime_mode: Option<ScaffoldRuntimeMode>,
+        options: CreateSandboxOptions<'_>,
+        agent_route: &AgentRoute,
         cancellation: &CancellationToken,
     ) -> Result<SessionEnvironment, ScaffoldError> {
+        let CreateSandboxOptions {
+            name,
+            source_ref,
+            region,
+            runtime_mode,
+        } = options;
         self.validate_scope(scope)?;
+        agent_route
+            .validate()
+            .map_err(|message| ScaffoldError::InvalidScope(message.into()))?;
         let deployment_id = scope
             .deployment_id
             .as_deref()
@@ -491,6 +581,7 @@ impl ScaffoldClient {
             source: source_ref.map(|reference| CreateSandboxSource { reference }),
             region,
             runtime_mode,
+            agent_route,
             comet_runtime_profile: CreateCometRuntimeProfile {
                 version: "scaffold.comet-runtime.v1",
                 project_id: &scope.project_id,
@@ -1113,6 +1204,14 @@ fn parse_rfc3339_ms(value: &str, field: &str) -> Result<i64, ScaffoldError> {
         .map_err(|error| ScaffoldError::InvalidResponse(format!("invalid {field}: {error}")))
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CreateSandboxOptions<'a> {
+    pub name: Option<&'a str>,
+    pub source_ref: Option<&'a str>,
+    pub region: Option<&'a str>,
+    pub runtime_mode: Option<ScaffoldRuntimeMode>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateSandboxBody<'a> {
@@ -1124,6 +1223,7 @@ struct CreateSandboxBody<'a> {
     region: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     runtime_mode: Option<ScaffoldRuntimeMode>,
+    agent_route: &'a AgentRoute,
     comet_runtime_profile: CreateCometRuntimeProfile<'a>,
 }
 
@@ -1561,15 +1661,19 @@ impl ScaffoldRuntime {
                 source_ref,
                 region,
                 runtime_mode,
+                agent_route,
             } => (
                 self.inner
                     .client
                     .create(
                         &scope,
-                        name.as_deref(),
-                        source_ref.as_deref(),
-                        region.as_deref(),
-                        runtime_mode,
+                        CreateSandboxOptions {
+                            name: name.as_deref(),
+                            source_ref: source_ref.as_deref(),
+                            region: region.as_deref(),
+                            runtime_mode,
+                        },
+                        &agent_route,
                         cancellation,
                     )
                     .await?,
@@ -2005,6 +2109,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_receipt_returns_attribution_without_credentials() {
+        let response = serde_json::json!({
+            "logicalSessionId": "session-a",
+            "routingMode": "pinned",
+            "requestedAccountId": "opaque-account-id",
+            "route": {
+                "provider": "openai",
+                "model": "gpt-5.6-sol",
+                "backend": "oauth",
+                "accountId": "opaque-account-id",
+                "accountGeneration": 3,
+                "createdAt": "2026-08-10T00:00:00Z",
+                "updatedAt": "2026-08-10T00:01:00Z",
+                "expiresAt": "2026-08-10T01:00:00Z"
+            },
+            "grant": {
+                "id": "grant-id",
+                "provider": "openai",
+                "model": "gpt-5.6-sol",
+                "harness": "codex",
+                "source": "comet-local",
+                "lifecycleEpoch": 1,
+                "environment": "local",
+                "routingMode": "pinned",
+                "requestedAccountId": "opaque-account-id",
+                "backend": "oauth",
+                "accountId": "opaque-account-id",
+                "accountGeneration": 3,
+                "createdAt": "2026-08-10T00:00:00Z",
+                "expiresAt": "2026-08-10T00:05:00Z",
+                "revokedAt": null
+            }
+        })
+        .to_string();
+        let (origin, captured) = mock_server(vec![response]).await;
+        let client = ScaffoldClient::new(
+            origin,
+            "project-a",
+            Arc::new(StaticToken("owner-scoped-bearer".into())),
+        )
+        .unwrap();
+        let receipt = client
+            .get_agent_route_receipt("session-a", &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(receipt.logical_session_id, "session-a");
+        assert_eq!(
+            receipt.route.account_id.as_deref(),
+            Some("opaque-account-id")
+        );
+        assert_eq!(receipt.grant.account_generation, Some(3));
+        let value = serde_json::to_value(receipt).unwrap();
+        assert!(value.get("token").is_none());
+        assert!(value.get("ownerSubject").is_none());
+
+        let requests = captured.await.unwrap();
+        assert!(requests[0].starts_with("GET /api/agent-auth/routes/session-a HTTP/1.1"));
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer owner-scoped-bearer")
+        );
+    }
+
+    #[tokio::test]
+    async fn route_rebind_uses_the_authenticated_exact_contract() {
+        let (origin, captured) = mock_server(vec!["{}".into()]).await;
+        let client = ScaffoldClient::new(
+            origin,
+            "project-a",
+            Arc::new(StaticToken("owner-scoped-bearer".into())),
+        )
+        .unwrap();
+
+        client
+            .rebind_agent_inference_route("session-a", &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let requests = captured.await.unwrap();
+        assert!(requests[0].starts_with("POST /api/agent-auth/grants/rebind HTTP/1.1"));
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer owner-scoped-bearer")
+        );
+        let body = requests[0].split("\r\n\r\n").nth(1).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(body).unwrap(),
+            serde_json::json!({ "logicalSessionId": "session-a" })
+        );
+    }
+
+    #[tokio::test]
     async fn control_plane_methods_decode_lifecycle_and_preserve_http_contract() {
         let listed_sandbox: Value = serde_json::from_str(&sandbox("paused")).unwrap();
         let listed = serde_json::json!({
@@ -2036,10 +2234,13 @@ mod tests {
         let created = client
             .create(
                 &scope(),
-                Some("Comet"),
-                Some("main"),
-                Some("us-central1"),
-                Some(ScaffoldRuntimeMode::Tilt),
+                CreateSandboxOptions {
+                    name: Some("Comet"),
+                    source_ref: Some("main"),
+                    region: Some("us-central1"),
+                    runtime_mode: Some(ScaffoldRuntimeMode::Tilt),
+                },
+                &AgentRoute::automatic(comet_proto::AgentProvider::OpenAi, "gpt-5.6-sol"),
                 &cancellation,
             )
             .await
@@ -2090,12 +2291,46 @@ mod tests {
                 .contains("authorization: bearer sc_rc_control_secret")
         }));
         assert!(requests[2].contains(r#""runtimeMode":"tilt""#));
+        assert!(requests[2].contains(
+            r#""agentRoute":{"provider":"openai","model":"gpt-5.6-sol","fallback":"disabled","routingMode":"automatic"}"#
+        ));
         assert!(requests[2].contains(r#""version":"scaffold.comet-runtime.v1""#));
         assert!(requests[2].contains(r#""projectId":"project-a""#));
         assert!(requests[2].contains(r#""deploymentId":"deployment-a""#));
         assert!(requests[2].contains(r#""sessionId":"011664b5-3660-4fe6-83a2-3647fa6a2f65""#));
     }
 
+    #[test]
+    fn create_sandbox_body_serializes_a_pinned_opaque_account() {
+        let route = AgentRoute::pinned(
+            comet_proto::AgentProvider::Anthropic,
+            "claude-opus-5",
+            "opaque-account-id",
+        );
+        let body = CreateSandboxBody {
+            name: None,
+            source: None,
+            region: None,
+            runtime_mode: Some(ScaffoldRuntimeMode::Compose),
+            agent_route: &route,
+            comet_runtime_profile: CreateCometRuntimeProfile {
+                version: "scaffold.comet-runtime.v1",
+                project_id: "project-a",
+                deployment_id: "deployment-a",
+                session_id: "session-a",
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(body).unwrap()["agentRoute"],
+            serde_json::json!({
+                "provider": "anthropic",
+                "model": "claude-opus-5",
+                "fallback": "disabled",
+                "routingMode": "pinned",
+                "accountId": "opaque-account-id",
+            })
+        );
+    }
     #[tokio::test]
     async fn attach_keeps_credentials_out_of_process_arguments() {
         let join_expires_at = now_ms() + 60_000;

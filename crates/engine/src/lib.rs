@@ -305,6 +305,7 @@ impl EngineCore {
 
     /// Attach the auth service (before building the RPC service / relays).
     pub fn set_auth(&self, auth: Auth) {
+        self.sessions.set_auth(auth.clone());
         *self
             .auth
             .lock()

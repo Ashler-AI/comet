@@ -241,6 +241,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
     let request = comet_proto::RunRequest {
         prompt: "please fix the login flow".into(),
         model: None,
+        agent_account_id: None,
         reasoning: None,
         model_options: serde_json::Map::new(),
         cwd: worktree.path.clone(),
@@ -292,6 +293,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
     let request = comet_proto::RunRequest {
         prompt: "another request".into(),
         model: None,
+        agent_account_id: None,
         reasoning: None,
         model_options: serde_json::Map::new(),
         cwd: worktree.path.clone(),

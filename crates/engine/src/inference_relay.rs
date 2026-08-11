@@ -3,12 +3,13 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener as StdTcpListener};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
 use chrono::{DateTime, TimeDelta, Utc};
-use futures::StreamExt;
+use futures::{StreamExt, stream};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
@@ -24,7 +25,7 @@ use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tokio_util::io::ReaderStream;
 
 use comet_harness::InferenceRoute;
-use comet_proto::HarnessId;
+use comet_proto::{AgentRoutingMode, HarnessId};
 
 use crate::scaffold::{AgentInferenceGrant, AgentInferenceGrantRequest, ScaffoldClient};
 use crate::{EngineError, new_id};
@@ -32,7 +33,7 @@ use crate::{EngineError, new_id};
 const MAX_REQUEST_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CONNECTIONS: usize = 64;
 const REFRESH_SKEW_SECONDS: i64 = 60;
-const MAX_FAILOVER_ATTEMPTS: usize = 4;
+const MAX_AUTOMATIC_REPLAYS: usize = 1;
 
 struct RequestSpool {
     path: TempPath,
@@ -50,6 +51,8 @@ impl RequestSpool {
 
 type BoxError = Box<dyn Error + Send + Sync>;
 type RelayBody = UnsyncBoxBody<Bytes, BoxError>;
+type RelayByteStream =
+    Pin<Box<dyn futures::Stream<Item = Result<Bytes, BoxError>> + Send + 'static>>;
 
 #[derive(Clone)]
 pub(crate) struct InferenceRelay {
@@ -85,28 +88,63 @@ fn inference_binding(
         .map(str::trim)
         .filter(|value| !value.is_empty() && *value != "default")
         .map(str::to_string)
-        .unwrap_or_else(|| match harness {
-            HarnessId::ClaudeCode => "claude-opus-5".into(),
-            HarnessId::Codex | HarnessId::Omp | HarnessId::PrimeAgent => "gpt-5.6-sol".into(),
-            _ => String::new(),
-        });
-    if selected.is_empty() {
-        return None;
-    }
+        .or_else(|| match harness {
+            HarnessId::ClaudeCode => Some("claude-opus-5".into()),
+            HarnessId::Codex => Some("gpt-5.6-sol".into()),
+            _ => None,
+        })?;
+    let lower = selected.to_ascii_lowercase();
+    let provider = match harness {
+        HarnessId::ClaudeCode if !lower.contains('/') => "anthropic",
+        HarnessId::Codex if !lower.contains('/') => "openai",
+        _ if lower.starts_with("anthropic/") => "anthropic",
+        _ if lower.starts_with("openai/") || lower.starts_with("openai-codex/") => "openai",
+        _ => return None,
+    };
     let provider_model = selected
         .rsplit_once('/')
         .map(|(_, model)| model)
-        .filter(|model| !model.is_empty())
-        .unwrap_or(selected.as_str())
-        .to_string();
-    let provider = if selected.to_ascii_lowercase().contains("claude")
-        || selected.to_ascii_lowercase().contains("anthropic")
-    {
-        "anthropic"
-    } else {
-        "openai"
+        .unwrap_or(selected.as_str());
+    (!provider_model.is_empty()).then(|| (provider, provider_model.to_string()))
+}
+
+fn inference_grant_request(
+    logical_session_id: &str,
+    harness: HarnessId,
+    selected_model: Option<&str>,
+    requested_account_id: Option<&str>,
+    lifecycle_epoch: u64,
+) -> Result<Option<AgentInferenceGrantRequest>, EngineError> {
+    let Some((provider, model)) = inference_binding(harness, selected_model) else {
+        return Ok(None);
     };
-    Some((provider, provider_model))
+    let harness = match harness {
+        HarnessId::Codex => "codex",
+        HarnessId::ClaudeCode => "claude-code",
+        HarnessId::Omp => "omp",
+        HarnessId::PrimeAgent => "prime-agent",
+        _ => return Ok(None),
+    };
+    let requested_account_id = requested_account_id.map(str::trim).map(str::to_string);
+    if requested_account_id.as_deref() == Some("") {
+        return Err(EngineError::Other(
+            "Agent Auth account selection cannot be empty".into(),
+        ));
+    }
+    let routing_mode = if requested_account_id.is_some() {
+        AgentRoutingMode::Pinned
+    } else {
+        AgentRoutingMode::Automatic
+    };
+    Ok(Some(AgentInferenceGrantRequest {
+        logical_session_id: logical_session_id.to_string(),
+        provider: provider.to_string(),
+        model,
+        harness: harness.to_string(),
+        routing_mode,
+        requested_account_id,
+        lifecycle_epoch,
+    }))
 }
 
 impl InferenceRelay {
@@ -133,31 +171,23 @@ impl InferenceRelay {
         logical_session_id: &str,
         harness: HarnessId,
         model: Option<&str>,
+        requested_account_id: Option<&str>,
     ) -> Result<Option<InferenceRoute>, EngineError> {
-        let Some((provider, model)) = inference_binding(harness, model) else {
-            return Ok(None);
-        };
-        let harness = match harness {
-            HarnessId::Codex => "codex",
-            HarnessId::ClaudeCode => "claude-code",
-            HarnessId::Omp => "omp",
-            HarnessId::PrimeAgent => "prime-agent",
-            other => {
-                tracing::debug!(?other, "inference relay skipped for unsupported harness");
-                return Ok(None);
-            }
-        };
         let lifecycle_epoch = self
             .inner
             .next_lifecycle_epoch
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
-        let request = AgentInferenceGrantRequest {
-            logical_session_id: logical_session_id.to_string(),
-            provider: provider.to_string(),
+        let Some(request) = inference_grant_request(
+            logical_session_id,
+            harness,
             model,
-            harness: harness.to_string(),
+            requested_account_id,
             lifecycle_epoch,
+        )?
+        else {
+            tracing::debug!(?harness, "inference relay skipped for unsupported harness");
+            return Ok(None);
         };
         let grant = self
             .inner
@@ -183,6 +213,17 @@ impl InferenceRelay {
             }),
         );
         Ok(Some(route))
+    }
+
+    pub(crate) async fn rebind(&self, logical_session_id: &str) -> Result<(), EngineError> {
+        self.inner
+            .client
+            .rebind_agent_inference_route(
+                logical_session_id,
+                &comet_harness::CancellationToken::new(),
+            )
+            .await
+            .map_err(|error| EngineError::Other(format!("Agent Auth route rebind failed: {error}")))
     }
 
     pub(crate) async fn remove(&self, local_token: &str) {
@@ -345,15 +386,15 @@ impl InferenceRelay {
             let upstream = match self
                 .inner
                 .client
-                .proxy_agent_inference(
+                .proxy_agent_inference(crate::scaffold::AgentInferenceProxyRequest {
                     endpoint,
-                    &grant,
-                    &request_id,
-                    sanitized_headers.clone(),
+                    grant: &grant,
+                    request_id: &request_id,
+                    headers: sanitized_headers.clone(),
                     content_length,
                     body,
-                    &cancellation,
-                )
+                    cancellation: &cancellation,
+                })
                 .await
             {
                 Ok(response) => response,
@@ -365,8 +406,13 @@ impl InferenceRelay {
                     );
                 }
             };
-            let Some(failure_class) = retryable_failure(&grant, upstream.status()) else {
+            if failovers >= MAX_AUTOMATIC_REPLAYS {
                 return stream_response(upstream);
+            }
+            let (upstream, failure_class) =
+                retryable_response(&route.request, &grant, upstream).await;
+            let Some(failure_class) = failure_class else {
+                return upstream;
             };
             let retry_after_seconds = upstream
                 .headers()
@@ -386,10 +432,10 @@ impl InferenceRelay {
                 .await;
             let replacement = match replacement {
                 Ok(Some(replacement)) => replacement,
-                Ok(None) => return stream_response(upstream),
+                Ok(None) => return upstream,
                 Err(error) => {
                     tracing::warn!(err = %error, "inference relay failure report was rejected");
-                    return stream_response(upstream);
+                    return upstream;
                 }
             };
             if let Err(error) = self
@@ -402,9 +448,7 @@ impl InferenceRelay {
                     json!({ "error": "agent_auth_unavailable" }),
                 );
             }
-            if failovers >= MAX_FAILOVER_ATTEMPTS {
-                return stream_response(upstream);
-            }
+            drop(upstream);
             failovers += 1;
             grant = replacement;
         }
@@ -483,15 +527,115 @@ async fn spool_request_body(body: Incoming, content_length: u64) -> io::Result<R
     })
 }
 
-fn retryable_failure(grant: &AgentInferenceGrant, status: StatusCode) -> Option<&'static str> {
-    if grant.binding.backend != "oauth" {
-        return None;
+async fn retryable_response(
+    request: &AgentInferenceGrantRequest,
+    grant: &AgentInferenceGrant,
+    upstream: reqwest::Response,
+) -> (Response<RelayBody>, Option<&'static str>) {
+    if request.routing_mode == AgentRoutingMode::Pinned || grant.binding.backend != "oauth" {
+        return (stream_response(upstream), None);
     }
-    match status {
-        StatusCode::TOO_MANY_REQUESTS => Some("account_exhausted"),
-        StatusCode::UNAUTHORIZED => Some("authentication_required"),
-        _ => None,
+    if upstream.status() == StatusCode::UNAUTHORIZED {
+        return (stream_response(upstream), Some("authentication_required"));
     }
+    if upstream.status() != StatusCode::TOO_MANY_REQUESTS
+        || upstream
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
+        || upstream
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .is_some_and(|length| length > MAX_FAILURE_RESPONSE_BYTES)
+    {
+        return (stream_response(upstream), None);
+    }
+
+    let status = upstream.status();
+    let headers = upstream.headers().clone();
+    let mut remaining = Box::pin(upstream.bytes_stream());
+    let mut chunks = Vec::new();
+    let mut observed = 0_usize;
+    while let Some(chunk) = remaining.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                let prefix = stream::iter(chunks.into_iter().map(Ok::<Bytes, BoxError>));
+                let failure = stream::once(async move { Err::<Bytes, BoxError>(Box::new(error)) });
+                return (
+                    streamed_response(status, headers, Box::pin(prefix.chain(failure))),
+                    None,
+                );
+            }
+        };
+        observed = match observed.checked_add(chunk.len()) {
+            Some(observed) => observed,
+            None => {
+                chunks.push(chunk);
+                let prefix = stream::iter(chunks.into_iter().map(Ok::<Bytes, BoxError>));
+                let rest =
+                    remaining.map(|chunk| chunk.map_err(|error| -> BoxError { Box::new(error) }));
+                return (
+                    streamed_response(status, headers, Box::pin(prefix.chain(rest))),
+                    None,
+                );
+            }
+        };
+        chunks.push(chunk);
+        if observed > MAX_FAILURE_RESPONSE_BYTES {
+            let prefix = stream::iter(chunks.into_iter().map(Ok::<Bytes, BoxError>));
+            let rest =
+                remaining.map(|chunk| chunk.map_err(|error| -> BoxError { Box::new(error) }));
+            return (
+                streamed_response(status, headers, Box::pin(prefix.chain(rest))),
+                None,
+            );
+        }
+    }
+
+    let mut body = Vec::with_capacity(observed);
+    for chunk in chunks {
+        body.extend_from_slice(&chunk);
+    }
+    let exhausted = confirmed_account_exhaustion(&body);
+    (
+        buffered_response(status, headers, Bytes::from(body)),
+        exhausted.then_some("account_exhausted"),
+    )
+}
+
+const MAX_FAILURE_RESPONSE_BYTES: usize = 64 * 1024;
+const SUBSCRIPTION_LIMIT_CODES: [&str; 3] = [
+    "insufficient_quota",
+    "subscription_limit_reached",
+    "usage_limit_reached",
+];
+
+fn confirmed_account_exhaustion(body: &[u8]) -> bool {
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(payload) = payload.as_object() else {
+        return false;
+    };
+    let nested = payload.get("error").and_then(serde_json::Value::as_object);
+    let code = nested
+        .and_then(|error| error.get("code"))
+        .or_else(|| payload.get("code"))
+        .and_then(serde_json::Value::as_str);
+    let failure_type = nested
+        .and_then(|error| error.get("type"))
+        .or_else(|| payload.get("type"))
+        .and_then(serde_json::Value::as_str);
+    code.is_some_and(|code| {
+        SUBSCRIPTION_LIMIT_CODES
+            .iter()
+            .any(|expected| code.trim().eq_ignore_ascii_case(expected))
+    }) || failure_type.is_some_and(|value| value.trim().eq_ignore_ascii_case("usage_limit_error"))
 }
 
 fn validate_grant(
@@ -499,18 +643,27 @@ fn validate_grant(
     request: &AgentInferenceGrantRequest,
 ) -> Result<DateTime<Utc>, EngineError> {
     let binding = &grant.binding;
+    let pinned_binding_invalid = request.routing_mode == AgentRoutingMode::Pinned
+        && (binding.backend != "oauth"
+            || binding.account_id.as_deref() != request.requested_account_id.as_deref()
+            || binding.account_generation.is_none());
+    let automatic_oauth_binding_invalid = request.routing_mode == AgentRoutingMode::Automatic
+        && binding.backend == "oauth"
+        && (binding.account_id.is_none() || binding.account_generation.is_none());
     if grant.token.is_empty()
         || binding.owner_subject.is_empty()
         || binding.logical_session_id != request.logical_session_id
         || binding.provider != request.provider
         || binding.model != request.model
         || binding.harness != request.harness
+        || binding.routing_mode != request.routing_mode
+        || binding.requested_account_id != request.requested_account_id
         || binding.source != "comet-local"
         || binding.lifecycle_epoch != request.lifecycle_epoch
         || binding.environment != "local"
         || !matches!(binding.backend.as_str(), "oauth" | "bifrost")
-        || (binding.backend == "oauth"
-            && (binding.account_id.is_none() || binding.account_generation.is_none()))
+        || pinned_binding_invalid
+        || automatic_oauth_binding_invalid
     {
         return Err(EngineError::Other(
             "Agent Auth returned a mismatched inference grant".into(),
@@ -607,11 +760,33 @@ fn json_response(status: StatusCode, body: serde_json::Value) -> Response<RelayB
 fn stream_response(upstream: reqwest::Response) -> Response<RelayBody> {
     let status = upstream.status();
     let headers = upstream.headers().clone();
-    let stream = upstream.bytes_stream().map(|chunk| {
-        chunk
-            .map(Frame::data)
-            .map_err(|error| -> BoxError { Box::new(error) })
-    });
+    let stream = upstream
+        .bytes_stream()
+        .map(|chunk| chunk.map_err(|error| -> BoxError { Box::new(error) }));
+    streamed_response(status, headers, Box::pin(stream))
+}
+
+fn streamed_response(
+    status: StatusCode,
+    headers: HeaderMap,
+    stream: RelayByteStream,
+) -> Response<RelayBody> {
+    let stream = stream.map(|chunk| chunk.map(Frame::data));
+    response_with_headers(status, headers, StreamBody::new(stream).boxed_unsync())
+}
+
+fn buffered_response(status: StatusCode, headers: HeaderMap, body: Bytes) -> Response<RelayBody> {
+    let body = Full::new(body)
+        .map_err(|never| match never {})
+        .boxed_unsync();
+    response_with_headers(status, headers, body)
+}
+
+fn response_with_headers(
+    status: StatusCode,
+    headers: HeaderMap,
+    body: RelayBody,
+) -> Response<RelayBody> {
     let mut response = Response::builder().status(status);
     if let Some(target) = response.headers_mut() {
         for (name, value) in headers {
@@ -625,7 +800,7 @@ fn stream_response(upstream: reqwest::Response) -> Response<RelayBody> {
         }
     }
     response
-        .body(StreamBody::new(stream).boxed_unsync())
+        .body(body)
         .expect("upstream status and headers are valid")
 }
 

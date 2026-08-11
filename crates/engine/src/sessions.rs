@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use chrono::Utc;
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot, watch};
 
 use comet_doc::{
     DocError, MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, SegmentWriter, SessionDoc,
@@ -148,8 +148,82 @@ struct HarnessSessionRef {
     cwd: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RunAuthIdentity {
+    Unattached,
+    SignedOut,
+    SignedIn {
+        owner_subject: String,
+        project_scope: String,
+    },
+}
+
+impl From<&crate::AuthState> for RunAuthIdentity {
+    fn from(state: &crate::AuthState) -> Self {
+        match state {
+            crate::AuthState::SignedOut => Self::SignedOut,
+            crate::AuthState::SignedIn {
+                user,
+                project_scope,
+            } => Self::SignedIn {
+                owner_subject: user.id.clone(),
+                project_scope: project_scope.clone(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunRoute {
+    harness: HarnessId,
+    model: Option<String>,
+    agent_account_id: Option<String>,
+    auth_identity: RunAuthIdentity,
+}
+
+impl RunRoute {
+    fn new(harness: HarnessId, request: &RunRequest, auth_identity: RunAuthIdentity) -> Self {
+        Self {
+            harness,
+            model: request.model.clone(),
+            agent_account_id: request.agent_account_id.clone(),
+            auth_identity,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DispatchPreparation {
+    id: String,
+    route: RunRoute,
+    cancel: CancellationToken,
+}
+
+struct DispatchPreparationGuard {
+    inner: Weak<Inner>,
+    chat_id: String,
+    id: String,
+    cancel: CancellationToken,
+}
+
+impl Drop for DispatchPreparationGuard {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let mut preparations = lock(&inner.preparations);
+        if preparations
+            .get(&self.chat_id)
+            .is_some_and(|preparation| preparation.id == self.id)
+        {
+            preparations.remove(&self.chat_id);
+        }
+    }
+}
+
 struct RunHandle {
     run_id: String,
+    route: RunRoute,
     steerable: bool,
     steering_mode: SteeringMode,
     steer_tx: mpsc::Sender<SteerMessage>,
@@ -208,6 +282,18 @@ struct Inner {
     doc_host: OnceLock<DocHost>,
     /// chat_id → live run.
     runs: Mutex<HashMap<String, RunHandle>>,
+    /// Per-chat dispatch serialization. The weak values disappear when the
+    /// final waiter leaves, while the map preserves one lock for all dispatches
+    /// that overlap grant preparation or harness startup.
+    dispatch_locks: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
+    /// A route reservation exists from the first potentially-async replacement
+    /// step through harness startup. Auth changes cancel stale preparations
+    /// even before a live run handle exists.
+    preparations: Mutex<HashMap<String, DispatchPreparation>>,
+    /// Last successfully prepared route per chat. Deliberately retained after
+    /// run removal so a changed no-live dispatch still clears the authenticated
+    /// upstream binding before asking for another grant.
+    last_routes: Mutex<HashMap<String, RunRoute>>,
     /// chat_id → broadcast hub (retained across runs so subscribers survive turns).
     hubs: Mutex<HashMap<String, broadcast::Sender<JournaledEvent>>>,
     statuses: Mutex<HashMap<String, Session>>,
@@ -227,6 +313,8 @@ struct Inner {
     titles: OnceLock<crate::titles::TitleGenerator>,
     /// Per-run loopback inference routes backed by centrally held Agent Auth credentials.
     inference_relay: OnceLock<crate::inference_relay::InferenceRelay>,
+    /// Synchronous authenticated identity used to bind persistent run routes.
+    auth: OnceLock<crate::Auth>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -254,6 +342,9 @@ impl SessionsEngine {
                 ipc_port,
                 doc_host: OnceLock::new(),
                 runs: Mutex::new(HashMap::new()),
+                dispatch_locks: Mutex::new(HashMap::new()),
+                preparations: Mutex::new(HashMap::new()),
+                last_routes: Mutex::new(HashMap::new()),
                 hubs: Mutex::new(HashMap::new()),
                 statuses: Mutex::new(HashMap::new()),
                 sessions_tx,
@@ -262,6 +353,7 @@ impl SessionsEngine {
                 peer_waiters: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
                 inference_relay: OnceLock::new(),
+                auth: OnceLock::new(),
             }),
         }
     }
@@ -279,6 +371,87 @@ impl SessionsEngine {
 
     pub(crate) fn set_inference_relay(&self, relay: crate::inference_relay::InferenceRelay) {
         let _ = self.inner.inference_relay.set(relay);
+    }
+
+    pub(crate) fn set_auth(&self, auth: crate::Auth) {
+        let mut state_rx = auth.watch_state();
+        if self.inner.auth.set(auth).is_err() {
+            return;
+        }
+        let mut previous = RunAuthIdentity::from(&*state_rx.borrow_and_update());
+        let weak = Arc::downgrade(&self.inner);
+        tokio::spawn(async move {
+            while state_rx.changed().await.is_ok() {
+                let current = RunAuthIdentity::from(&*state_rx.borrow_and_update());
+                if current == previous {
+                    continue;
+                }
+                previous = current.clone();
+                let Some(inner) = weak.upgrade() else {
+                    break;
+                };
+                let sessions = SessionsEngine { inner };
+                sessions
+                    .interrupt_runs_with_stale_auth_identity(&current)
+                    .await;
+            }
+        });
+    }
+
+    fn auth_identity(&self) -> RunAuthIdentity {
+        self.inner
+            .auth
+            .get()
+            .map(|auth| RunAuthIdentity::from(&auth.state()))
+            .unwrap_or(RunAuthIdentity::Unattached)
+    }
+
+    fn dispatch_lock(&self, chat_id: &str) -> Arc<AsyncMutex<()>> {
+        let mut locks = lock(&self.inner.dispatch_locks);
+        if let Some(dispatch_lock) = locks.get(chat_id).and_then(Weak::upgrade) {
+            return dispatch_lock;
+        }
+        let dispatch_lock = Arc::new(AsyncMutex::new(()));
+        locks.insert(chat_id.to_string(), Arc::downgrade(&dispatch_lock));
+        dispatch_lock
+    }
+
+    fn reserve_preparation(&self, chat_id: &str, route: RunRoute) -> DispatchPreparationGuard {
+        let id = new_id();
+        let cancel = CancellationToken::new();
+        let preparation = DispatchPreparation {
+            id: id.clone(),
+            route,
+            cancel: cancel.clone(),
+        };
+        if let Some(previous) =
+            lock(&self.inner.preparations).insert(chat_id.to_string(), preparation)
+        {
+            // This is only reachable if a future caller bypasses the per-chat
+            // dispatch lock. Fail closed instead of leaving both preparations live.
+            previous.cancel.cancel();
+        }
+        DispatchPreparationGuard {
+            inner: Arc::downgrade(&self.inner),
+            chat_id: chat_id.to_string(),
+            id,
+            cancel,
+        }
+    }
+
+    fn preparation_auth_is_current(
+        &self,
+        preparation: &DispatchPreparationGuard,
+        route: &RunRoute,
+    ) -> bool {
+        !preparation.cancel.is_cancelled() && self.auth_identity() == route.auth_identity
+    }
+
+    fn no_live_route_requires_rebind(&self, chat_id: &str, requested: &RunRoute) -> bool {
+        // With no in-memory identity the engine may have restarted after the
+        // remote route became sticky but before any local run survived. Treat
+        // that state as unknown and rebind conservatively before first prepare.
+        lock(&self.inner.last_routes).get(chat_id) != Some(requested)
     }
 
     fn doc_handle(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
@@ -471,59 +644,153 @@ impl SessionsEngine {
         message_id: Option<String>,
         inject_resume: bool,
     ) -> Result<String, EngineError> {
+        let dispatch_lock = self.dispatch_lock(chat_id);
+        let _dispatch_guard = dispatch_lock.lock().await;
+
+        enum ExistingRunDecision {
+            None,
+            Routed {
+                run_id: String,
+                status: MessageStatus,
+            },
+            Replace {
+                run_id: String,
+                route_changed: bool,
+            },
+        }
+
         let user_id = message_id.unwrap_or_else(new_id);
-        let routed = {
+        let requested_route = RunRoute::new(harness_id, &request, self.auth_identity());
+        let existing = {
             let mut runs = lock(&self.inner.runs);
-            runs.get_mut(chat_id).map(|handle| {
-                let was_turn_active = handle.turn_active;
-                handle.turn_active = true;
-                if !handle.steerable {
-                    return None;
+            match runs.get_mut(chat_id) {
+                None => ExistingRunDecision::None,
+                Some(handle) if handle.route != requested_route => ExistingRunDecision::Replace {
+                    run_id: handle.run_id.clone(),
+                    route_changed: true,
+                },
+                Some(handle) => {
+                    let was_turn_active = handle.turn_active;
+                    handle.turn_active = true;
+                    if !handle.steerable {
+                        ExistingRunDecision::Replace {
+                            run_id: handle.run_id.clone(),
+                            route_changed: false,
+                        }
+                    } else {
+                        let message = SteerMessage {
+                            prompt: request.prompt.clone(),
+                            message_id: Some(user_id.clone()),
+                        };
+                        if handle.steer_tx.try_send(message.clone()).is_err() {
+                            ExistingRunDecision::Replace {
+                                run_id: handle.run_id.clone(),
+                                route_changed: false,
+                            }
+                        } else {
+                            let status = handle.mailbox_message_status(was_turn_active, message);
+                            ExistingRunDecision::Routed {
+                                run_id: handle.run_id.clone(),
+                                status,
+                            }
+                        }
+                    }
                 }
-                let message = SteerMessage {
-                    prompt: request.prompt.clone(),
-                    message_id: Some(user_id.clone()),
-                };
-                if handle.steer_tx.try_send(message.clone()).is_err() {
-                    return None;
-                }
-                let status = handle.mailbox_message_status(was_turn_active, message);
-                Some((handle.run_id.clone(), status))
-            })
-        };
-        if let Some(mailbox) = routed {
-            if let Some((run_id, status)) = mailbox {
-                let handle = self.doc_handle(chat_id)?;
-                handle.write_user_message_with_status(
-                    &user_id,
-                    &request.prompt,
-                    now_ms(),
-                    status,
-                )?;
-                // The optimistic echo may already exist with a composer-guessed
-                // steer status. Stamp the engine-authoritative state over it.
-                handle.doc_arc().set_message_status(&user_id, status)?;
-                // Working BEFORE the lastMessageAt bump: both ride the
-                // workspace doc from this one peer, so causal order makes it
-                // impossible for an observer to hold [new message, old status]
-                // — that gap read as unseen-with-no-live-run = a phantom
-                // "completed" flash on every remote send (2026-07-31).
-                self.set_status(chat_id, SessionStatus::Working, false);
-                self.inner.note_message(chat_id, &request.prompt);
-                return Ok(run_id);
             }
-            // Mailbox closed (runtime mid-teardown / non-steering harness): replace it.
-            self.interrupt(chat_id).await?;
+        };
+        if let ExistingRunDecision::Routed { run_id, status } = &existing {
+            let handle = self.doc_handle(chat_id)?;
+            handle.write_user_message_with_status(&user_id, &request.prompt, now_ms(), *status)?;
+            // The optimistic echo may already exist with a composer-guessed
+            // steer status. Stamp the engine-authoritative state over it.
+            handle.doc_arc().set_message_status(&user_id, *status)?;
+            // Working BEFORE the lastMessageAt bump: both ride the
+            // workspace doc from this one peer, so causal order makes it
+            // impossible for an observer to hold [new message, old status]
+            // — that gap read as unseen-with-no-live-run = a phantom
+            // "completed" flash on every remote send (2026-07-31).
+            self.set_status(chat_id, SessionStatus::Working, false);
+            self.inner.note_message(chat_id, &request.prompt);
+            return Ok(run_id.clone());
+        }
+
+        // Reserve before the first async teardown/rebind/prepare step. A second
+        // dispatch for this chat cannot pass the lock above, and an auth change
+        // can cancel this route even though no replacement RunHandle exists yet.
+        let preparation = self.reserve_preparation(chat_id, requested_route.clone());
+        let mut rebound = false;
+        match existing {
+            ExistingRunDecision::Replace {
+                run_id,
+                route_changed,
+            } => {
+                // Mailbox closed, non-steering harness, or route mismatch:
+                // settle the old run before issuing any replacement.
+                self.interrupt(chat_id).await?;
+                // `interrupt` is intentionally bounded for ordinary callers;
+                // route replacement must also await relay removal and upstream
+                // grant revocation, which happen before the handle disappears.
+                while self.is_live(chat_id, &run_id) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                if route_changed && let Some(relay) = self.inner.inference_relay.get() {
+                    if !self.preparation_auth_is_current(&preparation, &requested_route) {
+                        return Err(EngineError::Other(
+                            "authenticated route changed during dispatch preparation".into(),
+                        ));
+                    }
+                    relay.rebind(chat_id).await?;
+                    rebound = true;
+                }
+            }
+            ExistingRunDecision::None => {}
+            ExistingRunDecision::Routed { .. } => unreachable!("routed dispatch returned above"),
+        }
+
+        if !self.preparation_auth_is_current(&preparation, &requested_route) {
+            return Err(EngineError::Other(
+                "authenticated route changed during dispatch preparation".into(),
+            ));
+        }
+        if !rebound
+            && self.no_live_route_requires_rebind(chat_id, &requested_route)
+            && let Some(relay) = self.inner.inference_relay.get()
+        {
+            // This includes restart state where the exact prior identity is
+            // unavailable. Rebind is deliberately before prepare/grant issuance.
+            relay.rebind(chat_id).await?;
+        }
+        if !self.preparation_auth_is_current(&preparation, &requested_route) {
+            return Err(EngineError::Other(
+                "authenticated route changed during dispatch preparation".into(),
+            ));
         }
 
         let harness = self.inner.registry.resolve(harness_id)?;
         let inference = if let Some(relay) = self.inner.inference_relay.get() {
             relay
-                .prepare(chat_id, harness_id, request.model.as_deref())
+                .prepare(
+                    chat_id,
+                    harness_id,
+                    request.model.as_deref(),
+                    request.agent_account_id.as_deref(),
+                )
                 .await?
         } else {
             None
         };
+        if !self.preparation_auth_is_current(&preparation, &requested_route) {
+            if let (Some(relay), Some(route)) =
+                (self.inner.inference_relay.get(), inference.as_ref())
+            {
+                relay.remove(&route.token).await;
+                relay.rebind(chat_id).await?;
+            }
+            return Err(EngineError::Other(
+                "authenticated route changed during dispatch preparation".into(),
+            ));
+        }
+        lock(&self.inner.last_routes).insert(chat_id.to_string(), requested_route.clone());
         let inference_token = inference.as_ref().map(|route| route.token.clone());
         let handle = self.doc_handle(chat_id)?;
         handle.write_user_message(&user_id, &request.prompt, now_ms())?;
@@ -573,10 +840,23 @@ impl SessionsEngine {
             }),
         };
 
+        if !self.preparation_auth_is_current(&preparation, &requested_route) {
+            if let (Some(relay), Some(token)) =
+                (self.inner.inference_relay.get(), inference_token.as_deref())
+            {
+                relay.remove(token).await;
+                relay.rebind(chat_id).await?;
+            }
+            return Err(EngineError::Other(
+                "authenticated route changed during dispatch preparation".into(),
+            ));
+        }
+
         lock(&self.inner.runs).insert(
             chat_id.to_string(),
             RunHandle {
                 run_id: run_id.clone(),
+                route: requested_route,
                 steerable: harness.supports_steering(),
                 steering_mode: harness.steering_mode(),
                 steer_tx,
@@ -606,6 +886,7 @@ impl SessionsEngine {
         let stream = match harness.run(request.clone(), controls).await {
             Ok(stream) => stream,
             Err(err) => {
+                self.inner.mark_run_tearing_down(chat_id, &run_id);
                 if let (Some(relay), Some(token)) =
                     (self.inner.inference_relay.get(), inference_token.as_deref())
                 {
@@ -802,6 +1083,38 @@ impl SessionsEngine {
         Ok(true)
     }
 
+    async fn interrupt_runs_with_stale_auth_identity(&self, current: &RunAuthIdentity) {
+        // Preparations precede live handles. Cancel them first so a grant that
+        // returns under a different owner/project is revoked instead of launched.
+        for preparation in lock(&self.inner.preparations).values() {
+            if &preparation.route.auth_identity != current {
+                preparation.cancel.cancel();
+            }
+        }
+        let runs = lock(&self.inner.runs)
+            .iter()
+            .filter(|(_, handle)| &handle.route.auth_identity != current)
+            .map(|(chat_id, handle)| (chat_id.clone(), handle.run_id.clone()))
+            .collect::<Vec<_>>();
+        let interrupted =
+            futures::future::join_all(runs.iter().map(|(chat_id, _)| self.interrupt(chat_id)))
+                .await;
+        for ((chat_id, _), result) in runs.iter().zip(interrupted) {
+            if let Err(error) = result {
+                tracing::warn!(
+                    chat = %chat_id,
+                    error = %error,
+                    "auth change run interrupt failed"
+                );
+            }
+        }
+        for (chat_id, run_id) in runs {
+            while self.is_live(&chat_id, &run_id) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
+
     /// Resolve a pending `request_input` question set. Returns `false` when no such
     /// request is pending (unknown id, or the run already settled).
     pub fn respond_input(
@@ -919,6 +1232,7 @@ impl SessionsEngine {
                         Some(RunRequest {
                             prompt: String::new(),
                             model: None,
+                            agent_account_id: None,
                             reasoning: None,
                             model_options: Default::default(),
                             cwd,
@@ -1207,6 +1521,16 @@ impl Inner {
         found
     }
 
+    fn mark_run_tearing_down(&self, chat_id: &str, run_id: &str) {
+        let mut runs = lock(&self.runs);
+        if let Some(handle) = runs
+            .get_mut(chat_id)
+            .filter(|handle| handle.run_id == run_id)
+        {
+            handle.steerable = false;
+        }
+    }
+
     fn remove_run(&self, chat_id: &str, run_id: &str) {
         let mut runs = lock(&self.runs);
         if runs.get(chat_id).is_some_and(|h| h.run_id == run_id) {
@@ -1489,13 +1813,14 @@ async fn drive_run(
                 chat = %chat_id,
                 "harness rejected injected resume id; retrying as a fresh session"
             );
+            inner.mark_run_tearing_down(&chat_id, &run_id);
             inner.forget_harness_session(&chat_id);
-            inner.remove_run(&chat_id, &run_id);
             if let (Some(relay), Some(token)) =
                 (inner.inference_relay.get(), inference_token.as_deref())
             {
                 relay.remove(token).await;
             }
+            inner.remove_run(&chat_id, &run_id);
             let engine = SessionsEngine {
                 inner: inner.clone(),
             };
@@ -1733,6 +2058,7 @@ async fn drive_run(
         }
     };
 
+    inner.mark_run_tearing_down(&chat_id, &run_id);
     let mut deferred_followups = {
         let mut runs = lock(&inner.runs);
         runs.get_mut(&chat_id)
@@ -1746,11 +2072,11 @@ async fn drive_run(
             })
             .unwrap_or_default()
     };
-    inner.remove_run(&chat_id, &run_id);
-    inner.set_status(&chat_id, final_status, false);
     if let (Some(relay), Some(token)) = (inner.inference_relay.get(), inference_token.as_deref()) {
         relay.remove(token).await;
     }
+    inner.remove_run(&chat_id, &run_id);
+    inner.set_status(&chat_id, final_status, false);
 
     if interrupted {
         for followup in deferred_followups {
@@ -1883,5 +2209,184 @@ mod tests {
             .doc_handle("session-a")
             .expect("session execution should preserve the projected room");
         assert!(Arc::ptr_eq(&projected, &run_handle));
+    }
+
+    fn bare_sessions(path: &std::path::Path) -> SessionsEngine {
+        SessionsEngine::new(
+            "test-device".into(),
+            Arc::new(RunJournal::open(path).unwrap()),
+            Arc::new(HarnessRegistry::new()),
+            27654,
+        )
+    }
+
+    fn test_route(harness: HarnessId) -> RunRoute {
+        RunRoute::new(
+            harness,
+            &RunRequest {
+                prompt: "hello".into(),
+                model: Some("gpt-5.6-sol".into()),
+                agent_account_id: Some("account-a".into()),
+                reasoning: None,
+                model_options: Default::default(),
+                cwd: "/tmp".into(),
+                sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
+                auto_approve: false,
+                resume: None,
+                attachments: vec![],
+            },
+            RunAuthIdentity::SignedIn {
+                owner_subject: "owner-a".into(),
+                project_scope: "project-a".into(),
+            },
+        )
+    }
+
+    #[test]
+    fn persistent_run_route_changes_with_harness_model_account_or_auth_identity() {
+        let route = test_route(HarnessId::Codex);
+        assert_eq!(route, test_route(HarnessId::Codex));
+        assert_ne!(route, test_route(HarnessId::ClaudeCode));
+
+        let mut changed_account_request = RunRequest {
+            prompt: "hello".into(),
+            model: Some("gpt-5.6-sol".into()),
+            agent_account_id: Some("account-b".into()),
+            reasoning: None,
+            model_options: Default::default(),
+            cwd: "/tmp".into(),
+            sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
+            auto_approve: false,
+            resume: None,
+            attachments: vec![],
+        };
+        let identity = route.auth_identity.clone();
+        assert_ne!(
+            route,
+            RunRoute::new(HarnessId::Codex, &changed_account_request, identity.clone())
+        );
+
+        changed_account_request.agent_account_id = None;
+        assert_ne!(
+            route,
+            RunRoute::new(HarnessId::Codex, &changed_account_request, identity.clone())
+        );
+
+        changed_account_request.agent_account_id = Some("account-a".into());
+        changed_account_request.model = Some("gpt-5.6-terra".into());
+        assert_ne!(
+            route,
+            RunRoute::new(HarnessId::Codex, &changed_account_request, identity)
+        );
+
+        let original_request = RunRequest {
+            model: Some("gpt-5.6-sol".into()),
+            agent_account_id: Some("account-a".into()),
+            ..changed_account_request
+        };
+        assert_ne!(
+            route,
+            RunRoute::new(
+                HarnessId::Codex,
+                &original_request,
+                RunAuthIdentity::SignedIn {
+                    owner_subject: "owner-b".into(),
+                    project_scope: "project-a".into(),
+                }
+            )
+        );
+        assert_ne!(
+            route,
+            RunRoute::new(
+                HarnessId::Codex,
+                &original_request,
+                RunAuthIdentity::SignedIn {
+                    owner_subject: "owner-a".into(),
+                    project_scope: "project-b".into(),
+                }
+            )
+        );
+        assert_ne!(
+            route,
+            RunRoute::new(
+                HarnessId::Codex,
+                &original_request,
+                RunAuthIdentity::SignedOut
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_idle_dispatches_are_serialized_before_preparation() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = bare_sessions(&dir.path().join("journal"));
+        let first_lock = sessions.dispatch_lock("chat-a");
+        let first = first_lock.lock().await;
+        let contender = sessions.clone();
+        let (entered_tx, mut entered_rx) = oneshot::channel();
+        let (attempted_tx, attempted_rx) = oneshot::channel();
+
+        let second = tokio::spawn(async move {
+            let _ = attempted_tx.send(());
+            let dispatch_lock = contender.dispatch_lock("chat-a");
+            let _guard = dispatch_lock.lock().await;
+            let _ = entered_tx.send(());
+        });
+        attempted_rx
+            .await
+            .expect("the contender should reach the per-chat lock");
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            entered_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        drop(first);
+        entered_rx
+            .await
+            .expect("the serialized dispatch should proceed after release");
+        second.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn auth_change_cancels_a_route_during_preparation() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = bare_sessions(&dir.path().join("journal"));
+        let route = test_route(HarnessId::Codex);
+        let preparation = sessions.reserve_preparation("chat-a", route);
+        assert!(!preparation.cancel.is_cancelled());
+
+        sessions
+            .interrupt_runs_with_stale_auth_identity(&RunAuthIdentity::SignedIn {
+                owner_subject: "owner-b".into(),
+                project_scope: "project-b".into(),
+            })
+            .await;
+
+        assert!(preparation.cancel.is_cancelled());
+    }
+
+    #[test]
+    fn no_live_changed_or_restart_unknown_route_requires_rebind() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = bare_sessions(&dir.path().join("journal"));
+        let route = test_route(HarnessId::Codex);
+
+        assert!(
+            sessions.no_live_route_requires_rebind("chat-a", &route),
+            "restart-unknown route state must fail closed"
+        );
+        lock(&sessions.inner.last_routes).insert("chat-a".into(), route.clone());
+        assert!(!sessions.no_live_route_requires_rebind("chat-a", &route));
+        assert!(
+            sessions.no_live_route_requires_rebind("chat-a", &test_route(HarnessId::ClaudeCode))
+        );
+        let mut changed_model = route.clone();
+        changed_model.model = Some("gpt-5.6-terra".into());
+        assert!(sessions.no_live_route_requires_rebind("chat-a", &changed_model));
+
+        let mut changed_account = route.clone();
+        changed_account.agent_account_id = Some("account-b".into());
+        assert!(sessions.no_live_route_requires_rebind("chat-a", &changed_account));
     }
 }

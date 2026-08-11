@@ -146,6 +146,9 @@ struct Detected {
 enum LoginFlow {
     Claude {
         verifier: String,
+        /// Exchanged OAuth material retained only in memory until Agent Auth
+        /// acknowledges the import. A retry must not consume the code again.
+        slot: Option<Box<Slot>>,
         started_at: Instant,
     },
     Codex {
@@ -176,6 +179,8 @@ struct Inner {
     config: AgentAccountsConfig,
     http: reqwest::Client,
     flows: Mutex<HashMap<String, LoginFlow>>,
+    claude_token_url: String,
+    claude_profile_url: String,
     /// Present after authenticated controller startup. Every account operation
     /// requires this client because Agent Auth is the sole authority.
     remote: Mutex<Option<ScaffoldClient>>,
@@ -212,6 +217,8 @@ impl AgentAccounts {
             inner: Arc::new(Inner {
                 config,
                 http,
+                claude_token_url: CLAUDE_TOKEN_URL.into(),
+                claude_profile_url: CLAUDE_PROFILE_URL.into(),
                 flows: Mutex::new(HashMap::new()),
                 remote: Mutex::new(None),
             }),
@@ -499,6 +506,7 @@ impl AgentAccounts {
             login_id.clone(),
             LoginFlow::Claude {
                 verifier,
+                slot: None,
                 started_at: Instant::now(),
             },
         );
@@ -649,14 +657,20 @@ impl AgentAccounts {
         login_id: &str,
         code: &str,
     ) -> Result<AgentAccountsSnapshot, EngineError> {
-        let verifier = match lock(&self.inner.flows).get(login_id) {
-            Some(LoginFlow::Claude { verifier, .. }) => verifier.clone(),
+        let (verifier, exchanged_slot) = match lock(&self.inner.flows).get(login_id) {
+            Some(LoginFlow::Claude { verifier, slot, .. }) => (verifier.clone(), slot.clone()),
             _ => {
                 return Err(EngineError::Other(
                     "This sign-in attempt expired — start again.".into(),
                 ));
             }
         };
+        if let Some(slot) = exchanged_slot {
+            let remote = self.remote()?;
+            self.import_slot(&remote, &slot).await?;
+            lock(&self.inner.flows).remove(login_id);
+            return self.list().await;
+        }
         let (auth_code, state) = match code.trim().split_once('#') {
             Some((c, s)) => (c.to_string(), s.to_string()),
             None => (code.trim().to_string(), verifier.clone()),
@@ -669,7 +683,7 @@ impl AgentAccounts {
         let token = self
             .inner
             .http
-            .post(CLAUDE_TOKEN_URL)
+            .post(&self.inner.claude_token_url)
             .json(&serde_json::json!({
                 "grant_type": "authorization_code",
                 "code": auth_code,
@@ -711,7 +725,7 @@ impl AgentAccounts {
         let profile: Option<serde_json::Value> = match self
             .inner
             .http
-            .get(CLAUDE_PROFILE_URL)
+            .get(&self.inner.claude_profile_url)
             .bearer_auth(&access_token)
             .header("anthropic-beta", "oauth-2025-04-20")
             .send()
@@ -799,6 +813,19 @@ impl AgentAccounts {
             saved_at: now_ms(),
             created_at: None,
         };
+        {
+            let mut flows = lock(&self.inner.flows);
+            match flows.get_mut(login_id) {
+                Some(LoginFlow::Claude {
+                    slot: pending_slot, ..
+                }) => *pending_slot = Some(Box::new(slot.clone())),
+                _ => {
+                    return Err(EngineError::Other(
+                        "This sign-in attempt expired — start again.".into(),
+                    ));
+                }
+            }
+        }
         let remote = self.remote()?;
         self.import_slot(&remote, &slot).await?;
         lock(&self.inner.flows).remove(login_id);
@@ -1440,6 +1467,145 @@ fn write_file_atomic(file: &Path, bytes: &[u8], secret: bool) -> Result<(), Engi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    struct StaticToken;
+
+    #[async_trait]
+    impl comet_rpc::TokenSource for StaticToken {
+        async fn token(&self) -> Option<String> {
+            Some("test-access-token".into())
+        }
+    }
+
+    async fn scripted_server(
+        responses: Vec<(u16, String)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 4096];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..read]);
+                    let Some(header_end) =
+                        bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let content_length = String::from_utf8_lossy(&bytes[..header_end])
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if bytes.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+                requests.push(String::from_utf8(bytes).unwrap());
+                let reason = if status == 200 {
+                    "OK"
+                } else {
+                    "Internal Server Error"
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (origin, task)
+    }
+
+    fn claude_test_accounts(
+        config: AgentAccountsConfig,
+        claude_origin: &str,
+        remote: ScaffoldClient,
+    ) -> AgentAccounts {
+        let http = reqwest::Client::builder()
+            .timeout(HTTP_TIMEOUT)
+            .build()
+            .unwrap();
+        AgentAccounts {
+            inner: Arc::new(Inner {
+                config,
+                http,
+                flows: Mutex::new(HashMap::new()),
+                claude_token_url: format!("{claude_origin}/token"),
+                claude_profile_url: format!("{claude_origin}/profile"),
+                remote: Mutex::new(Some(remote)),
+            }),
+        }
+    }
+
+    fn has_temporary_claude_credential(accounts: &AgentAccounts, login_id: &str) -> bool {
+        matches!(
+            lock(&accounts.inner.flows).get(login_id),
+            Some(LoginFlow::Claude { slot: Some(_), .. })
+        )
+    }
+
+    fn claude_token_response() -> String {
+        serde_json::json!({
+            "access_token": "claude-access",
+            "refresh_token": "claude-refresh",
+            "expires_in": 3600,
+            "scope": "user:profile user:inference",
+            "account": {
+                "uuid": "account-1",
+                "email_address": "person@example.com"
+            }
+        })
+        .to_string()
+    }
+
+    fn claude_profile_response() -> String {
+        serde_json::json!({
+            "account": {
+                "uuid": "account-1",
+                "email_address": "person@example.com",
+                "display_name": "Person"
+            },
+            "organization": {
+                "uuid": "organization-1",
+                "name": "Example",
+                "organization_type": "claude_pro"
+            }
+        })
+        .to_string()
+    }
+
+    fn imported_claude_account_response() -> String {
+        serde_json::json!({
+            "account": {
+                "id": "remote-account-1",
+                "provider": "anthropic",
+                "providerAccountId": "account-1",
+                "email": "person@example.com",
+                "displayName": "Person",
+                "organization": "Example",
+                "plan": "Pro",
+                "status": "connected",
+                "usageFraction": null,
+                "resetAt": null
+            }
+        })
+        .to_string()
+    }
 
     fn test_config(root: &Path) -> AgentAccountsConfig {
         AgentAccountsConfig {
@@ -1470,6 +1636,129 @@ mod tests {
                 "account_id": account_id
             }
         })
+    }
+    #[tokio::test]
+    async fn claude_import_retry_reuses_the_single_code_exchange() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (claude_origin, claude_requests) = scripted_server(vec![
+            (200, claude_token_response()),
+            (200, claude_profile_response()),
+        ])
+        .await;
+        let remote_account = imported_claude_account_response();
+        let list = serde_json::json!({
+            "accounts": [serde_json::from_str::<serde_json::Value>(&remote_account)
+                .unwrap()["account"].clone()]
+        })
+        .to_string();
+        let (remote_origin, remote_requests) = scripted_server(vec![
+            (
+                500,
+                serde_json::json!({ "message": "temporary" }).to_string(),
+            ),
+            (200, remote_account),
+            (200, list),
+        ])
+        .await;
+        let remote =
+            ScaffoldClient::new(&remote_origin, "project-1", Arc::new(StaticToken)).unwrap();
+        let accounts = claude_test_accounts(test_config(tmp.path()), &claude_origin, remote);
+        let login = accounts.start_claude_login();
+
+        let first = accounts
+            .complete_login(&login.login_id, "one-time-code")
+            .await;
+        assert!(first.is_err(), "the first Agent Auth import must fail");
+        assert!(
+            has_temporary_claude_credential(&accounts, &login.login_id),
+            "the exchanged credential remains only in the temporary flow"
+        );
+
+        accounts
+            .complete_login(&login.login_id, "already-consumed-code")
+            .await
+            .expect("retry imports the exchanged credential");
+        assert!(
+            !has_temporary_claude_credential(&accounts, &login.login_id),
+            "acknowledged import clears the temporary credential"
+        );
+
+        let claude_requests = claude_requests.await.unwrap();
+        assert_eq!(
+            claude_requests
+                .iter()
+                .filter(|request| request.starts_with("POST /token "))
+                .count(),
+            1
+        );
+        assert_eq!(
+            claude_requests
+                .iter()
+                .filter(|request| request.starts_with("GET /profile "))
+                .count(),
+            1
+        );
+        let remote_requests = remote_requests.await.unwrap();
+        assert_eq!(
+            remote_requests
+                .iter()
+                .filter(|request| request.starts_with("POST /api/agent-accounts/import "))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_claude_import_retry_clears_the_exchanged_credential() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (claude_origin, claude_requests) = scripted_server(vec![
+            (200, claude_token_response()),
+            (200, claude_profile_response()),
+        ])
+        .await;
+        let (remote_origin, remote_requests) = scripted_server(vec![(
+            500,
+            serde_json::json!({ "message": "temporary" }).to_string(),
+        )])
+        .await;
+        let remote =
+            ScaffoldClient::new(&remote_origin, "project-1", Arc::new(StaticToken)).unwrap();
+        let accounts = claude_test_accounts(test_config(tmp.path()), &claude_origin, remote);
+        let login = accounts.start_claude_login();
+
+        assert!(
+            accounts
+                .complete_login(&login.login_id, "one-time-code")
+                .await
+                .is_err()
+        );
+        assert!(has_temporary_claude_credential(&accounts, &login.login_id));
+        accounts.cancel_login(&login.login_id);
+        assert!(!has_temporary_claude_credential(&accounts, &login.login_id));
+        assert!(
+            accounts
+                .complete_login(&login.login_id, "one-time-code")
+                .await
+                .is_err(),
+            "a cancelled flow cannot reuse or exchange credentials"
+        );
+
+        let claude_requests = claude_requests.await.unwrap();
+        assert_eq!(
+            claude_requests
+                .iter()
+                .filter(|request| request.starts_with("POST /token "))
+                .count(),
+            1
+        );
+        let remote_requests = remote_requests.await.unwrap();
+        assert_eq!(
+            remote_requests
+                .iter()
+                .filter(|request| request.starts_with("POST /api/agent-accounts/import "))
+                .count(),
+            1
+        );
     }
 
     #[test]

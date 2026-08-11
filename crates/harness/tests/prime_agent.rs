@@ -60,6 +60,7 @@ fn request(resume: Option<&str>) -> RunRequest {
     RunRequest {
         prompt: "hello".into(),
         model: Some("openai-codex/gpt-5.6-sol".into()),
+        agent_account_id: None,
         reasoning: Some(ReasoningLevel::High),
         model_options: serde_json::Map::new(),
         cwd: String::new(),

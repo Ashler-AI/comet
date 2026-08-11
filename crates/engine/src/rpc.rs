@@ -31,8 +31,8 @@
 //!   real multi-account auth in M6.
 //! - Shared Agent Auth accounts: `ListAgentAccounts` → `AgentAccountsSnapshot`,
 //!   `MigrateAgentAccount {harness, accountId}` / `RevokeAgentAccount
-//!   {accountId}` → snapshot, plus the add-account login flow. Account methods
-//!   are global and never accept `targetDeviceId`.
+//!   {accountId}` → snapshot, plus the add-account login flow, and owner-scoped
+//!   `GetAgentRouteReceipt {logicalSessionId}` → attribution-only receipt.
 //! - Uploads (§3.7): `UploadChunk {uploadId, data, seq?}`,
 //!   `UploadCommit {uploadId, fileName}` → `{path}`,
 //!   `ReadAttachmentChunk {path, offset}` → `{name, mimeType, data, nextOffset,
@@ -65,9 +65,9 @@ use comet_proto::{
     SessionRoomProjection, SessionStatus, ToolCall,
 };
 use comet_rpc::{
-    LinkCache, PeerMessageResult, PeerReplyResult, PeerWaitResult, RemoveSessionRefResult,
-    ReplyPeerMessageParams, RpcError, RpcReply, RpcService, SendPeerMessageParams,
-    SessionRefParams, WaitPeerReplyParams, methods, parse_params,
+    GetAgentRouteReceiptParams, LinkCache, PeerMessageResult, PeerReplyResult, PeerWaitResult,
+    RemoveSessionRefResult, ReplyPeerMessageParams, RpcError, RpcReply, RpcService,
+    SendPeerMessageParams, SessionRefParams, WaitPeerReplyParams, methods, parse_params,
 };
 
 use crate::agent_accounts::AgentAccounts;
@@ -2095,6 +2095,17 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
+            methods::GET_AGENT_ROUTE_RECEIPT => {
+                let p: GetAgentRouteReceiptParams = parse_params(params)?;
+                let cancellation = comet_harness::CancellationToken::new();
+                let receipt = self
+                    .scaffold()?
+                    .client()
+                    .get_agent_route_receipt(&p.logical_session_id, &cancellation)
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&receipt)
+            }
             methods::LIST_AGENT_ACCOUNTS => {
                 self.require_agent_accounts()?;
                 let snapshot = self
@@ -2237,6 +2248,22 @@ mod tests {
             parse_params(serde_json::json!({ "accountId": "acct-1" }))
                 .expect("revoke account params");
         assert_eq!(revoke.account_id, "acct-1");
+    }
+
+    #[test]
+    fn route_receipt_params_accept_only_logical_session_identity() {
+        let receipt: GetAgentRouteReceiptParams = parse_params(serde_json::json!({
+            "logicalSessionId": "session-1",
+        }))
+        .expect("route receipt params");
+        assert_eq!(receipt.logical_session_id, "session-1");
+        assert!(
+            parse_params::<GetAgentRouteReceiptParams>(serde_json::json!({
+                "logicalSessionId": "session-1",
+                "ownerSubject": "caller-supplied-owner",
+            }))
+            .is_err()
+        );
     }
 
     #[test]

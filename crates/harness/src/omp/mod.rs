@@ -458,7 +458,7 @@ fn propagate_auth_broker_environment(
     // single-use file so supervisors never place the bearer in argv or their
     // long-lived environment. Remove it before parsing or spawning on every
     // outcome, including malformed content and permission failures.
-    let metadata = std::fs::symlink_metadata(&path);
+    let metadata = std::fs::symlink_metadata(path);
     let bytes = metadata.as_ref().ok().and_then(|metadata| {
         if !metadata.is_file() || metadata.len() > 16 * 1024 {
             return None;
@@ -470,9 +470,9 @@ fn propagate_auth_broker_environment(
                 return None;
             }
         }
-        std::fs::read(&path).ok()
+        std::fs::read(path).ok()
     });
-    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path);
     if let Some(token) = bytes
         .as_deref()
         .and_then(|bytes| std::str::from_utf8(bytes).ok())
@@ -1978,6 +1978,7 @@ mod tests {
         RunRequest {
             prompt: "test".into(),
             model: None,
+            agent_account_id: None,
             reasoning: None,
             model_options: serde_json::Map::new(),
             cwd: "/workspace".into(),

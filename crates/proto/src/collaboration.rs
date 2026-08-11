@@ -302,6 +302,131 @@ pub enum AgentSessionSource {
     Scaffold,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentProvider {
+    OpenAi,
+    Anthropic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentRoutingMode {
+    Automatic,
+    Pinned,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRouteFallback {
+    Disabled,
+}
+
+/// Credential-free inference intent. `account_id` is an opaque Agent Auth
+/// account key, never a provider credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRoute {
+    pub provider: AgentProvider,
+    pub model: String,
+    pub fallback: AgentRouteFallback,
+    pub routing_mode: AgentRoutingMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+}
+
+impl AgentRoute {
+    pub fn automatic(provider: AgentProvider, model: impl Into<String>) -> Self {
+        Self {
+            provider,
+            model: model.into(),
+            fallback: AgentRouteFallback::Disabled,
+            routing_mode: AgentRoutingMode::Automatic,
+            account_id: None,
+        }
+    }
+
+    pub fn pinned(
+        provider: AgentProvider,
+        model: impl Into<String>,
+        account_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider,
+            model: model.into(),
+            fallback: AgentRouteFallback::Disabled,
+            routing_mode: AgentRoutingMode::Pinned,
+            account_id: Some(account_id.into()),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.model.trim().is_empty() {
+            return Err("agent route model is required");
+        }
+        match (self.routing_mode, self.account_id.as_deref()) {
+            (AgentRoutingMode::Automatic, None) => Ok(()),
+            (AgentRoutingMode::Automatic, Some(_)) => {
+                Err("automatic agent route cannot select an account")
+            }
+            (AgentRoutingMode::Pinned, Some(account_id)) if !account_id.trim().is_empty() => Ok(()),
+            (AgentRoutingMode::Pinned, _) => Err("pinned agent route requires an account id"),
+        }
+    }
+}
+
+/// Owner-scoped inference attribution. It intentionally contains no owner
+/// identity, grant token, provider credential, or credential hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRouteReceipt {
+    pub logical_session_id: String,
+    pub routing_mode: AgentRoutingMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_account_id: Option<String>,
+    pub route: AgentRouteAttribution,
+    pub grant: AgentGrantAttribution,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRouteAttribution {
+    pub provider: AgentProvider,
+    pub model: String,
+    pub backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_generation: Option<u64>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentGrantAttribution {
+    pub id: String,
+    pub provider: AgentProvider,
+    pub model: String,
+    pub harness: String,
+    pub source: String,
+    pub lifecycle_epoch: u64,
+    pub environment: String,
+    pub routing_mode: AgentRoutingMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_account_id: Option<String>,
+    pub backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_generation: Option<u64>,
+    pub created_at: String,
+    pub expires_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<String>,
+}
+
 /// Lifecycle reported by Scaffold's code-sandbox API. This intentionally has no
 /// catch-all variant: an unknown control-plane status must fail decoding rather
 /// than being presented as a known safe transition.
@@ -402,6 +527,8 @@ pub enum ScaffoldEnvironmentControl {
         region: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         runtime_mode: Option<ScaffoldRuntimeMode>,
+        #[serde(rename = "agentRoute")]
+        agent_route: AgentRoute,
     },
     Pause {
         sandbox_id: String,
@@ -769,7 +896,8 @@ pub struct CollaborationSnapshot {
 #[cfg(test)]
 mod tests {
     use super::{
-        CollaborationScope, CometInvitation, ScaffoldEnvironmentControl, parse_scaffold_device_id,
+        AgentProvider, AgentRoute, CollaborationScope, CometInvitation, ScaffoldEnvironmentControl,
+        parse_scaffold_device_id,
     };
 
     #[test]
@@ -789,6 +917,47 @@ mod tests {
         assert_eq!(value["sandboxId"], "sandbox-a");
         assert_eq!(value["localCandidateId"], "opaque-local-id");
         assert_eq!(value["scope"]["sessionId"], "session-a");
+    }
+
+    #[test]
+    fn agent_routes_use_the_shared_camel_case_wire_shape() {
+        let automatic =
+            serde_json::to_value(AgentRoute::automatic(AgentProvider::OpenAi, "gpt-5.6-sol"))
+                .unwrap();
+        assert_eq!(
+            automatic,
+            serde_json::json!({
+                "provider": "openai",
+                "model": "gpt-5.6-sol",
+                "fallback": "disabled",
+                "routingMode": "automatic",
+            })
+        );
+
+        let pinned = AgentRoute::pinned(
+            AgentProvider::Anthropic,
+            "claude-opus-5",
+            "opaque-account-id",
+        );
+        assert_eq!(
+            serde_json::to_value(&pinned).unwrap(),
+            serde_json::json!({
+                "provider": "anthropic",
+                "model": "claude-opus-5",
+                "fallback": "disabled",
+                "routingMode": "pinned",
+                "accountId": "opaque-account-id",
+            })
+        );
+        assert!(pinned.validate().is_ok());
+        assert!(
+            AgentRoute::pinned(AgentProvider::OpenAi, "gpt-5.6-sol", " ")
+                .validate()
+                .is_err()
+        );
+        let mut invalid_automatic = AgentRoute::automatic(AgentProvider::OpenAi, "gpt-5.6-sol");
+        invalid_automatic.account_id = Some("opaque-account-id".into());
+        assert!(invalid_automatic.validate().is_err());
     }
 
     #[test]

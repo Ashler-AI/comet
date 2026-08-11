@@ -2468,8 +2468,9 @@ impl DocHost {
 
     /// A steer-turned-run with no in-process `last_request` (engine restarted
     /// since the last turn): rebuild the run config from the chat's workspace
-    /// row — cwd from the row, model/reasoning/options/sandbox from its config
-    /// (composer defaults otherwise). `None` without a workspace host or row.
+    /// row — cwd from the row, model/reasoning/account/options/sandbox from its
+    /// config (composer defaults otherwise). `None` without a workspace host
+    /// or row.
     // (Also the RespondInput dead-run fallback's config source.)
     pub(crate) fn request_from_chat_row(
         &self,
@@ -2488,6 +2489,9 @@ impl DocHost {
         Some(comet_proto::RunRequest {
             prompt: prompt.to_string(),
             model: config.as_ref().and_then(|c| c.model.clone()),
+            agent_account_id: config
+                .as_ref()
+                .and_then(|config| config.agent_account_id.clone()),
             reasoning: config.as_ref().and_then(|c| c.reasoning),
             model_options: config
                 .as_ref()

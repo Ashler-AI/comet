@@ -54,6 +54,7 @@ fn request(resume: Option<&str>) -> RunRequest {
     RunRequest {
         prompt: "hello".into(),
         model: None,
+        agent_account_id: None,
         reasoning: None,
         model_options: serde_json::Map::new(),
         cwd: String::new(),

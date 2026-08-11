@@ -25,6 +25,8 @@ mod tests {
         owner_subject: String,
         session_id: String,
         request_id: String,
+        routing_mode: String,
+        requested_account_id: Option<String>,
         body: Value,
     }
 
@@ -61,6 +63,8 @@ mod tests {
                                             "provider": input["provider"],
                                             "model": input["model"],
                                             "harness": input["harness"],
+                                            "routingMode": input["routingMode"],
+                                            "requestedAccountId": input["requestedAccountId"],
                                             "source": "comet-local",
                                             "lifecycleEpoch": input["lifecycleEpoch"],
                                             "environment": "local",
@@ -95,6 +99,14 @@ mod tests {
                                                 .to_str()
                                                 .unwrap()
                                                 .to_string(),
+                                            routing_mode: headers["x-agent-auth-routing-mode"]
+                                                .to_str()
+                                                .unwrap()
+                                                .to_string(),
+                                            requested_account_id: headers
+                                                .get("x-agent-auth-requested-account-id")
+                                                .and_then(|value| value.to_str().ok())
+                                                .map(str::to_string),
                                             body: serde_json::from_slice(&bytes).unwrap(),
                                         })
                                         .unwrap();
@@ -126,22 +138,31 @@ mod tests {
         path: String,
         authorization: String,
         request_id: Option<String>,
+        routing_mode: String,
+        requested_account_id: Option<String>,
         body: Value,
     }
 
     async fn failover_control_plane(
         captured: mpsc::UnboundedSender<FailoverCapture>,
-        first_failure_status: StatusCode,
+        upstream_responses: Vec<(StatusCode, Value)>,
     ) -> String {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
+        let upstream_responses = Arc::new(upstream_responses);
+        let next_upstream_response =
+            Arc::new(std::sync::atomic::AtomicUsize::new(0));
         tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
                 let captured = captured.clone();
+                let upstream_responses = upstream_responses.clone();
+                let next_upstream_response = next_upstream_response.clone();
                 tokio::spawn(async move {
                     let service = service_fn(move |request: Request<Incoming>| {
                         let captured = captured.clone();
+                        let upstream_responses = upstream_responses.clone();
+                        let next_upstream_response = next_upstream_response.clone();
                         async move {
                             let path = request.uri().path().to_string();
                             let headers = request.headers().clone();
@@ -161,6 +182,8 @@ mod tests {
                                             "provider": "openai",
                                             "model": "gpt-5.6-sol",
                                             "harness": "codex",
+                                            "routingMode": body["routingMode"],
+                                            "requestedAccountId": body["requestedAccountId"],
                                             "source": "comet-local",
                                             "lifecycleEpoch": 1,
                                             "environment": "local",
@@ -178,6 +201,14 @@ mod tests {
                                             .unwrap()
                                             .to_string(),
                                         request_id: None,
+                                        routing_mode: headers["x-agent-auth-routing-mode"]
+                                            .to_str()
+                                            .unwrap()
+                                            .to_string(),
+                                        requested_account_id: headers
+                                            .get("x-agent-auth-requested-account-id")
+                                            .and_then(|value| value.to_str().ok())
+                                            .map(str::to_string),
                                         body,
                                     }).unwrap();
                                     (
@@ -193,6 +224,8 @@ mod tests {
                                                     "provider": "openai",
                                                     "model": "gpt-5.6-sol",
                                                     "harness": "codex",
+                                                    "routingMode": "automatic",
+                                                    "requestedAccountId": null,
                                                     "source": "comet-local",
                                                     "lifecycleEpoch": 1,
                                                     "environment": "local",
@@ -213,16 +246,24 @@ mod tests {
                                         request_id: headers.get("x-agent-auth-request-id")
                                             .and_then(|value| value.to_str().ok())
                                             .map(str::to_string),
+                                        routing_mode: headers["x-agent-auth-routing-mode"]
+                                            .to_str()
+                                            .unwrap()
+                                            .to_string(),
+                                        requested_account_id: headers
+                                            .get("x-agent-auth-requested-account-id")
+                                            .and_then(|value| value.to_str().ok())
+                                            .map(str::to_string),
                                         body,
                                     }).unwrap();
-                                    if authorization == "Bearer remote-account-1" {
-                                        (
-                                            first_failure_status,
-                                            json!({ "error": { "code": "credential_unavailable" } }),
-                                        )
-                                    } else {
-                                        (StatusCode::OK, json!({ "ok": true }))
-                                    }
+                                    let response_index =
+                                        next_upstream_response.fetch_add(1, Ordering::SeqCst);
+                                    upstream_responses
+                                        .get(response_index)
+                                        .cloned()
+                                        .unwrap_or_else(|| {
+                                            (StatusCode::OK, json!({ "ok": true }))
+                                        })
                                 }
                                 other => panic!("unexpected failover control-plane path {other}"),
                             };
@@ -253,7 +294,12 @@ mod tests {
         let client = ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap();
         let relay = InferenceRelay::start(client).unwrap();
         let route = relay
-            .prepare("session-1", HarnessId::Codex, Some("gpt-5.6-sol"))
+            .prepare(
+                "session-1",
+                HarnessId::Codex,
+                Some("gpt-5.6-sol"),
+                None,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -299,6 +345,8 @@ mod tests {
         assert_eq!(captured.owner_subject, "owner-1");
         assert_eq!(captured.session_id, "session-1");
         assert_eq!(captured.request_id, "request-1");
+        assert_eq!(captured.routing_mode, "automatic");
+        assert_eq!(captured.requested_account_id, None);
         assert_eq!(captured.body["input"], "hello");
 
         relay.remove(&route.token).await;
@@ -313,14 +361,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replays_an_unstarted_429_through_the_next_sticky_account() {
+    async fn streams_a_generic_429_without_reporting_or_replaying() {
         let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
-        let origin =
-            failover_control_plane(captured_tx, StatusCode::TOO_MANY_REQUESTS).await;
+        let generic_failure = json!({ "error": { "code": "rate_limit_exceeded" } });
+        let origin = failover_control_plane(
+            captured_tx,
+            vec![(StatusCode::TOO_MANY_REQUESTS, generic_failure.clone())],
+        )
+        .await;
         let client = ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap();
         let relay = InferenceRelay::start(client).unwrap();
         let route = relay
-            .prepare("session-failover", HarnessId::Codex, Some("gpt-5.6-sol"))
+            .prepare(
+                "session-failover",
+                HarnessId::Codex,
+                Some("gpt-5.6-sol"),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let payload = json!({ "model": "gpt-5.6-sol", "input": "stay sticky" });
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/responses", route.base_url))
+            .bearer_auth(&route.token)
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.json::<Value>().await.unwrap(), generic_failure);
+
+        let first = captured_rx.recv().await.unwrap();
+        assert_eq!(first.authorization, "Bearer remote-account-1");
+        assert!(captured_rx.try_recv().is_err());
+
+        let later = reqwest::Client::new()
+            .post(format!("{}/v1/responses", route.base_url))
+            .bearer_auth(&route.token)
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(later.status(), reqwest::StatusCode::OK);
+        let later_capture = captured_rx.recv().await.unwrap();
+        assert_eq!(later_capture.authorization, "Bearer remote-account-1");
+    }
+
+    #[tokio::test]
+    async fn replays_confirmed_exhaustion_through_one_replacement_account() {
+        let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
+        let origin = failover_control_plane(
+            captured_tx,
+            vec![(
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({ "error": { "code": "usage_limit_reached" } }),
+            )],
+        )
+        .await;
+        let client = ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap();
+        let relay = InferenceRelay::start(client).unwrap();
+        let route = relay
+            .prepare(
+                "session-failover",
+                HarnessId::Codex,
+                Some("gpt-5.6-sol"),
+                None,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -364,13 +471,112 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replays_an_unstarted_401_through_the_next_sticky_account() {
+    async fn does_not_report_or_attempt_a_third_account_after_replay_fails() {
         let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
-        let origin = failover_control_plane(captured_tx, StatusCode::UNAUTHORIZED).await;
+        let second_failure = json!({ "error": { "type": "usage_limit_error" } });
+        let origin = failover_control_plane(
+            captured_tx,
+            vec![
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    json!({ "error": { "code": "subscription_limit_reached" } }),
+                ),
+                (StatusCode::TOO_MANY_REQUESTS, second_failure.clone()),
+            ],
+        )
+        .await;
         let client = ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap();
         let relay = InferenceRelay::start(client).unwrap();
         let route = relay
-            .prepare("session-failover", HarnessId::Codex, Some("gpt-5.6-sol"))
+            .prepare(
+                "session-failover",
+                HarnessId::Codex,
+                Some("gpt-5.6-sol"),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/responses", route.base_url))
+            .bearer_auth(&route.token)
+            .header("x-request-id", "bounded-replay-request")
+            .json(&json!({ "model": "gpt-5.6-sol", "input": "stop after replay" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.json::<Value>().await.unwrap(), second_failure);
+
+        let first = captured_rx.recv().await.unwrap();
+        let report = captured_rx.recv().await.unwrap();
+        let second = captured_rx.recv().await.unwrap();
+        assert_eq!(first.authorization, "Bearer remote-account-1");
+        assert_eq!(report.path, "/api/agent-auth/grants/failure");
+        assert_eq!(report.body["failureClass"], "account_exhausted");
+        assert_eq!(second.authorization, "Bearer remote-account-2");
+        assert_eq!(second.request_id, first.request_id);
+        assert!(captured_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn pinned_routes_never_report_failure_or_rotate_accounts() {
+        let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
+        let origin = failover_control_plane(
+            captured_tx,
+            vec![(
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({ "error": { "code": "usage_limit_reached" } }),
+            )],
+        )
+        .await;
+        let client = ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap();
+        let relay = InferenceRelay::start(client).unwrap();
+        let route = relay
+            .prepare(
+                "session-failover",
+                HarnessId::Codex,
+                Some("gpt-5.6-sol"),
+                Some("account-1"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/responses", route.base_url))
+            .bearer_auth(&route.token)
+            .json(&json!({ "model": "gpt-5.6-sol", "input": "stay pinned" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+        let first = captured_rx.recv().await.unwrap();
+        assert_eq!(first.authorization, "Bearer remote-account-1");
+        assert_eq!(first.routing_mode, "pinned");
+        assert_eq!(first.requested_account_id.as_deref(), Some("account-1"));
+        assert!(captured_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn replays_an_unstarted_401_through_the_next_sticky_account() {
+        let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
+        let origin = failover_control_plane(
+            captured_tx,
+            vec![(
+                StatusCode::UNAUTHORIZED,
+                json!({ "error": { "code": "unauthorized" } }),
+            )],
+        )
+        .await;
+        let client = ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap();
+        let relay = InferenceRelay::start(client).unwrap();
+        let route = relay
+            .prepare(
+                "session-failover",
+                HarnessId::Codex,
+                Some("gpt-5.6-sol"),
+                None,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -406,6 +612,7 @@ mod tests {
                 "session-anthropic",
                 HarnessId::ClaudeCode,
                 Some("claude-opus-5"),
+                None,
             )
             .await
             .unwrap()
@@ -432,15 +639,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_grants_from_non_local_environments() {
-        let request = AgentInferenceGrantRequest {
+    fn rejects_nonlocal_and_nonexact_pinned_grants() {
+        let mut request = AgentInferenceGrantRequest {
             logical_session_id: "session-1".into(),
             provider: "openai".into(),
             model: "gpt-5.6-sol".into(),
             harness: "codex".into(),
+            routing_mode: AgentRoutingMode::Automatic,
+            requested_account_id: None,
             lifecycle_epoch: 1,
         };
-        let grant = AgentInferenceGrant {
+        let mut grant = AgentInferenceGrant {
             token: "remote-agent-auth-grant".into(),
             expires_at: (Utc::now() + TimeDelta::minutes(5)).to_rfc3339(),
             binding: AgentInferenceGrantBinding {
@@ -449,6 +658,8 @@ mod tests {
                 provider: request.provider.clone(),
                 model: request.model.clone(),
                 harness: request.harness.clone(),
+                routing_mode: request.routing_mode,
+                requested_account_id: request.requested_account_id.clone(),
                 source: "comet-local".into(),
                 lifecycle_epoch: request.lifecycle_epoch,
                 environment: "staging".into(),
@@ -458,6 +669,21 @@ mod tests {
             },
         };
 
+        assert!(validate_grant(&grant, &request).is_err());
+
+        request.routing_mode = AgentRoutingMode::Pinned;
+        request.requested_account_id = Some("account-1".into());
+        grant.binding.environment = "local".into();
+        grant.binding.routing_mode = AgentRoutingMode::Pinned;
+        grant.binding.requested_account_id = Some("account-1".into());
+        grant.binding.backend = "bifrost".into();
+        grant.binding.account_id = None;
+        grant.binding.account_generation = None;
+        assert!(validate_grant(&grant, &request).is_err());
+
+        grant.binding.backend = "oauth".into();
+        grant.binding.account_id = Some("account-2".into());
+        grant.binding.account_generation = Some(1);
         assert!(validate_grant(&grant, &request).is_err());
     }
 
@@ -476,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_harness_provider_selectors_without_losing_paid_models() {
+    fn normalizes_only_direct_openai_and_anthropic_model_selectors() {
         assert_eq!(
             inference_binding(HarnessId::Omp, Some("openai-codex/gpt-5.6-sol")),
             Some(("openai", "gpt-5.6-sol".into()))
@@ -494,7 +720,59 @@ mod tests {
                 HarnessId::PrimeAgent,
                 Some("prime-inference/x-ai/grok-4.20")
             ),
-            Some(("openai", "grok-4.20".into()))
+            None
+        );
+        assert_eq!(
+            inference_binding(
+                HarnessId::Omp,
+                Some("prime-inference/moonshotai/kimi-k3")
+            ),
+            None
+        );
+        assert_eq!(
+            inference_binding(HarnessId::ClaudeCode, Some("opus")),
+            Some(("anthropic", "opus".into()))
+        );
+    }
+
+    #[test]
+    fn grant_requests_serialize_automatic_and_pinned_routing_intent() {
+        let automatic =
+            inference_grant_request("session-1", HarnessId::Codex, Some("gpt-5.6-sol"), None, 1)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(&automatic).unwrap(),
+            json!({
+                "logicalSessionId": "session-1",
+                "provider": "openai",
+                "model": "gpt-5.6-sol",
+                "harness": "codex",
+                "routingMode": "automatic",
+                "lifecycleEpoch": 1,
+            })
+        );
+
+        let pinned = inference_grant_request(
+            "session-1",
+            HarnessId::ClaudeCode,
+            Some("claude-opus-5"),
+            Some("opaque-account-id"),
+            2,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&pinned).unwrap(),
+            json!({
+                "logicalSessionId": "session-1",
+                "provider": "anthropic",
+                "model": "claude-opus-5",
+                "harness": "claude-code",
+                "routingMode": "pinned",
+                "requestedAccountId": "opaque-account-id",
+                "lifecycleEpoch": 2,
+            })
         );
     }
 
@@ -507,6 +785,11 @@ mod tests {
         assert_eq!(
             inference_binding(HarnessId::Codex, None),
             Some(("openai", "gpt-5.6-sol".into()))
+        );
+        assert_eq!(inference_binding(HarnessId::Omp, None), None);
+        assert_eq!(
+            inference_binding(HarnessId::PrimeAgent, Some("default")),
+            None
         );
     }
 }

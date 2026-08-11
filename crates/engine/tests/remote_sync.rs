@@ -613,6 +613,7 @@ fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
         prompt: prompt.into(),
         model: None,
+        agent_account_id: None,
         reasoning: None,
         model_options: Default::default(),
         cwd: "/tmp".into(),

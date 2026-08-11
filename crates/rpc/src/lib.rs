@@ -115,6 +115,8 @@ pub mod methods {
     pub const COMPLETE_AGENT_LOGIN: &str = "CompleteAgentLogin";
     pub const POLL_AGENT_LOGIN: &str = "PollAgentLogin";
     pub const CANCEL_AGENT_LOGIN: &str = "CancelAgentLogin";
+    /// Owner-scoped attribution for the account that handled a logical session.
+    pub const GET_AGENT_ROUTE_RECEIPT: &str = "GetAgentRouteReceipt";
     /// Read and update OMP's device-local advisor settings.
     pub const GET_OMP_ADVISOR_CONFIG: &str = "GetOmpAdvisorConfig";
     pub const SET_OMP_ADVISOR_CONFIG: &str = "SetOmpAdvisorConfig";
@@ -153,6 +155,12 @@ pub struct SessionRefParams {
 #[serde(rename_all = "camelCase")]
 pub struct RemoveSessionRefResult {
     pub removed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct GetAgentRouteReceiptParams {
+    pub logical_session_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
