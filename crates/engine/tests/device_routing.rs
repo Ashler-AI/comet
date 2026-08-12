@@ -303,6 +303,7 @@ async fn target_device_id_routes_over_the_relay() {
         request: RunRequest {
             prompt: "run remotely".into(),
             model: None,
+            agent_account_id: None,
             reasoning: None,
             model_options: serde_json::Map::new(),
             cwd: "/tmp".into(),

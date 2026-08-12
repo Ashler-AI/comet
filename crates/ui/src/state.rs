@@ -30,11 +30,11 @@ use serde::de::DeserializeOwned;
 use comet_doc::{MessagePart, MessageRole, SessionMessageEntry, TranscriptDesync, TranscriptFrame};
 use comet_engine::{Engine, EngineConfig, EngineRuntime, rpc::AuthRpc};
 use comet_proto::{
-    AuthState, Chat, ChatIndicator, CollaborationScope, CollaborationSnapshot, Device, HarnessId,
-    LocalSessionAttachResult, LocalSessionCandidate, MessageProvenance, ParticipantPresence,
-    RuntimeProfile, ScaffoldEnvironmentControl, ScaffoldEnvironmentControlResult,
-    ScaffoldLifecycle, ScaffoldRuntimeMode, Session, SessionEnvironmentSource, SessionRef,
-    SessionRoomProjection, Space,
+    AgentRoute, AuthState, Chat, ChatIndicator, CollaborationScope, CollaborationSnapshot, Device,
+    HarnessId, LocalSessionAttachResult, LocalSessionCandidate, MessageProvenance,
+    ParticipantPresence, RuntimeProfile, ScaffoldEnvironmentControl,
+    ScaffoldEnvironmentControlResult, ScaffoldLifecycle, ScaffoldRuntimeMode, Session,
+    SessionEnvironmentSource, SessionRef, SessionRoomProjection, Space,
 };
 use comet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
 
@@ -426,6 +426,7 @@ pub(crate) struct ScaffoldSessionAttachment {
     pub grant_id: String,
     pub owner_device_id: String,
     pub actor_subject: String,
+    pub source_ref: Option<String>,
 }
 
 /// Start the staging sandbox without coupling creation to remote Comet
@@ -433,13 +434,16 @@ pub(crate) struct ScaffoldSessionAttachment {
 pub(crate) async fn create_scaffold_session(
     handle: &EngineHandle,
     scope: &CollaborationScope,
-) -> Result<String, RpcError> {
+    source_ref: Option<&str>,
+    agent_route: &AgentRoute,
+) -> Result<(String, CollaborationScope), RpcError> {
     let create = ScaffoldEnvironmentControl::Create {
         scope: scope.clone(),
         name: Some("Comet Scaffold session".into()),
-        source_ref: None,
+        source_ref: source_ref.map(str::to_string),
         region: None,
         runtime_mode: Some(ScaffoldRuntimeMode::Compose),
+        agent_route: agent_route.clone(),
     };
     let value = handle
         .client()
@@ -450,12 +454,13 @@ pub(crate) async fn create_scaffold_session(
         .await?;
     let created: ScaffoldEnvironmentControlResult =
         serde_json::from_value(value).map_err(|err| RpcError::Failed(err.to_string()))?;
+    let authoritative_scope = created.environment.scope.clone();
     let SessionEnvironmentSource::Scaffold { sandbox_id, .. } = created.environment.source else {
         return Err(RpcError::Failed(
             "Scaffold returned a local environment".into(),
         ));
     };
-    Ok(sandbox_id)
+    Ok((sandbox_id, authoritative_scope))
 }
 
 /// Read the sandbox lifecycle without opening a session-room projection or
@@ -520,8 +525,10 @@ pub(crate) async fn attach_scaffold_session(
         .await?;
     let attached: ScaffoldEnvironmentControlResult =
         serde_json::from_value(value).map_err(|err| RpcError::Failed(err.to_string()))?;
+    let source_ref = attached.environment.source_ref.clone();
     let SessionEnvironmentSource::Scaffold {
         sandbox_id: attached_sandbox_id,
+        lifecycle_epoch,
         ..
     } = &attached.environment.source
     else {
@@ -557,12 +564,16 @@ pub(crate) async fn attach_scaffold_session(
             "Scaffold attach returned no chat authority".into(),
         ));
     }
+    let expected_lifecycle_epoch = lifecycle_epoch
+        .ok_or_else(|| RpcError::Failed("Scaffold attach returned no lifecycle epoch".into()))?;
     let owner_device_id = attached
         .attached_device_id
         .filter(|device_id| {
-            device_id
-                .strip_prefix("comet-scaffold-")
-                .is_some_and(|sandbox| sandbox == sandbox_id)
+            comet_proto::parse_scaffold_device_id(device_id).is_some_and(
+                |(device_sandbox_id, lifecycle_epoch)| {
+                    device_sandbox_id == sandbox_id && lifecycle_epoch == expected_lifecycle_epoch
+                },
+            )
         })
         .ok_or_else(|| RpcError::Failed("Scaffold attach returned a different device".into()))?;
     if attached.environment.owner_principal.is_empty() {
@@ -575,17 +586,141 @@ pub(crate) async fn attach_scaffold_session(
         grant_id: grant.id,
         owner_device_id,
         actor_subject: attached.environment.owner_principal,
+        source_ref,
     })
 }
+const SCAFFOLD_ATTACH_MAX_ATTEMPTS: usize = 60;
+#[cfg(not(test))]
+const SCAFFOLD_ATTACH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+#[cfg(test)]
+const SCAFFOLD_ATTACH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
+
+fn is_retryable_scaffold_attach_error(error: &RpcError) -> bool {
+    matches!(
+        error,
+        RpcError::Failed(message)
+            if message.contains("scaffold_api_error:502:scaffold_request_rejected")
+                || message.contains(
+                    "scaffold_api_error:409:sandbox_provider_error:Sandbox lifecycle changed while the operation was in flight",
+                )
+    )
+}
+
+async fn attach_scaffold_session_with_retry<Wait, WaitFuture>(
+    handle: &EngineHandle,
+    sandbox_id: &str,
+    scope: CollaborationScope,
+    wait: &Wait,
+) -> Result<ScaffoldSessionAttachment, RpcError>
+where
+    Wait: Fn(std::time::Duration) -> WaitFuture,
+    WaitFuture: Future<Output = ()>,
+{
+    let mut attempt = 1;
+    loop {
+        match attach_scaffold_session(handle, sandbox_id, scope.clone()).await {
+            Ok(attachment) => return Ok(attachment),
+            Err(error)
+                if attempt < SCAFFOLD_ATTACH_MAX_ATTEMPTS
+                    && is_retryable_scaffold_attach_error(&error) =>
+            {
+                attempt += 1;
+                wait(SCAFFOLD_ATTACH_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Reconnect an existing Scaffold room. Paused sandboxes resume before a fresh,
+/// lifecycle-bound device grant is installed; active sandboxes only reattach.
+pub(crate) async fn ensure_scaffold_session_attached<Wait, WaitFuture>(
+    handle: &EngineHandle,
+    sandbox_id: &str,
+    scope: &CollaborationScope,
+    wait: &Wait,
+) -> Result<ScaffoldSessionAttachment, RpcError>
+where
+    Wait: Fn(std::time::Duration) -> WaitFuture,
+    WaitFuture: Future<Output = ()>,
+{
+    match inspect_scaffold_session(handle, sandbox_id, scope).await? {
+        ScaffoldLifecycle::Paused => {
+            let value = handle
+                .client()
+                .call(
+                    methods::CONTROL_SCAFFOLD_ENVIRONMENT,
+                    serde_json::to_value(ScaffoldEnvironmentControl::Resume {
+                        sandbox_id: sandbox_id.to_string(),
+                        scope: scope.clone(),
+                    })
+                    .unwrap_or_default(),
+                )
+                .await?;
+            let resumed: ScaffoldEnvironmentControlResult =
+                serde_json::from_value(value).map_err(|err| RpcError::Failed(err.to_string()))?;
+            if resumed.environment.scope != *scope {
+                return Err(RpcError::Failed(
+                    "Scaffold resume returned a different sandbox scope".into(),
+                ));
+            }
+            let SessionEnvironmentSource::Scaffold {
+                sandbox_id: resumed_id,
+                lifecycle,
+                ..
+            } = resumed.environment.source
+            else {
+                return Err(RpcError::Failed(
+                    "Scaffold resume returned a local environment".into(),
+                ));
+            };
+            if resumed_id != sandbox_id {
+                return Err(RpcError::Failed(
+                    "Scaffold resume returned a different sandbox scope".into(),
+                ));
+            }
+            if matches!(
+                lifecycle,
+                ScaffoldLifecycle::Stopped | ScaffoldLifecycle::Failed
+            ) {
+                return Err(RpcError::Failed(format!(
+                    "Scaffold resume returned terminal lifecycle {lifecycle:?}"
+                )));
+            }
+        }
+        ScaffoldLifecycle::Stopped | ScaffoldLifecycle::Failed => {
+            return Err(RpcError::Failed(
+                "Scaffold session is no longer resumable".into(),
+            ));
+        }
+        ScaffoldLifecycle::Creating
+        | ScaffoldLifecycle::RestoringSnapshot
+        | ScaffoldLifecycle::Starting
+        | ScaffoldLifecycle::Ready
+        | ScaffoldLifecycle::AgentRunning
+        | ScaffoldLifecycle::Resuming => {}
+    }
+    attach_scaffold_session_with_retry(handle, sandbox_id, scope.clone(), wait).await
+}
+
 /// Create the sandbox and immediately dispatch its supervised Comet bootstrap.
 /// Runtime readiness depends on this attachment, so callers must not wait for
 /// `Ready` before attaching.
-pub(crate) async fn create_and_attach_scaffold_session(
+pub(crate) async fn create_and_attach_scaffold_session<Wait, WaitFuture>(
     handle: &EngineHandle,
     scope: &CollaborationScope,
-) -> Result<(String, ScaffoldSessionAttachment), RpcError> {
-    let sandbox_id = create_scaffold_session(handle, scope).await?;
-    let attachment = attach_scaffold_session(handle, &sandbox_id, scope.clone()).await?;
+    source_ref: Option<&str>,
+    agent_route: &AgentRoute,
+    wait: &Wait,
+) -> Result<(String, ScaffoldSessionAttachment), RpcError>
+where
+    Wait: Fn(std::time::Duration) -> WaitFuture,
+    WaitFuture: Future<Output = ()>,
+{
+    let (sandbox_id, authoritative_scope) =
+        create_scaffold_session(handle, scope, source_ref, agent_route).await?;
+    let attachment =
+        attach_scaffold_session_with_retry(handle, &sandbox_id, authoritative_scope, wait).await?;
     Ok((sandbox_id, attachment))
 }
 
@@ -2301,10 +2436,15 @@ mod tests {
     // `SessionStatus` is only needed to build the fixtures below — the module
     // itself derives everything through `comet_proto::view`.
     use comet_proto::{SessionStatus, UserProfile};
-    use std::sync::Mutex as StdMutex;
+    use std::sync::{
+        Mutex as StdMutex,
+        atomic::{AtomicU16, Ordering},
+    };
 
     struct ReadyScaffoldRpc {
         operations: Arc<StdMutex<Vec<String>>>,
+        attach_failures_remaining: AtomicU16,
+        inspect_lifecycle: &'static str,
     }
 
     #[async_trait::async_trait]
@@ -2319,17 +2459,44 @@ mod tests {
                 .get("operation")
                 .and_then(serde_json::Value::as_str)
                 .expect("typed Scaffold operation");
+            if operation == "create" {
+                assert_eq!(
+                    params.get("source_ref").and_then(serde_json::Value::as_str),
+                    Some("feat/comet-identity-integration")
+                );
+                assert_eq!(
+                    params.get("agentRoute"),
+                    Some(&serde_json::json!({
+                        "provider": "openai",
+                        "model": "gpt-5.6-sol",
+                        "fallback": "disabled",
+                        "routingMode": "automatic",
+                    }))
+                );
+            }
             self.operations
                 .lock()
                 .expect("Scaffold operation log")
                 .push(operation.to_string());
+            if operation == "attach"
+                && self
+                    .attach_failures_remaining
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+            {
+                return Err(RpcError::Failed(
+                    "scaffold_api_error:502:scaffold_request_rejected".into(),
+                ));
+            }
             let scope = params.get("scope").expect("Scaffold scope");
             let session_id = scope
                 .get("sessionId")
                 .and_then(serde_json::Value::as_str)
                 .expect("session id");
             let lifecycle = if operation == "inspect" {
-                "ready"
+                self.inspect_lifecycle
             } else {
                 "starting"
             };
@@ -2339,20 +2506,22 @@ mod tests {
                     "sandbox_id": "sandbox-ready",
                     "region": "default",
                     "lifecycle": lifecycle,
+                    "lifecycle_epoch": 1,
                     "links": {}
                 },
                 "ownerPrincipal": "accounts.google.com:ready@example.com",
+                "sourceRef": "387d6652abd642f0b85e8bd14f9131a9f23b7e70",
                 "scope": {
                     "projectId": "ashler-staging",
                     "deploymentId": "ashler-staging",
                     "sessionId": session_id
                 },
-                "lastActivityAt": 1
+                "lastActivityAt": 1,
             });
             let result = if operation == "attach" {
                 serde_json::json!({
                     "environment": environment,
-                    "attachedDeviceId": "comet-scaffold-sandbox-ready",
+                    "attachedDeviceId": "comet-scaffold-sandbox-ready-e1",
                     "runId": "run-ready",
                     "roomProjection": {
                         "projectId": "ashler-staging",
@@ -2366,7 +2535,7 @@ mod tests {
                     }
                 })
             } else {
-                assert!(matches!(operation, "create" | "inspect"));
+                assert!(matches!(operation, "create" | "inspect" | "resume"));
                 serde_json::json!({ "environment": environment })
             };
             RpcReply::value(&result)
@@ -2377,10 +2546,12 @@ mod tests {
     /// range (macOS: 49152+), which `:0` allocations and outbound sockets in
     /// parallel test processes draw from. Binding `:0` and re-using the port
     /// after drop raced those allocations in the free→bootstrap window.
+    static NEXT_TEST_PORT_OFFSET: AtomicU16 = AtomicU16::new(0);
     async fn free_port() -> u16 {
         let start = 20000 + (std::process::id() % 10000) as u16;
-        for offset in 0..2000 {
-            let port = start + offset;
+        for _ in 0..2000 {
+            let offset = NEXT_TEST_PORT_OFFSET.fetch_add(1, Ordering::Relaxed);
+            let port = start + (offset % 2000);
             if tokio::net::TcpListener::bind(("127.0.0.1", port))
                 .await
                 .is_ok()
@@ -2422,6 +2593,8 @@ mod tests {
         let operations = Arc::new(StdMutex::new(Vec::new()));
         let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
             operations: Arc::clone(&operations),
+            attach_failures_remaining: AtomicU16::new(0),
+            inspect_lifecycle: "ready",
         });
         let handle = EngineHandle {
             inner: Arc::new(RemoteEngine {
@@ -2435,10 +2608,17 @@ mod tests {
             session_id: Some("session-ready".into()),
             unknown: Default::default(),
         };
+        let no_wait = |_| futures::future::ready(());
 
-        let (sandbox_id, attachment) = create_and_attach_scaffold_session(&handle, &scope)
-            .await
-            .unwrap();
+        let (sandbox_id, attachment) = create_and_attach_scaffold_session(
+            &handle,
+            &scope,
+            Some("feat/comet-identity-integration"),
+            &AgentRoute::automatic(comet_proto::AgentProvider::OpenAi, "gpt-5.6-sol"),
+            &no_wait,
+        )
+        .await
+        .unwrap();
         assert_eq!(sandbox_id, "sandbox-ready");
         assert_eq!(
             operations
@@ -2461,11 +2641,112 @@ mod tests {
             ["create", "attach", "inspect"]
         );
         assert_eq!(attachment.projection.session_id, "session-ready");
-        assert_eq!(attachment.owner_device_id, "comet-scaffold-sandbox-ready");
+        assert_eq!(
+            attachment.owner_device_id,
+            "comet-scaffold-sandbox-ready-e1"
+        );
         assert_eq!(attachment.grant_id, "grant-ready");
         assert_eq!(
             attachment.actor_subject,
             "accounts.google.com:ready@example.com"
+        );
+        assert_eq!(
+            attachment.source_ref.as_deref(),
+            Some("387d6652abd642f0b85e8bd14f9131a9f23b7e70")
+        );
+    }
+
+    #[test]
+    fn scaffold_attach_retries_transient_provider_claim_conflicts() {
+        assert!(is_retryable_scaffold_attach_error(&RpcError::Failed(
+            "scaffold_api_error:502:scaffold_request_rejected".into()
+        )));
+        assert!(!is_retryable_scaffold_attach_error(&RpcError::Failed(
+            "scaffold_response_invalid: sandbox failed".into()
+        )));
+
+        let runtime = tokio::runtime::Runtime::new().expect("Tokio RPC server runtime");
+        let (handle, operations) = {
+            let _runtime_guard = runtime.enter();
+            let operations = Arc::new(StdMutex::new(Vec::new()));
+            let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
+                operations: Arc::clone(&operations),
+                attach_failures_remaining: AtomicU16::new(2),
+                inspect_lifecycle: "ready",
+            });
+            let handle = EngineHandle {
+                inner: Arc::new(RemoteEngine {
+                    client: memory_client(service),
+                    url: "memory://transient-scaffold".into(),
+                }),
+            };
+            (handle, operations)
+        };
+
+        futures::executor::block_on(async {
+            let scope = CollaborationScope {
+                project_id: "ashler-staging".into(),
+                deployment_id: Some("ashler-staging".into()),
+                session_id: Some("session-transient".into()),
+                unknown: Default::default(),
+            };
+            let no_wait = |_| futures::future::ready(());
+            let (sandbox_id, attachment) = create_and_attach_scaffold_session(
+                &handle,
+                &scope,
+                Some("feat/comet-identity-integration"),
+                &AgentRoute::automatic(comet_proto::AgentProvider::OpenAi, "gpt-5.6-sol"),
+                &no_wait,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(sandbox_id, "sandbox-ready");
+            assert_eq!(attachment.projection.session_id, "session-transient");
+            assert_eq!(
+                operations
+                    .lock()
+                    .expect("Scaffold operation log")
+                    .as_slice(),
+                ["create", "attach", "attach", "attach"]
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn paused_scaffold_resumes_before_reattaching() {
+        let operations = Arc::new(StdMutex::new(Vec::new()));
+        let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
+            operations: Arc::clone(&operations),
+            attach_failures_remaining: AtomicU16::new(0),
+            inspect_lifecycle: "paused",
+        });
+        let handle = EngineHandle {
+            inner: Arc::new(RemoteEngine {
+                client: memory_client(service),
+                url: "memory://paused-scaffold".into(),
+            }),
+        };
+        let scope = CollaborationScope {
+            project_id: "ashler-staging".into(),
+            deployment_id: Some("ashler-staging".into()),
+            session_id: Some("session-paused".into()),
+            unknown: Default::default(),
+        };
+        let no_wait = |_| futures::future::ready(());
+
+        let attachment =
+            ensure_scaffold_session_attached(&handle, "sandbox-ready", &scope, &no_wait)
+                .await
+                .unwrap();
+
+        assert_eq!(attachment.projection.session_id, "session-paused");
+        assert_eq!(
+            operations
+                .lock()
+                .expect("Scaffold operation log")
+                .as_slice(),
+            ["inspect", "resume", "attach"]
         );
     }
 
@@ -2685,6 +2966,8 @@ mod tests {
         let operations = Arc::new(StdMutex::new(Vec::new()));
         let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
             operations: Arc::clone(&operations),
+            attach_failures_remaining: AtomicU16::new(0),
+            inspect_lifecycle: "ready",
         });
         let handle = EngineHandle {
             inner: Arc::new(RemoteEngine {
@@ -3129,6 +3412,7 @@ mod tests {
             harness: HarnessId::ClaudeCode,
             model: Some("claude-fable-5".into()),
             reasoning: Some(comet_proto::ReasoningLevel::XHigh),
+            agent_account_id: Some("opaque-account-id".into()),
             model_options: serde_json::Map::new(),
             sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
         };
@@ -3153,6 +3437,7 @@ mod tests {
                 harness: HarnessId::ClaudeCode,
                 model: None,
                 reasoning: None,
+                agent_account_id: None,
                 model_options: serde_json::Map::new(),
                 sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
             },

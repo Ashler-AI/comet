@@ -34,12 +34,32 @@ pub struct SteerMessage {
     pub prompt: String,
     pub message_id: Option<String>,
 }
+#[derive(Clone, PartialEq, Eq)]
+pub struct InferenceRoute {
+    pub base_url: String,
+    pub token: String,
+    pub provider: String,
+    pub model: String,
+}
+
+impl std::fmt::Debug for InferenceRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InferenceRoute")
+            .field("base_url", &self.base_url)
+            .field("token", &"<redacted>")
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .finish()
+    }
+}
+
 /// Engine-owned context exposed to an agent child process. This is launch
 /// metadata, not user-authored run configuration or prompt content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunContext {
     pub session_id: String,
     pub ipc_port: u16,
+    pub inference: Option<InferenceRoute>,
 }
 
 /// Host-side controls handed to a run: input-request bridge + steering mailbox.
@@ -79,6 +99,7 @@ pub trait Harness: Send + Sync {
 }
 
 mod approval;
+mod auth_gateway;
 pub mod claude;
 pub mod codex;
 pub mod mock;
@@ -179,10 +200,38 @@ pub(crate) fn compose_child_path(cmd: &mut tokio::process::Command, exe: &std::p
 pub(crate) fn apply_run_context(cmd: &mut tokio::process::Command, context: Option<&RunContext>) {
     // Never inherit a stale context from the engine's own launch environment.
     cmd.env_remove("COMET_SESSION_ID")
-        .env_remove("COMET_IPC_PORT");
+        .env_remove("COMET_IPC_PORT")
+        .env_remove("COMET_INFERENCE_TOKEN")
+        .env_remove("PRIME_AGENT_AUTH_GATEWAY_URL")
+        .env_remove("OMP_AUTH_GATEWAY_URL")
+        .env_remove("OMP_AUTH_GATEWAY_TOKEN");
     if let Some(context) = context {
         cmd.env("COMET_SESSION_ID", &context.session_id)
             .env("COMET_IPC_PORT", context.ipc_port.to_string());
+        if let Some(inference) = &context.inference {
+            // OMP_AUTH_BROKER_* is OMP's credential-vault protocol, not an
+            // inference gateway. Shared Comet runs instead load the bundled
+            // provider adapter below and must not leak an inherited vault.
+            cmd.env_remove("OMP_AUTH_BROKER_URL")
+                .env_remove("OMP_AUTH_BROKER_TOKEN")
+                .env("COMET_INFERENCE_TOKEN", &inference.token)
+                .env("PRIME_AGENT_AUTH_GATEWAY_URL", &inference.base_url)
+                .env("OMP_AUTH_GATEWAY_URL", &inference.base_url)
+                .env("OMP_AUTH_GATEWAY_TOKEN", &inference.token);
+            match inference.provider.as_str() {
+                "openai" => {
+                    cmd.env("OPENAI_BASE_URL", format!("{}/v1", inference.base_url))
+                        .env("OPENAI_API_KEY", &inference.token)
+                        .env_remove("CODEX_API_KEY");
+                }
+                "anthropic" => {
+                    cmd.env("ANTHROPIC_BASE_URL", &inference.base_url)
+                        .env("ANTHROPIC_AUTH_TOKEN", &inference.token)
+                        .env_remove("ANTHROPIC_API_KEY");
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -265,7 +314,7 @@ pub use omp::OmpHarness;
 pub use prime_agent::PrimeAgentHarness;
 #[cfg(test)]
 mod run_context_tests {
-    use super::{RunContext, apply_run_context};
+    use super::{InferenceRoute, RunContext, apply_run_context};
 
     fn configured_env(cmd: &tokio::process::Command, key: &str) -> Option<String> {
         cmd.as_std()
@@ -283,6 +332,7 @@ mod run_context_tests {
             Some(&RunContext {
                 session_id: "session-123".into(),
                 ipc_port: 38117,
+                inference: None,
             }),
         );
 
@@ -294,6 +344,45 @@ mod run_context_tests {
             configured_env(&cmd, "COMET_IPC_PORT").as_deref(),
             Some("38117")
         );
+    }
+
+    #[test]
+    fn applies_loopback_inference_context_without_logging_the_token() {
+        let route = InferenceRoute {
+            base_url: "http://127.0.0.1:41234".into(),
+            token: "local-inference-token".into(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-5".into(),
+        };
+        let mut cmd = tokio::process::Command::new("unused");
+        apply_run_context(
+            &mut cmd,
+            Some(&RunContext {
+                session_id: "session-123".into(),
+                ipc_port: 38117,
+                inference: Some(route.clone()),
+            }),
+        );
+
+        assert_eq!(
+            configured_env(&cmd, "ANTHROPIC_BASE_URL").as_deref(),
+            Some("http://127.0.0.1:41234")
+        );
+        assert_eq!(
+            configured_env(&cmd, "ANTHROPIC_AUTH_TOKEN").as_deref(),
+            Some("local-inference-token")
+        );
+        assert_eq!(
+            configured_env(&cmd, "OMP_AUTH_GATEWAY_URL").as_deref(),
+            Some("http://127.0.0.1:41234")
+        );
+        assert_eq!(
+            configured_env(&cmd, "OMP_AUTH_GATEWAY_TOKEN").as_deref(),
+            Some("local-inference-token")
+        );
+        assert_eq!(configured_env(&cmd, "OMP_AUTH_BROKER_URL"), None);
+        assert_eq!(configured_env(&cmd, "OMP_AUTH_BROKER_TOKEN"), None);
+        assert!(!format!("{route:?}").contains("local-inference-token"));
     }
 
     #[test]

@@ -20,6 +20,7 @@ interface GrantRecord {
   sandboxId: string;
   targetDeviceId: string;
   sessionId: string;
+  lifecycleEpoch: number;
   capabilities: string[];
   grantHash: string;
   issuedAt: number;
@@ -111,6 +112,7 @@ export class AuthGrant implements DurableObject {
         sandboxId: record.sandboxId,
         targetDeviceId: record.targetDeviceId,
         sessionId: record.sessionId,
+        lifecycleEpoch: record.lifecycleEpoch,
         capabilities: record.capabilities
       });
     }
@@ -141,6 +143,7 @@ export class AuthGrant implements DurableObject {
         sandboxId: record.sandboxId,
         targetDeviceId: record.targetDeviceId,
         sessionId: record.sessionId,
+        lifecycleEpoch: record.lifecycleEpoch,
         capabilities: record.capabilities
       });
     }
@@ -165,6 +168,7 @@ export class AuthGrant implements DurableObject {
         sandboxId: record.sandboxId,
         targetDeviceId: record.targetDeviceId,
         sessionId: record.sessionId,
+        lifecycleEpoch: record.lifecycleEpoch,
         capabilities: record.capabilities,
         grantedAt: record.issuedAt,
         expiresAt: record.accessExpiresAt,
@@ -193,6 +197,7 @@ export const authenticateDeviceToken = async (
   sandboxId: string;
   targetDeviceId: string;
   sessionId: string;
+  lifecycleEpoch: number;
   grantedAt: number;
   expiresAt: number;
   revokedAt: null;
@@ -213,6 +218,7 @@ export const authenticateDeviceToken = async (
     sandboxId?: unknown;
     targetDeviceId?: unknown;
     sessionId?: unknown;
+    lifecycleEpoch?: unknown;
     capabilities?: unknown;
     grantedAt?: unknown;
     expiresAt?: unknown;
@@ -228,6 +234,9 @@ export const authenticateDeviceToken = async (
     typeof body.grantId !== "string" ||
     typeof body.targetDeviceId !== "string" ||
     typeof body.sessionId !== "string" ||
+    typeof body.lifecycleEpoch !== "number" ||
+    !Number.isSafeInteger(body.lifecycleEpoch) ||
+    body.lifecycleEpoch < 1 ||
     typeof body.grantedAt !== "number" ||
     !Number.isSafeInteger(body.grantedAt) ||
     typeof body.expiresAt !== "number" ||
@@ -249,6 +258,7 @@ export const authenticateDeviceToken = async (
     sandboxId: body.sandboxId,
     targetDeviceId: body.targetDeviceId,
     sessionId: body.sessionId,
+    lifecycleEpoch: body.lifecycleEpoch,
     grantedAt: body.grantedAt,
     expiresAt: body.expiresAt,
     revokedAt: null,
@@ -281,6 +291,7 @@ interface SandboxTarget {
   deploymentId: string;
   targetDeviceId: string;
   sessionId: string;
+  lifecycleEpoch: number;
 }
 
 const verifiedSandboxTarget = async (
@@ -335,6 +346,7 @@ const verifiedSandboxTarget = async (
       deploymentId?: unknown;
       targetDeviceId?: unknown;
       sessionId?: unknown;
+      lifecycleEpoch?: unknown;
       actor?: { sub?: unknown };
     };
   }>(response);
@@ -356,6 +368,9 @@ const verifiedSandboxTarget = async (
     profile.deploymentId !== requested.deploymentId ||
     typeof profile.targetDeviceId !== "string" ||
     !ID_RE.test(profile.targetDeviceId) ||
+    typeof profile.lifecycleEpoch !== "number" ||
+    !Number.isSafeInteger(profile.lifecycleEpoch) ||
+    profile.lifecycleEpoch !== requested.lifecycleEpoch ||
     profile.targetDeviceId !== requested.targetDeviceId ||
     typeof profile.sessionId !== "string" ||
     !ID_RE.test(profile.sessionId) ||
@@ -368,6 +383,7 @@ const verifiedSandboxTarget = async (
     sandboxId: profile.sandboxId,
     deploymentId: profile.deploymentId,
     targetDeviceId: profile.targetDeviceId,
+    lifecycleEpoch: profile.lifecycleEpoch,
     sessionId: profile.sessionId
   };
 };
@@ -428,6 +444,7 @@ export const handleAuthenticatedAuthRoute = async (
       sandboxId?: string;
       targetDeviceId?: string;
       sessionId?: string;
+      lifecycleEpoch?: number;
       capabilities?: string[];
       ttlSeconds?: number;
     }>(request);
@@ -440,6 +457,9 @@ export const handleAuthenticatedAuthRoute = async (
       typeof body.targetDeviceId !== "string" ||
       !ID_RE.test(body.targetDeviceId) ||
       typeof body.sessionId !== "string" ||
+      typeof body.lifecycleEpoch !== "number" ||
+      !Number.isSafeInteger(body.lifecycleEpoch) ||
+      body.lifecycleEpoch < 1 ||
       !ID_RE.test(body.sessionId) ||
       !Array.isArray(body.capabilities) ||
       (body.ttlSeconds !== undefined &&
@@ -456,7 +476,8 @@ export const handleAuthenticatedAuthRoute = async (
       deploymentId: body.deploymentId,
       sandboxId: body.sandboxId,
       targetDeviceId: body.targetDeviceId,
-      sessionId: body.sessionId
+      sessionId: body.sessionId,
+      lifecycleEpoch: body.lifecycleEpoch
     });
     if (!target) return json({ error: "grant_target_forbidden" }, 403);
     if (!(await requesterOwnsSession(env, target, identity.userId))) {
@@ -479,6 +500,7 @@ export const handleAuthenticatedAuthRoute = async (
       sandboxId: target.sandboxId,
       targetDeviceId: target.targetDeviceId,
       sessionId: target.sessionId,
+      lifecycleEpoch: target.lifecycleEpoch,
       capabilities: [...new Set(body.capabilities)],
       grantHash: await hash(secret),
       issuedAt,

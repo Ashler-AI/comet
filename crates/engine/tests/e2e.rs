@@ -32,6 +32,7 @@ fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
         prompt: prompt.into(),
         model: None,
+        agent_account_id: None,
         reasoning: None,
         model_options: Default::default(),
         cwd: "/tmp".into(),
@@ -2437,6 +2438,7 @@ async fn real_claude_sees_uploaded_image_inline() {
     let request = RunRequest {
         prompt,
         model: Some("haiku".into()),
+        agent_account_id: None,
         reasoning: None,
         model_options: Default::default(),
         cwd: cwd.to_string_lossy().to_string(),

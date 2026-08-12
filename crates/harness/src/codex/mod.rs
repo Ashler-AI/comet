@@ -242,6 +242,26 @@ impl Harness for CodexHarness {
         }
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
+        if let Some(inference) = controls
+            .context
+            .as_ref()
+            .and_then(|context| context.inference.as_ref())
+            .filter(|route| route.provider == "openai")
+        {
+            let base_url = serde_json::to_string(&format!("{}/v1", inference.base_url))
+                .expect("loopback inference URL serializes");
+            for override_value in [
+                "model_provider=\"comet\"".to_string(),
+                "model_providers.comet.name=\"Comet Agent Auth\"".to_string(),
+                format!("model_providers.comet.base_url={base_url}"),
+                "model_providers.comet.env_key=\"COMET_INFERENCE_TOKEN\"".to_string(),
+                "model_providers.comet.wire_api=\"responses\"".to_string(),
+                "model_providers.comet.requires_openai_auth=false".to_string(),
+                "model_providers.comet.supports_websockets=false".to_string(),
+            ] {
+                cmd.arg("-c").arg(override_value);
+            }
+        }
         crate::compose_child_path(&mut cmd, &exe);
         crate::apply_run_context(&mut cmd, controls.context.as_ref());
         if !request.cwd.is_empty() {

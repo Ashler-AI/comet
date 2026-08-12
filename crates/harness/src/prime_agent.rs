@@ -1,5 +1,6 @@
 //! Prime Agent harness over its persistent Agent Client Protocol (ACP) mode.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -28,6 +29,8 @@ const REASONING_LEVELS: &[ReasoningLevel] = &[
     ReasoningLevel::XHigh,
     ReasoningLevel::Max,
 ];
+
+const ACP_ARGS: &[&str] = &["--mode", "acp"];
 
 fn resolve_prime_agent_executable() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("PRIME_AGENT_EXECUTABLE").filter(|value| !value.is_empty())
@@ -61,16 +64,86 @@ fn resolve_prime_agent_executable() -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.exists())
 }
 
-fn prime_config_dir() -> PathBuf {
-    std::env::var_os("PRIME_AGENT_CODING_AGENT_DIR")
+fn resolve_prime_config_dir(
+    configured: Option<OsString>,
+    home: Option<OsString>,
+    current_dir: &Path,
+) -> PathBuf {
+    let path = configured
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|value| !value.is_empty())
+            home.filter(|value| !value.is_empty())
                 .map(|home| PathBuf::from(home).join(".prime/agent"))
         })
-        .unwrap_or_else(|| PathBuf::from(".prime/agent"))
+        .unwrap_or_else(|| PathBuf::from(".prime/agent"));
+    if path.is_absolute() {
+        path
+    } else {
+        current_dir.join(path)
+    }
+}
+
+fn prime_config_dir() -> Result<PathBuf, HarnessError> {
+    let current_dir = std::env::current_dir()?;
+    Ok(resolve_prime_config_dir(
+        std::env::var_os("PRIME_AGENT_CODING_AGENT_DIR"),
+        std::env::var_os("HOME"),
+        &current_dir,
+    ))
+}
+
+fn daemon_endpoint_hash(agent_dir: &Path) -> u64 {
+    agent_dir
+        .to_string_lossy()
+        .bytes()
+        .fold(0xcbf29ce484222325, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        })
+}
+
+fn comet_daemon_endpoint(agent_dir: &Path, windows: bool, temp_dir: &Path) -> PathBuf {
+    if windows {
+        PathBuf::from(format!(
+            r"\\.\pipe\ashler-comet-prime-agent-{:016x}",
+            daemon_endpoint_hash(agent_dir)
+        ))
+    } else {
+        temp_dir
+            .join(format!("comet-pa-{:016x}", daemon_endpoint_hash(agent_dir)))
+            .join("p.sock")
+    }
+}
+
+fn prepare_comet_daemon_endpoint(agent_dir: &Path, windows: bool) -> Result<PathBuf, HarnessError> {
+    let temp_dir = std::env::temp_dir();
+    let temp_dir = if temp_dir.is_absolute() {
+        temp_dir
+    } else {
+        std::env::current_dir()?.join(temp_dir)
+    };
+    let endpoint = comet_daemon_endpoint(agent_dir, windows, &temp_dir);
+    if !windows {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+
+            const MAX_UNIX_SOCKET_PATH_BYTES: usize = 103;
+            let length = endpoint.as_os_str().as_bytes().len();
+            if length > MAX_UNIX_SOCKET_PATH_BYTES {
+                return Err(HarnessError::Protocol(format!(
+                    "Prime Agent Comet daemon socket path is {length} bytes; Unix permits at most \
+                     {MAX_UNIX_SOCKET_PATH_BYTES}: {}",
+                    endpoint.display()
+                )));
+            }
+        }
+        let parent = endpoint.parent().ok_or_else(|| {
+            HarnessError::Protocol("Prime Agent Comet daemon socket has no parent".into())
+        })?;
+        crate::auth_gateway::prepare_private_directory(parent)?;
+    }
+    Ok(endpoint)
 }
 
 fn reasoning_arg(level: ReasoningLevel) -> &'static str {
@@ -192,8 +265,8 @@ impl PrimeAgentHarness {
         command
     }
 
-    fn new_session_dir() -> Result<PathBuf, HarnessError> {
-        let path = prime_config_dir()
+    fn new_session_dir(agent_dir: &Path) -> Result<PathBuf, HarnessError> {
+        let path = agent_dir
             .join("comet-sessions")
             .join(uuid::Uuid::new_v4().to_string());
         std::fs::create_dir_all(&path)?;
@@ -317,24 +390,47 @@ impl Harness for PrimeAgentHarness {
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let executable = self.resolve_executable()?;
+        let agent_dir = prime_config_dir()?;
+        crate::auth_gateway::prepare_runtime_dir(&agent_dir)?;
+        let daemon_endpoint = prepare_comet_daemon_endpoint(&agent_dir, cfg!(windows))?;
         let preloaded_session_id = request.resume.clone();
         let mut command = self.command(&executable, &request.cwd);
+        if let Some(provider) = controls
+            .context
+            .as_ref()
+            .and_then(|context| context.inference.as_ref())
+            .and_then(|inference| crate::auth_gateway::provider(&inference.provider))
+        {
+            command.env("PRIME_AGENT_MANAGE_AUTH_ROUTER", "0");
+            let extension = crate::auth_gateway::install_prime_extension(&agent_dir)?;
+            command.arg("--extension").arg(extension);
+            command.args(["--provider", provider]);
+        }
+        crate::apply_run_context(&mut command, controls.context.as_ref());
         let reported_session_dir = if let Some(resume) = request.resume.as_deref() {
             command.args(["--resume", resume]);
             None
         } else {
-            let session_dir = Self::new_session_dir()?;
+            let session_dir = Self::new_session_dir(&agent_dir)?;
             command.arg("--session-dir").arg(&session_dir);
             Some(session_dir)
         };
-        if let Some(model) = request.model.as_deref().filter(|model| *model != "default") {
+        let model = controls
+            .context
+            .as_ref()
+            .and_then(|context| context.inference.as_ref())
+            .map(|inference| inference.model.as_str())
+            .or_else(|| request.model.as_deref().filter(|model| *model != "default"));
+        if let Some(model) = model {
             command.args(["--model", model]);
         }
         if let Some(reasoning) = request.reasoning {
             command.args(["--thinking", reasoning_arg(reasoning)]);
         }
         command
-            .args(["--dangerously-skip-permissions", "--mode", "acp"])
+            .arg("--daemon-socket")
+            .arg(daemon_endpoint)
+            .args(ACP_ARGS)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -407,6 +503,69 @@ mod tests {
 
         assert!(harness.supports_steering());
         assert_eq!(harness.steering_mode(), SteeringMode::TurnBoundary);
+    }
+
+    #[test]
+    fn uses_only_prime_agent_supported_acp_flags() {
+        assert_eq!(ACP_ARGS, ["--mode", "acp"]);
+    }
+    #[test]
+    fn uses_a_short_stable_unix_socket_outside_the_agent_directory() {
+        let agent_dir = Path::new("/an/arbitrarily/long/prime-agent-directory");
+        let first = comet_daemon_endpoint(agent_dir, false, Path::new("/tmp"));
+        let same = comet_daemon_endpoint(agent_dir, false, Path::new("/tmp"));
+        let second = comet_daemon_endpoint(
+            Path::new("/another/prime-agent-directory"),
+            false,
+            Path::new("/tmp"),
+        );
+
+        assert_eq!(first, same);
+        assert_eq!(
+            first
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with("comet-pa-")),
+            Some(true)
+        );
+        assert_eq!(
+            first.file_name().and_then(|name| name.to_str()),
+            Some("p.sock")
+        );
+        assert!(!first.starts_with(agent_dir));
+    }
+
+    #[test]
+    fn uses_a_comet_specific_windows_named_pipe() {
+        let temp_dir = Path::new(r"C:\Temp");
+        let first = comet_daemon_endpoint(Path::new(r"C:\Users\one\.prime\agent"), true, temp_dir);
+        let same = comet_daemon_endpoint(Path::new(r"C:\Users\one\.prime\agent"), true, temp_dir);
+        let second = comet_daemon_endpoint(Path::new(r"C:\Users\two\.prime\agent"), true, temp_dir);
+        let first = first.to_string_lossy();
+
+        assert!(first.starts_with(r"\\.\pipe\ashler-comet-prime-agent-"));
+        assert!(!first.contains(".sock"));
+        assert_eq!(first, same.to_string_lossy());
+        assert_ne!(first, second.to_string_lossy());
+    }
+
+    #[test]
+    fn resolves_relative_and_no_home_agent_directories_absolutely() {
+        let current_dir = Path::new("/workspace/comet");
+
+        assert_eq!(
+            resolve_prime_config_dir(
+                Some(OsString::from("relative-prime")),
+                Some(OsString::from("/ignored-home")),
+                current_dir,
+            ),
+            current_dir.join("relative-prime")
+        );
+        assert_eq!(
+            resolve_prime_config_dir(None, None, current_dir),
+            current_dir.join(".prime/agent")
+        );
     }
 
     #[test]

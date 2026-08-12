@@ -29,14 +29,15 @@ use comet_doc::{
     SessionMessageEntry,
 };
 use comet_proto::{
-    AgentSessionSource, ChatConfig, FileSearchMatch, HarnessCommand, HarnessId, RunRequest,
-    SandboxLevel, ScaffoldLifecycle, SteeringMode, UserInputAnswer, UserInputQuestion,
+    AgentProvider, AgentRoute, AgentSessionSource, ChatConfig, FileSearchMatch, HarnessCommand,
+    HarnessId, RunRequest, SandboxLevel, ScaffoldLifecycle, SteeringMode, UserInputAnswer,
+    UserInputQuestion,
 };
 use comet_rpc::{RpcError, methods};
 
 use crate::attachments::{self, StagedAttachment};
 use crate::motion;
-use crate::pickers::Pickers;
+use crate::pickers::{CheckoutPlan, Pickers};
 use crate::state::{AppState, Indicator, latest_active_omp_goal};
 use crate::theme::Theme;
 
@@ -79,6 +80,78 @@ pub const DRAG_SCROLL_FRAME_MS: u64 = 16;
 /// Maximum time the first prompt waits for its Scaffold sandbox and remote
 /// Comet host. Failure is surfaced; the prompt never falls back to local.
 const SCAFFOLD_DEMO_WAIT: Duration = Duration::from_secs(10 * 60);
+
+fn scaffold_source_ref(plan: &CheckoutPlan) -> Option<&str> {
+    match plan {
+        CheckoutPlan::CurrentCheckout { branch } => branch.as_deref(),
+        CheckoutPlan::ReuseWorktree { branch, .. } => Some(branch.as_str()),
+        CheckoutPlan::NewWorktree { base } => base.as_deref(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScaffoldAgentBinding {
+    route: AgentRoute,
+    /// OMP's immutable provider-qualified model identity. The control plane
+    /// receives the provider and provider-local model separately, while the
+    /// attached chat and every run use this exact selector.
+    model_id: String,
+}
+
+fn scaffold_agent_binding(
+    harness: Option<HarnessId>,
+    selected_model: Option<&str>,
+    agent_account_id: Option<&str>,
+) -> Option<ScaffoldAgentBinding> {
+    if harness? != HarnessId::Omp {
+        return None;
+    }
+    let selected = selected_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && *model != "default")?;
+    let lower = selected.to_ascii_lowercase();
+    let provider = if lower.starts_with("anthropic/") {
+        AgentProvider::Anthropic
+    } else if lower.starts_with("openai/") || lower.starts_with("openai-codex/") {
+        AgentProvider::OpenAi
+    } else {
+        return None;
+    };
+    let (_, model) = selected.rsplit_once('/')?;
+    if model.is_empty() {
+        return None;
+    }
+    let model_id = selected.to_string();
+    let account_id = agent_account_id.map(str::trim).filter(|id| !id.is_empty());
+    let route = match account_id {
+        Some(account_id) => AgentRoute::pinned(provider, model, account_id),
+        None => AgentRoute::automatic(provider, model),
+    };
+    Some(ScaffoldAgentBinding { route, model_id })
+}
+
+fn scaffold_attached_chat_config(binding: &ScaffoldAgentBinding) -> ChatConfig {
+    ChatConfig {
+        harness: HarnessId::Omp,
+        model: Some(binding.model_id.clone()),
+        reasoning: None,
+        agent_account_id: binding.route.account_id.clone(),
+        model_options: Default::default(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+    }
+}
+
+fn scaffold_run_model(
+    attached: bool,
+    binding: Option<&ScaffoldAgentBinding>,
+    resolved_model: Option<&str>,
+) -> Option<String> {
+    if attached {
+        binding.map(|binding| binding.model_id.clone())
+    } else {
+        resolved_model.map(str::to_string)
+    }
+}
 
 /// Hysteresis slack for the expanded→compact flip: once expanded, the composer
 /// only collapses when the text is comfortably narrower than the compact
@@ -3228,6 +3301,13 @@ struct ControlRoute {
     actor_subject: String,
     grant_id: String,
     source: AgentSessionSource,
+    scaffold: Option<ScaffoldControlTarget>,
+}
+
+#[derive(Debug, Clone)]
+struct ScaffoldControlTarget {
+    sandbox_id: String,
+    scope: comet_proto::CollaborationScope,
 }
 
 fn control_route_grant_id(
@@ -3256,11 +3336,14 @@ fn scaffold_start_control_route(
         grant.id == preferred_grant_id
             && grant.granted_by == "comet-edge-device-room"
             && grant.permits(principal, required_capability, now)
-            && grant.device_id.as_deref().and_then(|device| {
-                device
-                    .strip_prefix("comet-scaffold-")
-                    .map(|sandbox| Some(sandbox) == grant.sandbox_id.as_deref())
-            }) == Some(true)
+            && grant.device_id.as_deref().is_some_and(|device| {
+                comet_proto::parse_scaffold_device_id(device).is_some_and(
+                    |(sandbox_id, lifecycle_epoch)| {
+                        Some(sandbox_id) == grant.sandbox_id.as_deref()
+                            && Some(lifecycle_epoch) == grant.lifecycle_epoch
+                    },
+                )
+            })
     })?;
     Some((
         grant.scope.session_id.clone()?,
@@ -4364,6 +4447,22 @@ impl Composer {
                 grant_id,
             )
         };
+        let scaffold = if source == AgentSessionSource::Scaffold {
+            let grant = snapshot
+                .grants
+                .iter()
+                .find(|grant| grant.id == grant_id)
+                .ok_or_else(|| SharedString::from("Reconnect to control this session"))?;
+            Some(ScaffoldControlTarget {
+                sandbox_id: grant
+                    .sandbox_id
+                    .clone()
+                    .ok_or_else(|| SharedString::from("Reconnect to control this session"))?,
+                scope: grant.scope.clone(),
+            })
+        } else {
+            None
+        };
         Ok(Some(ControlRoute {
             session_id,
             owner_device_id,
@@ -4371,6 +4470,7 @@ impl Composer {
             actor_subject: principal.subject.clone(),
             grant_id,
             source,
+            scaffold,
         }))
     }
 
@@ -4610,6 +4710,23 @@ impl Composer {
             return;
         }
         let scaffold_demo = scaffold_draft.is_some();
+        let requested_scaffold_source_ref = scaffold_demo
+            .then(|| scaffold_source_ref(&plan).map(str::to_string))
+            .flatten();
+        let scaffold_agent_binding = if scaffold_demo {
+            let Some(binding) = scaffold_agent_binding(
+                resolved.harness,
+                resolved.model.as_deref(),
+                resolved.agent_account_id.as_deref(),
+            ) else {
+                self.failure = Some("Select a supported model before starting Scaffold".into());
+                cx.notify();
+                return;
+            };
+            Some(binding)
+        } else {
+            None
+        };
         let scaffold_scope = scaffold_draft
             .as_ref()
             .map(|draft| draft.collaboration_scope());
@@ -4736,17 +4853,31 @@ impl Composer {
             });
         }
         self.send_task = Some(cx.spawn(async move |this, cx| {
-            let mut scaffold_attached = false;
+            let mut scaffold_attached = control_route
+                .as_ref()
+                .is_some_and(|route| route.source == AgentSessionSource::Scaffold);
             let result: Result<(), String> = async {
                 let mut control_route = control_route;
                 let mut host_device_id = host_device_id;
+                let mut attached_scaffold_source_ref = requested_scaffold_source_ref.clone();
                 if let Some(scope) = scaffold_scope {
                     let wait_started = Instant::now();
                     let mut sandbox_id = None;
                     let mut pending_attachment = None;
                     let mut last_error = None;
-                    let launch =
-                        crate::state::create_and_attach_scaffold_session(&engine, &scope);
+                    let scaffold_retry_executor = cx.background_executor().clone();
+                    let scaffold_retry_delay =
+                        move |delay| scaffold_retry_executor.timer(delay);
+                    let launch = crate::state::create_and_attach_scaffold_session(
+                        &engine,
+                        &scope,
+                        requested_scaffold_source_ref.as_deref(),
+                        &scaffold_agent_binding
+                            .as_ref()
+                            .expect("Scaffold route is resolved before launch")
+                            .route,
+                        &scaffold_retry_delay,
+                    );
                     let deadline = cx.background_executor().timer(SCAFFOLD_DEMO_WAIT);
                     futures::pin_mut!(launch);
                     match futures::future::select(launch, deadline).await {
@@ -4773,6 +4904,12 @@ impl Composer {
                     if let (Some(created_id), Some(attachment)) =
                         (sandbox_id.as_deref(), pending_attachment.as_ref())
                     {
+                        let authoritative_scope = comet_proto::CollaborationScope {
+                            project_id: attachment.projection.project_id.clone(),
+                            deployment_id: Some(attachment.projection.deployment_id.clone()),
+                            session_id: Some(attachment.projection.session_id.clone()),
+                            unknown: Default::default(),
+                        };
                         loop {
                             let remaining =
                                 SCAFFOLD_DEMO_WAIT.saturating_sub(wait_started.elapsed());
@@ -4780,7 +4917,7 @@ impl Composer {
                                 break;
                             }
                             let inspect = crate::state::inspect_scaffold_session(
-                                &engine, created_id, &scope,
+                                &engine, created_id, &authoritative_scope,
                             );
                             let deadline = cx.background_executor().timer(remaining);
                             futures::pin_mut!(inspect);
@@ -4818,6 +4955,10 @@ impl Composer {
                                     break;
                                 };
                                 host_device_id = Some(attachment.owner_device_id.clone());
+                                attached_scaffold_source_ref = attachment
+                                    .source_ref
+                                    .clone()
+                                    .or(attached_scaffold_source_ref);
                                 control_route = Some(ControlRoute {
                                     session_id: attachment.projection.session_id.clone(),
                                     owner_device_id: attachment.owner_device_id.clone(),
@@ -4825,6 +4966,10 @@ impl Composer {
                                     actor_subject: attachment.actor_subject.clone(),
                                     grant_id: attachment.grant_id.clone(),
                                     source: AgentSessionSource::Scaffold,
+                                    scaffold: Some(ScaffoldControlTarget {
+                                        sandbox_id: created_id.to_string(),
+                                        scope: authoritative_scope.clone(),
+                                    }),
                                 });
                                 this.update(cx, |composer, cx| {
                                     composer.state.update(cx, |state, cx| {
@@ -4867,13 +5012,51 @@ impl Composer {
                     })
                     .ok();
                 }
-                // Resolve the working directory: existing chats keep theirs;
-                // new chats run per the checkout plan: the
-                // space's folder as-is, an EXISTING worktree of the picked ref
-                // (a plain cwd override — multiple sessions share one
-                // worktree), or a fresh isolated worktree created off the
-                // picked base ref (CreateWorktree on send, targeted at the
-                // space's device; the RPC relay-forwards).
+                if !scaffold_demo
+                    && let Some(target) = control_route
+                        .as_ref()
+                        .and_then(|route| route.scaffold.clone())
+                {
+                    let scaffold_retry_executor = cx.background_executor().clone();
+                    let scaffold_retry_delay =
+                        move |delay| scaffold_retry_executor.timer(delay);
+                    let attachment = crate::state::ensure_scaffold_session_attached(
+                        &engine,
+                        &target.sandbox_id,
+                        &target.scope,
+                        &scaffold_retry_delay,
+                    )
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!(
+                            sandbox_id = %target.sandbox_id,
+                            error = %error,
+                            "Scaffold session reconnect failed"
+                        );
+                        "Reconnect to control this session".to_string()
+                    })?;
+                    host_device_id = Some(attachment.owner_device_id.clone());
+                    attached_scaffold_source_ref = attachment
+                        .source_ref
+                        .clone()
+                        .or(attached_scaffold_source_ref);
+                    let route = control_route
+                        .as_mut()
+                        .expect("Scaffold reconnect preserves its control route");
+                    route.session_id = attachment.projection.session_id.clone();
+                    route.owner_device_id = attachment.owner_device_id.clone();
+                    route.grant_id = attachment.grant_id.clone();
+                    this.update(cx, |composer, cx| {
+                        composer.state.update(cx, |state, cx| {
+                            state.install_scaffold_session(&attachment, cx);
+                        });
+                    })
+                    .ok();
+                }
+                // Resolve the execution checkout. Local sessions may reuse a
+                // local path. Scaffold sessions instead target the attached
+                // device and use only sandbox-relative paths; a fresh checkout
+                // is created from the control-plane-returned source ref.
                 let mut cwd = if scaffold_attached {
                     ".".to_string()
                 } else if is_new {
@@ -4889,40 +5072,64 @@ impl Composer {
                 // it from the first frame (it read "Select ref" until the
                 // host's diff reconciler got around to stamping the branch).
                 let mut chat_branch: Option<String> = None;
-                if is_new && !scaffold_demo {
+                if is_new || scaffold_demo {
                     match &plan {
-                        crate::pickers::CheckoutPlan::CurrentCheckout { branch } => {
+                        CheckoutPlan::CurrentCheckout { branch } => {
                             chat_branch = branch.clone();
                         }
-                        crate::pickers::CheckoutPlan::ReuseWorktree { path, branch } => {
-                            cwd = path.clone();
-                            worktree_cwd = Some(path.clone());
+                        CheckoutPlan::ReuseWorktree { path, branch } => {
                             chat_branch = Some(branch.clone());
+                            if !scaffold_attached {
+                                cwd = path.clone();
+                                worktree_cwd = Some(path.clone());
+                            }
                         }
-                        crate::pickers::CheckoutPlan::NewWorktree { base } => {
+                        CheckoutPlan::NewWorktree { base } => {
                             chat_branch = base.clone();
-                            if let (Some(repo_path), Some(base)) = (&space_path, base) {
-                                let mut params = serde_json::json!({
-                                    "repoPath": repo_path,
-                                    "branch": base,
-                                });
-                                if space_remote
-                                    && let Some(object) = params.as_object_mut()
-                                {
-                                    object.insert(
-                                        "targetDeviceId".into(),
-                                        serde_json::Value::String(device_id.clone()),
-                                    );
+                            if let Some(base) = base {
+                                let repo_path = if scaffold_attached {
+                                    Some(".".to_string())
+                                } else {
+                                    space_path.clone()
+                                };
+                                let worktree_base = if scaffold_attached {
+                                    attached_scaffold_source_ref
+                                        .clone()
+                                        .unwrap_or_else(|| base.clone())
+                                } else {
+                                    base.clone()
+                                };
+                                if let Some(repo_path) = repo_path {
+                                    let mut params = serde_json::json!({
+                                        "repoPath": repo_path,
+                                        "branch": worktree_base,
+                                    });
+                                    let target_device_id = if scaffold_attached {
+                                        host_device_id.clone()
+                                    } else if space_remote {
+                                        Some(device_id.clone())
+                                    } else {
+                                        None
+                                    };
+                                    if let (Some(target_device_id), Some(object)) =
+                                        (target_device_id, params.as_object_mut())
+                                    {
+                                        object.insert(
+                                            "targetDeviceId".into(),
+                                            serde_json::Value::String(target_device_id),
+                                        );
+                                    }
+                                    let value = engine
+                                        .client()
+                                        .call(methods::CREATE_WORKTREE, params)
+                                        .await
+                                        .map_err(|e| format!("Worktree failed: {e}"))?;
+                                    let worktree: comet_proto::Worktree =
+                                        serde_json::from_value(value)
+                                            .map_err(|e| format!("Worktree reply malformed: {e}"))?;
+                                    cwd = worktree.path.clone();
+                                    worktree_cwd = Some(worktree.path);
                                 }
-                                let value = engine
-                                    .client()
-                                    .call(methods::CREATE_WORKTREE, params)
-                                    .await
-                                    .map_err(|e| format!("Worktree failed: {e}"))?;
-                                let worktree: comet_proto::Worktree = serde_json::from_value(value)
-                                    .map_err(|e| format!("Worktree reply malformed: {e}"))?;
-                                cwd = worktree.path.clone();
-                                worktree_cwd = Some(worktree.path);
                             }
                         }
                     }
@@ -4950,13 +5157,11 @@ impl Composer {
                             );
                         }
                         let config = if scaffold_attached {
-                            Some(ChatConfig {
-                                harness: HarnessId::Omp,
-                                model: None,
-                                reasoning: None,
-                                model_options: Default::default(),
-                                sandbox: SandboxLevel::WorkspaceWrite,
-                            })
+                            Some(scaffold_attached_chat_config(
+                                scaffold_agent_binding
+                                    .as_ref()
+                                    .expect("attached Scaffold session has a resolved route"),
+                            ))
                         } else {
                             resolved.chat_config()
                         };
@@ -5057,7 +5262,12 @@ impl Composer {
 
                 let run_request = || RunRequest {
                     prompt: content.clone(),
-                    model: resolved.model.clone(),
+                    model: scaffold_run_model(
+                        scaffold_attached,
+                        scaffold_agent_binding.as_ref(),
+                        resolved.model.as_deref(),
+                    ),
+                    agent_account_id: resolved.agent_account_id.clone(),
                     reasoning: resolved.reasoning,
                     model_options: resolved.model_options.clone(),
                     cwd: cwd.clone(),
@@ -6148,6 +6358,101 @@ mod tests {
     }
 
     #[test]
+    fn scaffold_source_ref_follows_the_selected_checkout() {
+        assert_eq!(
+            scaffold_source_ref(&CheckoutPlan::CurrentCheckout {
+                branch: Some("main".into()),
+            }),
+            Some("main")
+        );
+        assert_eq!(
+            scaffold_source_ref(&CheckoutPlan::ReuseWorktree {
+                path: "/tmp/worktree".into(),
+                branch: "feat/identity".into(),
+            }),
+            Some("feat/identity")
+        );
+        assert_eq!(
+            scaffold_source_ref(&CheckoutPlan::NewWorktree {
+                base: Some("feat/identity".into()),
+            }),
+            Some("feat/identity")
+        );
+    }
+
+    #[test]
+    fn scaffold_openai_binding_persists_and_sends_exact_model_identity() {
+        let binding =
+            scaffold_agent_binding(Some(HarnessId::Omp), Some("openai-codex/gpt-5.6-sol"), None)
+                .unwrap();
+        assert_eq!(binding.route.provider, AgentProvider::OpenAi);
+        assert_eq!(binding.route.model, "gpt-5.6-sol");
+        assert_eq!(binding.model_id, "openai-codex/gpt-5.6-sol");
+
+        let persisted = scaffold_attached_chat_config(&binding);
+        assert_eq!(persisted.harness, HarnessId::Omp);
+        assert_eq!(persisted.model.as_deref(), Some("openai-codex/gpt-5.6-sol"));
+        assert_eq!(
+            scaffold_run_model(true, Some(&binding), Some("wrong-model")).as_deref(),
+            persisted.model.as_deref()
+        );
+    }
+
+    #[test]
+    fn scaffold_anthropic_binding_persists_and_sends_exact_model_identity() {
+        let binding = scaffold_agent_binding(
+            Some(HarnessId::Omp),
+            Some("anthropic/claude-opus-5"),
+            Some("opaque-account-id"),
+        )
+        .unwrap();
+        assert_eq!(binding.route.provider, AgentProvider::Anthropic);
+        assert_eq!(binding.route.model, "claude-opus-5");
+        assert_eq!(binding.model_id, "anthropic/claude-opus-5");
+
+        let persisted = scaffold_attached_chat_config(&binding);
+        assert_eq!(persisted.harness, HarnessId::Omp);
+        assert_eq!(persisted.model.as_deref(), Some("anthropic/claude-opus-5"));
+        assert_eq!(
+            persisted.agent_account_id.as_deref(),
+            Some("opaque-account-id")
+        );
+        assert_eq!(
+            scaffold_run_model(true, Some(&binding), Some("wrong-model")).as_deref(),
+            persisted.model.as_deref()
+        );
+    }
+
+    #[test]
+    fn scaffold_binding_rejects_non_omp_harnesses_and_non_oauth_models() {
+        for harness in [
+            HarnessId::ClaudeCode,
+            HarnessId::Codex,
+            HarnessId::OpenCode,
+            HarnessId::PrimeAgent,
+        ] {
+            assert!(
+                scaffold_agent_binding(
+                    Some(harness),
+                    Some("openai-codex/gpt-5.6-sol"),
+                    Some("opaque-account-id")
+                )
+                .is_none(),
+                "Scaffold must run exclusively through OMP"
+            );
+        }
+        assert!(
+            scaffold_agent_binding(
+                Some(HarnessId::Omp),
+                Some("prime-inference/x-ai/grok-4.20"),
+                Some("opaque-account-id")
+            )
+            .is_none(),
+            "third-party models must not request an OAuth-backed Scaffold route"
+        );
+    }
+
+    #[test]
     fn mention_tooltip_wait_survives_pointer_jitter_and_promotes_once() {
         let target = tooltip_target(3..20, "src/composer.rs");
         let waiting = MentionTooltipPhase::Waiting {
@@ -7020,7 +7325,8 @@ mod tests {
                     },
                     "capabilities": ["session.chat"],
                     "sandboxId": "sandbox-a",
-                    "deviceId": "comet-scaffold-sandbox-a",
+                    "deviceId": "comet-scaffold-sandbox-a-e1",
+                    "lifecycleEpoch": 1,
                     "grantedBy": "comet-edge-device-room",
                     "grantedAt": 1,
                     "expiresAt": 60_000
@@ -7036,7 +7342,7 @@ mod tests {
             ),
             Some((
                 "session-a".into(),
-                "comet-scaffold-sandbox-a".into(),
+                "comet-scaffold-sandbox-a-e1".into(),
                 "grant-a".into(),
             ))
         );

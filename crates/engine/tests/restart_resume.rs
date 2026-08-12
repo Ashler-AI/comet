@@ -38,6 +38,7 @@ fn run_request(prompt: &str, cwd: &str) -> RunRequest {
     RunRequest {
         prompt: prompt.into(),
         model: None,
+        agent_account_id: None,
         reasoning: None,
         model_options: Default::default(),
         cwd: cwd.into(),
@@ -796,6 +797,7 @@ async fn real_claude_remembers_codeword_across_engine_restart() {
     let real_request = |prompt: &str| RunRequest {
         prompt: prompt.into(),
         model: Some("haiku".into()),
+        agent_account_id: None,
         reasoning: None,
         model_options: Default::default(),
         cwd: cwd.clone(),

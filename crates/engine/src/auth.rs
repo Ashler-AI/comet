@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+use comet_proto::CollaborationScope;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -114,6 +115,7 @@ pub struct AuthConfig {
     pub expected_device_id: Option<String>,
     pub expected_session_id: Option<String>,
     pub expected_deployment_id: Option<String>,
+    pub expected_lifecycle_epoch: Option<u64>,
     pub expected_sandbox_id: Option<String>,
 }
 
@@ -135,6 +137,7 @@ impl std::fmt::Debug for AuthConfig {
             .field("expected_device_id", &self.expected_device_id)
             .field("expected_session_id", &self.expected_session_id)
             .field("expected_deployment_id", &self.expected_deployment_id)
+            .field("expected_lifecycle_epoch", &self.expected_lifecycle_epoch)
             .field("expected_sandbox_id", &self.expected_sandbox_id)
             .finish()
     }
@@ -155,6 +158,7 @@ impl AuthConfig {
             expected_device_id: None,
             expected_session_id: None,
             expected_deployment_id: None,
+            expected_lifecycle_epoch: None,
             expected_sandbox_id: None,
         }
     }
@@ -165,9 +169,40 @@ impl AuthConfig {
 struct StoredSession {
     access_token: String,
     user: AuthUser,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at: Option<i64>,
     project_scope: String,
     #[serde(default)]
     capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DeviceGrantAuthority {
+    pub grant_id: String,
+    pub expires_at: i64,
+    pub principal_subject: String,
+    pub scope: CollaborationScope,
+    pub sandbox_id: String,
+    pub device_id: String,
+    pub lifecycle_epoch: u64,
+    pub capabilities: Vec<String>,
+}
+
+fn grant_token_id<'a>(token: &'a str, expected_prefix: &str) -> Option<&'a str> {
+    let mut parts = token.split('.');
+    let prefix = parts.next()?;
+    let grant_id = parts.next()?;
+    let secret = parts.next()?;
+    if prefix != expected_prefix
+        || grant_id.len() != 32
+        || !grant_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || secret.is_empty()
+        || parts.next().is_some()
+    {
+        return None;
+    }
+    Some(grant_id)
 }
 
 #[derive(Debug, Clone)]
@@ -305,13 +340,13 @@ impl Auth {
             sandbox_id: String,
             target_device_id: String,
             session_id: String,
+            lifecycle_epoch: u64,
             #[serde(default)]
             capabilities: Vec<String>,
         }
 
-        if !grant.starts_with("cg1.") {
-            return Err(EngineError::Other("device_join_grant_unavailable".into()));
-        }
+        let grant_id = grant_token_id(grant, "cg1")
+            .ok_or_else(|| EngineError::Other("device_join_grant_unavailable".into()))?;
         let exchange_url = device_grant_exchange_url(&self.inner.config.edge_url)?;
         let response = self
             .inner
@@ -328,7 +363,7 @@ impl Auth {
             .json()
             .await
             .map_err(|_| EngineError::Other("device_join_grant_unavailable".into()))?;
-        if !exchange.access_token.starts_with("cs1.")
+        if grant_token_id(&exchange.access_token, "cs1") != Some(grant_id)
             || exchange.expires_at <= chrono::Utc::now().timestamp_millis()
             || exchange.project_id != self.inner.config.project_scope
             || self
@@ -352,6 +387,11 @@ impl Auth {
             || self
                 .inner
                 .config
+                .expected_lifecycle_epoch
+                .is_some_and(|expected| expected != exchange.lifecycle_epoch)
+            || self
+                .inner
+                .config
                 .expected_sandbox_id
                 .as_deref()
                 .is_some_and(|expected| expected != exchange.sandbox_id)
@@ -360,6 +400,7 @@ impl Auth {
         }
         Ok(StoredSession {
             access_token: exchange.access_token,
+            expires_at: Some(exchange.expires_at),
             user: AuthUser {
                 id: exchange.user_id,
                 email: exchange.email,
@@ -376,6 +417,33 @@ impl Auth {
 
     pub fn device_mode(&self) -> bool {
         self.inner.device_mode
+    }
+
+    pub(crate) fn device_grant_authority(&self) -> Option<DeviceGrantAuthority> {
+        if !self.inner.device_mode {
+            return None;
+        }
+        let stored = lock(&self.inner.stored);
+        let session = stored.as_ref()?;
+        let expires_at = session.expires_at?;
+        if expires_at <= chrono::Utc::now().timestamp_millis() {
+            return None;
+        }
+        Some(DeviceGrantAuthority {
+            grant_id: grant_token_id(&session.access_token, "cs1")?.to_string(),
+            expires_at,
+            principal_subject: session.user.id.clone(),
+            scope: CollaborationScope {
+                project_id: session.project_scope.clone(),
+                deployment_id: Some(self.inner.config.expected_deployment_id.clone()?),
+                session_id: Some(self.inner.config.expected_session_id.clone()?),
+                unknown: Default::default(),
+            },
+            sandbox_id: self.inner.config.expected_sandbox_id.clone()?,
+            device_id: self.inner.config.expected_device_id.clone()?,
+            lifecycle_epoch: self.inner.config.expected_lifecycle_epoch?,
+            capabilities: session.capabilities.clone(),
+        })
     }
 
     pub fn watch_state(&self) -> watch::Receiver<AuthState> {
@@ -476,6 +544,8 @@ impl Auth {
             .clone()
             .ok_or_else(|| EngineError::Other("device_token_unavailable".into()))?;
         let current = current_session.access_token.clone();
+        let current_grant_id = grant_token_id(&current, "cs1")
+            .ok_or_else(|| EngineError::Other("device_token_unavailable".into()))?;
         let response = self
             .inner
             .http
@@ -496,9 +566,9 @@ impl Auth {
         let refreshed: Refresh = response.json().await.map_err(|error| {
             EngineError::Other(format!("malformed device token refresh: {error}"))
         })?;
-        if !refreshed.access_token.starts_with("cs1.")
+        if grant_token_id(&refreshed.access_token, "cs1") != Some(refreshed.grant_id.as_str())
+            || refreshed.grant_id != current_grant_id
             || refreshed.expires_at <= chrono::Utc::now().timestamp_millis()
-            || refreshed.grant_id.trim().is_empty()
             || refreshed.user_id != current_session.user.id
             || refreshed.email != current_session.user.email
             || refreshed.project_id != current_session.project_scope
@@ -538,6 +608,7 @@ impl Auth {
             .filter(|session| session.access_token == current)
             .ok_or_else(|| EngineError::Other("device token changed during refresh".into()))?;
         session.access_token = refreshed.access_token;
+        session.expires_at = Some(refreshed.expires_at);
         Ok(())
     }
 
@@ -845,6 +916,7 @@ impl Auth {
     fn finish_sign_in(&self, result: SignInResult) {
         let session = StoredSession {
             access_token: result.access_token,
+            expires_at: None,
             user: result.user.clone(),
             project_scope: self.inner.config.project_scope.clone(),
             capabilities: result.capabilities,
@@ -1222,6 +1294,47 @@ mod tests {
                 .as_str(),
             "http://[::1]:8787/auth/device-grants/exchange"
         );
+    }
+    #[test]
+    fn device_grant_authority_exposes_only_non_secret_room_binding() {
+        let data_dir =
+            std::env::temp_dir().join(format!("comet-auth-authority-{}", uuid::Uuid::new_v4()));
+        let mut config = AuthConfig::new("http://127.0.0.1:8787", &data_dir);
+        config.project_scope = "project-a".into();
+        config.expected_deployment_id = Some("deployment-a".into());
+        config.expected_session_id = Some("session-a".into());
+        config.expected_sandbox_id = Some("sandbox-a".into());
+        config.expected_device_id = Some("device-a".into());
+        config.expected_lifecycle_epoch = Some(7);
+        let auth = Auth::new_with_mode(config, true);
+        *lock(&auth.inner.stored) = Some(StoredSession {
+            access_token: "cs1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.device_access_secret".into(),
+            user: AuthUser {
+                id: "accounts.google.com:alice".into(),
+                email: "alice@example.com".into(),
+                name: None,
+            },
+            expires_at: Some(chrono::Utc::now().timestamp_millis() + 60_000),
+            project_scope: "project-a".into(),
+            capabilities: vec!["session.read".into(), "session.chat".into()],
+        });
+
+        let authority = auth.device_grant_authority().unwrap();
+
+        assert_eq!(authority.grant_id, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(authority.principal_subject, "accounts.google.com:alice");
+        assert_eq!(
+            authority.scope.deployment_id.as_deref(),
+            Some("deployment-a")
+        );
+        assert_eq!(authority.scope.session_id.as_deref(), Some("session-a"));
+        assert_eq!(authority.sandbox_id, "sandbox-a");
+        assert_eq!(authority.device_id, "device-a");
+        assert_eq!(authority.lifecycle_epoch, 7);
+        let serialized = serde_json::to_string(&authority).unwrap();
+        assert!(!serialized.contains("device_access_secret"));
+        assert!(!serialized.contains("cs1."));
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[test]

@@ -78,6 +78,9 @@ pub struct ChatConfig {
     pub harness: HarnessId,
     pub model: Option<String>,
     pub reasoning: Option<ReasoningLevel>,
+    /// Opaque shared Agent Auth account id. `None` requests automatic routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_account_id: Option<String>,
     #[serde(default)]
     pub model_options: serde_json::Map<String, serde_json::Value>,
     pub sandbox: SandboxLevel,
@@ -388,27 +391,25 @@ pub enum AuthState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentAccount {
+    /// Agent Auth account id, or the deterministic local migration id while
+    /// `migration_available` is true.
     pub id: String,
     pub harness: HarnessId,
     pub email: Option<String>,
     pub plan_label: Option<String>,
-    pub active: bool,
     #[serde(default)]
     pub usage_windows: Vec<AgentUsageWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub organization: Option<String>,
-    /// How the CLI is signed in (`oauth` account vs raw `api-key`).
+    /// How a discovered local CLI is signed in. Agent Auth accounts are OAuth.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_kind: Option<AgentAuthKind>,
-    /// False for a live login whose credentials we could not read (e.g. macOS
-    /// Keychain denied) — shown, but not re-activatable.
+    /// True only for a credential recovery snapshot waiting for explicit import
+    /// into the shared Agent Auth pool.
     #[serde(default)]
-    pub switchable: bool,
-    /// Epoch millis of the slot's last snapshot.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub saved_at: Option<i64>,
+    pub migration_available: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -418,7 +419,8 @@ pub enum AgentAuthKind {
     ApiKey,
 }
 
-/// Everything the Accounts settings page renders, rebuilt after every mutation.
+/// Everything the Accounts settings page renders from the shared Agent Auth
+/// pool, plus local credentials still waiting for one-time migration.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentAccountsSnapshot {
@@ -503,4 +505,35 @@ pub enum TerminalEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signal: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_config_agent_account_is_optional_and_camel_case() {
+        let automatic: ChatConfig = serde_json::from_value(serde_json::json!({
+            "harness": "claude-code",
+            "model": "claude-opus-5",
+            "reasoning": null,
+            "modelOptions": {},
+            "sandbox": "workspace-write"
+        }))
+        .expect("legacy chat config");
+        assert_eq!(automatic.agent_account_id, None);
+        assert!(
+            serde_json::to_value(&automatic)
+                .expect("automatic config")
+                .get("agentAccountId")
+                .is_none()
+        );
+
+        let mut pinned = automatic;
+        pinned.agent_account_id = Some("opaque-account-id".into());
+        assert_eq!(
+            serde_json::to_value(pinned).expect("pinned config")["agentAccountId"],
+            "opaque-account-id"
+        );
+    }
 }

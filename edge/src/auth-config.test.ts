@@ -44,8 +44,9 @@ describe("device access token rotation", () => {
           projectId: "ashler-staging",
           deploymentId: "ashler-staging",
           sandboxId: "sandbox-789",
-          targetDeviceId: "comet-scaffold-sandbox-789",
+          targetDeviceId: "comet-scaffold-sandbox-789-e1",
           sessionId: "session-456",
+          lifecycleEpoch: 1,
           capabilities: ["session.read"],
           grantHash: await crypto.subtle
             .digest("SHA-256", new TextEncoder().encode(joinSecret))
@@ -82,14 +83,16 @@ describe("device access token rotation", () => {
       sandboxId: string;
       targetDeviceId: string;
       sessionId: string;
+      lifecycleEpoch: number;
     };
     expect(rotated.accessToken).not.toBe(original.accessToken);
     expect(rotated).toMatchObject({
       projectId: "ashler-staging",
       deploymentId: "ashler-staging",
       sandboxId: "sandbox-789",
-      targetDeviceId: "comet-scaffold-sandbox-789",
-      sessionId: "session-456"
+      targetDeviceId: "comet-scaffold-sandbox-789-e1",
+      sessionId: "session-456",
+      lifecycleEpoch: 1
     });
     expect(
       (
@@ -121,6 +124,7 @@ describe("device grant issuance", () => {
       sandboxId: string;
       targetDeviceId: string;
       sessionId: string;
+      lifecycleEpoch: number;
     }> = {}
   ) =>
     new Request("https://comet.example/auth/device-grants", {
@@ -132,8 +136,9 @@ describe("device grant issuance", () => {
       body: JSON.stringify({
         deploymentId: identity.projectScope,
         sandboxId: "sandbox-789",
-        targetDeviceId: "comet-scaffold-sandbox-789",
+        targetDeviceId: "comet-scaffold-sandbox-789-e1",
         sessionId: "session-456",
+        lifecycleEpoch: 1,
         capabilities: ["session.read", "session.control"],
         ...overrides
       })
@@ -192,8 +197,9 @@ describe("device grant issuance", () => {
           projectId: identity.projectScope,
           deploymentId: identity.projectScope,
           sandboxId: "sandbox-789",
-          targetDeviceId: "comet-scaffold-sandbox-789",
+          targetDeviceId: "comet-scaffold-sandbox-789-e1",
           sessionId: "session-456",
+          lifecycleEpoch: 1,
           actor: { sub: identity.userId }
         }
       })
@@ -215,8 +221,9 @@ describe("device grant issuance", () => {
           projectId: identity.projectScope,
           deploymentId: identity.projectScope,
           sandboxId: "sandbox-789",
-          targetDeviceId: "comet-scaffold-sandbox-789",
-          sessionId: "session-456"
+          targetDeviceId: "comet-scaffold-sandbox-789-e1",
+          sessionId: "session-456",
+          lifecycleEpoch: 1
         })
       })
     );
@@ -225,8 +232,9 @@ describe("device grant issuance", () => {
       projectId: identity.projectScope,
       deploymentId: identity.projectScope,
       sandboxId: "sandbox-789",
-      targetDeviceId: "comet-scaffold-sandbox-789",
-      sessionId: "session-456"
+      targetDeviceId: "comet-scaffold-sandbox-789-e1",
+      sessionId: "session-456",
+      lifecycleEpoch: 1
     });
     expect(sessionChecks).toEqual([
       {
@@ -247,8 +255,9 @@ describe("device grant issuance", () => {
           projectId: identity.projectScope,
           deploymentId: identity.projectScope,
           sandboxId: "sandbox-789",
-          targetDeviceId: "comet-scaffold-sandbox-789",
+          targetDeviceId: "comet-scaffold-sandbox-789-e1",
           sessionId: "session-456",
+          lifecycleEpoch: 1,
           actor: { sub: identity.userId }
         }
       })
@@ -257,9 +266,37 @@ describe("device grant issuance", () => {
     const response = await handleAuthenticatedAuthRoute(
       request({
         sandboxId: "foreign-sandbox",
-        targetDeviceId: "comet-scaffold-foreign-sandbox",
-        sessionId: "stale-session"
+        targetDeviceId: "comet-scaffold-foreign-sandbox-e2",
+        sessionId: "stale-session",
+        lifecycleEpoch: 2
       }),
+      env,
+      new URL("https://comet.example/auth/device-grants"),
+      identity
+    );
+    expect(response?.status).toBe(403);
+    expect(records).toHaveLength(0);
+  });
+
+  it("rejects a grant request from an earlier sandbox lifecycle", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      Response.json({
+        ok: true,
+        profile: {
+          version: "scaffold.comet-runtime.v1",
+          projectId: identity.projectScope,
+          deploymentId: identity.projectScope,
+          sandboxId: "sandbox-789",
+          targetDeviceId: "comet-scaffold-sandbox-789-e2",
+          sessionId: "session-456",
+          lifecycleEpoch: 2,
+          actor: { sub: identity.userId }
+        }
+      })
+    );
+    const { env, records } = envAndRecords();
+    const response = await handleAuthenticatedAuthRoute(
+      request(),
       env,
       new URL("https://comet.example/auth/device-grants"),
       identity
@@ -280,8 +317,9 @@ describe("device grant issuance", () => {
           projectId: identity.projectScope,
           deploymentId: identity.projectScope,
           sandboxId: "sandbox-789",
-          targetDeviceId: "comet-scaffold-sandbox-789",
+          targetDeviceId: "comet-scaffold-sandbox-789-e1",
           sessionId: "session-456",
+          lifecycleEpoch: 1,
           actor: { sub: identity.userId }
         }
       })
@@ -313,8 +351,9 @@ describe("device grant issuance", () => {
           projectId: identity.projectScope,
           deploymentId: identity.projectScope,
           sandboxId: "sandbox-789",
-          targetDeviceId: "comet-scaffold-sandbox-789",
+          targetDeviceId: "comet-scaffold-sandbox-789-e1",
           sessionId: "session-456",
+          lifecycleEpoch: 1,
           user: { sub: identity.userId }
         }
       }

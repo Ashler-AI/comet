@@ -944,6 +944,7 @@ mod tests {
                 harness: HarnessId::Mock,
                 model: Some("mock-1".into()),
                 reasoning: None,
+                agent_account_id: None,
                 model_options: Default::default(),
                 sandbox: SandboxLevel::WorkspaceWrite,
             }),
@@ -1013,6 +1014,7 @@ mod tests {
             harness: HarnessId::ClaudeCode,
             model: Some("claude-fable-5".into()),
             reasoning: Some(comet_proto::ReasoningLevel::XHigh),
+            agent_account_id: None,
             model_options: options,
             sandbox: SandboxLevel::WorkspaceWrite,
         };

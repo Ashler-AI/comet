@@ -301,6 +301,7 @@ fn materialize_discovered(
         },
         model: candidate.model.clone(),
         reasoning: candidate.reasoning,
+        agent_account_id: None,
         model_options: serde_json::Map::new(),
         sandbox: SandboxLevel::WorkspaceWrite,
     };

@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.25"
+version = "0.1.39"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -63,6 +63,10 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures = "0.3"
 async-trait = "0.1"
 parking_lot = "0.12"
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 # serialization
 serde = { version = "1", features = ["derive"] }

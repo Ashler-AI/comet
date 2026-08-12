@@ -12,6 +12,7 @@ pub(crate) mod rpc;
 pub(crate) mod rpc_mode;
 
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::future::Future;
 use std::io::{BufRead as _, BufReader, Read as _};
 use std::path::{Path, PathBuf};
@@ -35,7 +36,7 @@ use comet_proto::{
     ToolCall, UserInputQuestion,
 };
 
-use crate::{Harness, HarnessError, RunControls};
+use crate::{Harness, HarnessError, InferenceRoute, RunControls};
 use rpc::{Incoming, RpcClient};
 
 const ACP_PROTOCOL_VERSION: i64 = 1;
@@ -51,6 +52,84 @@ const SCAFFOLD_PROFILE: &str = "scaffold-host";
 const AUTH_BROKER_URL_ENV: &str = "OMP_AUTH_BROKER_URL";
 const AUTH_BROKER_TOKEN_ENV: &str = "OMP_AUTH_BROKER_TOKEN";
 const AUTH_BROKER_TOKEN_FILE_ENV: &str = "OMP_AUTH_BROKER_TOKEN_FILE";
+const SCAFFOLD_INFERENCE_PROFILE_FILE: &str = "omp-inference/profile.json";
+const SCAFFOLD_INFERENCE_PROFILE_BYTES: u64 = 4 * 1024;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScaffoldInferenceProfile {
+    profile: String,
+    model: String,
+}
+
+fn scaffold_inference_model_at(
+    runtime_dir: &Path,
+    requested_model: Option<&str>,
+) -> Result<String, HarnessError> {
+    let path = runtime_dir.join(SCAFFOLD_INFERENCE_PROFILE_FILE);
+    let metadata = std::fs::symlink_metadata(&path)?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() == 0
+        || metadata.len() > SCAFFOLD_INFERENCE_PROFILE_BYTES
+    {
+        return Err(HarnessError::Protocol(
+            "Scaffold OMP inference profile is not a bounded regular file".into(),
+        ));
+    }
+    let profile: ScaffoldInferenceProfile =
+        serde_json::from_slice(&std::fs::read(path)?).map_err(|error| {
+            HarnessError::Protocol(format!("invalid Scaffold OMP inference profile: {error}"))
+        })?;
+    if profile.profile != SCAFFOLD_PROFILE
+        || profile.model.len() > 256
+        || profile.model.chars().any(char::is_whitespace)
+    {
+        return Err(HarnessError::Protocol(
+            "Scaffold OMP inference profile has an invalid model binding".into(),
+        ));
+    }
+    let (requested_provider, requested_model) = requested_model
+        .and_then(|model| model.rsplit_once('/'))
+        .filter(|(provider, model)| !provider.is_empty() && !model.is_empty())
+        .ok_or_else(|| {
+            HarnessError::Protocol(
+                "Scaffold OMP runs require a provider-qualified model selection".into(),
+            )
+        })?;
+    let routed_provider = match requested_provider {
+        "openai-codex" => "scaffold-openai",
+        "anthropic" => "scaffold-anthropic",
+        _ => {
+            return Err(HarnessError::Protocol(
+                "Scaffold OMP inference profile does not match the requested model".into(),
+            ));
+        }
+    };
+    let (profile_provider, routed_model) = profile.model.rsplit_once('/').ok_or_else(|| {
+        HarnessError::Protocol("Scaffold OMP inference profile has an invalid model binding".into())
+    })?;
+    if profile_provider != routed_provider || requested_model != routed_model {
+        return Err(HarnessError::Protocol(
+            "Scaffold OMP inference profile does not match the requested model".into(),
+        ));
+    }
+    Ok(profile.model)
+}
+
+fn configure_scaffold_inference_profile(
+    command: &mut Command,
+    requested_model: Option<&str>,
+) -> Result<(), HarnessError> {
+    let runtime_dir = std::env::var_os("SCAFFOLD_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            HarnessError::Protocol("SCAFFOLD_RUNTIME_DIR is required for Scaffold OMP".into())
+        })?;
+    let model = scaffold_inference_model_at(&runtime_dir, requested_model)?;
+    command.args(["--model", &model]);
+    Ok(())
+}
 
 const OMP_SESSION_DIRECTORY_SCAN_LIMIT: usize = 10_000;
 const OMP_SESSION_HEADER_BYTES: u64 = 64 * 1024;
@@ -264,6 +343,36 @@ fn omp_session_dirs(scaffold_host: bool) -> Vec<PathBuf> {
     dirs
 }
 
+fn omp_agent_dir(scaffold_host: bool) -> PathBuf {
+    omp_session_dirs(scaffold_host)
+        .into_iter()
+        .next()
+        .and_then(|sessions| sessions.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from(".omp/agent"))
+}
+
+fn configure_inference_gateway(
+    command: &mut Command,
+    agent_dir: &Path,
+    inference: &InferenceRoute,
+) -> Result<(), HarnessError> {
+    let provider = crate::auth_gateway::provider(&inference.provider).ok_or_else(|| {
+        HarnessError::Protocol(format!(
+            "unsupported shared inference provider: {}",
+            inference.provider
+        ))
+    })?;
+    if let Some(extension) = crate::auth_gateway::install_extension(agent_dir)? {
+        command.arg("--extension").arg(extension);
+    }
+    let model = inference
+        .model
+        .rsplit_once('/')
+        .map_or(inference.model.as_str(), |(_, model)| model);
+    command.args(["--model", &format!("{provider}/{model}")]);
+    Ok(())
+}
+
 fn session_file_has_id(path: &Path, session_id: &str) -> bool {
     let Ok(file) = std::fs::File::open(path) else {
         return false;
@@ -362,10 +471,28 @@ pub fn installed_executable() -> Option<PathBuf> {
     resolve_omp_executable()
 }
 
+#[derive(Clone, Default)]
+struct AuthBrokerEnvironment {
+    url: Option<OsString>,
+    token: Option<OsString>,
+    token_file: Option<OsString>,
+}
+
+impl AuthBrokerEnvironment {
+    fn from_process() -> Self {
+        Self {
+            url: std::env::var_os(AUTH_BROKER_URL_ENV),
+            token: std::env::var_os(AUTH_BROKER_TOKEN_ENV),
+            token_file: std::env::var_os(AUTH_BROKER_TOKEN_FILE_ENV),
+        }
+    }
+}
+
 fn propagate_auth_broker_environment(
     command: &mut Command,
     scaffold_host: bool,
     include_token: bool,
+    environment: &AuthBrokerEnvironment,
 ) {
     command.env_remove(AUTH_BROKER_TOKEN_FILE_ENV);
     if scaffold_host {
@@ -383,7 +510,7 @@ fn propagate_auth_broker_environment(
     if !include_token {
         command.env_remove(AUTH_BROKER_TOKEN_ENV);
     }
-    if let Some(url) = std::env::var_os(AUTH_BROKER_URL_ENV).filter(|value| !value.is_empty()) {
+    if let Some(url) = environment.url.as_ref().filter(|value| !value.is_empty()) {
         command.env(AUTH_BROKER_URL_ENV, url);
     }
     if !include_token {
@@ -393,13 +520,15 @@ fn propagate_auth_broker_environment(
     // must never accept that long-lived credential and can use only its
     // single-use token file projection.
     if !scaffold_host
-        && let Some(token) =
-            std::env::var_os(AUTH_BROKER_TOKEN_ENV).filter(|value| !value.is_empty())
+        && let Some(token) = environment.token.as_ref().filter(|value| !value.is_empty())
     {
         command.env(AUTH_BROKER_TOKEN_ENV, token);
         return;
     }
-    let Some(path) = std::env::var_os(AUTH_BROKER_TOKEN_FILE_ENV).filter(|value| !value.is_empty())
+    let Some(path) = environment
+        .token_file
+        .as_ref()
+        .filter(|value| !value.is_empty())
     else {
         return;
     };
@@ -407,7 +536,7 @@ fn propagate_auth_broker_environment(
     // single-use file so supervisors never place the bearer in argv or their
     // long-lived environment. Remove it before parsing or spawning on every
     // outcome, including malformed content and permission failures.
-    let metadata = std::fs::symlink_metadata(&path);
+    let metadata = std::fs::symlink_metadata(path);
     let bytes = metadata.as_ref().ok().and_then(|metadata| {
         if !metadata.is_file() || metadata.len() > 16 * 1024 {
             return None;
@@ -419,9 +548,9 @@ fn propagate_auth_broker_environment(
                 return None;
             }
         }
-        std::fs::read(&path).ok()
+        std::fs::read(path).ok()
     });
-    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path);
     if let Some(token) = bytes
         .as_deref()
         .and_then(|bytes| std::str::from_utf8(bytes).ok())
@@ -438,6 +567,7 @@ pub struct OmpHarness {
     interrupt_grace: Duration,
     session_dirs: Option<Vec<PathBuf>>,
     session_writer_probe: Option<PathBuf>,
+    auth_broker_environment: Option<AuthBrokerEnvironment>,
 }
 
 impl Default for OmpHarness {
@@ -448,6 +578,7 @@ impl Default for OmpHarness {
             interrupt_grace: Duration::from_secs(3),
             session_dirs: None,
             session_writer_probe: None,
+            auth_broker_environment: None,
         }
     }
 }
@@ -466,6 +597,12 @@ impl OmpHarness {
 
     pub fn with_executable(mut self, executable: impl Into<PathBuf>) -> Self {
         self.executable = Some(executable.into());
+        self
+    }
+
+    #[cfg(test)]
+    fn with_auth_broker_environment(mut self, environment: AuthBrokerEnvironment) -> Self {
+        self.auth_broker_environment = Some(environment);
         self
     }
 
@@ -544,10 +681,15 @@ impl OmpHarness {
     ) -> Command {
         let mut command = Command::new(executable);
         crate::compose_child_path(&mut command, executable);
+        let auth_broker_environment = self
+            .auth_broker_environment
+            .clone()
+            .unwrap_or_else(AuthBrokerEnvironment::from_process);
         propagate_auth_broker_environment(
             &mut command,
             self.scaffold_host,
             include_auth_broker_token,
+            &auth_broker_environment,
         );
         if !cwd.is_empty() {
             command.current_dir(cwd);
@@ -588,7 +730,9 @@ impl OmpHarness {
     /// in-band configure stage.
     fn run_command(&self, executable: &Path, request: &RunRequest) -> Command {
         let mut command = self.rpc_mode_command(executable, &request.cwd, true);
-        if let Some(model) = request.model.as_deref().filter(|model| *model != "default") {
+        if !self.scaffold_host
+            && let Some(model) = request.model.as_deref().filter(|model| *model != "default")
+        {
             command.args(["--model", model]);
         }
         if let Some(reasoning) = request.reasoning {
@@ -859,6 +1003,19 @@ impl Harness for OmpHarness {
         self.ensure_resume_has_no_writer(request.resume.as_deref())?;
         let mut command = self.run_command(&executable, &request);
         crate::apply_run_context(&mut command, controls.context.as_ref());
+        if let Some(inference) = controls
+            .context
+            .as_ref()
+            .and_then(|context| context.inference.as_ref())
+        {
+            configure_inference_gateway(
+                &mut command,
+                &omp_agent_dir(self.scaffold_host),
+                inference,
+            )?;
+        } else if self.scaffold_host {
+            configure_scaffold_inference_profile(&mut command, request.model.as_deref())?;
+        }
         let mut child = command.spawn().map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 HarnessError::NotInstalled(executable.display().to_string())
@@ -1869,18 +2026,10 @@ mod tests {
         );
     }
 
-    /// Serializes tests that interact through the process-global
-    /// `OMP_AUTH_BROKER_*` variables: `propagate_auth_broker_environment`
-    /// consumes (deletes) the single-use token file, so a builder call from a
-    /// parallel test inside the broker test's env window steals its token.
-    static BROKER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn scaffold_command_invokes_only_omp_rpc_mode_with_hardening() {
-        let _guard = BROKER_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let harness = OmpHarness::scaffold_host();
+        let harness = OmpHarness::scaffold_host()
+            .with_auth_broker_environment(AuthBrokerEnvironment::default());
         let command = harness.rpc_mode_command(Path::new("/usr/local/bin/omp"), "/workspace", true);
         let args: Vec<String> = command
             .as_std()
@@ -1911,6 +2060,7 @@ mod tests {
         RunRequest {
             prompt: "test".into(),
             model: None,
+            agent_account_id: None,
             reasoning: None,
             model_options: serde_json::Map::new(),
             cwd: "/workspace".into(),
@@ -1964,10 +2114,85 @@ mod tests {
     }
 
     #[test]
+    fn shared_inference_uses_an_explicit_gateway_extension_and_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut request = run_request(None);
+        request.model = Some("gpt-5.6-sol".into());
+        let mut command =
+            OmpHarness::scaffold_host().run_command(Path::new("/usr/local/bin/omp"), &request);
+        configure_inference_gateway(
+            &mut command,
+            temp.path(),
+            &InferenceRoute {
+                base_url: "http://127.0.0.1:41234".into(),
+                token: "local-inference-token".into(),
+                provider: "openai".into(),
+                model: "gpt-5.6-sol".into(),
+            },
+        )
+        .unwrap();
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        let extension = temp.path().join("comet-runtime/agent-auth-gateway.ts");
+        assert!(extension.is_file());
+        assert!(args.windows(2).any(|pair| {
+            pair == [
+                "--extension".to_string(),
+                extension.to_string_lossy().into_owned(),
+            ]
+        }));
+        assert_eq!(
+            &args[args.len() - 2..],
+            ["--model", "comet-openai/gpt-5.6-sol"]
+        );
+    }
+
+    #[test]
+    fn scaffold_inference_profile_pins_the_scoped_model() {
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let profile_dir = runtime_dir.path().join("omp-inference");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(
+            profile_dir.join("profile.json"),
+            r#"{"profile":"scaffold-host","model":"scaffold-openai/gpt-5.6-sol"}"#,
+        )
+        .unwrap();
+
+        let model =
+            scaffold_inference_model_at(runtime_dir.path(), Some("openai-codex/gpt-5.6-sol"))
+                .unwrap();
+
+        assert_eq!(model, "scaffold-openai/gpt-5.6-sol");
+        assert!(
+            scaffold_inference_model_at(runtime_dir.path(), Some("openai-codex/gpt-5.6-terra"),)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
+
+        std::fs::write(
+            profile_dir.join("profile.json"),
+            r#"{"profile":"scaffold-host","model":"scaffold-anthropic/claude-opus-4-1"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            scaffold_inference_model_at(runtime_dir.path(), Some("anthropic/claude-opus-4-1"),)
+                .unwrap(),
+            "scaffold-anthropic/claude-opus-4-1"
+        );
+        assert!(
+            scaffold_inference_model_at(runtime_dir.path(), Some("openai-codex/claude-opus-4-1"),)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
+    }
+
+    #[test]
     fn broker_configuration_is_environment_only_and_scaffold_stays_isolated() {
-        let _guard = BROKER_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = tempfile::tempdir().unwrap();
         let token_file = temp.path().join("broker.token");
         std::fs::write(&token_file, "super-secret-token\n").unwrap();
@@ -1976,13 +2201,14 @@ mod tests {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
-        unsafe {
-            std::env::set_var(AUTH_BROKER_URL_ENV, "https://broker.example.test");
-            std::env::set_var(AUTH_BROKER_TOKEN_ENV, "workstation-token-must-not-leak");
-            std::env::set_var(AUTH_BROKER_TOKEN_FILE_ENV, &token_file);
-        }
-        let catalog_command = OmpHarness::scaffold_host()
-            .command_catalog_command(Path::new("/usr/local/bin/omp"), "/workspace");
+        let harness =
+            OmpHarness::scaffold_host().with_auth_broker_environment(AuthBrokerEnvironment {
+                url: Some("https://broker.example.test".into()),
+                token: Some("workstation-token-must-not-leak".into()),
+                token_file: Some(token_file.clone().into_os_string()),
+            });
+        let catalog_command =
+            harness.command_catalog_command(Path::new("/usr/local/bin/omp"), "/workspace");
         let catalog_process = catalog_command.as_std();
         assert!(catalog_process.get_envs().any(|(key, value)| {
             key == std::ffi::OsStr::new(AUTH_BROKER_TOKEN_ENV) && value.is_none()
@@ -1995,11 +2221,7 @@ mod tests {
             "command discovery must preserve the token for the persistent RPC child"
         );
 
-        let command = OmpHarness::scaffold_host().rpc_mode_command(
-            Path::new("/usr/local/bin/omp"),
-            "/workspace",
-            true,
-        );
+        let command = harness.rpc_mode_command(Path::new("/usr/local/bin/omp"), "/workspace", true);
         let process = command.as_std();
         let args: Vec<_> = process
             .get_args()
@@ -2059,12 +2281,13 @@ mod tests {
             std::fs::set_permissions(&insecure_file, std::fs::Permissions::from_mode(0o644))
                 .unwrap();
         }
-        unsafe { std::env::set_var(AUTH_BROKER_TOKEN_FILE_ENV, &insecure_file) };
-        let insecure = OmpHarness::scaffold_host().rpc_mode_command(
-            Path::new("/usr/local/bin/omp"),
-            "/workspace",
-            true,
-        );
+        let insecure = OmpHarness::scaffold_host()
+            .with_auth_broker_environment(AuthBrokerEnvironment {
+                url: Some("https://broker.example.test".into()),
+                token: Some("workstation-token-must-not-leak".into()),
+                token_file: Some(insecure_file.clone().into_os_string()),
+            })
+            .rpc_mode_command(Path::new("/usr/local/bin/omp"), "/workspace", true);
         assert!(insecure.as_std().get_envs().any(|(key, value)| {
             key == std::ffi::OsStr::new(AUTH_BROKER_TOKEN_ENV) && value.is_none()
         }));
@@ -2072,11 +2295,6 @@ mod tests {
             !insecure_file.exists(),
             "rejected token files must still be removed"
         );
-        unsafe {
-            std::env::remove_var(AUTH_BROKER_URL_ENV);
-            std::env::remove_var(AUTH_BROKER_TOKEN_ENV);
-            std::env::remove_var(AUTH_BROKER_TOKEN_FILE_ENV);
-        }
     }
 
     #[test]

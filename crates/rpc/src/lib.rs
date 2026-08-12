@@ -79,6 +79,9 @@ pub mod methods {
     /// This engine's identity → `{deviceId}` (IPC-only; never relay-forwarded —
     /// the answer is about whichever engine you are directly connected to).
     pub const LOCAL_DEVICE: &str = "LocalDevice";
+    /// Non-secret edge grant metadata for a deployment-bound Scaffold host.
+    /// IPC-only; local controllers use it to reuse an already-running host.
+    pub const SCAFFOLD_HOST_AUTHORITY: &str = "ScaffoldHostAuthority";
     pub const AUTH_STATUS: &str = "AuthStatus";
     // AuthRpc mutations (feature-inventory §2 AuthRpc; IPC-only).
     pub const SIGN_IN: &str = "SignIn";
@@ -107,14 +110,16 @@ pub mod methods {
     /// Checkout-diff stream for the target device's chats (DataRpc,
     /// relay-forwardable — diffs are produced where the checkout lives).
     pub const WATCH_CHECKOUT_DIFFS: &str = "WatchCheckoutDiffs";
-    // Agent accounts (ControlRpc, relay-forwardable — CLI logins are per-device).
+    // Shared Agent Auth account pool (ControlRpc, never device-targeted).
     pub const LIST_AGENT_ACCOUNTS: &str = "ListAgentAccounts";
-    pub const ACTIVATE_AGENT_ACCOUNT: &str = "ActivateAgentAccount";
-    pub const FORGET_AGENT_ACCOUNT: &str = "ForgetAgentAccount";
+    pub const MIGRATE_AGENT_ACCOUNT: &str = "MigrateAgentAccount";
+    pub const REVOKE_AGENT_ACCOUNT: &str = "RevokeAgentAccount";
     pub const START_AGENT_LOGIN: &str = "StartAgentLogin";
     pub const COMPLETE_AGENT_LOGIN: &str = "CompleteAgentLogin";
     pub const POLL_AGENT_LOGIN: &str = "PollAgentLogin";
     pub const CANCEL_AGENT_LOGIN: &str = "CancelAgentLogin";
+    /// Owner-scoped attribution for the account that handled a logical session.
+    pub const GET_AGENT_ROUTE_RECEIPT: &str = "GetAgentRouteReceipt";
     /// Read and update OMP's device-local advisor settings.
     pub const GET_OMP_ADVISOR_CONFIG: &str = "GetOmpAdvisorConfig";
     pub const SET_OMP_ADVISOR_CONFIG: &str = "SetOmpAdvisorConfig";
@@ -153,6 +158,12 @@ pub struct SessionRefParams {
 #[serde(rename_all = "camelCase")]
 pub struct RemoveSessionRefResult {
     pub removed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct GetAgentRouteReceiptParams {
+    pub logical_session_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

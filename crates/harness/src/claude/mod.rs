@@ -755,6 +755,7 @@ mod tests {
         let request = RunRequest {
             prompt: "test".into(),
             model: None,
+            agent_account_id: None,
             reasoning: None,
             model_options: serde_json::Map::new(),
             cwd: String::new(),

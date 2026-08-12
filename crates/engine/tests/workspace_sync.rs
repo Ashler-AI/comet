@@ -175,6 +175,7 @@ fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
         prompt: prompt.into(),
         model: None,
+        agent_account_id: None,
         reasoning: None,
         model_options: Default::default(),
         cwd: "/tmp".into(),
@@ -594,6 +595,7 @@ async fn chat_config_selects_the_run_harness() {
                 harness: HarnessId::Codex,
                 model: None,
                 reasoning: None,
+                agent_account_id: None,
                 model_options: Default::default(),
                 sandbox: SandboxLevel::WorkspaceWrite,
             }),

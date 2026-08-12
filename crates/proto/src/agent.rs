@@ -178,6 +178,10 @@ const fn default_auto_approve() -> bool {
 pub struct RunRequest {
     pub prompt: String,
     pub model: Option<String>,
+    /// Opaque Agent Auth account selection. `None` requests automatic routing;
+    /// this is never a provider token or refresh credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_account_id: Option<String>,
     pub reasoning: Option<ReasoningLevel>,
     /// Harness-specific option selections (option id -> choice id), JSON round-tripped.
     #[serde(default)]
@@ -453,6 +457,33 @@ mod tests {
         let round: RunRequest =
             serde_json::from_value(serde_json::to_value(&req).unwrap()).unwrap();
         assert_eq!(round.attachments, vec!["/tmp/a.png".to_string()]);
+    }
+
+    #[test]
+    fn run_request_serializes_only_an_opaque_pinned_account_selection() {
+        let old = r#"{"prompt":"p","model":"gpt-5.6-sol","reasoning":null,"cwd":".","sandbox":"workspace-write","resume":null}"#;
+        let automatic: RunRequest = serde_json::from_str(old).unwrap();
+        assert_eq!(automatic.agent_account_id, None);
+        assert!(
+            serde_json::to_value(&automatic)
+                .unwrap()
+                .get("agentAccountId")
+                .is_none()
+        );
+
+        let pinned = RunRequest {
+            agent_account_id: Some("opaque-account-id".into()),
+            ..automatic
+        };
+        let value = serde_json::to_value(&pinned).unwrap();
+        assert_eq!(value["agentAccountId"], "opaque-account-id");
+        assert_eq!(
+            serde_json::from_value::<RunRequest>(value)
+                .unwrap()
+                .agent_account_id
+                .as_deref(),
+            Some("opaque-account-id")
+        );
     }
 
     #[test]

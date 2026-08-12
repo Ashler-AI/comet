@@ -16,6 +16,7 @@ pub mod agent_accounts;
 pub mod auth;
 pub mod diff_sync;
 pub mod doc_host;
+mod inference_relay;
 pub mod instance_lock;
 pub mod local_sessions;
 pub mod omp_session_artifact;
@@ -111,6 +112,7 @@ pub struct DeviceBootstrapConfig {
     pub deployment_id: String,
     pub session_id: String,
     pub device_id: String,
+    pub lifecycle_epoch: u64,
     pub sandbox_id: String,
 }
 
@@ -122,6 +124,7 @@ impl std::fmt::Debug for DeviceBootstrapConfig {
             .field("deployment_id", &self.deployment_id)
             .field("session_id", &self.session_id)
             .field("device_id", &self.device_id)
+            .field("lifecycle_epoch", &self.lifecycle_epoch)
             .field("sandbox_id", &self.sandbox_id)
             .finish()
     }
@@ -260,7 +263,11 @@ impl EngineCore {
                 platform: std::env::consts::OS.to_string(),
                 project_scope: context.project_scope.to_string(),
                 user_id: context.user_id.to_string(),
-                edge: edge.clone(),
+                edge: context
+                    .runtime_profile
+                    .allows_workspace_room()
+                    .then(|| edge.clone())
+                    .flatten(),
             },
         )?;
         doc_host.set_workspace(workspace.clone());
@@ -313,6 +320,7 @@ impl EngineCore {
 
     /// Attach the auth service (before building the RPC service / relays).
     pub fn set_auth(&self, auth: Auth) {
+        self.sessions.set_auth(auth.clone());
         *self
             .auth
             .lock()
@@ -369,6 +377,7 @@ impl EngineCore {
     }
 
     pub fn set_scaffold_runtime(&self, scaffold: ScaffoldRuntime) {
+        self.agent_accounts.set_remote(scaffold.client());
         *self
             .scaffold
             .lock()
@@ -406,10 +415,13 @@ impl EngineCore {
             comet_rpc::HostRelayConfig::new(edge_url, self.device_id.clone(), Arc::new(auth));
         let nudge_host = self.doc_host.clone();
         let on_nudge: comet_rpc::NudgeHandler = Arc::new(move |chat_id: String| {
-            // Opening the doc joins its room + syncs; drain fires on the change
-            // subscription — the command executes with no standing per-chat socket.
-            match nudge_host.open(&chat_id) {
-                Ok(_) => tracing::info!(chat = %chat_id, "nudge: chat doc opened"),
+            // Scaffold hosts must not open the legacy unprojected room while
+            // the verified grant frame is still in flight.
+            match nudge_host.open_for_nudge(&chat_id) {
+                Ok(Some(_)) => tracing::info!(chat = %chat_id, "nudge: chat doc opened"),
+                Ok(None) => {
+                    tracing::info!(chat = %chat_id, "nudge: waiting for verified room grant")
+                }
                 Err(err) => {
                     tracing::warn!(chat = %chat_id, error = %err, "nudge: open failed")
                 }
@@ -526,6 +538,7 @@ impl Engine {
             auth_config.expected_device_id = Some(bootstrap.device_id.clone());
             auth_config.expected_session_id = Some(bootstrap.session_id.clone());
             auth_config.expected_deployment_id = Some(bootstrap.deployment_id.clone());
+            auth_config.expected_lifecycle_epoch = Some(bootstrap.lifecycle_epoch);
             auth_config.expected_sandbox_id = Some(bootstrap.sandbox_id.clone());
         }
         if let Ok(scopes) = std::env::var("COMET_OAUTH_SCOPES")
@@ -596,6 +609,8 @@ impl Engine {
         {
             let bearer: Arc<dyn comet_rpc::TokenSource> = Arc::new(auth.clone());
             let client = ScaffoldClient::new(scaffold_url, project_scope.clone(), bearer.clone())?;
+            core.sessions
+                .set_inference_relay(inference_relay::InferenceRelay::start(client.clone())?);
             let grants = Arc::new(EdgeDeviceJoinGrantClient::new(&config.edge_url, bearer)?);
             core.set_scaffold_runtime(ScaffoldRuntime::new(
                 client,
@@ -668,7 +683,7 @@ impl Engine {
         std::fs::create_dir_all(&config.data_dir)?;
         if let Some(bootstrap) = &bootstrap {
             validate_device_bootstrap(&config, bootstrap)?;
-            persist_expected_device_id(&config.data_dir, &bootstrap.device_id)?;
+            persist_expected_device_id(&config.data_dir, bootstrap)?;
         }
         let auth = Self::build_auth_for(&config, bootstrap.as_ref()).await;
         if auth.device_mode() && auth.access_token().await.is_none() {
@@ -905,24 +920,45 @@ fn validate_device_bootstrap(
         || !valid_id(&bootstrap.session_id)
         || !valid_id(&bootstrap.device_id)
         || !valid_id(&bootstrap.sandbox_id)
-        || bootstrap.device_id != format!("comet-scaffold-{}", bootstrap.sandbox_id)
+        || bootstrap.lifecycle_epoch == 0
+        || bootstrap.device_id
+            != format!(
+                "comet-scaffold-{}-e{}",
+                bootstrap.sandbox_id, bootstrap.lifecycle_epoch
+            )
     {
         return Err(EngineError::Other("device_join_grant_unavailable".into()));
     }
     Ok(())
 }
 
-fn persist_expected_device_id(data_dir: &Path, expected: &str) -> Result<(), EngineError> {
+fn persist_expected_device_id(
+    data_dir: &Path,
+    bootstrap: &DeviceBootstrapConfig,
+) -> Result<(), EngineError> {
     let path = data_dir.join("device-id");
+    let expected = &bootstrap.device_id;
     match std::fs::read_to_string(&path) {
         Ok(existing) if existing.trim() == expected => Ok(()),
         Ok(existing) if existing.trim().is_empty() => {
             std::fs::write(path, expected)?;
             Ok(())
         }
-        Ok(_) => Err(EngineError::Other(
-            "sandbox device id does not match its join grant".into(),
-        )),
+        Ok(existing) => {
+            let epoch_prefix = format!("comet-scaffold-{}-e", bootstrap.sandbox_id);
+            let prior_epoch = existing
+                .trim()
+                .strip_prefix(&epoch_prefix)
+                .and_then(|value| value.parse::<u64>().ok());
+            if prior_epoch.is_some_and(|epoch| epoch < bootstrap.lifecycle_epoch) {
+                std::fs::write(path, expected)?;
+                Ok(())
+            } else {
+                Err(EngineError::Other(
+                    "sandbox device id does not match its join grant".into(),
+                ))
+            }
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             std::fs::write(path, expected)?;
             Ok(())
@@ -941,5 +977,51 @@ fn load_or_create_device_id(data_dir: &Path) -> Result<String, EngineError> {
             std::fs::write(&path, &id)?;
             Ok(id)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bootstrap(sandbox_id: &str, lifecycle_epoch: u64) -> DeviceBootstrapConfig {
+        DeviceBootstrapConfig {
+            device_join_grant: "cg1.test".to_string(),
+            project_id: "project".to_string(),
+            deployment_id: "deployment".to_string(),
+            session_id: "session".to_string(),
+            device_id: format!("comet-scaffold-{sandbox_id}-e{lifecycle_epoch}"),
+            lifecycle_epoch,
+            sandbox_id: sandbox_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn rotates_scaffold_device_id_for_a_newer_lifecycle_epoch() {
+        let dir = tempfile::tempdir().expect("temp data dir");
+        std::fs::write(dir.path().join("device-id"), "comet-scaffold-sandbox-1-e1")
+            .expect("seed device id");
+
+        persist_expected_device_id(dir.path(), &bootstrap("sandbox-1", 11))
+            .expect("rotate lifecycle-bound device id");
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("device-id")).expect("read device id"),
+            "comet-scaffold-sandbox-1-e11"
+        );
+    }
+
+    #[test]
+    fn rejects_device_id_rotation_across_sandboxes_or_to_an_older_epoch() {
+        let dir = tempfile::tempdir().expect("temp data dir");
+        let path = dir.path().join("device-id");
+        std::fs::write(&path, "comet-scaffold-sandbox-1-e12").expect("seed device id");
+
+        assert!(persist_expected_device_id(dir.path(), &bootstrap("sandbox-2", 13)).is_err());
+        assert!(persist_expected_device_id(dir.path(), &bootstrap("sandbox-1", 11)).is_err());
+        assert_eq!(
+            std::fs::read_to_string(path).expect("read device id"),
+            "comet-scaffold-sandbox-1-e12"
+        );
     }
 }

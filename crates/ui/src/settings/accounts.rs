@@ -1,16 +1,9 @@
-//! Settings → Agents / accounts (feature-inventory §1.9): provider cards
-//! (Claude Code, Codex) with account rows — email, plan badge, Active, usage
-//! meters (indigo → amber ≥80% → red ≥95%, reset time), Switch / Forget — plus
-//! the add-account dialogs (paste-code and browser-poll flows) and
-//! account-shaped loading skeletons, and the "Agent versions" section (agent
-//! CLI versions from the `UpdateStatus` stream, per-harness Update buttons,
-//! the update-agents-after-Comet-updates toggle). Comet retargets devices
-//! from the settings sidebar (`targetDeviceId` passthrough kept plumbed,
-//! unused single-device).
+//! Settings → Accounts: the shared Agent Auth pool grouped by Claude Code and
+//! Codex, with provider usage, one-time local migration, revoke, add-account
+//! login flows, and the existing agent-version controls.
 //!
-//! The accounts RPC surface is being implemented engine-side in parallel —
-//! every call here surfaces failures as inline UI states rather than assuming
-//! the methods exist.
+//! Agent Auth is authoritative. The page never activates a local account,
+//! manages credential slots, or targets another device.
 
 use chrono::{DateTime, Utc};
 use gpui::{
@@ -69,39 +62,6 @@ pub fn usage_color(level: UsageLevel, theme: &Theme) -> Hsla {
     }
 }
 
-/// Why a `ListAgentAccounts` load is happening. Pure input to
-/// [`force_usage_for`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LoadTrigger {
-    /// Page construction — the visit's first list.
-    Mount,
-    /// "Click to retry" after a failed load — still the visit's first
-    /// successful list.
-    Retry,
-    /// The explicit Refresh button.
-    Refresh,
-    /// After a completed add-account login flow.
-    PostLogin,
-    /// After Switch/Forget succeeds.
-    PostAction,
-}
-
-/// Whether a load should ask the engine to probe usage (`forceUsage`). The
-/// engine only hits the provider when forced; non-forced lists serve the 60s
-/// usage cache or nothing (engine/src/agent_accounts.rs module docs — the
-/// design expects the UI to force "on page mount/refresh"). The visit's first
-/// list (mount, or retry after a failure) must force, or every first open
-/// renders "Usage unavailable" until a manual Refresh — the old app fetched
-/// usage on every list. Post-Switch/Forget lists ride the still-warm cache.
-pub fn force_usage_for(trigger: LoadTrigger) -> bool {
-    match trigger {
-        LoadTrigger::Mount | LoadTrigger::Retry | LoadTrigger::Refresh | LoadTrigger::PostLogin => {
-            true
-        }
-        LoadTrigger::PostAction => false,
-    }
-}
-
 /// Compact absolute reset moment (comet settings.agents.tsx `formatReset`):
 /// a local clock time ("3:45 PM") when it lands within ~22h, else a short
 /// weekday ("Mon"); the caller prefixes "resets ". Pure given `now`.
@@ -116,25 +76,22 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
     })
 }
 
-/// The provider cards, in display order: (harness, name, CLI command — named
-/// in the empty-state copy, comet settings.agents.tsx `PROVIDERS`).
-pub const PROVIDERS: [(HarnessId, &str, &str); 2] = [
-    (HarnessId::ClaudeCode, "Claude Code", "claude"),
-    (HarnessId::Codex, "Codex", "codex"),
+/// Provider cards in display order.
+pub const PROVIDERS: [(HarnessId, &str); 2] = [
+    (HarnessId::ClaudeCode, "Anthropic"),
+    (HarnessId::Codex, "OpenAI"),
 ];
 
-/// Accounts of one provider, active first (stable otherwise). Pure.
+/// Accounts of one provider in authoritative server order. Pure.
 pub fn provider_accounts(
     snapshot: &AgentAccountsSnapshot,
     harness: HarnessId,
 ) -> Vec<&AgentAccount> {
-    let mut accounts: Vec<&AgentAccount> = snapshot
+    snapshot
         .accounts
         .iter()
-        .filter(|a| a.harness == harness)
-        .collect();
-    accounts.sort_by_key(|a| !a.active);
-    accounts
+        .filter(|account| account.harness == harness)
+        .collect()
 }
 
 /// "vX.Y.Z" — tolerate an already-prefixed version string. Pure.
@@ -202,7 +159,7 @@ enum LoginFlow {
 }
 
 impl LoginFlow {
-    /// Dialog title (comet: "Add Claude account" / "Add Codex account").
+    /// Dialog title for the provider account being added.
     fn title(&self) -> &'static str {
         let harness = match self {
             LoginFlow::Starting { harness }
@@ -210,25 +167,19 @@ impl LoginFlow {
             | LoginFlow::Browser { harness, .. } => *harness,
         };
         match harness {
-            HarnessId::Codex => "Add Codex account",
-            _ => "Add Claude account",
+            HarnessId::Codex => "Add OpenAI account",
+            _ => "Add Anthropic account",
         }
     }
 }
 
 pub struct AccountsPage {
     state: Entity<AppState>,
-    /// Which device's logins are shown; `None` = this device (no passthrough).
-    /// Retargeted by the page-header device switcher (comet parity: the
-    /// accounts RPCs are relay-forwardable, CLI logins are per-device).
-    target_device: Option<String>,
-    device_menu_open: bool,
-    /// Outside-click dismissal instant — suppresses the trigger click that
-    /// follows the same mouse-down from instantly reopening the menu.
-    device_menu_dismissed_at: Option<std::time::Instant>,
     snapshot: Loadable<AgentAccountsSnapshot>,
-    /// Account id with an in-flight Switch/Forget.
+    /// Account id with an in-flight migration or revoke.
     busy_account: Option<String>,
+    /// Shared account awaiting explicit removal confirmation.
+    pending_revoke: Option<AgentAccount>,
     login: Option<LoginFlow>,
     error: Option<SharedString>,
     code_input: Entity<ComposerInput>,
@@ -259,11 +210,9 @@ impl AccountsPage {
         });
         let mut page = Self {
             state,
-            target_device: None,
-            device_menu_open: false,
-            device_menu_dismissed_at: None,
             snapshot: Loadable::Idle,
             busy_account: None,
+            pending_revoke: None,
             login: None,
             error: None,
             code_input,
@@ -277,209 +226,20 @@ impl AccountsPage {
             _observe: observe,
             _code_events: code_events,
         };
-        // Force the usage probe on the visit's first list — a plain list
-        // returns no usage windows on a cold engine cache, which rendered
-        // every account as "Usage unavailable" until a manual Refresh. The
-        // Loading skeleton (meter ghosts) covers the probe latency, so
-        // "Usage unavailable" is reserved for a probe that genuinely failed.
-        page.load(force_usage_for(LoadTrigger::Mount), cx);
+        page.load(cx);
         page
     }
 
-    /// Retarget the page at another device's logins: every accounts RPC is
-    /// relay-forwardable, so the whole page — list, usage probes, switch,
-    /// forget, login flows — follows the passthrough.
-    fn set_target_device(&mut self, target: Option<String>, cx: &mut Context<Self>) {
-        self.device_menu_open = false;
-        if self.target_device == target {
-            cx.notify();
-            return;
-        }
-        self.target_device = target;
-        // A different device = a different accounts world: drop in-flight
-        // login/action state and reload with a forced usage probe (the new
-        // device's cache is cold).
-        self.login = None;
-        self.busy_account = None;
-        self.error = None;
-        self.load(force_usage_for(LoadTrigger::Mount), cx);
-    }
-
-    /// Params with the `targetDeviceId` passthrough merged in.
-    fn params(&self, value: serde_json::Value) -> serde_json::Value {
-        let mut value = value;
-        if let (Some(target), Some(object)) = (&self.target_device, value.as_object_mut()) {
-            object.insert("targetDeviceId".into(), serde_json::json!(target));
-        }
-        value
-    }
-
-    /// The page-header device switcher (comet device-switcher.tsx): a quiet
-    /// trigger — platform glyph · name · presence dot · sort glyph — opening a
-    /// dropdown of every registered device. Selecting one retargets the page.
-    fn render_device_switcher(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        use crate::icons::{self, icon};
-        let (mut devices, local_id) = {
-            let s = self.state.read(cx);
-            (s.devices.clone(), s.local_device_id.clone())
-        };
-        // Stable row order (registration time, then id) — comet's switcher
-        // sorts the same way so rows never reshuffle on heartbeats.
-        devices.sort_by(|a, b| {
-            a.created_at
-                .cmp(&b.created_at)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        let effective = self.target_device.clone().or_else(|| local_id.clone());
-        let selected = devices
-            .iter()
-            .find(|d| Some(d.id.as_str()) == effective.as_deref())
-            .cloned();
-        let platform_glyph = |platform: &str| match platform {
-            "macos" | "darwin" => icons::LAPTOP,
-            "ios" | "android" => icons::SMARTPHONE,
-            _ => icons::MONITOR,
-        };
-        let trigger_glyph = platform_glyph(
-            selected
-                .as_ref()
-                .map(|d| d.platform.as_str())
-                .unwrap_or("macos"),
-        );
-        let trigger_label: SharedString = selected
-            .as_ref()
-            .map(|d| d.name.clone().into())
-            .unwrap_or_else(|| SharedString::from("This device"));
-        let emerald = theme.success;
-        let open = self.device_menu_open;
-
-        let mut trigger =
-            div()
-                .id("accounts-device-switcher")
-                .flex_none()
-                .h(px(28.0))
-                .px(px(8.0))
-                .rounded(px(6.0))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(6.0))
-                .cursor_pointer()
-                .bg(if open {
-                    crate::theme::ink(0.06)
-                } else {
-                    gpui::transparent_black()
-                })
-                .when(!open, |el| el.hover(|s| s.bg(crate::theme::ink(0.04))))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    let just_dismissed = this
-                        .device_menu_dismissed_at
-                        .is_some_and(|at| at.elapsed() < Duration::from_millis(400));
-                    this.device_menu_open = !this.device_menu_open && !just_dismissed;
-                    this.device_menu_dismissed_at = None;
-                    cx.notify();
-                }))
-                .child(
-                    icon(trigger_glyph)
-                        .size(px(16.0))
-                        .flex_none()
-                        .text_color(theme.text_muted),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(px(12.5))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme.text)
-                        .child(trigger_label),
-                )
-                .child(div().size(px(6.0)).rounded_full().flex_none().bg(
-                    if effective == local_id {
-                        emerald
-                    } else {
-                        crate::theme::ink(0.2)
-                    },
-                ))
-                .child(
-                    icon(icons::SORT_VERTICAL)
-                        .size(px(14.0))
-                        .flex_none()
-                        .text_color(theme.text_muted.opacity(if open { 0.9 } else { 0.4 })),
-                );
-
-        if open {
-            let menu = popover::popover_card(theme)
-                .w(px(220.0))
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.device_menu_open = false;
-                    this.device_menu_dismissed_at = Some(std::time::Instant::now());
-                    cx.notify();
-                }))
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .child(popover::menu_heading(theme, "Devices"))
-                .children(devices.into_iter().enumerate().map(|(ix, d)| {
-                    let is_active = Some(d.id.as_str()) == effective.as_deref();
-                    let is_local = local_id.as_deref() == Some(d.id.as_str());
-                    let glyph = platform_glyph(&d.platform);
-                    let name: SharedString = d.name.clone().into();
-                    let pick_local = is_local;
-                    let pick_id = d.id.clone();
-                    popover::menu_row(theme, is_active, format!("accounts-device-row-{ix}"))
-                        .id(("accounts-device-row", ix))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            // Local device = no passthrough (calls stay direct).
-                            let target = (!pick_local).then(|| pick_id.clone());
-                            this.set_target_device(target, cx);
-                        }))
-                        .child(
-                            icon(glyph)
-                                .size(px(16.0))
-                                .flex_none()
-                                .text_color(theme.text_muted),
-                        )
-                        .child(div().flex_1().min_w_0().truncate().child(name))
-                        .when(is_local, |el| {
-                            el.child(
-                                div()
-                                    .flex_none()
-                                    .text_size(px(10.5))
-                                    .text_color(theme.text_muted.opacity(0.35))
-                                    .child(SharedString::from("You")),
-                            )
-                        })
-                        .when(is_active, |el| el.child(popover::menu_check(theme)))
-                        .child(
-                            div()
-                                .size(px(6.0))
-                                .rounded_full()
-                                .flex_none()
-                                .bg(if is_local {
-                                    emerald
-                                } else {
-                                    crate::theme::ink(0.2)
-                                }),
-                        )
-                }))
-                .into_any_element();
-            trigger = trigger.child(popover::anchored_menu("accounts-device-menu", menu));
-        }
-        trigger.into_any_element()
-    }
-
-    fn load(&mut self, force_usage: bool, cx: &mut Context<Self>) {
+    fn load(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.snapshot = Loadable::Error("Engine not connected".into());
             return;
         };
         self.snapshot = Loadable::Loading;
-        let params = self.params(serde_json::json!({ "forceUsage": force_usage }));
         self.load_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
-                .call(methods::LIST_AGENT_ACCOUNTS, params)
+                .call(methods::LIST_AGENT_ACCOUNTS, serde_json::json!({}))
                 .await;
             this.update(cx, |page, cx| {
                 page.snapshot = match result {
@@ -496,30 +256,31 @@ impl AccountsPage {
         cx.notify();
     }
 
-    /// Switch / Forget an account.
+    /// Migrate a local recovery snapshot or revoke a shared account.
     fn account_action(
         &mut self,
         method: &'static str,
         account: &AgentAccount,
         cx: &mut Context<Self>,
     ) {
+        if self.busy_account.is_some() {
+            return;
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
         self.busy_account = Some(account.id.clone());
         self.error = None;
-        // Tolerant param shape: both `id` and `accountId` plus the harness.
-        let params = self.params(serde_json::json!({
-            "id": account.id,
+        let params = serde_json::json!({
             "accountId": account.id,
             "harness": account.harness,
-        }));
+        });
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine.client().call(method, params).await;
             this.update(cx, |page, cx| {
                 page.busy_account = None;
                 match result {
-                    Ok(_) => page.load(force_usage_for(LoadTrigger::PostAction), cx),
+                    Ok(_) => page.load(cx),
                     Err(err) => page.error = Some(format!("{err}").into()),
                 }
                 cx.notify();
@@ -527,6 +288,26 @@ impl AccountsPage {
             .ok();
         }));
         cx.notify();
+    }
+
+    fn request_revoke(&mut self, account: AgentAccount, cx: &mut Context<Self>) {
+        if self.busy_account.is_some() {
+            return;
+        }
+        self.pending_revoke = Some(account);
+        cx.notify();
+    }
+
+    fn cancel_revoke(&mut self, cx: &mut Context<Self>) {
+        self.pending_revoke = None;
+        cx.notify();
+    }
+
+    fn confirm_revoke(&mut self, cx: &mut Context<Self>) {
+        let Some(account) = self.pending_revoke.take() else {
+            return;
+        };
+        self.account_action(methods::REVOKE_AGENT_ACCOUNT, &account, cx);
     }
 
     // ---- add-account flows ----
@@ -537,7 +318,7 @@ impl AccountsPage {
         };
         self.login = Some(LoginFlow::Starting { harness });
         self.error = None;
-        let params = self.params(serde_json::json!({ "harness": harness }));
+        let params = serde_json::json!({ "harness": harness });
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -603,7 +384,7 @@ impl AccountsPage {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let params = self.params(serde_json::json!({ "loginId": login_id, "code": code }));
+        let params = serde_json::json!({ "loginId": login_id, "code": code });
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -613,7 +394,7 @@ impl AccountsPage {
                 match result {
                     Ok(_) => {
                         page.login = None;
-                        page.load(force_usage_for(LoadTrigger::PostLogin), cx);
+                        page.load(cx);
                     }
                     Err(err) => {
                         if let Some(LoginFlow::PasteCode {
@@ -641,7 +422,7 @@ impl AccountsPage {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let params = self.params(serde_json::json!({ "loginId": login_id }));
+        let params = serde_json::json!({ "loginId": login_id });
         self.poll_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -661,7 +442,7 @@ impl AccountsPage {
                         Some(poll) => match poll.status {
                             AgentLoginStatus::Done => {
                                 page.login = None;
-                                page.load(force_usage_for(LoadTrigger::PostLogin), cx);
+                                page.load(cx);
                                 cx.notify();
                                 true
                             }
@@ -711,7 +492,7 @@ impl AccountsPage {
         self.login = None;
         self.poll_task = None;
         if let (Some(login_id), Some(engine)) = (login_id, self.state.read(cx).engine().cloned()) {
-            let params = self.params(serde_json::json!({ "loginId": login_id }));
+            let params = serde_json::json!({ "loginId": login_id });
             self.action_task = Some(cx.spawn(async move |_, _| {
                 if let Err(err) = engine
                     .client()
@@ -857,9 +638,8 @@ impl AccountsPage {
             .into_any_element()
     }
 
-    /// One account row (comet settings.agents.tsx `AccountRow`): initial
-    /// avatar, email + usage meters left; badges over the Switch/Forget
-    /// actions right-anchored.
+    /// One account row: identity and usage left; plan/status badges and the
+    /// migrate or revoke action right-anchored.
     fn render_account_row(
         &self,
         account: &AgentAccount,
@@ -883,71 +663,53 @@ impl AccountsPage {
             .map(|c| c.to_uppercase().to_string())
             .unwrap_or_else(|| "?".into())
             .into();
-        let switch_account = account.clone();
-        let forget_account = account.clone();
+        let action_account = account.clone();
 
         let badges = div()
             .flex()
             .flex_row()
             .items_center()
             .gap(px(6.0))
-            .when(account.active, |el| {
-                el.child(widgets::badge_active(theme, "Active"))
+            .when(account.migration_available, |el| {
+                el.child(widgets::badge(theme, "Local"))
             })
             .when_some(account.plan_label.clone(), |el, plan| {
                 el.child(widgets::badge(theme, plan))
             });
 
-        // Actions only on INACTIVE accounts (comet `{!account.active && …}`):
-        // an icon-only Forget (trash, hover → foreground) then Switch, which
-        // reads "Switching…" while the activate round-trips.
-        let actions: Option<gpui::Div> = (!account.active).then(|| {
+        let actions = if account.migration_available {
+            let label = if is_busy { "Importing…" } else { "Import" };
+            crate::popover::btn_primary(theme, label)
+                .id(("account-import", ix))
+                .px(px(8.0))
+                .py(px(4.0))
+                .rounded(px(6.0))
+                .text_size(px(11.5))
+                .when(is_busy, |el| el.opacity(0.5))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.account_action(methods::MIGRATE_AGENT_ACCOUNT, &action_account, cx);
+                }))
+                .into_any_element()
+        } else {
             div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(4.0))
+                .id(("account-revoke", ix))
+                .rounded(px(6.0))
+                .px(px(6.0))
+                .py(px(4.0))
+                .text_color(theme.text_muted)
+                .cursor_pointer()
+                .when(is_busy, |el| el.opacity(0.5))
+                .hover(|s| s.bg(crate::theme::ink(0.06)).text_color(theme.text))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.request_revoke(action_account.clone(), cx);
+                }))
                 .child(
-                    div()
-                        .id(("account-forget", ix))
-                        .rounded(px(6.0))
-                        .px(px(6.0))
-                        .py(px(4.0))
-                        .text_color(theme.text_muted)
-                        .cursor_pointer()
-                        .when(is_busy, |el| el.opacity(0.5))
-                        .hover(|s| s.bg(crate::theme::ink(0.06)).text_color(theme.text))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.account_action(methods::FORGET_AGENT_ACCOUNT, &forget_account, cx);
-                        }))
-                        .child(
-                            crate::icons::icon(crate::icons::TRASH_BIN_MINIMALISTIC)
-                                .size(px(14.0))
-                                .text_color(theme.text_muted),
-                        ),
+                    crate::icons::icon(crate::icons::TRASH_BIN_MINIMALISTIC)
+                        .size(px(14.0))
+                        .text_color(theme.text_muted),
                 )
-                .when(account.switchable, |el| {
-                    el.child(
-                        crate::popover::btn_primary(
-                            theme,
-                            if is_busy { "Switching…" } else { "Switch" },
-                        )
-                        .id(("account-switch", ix))
-                        .px(px(8.0))
-                        .py(px(4.0))
-                        .rounded(px(6.0))
-                        .text_size(px(11.5))
-                        .when(is_busy, |el| el.opacity(0.5))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.account_action(
-                                methods::ACTIVATE_AGENT_ACCOUNT,
-                                &switch_account,
-                                cx,
-                            );
-                        })),
-                    )
-                })
-        });
+                .into_any_element()
+        };
 
         div()
             .px(px(20.0))
@@ -983,8 +745,6 @@ impl AccountsPage {
                     .flex_col()
                     .child(widgets::row_title(theme, email))
                     .map(|el| {
-                        // Meters XOR the quiet fallback line — never both
-                        // (comet: `usage ? meters : "Usage unavailable"…`).
                         if account.usage_windows.is_empty() {
                             el.child(
                                 div()
@@ -992,10 +752,10 @@ impl AccountsPage {
                                     .truncate()
                                     .text_size(px(11.5))
                                     .text_color(theme.text_muted.opacity(0.6))
-                                    .child(SharedString::from(if account.switchable {
-                                        "Usage unavailable"
+                                    .child(SharedString::from(if account.migration_available {
+                                        "Ready to import"
                                     } else {
-                                        "Credentials unavailable"
+                                        "Usage unavailable"
                                     })),
                             )
                         } else {
@@ -1019,9 +779,44 @@ impl AccountsPage {
                     .justify_between()
                     .gap(px(8.0))
                     .child(badges)
-                    .children(actions),
+                    .child(actions),
             )
             .into_any_element()
+    }
+
+    fn render_revoke_dialog(
+        &mut self,
+        viewport: gpui::Size<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        self.pending_revoke.as_ref()?;
+        let theme = Theme::of(cx).clone();
+        let card = popover::dialog_card(&theme)
+            .child(popover::dialog_title(&theme, "Remove this account?"))
+            .child(div().mt(px(6.0)).child(popover::dialog_body(
+                &theme,
+                "New turns will stop using it immediately.",
+            )))
+            .child(
+                div()
+                    .mt(px(16.0))
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap(px(8.0))
+                    .child(
+                        popover::btn_ghost(&theme, "Cancel", "account-revoke-cancel")
+                            .id("account-revoke-cancel")
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel_revoke(cx))),
+                    )
+                    .child(
+                        popover::btn_danger(&theme, "Remove")
+                            .id("account-revoke-confirm")
+                            .on_click(cx.listener(|this, _, _, cx| this.confirm_revoke(cx))),
+                    ),
+            )
+            .into_any_element();
+        Some(popover::modal("remove-account-dialog", viewport, card))
     }
 
     fn render_login_dialog(
@@ -1074,9 +869,8 @@ impl AccountsPage {
                     .flex_col()
                     .child(div().mt(px(8.0)).child(popover::dialog_body(
                         &theme,
-                        "A browser window opened. Sign in to the account you want to add, \
-                         approve access, then paste the code Anthropic shows you below. Your \
-                         current login is untouched until you switch.",
+                        "Sign in to the account you want to add, approve access, then paste the \
+                         code from Anthropic. Your current CLI login stays unchanged.",
                     )))
                     .child(url_link(
                         "login-open-url",
@@ -1140,9 +934,8 @@ impl AccountsPage {
                     .flex_col()
                     .child(div().mt(px(8.0)).child(popover::dialog_body(
                         &theme,
-                        "Finish signing in to OpenAI in your browser. The new login is \
-                         captured in an isolated profile — your current session is untouched \
-                         until you switch.",
+                        "Finish signing in to OpenAI. The account is added to the shared pool; \
+                         your current CLI login stays unchanged.",
                     )))
                     .child(url_link(
                         "login-open-url-browser",
@@ -1506,11 +1299,6 @@ impl AccountsPage {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         use crate::settings::widgets;
-        // Local device only: the UpdateStatus stream subscribed at bootstrap
-        // is the local engine's, so a retargeted page would show stale facts.
-        if self.target_device.is_some() {
-            return None;
-        }
         let update = self.state.read(cx).update.clone()?;
         if update.harnesses.is_empty() {
             return None;
@@ -1549,7 +1337,11 @@ impl Render for AccountsPage {
         use crate::settings::widgets;
         let theme = Theme::of(cx).clone();
         let now = Utc::now();
-        let dialog = self.render_login_dialog(window.viewport_size(), cx);
+        let dialog = if self.pending_revoke.is_some() {
+            self.render_revoke_dialog(window.viewport_size(), cx)
+        } else {
+            self.render_login_dialog(window.viewport_size(), cx)
+        };
         let refreshing = matches!(self.snapshot, Loadable::Loading);
         let account_count = self
             .snapshot
@@ -1587,7 +1379,7 @@ impl Render for AccountsPage {
         let sections: Vec<AnyElement> = match &self.snapshot {
             Loadable::Idle | Loadable::Loading => PROVIDERS
                 .into_iter()
-                .map(|(harness, name, _cli)| {
+                .map(|(harness, name)| {
                     let skeleton_id = match harness {
                         HarnessId::Codex => "accounts-skeleton-codex",
                         _ => "accounts-skeleton-claude",
@@ -1640,10 +1432,7 @@ impl Render for AccountsPage {
                     widgets::error_strip(&theme, message)
                         .id("accounts-load-error")
                         .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            // Retry IS the visit's first successful list — force usage.
-                            this.load(force_usage_for(LoadTrigger::Retry), cx)
-                        }))
+                        .on_click(cx.listener(|this, _, _, cx| this.load(cx)))
                         .child(
                             div()
                                 .mt(px(4.0))
@@ -1658,7 +1447,7 @@ impl Render for AccountsPage {
                 let snapshot = snapshot.clone();
                 PROVIDERS
                     .into_iter()
-                    .map(|(harness, name, cli)| {
+                    .map(|(harness, name)| {
                         let accounts = provider_accounts(&snapshot, harness);
                         // EVERY warning renders its own strip (comet maps them).
                         let warnings: Vec<String> = snapshot
@@ -1684,10 +1473,7 @@ impl Render for AccountsPage {
                                     .text_center()
                                     .text_size(px(14.0))
                                     .text_color(theme.text_muted.opacity(0.6))
-                                    .child(SharedString::from(format!(
-                                        "No {name} login detected on this device — sign in \
-                                         with \u{201C}{cli}\u{201D} or add an account."
-                                    ))),
+                                    .child(SharedString::from(format!("No {name} accounts."))),
                             )
                         } else {
                             card.children(rows)
@@ -1763,23 +1549,18 @@ impl Render for AccountsPage {
                                     .text_size(px(12.5))
                                     .hover(|s| widgets::ghost_hover(&theme, s))
                                     .when(refreshing, |el| el.opacity(0.5))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.load(force_usage_for(LoadTrigger::Refresh), cx)
-                                    }))
+                                    .on_click(cx.listener(|this, _, _, cx| this.load(cx)))
                                     .child(
                                         crate::icons::icon(crate::icons::REFRESH)
                                             .size(px(16.0))
                                             .text_color(theme.text_muted),
                                     )
                                     .child(SharedString::from("Refresh")),
-                            )
-                            .child(self.render_device_switcher(&theme, cx)),
+                            ),
                     )
                     .child(widgets::page_subtitle(
                         &theme,
-                        "The Claude Code and Codex logins on this device. Comet detects the \
-                         live session, keeps each account backed up, and can swap between \
-                         them.",
+                        "One account pool for local agents and Scaffold.",
                     ))
                     .when_some(self.error.clone(), |el, message| {
                         el.child(
@@ -1803,10 +1584,8 @@ impl Render for AccountsPage {
                             .line_height(px(19.0))
                             .text_color(theme.text_muted.opacity(0.6))
                             .child(SharedString::from(
-                                "Switching rewrites the CLI\u{2019}s stored login, so new \
-                                 agent sessions use the selected account immediately. On \
-                                 macOS, an already-running Claude Code can hold the previous \
-                                 login for up to ~30 seconds (Keychain cache).",
+                                "Accounts are encrypted centrally. Agents receive only short-lived, \
+                                 session-scoped grants.",
                             )),
                     ),
             )
@@ -1818,21 +1597,6 @@ impl Render for AccountsPage {
 mod tests {
     use super::*;
     use chrono::TimeDelta;
-
-    #[test]
-    fn first_load_of_a_visit_forces_the_usage_probe() {
-        // The engine only probes usage when forced (M5c); without forcing on
-        // mount, the first Accounts open always rendered "Usage unavailable".
-        assert!(force_usage_for(LoadTrigger::Mount));
-        // A retry after a failed load is still the visit's first successful
-        // list — same requirement.
-        assert!(force_usage_for(LoadTrigger::Retry));
-        // Explicit refresh and a just-completed login always re-probe.
-        assert!(force_usage_for(LoadTrigger::Refresh));
-        assert!(force_usage_for(LoadTrigger::PostLogin));
-        // Switch/Forget re-lists ride the still-warm 60s cache.
-        assert!(!force_usage_for(LoadTrigger::PostAction));
-    }
 
     #[test]
     fn usage_thresholds_match_comet() {
@@ -1878,19 +1642,17 @@ mod tests {
     }
 
     #[test]
-    fn provider_grouping_puts_active_first() {
-        let account = |id: &str, harness: HarnessId, active: bool| AgentAccount {
+    fn provider_grouping_preserves_authoritative_order() {
+        let account = |id: &str, harness: HarnessId, migration_available: bool| AgentAccount {
             id: id.into(),
             harness,
             email: None,
             plan_label: None,
-            active,
             usage_windows: vec![],
             display_name: None,
             organization: None,
             auth_kind: None,
-            switchable: true,
-            saved_at: None,
+            migration_available,
         };
         let snapshot = AgentAccountsSnapshot {
             accounts: vec![
@@ -1901,8 +1663,8 @@ mod tests {
             warnings: vec![],
         };
         let claude = provider_accounts(&snapshot, HarnessId::ClaudeCode);
-        let ids: Vec<&str> = claude.iter().map(|a| a.id.as_str()).collect();
-        assert_eq!(ids, ["c2", "c1"], "active account leads");
+        let ids: Vec<&str> = claude.iter().map(|account| account.id.as_str()).collect();
+        assert_eq!(ids, ["c1", "c2"]);
         assert_eq!(provider_accounts(&snapshot, HarnessId::Codex).len(), 1);
         assert!(provider_accounts(&snapshot, HarnessId::Cursor).is_empty());
     }

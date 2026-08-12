@@ -29,11 +29,10 @@
 //!   (replay then live tail), `WriteTerminal {terminalId, data}`, `ResizeTerminal`,
 //!   `CloseTerminal`. M5 is single-user local: per-user owner checks land with
 //!   real multi-account auth in M6.
-//! - Agent accounts (§3.7): `ListAgentAccounts {forceUsage?}` →
-//!   `AgentAccountsSnapshot`, `ActivateAgentAccount`/`ForgetAgentAccount`
-//!   `{harness, accountId}` → snapshot, `StartAgentLogin {harness}` →
-//!   `{loginId, url, mode}`, `CompleteAgentLogin {loginId, code}` → snapshot,
-//!   `PollAgentLogin {loginId}`, `CancelAgentLogin {loginId}`.
+//! - Shared Agent Auth accounts: `ListAgentAccounts` → `AgentAccountsSnapshot`,
+//!   `MigrateAgentAccount {harness, accountId}` / `RevokeAgentAccount
+//!   {accountId}` → snapshot, plus the add-account login flow, and owner-scoped
+//!   `GetAgentRouteReceipt {logicalSessionId}` → attribution-only receipt.
 //! - Uploads (§3.7): `UploadChunk {uploadId, data, seq?}`,
 //!   `UploadCommit {uploadId, fileName}` → `{path}`,
 //!   `ReadAttachmentChunk {path, offset}` → `{name, mimeType, data, nextOffset,
@@ -67,9 +66,9 @@ use comet_proto::{
     WorktreeDeletionStage,
 };
 use comet_rpc::{
-    LinkCache, PeerMessageResult, PeerReplyResult, PeerWaitResult, RemoveSessionRefResult,
-    ReplyPeerMessageParams, RpcError, RpcReply, RpcService, SendPeerMessageParams,
-    SessionRefParams, WaitPeerReplyParams, methods, parse_params,
+    GetAgentRouteReceiptParams, LinkCache, PeerMessageResult, PeerReplyResult, PeerWaitResult,
+    RemoveSessionRefResult, ReplyPeerMessageParams, RpcError, RpcReply, RpcService,
+    SendPeerMessageParams, SessionRefParams, WaitPeerReplyParams, methods, parse_params,
 };
 
 use crate::agent_accounts::AgentAccounts;
@@ -306,15 +305,14 @@ struct ResizeTerminalParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ListAgentAccountsParams {
-    #[serde(default)]
-    force_usage: Option<bool>,
+struct MigrateAgentAccountParams {
+    harness: HarnessId,
+    account_id: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AgentAccountParams {
-    harness: HarnessId,
+struct RevokeAgentAccountParams {
     account_id: String,
 }
 
@@ -699,6 +697,7 @@ impl EngineRpc {
             capabilities: vec![action.required_capability().to_string()],
             sandbox_id: None,
             device_id: Some(owner_device_id.clone()),
+            lifecycle_epoch: None,
             granted_by: "authenticated-local-identity".into(),
             granted_at: now,
             expires_at: Some(now + crate::doc_host::LOCAL_OWNER_GRANT_TTL_MS),
@@ -723,7 +722,11 @@ impl EngineRpc {
                 "Scaffold control grant has no attached device".into(),
             ));
         };
-        let SessionEnvironmentSource::Scaffold { sandbox_id, .. } = &result.environment.source
+        let SessionEnvironmentSource::Scaffold {
+            sandbox_id,
+            lifecycle_epoch,
+            ..
+        } = &result.environment.source
         else {
             return Err(RpcError::Failed(
                 "Scaffold control grant has no sandbox".into(),
@@ -749,6 +752,7 @@ impl EngineRpc {
             capabilities: control_grant.capabilities.clone(),
             sandbox_id: Some(sandbox_id.clone()),
             device_id: Some(attached_device_id.clone()),
+            lifecycle_epoch: *lifecycle_epoch,
             granted_by: "comet-edge-device-room".into(),
             granted_at: crate::now_ms(),
             expires_at: Some(control_grant.expires_at),
@@ -1150,15 +1154,6 @@ fn forwardable(method: &str) -> bool {
             | methods::WRITE_TERMINAL
             | methods::RESIZE_TERMINAL
             | methods::CLOSE_TERMINAL
-            // Agent accounts are per-device CLI logins (the device switcher
-            // retargets which device's logins are shown).
-            | methods::LIST_AGENT_ACCOUNTS
-            | methods::ACTIVATE_AGENT_ACCOUNT
-            | methods::FORGET_AGENT_ACCOUNT
-            | methods::START_AGENT_LOGIN
-            | methods::COMPLETE_AGENT_LOGIN
-            | methods::POLL_AGENT_LOGIN
-            | methods::CANCEL_AGENT_LOGIN
             // Uploads/attachments target the chat's host device (the agent reads
             // the committed file from that device's disk).
             | methods::UPLOAD_CHUNK
@@ -1956,6 +1951,17 @@ impl RpcService for EngineRpc {
             methods::LOCAL_DEVICE => {
                 RpcReply::value(&serde_json::json!({ "deviceId": self.doc_host.device_id() }))
             }
+            methods::SCAFFOLD_HOST_AUTHORITY => {
+                if self.runtime_profile != RuntimeProfile::ScaffoldHost {
+                    return Err(RpcError::Failed(
+                        "scaffold_host_authority_disabled_by_runtime_profile".into(),
+                    ));
+                }
+                let authority = self.auth()?.device_grant_authority().ok_or_else(|| {
+                    RpcError::Failed("scaffold_host_authority_unavailable".into())
+                })?;
+                RpcReply::value(&authority)
+            }
             methods::UPDATE_STATUS => Ok(RpcReply::Stream(watch_stream(self.updater()?.watch()))),
             methods::STAGE_UPDATE => {
                 let staged = self
@@ -2167,32 +2173,42 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
+            methods::GET_AGENT_ROUTE_RECEIPT => {
+                let p: GetAgentRouteReceiptParams = parse_params(params)?;
+                let cancellation = comet_harness::CancellationToken::new();
+                let receipt = self
+                    .scaffold()?
+                    .client()
+                    .get_agent_route_receipt(&p.logical_session_id, &cancellation)
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&receipt)
+            }
             methods::LIST_AGENT_ACCOUNTS => {
                 self.require_agent_accounts()?;
-                let p: ListAgentAccountsParams = parse_params(params)?;
                 let snapshot = self
                     .agent_accounts
-                    .list(p.force_usage.unwrap_or(false))
+                    .list()
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&snapshot)
             }
-            methods::ACTIVATE_AGENT_ACCOUNT => {
+            methods::MIGRATE_AGENT_ACCOUNT => {
                 self.require_agent_accounts()?;
-                let p: AgentAccountParams = parse_params(params)?;
+                let p: MigrateAgentAccountParams = parse_params(params)?;
                 let snapshot = self
                     .agent_accounts
-                    .activate(p.harness, &p.account_id)
+                    .migrate(p.harness, &p.account_id)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&snapshot)
             }
-            methods::FORGET_AGENT_ACCOUNT => {
+            methods::REVOKE_AGENT_ACCOUNT => {
                 self.require_agent_accounts()?;
-                let p: AgentAccountParams = parse_params(params)?;
+                let p: RevokeAgentAccountParams = parse_params(params)?;
                 let snapshot = self
                     .agent_accounts
-                    .forget(p.harness, &p.account_id)
+                    .revoke(&p.account_id)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&snapshot)
@@ -2296,19 +2312,36 @@ impl RpcService for EngineRpc {
 mod tests {
     use super::*;
 
-    /// The UI's Switch/Forget calls send `{id, accountId, harness}` (+ optional
-    /// `targetDeviceId`); the extra fields must be tolerated, `accountId` wins.
     #[test]
-    fn agent_account_params_accept_ui_shape() {
-        let p: AgentAccountParams = parse_params(serde_json::json!({
-            "id": "acct-1",
+    fn agent_account_params_accept_global_shapes() {
+        let migrate: MigrateAgentAccountParams = parse_params(serde_json::json!({
             "accountId": "acct-1",
             "harness": "claude-code",
-            "targetDeviceId": "dev-2",
         }))
-        .expect("ui param shape");
-        assert_eq!(p.account_id, "acct-1");
-        assert_eq!(p.harness, HarnessId::ClaudeCode);
+        .expect("migrate account params");
+        assert_eq!(migrate.account_id, "acct-1");
+        assert_eq!(migrate.harness, HarnessId::ClaudeCode);
+
+        let revoke: RevokeAgentAccountParams =
+            parse_params(serde_json::json!({ "accountId": "acct-1" }))
+                .expect("revoke account params");
+        assert_eq!(revoke.account_id, "acct-1");
+    }
+
+    #[test]
+    fn route_receipt_params_accept_only_logical_session_identity() {
+        let receipt: GetAgentRouteReceiptParams = parse_params(serde_json::json!({
+            "logicalSessionId": "session-1",
+        }))
+        .expect("route receipt params");
+        assert_eq!(receipt.logical_session_id, "session-1");
+        assert!(
+            parse_params::<GetAgentRouteReceiptParams>(serde_json::json!({
+                "logicalSessionId": "session-1",
+                "ownerSubject": "caller-supplied-owner",
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -2532,6 +2565,7 @@ mod tests {
             capabilities: vec![comet_proto::CAPABILITY_SESSION_ANNOTATE.into()],
             sandbox_id: None,
             device_id: Some("device-a".into()),
+            lifecycle_epoch: None,
             granted_by: "authenticated-local-identity".into(),
             granted_at: now,
             expires_at: Some(now + 60_000),
@@ -2553,6 +2587,7 @@ mod tests {
             expected_device_id: None,
             expected_session_id: None,
             expected_deployment_id: None,
+            expected_lifecycle_epoch: None,
             expected_sandbox_id: None,
         });
         let projection = project_collaboration_snapshot(&doc, &host, Some(&auth), None).unwrap();
@@ -2576,7 +2611,8 @@ mod tests {
             },
             capabilities: vec![comet_proto::CAPABILITY_SESSION_CHAT.into()],
             sandbox_id: Some("sandbox-a".into()),
-            device_id: Some("comet-scaffold-sandbox-a".into()),
+            device_id: Some("comet-scaffold-sandbox-a-e1".into()),
+            lifecycle_epoch: Some(1),
             granted_by: "comet-edge-device-room".into(),
             granted_at: now,
             expires_at: Some(now + 60_000),

@@ -13,11 +13,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use comet_harness::CancellationToken;
 use comet_proto::{
-    CAPABILITY_SESSION_ANNOTATE, CAPABILITY_SESSION_CHAT, CAPABILITY_SESSION_CONTROL,
-    CAPABILITY_SESSION_ENVIRONMENT, CAPABILITY_SESSION_FILES, CAPABILITY_SESSION_READ,
-    CollaborationScope, OmpSessionArtifact, ScaffoldControlGrant, ScaffoldEnvironmentControl,
-    ScaffoldEnvironmentControlResult, ScaffoldEnvironmentLinks, ScaffoldEnvironmentSnapshot,
-    ScaffoldRuntimeMode, SessionEnvironment, SessionEnvironmentSource, SessionRoomProjection,
+    AgentRoute, AgentRouteReceipt, AgentRoutingMode, CAPABILITY_SESSION_ANNOTATE,
+    CAPABILITY_SESSION_CHAT, CAPABILITY_SESSION_CONTROL, CAPABILITY_SESSION_ENVIRONMENT,
+    CAPABILITY_SESSION_FILES, CAPABILITY_SESSION_READ, CollaborationScope, OmpSessionArtifact,
+    ScaffoldControlGrant, ScaffoldEnvironmentControl, ScaffoldEnvironmentControlResult,
+    ScaffoldEnvironmentLinks, ScaffoldEnvironmentSnapshot, ScaffoldRuntimeMode, SessionEnvironment,
+    SessionEnvironmentSource, SessionRoomProjection,
 };
 use comet_rpc::TokenSource;
 use reqwest::{Method, StatusCode, Url};
@@ -36,6 +37,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn routing_mode_value(mode: AgentRoutingMode) -> &'static str {
+    match mode {
+        AgentRoutingMode::Automatic => "automatic",
+        AgentRoutingMode::Pinned => "pinned",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +107,118 @@ pub struct ScaffoldClient {
     bearer: Arc<dyn TokenSource>,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentAccountCredentialImport {
+    pub provider: String,
+    pub provider_account_id: String,
+    pub email: Option<String>,
+    pub display_name: Option<String>,
+    pub organization: Option<String>,
+    pub plan: Option<String>,
+    pub capabilities: Vec<String>,
+    pub credential: AgentAccountOAuthCredential,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentAccountOAuthCredential {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_at: String,
+    pub scopes: Vec<String>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RemoteAgentAccount {
+    pub id: String,
+    pub provider: String,
+    pub provider_account_id: String,
+    pub email: Option<String>,
+    pub display_name: Option<String>,
+    pub organization: Option<String>,
+    pub plan: Option<String>,
+    pub status: String,
+    pub usage_fraction: Option<f32>,
+    pub reset_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RemoteAgentAccountsEnvelope {
+    accounts: Vec<RemoteAgentAccount>,
+}
+
+#[derive(Deserialize)]
+struct RemoteAgentAccountEnvelope {
+    account: RemoteAgentAccount,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentInferenceGrantRequest {
+    pub logical_session_id: String,
+    pub provider: String,
+    pub model: String,
+    pub harness: String,
+    pub routing_mode: AgentRoutingMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_account_id: Option<String>,
+    pub lifecycle_epoch: u64,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentInferenceGrantBinding {
+    pub owner_subject: String,
+    pub logical_session_id: String,
+    pub provider: String,
+    pub model: String,
+    pub harness: String,
+    pub routing_mode: AgentRoutingMode,
+    #[serde(default)]
+    pub requested_account_id: Option<String>,
+    pub source: String,
+    pub lifecycle_epoch: u64,
+    pub environment: String,
+    pub backend: String,
+    pub account_id: Option<String>,
+    pub account_generation: Option<u64>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentInferenceGrant {
+    pub token: String,
+    pub expires_at: String,
+    pub binding: AgentInferenceGrantBinding,
+}
+
+pub(crate) struct AgentInferenceProxyRequest<'a> {
+    pub endpoint: &'a str,
+    pub grant: &'a AgentInferenceGrant,
+    pub request_id: &'a str,
+    pub headers: reqwest::header::HeaderMap,
+    pub content_length: u64,
+    pub body: reqwest::Body,
+    pub cancellation: &'a CancellationToken,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentInferenceFailureReport<'a> {
+    failure_class: &'a str,
+    response_started: bool,
+    retry_after_seconds: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentInferenceFailureResponse {
+    retry: bool,
+    grant: Option<AgentInferenceGrant>,
+}
+
 impl fmt::Debug for ScaffoldClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ScaffoldClient")
@@ -137,6 +257,258 @@ impl ScaffoldClient {
 
     pub fn project_scope(&self) -> &str {
         &self.project_scope
+    }
+
+    pub(crate) async fn list_agent_accounts(
+        &self,
+    ) -> Result<Vec<RemoteAgentAccount>, ScaffoldError> {
+        let url = self
+            .origin
+            .join("/api/agent-accounts")
+            .expect("static account list path");
+        let response: RemoteAgentAccountsEnvelope = self
+            .request(
+                Method::GET,
+                url,
+                Option::<&()>::None,
+                &CancellationToken::new(),
+            )
+            .await?;
+        Ok(response.accounts)
+    }
+
+    pub(crate) async fn import_agent_account(
+        &self,
+        account: &AgentAccountCredentialImport,
+    ) -> Result<RemoteAgentAccount, ScaffoldError> {
+        let url = self
+            .origin
+            .join("/api/agent-accounts/import")
+            .expect("static account import path");
+        let response: RemoteAgentAccountEnvelope = self
+            .request(Method::POST, url, Some(account), &CancellationToken::new())
+            .await?;
+        Ok(response.account)
+    }
+
+    pub(crate) async fn revoke_agent_account(&self, account_id: &str) -> Result<(), ScaffoldError> {
+        let mut url = self
+            .origin
+            .join("/api/agent-accounts/")
+            .expect("static account revoke path");
+        url.path_segments_mut()
+            .expect("Scaffold origin is hierarchical")
+            .pop_if_empty()
+            .push(account_id);
+        let _: Value = self
+            .request(
+                Method::DELETE,
+                url,
+                Option::<&()>::None,
+                &CancellationToken::new(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn issue_agent_inference_grant(
+        &self,
+        request: &AgentInferenceGrantRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<AgentInferenceGrant, ScaffoldError> {
+        let url = self
+            .origin
+            .join("/api/agent-auth/grants")
+            .expect("static inference grant path");
+        self.request(Method::POST, url, Some(request), cancellation)
+            .await
+    }
+
+    pub(crate) async fn proxy_agent_inference(
+        &self,
+        proxy: AgentInferenceProxyRequest<'_>,
+    ) -> Result<reqwest::Response, ScaffoldError> {
+        let AgentInferenceProxyRequest {
+            endpoint,
+            grant,
+            request_id,
+            mut headers,
+            content_length,
+            body,
+            cancellation,
+        } = proxy;
+        let path = match endpoint {
+            "responses" => "/api/agent-auth/v1/responses",
+            "messages" => "/api/agent-auth/v1/messages",
+            _ => {
+                return Err(ScaffoldError::InvalidResponse(
+                    "unsupported inference endpoint".into(),
+                ));
+            }
+        };
+        for name in [
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HOST,
+            reqwest::header::CONTENT_LENGTH,
+            reqwest::header::CONNECTION,
+        ] {
+            headers.remove(name);
+        }
+        for name in [
+            "x-agent-auth-owner-subject",
+            "x-agent-auth-session-id",
+            "x-agent-auth-provider",
+            "x-agent-auth-model",
+            "x-agent-auth-harness",
+            "x-agent-auth-source",
+            "x-agent-auth-environment",
+            "x-agent-auth-lifecycle-epoch",
+            "x-agent-auth-request-id",
+            "x-agent-auth-routing-mode",
+            "x-agent-auth-requested-account-id",
+            "x-agent-auth-internal-secret",
+        ] {
+            headers.remove(name);
+        }
+        let url = self.origin.join(path).expect("static inference proxy path");
+        let mut request = self
+            .http
+            .post(url)
+            .headers(headers)
+            .bearer_auth(&grant.token)
+            .header("x-agent-auth-owner-subject", &grant.binding.owner_subject)
+            .header("x-agent-auth-session-id", &grant.binding.logical_session_id)
+            .header("x-agent-auth-provider", &grant.binding.provider)
+            .header("x-agent-auth-model", &grant.binding.model)
+            .header("x-agent-auth-harness", &grant.binding.harness)
+            .header("x-agent-auth-environment", &grant.binding.environment)
+            .header("x-agent-auth-source", &grant.binding.source)
+            .header(
+                "x-agent-auth-routing-mode",
+                routing_mode_value(grant.binding.routing_mode),
+            )
+            .header(
+                "x-agent-auth-lifecycle-epoch",
+                grant.binding.lifecycle_epoch.to_string(),
+            )
+            .header("x-agent-auth-request-id", request_id);
+        if let Some(account_id) = &grant.binding.requested_account_id {
+            request = request.header("x-agent-auth-requested-account-id", account_id);
+        }
+        let request = request
+            .header(reqwest::header::CONTENT_LENGTH, content_length)
+            .body(body);
+        tokio::select! {
+            response = request.send() => response.map_err(ScaffoldError::Transport),
+            () = cancellation.cancelled() => Err(ScaffoldError::Cancelled),
+        }
+    }
+
+    pub(crate) async fn report_agent_inference_failure(
+        &self,
+        grant: &AgentInferenceGrant,
+        failure_class: &str,
+        response_started: bool,
+        retry_after_seconds: Option<u64>,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<AgentInferenceGrant>, ScaffoldError> {
+        let url = self
+            .origin
+            .join("/api/agent-auth/grants/failure")
+            .expect("static inference failure path");
+        let mut request = self
+            .http
+            .post(url)
+            .bearer_auth(&grant.token)
+            .header("x-agent-auth-owner-subject", &grant.binding.owner_subject)
+            .header("x-agent-auth-session-id", &grant.binding.logical_session_id)
+            .header("x-agent-auth-provider", &grant.binding.provider)
+            .header("x-agent-auth-model", &grant.binding.model)
+            .header("x-agent-auth-harness", &grant.binding.harness)
+            .header("x-agent-auth-source", &grant.binding.source)
+            .header("x-agent-auth-environment", &grant.binding.environment)
+            .header(
+                "x-agent-auth-routing-mode",
+                routing_mode_value(grant.binding.routing_mode),
+            )
+            .header(
+                "x-agent-auth-lifecycle-epoch",
+                grant.binding.lifecycle_epoch.to_string(),
+            );
+        if let Some(account_id) = &grant.binding.requested_account_id {
+            request = request.header("x-agent-auth-requested-account-id", account_id);
+        }
+        let request = request.json(&AgentInferenceFailureReport {
+            failure_class,
+            response_started,
+            retry_after_seconds,
+        });
+        let response = tokio::select! {
+            response = request.send() => response?,
+            () = cancellation.cancelled() => return Err(ScaffoldError::Cancelled),
+        };
+        let status = response.status();
+        let bytes = response.bytes().await?;
+        if !status.is_success() {
+            return Err(api_error(status, &bytes));
+        }
+        let reported: AgentInferenceFailureResponse = serde_json::from_slice(&bytes)
+            .map_err(|error| ScaffoldError::InvalidResponse(error.to_string()))?;
+        Ok(reported.retry.then_some(reported.grant).flatten())
+    }
+
+    pub(crate) async fn revoke_agent_inference_grants(
+        &self,
+        logical_session_id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ScaffoldError> {
+        let url = self
+            .origin
+            .join("api/agent-auth/grants/revoke")
+            .expect("static Agent Auth grant revocation path");
+        let body = serde_json::json!({ "logicalSessionId": logical_session_id });
+        let _: serde_json::Value = self
+            .request(Method::POST, url, Some(&body), cancellation)
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn rebind_agent_inference_route(
+        &self,
+        logical_session_id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ScaffoldError> {
+        let url = self
+            .origin
+            .join("/api/agent-auth/grants/rebind")
+            .expect("static Agent Auth route rebind path");
+        let body = serde_json::json!({ "logicalSessionId": logical_session_id });
+        let _: serde_json::Value = self
+            .request(Method::POST, url, Some(&body), cancellation)
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn get_agent_route_receipt(
+        &self,
+        logical_session_id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<AgentRouteReceipt, ScaffoldError> {
+        if logical_session_id.trim().is_empty() {
+            return Err(ScaffoldError::InvalidScope(
+                "logicalSessionId is required".into(),
+            ));
+        }
+        let mut url = self
+            .origin
+            .join("/api/agent-auth/routes/")
+            .expect("static Agent Auth route receipt path");
+        url.path_segments_mut()
+            .expect("Scaffold origin is hierarchical")
+            .pop_if_empty()
+            .push(logical_session_id);
+        self.request(Method::GET, url, Option::<&()>::None, cancellation)
+            .await
     }
 
     pub async fn list(
@@ -183,31 +555,38 @@ impl ScaffoldClient {
         response.sandbox.into_environment(scope.clone())
     }
 
-    pub async fn create(
+    pub(crate) async fn create(
         &self,
         scope: &CollaborationScope,
-        name: Option<&str>,
-        source_ref: Option<&str>,
-        region: Option<&str>,
-        runtime_mode: Option<ScaffoldRuntimeMode>,
+        options: CreateSandboxOptions<'_>,
+        agent_route: &AgentRoute,
         cancellation: &CancellationToken,
     ) -> Result<SessionEnvironment, ScaffoldError> {
+        let CreateSandboxOptions {
+            name,
+            source_ref,
+            region,
+            runtime_mode,
+        } = options;
         self.validate_scope(scope)?;
+        agent_route
+            .validate()
+            .map_err(|message| ScaffoldError::InvalidScope(message.into()))?;
         let deployment_id = scope
             .deployment_id
             .as_deref()
             .expect("validated deploymentId");
-        let session_id = scope.session_id.as_deref().expect("validated sessionId");
         let body = CreateSandboxBody {
             name,
             source: source_ref.map(|reference| CreateSandboxSource { reference }),
             region,
             runtime_mode,
+            agent_route,
             comet_runtime_profile: CreateCometRuntimeProfile {
                 version: "scaffold.comet-runtime.v1",
                 project_id: &scope.project_id,
                 deployment_id,
-                session_id,
+                session_id: scope.session_id.as_deref().expect("validated sessionId"),
             },
         };
         let response: SandboxEnvelope = self
@@ -716,12 +1095,24 @@ struct ScaffoldSandbox {
     runtime_profile: Option<String>,
     region: Option<String>,
     selected_region: Option<String>,
+    source_ref: Option<String>,
     owner_email: Option<String>,
     created_at: String,
     updated_at: String,
     last_activity_at: Option<String>,
     #[serde(default)]
     links: ScaffoldEnvironmentLinks,
+    comet_runtime_profile: Option<ScaffoldCometRuntimeProfile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScaffoldCometRuntimeProfile {
+    version: String,
+    project_id: String,
+    deployment_id: String,
+    session_id: String,
+    sandbox_id: String,
 }
 
 impl ScaffoldSandbox {
@@ -762,16 +1153,45 @@ impl ScaffoldSandbox {
         // Validate required timestamps even though only last activity enters the projection.
         let _ = parse_rfc3339_ms(&self.created_at, "createdAt")?;
         let _ = parse_rfc3339_ms(&self.updated_at, "updatedAt")?;
-        let _ = self.lifecycle_epoch;
+        let scope = if self.runtime_profile.as_deref() == Some("comet_remote") {
+            let profile = self.comet_runtime_profile.as_ref().ok_or_else(|| {
+                ScaffoldError::InvalidResponse(format!(
+                    "sandbox {} has no authoritative Comet runtime profile",
+                    self.id
+                ))
+            })?;
+            if profile.version != "scaffold.comet-runtime.v1"
+                || profile.project_id != scope.project_id
+                || Some(profile.deployment_id.as_str()) != scope.deployment_id.as_deref()
+                || Some(profile.session_id.as_str()) != scope.session_id.as_deref()
+                || profile.sandbox_id != self.id
+            {
+                return Err(ScaffoldError::InvalidResponse(format!(
+                    "sandbox {} returned a mismatched Comet runtime profile",
+                    self.id
+                )));
+            }
+            CollaborationScope {
+                project_id: profile.project_id.clone(),
+                deployment_id: Some(profile.deployment_id.clone()),
+                session_id: Some(profile.session_id.clone()),
+                unknown: Default::default(),
+            }
+        } else {
+            scope
+        };
+        let lifecycle_epoch = self.lifecycle_epoch;
         Ok(SessionEnvironment {
             source: SessionEnvironmentSource::Scaffold {
                 sandbox_id: self.id,
                 region: self.selected_region.or(self.region),
                 lifecycle: self.status,
-                links: self.links,
+                lifecycle_epoch,
+                links: Box::new(self.links),
             },
             owner_principal,
             scope,
+            source_ref: self.source_ref,
             last_activity_at,
             unknown: Default::default(),
         })
@@ -782,6 +1202,14 @@ fn parse_rfc3339_ms(value: &str, field: &str) -> Result<i64, ScaffoldError> {
     chrono::DateTime::parse_from_rfc3339(value)
         .map(|timestamp| timestamp.timestamp_millis())
         .map_err(|error| ScaffoldError::InvalidResponse(format!("invalid {field}: {error}")))
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CreateSandboxOptions<'a> {
+    pub name: Option<&'a str>,
+    pub source_ref: Option<&'a str>,
+    pub region: Option<&'a str>,
+    pub runtime_mode: Option<ScaffoldRuntimeMode>,
 }
 
 #[derive(Debug, Serialize)]
@@ -795,6 +1223,7 @@ struct CreateSandboxBody<'a> {
     region: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     runtime_mode: Option<ScaffoldRuntimeMode>,
+    agent_route: &'a AgentRoute,
     comet_runtime_profile: CreateCometRuntimeProfile<'a>,
 }
 
@@ -826,6 +1255,19 @@ struct ExecBody<'a> {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ScaffoldHostAuthorityResponse {
+    grant_id: String,
+    expires_at: i64,
+    principal_subject: String,
+    scope: CollaborationScope,
+    sandbox_id: String,
+    device_id: String,
+    lifecycle_epoch: u64,
+    capabilities: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ExecResponse {
     ok: bool,
     #[serde(default)]
@@ -850,6 +1292,25 @@ struct UploadGrantEnvelope {
     upload: UploadGrant,
 }
 
+fn deserialize_timestamp_millis<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum WireTimestamp {
+        Millis(i64),
+        Rfc3339(String),
+    }
+
+    match WireTimestamp::deserialize(deserializer)? {
+        WireTimestamp::Millis(value) => Ok(value),
+        WireTimestamp::Rfc3339(value) => chrono::DateTime::parse_from_rfc3339(&value)
+            .map(|timestamp| timestamp.timestamp_millis())
+            .map_err(serde::de::Error::custom),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UploadGrant {
@@ -857,6 +1318,7 @@ struct UploadGrant {
     token: String,
     token_env: String,
     destination_path: String,
+    #[serde(deserialize_with = "deserialize_timestamp_millis")]
     expires_at: i64,
     // Intentionally decoded only so schema drift is caught. Never execute or
     // log this shell command because it projects the upload bearer externally.
@@ -974,6 +1436,7 @@ pub struct DeviceJoinGrantRequest {
     pub scope: CollaborationScope,
     pub sandbox_id: String,
     pub device_id: String,
+    pub lifecycle_epoch: u64,
     pub capabilities: Vec<String>,
     pub expires_in_seconds: u32,
 }
@@ -1050,6 +1513,7 @@ impl DeviceJoinGrantProvider for EdgeDeviceJoinGrantClient {
             session_id: &'a str,
             deployment_id: &'a str,
             sandbox_id: &'a str,
+            lifecycle_epoch: u64,
             capabilities: &'a [String],
             ttl_seconds: u32,
         }
@@ -1074,6 +1538,7 @@ impl DeviceJoinGrantProvider for EdgeDeviceJoinGrantClient {
             session_id,
             deployment_id,
             sandbox_id: &request.sandbox_id,
+            lifecycle_epoch: request.lifecycle_epoch,
             capabilities: &request.capabilities,
             ttl_seconds: request.expires_in_seconds,
         };
@@ -1179,6 +1644,10 @@ impl ScaffoldRuntime {
         }
     }
 
+    pub(crate) fn client(&self) -> ScaffoldClient {
+        self.inner.client.clone()
+    }
+
     pub fn watch(&self) -> watch::Receiver<ScaffoldEnvironmentSnapshot> {
         self.inner.watch_tx.subscribe()
     }
@@ -1225,15 +1694,19 @@ impl ScaffoldRuntime {
                 source_ref,
                 region,
                 runtime_mode,
+                agent_route,
             } => (
                 self.inner
                     .client
                     .create(
                         &scope,
-                        name.as_deref(),
-                        source_ref.as_deref(),
-                        region.as_deref(),
-                        runtime_mode,
+                        CreateSandboxOptions {
+                            name: name.as_deref(),
+                            source_ref: source_ref.as_deref(),
+                            region: region.as_deref(),
+                            runtime_mode,
+                        },
+                        &agent_route,
                         cancellation,
                     )
                     .await?,
@@ -1278,7 +1751,7 @@ impl ScaffoldRuntime {
                     .attach(&sandbox_id, &scope, &environment, cancellation)
                     .await?;
                 control_grant = Some(grant);
-                (environment, Some(device_id), Some(run_id), None)
+                (environment, Some(device_id), run_id, None)
             }
             ScaffoldEnvironmentControl::HandoffOmpSession {
                 sandbox_id,
@@ -1290,7 +1763,7 @@ impl ScaffoldRuntime {
                     .client
                     .inspect(&sandbox_id, &scope, cancellation)
                     .await?;
-                let (lifecycle, _) = scaffold_source(&environment)?;
+                let (lifecycle, _, _) = scaffold_source(&environment)?;
                 if !matches!(
                     lifecycle,
                     comet_proto::ScaffoldLifecycle::Ready
@@ -1340,8 +1813,8 @@ impl ScaffoldRuntime {
         scope: &CollaborationScope,
         environment: &SessionEnvironment,
         cancellation: &CancellationToken,
-    ) -> Result<(String, String, ScaffoldControlGrant), ScaffoldError> {
-        let (lifecycle, _) = scaffold_source(environment)?;
+    ) -> Result<(String, Option<String>, ScaffoldControlGrant), ScaffoldError> {
+        let (lifecycle, lifecycle_epoch, _) = scaffold_source(environment)?;
         if !matches!(
             lifecycle,
             comet_proto::ScaffoldLifecycle::Starting
@@ -1364,8 +1837,53 @@ impl ScaffoldRuntime {
             .as_deref()
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| ScaffoldError::InvalidScope("sessionId is required to attach".into()))?;
+        let lifecycle_epoch = lifecycle_epoch.ok_or_else(|| {
+            ScaffoldError::InvalidResponse("sandbox lifecycle epoch is required to attach".into())
+        })?;
 
-        // Probe first so missing installations fail deterministically without minting a credential.
+        // Reuse a live deployment-bound host before minting another grant. This
+        // keeps repeated attach idempotent while preserving a fail-closed fallback
+        // when the prior process is missing, stale, or bound to another room.
+        let authority_argv = vec!["comet".to_string(), "scaffold-authority".to_string()];
+        if let Ok(authority) = self
+            .inner
+            .client
+            .exec(
+                sandbox_id,
+                &ExecBody {
+                    argv: &authority_argv,
+                    mode: "inline",
+                    timeout_ms: 10_000,
+                },
+                cancellation,
+            )
+            .await
+            && authority.ok
+            && authority.exit_code == Some(0)
+            && let Some(stdout) = authority.stdout.as_deref()
+            && let Ok(existing) =
+                serde_json::from_str::<ScaffoldHostAuthorityResponse>(stdout.trim())
+            && existing.expires_at > now_ms()
+            && existing.principal_subject == environment.owner_principal
+            && existing.scope == *scope
+            && existing.sandbox_id == sandbox_id
+            && existing.device_id == device_id_for(sandbox_id, lifecycle_epoch)
+            && existing.lifecycle_epoch == lifecycle_epoch
+            && existing.capabilities == scaffold_host_capabilities()
+        {
+            return Ok((
+                existing.device_id,
+                None,
+                ScaffoldControlGrant {
+                    id: existing.grant_id,
+                    expires_at: existing.expires_at,
+                    capabilities: existing.capabilities,
+                },
+            ));
+        }
+
+        // Probe after reuse so an older binary without the authority command
+        // still fails deterministically without minting a credential.
         let probe_argv = vec![
             "sh".to_string(),
             "-lc".to_string(),
@@ -1388,20 +1906,14 @@ impl ScaffoldRuntime {
             return Err(ScaffoldError::CometNotInstalled);
         }
 
-        let device_id = format!("comet-scaffold-{sandbox_id}");
+        let device_id = device_id_for(sandbox_id, lifecycle_epoch);
         let request = DeviceJoinGrantRequest {
             principal_subject: environment.owner_principal.clone(),
             scope: scope.clone(),
             sandbox_id: sandbox_id.to_string(),
             device_id: device_id.clone(),
-            capabilities: vec![
-                CAPABILITY_SESSION_READ.into(),
-                CAPABILITY_SESSION_CHAT.into(),
-                CAPABILITY_SESSION_CONTROL.into(),
-                CAPABILITY_SESSION_ANNOTATE.into(),
-                CAPABILITY_SESSION_FILES.into(),
-                CAPABILITY_SESSION_ENVIRONMENT.into(),
-            ],
+            lifecycle_epoch,
+            capabilities: scaffold_host_capabilities(),
             expires_in_seconds: JOIN_GRANT_TTL_SECONDS,
         };
         let join = self.inner.grants.mint(&request, cancellation).await?;
@@ -1420,6 +1932,7 @@ impl ScaffoldRuntime {
             "deploymentId": deployment_id,
             "sessionId": session_id,
             "deviceId": device_id,
+            "lifecycleEpoch": lifecycle_epoch,
             "sandboxId": sandbox_id
         })
         .to_string();
@@ -1513,7 +2026,7 @@ impl ScaffoldRuntime {
         let run_id = started.run_id.ok_or_else(|| {
             ScaffoldError::InvalidResponse("sandbox exec returned no runId".into())
         })?;
-        Ok((device_id, run_id, control_grant))
+        Ok((device_id, Some(run_id), control_grant))
     }
 
     fn publish(&self) -> ScaffoldEnvironmentSnapshot {
@@ -1525,16 +2038,31 @@ impl ScaffoldRuntime {
         snapshot
     }
 }
+fn device_id_for(sandbox_id: &str, lifecycle_epoch: u64) -> String {
+    format!("comet-scaffold-{sandbox_id}-e{lifecycle_epoch}")
+}
+
+fn scaffold_host_capabilities() -> Vec<String> {
+    vec![
+        CAPABILITY_SESSION_READ.into(),
+        CAPABILITY_SESSION_CHAT.into(),
+        CAPABILITY_SESSION_CONTROL.into(),
+        CAPABILITY_SESSION_ANNOTATE.into(),
+        CAPABILITY_SESSION_FILES.into(),
+        CAPABILITY_SESSION_ENVIRONMENT.into(),
+    ]
+}
 
 fn scaffold_source(
     environment: &SessionEnvironment,
-) -> Result<(comet_proto::ScaffoldLifecycle, &str), ScaffoldError> {
+) -> Result<(comet_proto::ScaffoldLifecycle, Option<u64>, &str), ScaffoldError> {
     match &environment.source {
         SessionEnvironmentSource::Scaffold {
             sandbox_id,
             lifecycle,
+            lifecycle_epoch,
             ..
-        } => Ok((*lifecycle, sandbox_id)),
+        } => Ok((*lifecycle, *lifecycle_epoch, sandbox_id)),
         SessionEnvironmentSource::Local => Err(ScaffoldError::InvalidResponse(
             "local environment has no Scaffold sandbox".into(),
         )),
@@ -1542,7 +2070,7 @@ fn scaffold_source(
 }
 
 fn environment_sandbox_id(environment: &SessionEnvironment) -> Result<&str, ScaffoldError> {
-    scaffold_source(environment).map(|(_, sandbox_id)| sandbox_id)
+    scaffold_source(environment).map(|(_, _, sandbox_id)| sandbox_id)
 }
 
 #[cfg(test)]
@@ -1586,29 +2114,36 @@ mod tests {
         CollaborationScope {
             project_id: "project-a".into(),
             deployment_id: Some("deployment-a".into()),
-            session_id: Some("session-a".into()),
+            session_id: Some("011664b5-3660-4fe6-83a2-3647fa6a2f65".into()),
             unknown: Default::default(),
         }
     }
 
     fn sandbox(status: &str) -> String {
         format!(
-            r#"{{"sandbox":{{"id":"sandbox-a","status":"{status}","kind":"remote_code","runtimeProfile":"remote_code","region":"us-central1","ownerEmail":"alice@example.com","createdAt":"2026-08-04T00:00:00Z","updatedAt":"2026-08-04T00:01:00Z","lastActivityAt":"2026-08-04T00:02:00Z","links":{{"terminal":"https://terminal.example"}}}}}}"#
+            r#"{{"sandbox":{{"id":"sandbox-a","lifecycleEpoch":1,"status":"{status}","kind":"remote_code","runtimeProfile":"remote_code","region":"us-central1","sourceRef":"387d6652abd642f0b85e8bd14f9131a9f23b7e70","ownerEmail":"alice@example.com","createdAt":"2026-08-04T00:00:00Z","updatedAt":"2026-08-04T00:01:00Z","lastActivityAt":"2026-08-04T00:02:00Z","links":{{"terminal":"https://terminal.example"}}}}}}"#
+        )
+    }
+
+    fn comet_sandbox(status: &str) -> String {
+        sandbox(status).replace(
+            r#""runtimeProfile":"remote_code""#,
+            r#""runtimeProfile":"comet_remote","cometRuntimeProfile":{"version":"scaffold.comet-runtime.v1","projectId":"project-a","deploymentId":"deployment-a","sessionId":"011664b5-3660-4fe6-83a2-3647fa6a2f65","sandboxId":"sandbox-a"}"#,
         )
     }
 
     #[test]
     fn accepts_the_additive_comet_remote_profile_from_code_sandboxes() {
-        let envelope: SandboxEnvelope = serde_json::from_str(&sandbox("ready").replace(
-            r#""runtimeProfile":"remote_code""#,
-            r#""runtimeProfile":"comet_remote""#,
-        ))
-        .unwrap();
+        let envelope: SandboxEnvelope = serde_json::from_str(&comet_sandbox("ready")).unwrap();
         let environment = envelope.sandbox.into_environment(scope()).unwrap();
-        assert!(matches!(
-            environment.source,
-            SessionEnvironmentSource::Scaffold { .. }
-        ));
+        assert_eq!(
+            environment.source_ref.as_deref(),
+            Some("387d6652abd642f0b85e8bd14f9131a9f23b7e70")
+        );
+        assert_eq!(
+            environment.scope.session_id.as_deref(),
+            Some("011664b5-3660-4fe6-83a2-3647fa6a2f65")
+        );
     }
 
     async fn mock_server(responses: Vec<String>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
@@ -1656,6 +2191,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_receipt_returns_attribution_without_credentials() {
+        let response = serde_json::json!({
+            "logicalSessionId": "session-a",
+            "routingMode": "pinned",
+            "requestedAccountId": "opaque-account-id",
+            "route": {
+                "provider": "openai",
+                "model": "gpt-5.6-sol",
+                "backend": "oauth",
+                "accountId": "opaque-account-id",
+                "accountGeneration": 3,
+                "createdAt": "2026-08-10T00:00:00Z",
+                "updatedAt": "2026-08-10T00:01:00Z",
+                "expiresAt": "2026-08-10T01:00:00Z"
+            },
+            "grant": {
+                "id": "grant-id",
+                "provider": "openai",
+                "model": "gpt-5.6-sol",
+                "harness": "codex",
+                "source": "comet-local",
+                "lifecycleEpoch": 1,
+                "environment": "local",
+                "routingMode": "pinned",
+                "requestedAccountId": "opaque-account-id",
+                "backend": "oauth",
+                "accountId": "opaque-account-id",
+                "accountGeneration": 3,
+                "createdAt": "2026-08-10T00:00:00Z",
+                "expiresAt": "2026-08-10T00:05:00Z",
+                "revokedAt": null
+            }
+        })
+        .to_string();
+        let (origin, captured) = mock_server(vec![response]).await;
+        let client = ScaffoldClient::new(
+            origin,
+            "project-a",
+            Arc::new(StaticToken("owner-scoped-bearer".into())),
+        )
+        .unwrap();
+        let receipt = client
+            .get_agent_route_receipt("session-a", &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(receipt.logical_session_id, "session-a");
+        assert_eq!(
+            receipt.route.account_id.as_deref(),
+            Some("opaque-account-id")
+        );
+        assert_eq!(receipt.grant.account_generation, Some(3));
+        let value = serde_json::to_value(receipt).unwrap();
+        assert!(value.get("token").is_none());
+        assert!(value.get("ownerSubject").is_none());
+
+        let requests = captured.await.unwrap();
+        assert!(requests[0].starts_with("GET /api/agent-auth/routes/session-a HTTP/1.1"));
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer owner-scoped-bearer")
+        );
+    }
+
+    #[tokio::test]
+    async fn route_rebind_uses_the_authenticated_exact_contract() {
+        let (origin, captured) = mock_server(vec!["{}".into()]).await;
+        let client = ScaffoldClient::new(
+            origin,
+            "project-a",
+            Arc::new(StaticToken("owner-scoped-bearer".into())),
+        )
+        .unwrap();
+
+        client
+            .rebind_agent_inference_route("session-a", &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let requests = captured.await.unwrap();
+        assert!(requests[0].starts_with("POST /api/agent-auth/grants/rebind HTTP/1.1"));
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer owner-scoped-bearer")
+        );
+        let body = requests[0].split("\r\n\r\n").nth(1).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(body).unwrap(),
+            serde_json::json!({ "logicalSessionId": "session-a" })
+        );
+    }
+
+    #[tokio::test]
     async fn control_plane_methods_decode_lifecycle_and_preserve_http_contract() {
         let listed_sandbox: Value = serde_json::from_str(&sandbox("paused")).unwrap();
         let listed = serde_json::json!({
@@ -1666,7 +2295,7 @@ mod tests {
         let responses = vec![
             listed,
             sandbox("ready"),
-            sandbox("creating"),
+            comet_sandbox("creating"),
             sandbox("paused"),
             sandbox("resuming"),
             sandbox("stopped"),
@@ -1684,17 +2313,24 @@ mod tests {
             .inspect("sandbox-a", &scope(), &cancellation)
             .await
             .unwrap();
-        client
+        let created = client
             .create(
                 &scope(),
-                Some("Comet"),
-                Some("main"),
-                Some("us-central1"),
-                Some(ScaffoldRuntimeMode::Tilt),
+                CreateSandboxOptions {
+                    name: Some("Comet"),
+                    source_ref: Some("main"),
+                    region: Some("us-central1"),
+                    runtime_mode: Some(ScaffoldRuntimeMode::Tilt),
+                },
+                &AgentRoute::automatic(comet_proto::AgentProvider::OpenAi, "gpt-5.6-sol"),
                 &cancellation,
             )
             .await
             .unwrap();
+        assert_eq!(
+            created.scope.session_id.as_deref(),
+            Some("011664b5-3660-4fe6-83a2-3647fa6a2f65")
+        );
         client
             .pause("sandbox-a", &scope(), &cancellation)
             .await
@@ -1737,12 +2373,46 @@ mod tests {
                 .contains("authorization: bearer sc_rc_control_secret")
         }));
         assert!(requests[2].contains(r#""runtimeMode":"tilt""#));
+        assert!(requests[2].contains(
+            r#""agentRoute":{"provider":"openai","model":"gpt-5.6-sol","fallback":"disabled","routingMode":"automatic"}"#
+        ));
         assert!(requests[2].contains(r#""version":"scaffold.comet-runtime.v1""#));
         assert!(requests[2].contains(r#""projectId":"project-a""#));
         assert!(requests[2].contains(r#""deploymentId":"deployment-a""#));
-        assert!(requests[2].contains(r#""sessionId":"session-a""#));
+        assert!(requests[2].contains(r#""sessionId":"011664b5-3660-4fe6-83a2-3647fa6a2f65""#));
     }
 
+    #[test]
+    fn create_sandbox_body_serializes_a_pinned_opaque_account() {
+        let route = AgentRoute::pinned(
+            comet_proto::AgentProvider::Anthropic,
+            "claude-opus-5",
+            "opaque-account-id",
+        );
+        let body = CreateSandboxBody {
+            name: None,
+            source: None,
+            region: None,
+            runtime_mode: Some(ScaffoldRuntimeMode::Compose),
+            agent_route: &route,
+            comet_runtime_profile: CreateCometRuntimeProfile {
+                version: "scaffold.comet-runtime.v1",
+                project_id: "project-a",
+                deployment_id: "deployment-a",
+                session_id: "session-a",
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(body).unwrap()["agentRoute"],
+            serde_json::json!({
+                "provider": "anthropic",
+                "model": "claude-opus-5",
+                "fallback": "disabled",
+                "routingMode": "pinned",
+                "accountId": "opaque-account-id",
+            })
+        );
+    }
     #[tokio::test]
     async fn attach_keeps_credentials_out_of_process_arguments() {
         let join_expires_at = now_ms() + 60_000;
@@ -1750,6 +2420,7 @@ mod tests {
             join_expires_at - i64::from(JOIN_GRANT_TTL_SECONDS) * 1000 + DEVICE_ACCESS_TTL_MS;
         let responses = vec![
             sandbox("ready"),
+            r#"{"ok":false,"exitCode":1}"#.into(),
             r#"{"ok":true,"exitCode":0}"#.into(),
             format!(
                 r#"{{"grant":"cg1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narrow_secret","expiresAt":{join_expires_at}}}"#
@@ -1777,7 +2448,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             result.attached_device_id.as_deref(),
-            Some("comet-scaffold-sandbox-a")
+            Some("comet-scaffold-sandbox-a-e1")
         );
         assert_eq!(result.run_id.as_deref(), Some("run-a"));
         assert_eq!(result.environment.owner_principal, "alice@example.com");
@@ -1786,7 +2457,7 @@ mod tests {
             Some(SessionRoomProjection {
                 project_id: "project-a".into(),
                 deployment_id: "deployment-a".into(),
-                session_id: "session-a".into(),
+                session_id: "011664b5-3660-4fe6-83a2-3647fa6a2f65".into(),
             })
         );
         assert_eq!(
@@ -1814,17 +2485,18 @@ mod tests {
             .filter(|request| request.starts_with("POST /api/code-sandboxes/sandbox-a/exec "))
             .map(|request| request.split_once("\r\n\r\n").unwrap().1)
             .collect();
-        assert_eq!(exec_bodies.len(), 3);
+        assert_eq!(exec_bodies.len(), 4);
         assert!(
             exec_bodies
                 .iter()
                 .all(|body| !body.contains("sc_rc_broad_secret") && !body.contains("cg1."))
         );
-        assert!(exec_bodies[1].contains(r#""chmod","600""#));
-        assert!(exec_bodies[2].contains(r#""--device-bootstrap-file""#));
-        assert!(!exec_bodies[2].contains("--device-join-grant"));
-        assert!(exec_bodies[2].contains(r#""mode":"background""#));
-        assert!(exec_bodies[2].contains(r#""timeoutMs":0"#));
+        assert!(exec_bodies[0].contains(r#""comet","scaffold-authority""#));
+        assert!(exec_bodies[2].contains(r#""chmod","600""#));
+        assert!(exec_bodies[3].contains(r#""--device-bootstrap-file""#));
+        assert!(!exec_bodies[3].contains("--device-join-grant"));
+        assert!(exec_bodies[3].contains(r#""mode":"background""#));
+        assert!(exec_bodies[3].contains(r#""timeoutMs":0"#));
         let bootstrap_request = requests
             .iter()
             .find(|request| request.starts_with("PUT /api/code-sandboxes/sandbox-a/files?"))
@@ -1838,10 +2510,77 @@ mod tests {
             "cg1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narrow_secret"
         );
         assert_eq!(bootstrap["deploymentId"], "deployment-a");
-        let grant_body = requests[2].split_once("\r\n\r\n").unwrap().1;
+        assert_eq!(bootstrap["lifecycleEpoch"], 1);
+        let grant_body = requests[3].split_once("\r\n\r\n").unwrap().1;
         assert!(grant_body.contains(r#""sandboxId":"sandbox-a""#));
         assert!(grant_body.contains(r#""deploymentId":"deployment-a""#));
+        assert!(grant_body.contains(r#""lifecycleEpoch":1"#));
     }
+    #[tokio::test]
+    async fn repeated_attach_reuses_matching_scaffold_host_authority() {
+        let expires_at = now_ms() + 60_000;
+        let responses = vec![
+            sandbox("ready"),
+            serde_json::json!({
+                "ok": true,
+                "exitCode": 0,
+                "stdout": serde_json::json!({
+                    "grantId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "expiresAt": expires_at,
+                    "principalSubject": "alice@example.com",
+                    "scope": scope(),
+                    "sandboxId": "sandbox-a",
+                    "deviceId": "comet-scaffold-sandbox-a-e1",
+                    "lifecycleEpoch": 1,
+                    "capabilities": scaffold_host_capabilities(),
+                })
+                .to_string(),
+            })
+            .to_string(),
+        ];
+        let (origin, captured) = mock_server(responses).await;
+        let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("sc_rc_broad_secret".into()));
+        let runtime = ScaffoldRuntime::new(
+            ScaffoldClient::new(&origin, "project-a", bearer.clone()).unwrap(),
+            "https://comet-edge.example",
+            Arc::new(EdgeDeviceJoinGrantClient::new(&origin, bearer).unwrap()),
+        );
+
+        let result = runtime
+            .control(
+                ScaffoldEnvironmentControl::Attach {
+                    sandbox_id: "sandbox-a".into(),
+                    scope: scope(),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.run_id, None);
+        assert_eq!(
+            result.control_grant,
+            Some(ScaffoldControlGrant {
+                id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                expires_at,
+                capabilities: scaffold_host_capabilities(),
+            })
+        );
+        let requests = captured.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains(r#""comet","scaffold-authority""#));
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.contains("/auth/device-grants"))
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.contains("--device-bootstrap-file"))
+        );
+    }
+
     #[tokio::test]
     async fn omp_handoff_uses_one_use_raw_tar_and_verifies_without_starting_acp() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1855,7 +2594,7 @@ mod tests {
                     "token": "single_use_upload_secret",
                     "tokenEnv": "SCAFFOLD_UPLOAD_TOKEN",
                     "destinationPath": "/workspace/ashler-platform/.scaffold/omp-handoff-staging",
-                    "expiresAt": now_ms() + 60_000,
+                    "expiresAt": chrono::Utc::now().checked_add_signed(chrono::Duration::minutes(1)).unwrap().to_rfc3339(),
                     "command": "SCAFFOLD_UPLOAD_TOKEN=single_use_upload_secret curl ..."
                 }
             })

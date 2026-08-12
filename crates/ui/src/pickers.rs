@@ -22,8 +22,8 @@ use gpui::{
 
 use comet_engine::registry::HarnessDescriptor;
 use comet_proto::{
-    ChatConfig, FolderListing, HarnessCommand, HarnessId, Model, ReasoningLevel, RepoRef,
-    SandboxLevel, SteeringMode,
+    AgentAccount, AgentAccountsSnapshot, AuthState, ChatConfig, FolderListing, HarnessCommand,
+    HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel, SteeringMode,
 };
 use comet_rpc::methods;
 
@@ -50,6 +50,7 @@ pub struct DraftConfig {
     pub harness: Option<HarnessId>,
     pub model: Option<String>,
     pub reasoning: Option<ReasoningLevel>,
+    pub agent_account_id: Option<String>,
     /// option id → choice id (only non-defaults are meaningful).
     pub model_options: serde_json::Map<String, serde_json::Value>,
     /// The picked ref (base branch in NewWorktree mode; a worktree's branch
@@ -105,6 +106,7 @@ pub struct ResolvedRunConfig {
     pub harness: Option<HarnessId>,
     pub model: Option<String>,
     pub reasoning: Option<ReasoningLevel>,
+    pub agent_account_id: Option<String>,
     pub model_options: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -115,6 +117,7 @@ impl ResolvedRunConfig {
             harness: self.harness?,
             model: self.model.clone(),
             reasoning: self.reasoning,
+            agent_account_id: self.agent_account_id.clone(),
             model_options: self.model_options.clone(),
             sandbox: SandboxLevel::WorkspaceWrite,
         })
@@ -158,6 +161,93 @@ pub fn clamp_reasoning(
         Some(level) if ladder.contains(&level) => Some(level),
         _ => default_reasoning(ladder),
     }
+}
+
+/// Shared-account provider for a selected coding-agent model.
+pub fn account_harness_for_model(
+    harness: Option<HarnessId>,
+    model_id: Option<&str>,
+) -> Option<HarnessId> {
+    let harness = harness?;
+    if !matches!(
+        harness,
+        HarnessId::ClaudeCode | HarnessId::Codex | HarnessId::Omp | HarnessId::PrimeAgent
+    ) {
+        return None;
+    }
+    let model = model_id?.trim().to_ascii_lowercase();
+    if model.is_empty() || model == "default" {
+        return match harness {
+            HarnessId::ClaudeCode => Some(HarnessId::ClaudeCode),
+            HarnessId::Codex => Some(HarnessId::Codex),
+            _ => None,
+        };
+    }
+    match harness {
+        HarnessId::ClaudeCode if !model.contains('/') => Some(HarnessId::ClaudeCode),
+        HarnessId::Codex if !model.contains('/') => Some(HarnessId::Codex),
+        _ if model.starts_with("anthropic/") => Some(HarnessId::ClaudeCode),
+        _ if model.starts_with("openai/") || model.starts_with("openai-codex/") => {
+            Some(HarnessId::Codex)
+        }
+        _ => None,
+    }
+}
+
+pub fn compatible_connected_accounts(
+    snapshot: &AgentAccountsSnapshot,
+    account_harness: HarnessId,
+) -> Vec<&AgentAccount> {
+    snapshot
+        .accounts
+        .iter()
+        .filter(|account| !account.migration_available && account.harness == account_harness)
+        .collect()
+}
+
+/// Preserve an explicit pin until Agent Auth validates it. Snapshot absence,
+/// staleness, or a transient load failure must never turn pinned routing into
+/// automatic routing. Models without an Agent Auth provider ignore the pin.
+pub fn resolve_agent_account_id(
+    candidate: Option<&str>,
+    account_harness: Option<HarnessId>,
+    _snapshot: Option<&AgentAccountsSnapshot>,
+) -> Option<String> {
+    account_harness?;
+    let candidate = candidate?.trim();
+    (!candidate.is_empty()).then(|| candidate.to_string())
+}
+
+fn agent_account_label(account: &AgentAccount) -> &str {
+    account
+        .display_name
+        .as_deref()
+        .filter(|label| !label.trim().is_empty())
+        .or_else(|| {
+            account
+                .email
+                .as_deref()
+                .filter(|label| !label.trim().is_empty())
+        })
+        .unwrap_or(match account.harness {
+            HarnessId::ClaudeCode => "Anthropic",
+            HarnessId::Codex => "OpenAI",
+            _ => "Account",
+        })
+}
+
+pub fn selected_agent_account_candidate(
+    persisted: Option<&ChatConfig>,
+    draft: &DraftConfig,
+    draft_applies: bool,
+) -> Option<String> {
+    persisted
+        .and_then(|config| config.agent_account_id.clone())
+        .or_else(|| {
+            draft_applies
+                .then(|| draft.agent_account_id.clone())
+                .flatten()
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -267,6 +357,45 @@ pub enum PickerKind {
     HarnessModel,
     Traits,
 }
+fn is_pending_scaffold_selection(
+    selected_chat: Option<&str>,
+    pending_scaffold_chat: Option<&str>,
+) -> bool {
+    selected_chat.is_some() && selected_chat == pending_scaffold_chat
+}
+fn is_scaffold_selection(
+    selected_chat_is_scaffold_room: bool,
+    selected_chat: Option<&str>,
+    pending_scaffold_chat: Option<&str>,
+) -> bool {
+    selected_chat_is_scaffold_room
+        || is_pending_scaffold_selection(selected_chat, pending_scaffold_chat)
+}
+
+fn draft_config_applies(selected_chat: Option<&str>, pending_scaffold_chat: Option<&str>) -> bool {
+    selected_chat.is_none() || is_pending_scaffold_selection(selected_chat, pending_scaffold_chat)
+}
+
+/// A Scaffold room's remote OMP broker is bound to the control-plane route
+/// chosen at first send. Later control actions carry prompts, not a new route,
+/// so only the pending first-send draft may change model or account.
+fn scaffold_route_picker_locked(
+    selected_chat_is_scaffold_room: bool,
+    selected_chat: Option<&str>,
+    pending_scaffold_chat: Option<&str>,
+) -> bool {
+    selected_chat_is_scaffold_room && !draft_config_applies(selected_chat, pending_scaffold_chat)
+}
+
+fn agent_accounts_owner(auth: Option<&AuthState>) -> Option<(String, String)> {
+    match auth? {
+        AuthState::SignedIn {
+            user,
+            project_scope,
+        } => Some((user.id.clone(), project_scope.clone())),
+        AuthState::SignedOut => None,
+    }
+}
 
 /// Command catalogs vary by harness, repository, and owning device: project
 /// commands and skills are discovered from `cwd`, while remote hosts can have a
@@ -321,6 +450,9 @@ pub struct Pickers {
     /// Synchronous cold-start metadata: `/goal` stays discoverable while the
     /// repository/device-specific OMP catalog is still loading.
     omp_command_fallback: HarnessCommand,
+    agent_accounts: Loadable<AgentAccountsSnapshot>,
+    /// Owner and project scope of the cached account snapshot.
+    agent_accounts_owner: Option<(String, String)>,
     refs: Loadable<Vec<RepoRef>>,
     /// Space id the `refs` slot belongs to (invalidated on space change).
     refs_space: Option<String>,
@@ -343,6 +475,8 @@ pub struct Pickers {
     /// Own slot: the refs load runs concurrently with the eager
     /// harness/model loads — sharing `load_task` would abort one mid-flight.
     refs_task: Option<Task<()>>,
+    /// Own slot so account loading cannot abort harness or refs loading.
+    accounts_task: Option<Task<()>>,
     /// In-flight mid-session `SwitchRef` (the ref being switched to).
     switching: Option<String>,
     switch_task: Option<Task<()>>,
@@ -374,21 +508,46 @@ impl Pickers {
             | ComposerInputEvent::MentionDismiss => {}
         });
         // Chat selection / config changes must re-render the chips (child views
-        // only re-render on their own notify). A selection change also drops
-        // the draft picks — they belonged to the previous chat/new-chat canvas.
+        // only re-render on their own notify). A selection change normally
+        // drops draft picks so they cannot leak into another chat. The pending
+        // Scaffold chat is the exception: it is deliberately created before
+        // first send, and its draft must carry the chosen harness into that
+        // first prompt.
         let state_observe = cx.observe(&state, |this: &mut Self, state, cx| {
-            let selected = state.read(cx).selected_chat.clone();
+            let state = state.read(cx);
+            let selected = state.selected_chat.clone();
+            let pending_scaffold_chat = state
+                .scaffold_session_draft()
+                .map(|draft| draft.chat_id.as_str());
+            let pending_scaffold =
+                is_pending_scaffold_selection(selected.as_deref(), pending_scaffold_chat);
+            let accounts_owner = agent_accounts_owner(state.auth.as_ref());
+            if accounts_owner != this.agent_accounts_owner {
+                this.agent_accounts_owner = accounts_owner;
+                this.accounts_task = None;
+                this.agent_accounts = Loadable::Idle;
+            }
             if selected != this.draft_owner {
-                this.draft_owner = selected;
-                this.config.harness = None;
+                this.draft_owner = selected.clone();
+                if !pending_scaffold {
+                    this.config.harness = None;
+                    this.config.model = None;
+                    this.config.reasoning = None;
+                    this.config.agent_account_id = None;
+                    this.config.model_options.clear();
+                }
+                this.switch_error = None;
+            }
+            if pending_scaffold && this.config.harness != Some(HarnessId::Omp) {
+                this.config.harness = Some(HarnessId::Omp);
                 this.config.model = None;
                 this.config.reasoning = None;
+                this.config.agent_account_id = None;
                 this.config.model_options.clear();
-                this.switch_error = None;
             }
             // A space switch invalidates the branch draft + cache — the folder
             // (and possibly the device) changed under them.
-            let space = state.read(cx).selected_space.clone();
+            let space = state.selected_space.clone();
             if space != this.space_owner {
                 this.space_owner = space;
                 this.config.branch = None;
@@ -426,6 +585,7 @@ impl Pickers {
         };
         let draft_owner = state.read(cx).selected_chat.clone();
         let space_owner = state.read(cx).selected_space.clone();
+        let agent_accounts_owner = agent_accounts_owner(state.read(cx).auth.as_ref());
         Self {
             state,
             space_owner,
@@ -438,6 +598,8 @@ impl Pickers {
             models: HashMap::new(),
             commands: HashMap::new(),
             omp_command_fallback: comet_proto::omp_goal_command(),
+            agent_accounts: Loadable::Idle,
+            agent_accounts_owner,
             refs: Loadable::Idle,
             refs_space: None,
             active: 0,
@@ -448,6 +610,7 @@ impl Pickers {
             boot_focus_pending: open.is_some(),
             load_task: None,
             refs_task: None,
+            accounts_task: None,
             switching: None,
             switch_task: None,
             switch_error: None,
@@ -479,9 +642,42 @@ impl Pickers {
         &self.config
     }
 
-    /// Harness is locked once the chat exists (feature-inventory §1.7).
+    /// Harness is locked once a persisted chat owns its run configuration.
+    /// A pending Scaffold chat is still a first-send draft even though its
+    /// local chat row already exists.
     fn harness_locked(&self, cx: &App) -> bool {
-        self.state.read(cx).selected_chat.is_some()
+        !self.draft_config_applies(cx)
+    }
+
+    fn draft_config_applies(&self, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        draft_config_applies(
+            state.selected_chat.as_deref(),
+            state
+                .scaffold_session_draft()
+                .map(|draft| draft.chat_id.as_str()),
+        )
+    }
+
+    fn scaffold_route_picker_locked(&self, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        scaffold_route_picker_locked(
+            state.selected_chat_is_scaffold_room(),
+            state.selected_chat.as_deref(),
+            state
+                .scaffold_session_draft()
+                .map(|draft| draft.chat_id.as_str()),
+        )
+    }
+    fn is_scaffold_selection(&self, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        is_scaffold_selection(
+            state.selected_chat_is_scaffold_room(),
+            state.selected_chat.as_deref(),
+            state
+                .scaffold_session_draft()
+                .map(|draft| draft.chat_id.as_str()),
+        )
     }
 
     fn engine(&self, cx: &App) -> Option<EngineHandle> {
@@ -499,11 +695,19 @@ impl Pickers {
         (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device)
     }
 
-    /// Effective harness: the selected chat owns its harness; otherwise use the
-    /// new-chat draft, remembered default, or first listed harness.
+    /// Effective harness: a persisted chat owns its harness; otherwise use the
+    /// first-send draft, remembered default, or first listed harness.
     fn effective_harness(&self, cx: &App) -> Option<HarnessId> {
+        if self.is_scaffold_selection(cx) {
+            return Some(HarnessId::Omp);
+        }
         if let Some(chat) = self.state.read(cx).selected_chat_row() {
-            return chat.config.as_ref().map(|config| config.harness);
+            if let Some(config) = chat.config.as_ref() {
+                return Some(config.harness);
+            }
+            if !self.draft_config_applies(cx) {
+                return None;
+            }
         }
         if let Some(harness) = self.config.harness {
             return Some(harness);
@@ -528,14 +732,16 @@ impl Pickers {
             .and_then(|list| visible_harnesses(list).first().map(|d| d.id))
     }
 
-    /// Effective model id: the selected chat owns its persisted model; the
-    /// draft and remembered defaults apply only to the new-chat canvas.
+    /// Effective model id: a persisted chat owns its model; the draft and
+    /// remembered defaults also apply to a pending first-send Scaffold chat.
     fn effective_model_id<'a>(&'a self, cx: &'a App) -> Option<&'a str> {
         if let Some(chat) = self.state.read(cx).selected_chat_row() {
-            return chat
-                .config
-                .as_ref()
-                .and_then(|config| config.model.as_deref());
+            if let Some(config) = chat.config.as_ref() {
+                return config.model.as_deref();
+            }
+            if !self.draft_config_applies(cx) {
+                return None;
+            }
         }
         if let Some(id) = self.config.model.as_deref() {
             return Some(id);
@@ -550,9 +756,17 @@ impl Pickers {
     /// draft pick / chat config / remembered default, clamped to the selected
     /// model's ladder, falling back to the model's default level.
     fn effective_reasoning(&self, cx: &App) -> Option<ReasoningLevel> {
-        let explicit = match self.state.read(cx).selected_chat_row() {
-            Some(chat) => chat.config.as_ref().and_then(|config| config.reasoning),
-            None => self.config.reasoning.or(self.defaults.reasoning),
+        let chat_config = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .and_then(|chat| chat.config.as_ref());
+        let explicit = if let Some(config) = chat_config {
+            config.reasoning
+        } else if self.draft_config_applies(cx) {
+            self.config.reasoning.or(self.defaults.reasoning)
+        } else {
+            None
         };
         if self.selected_model(cx).is_none() {
             // Catalog not loaded yet: show the explicit value as-is (nothing
@@ -577,18 +791,44 @@ impl Pickers {
         }
     }
 
-    /// The explicit (non-default) option picks: the chat's persisted
-    /// selections for existing chats, the draft's for the new-chat canvas.
+    /// The explicit (non-default) option picks: the persisted chat's
+    /// selections, or the first-send draft's selections.
     fn explicit_options(&self, cx: &App) -> serde_json::Map<String, serde_json::Value> {
-        match self
+        if let Some(config) = self
             .state
             .read(cx)
             .selected_chat_row()
-            .and_then(|c| c.config.as_ref())
+            .and_then(|chat| chat.config.as_ref())
         {
-            Some(config) => config.model_options.clone(),
-            None => self.config.model_options.clone(),
+            return config.model_options.clone();
         }
+        if self.draft_config_applies(cx) {
+            return self.config.model_options.clone();
+        }
+        serde_json::Map::new()
+    }
+
+    fn effective_agent_account_id(&self, cx: &App) -> Option<String> {
+        let draft_applies = self.draft_config_applies(cx);
+        let state = self.state.read(cx);
+        let candidate = selected_agent_account_candidate(
+            state
+                .selected_chat_row()
+                .and_then(|chat| chat.config.as_ref()),
+            &self.config,
+            draft_applies,
+        );
+        let account_harness = account_harness_for_model(
+            self.effective_harness(cx),
+            self.selected_model(cx)
+                .map(|model| model.id.as_str())
+                .or_else(|| self.effective_model_id(cx)),
+        );
+        resolve_agent_account_id(
+            candidate.as_deref(),
+            account_harness,
+            self.agent_accounts.ready(),
+        )
     }
 
     /// The fully-resolved config the composer threads into the Run request and
@@ -603,6 +843,7 @@ impl Pickers {
                 // Catalog not loaded (offline): still send the id we know.
                 .or_else(|| self.effective_model_id(cx).map(str::to_string)),
             reasoning: self.effective_reasoning(cx),
+            agent_account_id: self.effective_agent_account_id(cx),
             model_options: self.explicit_options(cx),
         }
     }
@@ -652,6 +893,11 @@ impl Pickers {
         } else {
             kind
         };
+        if kind == PickerKind::HarnessModel && self.scaffold_route_picker_locked(cx) {
+            self.open = None;
+            cx.notify();
+            return;
+        }
         if self.open == Some(kind) {
             self.open = None;
             cx.notify();
@@ -708,6 +954,7 @@ impl Pickers {
                     self.ensure_models(harness, cx);
                     self.ensure_commands(harness, cx);
                 }
+                self.ensure_agent_accounts(cx);
             }
         }
         cx.notify();
@@ -751,6 +998,36 @@ impl Pickers {
                     pickers.ensure_models(harness, cx);
                     pickers.ensure_commands(harness, cx);
                 }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn ensure_agent_accounts(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.agent_accounts, Loadable::Idle) {
+            return;
+        }
+        if self.agent_accounts_owner.is_none() {
+            return;
+        }
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        self.agent_accounts = Loadable::Loading;
+        self.accounts_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::LIST_AGENT_ACCOUNTS, serde_json::json!({}))
+                .await;
+            this.update(cx, |pickers, cx| {
+                pickers.agent_accounts = match result {
+                    Ok(value) => match serde_json::from_value::<AgentAccountsSnapshot>(value) {
+                        Ok(snapshot) => Loadable::Ready(snapshot),
+                        Err(err) => Loadable::Error(err.to_string()),
+                    },
+                    Err(err) => Loadable::Error(err.to_string()),
+                };
                 cx.notify();
             })
             .ok();
@@ -964,9 +1241,9 @@ impl Pickers {
     // ---- selections ----
 
     fn pick_ref(&mut self, row: RepoRef, cx: &mut Context<Self>) {
-        // Existing-session ref picks switch its checkout instead of updating
-        // the draft.
-        if self.state.read(cx).selected_chat_row().is_some() {
+        // Persisted-session ref picks switch its checkout. A pending Scaffold
+        // chat is still a first-send draft and must only update that draft.
+        if self.state.read(cx).selected_chat_row().is_some() && !self.draft_config_applies(cx) {
             self.switch_session_ref(row, cx);
             return;
         }
@@ -1153,6 +1430,9 @@ impl Pickers {
         if self.harness_locked(cx) {
             return;
         }
+        if self.is_scaffold_selection(cx) && harness != HarnessId::Omp {
+            return;
+        }
         if self.config.harness != Some(harness) {
             // The remembered model for this harness takes over via the
             // defaults fallback; a foreign pick must not linger.
@@ -1170,6 +1450,9 @@ impl Pickers {
     }
 
     fn pick_model(&mut self, model_id: String, cx: &mut Context<Self>) {
+        if self.scaffold_route_picker_locked(cx) {
+            return;
+        }
         self.open = None;
         if self.state.read(cx).selected_chat.is_some() {
             // Existing chat: persist to the chat row (Mutate setChatConfig) —
@@ -1201,6 +1484,20 @@ impl Pickers {
             self.config.reasoning = Some(level);
             self.defaults.reasoning = Some(level);
             self.save_defaults();
+        }
+        cx.notify();
+    }
+
+    fn pick_agent_account(&mut self, agent_account_id: Option<String>, cx: &mut Context<Self>) {
+        if self.scaffold_route_picker_locked(cx) {
+            return;
+        }
+        if self.draft_config_applies(cx) {
+            self.config.agent_account_id = agent_account_id;
+        } else {
+            self.update_chat_config(cx, move |config| {
+                config.agent_account_id = agent_account_id;
+            });
         }
         cx.notify();
     }
@@ -1276,6 +1573,13 @@ impl Pickers {
             if !ladder.is_empty() {
                 config.reasoning = clamp_reasoning(config.reasoning, &ladder);
             }
+        }
+        if self.agent_accounts.ready().is_some() {
+            config.agent_account_id = resolve_agent_account_id(
+                config.agent_account_id.as_deref(),
+                account_harness_for_model(Some(config.harness), config.model.as_deref()),
+                self.agent_accounts.ready(),
+            );
         }
         self.state.update(cx, |state, cx| {
             state.apply_chat_config(&chat_id, config.clone());
@@ -1500,28 +1804,22 @@ impl Pickers {
 
     // ---- render ----
 
-    fn trigger_chip(
+    fn model_trigger_chip(
         &self,
-        kind: PickerKind,
         label: SharedString,
         chip_icon: Option<(&'static str, Option<gpui::Hsla>)>,
         suffix: Option<SharedString>,
         theme: &Theme,
+        disabled: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let id: &'static str = match kind {
-            PickerKind::Branch => "picker-branch",
-            PickerKind::Checkout => "picker-checkout",
-            PickerKind::HarnessModel => "picker-model",
-            PickerKind::Traits => "picker-traits",
-        };
-        let open = self.open == Some(kind)
-            || (kind == PickerKind::Traits && self.open == Some(PickerKind::HarnessModel));
+        const ID: &str = "picker-model";
+        let open = self.open == Some(PickerKind::HarnessModel);
         // Ghost pill (comet composer/styles.tsx `pill`): `h-8 rounded-lg px-2.5
         // gap-1.5 text-[12px] font-medium text-muted-foreground`, icons size-4,
         // hover/open wash — no border, no caret; the actions row stays quiet.
         div()
-            .id(id)
+            .id(ID)
             .h(px(32.0))
             .max_w(px(208.0))
             .flex()
@@ -1534,15 +1832,25 @@ impl Pickers {
             .font_weight(gpui::FontWeight::MEDIUM)
             // comet composer/styles.tsx `pill`: `transition-colors` — the wash
             // and text brighten fade over 150ms.
-            .text_color(motion::hover_blend(id, theme.text.opacity(0.9), theme.text))
+            .text_color(if disabled {
+                theme.text_muted.opacity(0.6)
+            } else {
+                motion::hover_blend(ID, theme.text.opacity(0.9), theme.text)
+            })
             .bg(if open {
                 theme.element_hover
+            } else if disabled {
+                gpui::transparent_black()
             } else {
-                motion::hover_blend(id, gpui::transparent_black(), theme.element_hover)
+                motion::hover_blend(ID, gpui::transparent_black(), theme.element_hover)
             })
-            .on_hover(motion::hover_listener(id))
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _, window, cx| this.toggle(kind, window, cx)))
+            .when(!disabled, |el| {
+                el.on_hover(motion::hover_listener(ID)).cursor_pointer()
+            })
+            .when(disabled, |el| el.opacity(0.55))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.toggle(PickerKind::HarnessModel, window, cx);
+            }))
             .when_some(chip_icon, |el, (path, tint)| {
                 el.child(
                     crate::icons::icon(path)
@@ -1636,9 +1944,10 @@ impl Pickers {
     }
 
     /// The composer footer row: checkout-kind on the
-    /// left, the ref selector right-aligned. `None` for non-git spaces. On an
-    /// existing session both sides are read-only labels ("Worktree" /
-    /// "Local checkout" + the chat's branch).
+    /// left, the ref selector right-aligned. `None` for non-git spaces. On a
+    /// persisted session both sides are read-only labels ("Worktree" /
+    /// "Local checkout" + the chat's branch). A pending Scaffold chat remains
+    /// editable until its first send commits the run configuration.
     pub fn render_footer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
         // A selected chat whose workspace row hasn't synced yet (the moment
@@ -1648,10 +1957,15 @@ impl Pickers {
         let (space, session) = {
             let state = self.state.read(cx);
             let space = state.selected_space_row().cloned()?;
-            let session = state
-                .selected_chat
-                .as_ref()
-                .and_then(|_| state.selected_chat_row().cloned());
+            let selected_chat = state.selected_chat.as_deref();
+            let pending_scaffold_chat = state
+                .scaffold_session_draft()
+                .map(|draft| draft.chat_id.as_str());
+            let session = if draft_config_applies(selected_chat, pending_scaffold_chat) {
+                None
+            } else {
+                selected_chat.and_then(|_| state.selected_chat_row().cloned())
+            };
             (space, session)
         };
         if !space.git_detected {
@@ -1816,6 +2130,33 @@ impl Pickers {
                             this.models.clear();
                             this.ensure_harnesses(cx);
                         }
+                    }))
+                    .child(SharedString::from("Retry")),
+            )
+            .into_any_element()
+    }
+
+    fn retry_agent_accounts_row(
+        &self,
+        message: &str,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        popover::error_row(theme, message)
+            .child(
+                div()
+                    .id("agent-accounts-retry")
+                    .px(px(Theme::SPACE_SM))
+                    .py(px(3.0))
+                    .rounded(px(Theme::CONTROL_RADIUS))
+                    .border_1()
+                    .border_color(theme.border)
+                    .text_color(theme.text)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.element_hover))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.agent_accounts = Loadable::Idle;
+                        this.ensure_agent_accounts(cx);
                     }))
                     .child(SharedString::from("Retry")),
             )
@@ -2029,6 +2370,7 @@ impl Pickers {
         let locked = self.harness_locked(cx);
         let effective = self.effective_harness(cx);
         let model_scroll = self.model_scroll.clone();
+        let scaffold_only = self.is_scaffold_selection(cx);
 
         let rail: AnyElement = match &self.harnesses {
             Loadable::Loading | Loadable::Idle => div()
@@ -2052,7 +2394,7 @@ impl Pickers {
                 )
             }
             Loadable::Ready(list) => {
-                let mut descriptors: Vec<HarnessDescriptor> = visible_harnesses(list);
+                let mut descriptors = visible_harnesses_for_selection(list, scaffold_only);
                 // The committed harness always gets its rail tab, even when
                 // it's the (normally hidden) mock harness of a dev session.
                 if let Some(effective) = effective
@@ -2305,6 +2647,89 @@ impl Pickers {
             .into_any_element()
     }
 
+    fn render_account_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let selected = self.effective_agent_account_id(cx);
+        let automatic = popover::menu_row(&theme, selected.is_none(), "agent-account-automatic")
+            .id("agent-account-automatic")
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.pick_agent_account(None, cx);
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(SharedString::from("Automatic")),
+            )
+            .when(selected.is_none(), |el| {
+                el.child(popover::menu_check(&theme))
+            })
+            .into_any_element();
+
+        let account_rows: AnyElement = match &self.agent_accounts {
+            Loadable::Loading | Loadable::Idle => div()
+                .px(px(4.0))
+                .child(popover::skeleton_rows(
+                    "agent-accounts-skeleton",
+                    &theme,
+                    2,
+                    cx.entity_id(),
+                    cx,
+                ))
+                .into_any_element(),
+            Loadable::Error(message) => {
+                let message = message.clone();
+                self.retry_agent_accounts_row(&message, &theme, cx)
+            }
+            Loadable::Ready(snapshot) => {
+                let accounts = account_harness_for_model(
+                    self.effective_harness(cx),
+                    self.selected_model(cx)
+                        .map(|model| model.id.as_str())
+                        .or_else(|| self.effective_model_id(cx)),
+                )
+                .map(|harness| compatible_connected_accounts(snapshot, harness))
+                .unwrap_or_default()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .children(accounts.into_iter().enumerate().map(|(ix, account)| {
+                        let id = account.id.clone();
+                        let is_selected = selected.as_deref() == Some(account.id.as_str());
+                        let label: SharedString = agent_account_label(&account).to_string().into();
+                        popover::menu_row(&theme, is_selected, format!("agent-account-row-{ix}"))
+                            .id(("agent-account-row", ix))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.pick_agent_account(Some(id.clone()), cx);
+                            }))
+                            .child(div().flex_1().min_w_0().truncate().child(label))
+                            .when(is_selected, |el| el.child(popover::menu_check(&theme)))
+                    }))
+                    .into_any_element()
+            }
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .child(popover::menu_heading(&theme, "Account"))
+            .child(
+                div()
+                    .px(px(4.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(automatic)
+                    .child(account_rows),
+            )
+            .into_any_element()
+    }
+
     /// The traits INSPECTOR: the reasoning ladder plus every advertised
     /// model option as headed segmented-chip sections, pinned under the
     /// models pane (formerly menu rows in the shared scroll). Selecting
@@ -2319,6 +2744,7 @@ impl Pickers {
         // Display the effective level (draft pick or the chat's config), so
         // the ladder check mirrors the chip summary.
         let current = self.effective_reasoning(cx);
+        let accounts = self.render_account_section(cx);
 
         let ladder: AnyElement = if levels.is_empty() {
             gpui::Empty.into_any_element()
@@ -2400,6 +2826,7 @@ impl Pickers {
             .gap(px(4.0))
             .pb(px(4.0))
             .child(ladder)
+            .child(accounts)
             .child(options)
             .into_any_element()
     }
@@ -2500,6 +2927,20 @@ fn mock_harness_enabled() -> bool {
 pub fn visible_harnesses(list: &[HarnessDescriptor]) -> Vec<HarnessDescriptor> {
     visible_harnesses_impl(list, mock_harness_enabled())
 }
+fn visible_harnesses_for_selection(
+    list: &[HarnessDescriptor],
+    scaffold_only: bool,
+) -> Vec<HarnessDescriptor> {
+    let visible = visible_harnesses(list);
+    if scaffold_only {
+        visible
+            .into_iter()
+            .filter(|descriptor| descriptor.id == HarnessId::Omp)
+            .collect()
+    } else {
+        visible
+    }
+}
 
 fn visible_harnesses_impl(list: &[HarnessDescriptor], allow_mock: bool) -> Vec<HarnessDescriptor> {
     if allow_mock {
@@ -2548,6 +2989,11 @@ fn attach_overlay_end(
 impl Render for Pickers {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
+        let scaffold_route_locked = self.scaffold_route_picker_locked(cx);
+        if scaffold_route_locked && self.open == Some(PickerKind::HarnessModel) {
+            self.open = None;
+            self.boot_focus_pending = false;
+        }
         // A COMET_OPEN_PICKER popover never went through `toggle`, so claim
         // its keyboard focus here (re-claim until it sticks — the shell's
         // first-paint fallback focuses the composer after our first render).
@@ -2590,6 +3036,9 @@ impl Render for Pickers {
         ) && matches!(self.refs, Loadable::Idle)
         {
             self.ensure_refs(false, cx);
+        }
+        if self.open == Some(PickerKind::HarnessModel) {
+            self.ensure_agent_accounts(cx);
         }
         // Chip shows the model's display name alone (comet `modelText`); the
         // harness reads from the brand mark beside it. Never "Default model":
@@ -2661,12 +3110,12 @@ impl Render for Pickers {
         // ONE combined model+effort chip (user request): brand icon + model
         // name, then the effort level muted with no icon — a single button
         // opening the single merged menu.
-        let combined_chip = self.trigger_chip(
-            PickerKind::HarnessModel,
+        let combined_chip = self.model_trigger_chip(
             model_label,
             Some(harness_icon),
             Some(traits_label),
             &theme,
+            scaffold_route_locked,
             cx,
         );
         let _ = traits_set;
@@ -2701,6 +3150,64 @@ impl Render for Pickers {
 mod tests {
     use super::*;
     use comet_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+
+    #[test]
+    fn pending_scaffold_chat_keeps_first_send_draft_config() {
+        assert!(draft_config_applies(None, None));
+        assert!(draft_config_applies(
+            Some("scaffold-chat"),
+            Some("scaffold-chat")
+        ));
+        assert!(is_pending_scaffold_selection(
+            Some("scaffold-chat"),
+            Some("scaffold-chat")
+        ));
+        assert!(!draft_config_applies(Some("ordinary-chat"), None));
+        assert!(!draft_config_applies(
+            Some("ordinary-chat"),
+            Some("different-scaffold-chat")
+        ));
+    }
+
+    #[test]
+    fn scaffold_route_picker_locks_only_after_the_first_send() {
+        assert!(
+            scaffold_route_picker_locked(true, Some("scaffold-chat"), None),
+            "an existing Scaffold room must keep its original model and account"
+        );
+        assert!(
+            !scaffold_route_picker_locked(true, Some("scaffold-chat"), Some("scaffold-chat")),
+            "a pending first-send Scaffold draft must remain configurable"
+        );
+        assert!(
+            !scaffold_route_picker_locked(false, Some("local-chat"), None),
+            "local persisted chats retain their existing picker behavior"
+        );
+    }
+    #[test]
+    fn scaffold_selection_offers_only_omp() {
+        let descriptor = |id: HarnessId, name: &str| HarnessDescriptor {
+            id,
+            name: name.into(),
+            supports_steering: true,
+            steering_mode: comet_proto::SteeringMode::StepBoundary,
+            reasoning_levels: vec![],
+        };
+        let catalog = vec![
+            descriptor(HarnessId::ClaudeCode, "Claude Code"),
+            descriptor(HarnessId::Codex, "Codex"),
+            descriptor(HarnessId::Omp, "OMP"),
+            descriptor(HarnessId::PrimeAgent, "Prime Agent"),
+        ];
+        let visible = visible_harnesses_for_selection(&catalog, true);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, HarnessId::Omp);
+        assert!(is_scaffold_selection(
+            false,
+            Some("scaffold-chat"),
+            Some("scaffold-chat")
+        ));
+    }
 
     #[test]
     fn traits_summary_formats_non_defaults() {
@@ -2820,10 +3327,154 @@ mod tests {
         resolved.harness = Some(HarnessId::ClaudeCode);
         resolved.model = Some("opus".into());
         resolved.reasoning = Some(ReasoningLevel::High);
+        resolved.agent_account_id = Some("opaque-account-id".into());
         let config = resolved.chat_config().expect("harness set");
         assert_eq!(config.harness, HarnessId::ClaudeCode);
         assert_eq!(config.model.as_deref(), Some("opus"));
+        assert_eq!(
+            config.agent_account_id.as_deref(),
+            Some("opaque-account-id")
+        );
         assert_eq!(config.sandbox, SandboxLevel::WorkspaceWrite);
+    }
+
+    #[test]
+    fn account_filtering_excludes_other_providers_and_local_migrations() {
+        let account = |id: &str, harness: HarnessId, migration_available: bool| AgentAccount {
+            id: id.into(),
+            harness,
+            email: None,
+            plan_label: None,
+            usage_windows: vec![],
+            display_name: None,
+            organization: None,
+            auth_kind: None,
+            migration_available,
+        };
+        let snapshot = AgentAccountsSnapshot {
+            accounts: vec![
+                account("claude-connected", HarnessId::ClaudeCode, false),
+                account("codex-connected", HarnessId::Codex, false),
+                account("claude-local", HarnessId::ClaudeCode, true),
+            ],
+            warnings: vec![],
+        };
+
+        assert_eq!(
+            account_harness_for_model(Some(HarnessId::Omp), Some("anthropic/claude-opus-5")),
+            Some(HarnessId::ClaudeCode)
+        );
+        assert_eq!(
+            account_harness_for_model(Some(HarnessId::PrimeAgent), Some("openai/gpt-5.6-sol")),
+            Some(HarnessId::Codex)
+        );
+        assert_eq!(
+            account_harness_for_model(
+                Some(HarnessId::PrimeAgent),
+                Some("prime-inference/x-ai/grok-4.20")
+            ),
+            None
+        );
+        assert_eq!(
+            account_harness_for_model(
+                Some(HarnessId::Omp),
+                Some("prime-inference/moonshotai/kimi-k3")
+            ),
+            None
+        );
+        let ids = compatible_connected_accounts(&snapshot, HarnessId::ClaudeCode)
+            .into_iter()
+            .map(|account| account.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["claude-connected"]);
+    }
+
+    #[test]
+    fn unresolved_agent_account_pin_never_becomes_automatic() {
+        let snapshot = AgentAccountsSnapshot {
+            accounts: vec![AgentAccount {
+                id: "claude-connected".into(),
+                harness: HarnessId::ClaudeCode,
+                email: None,
+                plan_label: None,
+                usage_windows: vec![],
+                display_name: None,
+                organization: None,
+                auth_kind: None,
+                migration_available: false,
+            }],
+            warnings: vec![],
+        };
+
+        for (candidate, harness, snapshot) in [
+            (
+                "claude-connected",
+                Some(HarnessId::ClaudeCode),
+                Some(&snapshot),
+            ),
+            ("claude-connected", Some(HarnessId::Codex), Some(&snapshot)),
+            ("codex-local", Some(HarnessId::Codex), Some(&snapshot)),
+            ("missing", Some(HarnessId::ClaudeCode), Some(&snapshot)),
+            ("missing", Some(HarnessId::ClaudeCode), None),
+        ] {
+            assert_eq!(
+                resolve_agent_account_id(Some(candidate), harness, snapshot).as_deref(),
+                Some(candidate)
+            );
+        }
+        assert_eq!(
+            resolve_agent_account_id(
+                Some("unused-pin"),
+                account_harness_for_model(
+                    Some(HarnessId::PrimeAgent),
+                    Some("prime-inference/x-ai/grok-4.20")
+                ),
+                Some(&snapshot)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn account_cache_scope_tracks_owner_and_project() {
+        let signed_in = AuthState::SignedIn {
+            user: comet_proto::UserProfile {
+                id: "owner-a".into(),
+                email: "owner@example.com".into(),
+                name: None,
+            },
+            project_scope: "project-a".into(),
+        };
+        assert_eq!(
+            agent_accounts_owner(Some(&signed_in)),
+            Some(("owner-a".into(), "project-a".into()))
+        );
+        assert_eq!(agent_accounts_owner(Some(&AuthState::SignedOut)), None);
+    }
+
+    #[test]
+    fn persisted_account_wins_and_draft_only_applies_to_first_send() {
+        let draft = DraftConfig {
+            agent_account_id: Some("draft-account".into()),
+            ..DraftConfig::default()
+        };
+        let persisted = ChatConfig {
+            harness: HarnessId::ClaudeCode,
+            model: Some("claude-opus-5".into()),
+            reasoning: None,
+            agent_account_id: Some("persisted-account".into()),
+            model_options: Default::default(),
+            sandbox: SandboxLevel::WorkspaceWrite,
+        };
+        assert_eq!(
+            selected_agent_account_candidate(Some(&persisted), &draft, true).as_deref(),
+            Some("persisted-account")
+        );
+        assert_eq!(
+            selected_agent_account_candidate(None, &draft, true).as_deref(),
+            Some("draft-account")
+        );
+        assert_eq!(selected_agent_account_candidate(None, &draft, false), None);
     }
 
     #[test]

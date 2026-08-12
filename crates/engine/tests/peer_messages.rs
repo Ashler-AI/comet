@@ -110,6 +110,7 @@ fn host_chats(core: &EngineCore, chat_ids: &[&str]) {
         harness: HarnessId::Mock,
         model: None,
         reasoning: None,
+        agent_account_id: None,
         model_options: Default::default(),
         sandbox: SandboxLevel::WorkspaceWrite,
     };

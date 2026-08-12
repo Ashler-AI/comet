@@ -16,6 +16,10 @@ loro.workspace = true
 tokio.workspace = true
 futures.workspace = true
 async-trait.workspace = true
+bytes.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 rusqlite.workspace = true
@@ -31,8 +35,9 @@ libc.workspace = true
 sha2.workspace = true
 reqwest.workspace = true
 ignore.workspace = true
+tempfile.workspace = true
+tokio-util.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 tokio-tungstenite.workspace = true
 loro-protocol.workspace = true

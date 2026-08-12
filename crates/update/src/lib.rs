@@ -682,10 +682,10 @@ pub fn version_transition(data_dir: &Path) -> bool {
     let previous = std::fs::read_to_string(&stamp)
         .map(|s| s.trim().to_string())
         .ok();
-    if previous.as_deref() != Some(current_version()) {
-        if let Err(err) = std::fs::write(&stamp, current_version()) {
-            tracing::warn!(error = %err, "boot-version stamp not persisted");
-        }
+    if previous.as_deref() != Some(current_version())
+        && let Err(err) = std::fs::write(&stamp, current_version())
+    {
+        tracing::warn!(error = %err, "boot-version stamp not persisted");
     }
     matches!(previous, Some(prev) if prev != current_version())
 }
@@ -746,6 +746,7 @@ pub type QuiescentCheck = Arc<dyn Fn() -> bool + Send + Sync>;
 /// Resolves the current Comet login bearer for each release request, allowing
 /// the credential to rotate without rebuilding the updater.
 pub type AccessTokenSource = Arc<dyn Fn() -> BoxFuture<'static, Option<String>> + Send + Sync>;
+type HarnessVersionCache = Arc<Mutex<HashMap<PathBuf, (SystemTime, Option<String>)>>>;
 
 /// Background release checker: polls `{edge}/releases` on a 6h cadence and
 /// publishes [`UpdateStatus`] over a watch channel (the `UpdateStatus` RPC
@@ -762,7 +763,7 @@ pub struct Updater {
     /// Agent CLIs tracked alongside the app's own releases.
     harnesses: Arc<Vec<HarnessSpec>>,
     /// `--version` probe results keyed by (path → mtime).
-    version_cache: Arc<Mutex<HashMap<PathBuf, (SystemTime, Option<String>)>>>,
+    version_cache: HarnessVersionCache,
 }
 
 impl Updater {
