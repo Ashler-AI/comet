@@ -8,7 +8,7 @@
 //! grant, marks processed before the side effect, and appends an actor-attributed audit.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 use sha2::{Digest, Sha256};
@@ -360,8 +360,11 @@ pub struct ChatDocHandle {
     last_access: AtomicI64,
     /// Last known snapshot blob size — the eviction budget estimate's input.
     snapshot_bytes: AtomicUsize,
-    room_projection: Option<SessionRoomProjection>,
+    room_projection: Mutex<Option<SessionRoomProjection>>,
     room: Mutex<Option<RoomClient>>,
+    /// Invalidates a room join that was already dialing when an unprojected
+    /// local handle adopts its trusted Scaffold projection.
+    room_generation: AtomicU64,
     /// Serializes idempotent command-id checks with appends for this doc.
     command_lock: Mutex<()>,
     room_join_started: AtomicBool,
@@ -408,6 +411,38 @@ impl ChatDocHandle {
 
     fn touch(&self) {
         self.last_access.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// Adopt the exact trusted Scaffold room for a handle that was opened
+    /// locally before attach completed. A handle may move from unprojected to
+    /// projected once. Projection-aware opens must keep matching exactly;
+    /// ordinary opens preserve an established trusted projection.
+    fn ensure_room_projection(
+        &self,
+        requested: Option<&SessionRoomProjection>,
+    ) -> Result<(), EngineError> {
+        let mut current = lock(&self.room_projection);
+        match (current.as_ref(), requested) {
+            (_, None) => return Ok(()),
+            (Some(existing), Some(requested)) if existing == requested => return Ok(()),
+            (Some(_), Some(_)) => {
+                return Err(EngineError::Other(
+                    "chat is already open with a different session room projection".into(),
+                ));
+            }
+            (None, Some(requested)) => {
+                *current = Some(requested.clone());
+            }
+        }
+        drop(current);
+
+        // A join may already be connected or dialing the legacy room. Bump the
+        // generation before dropping the current client so an old dial cannot
+        // install itself after the new projected join starts.
+        self.room_generation.fetch_add(1, Ordering::AcqRel);
+        drop(lock(&self.room).take());
+        self.room_join_started.store(false, Ordering::Release);
+        Ok(())
     }
 
     pub fn connected(&self) -> bool {
@@ -849,9 +884,11 @@ impl DocHost {
             return;
         }
 
+        let generation = handle.room_generation.load(Ordering::Acquire);
+        let projection = lock(&handle.room_projection).clone();
         let url = edge.room_url_for(
             format!("/session/{}/ws", handle.chat_id),
-            handle.room_projection.as_ref(),
+            projection.as_ref(),
         );
         let room_doc = handle.doc.doc().clone();
         let chat = handle.chat_id.clone();
@@ -860,7 +897,9 @@ impl DocHost {
             let mut wake = comet_sync::wake::subscribe();
             let mut backoff = crate::workspace_host::JOIN_RETRY_BASE;
             loop {
-                if weak.upgrade().is_none() {
+                if !weak.upgrade().is_some_and(|handle| {
+                    handle.room_generation.load(Ordering::Acquire) == generation
+                }) {
                     return;
                 }
                 match RoomClient::connect_via(url.clone(), &chat, room_doc.clone()).await {
@@ -868,7 +907,11 @@ impl DocHost {
                         let Some(handle) = weak.upgrade() else {
                             return;
                         };
-                        *lock(&handle.room) = Some(client);
+                        let mut room = lock(&handle.room);
+                        if handle.room_generation.load(Ordering::Acquire) != generation {
+                            return;
+                        }
+                        *room = Some(client);
                         tracing::info!(chat = %chat, "session room joined");
                         return;
                     }
@@ -909,10 +952,8 @@ impl DocHost {
     }
 
     /// Return an existing projection-aware handle, or open an ordinary local
-    /// handle when no controller has attached this chat yet.
-    ///
-    /// Reopening an attached Scaffold chat through `open()` would discard the
-    /// trusted room projection.
+    /// handle when no controller has attached this chat yet. Ordinary opens
+    /// preserve any trusted projection already installed on the handle.
     pub(crate) fn open_existing_or_local(
         &self,
         chat_id: &str,
@@ -983,11 +1024,7 @@ impl DocHost {
             ));
         }
         if let Some(handle) = lock(&self.inner.handles).get(chat_id) {
-            if handle.room_projection.as_ref() != projection {
-                return Err(EngineError::Other(
-                    "chat is already open with a different session room projection".into(),
-                ));
-            }
+            handle.ensure_room_projection(projection)?;
             handle.touch();
             self.start_room_join(handle.clone());
             return Ok(handle.clone());
@@ -1022,8 +1059,9 @@ impl DocHost {
             mirror_dirty: AtomicBool::new(true),
             last_access: AtomicI64::new(now_ms()),
             snapshot_bytes: AtomicUsize::new(snapshot_len),
-            room_projection: projection.cloned(),
+            room_projection: Mutex::new(projection.cloned()),
             room: Mutex::new(None),
+            room_generation: AtomicU64::new(0),
             command_lock: Mutex::new(()),
             room_join_started: AtomicBool::new(false),
             _sub: sub,
@@ -1031,11 +1069,7 @@ impl DocHost {
         let racing = {
             let mut handles = lock(&self.inner.handles);
             if let Some(existing) = handles.get(chat_id) {
-                if existing.room_projection.as_ref() != projection {
-                    return Err(EngineError::Other(
-                        "chat raced open with a different session room projection".into(),
-                    ));
-                }
+                existing.ensure_room_projection(projection)?;
                 Some(existing.clone())
             } else {
                 handles.insert(chat_id.to_string(), handle.clone());
@@ -1057,15 +1091,10 @@ impl DocHost {
     /// Bind a per-agent-session execution key to the shared thread document. SessionsEngine
     /// remains keyed by its first argument, so distinct keys run concurrently while every
     /// writer receives the same `SessionDoc` and publications CRDT-merge in one room.
-    fn bind_session_execution_key(
-        &self,
-        chat_id: &str,
-        session_id: &str,
-    ) -> Result<String, EngineError> {
-        let handle = self.open(chat_id)?;
-        let key = format!("{chat_id}::session::{session_id}");
-        lock(&self.inner.handles).insert(key.clone(), handle);
-        Ok(key)
+    fn bind_session_execution_key(&self, handle: &Arc<ChatDocHandle>, session_id: &str) -> String {
+        let key = format!("{}::session::{session_id}", handle.chat_id);
+        lock(&self.inner.handles).insert(key.clone(), handle.clone());
+        key
     }
 
     /// LRU eviction: while the warm set exceeds [`WARM_DOC_CAP`] or the
@@ -1366,13 +1395,10 @@ impl DocHost {
             status: SessionCommandStatus::Pending,
             resolution: None,
         };
-        let nudge_route =
-            self.command_nudge_route(chat_id, handle.room_projection.as_ref(), &entry);
-        let authorized_local_scaffold_command = self.edge_grant_authorizes_local_scaffold_command(
-            chat_id,
-            handle.room_projection.as_ref(),
-            &entry,
-        );
+        let projection = lock(&handle.room_projection).clone();
+        let nudge_route = self.command_nudge_route(chat_id, projection.as_ref(), &entry);
+        let authorized_local_scaffold_command =
+            self.edge_grant_authorizes_local_scaffold_command(chat_id, projection.as_ref(), &entry);
         if matches!(
             &entry.payload,
             SessionCommandPayload::Control {
@@ -2008,7 +2034,7 @@ impl DocHost {
                         Some("command addressed to another session owner".into()),
                     ));
                 }
-                let execution_key = self.bind_session_execution_key(chat_id, session_id)?;
+                let execution_key = self.bind_session_execution_key(handle, session_id);
                 match action.as_ref() {
                     SessionControlAction::Start {
                         request,
@@ -2970,7 +2996,7 @@ mod authority_tests {
             .expect("the verified room grant should route subsequent nudges");
         assert!(Arc::ptr_eq(&exact_handle, &nudged_handle));
         assert_eq!(
-            nudged_handle.room_projection.as_ref(),
+            lock(&nudged_handle.room_projection).as_ref(),
             Some(&SessionRoomProjection {
                 project_id: "project-a".into(),
                 deployment_id: "deployment-a".into(),
@@ -3000,6 +3026,153 @@ mod authority_tests {
             error
                 .to_string()
                 .contains("does not match its attached room")
+        );
+    }
+
+    #[tokio::test]
+    async fn projected_room_adopts_existing_handle_for_session_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let workspace = WorkspaceHost::open(
+            store.clone(),
+            crate::workspace_host::WorkspaceHostConfig {
+                device_id: "comet-scaffold-smoke-001-e1".into(),
+                device_name: "test".into(),
+                platform: "test".into(),
+                project_scope: "project-a".into(),
+                user_id: "accounts.google.com:owner@example.com".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "comet-scaffold-smoke-001-e1".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        host.set_workspace(workspace);
+        let projection = SessionRoomProjection {
+            project_id: "project-a".into(),
+            deployment_id: "deployment-a".into(),
+            session_id: "session-a".into(),
+        };
+        let local_handle = host.open("session-a").unwrap();
+        let room_handle = host
+            .open_projection("session-a", Some(&projection))
+            .unwrap();
+        assert!(Arc::ptr_eq(&local_handle, &room_handle));
+        assert!(Arc::ptr_eq(
+            &room_handle,
+            &host
+                .open("session-a")
+                .expect("ordinary reopen must preserve the trusted projection")
+        ));
+        let mismatched_projection = SessionRoomProjection {
+            deployment_id: "deployment-b".into(),
+            ..projection.clone()
+        };
+        assert!(
+            host.open_projection("session-a", Some(&mismatched_projection))
+                .err()
+                .expect("mismatched projection must fail")
+                .to_string()
+                .contains("different session room projection")
+        );
+
+        let execution_key = host.bind_session_execution_key(&room_handle, "agent-a");
+        let execution_handle = host.open_existing_or_local(&execution_key).unwrap();
+
+        assert!(Arc::ptr_eq(&room_handle, &execution_handle));
+        assert_eq!(
+            lock(&execution_handle.room_projection).as_ref(),
+            Some(&projection)
+        );
+    }
+
+    #[tokio::test]
+    async fn projected_room_control_start_reuses_attached_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let workspace = WorkspaceHost::open(
+            store.clone(),
+            crate::workspace_host::WorkspaceHostConfig {
+                device_id: "comet-scaffold-smoke-001-e1".into(),
+                device_name: "test".into(),
+                platform: "test".into(),
+                project_scope: "project-a".into(),
+                user_id: "accounts.google.com:owner@example.com".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "comet-scaffold-smoke-001-e1".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        host.set_workspace(workspace);
+        let projection = SessionRoomProjection {
+            project_id: "project-a".into(),
+            deployment_id: "deployment-a".into(),
+            session_id: "session-a".into(),
+        };
+        let handle = host
+            .open_projection("session-a", Some(&projection))
+            .unwrap();
+        let registry = crate::HarnessRegistry::for_profile(comet_proto::RuntimeProfile::Mock);
+        registry.register(Arc::new(comet_harness::mock::MockHarness {
+            script: vec![],
+        }));
+        let sessions = SessionsEngine::new(
+            "comet-scaffold-smoke-001-e1".into(),
+            Arc::new(crate::RunJournal::open(dir.path().join("journal")).unwrap()),
+            Arc::new(registry),
+            27654,
+        );
+        sessions.set_doc_host(host.clone());
+        let now = now_ms();
+        let command = SessionCommandEntry {
+            id: "command-start".into(),
+            payload: SessionCommandPayload::Control {
+                session_id: "session-a".into(),
+                owner_device_id: "comet-scaffold-smoke-001-e1".into(),
+                actor_device_id: "operator-device".into(),
+                actor_subject: "accounts.google.com:owner@example.com".into(),
+                grant_id: "grant-a".into(),
+                source: AgentSessionSource::Scaffold,
+                action: Box::new(SessionControlAction::Start {
+                    request: comet_proto::RunRequest {
+                        prompt: "hello".into(),
+                        model: None,
+                        agent_account_id: None,
+                        reasoning: None,
+                        model_options: Default::default(),
+                        cwd: "/workspace".into(),
+                        sandbox: comet_proto::SandboxLevel::DangerFullAccess,
+                        auto_approve: true,
+                        resume: None,
+                        attachments: vec![],
+                    },
+                    message_id: "message-start".into(),
+                }),
+            },
+            issued_by: "operator-device".into(),
+            issued_at: now,
+            based_on: None,
+            expires_at: Some(now + 60_000),
+            status: SessionCommandStatus::Pending,
+            resolution: None,
+        };
+
+        assert_eq!(
+            host.execute(&sessions, &handle, &command).await.unwrap(),
+            (SessionCommandStatus::Applied, None)
         );
     }
 

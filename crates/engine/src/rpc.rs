@@ -1884,6 +1884,17 @@ impl RpcService for EngineRpc {
             methods::LOCAL_DEVICE => {
                 RpcReply::value(&serde_json::json!({ "deviceId": self.doc_host.device_id() }))
             }
+            methods::SCAFFOLD_HOST_AUTHORITY => {
+                if self.runtime_profile != RuntimeProfile::ScaffoldHost {
+                    return Err(RpcError::Failed(
+                        "scaffold_host_authority_disabled_by_runtime_profile".into(),
+                    ));
+                }
+                let authority = self.auth()?.device_grant_authority().ok_or_else(|| {
+                    RpcError::Failed("scaffold_host_authority_unavailable".into())
+                })?;
+                RpcReply::value(&authority)
+            }
             methods::UPDATE_STATUS => Ok(RpcReply::Stream(watch_stream(self.updater()?.watch()))),
             methods::STAGE_UPDATE => {
                 let staged = self

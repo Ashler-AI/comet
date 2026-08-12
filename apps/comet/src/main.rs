@@ -26,6 +26,8 @@ enum Command {
     Logout,
     /// Show auth + engine status (exits nonzero when a sign-in is needed).
     Status,
+    #[command(hide = true)]
+    ScaffoldAuthority,
     /// Live sync introspection from the running engine: per-room connection
     /// state, last pushed-frame/ack ages, rejoin/probe/resync counters.
     Sync,
@@ -259,6 +261,10 @@ fn main() -> anyhow::Result<()> {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(auth_cli::status(engine_config_from_env()))
         }
+        Some(Command::ScaffoldAuthority) => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(scaffold_authority_cli(engine_config_from_env().ipc_port))
+        }
         Some(Command::Sync) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(sync_cli(engine_config_from_env().ipc_port))
@@ -377,6 +383,21 @@ fn harness_from_env() -> comet_engine::HarnessId {
 fn dirs_data_dir() -> std::path::PathBuf {
     let home = std::env::var_os("HOME").expect("HOME not set");
     std::path::PathBuf::from(home).join(".comet-native")
+}
+
+async fn scaffold_authority_cli(ipc_port: u16) -> anyhow::Result<()> {
+    let client = comet_rpc::connect_ws(&format!("ws://127.0.0.1:{ipc_port}"))
+        .await
+        .map_err(|error| anyhow::anyhow!("scaffold host unavailable: {error}"))?;
+    let authority = client
+        .call(
+            comet_rpc::methods::SCAFFOLD_HOST_AUTHORITY,
+            serde_json::json!({}),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("ScaffoldHostAuthority failed: {error}"))?;
+    println!("{}", serde_json::to_string(&authority)?);
+    Ok(())
 }
 
 /// `comet sync`: dial the running engine's IPC and print per-room sync state.

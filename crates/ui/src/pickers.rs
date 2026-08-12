@@ -363,6 +363,14 @@ fn is_pending_scaffold_selection(
 ) -> bool {
     selected_chat.is_some() && selected_chat == pending_scaffold_chat
 }
+fn is_scaffold_selection(
+    selected_chat_is_scaffold_room: bool,
+    selected_chat: Option<&str>,
+    pending_scaffold_chat: Option<&str>,
+) -> bool {
+    selected_chat_is_scaffold_room
+        || is_pending_scaffold_selection(selected_chat, pending_scaffold_chat)
+}
 
 fn draft_config_applies(selected_chat: Option<&str>, pending_scaffold_chat: Option<&str>) -> bool {
     selected_chat.is_none() || is_pending_scaffold_selection(selected_chat, pending_scaffold_chat)
@@ -476,6 +484,8 @@ impl Pickers {
             let pending_scaffold_chat = state
                 .scaffold_session_draft()
                 .map(|draft| draft.chat_id.as_str());
+            let pending_scaffold =
+                is_pending_scaffold_selection(selected.as_deref(), pending_scaffold_chat);
             let accounts_owner = agent_accounts_owner(state.auth.as_ref());
             if accounts_owner != this.agent_accounts_owner {
                 this.agent_accounts_owner = accounts_owner;
@@ -484,7 +494,7 @@ impl Pickers {
             }
             if selected != this.draft_owner {
                 this.draft_owner = selected.clone();
-                if !is_pending_scaffold_selection(selected.as_deref(), pending_scaffold_chat) {
+                if !pending_scaffold {
                     this.config.harness = None;
                     this.config.model = None;
                     this.config.reasoning = None;
@@ -492,6 +502,13 @@ impl Pickers {
                     this.config.model_options.clear();
                 }
                 this.switch_error = None;
+            }
+            if pending_scaffold && this.config.harness != Some(HarnessId::Omp) {
+                this.config.harness = Some(HarnessId::Omp);
+                this.config.model = None;
+                this.config.reasoning = None;
+                this.config.agent_account_id = None;
+                this.config.model_options.clear();
             }
             // A space switch invalidates the branch draft + cache — the folder
             // (and possibly the device) changed under them.
@@ -616,6 +633,16 @@ impl Pickers {
                 .map(|draft| draft.chat_id.as_str()),
         )
     }
+    fn is_scaffold_selection(&self, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        is_scaffold_selection(
+            state.selected_chat_is_scaffold_room(),
+            state.selected_chat.as_deref(),
+            state
+                .scaffold_session_draft()
+                .map(|draft| draft.chat_id.as_str()),
+        )
+    }
 
     fn engine(&self, cx: &App) -> Option<EngineHandle> {
         self.state.read(cx).engine().cloned()
@@ -635,6 +662,9 @@ impl Pickers {
     /// Effective harness: a persisted chat owns its harness; otherwise use the
     /// first-send draft, remembered default, or first listed harness.
     fn effective_harness(&self, cx: &App) -> Option<HarnessId> {
+        if self.is_scaffold_selection(cx) {
+            return Some(HarnessId::Omp);
+        }
         if let Some(chat) = self.state.read(cx).selected_chat_row() {
             if let Some(config) = chat.config.as_ref() {
                 return Some(config.harness);
@@ -1349,6 +1379,9 @@ impl Pickers {
 
     fn pick_harness(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
         if self.harness_locked(cx) {
+            return;
+        }
+        if self.is_scaffold_selection(cx) && harness != HarnessId::Omp {
             return;
         }
         if self.config.harness != Some(harness) {
@@ -2288,6 +2321,7 @@ impl Pickers {
         let locked = self.harness_locked(cx);
         let effective = self.effective_harness(cx);
         let model_scroll = self.model_scroll.clone();
+        let scaffold_only = self.is_scaffold_selection(cx);
 
         let rail: AnyElement = match &self.harnesses {
             Loadable::Loading | Loadable::Idle => div()
@@ -2311,7 +2345,7 @@ impl Pickers {
                 )
             }
             Loadable::Ready(list) => {
-                let mut descriptors: Vec<HarnessDescriptor> = visible_harnesses(list);
+                let mut descriptors = visible_harnesses_for_selection(list, scaffold_only);
                 // The committed harness always gets its rail tab, even when
                 // it's the (normally hidden) mock harness of a dev session.
                 if let Some(effective) = effective
@@ -2844,6 +2878,20 @@ fn mock_harness_enabled() -> bool {
 pub fn visible_harnesses(list: &[HarnessDescriptor]) -> Vec<HarnessDescriptor> {
     visible_harnesses_impl(list, mock_harness_enabled())
 }
+fn visible_harnesses_for_selection(
+    list: &[HarnessDescriptor],
+    scaffold_only: bool,
+) -> Vec<HarnessDescriptor> {
+    let visible = visible_harnesses(list);
+    if scaffold_only {
+        visible
+            .into_iter()
+            .filter(|descriptor| descriptor.id == HarnessId::Omp)
+            .collect()
+    } else {
+        visible
+    }
+}
 
 fn visible_harnesses_impl(list: &[HarnessDescriptor], allow_mock: bool) -> Vec<HarnessDescriptor> {
     if allow_mock {
@@ -3086,6 +3134,30 @@ mod tests {
             !scaffold_route_picker_locked(false, Some("local-chat"), None),
             "local persisted chats retain their existing picker behavior"
         );
+    }
+    #[test]
+    fn scaffold_selection_offers_only_omp() {
+        let descriptor = |id: HarnessId, name: &str| HarnessDescriptor {
+            id,
+            name: name.into(),
+            supports_steering: true,
+            steering_mode: comet_proto::SteeringMode::StepBoundary,
+            reasoning_levels: vec![],
+        };
+        let catalog = vec![
+            descriptor(HarnessId::ClaudeCode, "Claude Code"),
+            descriptor(HarnessId::Codex, "Codex"),
+            descriptor(HarnessId::Omp, "OMP"),
+            descriptor(HarnessId::PrimeAgent, "Prime Agent"),
+        ];
+        let visible = visible_harnesses_for_selection(&catalog, true);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, HarnessId::Omp);
+        assert!(is_scaffold_selection(
+            false,
+            Some("scaffold-chat"),
+            Some("scaffold-chat")
+        ));
     }
 
     #[test]

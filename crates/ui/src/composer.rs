@@ -103,45 +103,25 @@ fn scaffold_agent_binding(
     selected_model: Option<&str>,
     agent_account_id: Option<&str>,
 ) -> Option<ScaffoldAgentBinding> {
-    let harness = harness?;
-    if !matches!(
-        harness,
-        HarnessId::ClaudeCode | HarnessId::Codex | HarnessId::Omp | HarnessId::PrimeAgent
-    ) {
+    if harness? != HarnessId::Omp {
         return None;
     }
     let selected = selected_model
         .map(str::trim)
         .filter(|model| !model.is_empty() && *model != "default")?;
     let lower = selected.to_ascii_lowercase();
-    let provider = match harness {
-        HarnessId::ClaudeCode if !lower.contains('/') => AgentProvider::Anthropic,
-        HarnessId::Codex if !lower.contains('/') => AgentProvider::OpenAi,
-        _ if lower.starts_with("anthropic/") => AgentProvider::Anthropic,
-        _ if lower.starts_with("openai/") || lower.starts_with("openai-codex/") => {
-            AgentProvider::OpenAi
-        }
-        _ => return None,
+    let provider = if lower.starts_with("anthropic/") {
+        AgentProvider::Anthropic
+    } else if lower.starts_with("openai/") || lower.starts_with("openai-codex/") {
+        AgentProvider::OpenAi
+    } else {
+        return None;
     };
-    let model = selected
-        .rsplit_once('/')
-        .map(|(_, model)| model)
-        .unwrap_or(selected);
+    let (_, model) = selected.rsplit_once('/')?;
     if model.is_empty() {
         return None;
     }
-    // Preserve catalog selectors verbatim. Native Claude Code and Codex
-    // catalogs use provider-local ids, so qualify those once at this boundary
-    // using the corresponding OMP catalog provider.
-    let model_id = if selected.contains('/') {
-        selected.to_string()
-    } else {
-        let qualifier = match provider {
-            AgentProvider::Anthropic => "anthropic",
-            AgentProvider::OpenAi => "openai-codex",
-        };
-        format!("{qualifier}/{model}")
-    };
+    let model_id = selected.to_string();
     let account_id = agent_account_id.map(str::trim).filter(|id| !id.is_empty());
     let route = match account_id {
         Some(account_id) => AgentRoute::pinned(provider, model, account_id),
@@ -3321,6 +3301,13 @@ struct ControlRoute {
     actor_subject: String,
     grant_id: String,
     source: AgentSessionSource,
+    scaffold: Option<ScaffoldControlTarget>,
+}
+
+#[derive(Debug, Clone)]
+struct ScaffoldControlTarget {
+    sandbox_id: String,
+    scope: comet_proto::CollaborationScope,
 }
 
 fn control_route_grant_id(
@@ -3883,8 +3870,11 @@ impl Composer {
         let catalog = self.pickers.read(cx).harness_commands(cx).to_vec();
         self.mention.commands = matching_commands(&catalog, token);
         let count = self.mention.commands.len() + self.mention.results.len();
-        self.mention.active =
-            (count > 0).then_some(self.mention.active.unwrap_or(0).min(count - 1));
+        self.mention.active = if count == 0 {
+            None
+        } else {
+            Some(self.mention.active.unwrap_or(0).min(count - 1))
+        };
         self.sync_mention_controls(cx);
     }
 
@@ -4386,6 +4376,22 @@ impl Composer {
                 grant_id,
             )
         };
+        let scaffold = if source == AgentSessionSource::Scaffold {
+            let grant = snapshot
+                .grants
+                .iter()
+                .find(|grant| grant.id == grant_id)
+                .ok_or_else(|| SharedString::from("Reconnect to control this session"))?;
+            Some(ScaffoldControlTarget {
+                sandbox_id: grant
+                    .sandbox_id
+                    .clone()
+                    .ok_or_else(|| SharedString::from("Reconnect to control this session"))?,
+                scope: grant.scope.clone(),
+            })
+        } else {
+            None
+        };
         Ok(Some(ControlRoute {
             session_id,
             owner_device_id,
@@ -4393,6 +4399,7 @@ impl Composer {
             actor_subject: principal.subject.clone(),
             grant_id,
             source,
+            scaffold,
         }))
     }
 
@@ -4775,7 +4782,9 @@ impl Composer {
             });
         }
         self.send_task = Some(cx.spawn(async move |this, cx| {
-            let mut scaffold_attached = false;
+            let mut scaffold_attached = control_route
+                .as_ref()
+                .is_some_and(|route| route.source == AgentSessionSource::Scaffold);
             let result: Result<(), String> = async {
                 let mut control_route = control_route;
                 let mut host_device_id = host_device_id;
@@ -4785,6 +4794,9 @@ impl Composer {
                     let mut sandbox_id = None;
                     let mut pending_attachment = None;
                     let mut last_error = None;
+                    let scaffold_retry_executor = cx.background_executor().clone();
+                    let scaffold_retry_delay =
+                        move |delay| scaffold_retry_executor.timer(delay);
                     let launch = crate::state::create_and_attach_scaffold_session(
                         &engine,
                         &scope,
@@ -4793,6 +4805,7 @@ impl Composer {
                             .as_ref()
                             .expect("Scaffold route is resolved before launch")
                             .route,
+                        &scaffold_retry_delay,
                     );
                     let deadline = cx.background_executor().timer(SCAFFOLD_DEMO_WAIT);
                     futures::pin_mut!(launch);
@@ -4882,6 +4895,10 @@ impl Composer {
                                     actor_subject: attachment.actor_subject.clone(),
                                     grant_id: attachment.grant_id.clone(),
                                     source: AgentSessionSource::Scaffold,
+                                    scaffold: Some(ScaffoldControlTarget {
+                                        sandbox_id: created_id.to_string(),
+                                        scope: authoritative_scope.clone(),
+                                    }),
                                 });
                                 this.update(cx, |composer, cx| {
                                     composer.state.update(cx, |state, cx| {
@@ -4920,6 +4937,47 @@ impl Composer {
                         composer.state.update(cx, |state, cx| {
                             state.clear_scaffold_chat_starting(&err_chat_id, cx);
                             cx.notify();
+                        });
+                    })
+                    .ok();
+                }
+                if !scaffold_demo
+                    && let Some(target) = control_route
+                        .as_ref()
+                        .and_then(|route| route.scaffold.clone())
+                {
+                    let scaffold_retry_executor = cx.background_executor().clone();
+                    let scaffold_retry_delay =
+                        move |delay| scaffold_retry_executor.timer(delay);
+                    let attachment = crate::state::ensure_scaffold_session_attached(
+                        &engine,
+                        &target.sandbox_id,
+                        &target.scope,
+                        &scaffold_retry_delay,
+                    )
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!(
+                            sandbox_id = %target.sandbox_id,
+                            error = %error,
+                            "Scaffold session reconnect failed"
+                        );
+                        "Reconnect to control this session".to_string()
+                    })?;
+                    host_device_id = Some(attachment.owner_device_id.clone());
+                    attached_scaffold_source_ref = attachment
+                        .source_ref
+                        .clone()
+                        .or(attached_scaffold_source_ref);
+                    let route = control_route
+                        .as_mut()
+                        .expect("Scaffold reconnect preserves its control route");
+                    route.session_id = attachment.projection.session_id.clone();
+                    route.owner_device_id = attachment.owner_device_id.clone();
+                    route.grant_id = attachment.grant_id.clone();
+                    this.update(cx, |composer, cx| {
+                        composer.state.update(cx, |state, cx| {
+                            state.install_scaffold_session(&attachment, cx);
                         });
                     })
                     .ok();
@@ -6180,12 +6238,9 @@ mod tests {
 
     #[test]
     fn scaffold_openai_binding_persists_and_sends_exact_model_identity() {
-        let binding = scaffold_agent_binding(
-            Some(HarnessId::Codex),
-            Some("openai-codex/gpt-5.6-sol"),
-            None,
-        )
-        .unwrap();
+        let binding =
+            scaffold_agent_binding(Some(HarnessId::Omp), Some("openai-codex/gpt-5.6-sol"), None)
+                .unwrap();
         assert_eq!(binding.route.provider, AgentProvider::OpenAi);
         assert_eq!(binding.route.model, "gpt-5.6-sol");
         assert_eq!(binding.model_id, "openai-codex/gpt-5.6-sol");
@@ -6202,8 +6257,8 @@ mod tests {
     #[test]
     fn scaffold_anthropic_binding_persists_and_sends_exact_model_identity() {
         let binding = scaffold_agent_binding(
-            Some(HarnessId::ClaudeCode),
-            Some("claude-opus-5"),
+            Some(HarnessId::Omp),
+            Some("anthropic/claude-opus-5"),
             Some("opaque-account-id"),
         )
         .unwrap();
@@ -6225,18 +6280,26 @@ mod tests {
     }
 
     #[test]
-    fn scaffold_binding_rejects_non_oauth_models() {
+    fn scaffold_binding_rejects_non_omp_harnesses_and_non_oauth_models() {
+        for harness in [
+            HarnessId::ClaudeCode,
+            HarnessId::Codex,
+            HarnessId::OpenCode,
+            HarnessId::PrimeAgent,
+        ] {
+            assert!(
+                scaffold_agent_binding(
+                    Some(harness),
+                    Some("openai-codex/gpt-5.6-sol"),
+                    Some("opaque-account-id")
+                )
+                .is_none(),
+                "Scaffold must run exclusively through OMP"
+            );
+        }
         assert!(
             scaffold_agent_binding(
-                Some(HarnessId::OpenCode),
-                Some("gpt-5.6-sol"),
-                Some("opaque-account-id")
-            )
-            .is_none()
-        );
-        assert!(
-            scaffold_agent_binding(
-                Some(HarnessId::PrimeAgent),
+                Some(HarnessId::Omp),
                 Some("prime-inference/x-ai/grok-4.20"),
                 Some("opaque-account-id")
             )

@@ -79,6 +79,9 @@ pub mod methods {
     /// This engine's identity → `{deviceId}` (IPC-only; never relay-forwarded —
     /// the answer is about whichever engine you are directly connected to).
     pub const LOCAL_DEVICE: &str = "LocalDevice";
+    /// Non-secret edge grant metadata for a deployment-bound Scaffold host.
+    /// IPC-only; local controllers use it to reuse an already-running host.
+    pub const SCAFFOLD_HOST_AUTHORITY: &str = "ScaffoldHostAuthority";
     pub const AUTH_STATUS: &str = "AuthStatus";
     // AuthRpc mutations (feature-inventory §2 AuthRpc; IPC-only).
     pub const SIGN_IN: &str = "SignIn";

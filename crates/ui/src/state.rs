@@ -540,18 +540,138 @@ pub(crate) async fn attach_scaffold_session(
         source_ref,
     })
 }
+const SCAFFOLD_ATTACH_MAX_ATTEMPTS: usize = 60;
+#[cfg(not(test))]
+const SCAFFOLD_ATTACH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+#[cfg(test)]
+const SCAFFOLD_ATTACH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
+
+fn is_retryable_scaffold_attach_error(error: &RpcError) -> bool {
+    matches!(
+        error,
+        RpcError::Failed(message)
+            if message.contains("scaffold_api_error:502:scaffold_request_rejected")
+                || message.contains(
+                    "scaffold_api_error:409:sandbox_provider_error:Sandbox lifecycle changed while the operation was in flight",
+                )
+    )
+}
+
+async fn attach_scaffold_session_with_retry<Wait, WaitFuture>(
+    handle: &EngineHandle,
+    sandbox_id: &str,
+    scope: CollaborationScope,
+    wait: &Wait,
+) -> Result<ScaffoldSessionAttachment, RpcError>
+where
+    Wait: Fn(std::time::Duration) -> WaitFuture,
+    WaitFuture: Future<Output = ()>,
+{
+    let mut attempt = 1;
+    loop {
+        match attach_scaffold_session(handle, sandbox_id, scope.clone()).await {
+            Ok(attachment) => return Ok(attachment),
+            Err(error)
+                if attempt < SCAFFOLD_ATTACH_MAX_ATTEMPTS
+                    && is_retryable_scaffold_attach_error(&error) =>
+            {
+                attempt += 1;
+                wait(SCAFFOLD_ATTACH_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Reconnect an existing Scaffold room. Paused sandboxes resume before a fresh,
+/// lifecycle-bound device grant is installed; active sandboxes only reattach.
+pub(crate) async fn ensure_scaffold_session_attached<Wait, WaitFuture>(
+    handle: &EngineHandle,
+    sandbox_id: &str,
+    scope: &CollaborationScope,
+    wait: &Wait,
+) -> Result<ScaffoldSessionAttachment, RpcError>
+where
+    Wait: Fn(std::time::Duration) -> WaitFuture,
+    WaitFuture: Future<Output = ()>,
+{
+    match inspect_scaffold_session(handle, sandbox_id, scope).await? {
+        ScaffoldLifecycle::Paused => {
+            let value = handle
+                .client()
+                .call(
+                    methods::CONTROL_SCAFFOLD_ENVIRONMENT,
+                    serde_json::to_value(ScaffoldEnvironmentControl::Resume {
+                        sandbox_id: sandbox_id.to_string(),
+                        scope: scope.clone(),
+                    })
+                    .unwrap_or_default(),
+                )
+                .await?;
+            let resumed: ScaffoldEnvironmentControlResult =
+                serde_json::from_value(value).map_err(|err| RpcError::Failed(err.to_string()))?;
+            if resumed.environment.scope != *scope {
+                return Err(RpcError::Failed(
+                    "Scaffold resume returned a different sandbox scope".into(),
+                ));
+            }
+            let SessionEnvironmentSource::Scaffold {
+                sandbox_id: resumed_id,
+                lifecycle,
+                ..
+            } = resumed.environment.source
+            else {
+                return Err(RpcError::Failed(
+                    "Scaffold resume returned a local environment".into(),
+                ));
+            };
+            if resumed_id != sandbox_id {
+                return Err(RpcError::Failed(
+                    "Scaffold resume returned a different sandbox scope".into(),
+                ));
+            }
+            if matches!(
+                lifecycle,
+                ScaffoldLifecycle::Stopped | ScaffoldLifecycle::Failed
+            ) {
+                return Err(RpcError::Failed(format!(
+                    "Scaffold resume returned terminal lifecycle {lifecycle:?}"
+                )));
+            }
+        }
+        ScaffoldLifecycle::Stopped | ScaffoldLifecycle::Failed => {
+            return Err(RpcError::Failed(
+                "Scaffold session is no longer resumable".into(),
+            ));
+        }
+        ScaffoldLifecycle::Creating
+        | ScaffoldLifecycle::RestoringSnapshot
+        | ScaffoldLifecycle::Starting
+        | ScaffoldLifecycle::Ready
+        | ScaffoldLifecycle::AgentRunning
+        | ScaffoldLifecycle::Resuming => {}
+    }
+    attach_scaffold_session_with_retry(handle, sandbox_id, scope.clone(), wait).await
+}
+
 /// Create the sandbox and immediately dispatch its supervised Comet bootstrap.
 /// Runtime readiness depends on this attachment, so callers must not wait for
 /// `Ready` before attaching.
-pub(crate) async fn create_and_attach_scaffold_session(
+pub(crate) async fn create_and_attach_scaffold_session<Wait, WaitFuture>(
     handle: &EngineHandle,
     scope: &CollaborationScope,
     source_ref: Option<&str>,
     agent_route: &AgentRoute,
-) -> Result<(String, ScaffoldSessionAttachment), RpcError> {
+    wait: &Wait,
+) -> Result<(String, ScaffoldSessionAttachment), RpcError>
+where
+    Wait: Fn(std::time::Duration) -> WaitFuture,
+    WaitFuture: Future<Output = ()>,
+{
     let (sandbox_id, authoritative_scope) =
         create_scaffold_session(handle, scope, source_ref, agent_route).await?;
-    let attachment = attach_scaffold_session(handle, &sandbox_id, authoritative_scope).await?;
+    let attachment =
+        attach_scaffold_session_with_retry(handle, &sandbox_id, authoritative_scope, wait).await?;
     Ok((sandbox_id, attachment))
 }
 
@@ -2171,6 +2291,8 @@ mod tests {
 
     struct ReadyScaffoldRpc {
         operations: Arc<StdMutex<Vec<String>>>,
+        attach_failures_remaining: AtomicU16,
+        inspect_lifecycle: &'static str,
     }
 
     #[async_trait::async_trait]
@@ -2204,13 +2326,25 @@ mod tests {
                 .lock()
                 .expect("Scaffold operation log")
                 .push(operation.to_string());
+            if operation == "attach"
+                && self
+                    .attach_failures_remaining
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+            {
+                return Err(RpcError::Failed(
+                    "scaffold_api_error:502:scaffold_request_rejected".into(),
+                ));
+            }
             let scope = params.get("scope").expect("Scaffold scope");
             let session_id = scope
                 .get("sessionId")
                 .and_then(serde_json::Value::as_str)
                 .expect("session id");
             let lifecycle = if operation == "inspect" {
-                "ready"
+                self.inspect_lifecycle
             } else {
                 "starting"
             };
@@ -2249,7 +2383,7 @@ mod tests {
                     }
                 })
             } else {
-                assert!(matches!(operation, "create" | "inspect"));
+                assert!(matches!(operation, "create" | "inspect" | "resume"));
                 serde_json::json!({ "environment": environment })
             };
             RpcReply::value(&result)
@@ -2307,6 +2441,8 @@ mod tests {
         let operations = Arc::new(StdMutex::new(Vec::new()));
         let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
             operations: Arc::clone(&operations),
+            attach_failures_remaining: AtomicU16::new(0),
+            inspect_lifecycle: "ready",
         });
         let handle = EngineHandle {
             inner: Arc::new(RemoteEngine {
@@ -2320,12 +2456,14 @@ mod tests {
             session_id: Some("session-ready".into()),
             unknown: Default::default(),
         };
+        let no_wait = |_| futures::future::ready(());
 
         let (sandbox_id, attachment) = create_and_attach_scaffold_session(
             &handle,
             &scope,
             Some("feat/comet-identity-integration"),
             &AgentRoute::automatic(comet_proto::AgentProvider::OpenAi, "gpt-5.6-sol"),
+            &no_wait,
         )
         .await
         .unwrap();
@@ -2363,6 +2501,100 @@ mod tests {
         assert_eq!(
             attachment.source_ref.as_deref(),
             Some("387d6652abd642f0b85e8bd14f9131a9f23b7e70")
+        );
+    }
+
+    #[test]
+    fn scaffold_attach_retries_transient_provider_claim_conflicts() {
+        assert!(is_retryable_scaffold_attach_error(&RpcError::Failed(
+            "scaffold_api_error:502:scaffold_request_rejected".into()
+        )));
+        assert!(!is_retryable_scaffold_attach_error(&RpcError::Failed(
+            "scaffold_response_invalid: sandbox failed".into()
+        )));
+
+        let runtime = tokio::runtime::Runtime::new().expect("Tokio RPC server runtime");
+        let (handle, operations) = {
+            let _runtime_guard = runtime.enter();
+            let operations = Arc::new(StdMutex::new(Vec::new()));
+            let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
+                operations: Arc::clone(&operations),
+                attach_failures_remaining: AtomicU16::new(2),
+                inspect_lifecycle: "ready",
+            });
+            let handle = EngineHandle {
+                inner: Arc::new(RemoteEngine {
+                    client: memory_client(service),
+                    url: "memory://transient-scaffold".into(),
+                }),
+            };
+            (handle, operations)
+        };
+
+        futures::executor::block_on(async {
+            let scope = CollaborationScope {
+                project_id: "ashler-staging".into(),
+                deployment_id: Some("ashler-staging".into()),
+                session_id: Some("session-transient".into()),
+                unknown: Default::default(),
+            };
+            let no_wait = |_| futures::future::ready(());
+            let (sandbox_id, attachment) = create_and_attach_scaffold_session(
+                &handle,
+                &scope,
+                Some("feat/comet-identity-integration"),
+                &AgentRoute::automatic(comet_proto::AgentProvider::OpenAi, "gpt-5.6-sol"),
+                &no_wait,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(sandbox_id, "sandbox-ready");
+            assert_eq!(attachment.projection.session_id, "session-transient");
+            assert_eq!(
+                operations
+                    .lock()
+                    .expect("Scaffold operation log")
+                    .as_slice(),
+                ["create", "attach", "attach", "attach"]
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn paused_scaffold_resumes_before_reattaching() {
+        let operations = Arc::new(StdMutex::new(Vec::new()));
+        let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
+            operations: Arc::clone(&operations),
+            attach_failures_remaining: AtomicU16::new(0),
+            inspect_lifecycle: "paused",
+        });
+        let handle = EngineHandle {
+            inner: Arc::new(RemoteEngine {
+                client: memory_client(service),
+                url: "memory://paused-scaffold".into(),
+            }),
+        };
+        let scope = CollaborationScope {
+            project_id: "ashler-staging".into(),
+            deployment_id: Some("ashler-staging".into()),
+            session_id: Some("session-paused".into()),
+            unknown: Default::default(),
+        };
+        let no_wait = |_| futures::future::ready(());
+
+        let attachment =
+            ensure_scaffold_session_attached(&handle, "sandbox-ready", &scope, &no_wait)
+                .await
+                .unwrap();
+
+        assert_eq!(attachment.projection.session_id, "session-paused");
+        assert_eq!(
+            operations
+                .lock()
+                .expect("Scaffold operation log")
+                .as_slice(),
+            ["inspect", "resume", "attach"]
         );
     }
 
@@ -2582,6 +2814,8 @@ mod tests {
         let operations = Arc::new(StdMutex::new(Vec::new()));
         let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
             operations: Arc::clone(&operations),
+            attach_failures_remaining: AtomicU16::new(0),
+            inspect_lifecycle: "ready",
         });
         let handle = EngineHandle {
             inner: Arc::new(RemoteEngine {

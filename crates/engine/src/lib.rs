@@ -668,7 +668,7 @@ impl Engine {
         std::fs::create_dir_all(&config.data_dir)?;
         if let Some(bootstrap) = &bootstrap {
             validate_device_bootstrap(&config, bootstrap)?;
-            persist_expected_device_id(&config.data_dir, &bootstrap.device_id)?;
+            persist_expected_device_id(&config.data_dir, bootstrap)?;
         }
         let auth = Self::build_auth_for(&config, bootstrap.as_ref()).await;
         if auth.device_mode() && auth.access_token().await.is_none() {
@@ -917,17 +917,33 @@ fn validate_device_bootstrap(
     Ok(())
 }
 
-fn persist_expected_device_id(data_dir: &Path, expected: &str) -> Result<(), EngineError> {
+fn persist_expected_device_id(
+    data_dir: &Path,
+    bootstrap: &DeviceBootstrapConfig,
+) -> Result<(), EngineError> {
     let path = data_dir.join("device-id");
+    let expected = &bootstrap.device_id;
     match std::fs::read_to_string(&path) {
         Ok(existing) if existing.trim() == expected => Ok(()),
         Ok(existing) if existing.trim().is_empty() => {
             std::fs::write(path, expected)?;
             Ok(())
         }
-        Ok(_) => Err(EngineError::Other(
-            "sandbox device id does not match its join grant".into(),
-        )),
+        Ok(existing) => {
+            let epoch_prefix = format!("comet-scaffold-{}-e", bootstrap.sandbox_id);
+            let prior_epoch = existing
+                .trim()
+                .strip_prefix(&epoch_prefix)
+                .and_then(|value| value.parse::<u64>().ok());
+            if prior_epoch.is_some_and(|epoch| epoch < bootstrap.lifecycle_epoch) {
+                std::fs::write(path, expected)?;
+                Ok(())
+            } else {
+                Err(EngineError::Other(
+                    "sandbox device id does not match its join grant".into(),
+                ))
+            }
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             std::fs::write(path, expected)?;
             Ok(())
@@ -946,5 +962,51 @@ fn load_or_create_device_id(data_dir: &Path) -> Result<String, EngineError> {
             std::fs::write(&path, &id)?;
             Ok(id)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bootstrap(sandbox_id: &str, lifecycle_epoch: u64) -> DeviceBootstrapConfig {
+        DeviceBootstrapConfig {
+            device_join_grant: "cg1.test".to_string(),
+            project_id: "project".to_string(),
+            deployment_id: "deployment".to_string(),
+            session_id: "session".to_string(),
+            device_id: format!("comet-scaffold-{sandbox_id}-e{lifecycle_epoch}"),
+            lifecycle_epoch,
+            sandbox_id: sandbox_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn rotates_scaffold_device_id_for_a_newer_lifecycle_epoch() {
+        let dir = tempfile::tempdir().expect("temp data dir");
+        std::fs::write(dir.path().join("device-id"), "comet-scaffold-sandbox-1-e1")
+            .expect("seed device id");
+
+        persist_expected_device_id(dir.path(), &bootstrap("sandbox-1", 11))
+            .expect("rotate lifecycle-bound device id");
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("device-id")).expect("read device id"),
+            "comet-scaffold-sandbox-1-e11"
+        );
+    }
+
+    #[test]
+    fn rejects_device_id_rotation_across_sandboxes_or_to_an_older_epoch() {
+        let dir = tempfile::tempdir().expect("temp data dir");
+        let path = dir.path().join("device-id");
+        std::fs::write(&path, "comet-scaffold-sandbox-1-e12").expect("seed device id");
+
+        assert!(persist_expected_device_id(dir.path(), &bootstrap("sandbox-2", 13)).is_err());
+        assert!(persist_expected_device_id(dir.path(), &bootstrap("sandbox-1", 11)).is_err());
+        assert_eq!(
+            std::fs::read_to_string(path).expect("read device id"),
+            "comet-scaffold-sandbox-1-e12"
+        );
     }
 }

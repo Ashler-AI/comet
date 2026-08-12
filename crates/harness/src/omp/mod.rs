@@ -52,6 +52,84 @@ const SCAFFOLD_PROFILE: &str = "scaffold-host";
 const AUTH_BROKER_URL_ENV: &str = "OMP_AUTH_BROKER_URL";
 const AUTH_BROKER_TOKEN_ENV: &str = "OMP_AUTH_BROKER_TOKEN";
 const AUTH_BROKER_TOKEN_FILE_ENV: &str = "OMP_AUTH_BROKER_TOKEN_FILE";
+const SCAFFOLD_INFERENCE_PROFILE_FILE: &str = "omp-inference/profile.json";
+const SCAFFOLD_INFERENCE_PROFILE_BYTES: u64 = 4 * 1024;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScaffoldInferenceProfile {
+    profile: String,
+    model: String,
+}
+
+fn scaffold_inference_model_at(
+    runtime_dir: &Path,
+    requested_model: Option<&str>,
+) -> Result<String, HarnessError> {
+    let path = runtime_dir.join(SCAFFOLD_INFERENCE_PROFILE_FILE);
+    let metadata = std::fs::symlink_metadata(&path)?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() == 0
+        || metadata.len() > SCAFFOLD_INFERENCE_PROFILE_BYTES
+    {
+        return Err(HarnessError::Protocol(
+            "Scaffold OMP inference profile is not a bounded regular file".into(),
+        ));
+    }
+    let profile: ScaffoldInferenceProfile =
+        serde_json::from_slice(&std::fs::read(path)?).map_err(|error| {
+            HarnessError::Protocol(format!("invalid Scaffold OMP inference profile: {error}"))
+        })?;
+    if profile.profile != SCAFFOLD_PROFILE
+        || profile.model.len() > 256
+        || profile.model.chars().any(char::is_whitespace)
+    {
+        return Err(HarnessError::Protocol(
+            "Scaffold OMP inference profile has an invalid model binding".into(),
+        ));
+    }
+    let (requested_provider, requested_model) = requested_model
+        .and_then(|model| model.rsplit_once('/'))
+        .filter(|(provider, model)| !provider.is_empty() && !model.is_empty())
+        .ok_or_else(|| {
+            HarnessError::Protocol(
+                "Scaffold OMP runs require a provider-qualified model selection".into(),
+            )
+        })?;
+    let routed_provider = match requested_provider {
+        "openai-codex" => "scaffold-openai",
+        "anthropic" => "scaffold-anthropic",
+        _ => {
+            return Err(HarnessError::Protocol(
+                "Scaffold OMP inference profile does not match the requested model".into(),
+            ));
+        }
+    };
+    let (profile_provider, routed_model) = profile.model.rsplit_once('/').ok_or_else(|| {
+        HarnessError::Protocol("Scaffold OMP inference profile has an invalid model binding".into())
+    })?;
+    if profile_provider != routed_provider || requested_model != routed_model {
+        return Err(HarnessError::Protocol(
+            "Scaffold OMP inference profile does not match the requested model".into(),
+        ));
+    }
+    Ok(profile.model)
+}
+
+fn configure_scaffold_inference_profile(
+    command: &mut Command,
+    requested_model: Option<&str>,
+) -> Result<(), HarnessError> {
+    let runtime_dir = std::env::var_os("SCAFFOLD_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            HarnessError::Protocol("SCAFFOLD_RUNTIME_DIR is required for Scaffold OMP".into())
+        })?;
+    let model = scaffold_inference_model_at(&runtime_dir, requested_model)?;
+    command.args(["--model", &model]);
+    Ok(())
+}
 
 const OMP_SESSION_DIRECTORY_SCAN_LIMIT: usize = 10_000;
 const OMP_SESSION_HEADER_BYTES: u64 = 64 * 1024;
@@ -652,7 +730,9 @@ impl OmpHarness {
     /// in-band configure stage.
     fn run_command(&self, executable: &Path, request: &RunRequest) -> Command {
         let mut command = self.rpc_mode_command(executable, &request.cwd, true);
-        if let Some(model) = request.model.as_deref().filter(|model| *model != "default") {
+        if !self.scaffold_host
+            && let Some(model) = request.model.as_deref().filter(|model| *model != "default")
+        {
             command.args(["--model", model]);
         }
         if let Some(reasoning) = request.reasoning {
@@ -933,6 +1013,8 @@ impl Harness for OmpHarness {
                 &omp_agent_dir(self.scaffold_host),
                 inference,
             )?;
+        } else if self.scaffold_host {
+            configure_scaffold_inference_profile(&mut command, request.model.as_deref())?;
         }
         let mut child = command.spawn().map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -2065,6 +2147,47 @@ mod tests {
         assert_eq!(
             &args[args.len() - 2..],
             ["--model", "comet-openai/gpt-5.6-sol"]
+        );
+    }
+
+    #[test]
+    fn scaffold_inference_profile_pins_the_scoped_model() {
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let profile_dir = runtime_dir.path().join("omp-inference");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(
+            profile_dir.join("profile.json"),
+            r#"{"profile":"scaffold-host","model":"scaffold-openai/gpt-5.6-sol"}"#,
+        )
+        .unwrap();
+
+        let model =
+            scaffold_inference_model_at(runtime_dir.path(), Some("openai-codex/gpt-5.6-sol"))
+                .unwrap();
+
+        assert_eq!(model, "scaffold-openai/gpt-5.6-sol");
+        assert!(
+            scaffold_inference_model_at(runtime_dir.path(), Some("openai-codex/gpt-5.6-terra"),)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
+
+        std::fs::write(
+            profile_dir.join("profile.json"),
+            r#"{"profile":"scaffold-host","model":"scaffold-anthropic/claude-opus-4-1"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            scaffold_inference_model_at(runtime_dir.path(), Some("anthropic/claude-opus-4-1"),)
+                .unwrap(),
+            "scaffold-anthropic/claude-opus-4-1"
+        );
+        assert!(
+            scaffold_inference_model_at(runtime_dir.path(), Some("openai-codex/claude-opus-4-1"),)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
         );
     }
 

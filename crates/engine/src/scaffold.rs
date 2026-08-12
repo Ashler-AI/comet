@@ -1255,6 +1255,19 @@ struct ExecBody<'a> {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ScaffoldHostAuthorityResponse {
+    grant_id: String,
+    expires_at: i64,
+    principal_subject: String,
+    scope: CollaborationScope,
+    sandbox_id: String,
+    device_id: String,
+    lifecycle_epoch: u64,
+    capabilities: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ExecResponse {
     ok: bool,
     #[serde(default)]
@@ -1279,6 +1292,25 @@ struct UploadGrantEnvelope {
     upload: UploadGrant,
 }
 
+fn deserialize_timestamp_millis<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum WireTimestamp {
+        Millis(i64),
+        Rfc3339(String),
+    }
+
+    match WireTimestamp::deserialize(deserializer)? {
+        WireTimestamp::Millis(value) => Ok(value),
+        WireTimestamp::Rfc3339(value) => chrono::DateTime::parse_from_rfc3339(&value)
+            .map(|timestamp| timestamp.timestamp_millis())
+            .map_err(serde::de::Error::custom),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UploadGrant {
@@ -1286,6 +1318,7 @@ struct UploadGrant {
     token: String,
     token_env: String,
     destination_path: String,
+    #[serde(deserialize_with = "deserialize_timestamp_millis")]
     expires_at: i64,
     // Intentionally decoded only so schema drift is caught. Never execute or
     // log this shell command because it projects the upload bearer externally.
@@ -1718,7 +1751,7 @@ impl ScaffoldRuntime {
                     .attach(&sandbox_id, &scope, &environment, cancellation)
                     .await?;
                 control_grant = Some(grant);
-                (environment, Some(device_id), Some(run_id), None)
+                (environment, Some(device_id), run_id, None)
             }
             ScaffoldEnvironmentControl::HandoffOmpSession {
                 sandbox_id,
@@ -1780,7 +1813,7 @@ impl ScaffoldRuntime {
         scope: &CollaborationScope,
         environment: &SessionEnvironment,
         cancellation: &CancellationToken,
-    ) -> Result<(String, String, ScaffoldControlGrant), ScaffoldError> {
+    ) -> Result<(String, Option<String>, ScaffoldControlGrant), ScaffoldError> {
         let (lifecycle, lifecycle_epoch, _) = scaffold_source(environment)?;
         if !matches!(
             lifecycle,
@@ -1808,7 +1841,49 @@ impl ScaffoldRuntime {
             ScaffoldError::InvalidResponse("sandbox lifecycle epoch is required to attach".into())
         })?;
 
-        // Probe first so missing installations fail deterministically without minting a credential.
+        // Reuse a live deployment-bound host before minting another grant. This
+        // keeps repeated attach idempotent while preserving a fail-closed fallback
+        // when the prior process is missing, stale, or bound to another room.
+        let authority_argv = vec!["comet".to_string(), "scaffold-authority".to_string()];
+        if let Ok(authority) = self
+            .inner
+            .client
+            .exec(
+                sandbox_id,
+                &ExecBody {
+                    argv: &authority_argv,
+                    mode: "inline",
+                    timeout_ms: 10_000,
+                },
+                cancellation,
+            )
+            .await
+            && authority.ok
+            && authority.exit_code == Some(0)
+            && let Some(stdout) = authority.stdout.as_deref()
+            && let Ok(existing) =
+                serde_json::from_str::<ScaffoldHostAuthorityResponse>(stdout.trim())
+            && existing.expires_at > now_ms()
+            && existing.principal_subject == environment.owner_principal
+            && existing.scope == *scope
+            && existing.sandbox_id == sandbox_id
+            && existing.device_id == device_id_for(sandbox_id, lifecycle_epoch)
+            && existing.lifecycle_epoch == lifecycle_epoch
+            && existing.capabilities == scaffold_host_capabilities()
+        {
+            return Ok((
+                existing.device_id,
+                None,
+                ScaffoldControlGrant {
+                    id: existing.grant_id,
+                    expires_at: existing.expires_at,
+                    capabilities: existing.capabilities,
+                },
+            ));
+        }
+
+        // Probe after reuse so an older binary without the authority command
+        // still fails deterministically without minting a credential.
         let probe_argv = vec![
             "sh".to_string(),
             "-lc".to_string(),
@@ -1831,21 +1906,14 @@ impl ScaffoldRuntime {
             return Err(ScaffoldError::CometNotInstalled);
         }
 
-        let device_id = format!("comet-scaffold-{sandbox_id}-e{lifecycle_epoch}");
+        let device_id = device_id_for(sandbox_id, lifecycle_epoch);
         let request = DeviceJoinGrantRequest {
             principal_subject: environment.owner_principal.clone(),
             scope: scope.clone(),
             sandbox_id: sandbox_id.to_string(),
             device_id: device_id.clone(),
             lifecycle_epoch,
-            capabilities: vec![
-                CAPABILITY_SESSION_READ.into(),
-                CAPABILITY_SESSION_CHAT.into(),
-                CAPABILITY_SESSION_CONTROL.into(),
-                CAPABILITY_SESSION_ANNOTATE.into(),
-                CAPABILITY_SESSION_FILES.into(),
-                CAPABILITY_SESSION_ENVIRONMENT.into(),
-            ],
+            capabilities: scaffold_host_capabilities(),
             expires_in_seconds: JOIN_GRANT_TTL_SECONDS,
         };
         let join = self.inner.grants.mint(&request, cancellation).await?;
@@ -1958,7 +2026,7 @@ impl ScaffoldRuntime {
         let run_id = started.run_id.ok_or_else(|| {
             ScaffoldError::InvalidResponse("sandbox exec returned no runId".into())
         })?;
-        Ok((device_id, run_id, control_grant))
+        Ok((device_id, Some(run_id), control_grant))
     }
 
     fn publish(&self) -> ScaffoldEnvironmentSnapshot {
@@ -1969,6 +2037,20 @@ impl ScaffoldRuntime {
         self.inner.watch_tx.send_replace(snapshot.clone());
         snapshot
     }
+}
+fn device_id_for(sandbox_id: &str, lifecycle_epoch: u64) -> String {
+    format!("comet-scaffold-{sandbox_id}-e{lifecycle_epoch}")
+}
+
+fn scaffold_host_capabilities() -> Vec<String> {
+    vec![
+        CAPABILITY_SESSION_READ.into(),
+        CAPABILITY_SESSION_CHAT.into(),
+        CAPABILITY_SESSION_CONTROL.into(),
+        CAPABILITY_SESSION_ANNOTATE.into(),
+        CAPABILITY_SESSION_FILES.into(),
+        CAPABILITY_SESSION_ENVIRONMENT.into(),
+    ]
 }
 
 fn scaffold_source(
@@ -2338,6 +2420,7 @@ mod tests {
             join_expires_at - i64::from(JOIN_GRANT_TTL_SECONDS) * 1000 + DEVICE_ACCESS_TTL_MS;
         let responses = vec![
             sandbox("ready"),
+            r#"{"ok":false,"exitCode":1}"#.into(),
             r#"{"ok":true,"exitCode":0}"#.into(),
             format!(
                 r#"{{"grant":"cg1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narrow_secret","expiresAt":{join_expires_at}}}"#
@@ -2402,17 +2485,18 @@ mod tests {
             .filter(|request| request.starts_with("POST /api/code-sandboxes/sandbox-a/exec "))
             .map(|request| request.split_once("\r\n\r\n").unwrap().1)
             .collect();
-        assert_eq!(exec_bodies.len(), 3);
+        assert_eq!(exec_bodies.len(), 4);
         assert!(
             exec_bodies
                 .iter()
                 .all(|body| !body.contains("sc_rc_broad_secret") && !body.contains("cg1."))
         );
-        assert!(exec_bodies[1].contains(r#""chmod","600""#));
-        assert!(exec_bodies[2].contains(r#""--device-bootstrap-file""#));
-        assert!(!exec_bodies[2].contains("--device-join-grant"));
-        assert!(exec_bodies[2].contains(r#""mode":"background""#));
-        assert!(exec_bodies[2].contains(r#""timeoutMs":0"#));
+        assert!(exec_bodies[0].contains(r#""comet","scaffold-authority""#));
+        assert!(exec_bodies[2].contains(r#""chmod","600""#));
+        assert!(exec_bodies[3].contains(r#""--device-bootstrap-file""#));
+        assert!(!exec_bodies[3].contains("--device-join-grant"));
+        assert!(exec_bodies[3].contains(r#""mode":"background""#));
+        assert!(exec_bodies[3].contains(r#""timeoutMs":0"#));
         let bootstrap_request = requests
             .iter()
             .find(|request| request.starts_with("PUT /api/code-sandboxes/sandbox-a/files?"))
@@ -2427,11 +2511,76 @@ mod tests {
         );
         assert_eq!(bootstrap["deploymentId"], "deployment-a");
         assert_eq!(bootstrap["lifecycleEpoch"], 1);
-        let grant_body = requests[2].split_once("\r\n\r\n").unwrap().1;
+        let grant_body = requests[3].split_once("\r\n\r\n").unwrap().1;
         assert!(grant_body.contains(r#""sandboxId":"sandbox-a""#));
         assert!(grant_body.contains(r#""deploymentId":"deployment-a""#));
         assert!(grant_body.contains(r#""lifecycleEpoch":1"#));
     }
+    #[tokio::test]
+    async fn repeated_attach_reuses_matching_scaffold_host_authority() {
+        let expires_at = now_ms() + 60_000;
+        let responses = vec![
+            sandbox("ready"),
+            serde_json::json!({
+                "ok": true,
+                "exitCode": 0,
+                "stdout": serde_json::json!({
+                    "grantId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "expiresAt": expires_at,
+                    "principalSubject": "alice@example.com",
+                    "scope": scope(),
+                    "sandboxId": "sandbox-a",
+                    "deviceId": "comet-scaffold-sandbox-a-e1",
+                    "lifecycleEpoch": 1,
+                    "capabilities": scaffold_host_capabilities(),
+                })
+                .to_string(),
+            })
+            .to_string(),
+        ];
+        let (origin, captured) = mock_server(responses).await;
+        let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("sc_rc_broad_secret".into()));
+        let runtime = ScaffoldRuntime::new(
+            ScaffoldClient::new(&origin, "project-a", bearer.clone()).unwrap(),
+            "https://comet-edge.example",
+            Arc::new(EdgeDeviceJoinGrantClient::new(&origin, bearer).unwrap()),
+        );
+
+        let result = runtime
+            .control(
+                ScaffoldEnvironmentControl::Attach {
+                    sandbox_id: "sandbox-a".into(),
+                    scope: scope(),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.run_id, None);
+        assert_eq!(
+            result.control_grant,
+            Some(ScaffoldControlGrant {
+                id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                expires_at,
+                capabilities: scaffold_host_capabilities(),
+            })
+        );
+        let requests = captured.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains(r#""comet","scaffold-authority""#));
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.contains("/auth/device-grants"))
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.contains("--device-bootstrap-file"))
+        );
+    }
+
     #[tokio::test]
     async fn omp_handoff_uses_one_use_raw_tar_and_verifies_without_starting_acp() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2445,7 +2594,7 @@ mod tests {
                     "token": "single_use_upload_secret",
                     "tokenEnv": "SCAFFOLD_UPLOAD_TOKEN",
                     "destinationPath": "/workspace/ashler-platform/.scaffold/omp-handoff-staging",
-                    "expiresAt": now_ms() + 60_000,
+                    "expiresAt": chrono::Utc::now().checked_add_signed(chrono::Duration::minutes(1)).unwrap().to_rfc3339(),
                     "command": "SCAFFOLD_UPLOAD_TOKEN=single_use_upload_secret curl ..."
                 }
             })
