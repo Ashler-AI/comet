@@ -13,6 +13,8 @@
 //! - `sessions`: LoroMap keyed by chatId → row map {chatId, deviceId, status, startedAt?,
 //!   updatedAt}
 //! - `sessionRefs`: LoroMap keyed by chatId → row map {chatId, addedAt}
+//! - `worktreeDeletions`: LoroMap keyed by chatId → owner-approved delayed cleanup
+//!   {chatId, path, ownerSubject, ownerDeviceId, deleteAfter}
 //! - `meta`: LoroMap {schemaVersion} — in-band detection for future destructive changes
 //!
 //! Writer discipline (ARCHITECTURE §2.2): each device writes its own device row, its
@@ -27,7 +29,9 @@ use chrono::{DateTime, Utc};
 use loro::{ExportMode, LoroDoc, LoroMap, LoroValue, ToJson};
 use serde::{Deserialize, Serialize};
 
-use comet_proto::{Chat, ChatConfig, Device, Session, SessionRef, SessionStatus, Space};
+use comet_proto::{
+    Chat, ChatConfig, Device, Session, SessionRef, SessionStatus, Space, WorktreeDeletionStage,
+};
 
 use crate::schema::DocError;
 
@@ -54,6 +58,8 @@ pub struct WorkspaceState {
     pub chats: Vec<Chat>,
     pub sessions: Vec<Session>,
     pub session_refs: Vec<SessionRef>,
+    #[serde(default)]
+    pub worktree_deletions: Vec<WorktreeDeletionStage>,
 }
 
 /// Result of a `delete_space` cascade — the chat ids removed alongside the
@@ -346,12 +352,57 @@ impl WorkspaceDoc {
 
     /// LWW archived flag from any device. `false` when no such row.
     pub fn set_chat_archived(&self, chat_id: &str, archived: bool) -> Result<bool, DocError> {
+        self.set_chat_archived_with_worktree_deletion(chat_id, archived, None)
+    }
+
+    /// Archive and, when the authenticated session owner supplied one, stage
+    /// cleanup of the owning device's Comet-managed worktree in the same commit.
+    /// Unarchiving always cancels that chat's pending cleanup.
+    pub fn set_chat_archived_with_worktree_deletion(
+        &self,
+        chat_id: &str,
+        archived: bool,
+        stage: Option<&WorktreeDeletionStage>,
+    ) -> Result<bool, DocError> {
         let Some(row) = self.existing_row("chats", chat_id) else {
             return Ok(false);
         };
+        if stage.is_some_and(|stage| stage.chat_id != chat_id) {
+            return Err(DocError::Schema(
+                "worktree deletion stage chat id mismatch".into(),
+            ));
+        }
         row.insert("archived", archived)?;
+        if archived && let Some(stage) = stage {
+            let cleanup = self.row("worktreeDeletions", chat_id)?;
+            cleanup.insert("chatId", stage.chat_id.as_str())?;
+            cleanup.insert("path", stage.path.as_str())?;
+            cleanup.insert("ownerSubject", stage.owner_subject.as_str())?;
+            cleanup.insert("ownerDeviceId", stage.owner_device_id.as_str())?;
+            cleanup.insert("deleteAfter", stage.delete_after.timestamp_millis())?;
+        } else if !archived {
+            self.doc.get_map("worktreeDeletions").delete(chat_id)?;
+        }
         self.doc.commit();
         Ok(true)
+    }
+
+    pub fn read_worktree_deletions(&self) -> Result<Vec<WorktreeDeletionStage>, DocError> {
+        let mut stages: Vec<WorktreeDeletionStage> = self
+            .read_rows::<RawWorktreeDeletionStage>("worktreeDeletions")?
+            .into_iter()
+            .map(WorktreeDeletionStage::from)
+            .collect();
+        stages.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+        Ok(stages)
+    }
+
+    pub fn remove_worktree_deletion(&self, chat_id: &str) -> Result<bool, DocError> {
+        let rows = self.doc.get_map("worktreeDeletions");
+        let existed = rows.get(chat_id).is_some();
+        rows.delete(chat_id)?;
+        self.doc.commit();
+        Ok(existed)
     }
 
     /// Host-side git metadata: the branch checked out at the chat's cwd (HEAD
@@ -585,6 +636,7 @@ impl WorkspaceDoc {
             chats: self.read_chats()?,
             sessions: self.read_sessions()?,
             session_refs: self.read_session_refs()?,
+            worktree_deletions: self.read_worktree_deletions()?,
         })
     }
 
@@ -792,6 +844,28 @@ impl From<RawChat> for Chat {
             harness_session_cwd: raw.harness_session_cwd,
             space_id: raw.space_id,
             last_seen_at: raw.last_seen_at.map(dt),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawWorktreeDeletionStage {
+    chat_id: String,
+    path: String,
+    owner_subject: String,
+    owner_device_id: String,
+    delete_after: i64,
+}
+
+impl From<RawWorktreeDeletionStage> for WorktreeDeletionStage {
+    fn from(raw: RawWorktreeDeletionStage) -> Self {
+        WorktreeDeletionStage {
+            chat_id: raw.chat_id,
+            path: raw.path,
+            owner_subject: raw.owner_subject,
+            owner_device_id: raw.owner_device_id,
+            delete_after: dt(raw.delete_after),
         }
     }
 }
@@ -1070,14 +1144,46 @@ mod tests {
     }
 
     #[test]
+    fn owner_stage_round_trips_and_unarchive_cancels_it() {
+        let ws = WorkspaceDoc::new();
+        ws.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
+        let stage = WorktreeDeletionStage {
+            chat_id: "chat-1".into(),
+            path: "/tmp/worktrees/repo/quiet-raven".into(),
+            owner_subject: "accounts.google.com:owner".into(),
+            owner_device_id: "dev-a".into(),
+            delete_after: ts(604_802_000),
+        };
+
+        assert!(
+            ws.set_chat_archived_with_worktree_deletion("chat-1", true, Some(&stage))
+                .unwrap()
+        );
+        assert_eq!(ws.read_worktree_deletions().unwrap(), vec![stage]);
+
+        assert!(ws.set_chat_archived("chat-1", false).unwrap());
+        assert!(ws.read_worktree_deletions().unwrap().is_empty());
+    }
+
+    #[test]
     fn delete_chat_tombstones_row_and_session() {
         let ws = WorkspaceDoc::new();
         ws.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
         ws.upsert_session(&session("chat-1", "dev-a", SessionStatus::Idle))
             .unwrap();
+        let stage = WorktreeDeletionStage {
+            chat_id: "chat-1".into(),
+            path: "/tmp/worktrees/repo/quiet-raven".into(),
+            owner_subject: "accounts.google.com:owner".into(),
+            owner_device_id: "dev-a".into(),
+            delete_after: ts(604_802_000),
+        };
+        ws.set_chat_archived_with_worktree_deletion("chat-1", true, Some(&stage))
+            .unwrap();
         assert!(ws.delete_chat("chat-1").unwrap());
         assert!(ws.read_chats().unwrap().is_empty());
         assert!(ws.read_sessions().unwrap().is_empty());
+        assert_eq!(ws.read_worktree_deletions().unwrap(), vec![stage]);
         assert!(!ws.delete_chat("chat-1").unwrap());
     }
 

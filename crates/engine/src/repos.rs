@@ -108,6 +108,27 @@ impl Repos {
         }
     }
 
+    /// Resolve an existing checkout only when it is exactly
+    /// `{worktrees_root}/<repo>/<worktree>` and its canonical path stays inside
+    /// the Comet-managed root. Symlink escapes and ordinary repository roots
+    /// are rejected.
+    pub(crate) fn managed_worktree_path(&self, path: &Path) -> Option<PathBuf> {
+        let root = std::fs::canonicalize(&self.inner.worktrees_root).ok()?;
+        let path = std::fs::canonicalize(path).ok()?;
+        let relative = path.strip_prefix(&root).ok()?;
+        let mut components = relative.components();
+        let repo = components.next()?;
+        let worktree = components.next()?;
+        if components.next().is_some()
+            || !matches!(repo, std::path::Component::Normal(_))
+            || !matches!(worktree, std::path::Component::Normal(_))
+            || !path.join(".git").is_file()
+        {
+            return None;
+        }
+        Some(path)
+    }
+
     // ── registry (repos.json) ───────────────────────────────────────────────
 
     fn registry_path(&self) -> PathBuf {
@@ -634,7 +655,36 @@ impl Repos {
         self.current_branch(worktree_path).await
     }
 
-    /// Best-effort worktree removal (if it still exists), then prune stale refs.
+    /// Delete a delayed-cleanup candidate only after proving it is a linked
+    /// checkout inside Comet's managed worktree root. The main checkout is
+    /// resolved from git's own worktree registry immediately before removal.
+    pub async fn delete_managed_worktree(&self, worktree_path: &Path) -> Result<(), EngineError> {
+        if !worktree_path.exists() {
+            return Ok(());
+        }
+        let worktree_path = self
+            .managed_worktree_path(worktree_path)
+            .ok_or_else(|| EngineError::Other("refusing to delete unmanaged worktree".into()))?;
+        let listing = self
+            .git(&["worktree", "list", "--porcelain"], Some(&worktree_path))
+            .await?;
+        let repo_path = listing
+            .lines()
+            .find_map(|line| line.strip_prefix("worktree "))
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                EngineError::Other("git worktree registry has no main checkout".into())
+            })?;
+        let repo_path = std::fs::canonicalize(repo_path)?;
+        if repo_path == worktree_path {
+            return Err(EngineError::Other(
+                "refusing to delete the main checkout".into(),
+            ));
+        }
+        self.delete_worktree(&repo_path, &worktree_path).await
+    }
+
+    /// Force-remove a worktree (if it still exists), then prune stale refs.
     /// Deletes the worktree's branch ONLY when comet created it (`comet/…`) — the
     /// user may have checked out their own branch inside the worktree.
     pub async fn delete_worktree(
@@ -659,9 +709,15 @@ impl Repos {
                     Some(repo_path),
                 )
                 .await;
-            if removed.is_err() {
-                // git refused (or the dir is half-gone) — delete the folder directly.
-                let _ = std::fs::remove_dir_all(worktree_path);
+            if let Err(git_error) = removed {
+                // A half-removed checkout can make git refuse. The caller has
+                // already established ownership; surface a filesystem failure
+                // instead of claiming cleanup succeeded.
+                std::fs::remove_dir_all(worktree_path).map_err(|fs_error| {
+                    EngineError::Other(format!(
+                        "git worktree removal failed ({git_error}); fallback removal failed: {fs_error}"
+                    ))
+                })?;
             }
         }
         let _ = self.git(&["worktree", "prune"], Some(repo_path)).await;

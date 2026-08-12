@@ -30,6 +30,7 @@ pub mod terminals;
 pub mod titles;
 pub mod uploads;
 pub mod workspace_host;
+pub mod worktree_cleanup;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
 pub use auth::{Auth, AuthConfig, AuthState, AuthUser};
@@ -54,6 +55,7 @@ pub use uploads::{AttachmentChunk, Uploads};
 pub use workspace_host::{
     DEFAULT_PROJECT_SCOPE, DEFAULT_USER_ID, WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig,
 };
+pub use worktree_cleanup::WorktreeCleanup;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -143,6 +145,7 @@ pub struct EngineCore {
     pub terminals: Terminals,
     pub diff_sync: CheckoutDiffSync,
     pub spaces_sync: SpacesSync,
+    pub worktree_cleanup: WorktreeCleanup,
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
     pub device_id: String,
@@ -273,6 +276,17 @@ impl EngineCore {
         let uploads = Uploads::new(data_dir, edge.clone());
         let agent_accounts = AgentAccounts::new(AgentAccountsConfig::detect(data_dir));
         sessions.set_titles(TitleGenerator::new(workspace.clone(), repos.clone()));
+        let cleanup_quiescent: worktree_cleanup::QuiescentCheck = {
+            let sessions = sessions.clone();
+            let terminals = terminals.clone();
+            Arc::new(move || !sessions.any_active() && !terminals.any_open())
+        };
+        let worktree_cleanup = WorktreeCleanup::start(
+            repos.clone(),
+            workspace.clone(),
+            &device_id,
+            cleanup_quiescent,
+        );
         let diff_sync = CheckoutDiffSync::start(repos.clone(), workspace.clone(), &device_id, edge);
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
         Ok(Self {
@@ -284,6 +298,7 @@ impl EngineCore {
             terminals,
             diff_sync,
             spaces_sync,
+            worktree_cleanup,
             uploads,
             agent_accounts,
             device_id,

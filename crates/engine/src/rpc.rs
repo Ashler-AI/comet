@@ -60,10 +60,11 @@ use tokio::sync::watch;
 
 use comet_doc::{MessagePart, SessionCommandPayload};
 use comet_proto::{
-    ChatConfig, CollaborationPrincipal, CollaborationScope, CollaborationSnapshot, HarnessId,
-    OmpAdvisorSyncBacklog, ParticipantPresence, ParticipantState, RuntimeProfile,
-    ScaffoldEnvironmentControl, ScaffoldEnvironmentControlResult, SessionEnvironmentSource,
-    SessionRoomProjection, SessionStatus, ToolCall,
+    AgentSessionRecord, Chat, ChatConfig, CollaborationPrincipal, CollaborationScope,
+    CollaborationSnapshot, HarnessId, OmpAdvisorSyncBacklog, ParticipantPresence, ParticipantState,
+    RuntimeProfile, ScaffoldEnvironmentControl, ScaffoldEnvironmentControlResult,
+    SessionEnvironmentSource, SessionRoomProjection, SessionStatus, ToolCall,
+    WorktreeDeletionStage,
 };
 use comet_rpc::{
     LinkCache, PeerMessageResult, PeerReplyResult, PeerWaitResult, RemoveSessionRefResult,
@@ -88,6 +89,7 @@ const SCAFFOLD_OWNER_ROOM_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const FILE_SEARCH_FEATURED_PATHS: usize = 32;
 const DEFAULT_PEER_WAIT_MS: u64 = 30_000;
 const MAX_PEER_WAIT_MS: u64 = 120_000;
+const WORKTREE_DELETION_GRACE_DAYS: i64 = 7;
 
 fn peer_timeout(timeout_ms: Option<u64>) -> Duration {
     Duration::from_millis(
@@ -95,6 +97,10 @@ fn peer_timeout(timeout_ms: Option<u64>) -> Duration {
             .unwrap_or(DEFAULT_PEER_WAIT_MS)
             .min(MAX_PEER_WAIT_MS),
     )
+}
+
+fn worktree_deletion_deadline(now: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+    now + chrono::Duration::days(WORKTREE_DELETION_GRACE_DAYS)
 }
 
 fn canonical_session_id(value: &str) -> Option<String> {
@@ -931,6 +937,43 @@ impl EngineRpc {
         }
     }
 
+    fn worktree_deletion_stage(&self, chat_id: &str) -> Option<WorktreeDeletionStage> {
+        let chat = self.workspace.doc().chat(chat_id).ok()??;
+        let cwd = chat.cwd.as_deref()?;
+        let path = self
+            .repos
+            .managed_worktree_path(std::path::Path::new(cwd))?;
+        let actor_subject = self.auth.as_ref()?.user_id()?;
+        let sessions = self
+            .doc_host
+            .open(chat_id)
+            .ok()
+            .and_then(|handle| handle.doc().collaboration_snapshot().ok())
+            .map(|snapshot| snapshot.sessions)
+            .unwrap_or_default();
+        if !owner_may_stage_worktree_deletion(
+            &actor_subject,
+            self.doc_host.device_id(),
+            &chat,
+            &sessions,
+        ) {
+            tracing::info!(
+                chat = %chat_id,
+                actor = %actor_subject,
+                owner_device = %chat.device_id,
+                "settled session did not stage worktree cleanup: actor is not the worktree owner"
+            );
+            return None;
+        }
+        Some(WorktreeDeletionStage {
+            chat_id: chat.id,
+            path: path.to_string_lossy().into_owned(),
+            owner_subject: actor_subject,
+            owner_device_id: chat.device_id,
+            delete_after: worktree_deletion_deadline(chrono::Utc::now()),
+        })
+    }
+
     fn mutate(&self, params: MutateParams) -> Result<(), RpcError> {
         let failed = |e: crate::EngineError| RpcError::Failed(e.to_string());
         match params {
@@ -1013,17 +1056,26 @@ impl EngineRpc {
                 .set_chat_host(&chat_id, &device_id)
                 .map_err(failed)
                 .map(drop),
-            MutateParams::SetChatArchived { chat_id, archived } => self
-                .workspace
-                .set_chat_archived(&chat_id, archived)
-                .map_err(failed)
-                .map(drop),
+            MutateParams::SetChatArchived { chat_id, archived } => {
+                let stage = archived
+                    .then(|| self.worktree_deletion_stage(&chat_id))
+                    .flatten();
+                self.workspace
+                    .set_chat_archived_with_worktree_deletion(&chat_id, archived, stage.as_ref())
+                    .map_err(failed)
+                    .map(drop)
+            }
             MutateParams::SetChatConfig { chat_id, config } => self
                 .workspace
                 .set_chat_config(&chat_id, &config)
                 .map_err(failed)
                 .map(drop),
             MutateParams::DeleteChat { chat_id } => {
+                if let Some(stage) = self.worktree_deletion_stage(&chat_id) {
+                    self.workspace
+                        .set_chat_archived_with_worktree_deletion(&chat_id, true, Some(&stage))
+                        .map_err(failed)?;
+                }
                 self.workspace.delete_chat(&chat_id).map_err(failed)?;
                 self.doc_host.purge_chat(&chat_id);
                 Ok(())
@@ -1049,6 +1101,21 @@ impl EngineRpc {
                 .map(drop),
         }
     }
+}
+
+fn owner_may_stage_worktree_deletion(
+    actor_subject: &str,
+    local_device_id: &str,
+    chat: &Chat,
+    sessions: &[AgentSessionRecord],
+) -> bool {
+    if chat.device_id != local_device_id {
+        return false;
+    }
+    sessions.is_empty()
+        || sessions.iter().any(|session| {
+            session.owner_subject == actor_subject && session.owner_device_id == local_device_id
+        })
 }
 
 /// ControlRpc methods that operate on device-local resources and therefore
@@ -2282,6 +2349,78 @@ mod tests {
         assert_eq!(
             peer_timeout(Some(MAX_PEER_WAIT_MS + 1)),
             Duration::from_millis(MAX_PEER_WAIT_MS)
+        );
+    }
+
+    #[test]
+    fn only_the_worktree_owner_can_stage_shared_session_cleanup() {
+        let mut chat = Chat {
+            id: "chat-a".into(),
+            device_id: "device-a".into(),
+            title: None,
+            archived: false,
+            cwd: Some("/tmp/worktree".into()),
+            branch: None,
+            checkout_id: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: chrono::DateTime::UNIX_EPOCH,
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: None,
+            last_seen_at: None,
+        };
+        assert!(owner_may_stage_worktree_deletion(
+            "owner",
+            "device-a",
+            &chat,
+            &[]
+        ));
+        chat.device_id = "device-b".into();
+        assert!(!owner_may_stage_worktree_deletion(
+            "owner",
+            "device-a",
+            &chat,
+            &[]
+        ));
+
+        chat.device_id = "device-a".into();
+        let sessions = vec![AgentSessionRecord {
+            session_id: "session-a".into(),
+            chat_id: chat.id.clone(),
+            owner_subject: "owner".into(),
+            owner_device_id: "device-a".into(),
+            source: comet_proto::AgentSessionSource::Local,
+            environment: None,
+            harness: Some(HarnessId::Mock),
+            model: None,
+            harness_session_id: None,
+            status: Some(SessionStatus::Idle),
+            updated_at: Some(1),
+            created_at: 1,
+            unknown: Default::default(),
+        }];
+        assert!(owner_may_stage_worktree_deletion(
+            "owner", "device-a", &chat, &sessions
+        ));
+        assert!(!owner_may_stage_worktree_deletion(
+            "owner", "device-z", &chat, &sessions
+        ));
+        assert!(!owner_may_stage_worktree_deletion(
+            "collaborator",
+            "device-a",
+            &chat,
+            &sessions
+        ));
+    }
+
+    #[test]
+    fn staged_worktree_cleanup_waits_exactly_seven_days() {
+        let now = chrono::DateTime::from_timestamp_millis(1_000).unwrap();
+        assert_eq!(
+            worktree_deletion_deadline(now).timestamp_millis(),
+            1_000 + 7 * 24 * 60 * 60 * 1_000
         );
     }
 

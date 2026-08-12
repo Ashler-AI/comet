@@ -19,7 +19,7 @@ use chrono::Utc;
 use tokio::sync::watch;
 
 use comet_doc::{DeletedSpace, WorkspaceDoc, presence_key};
-use comet_proto::{Chat, ChatConfig, Device, Session, SessionRef, Space};
+use comet_proto::{Chat, ChatConfig, Device, Session, SessionRef, Space, WorktreeDeletionStage};
 use comet_sync::{DocsStore, RoomClient};
 
 use crate::doc_host::EdgeConfig;
@@ -123,6 +123,7 @@ struct WorkspaceHostInner {
     sessions_tx: watch::Sender<Vec<Session>>,
     spaces_tx: watch::Sender<Vec<Space>>,
     session_refs_tx: watch::Sender<Vec<SessionRef>>,
+    worktree_deletions_tx: watch::Sender<Vec<WorktreeDeletionStage>>,
     room: Mutex<Option<RoomClient>>,
     /// Freshest presence heartbeat (ms) we have EVER observed per device. The
     /// ephemeral store forgets entries after its 30s TTL and starts empty on a
@@ -207,6 +208,7 @@ impl WorkspaceHost {
         let (sessions_tx, _) = watch::channel(state.sessions);
         let (spaces_tx, _) = watch::channel(state.spaces);
         let (session_refs_tx, _) = watch::channel(state.session_refs);
+        let (worktree_deletions_tx, _) = watch::channel(state.worktree_deletions);
 
         let host = Self {
             inner: Arc::new(WorkspaceHostInner {
@@ -218,6 +220,7 @@ impl WorkspaceHost {
                 sessions_tx,
                 spaces_tx,
                 session_refs_tx,
+                worktree_deletions_tx,
                 room: Mutex::new(None),
                 presence_seen: Mutex::new(std::collections::HashMap::new()),
                 peer_alive: Mutex::new(None),
@@ -369,6 +372,10 @@ impl WorkspaceHost {
 
     pub fn watch_session_refs(&self) -> watch::Receiver<Vec<SessionRef>> {
         self.inner.session_refs_tx.subscribe()
+    }
+
+    pub fn watch_worktree_deletions(&self) -> watch::Receiver<Vec<WorktreeDeletionStage>> {
+        self.inner.worktree_deletions_tx.subscribe()
     }
 
     /// Add an exact-id pointer to a global session without creating a local
@@ -756,6 +763,40 @@ impl WorkspaceHost {
         Ok(self.inner.doc.set_chat_archived(chat_id, archived)?)
     }
 
+    pub fn set_chat_archived_with_worktree_deletion(
+        &self,
+        chat_id: &str,
+        archived: bool,
+        stage: Option<&WorktreeDeletionStage>,
+    ) -> Result<bool, EngineError> {
+        Ok(self
+            .inner
+            .doc
+            .set_chat_archived_with_worktree_deletion(chat_id, archived, stage)?)
+    }
+
+    pub fn read_worktree_deletions(&self) -> Result<Vec<WorktreeDeletionStage>, EngineError> {
+        Ok(self.inner.doc.read_worktree_deletions()?)
+    }
+
+    /// Only the device named by the owner-approved stage may retire it after
+    /// deleting its local checkout.
+    pub fn remove_owned_worktree_deletion(&self, chat_id: &str) -> Result<bool, EngineError> {
+        let Some(stage) = self
+            .inner
+            .doc
+            .read_worktree_deletions()?
+            .into_iter()
+            .find(|stage| stage.chat_id == chat_id)
+        else {
+            return Ok(false);
+        };
+        if stage.owner_device_id != self.inner.config.device_id {
+            return Ok(false);
+        }
+        Ok(self.inner.doc.remove_worktree_deletion(chat_id)?)
+    }
+
     /// LWW full-config replace on the chat row (comet `SetChatConfig` — the
     /// composer's mid-session model/reasoning/options changes). Returns false
     /// when the chat doesn't exist.
@@ -844,6 +885,8 @@ impl WorkspaceHostInner {
                 self.sessions_tx.send_replace(state.sessions);
                 self.spaces_tx.send_replace(state.spaces);
                 self.session_refs_tx.send_replace(state.session_refs);
+                self.worktree_deletions_tx
+                    .send_replace(state.worktree_deletions);
             }
             Err(err) => {
                 tracing::warn!(error = %err, "workspace read failed");

@@ -148,6 +148,20 @@ pub struct LocalSessionAttachResult {
     pub space_id: String,
 }
 
+/// Owner-approved delayed cleanup for a Comet-managed worktree.
+///
+/// The record lives in the shared workspace document so an owner can settle
+/// from any device while the device that owns the checkout performs deletion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeDeletionStage {
+    pub chat_id: String,
+    pub path: String,
+    pub owner_subject: String,
+    pub owner_device_id: String,
+    pub delete_after: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Chat {
