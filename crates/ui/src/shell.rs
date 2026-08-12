@@ -1063,33 +1063,33 @@ fn render_goal_group(
         .into_any_element()
 }
 
-/// Press bookkeeping for the session row's settle checkbox: the row is
-/// clickable (select) and the checkbox lives inside it, but gpui's
+/// Press bookkeeping for the session row's settle button: the row is
+/// clickable (select) and the button lives inside it, but gpui's
 /// `stop_propagation` does NOT suppress an ancestor's click listener from a
 /// descendant's — measured on the pinned rev, both fire, descendant first.
-/// So the row has to recognize the checkbox's click and stand down.
+/// So the row has to recognize the button's click and stand down.
 ///
 /// The press is the only reliable signal: `on_mouse_down` is hitbox-gated,
 /// while hover leave is state-diffed per element path — a row moving between
 /// the active and settled lists lands on a fresh path and never sees one.
-/// A descendant's press listener runs first, so the checkbox raises
-/// [`Self::press_checkbox`] and the row's press claims it; the row presses for
+/// A descendant's press listener runs first, so the button raises
+/// [`Self::press_button`] and the row's press claims it; the row presses for
 /// EVERY left press it contains, so nothing outlives the click it describes.
 #[derive(Default)]
 struct SettlePress {
-    /// The press in flight landed on a settle checkbox.
-    on_checkbox: bool,
-    /// The click in flight is the checkbox's, not a row selection.
+    /// The press in flight landed on a settle button.
+    on_button: bool,
+    /// The click in flight is the button's, not a row selection.
     owns_click: bool,
 }
 
 impl SettlePress {
-    fn press_checkbox(&mut self) {
-        self.on_checkbox = true;
+    fn press_button(&mut self) {
+        self.on_button = true;
     }
 
     fn press_row(&mut self) {
-        self.owns_click = std::mem::take(&mut self.on_checkbox);
+        self.owns_click = std::mem::take(&mut self.on_button);
     }
 
     /// Whether the click this press produced is the row's to act on.
@@ -1124,7 +1124,7 @@ pub struct Shell {
     shortcuts_sub: Option<Subscription>,
     /// Session-row context menu: (chat id, window position).
     chat_menu: Option<(String, Point<Pixels>)>,
-    /// Press bookkeeping for the session row's settle checkbox.
+    /// Press bookkeeping for the session row's settle button.
     settle_press: SettlePress,
     rename_dialog: Option<RenameChatDialog>,
     /// Chat id awaiting delete confirmation.
@@ -2800,7 +2800,7 @@ impl Shell {
         cx.notify();
     }
 
-    /// Settle (archive) or unsettle a session — the sidebar's row checkbox and
+    /// Settle (archive) or unsettle a session — the sidebar's row button and
     /// context menu, and the tab strip's close. `setChatArchived` is idempotent
     /// and reversible; settling also stages the session's managed worktree for
     /// deferred cleanup, which unsettling cancels (engine `rpc.rs`).
@@ -3245,8 +3245,8 @@ impl Shell {
     /// Rich session row: room context, title, source/runtime/model, and the
     /// top-right status slot — a spinner while the agent works, an attention
     /// dot when it finished or needs input, otherwise the recency label.
-    /// Hovering the row cross-fades that read-out out and a settle checkbox in
-    /// (`settled` seeds it checked, so the settled list unsettles). The row
+    /// Hovering the row cross-fades that read-out out and a settle checkmark in
+    /// (`settled` tints it green, so the settled list unsettles). The row
     /// retains the same content at both density settings; compact only
     /// tightens the vertical insets.
     #[allow(clippy::too_many_arguments)]
@@ -3329,24 +3329,23 @@ impl Shell {
         // rest, so the many resting rows carry no extra hitbox or tooltip.
         let reveal = motion::hover_t(&fade_key);
         let settle_id = id.clone();
-        let settle_toggle: Option<AnyElement> = (reveal > 0.0).then(|| {
+        let settle_button: Option<AnyElement> = (reveal > 0.0).then(|| {
             div()
                 .id(SharedString::from(format!("settle-{id}")))
-                // 13px fills the status band exactly: the reveal never changes
-                // the row's height, which the resort FLIP measures up front.
-                .size(px(13.0))
+                // An 18px rounded hit target reads as an action, not a form
+                // checkbox. It overlays the 13px status band without reflow.
+                .size(px(18.0))
                 .flex()
                 .flex_none()
                 .items_center()
                 .justify_center()
-                .rounded(px(3.0))
-                .border_1()
-                .border_color(if settled {
-                    theme.success.opacity(0.55)
+                .rounded(px(5.0))
+                .bg(if settled {
+                    theme.success.opacity(0.10)
                 } else {
-                    theme.border_strong
+                    crate::theme::ink(0.06)
                 })
-                .hover(|el| el.border_color(text).bg(crate::theme::ink(0.06)))
+                .hover(|el| el.bg(crate::theme::ink(0.13)))
                 .cursor_pointer()
                 .tooltip(popover::text_tooltip(if settled {
                     "Unsettle session"
@@ -3358,15 +3357,17 @@ impl Shell {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _, _| {
-                        this.settle_press.press_checkbox();
+                        this.settle_press.press_button();
                     }),
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.set_chat_settled(settle_id.clone(), !settled, cx);
                 }))
-                .when(settled, |el| {
-                    el.child(icon(icons::CHECK).size(px(10.0)).text_color(theme.success))
-                })
+                .child(icon(icons::CHECK).size(px(12.0)).text_color(if settled {
+                    theme.success
+                } else {
+                    theme.text_muted.opacity(0.82)
+                }))
                 .into_any_element()
         });
         div()
@@ -3430,7 +3431,7 @@ impl Shell {
                     )
                     .child(
                         // Fixed to the header line's 13px so dot/spinner/label
-                        // all center on the same baseline band. The checkbox
+                        // all center on the same baseline band. The button
                         // rides an absolute overlay pinned to the band's right
                         // edge: the read-out keeps owning the slot's width, so
                         // the swap costs no reflow at any indicator width.
@@ -3441,14 +3442,14 @@ impl Shell {
                             .flex()
                             .items_center()
                             .child(div().opacity(1.0 - reveal).child(status_slot))
-                            .when_some(settle_toggle, |el, toggle| {
+                            .when_some(settle_button, |el, button| {
                                 el.child(
                                     div()
                                         .absolute()
-                                        .top(px(0.0))
+                                        .top(px(-2.5))
                                         .right(px(0.0))
                                         .opacity(reveal)
-                                        .child(toggle),
+                                        .child(button),
                                 )
                             }),
                     ),
@@ -7819,13 +7820,13 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    /// A press on the settle checkbox hands its click to the checkbox; the row
+    /// A press on the settle button hands its click to the button; the row
     /// underneath must not also select the session.
     #[test]
-    fn settle_checkbox_press_takes_the_click_from_row_selection() {
+    fn settle_button_press_takes_the_click_from_row_selection() {
         let mut press = SettlePress::default();
-        // One press, dispatched descendant-first: checkbox, then row.
-        press.press_checkbox();
+        // One press, dispatched descendant-first: button, then row.
+        press.press_button();
         press.press_row();
         assert!(!press.row_click_selects());
     }
@@ -7836,20 +7837,20 @@ mod tests {
     #[test]
     fn settle_press_never_suppresses_a_later_row_click() {
         let mut press = SettlePress::default();
-        press.press_checkbox();
+        press.press_button();
         press.press_row();
-        // Next press lands on the row body — no checkbox press precedes it.
+        // Next press lands on the row body — no button press precedes it.
         press.press_row();
         assert!(press.row_click_selects());
     }
 
-    /// Settling twice in a row (toggling the same checkbox) suppresses each of
+    /// Settling twice in a row (toggling the same button) suppresses each of
     /// those clicks, not just the first.
     #[test]
     fn repeated_settle_presses_each_take_their_own_click() {
         let mut press = SettlePress::default();
         for _ in 0..2 {
-            press.press_checkbox();
+            press.press_button();
             press.press_row();
             assert!(!press.row_click_selects());
         }
