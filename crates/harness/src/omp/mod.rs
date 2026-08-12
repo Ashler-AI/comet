@@ -48,6 +48,11 @@ const ACP_INITIALIZE_DEADLINE: Duration = Duration::from_secs(15);
 const ACP_SESSION_DEADLINE: Duration = Duration::from_secs(30);
 const ACP_CONFIGURE_DEADLINE: Duration = Duration::from_secs(15);
 const ACP_PROMPT_INACTIVITY_LOG_INTERVAL: Duration = Duration::from_secs(300);
+// Cold project capability discovery can legitimately exceed the old 15-second
+// boundary in large repositories. Warm launches still return as soon as ready.
+const RPC_STARTUP_DEADLINE: Duration = Duration::from_secs(60);
+// Includes the startup boundary plus the command stream's two-second settle.
+const RPC_COMMAND_CATALOG_DEADLINE: Duration = Duration::from_secs(65);
 const SCAFFOLD_PROFILE: &str = "scaffold-host";
 const AUTH_BROKER_URL_ENV: &str = "OMP_AUTH_BROKER_URL";
 const AUTH_BROKER_TOKEN_ENV: &str = "OMP_AUTH_BROKER_TOKEN";
@@ -989,7 +994,7 @@ impl Harness for OmpHarness {
                 frames,
                 stderr_tail,
             },
-            Duration::from_secs(10),
+            RPC_COMMAND_CATALOG_DEADLINE,
         )
         .await
     }
