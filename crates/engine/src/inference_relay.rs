@@ -69,6 +69,7 @@ struct Inner {
 struct Route {
     request: AgentInferenceGrantRequest,
     grant: AsyncMutex<GrantState>,
+    cancellation: comet_harness::CancellationToken,
 }
 
 struct GrantState {
@@ -205,10 +206,12 @@ impl InferenceRelay {
             provider: request.provider.clone(),
             model: request.model.clone(),
         };
+        let cancellation = comet_harness::CancellationToken::new();
         lock(&self.inner.routes).insert(
             local_token,
             Arc::new(Route {
                 request,
+                cancellation,
                 grant: AsyncMutex::new(GrantState { grant, expires_at }),
             }),
         );
@@ -231,6 +234,7 @@ impl InferenceRelay {
         let Some(route) = route else {
             return;
         };
+        route.cancellation.cancel();
         if let Err(error) = self
             .inner
             .client
@@ -369,7 +373,7 @@ impl InferenceRelay {
                 );
             }
         };
-        let cancellation = comet_harness::CancellationToken::new();
+        let cancellation = route.cancellation.clone();
         let sanitized_headers = sanitize_request_headers(headers);
         let mut failovers = 0_usize;
         loop {
@@ -407,10 +411,10 @@ impl InferenceRelay {
                 }
             };
             if failovers >= MAX_AUTOMATIC_REPLAYS {
-                return stream_response(upstream);
+                return stream_response(upstream, cancellation);
             }
             let (upstream, failure_class) =
-                retryable_response(&route.request, &grant, upstream).await;
+                retryable_response(&route.request, &grant, upstream, cancellation.clone()).await;
             let Some(failure_class) = failure_class else {
                 return upstream;
             };
@@ -531,12 +535,16 @@ async fn retryable_response(
     request: &AgentInferenceGrantRequest,
     grant: &AgentInferenceGrant,
     upstream: reqwest::Response,
+    cancellation: comet_harness::CancellationToken,
 ) -> (Response<RelayBody>, Option<&'static str>) {
     if request.routing_mode == AgentRoutingMode::Pinned || grant.binding.backend != "oauth" {
-        return (stream_response(upstream), None);
+        return (stream_response(upstream, cancellation), None);
     }
     if upstream.status() == StatusCode::UNAUTHORIZED {
-        return (stream_response(upstream), Some("authentication_required"));
+        return (
+            stream_response(upstream, cancellation),
+            Some("authentication_required"),
+        );
     }
     if upstream.status() != StatusCode::TOO_MANY_REQUESTS
         || upstream
@@ -552,7 +560,7 @@ async fn retryable_response(
             .and_then(|value| value.parse::<usize>().ok())
             .is_some_and(|length| length > MAX_FAILURE_RESPONSE_BYTES)
     {
-        return (stream_response(upstream), None);
+        return (stream_response(upstream, cancellation), None);
     }
 
     let status = upstream.status();
@@ -757,12 +765,16 @@ fn json_response(status: StatusCode, body: serde_json::Value) -> Response<RelayB
         .expect("static relay response")
 }
 
-fn stream_response(upstream: reqwest::Response) -> Response<RelayBody> {
+fn stream_response(
+    upstream: reqwest::Response,
+    cancellation: comet_harness::CancellationToken,
+) -> Response<RelayBody> {
     let status = upstream.status();
     let headers = upstream.headers().clone();
     let stream = upstream
         .bytes_stream()
-        .map(|chunk| chunk.map_err(|error| -> BoxError { Box::new(error) }));
+        .map(|chunk| chunk.map_err(|error| -> BoxError { Box::new(error) }))
+        .take_until(cancellation.cancelled_owned());
     streamed_response(status, headers, Box::pin(stream))
 }
 

@@ -46,6 +46,19 @@ fn routing_mode_value(mode: AgentRoutingMode) -> &'static str {
     }
 }
 
+fn scaffold_http_client(
+    total_timeout: Option<Duration>,
+) -> Result<reqwest::Client, reqwest::Error> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(REQUEST_TIMEOUT)
+        // Authorization-bearing requests must never follow a redirect to another origin.
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(timeout) = total_timeout {
+        builder = builder.timeout(timeout);
+    }
+    builder.build()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScaffoldApiError {
     pub status: u16,
@@ -102,6 +115,7 @@ impl ScaffoldError {
 #[derive(Clone)]
 pub struct ScaffoldClient {
     http: reqwest::Client,
+    inference_http: reqwest::Client,
     origin: Url,
     project_scope: String,
     bearer: Arc<dyn TokenSource>,
@@ -240,15 +254,11 @@ impl ScaffoldClient {
         if project_scope.trim().is_empty() {
             return Err(ScaffoldError::InvalidScope("projectId is required".into()));
         }
-        let http = reqwest::Client::builder()
-            .connect_timeout(REQUEST_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
-            // Upload grants are one-use credentials. Never follow a redirect
-            // that could carry their Authorization header to another origin.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
+        let http = scaffold_http_client(Some(REQUEST_TIMEOUT))?;
+        let inference_http = scaffold_http_client(None)?;
         Ok(Self {
             http,
+            inference_http,
             origin,
             project_scope,
             bearer,
@@ -372,7 +382,7 @@ impl ScaffoldClient {
         }
         let url = self.origin.join(path).expect("static inference proxy path");
         let mut request = self
-            .http
+            .inference_http
             .post(url)
             .headers(headers)
             .bearer_auth(&grant.token)
@@ -2188,6 +2198,96 @@ mod tests {
             requests
         });
         (origin, task)
+    }
+
+    fn test_inference_grant() -> AgentInferenceGrant {
+        AgentInferenceGrant {
+            token: "remote-grant".into(),
+            expires_at: "2026-08-12T23:00:00Z".into(),
+            binding: AgentInferenceGrantBinding {
+                owner_subject: "owner-1".into(),
+                logical_session_id: "session-1".into(),
+                provider: "openai".into(),
+                model: "gpt-5.6-sol".into(),
+                harness: "omp".into(),
+                routing_mode: AgentRoutingMode::Automatic,
+                requested_account_id: None,
+                source: "comet-local".into(),
+                lifecycle_epoch: 1,
+                environment: "local".into(),
+                backend: "oauth".into(),
+                account_id: Some("account-1".into()),
+                account_generation: Some(1),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn inference_response_outlives_the_control_plane_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 4096];
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(header_end) =
+                    request.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let content_length = String::from_utf8_lossy(&request[..header_end])
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            stream.write_all(b"9\r\ndata: 1\n\n\r\n").await.unwrap();
+            tokio::time::sleep(REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+            stream
+                .write_all(b"9\r\ndata: 2\n\n\r\n0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let client = ScaffoldClient::new(
+            origin,
+            "project-a",
+            Arc::new(StaticToken("owner-scoped-bearer".into())),
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        let grant = test_inference_grant();
+        let response = client
+            .proxy_agent_inference(AgentInferenceProxyRequest {
+                endpoint: "responses",
+                grant: &grant,
+                request_id: "request-1",
+                headers: reqwest::header::HeaderMap::new(),
+                content_length: 2,
+                body: reqwest::Body::from("{}"),
+                cancellation: &cancellation,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.text().await.unwrap(), "data: 1\n\ndata: 2\n\n");
     }
 
     #[tokio::test]

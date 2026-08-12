@@ -141,7 +141,8 @@ fn refresh_tool_call(existing: &mut ToolCall, incoming: &ToolCall) {
 /// - `ToolCall` appends, or refreshes in place when the id already exists (SDK retry idempotence).
 /// - `ToolResult` marks the matching tool part resolved / errored in place.
 /// - `InputRequested` appends an input part; `InputResolved` marks it resolved.
-/// - `Error` and `Done{error}` become visible error parts.
+/// - `Error` and `Done{error}` become visible error parts; a terminal `Done` reusing the latest
+///   error message is idempotent.
 pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
     match event {
         AgentEvent::SessionStarted { .. } | AgentEvent::Steered { .. } => {
@@ -237,7 +238,9 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
             });
         }
         AgentEvent::Done { error, .. } => {
-            if let Some(message) = error {
+            if let Some(message) = error
+                && !matches!(out.last(), Some(MessagePart::Error { message: existing, .. }) if existing == message)
+            {
                 let id = format!("e{}", out.len());
                 out.push(MessagePart::Error {
                     id,
@@ -401,6 +404,55 @@ mod tests {
             },
         );
         assert!(parts.is_empty());
+    }
+
+    #[test]
+    fn terminal_done_does_not_duplicate_the_immediately_preceding_error() {
+        let message = "The socket connection was closed unexpectedly";
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Error {
+                message: message.into(),
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Done {
+                status: comet_proto::DoneStatus::Errored,
+                result: None,
+                error: Some(message.into()),
+                session_id: Some("omp-session".into()),
+            },
+        );
+
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Error { message: visible, .. } if visible == message
+        ));
+    }
+
+    #[test]
+    fn terminal_done_preserves_a_distinct_error() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Error {
+                message: "provider warning".into(),
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Done {
+                status: comet_proto::DoneStatus::Errored,
+                result: None,
+                error: Some("terminal failure".into()),
+                session_id: None,
+            },
+        );
+
+        assert_eq!(parts.len(), 2);
     }
 
     #[test]
