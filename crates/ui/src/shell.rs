@@ -1063,6 +1063,41 @@ fn render_goal_group(
         .into_any_element()
 }
 
+/// Press bookkeeping for the session row's settle checkbox: the row is
+/// clickable (select) and the checkbox lives inside it, but gpui's
+/// `stop_propagation` does NOT suppress an ancestor's click listener from a
+/// descendant's — measured on the pinned rev, both fire, descendant first.
+/// So the row has to recognize the checkbox's click and stand down.
+///
+/// The press is the only reliable signal: `on_mouse_down` is hitbox-gated,
+/// while hover leave is state-diffed per element path — a row moving between
+/// the active and settled lists lands on a fresh path and never sees one.
+/// A descendant's press listener runs first, so the checkbox raises
+/// [`Self::press_checkbox`] and the row's press claims it; the row presses for
+/// EVERY left press it contains, so nothing outlives the click it describes.
+#[derive(Default)]
+struct SettlePress {
+    /// The press in flight landed on a settle checkbox.
+    on_checkbox: bool,
+    /// The click in flight is the checkbox's, not a row selection.
+    owns_click: bool,
+}
+
+impl SettlePress {
+    fn press_checkbox(&mut self) {
+        self.on_checkbox = true;
+    }
+
+    fn press_row(&mut self) {
+        self.owns_click = std::mem::take(&mut self.on_checkbox);
+    }
+
+    /// Whether the click this press produced is the row's to act on.
+    fn row_click_selects(&self) -> bool {
+        !self.owns_click
+    }
+}
+
 pub struct Shell {
     state: Entity<AppState>,
     transcript: Entity<Transcript>,
@@ -1089,6 +1124,8 @@ pub struct Shell {
     shortcuts_sub: Option<Subscription>,
     /// Session-row context menu: (chat id, window position).
     chat_menu: Option<(String, Point<Pixels>)>,
+    /// Press bookkeeping for the session row's settle checkbox.
+    settle_press: SettlePress,
     rename_dialog: Option<RenameChatDialog>,
     /// Chat id awaiting delete confirmation.
     delete_confirm: Option<String>,
@@ -1331,6 +1368,7 @@ impl Shell {
             advisor_page: None,
             shortcuts_sub: None,
             chat_menu: None,
+            settle_press: SettlePress::default(),
             rename_dialog: None,
             delete_confirm: None,
             space_menu: None,
@@ -2765,10 +2803,14 @@ impl Shell {
         cx.notify();
     }
 
-    fn archive_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
+    /// Settle (archive) or unsettle a session — the sidebar's row checkbox and
+    /// context menu, and the tab strip's close. `setChatArchived` is idempotent
+    /// and reversible; settling also stages the session's managed worktree for
+    /// deferred cleanup, which unsettling cancels (engine `rpc.rs`).
+    fn set_chat_settled(&mut self, chat_id: String, settled: bool, cx: &mut Context<Self>) {
         self.chat_menu = None;
         self.mutate(
-            serde_json::json!({ "op": "setChatArchived", "chatId": chat_id, "archived": true }),
+            serde_json::json!({ "op": "setChatArchived", "chatId": chat_id, "archived": settled }),
             cx,
         );
         cx.notify();
@@ -3205,8 +3247,10 @@ impl Shell {
 
     /// Rich session row: room context, title, source/runtime/model, and the
     /// top-right status slot — a spinner while the agent works, an attention
-    /// dot when it finished or needs input, otherwise the recency label. The
-    /// row retains the same content at both density settings; compact only
+    /// dot when it finished or needs input, otherwise the recency label.
+    /// Hovering the row cross-fades that read-out out and a settle checkbox in
+    /// (`settled` seeds it checked, so the settled list unsettles). The row
+    /// retains the same content at both density settings; compact only
     /// tightens the vertical insets.
     #[allow(clippy::too_many_arguments)]
     fn render_chat_row(
@@ -3218,6 +3262,7 @@ impl Shell {
         branch: Option<SharedString>,
         meta: SidebarSessionMeta,
         status: comet_proto::ChatIndicator,
+        settled: bool,
         selected: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
@@ -3280,6 +3325,53 @@ impl Shell {
                 .child(time_ago)
                 .into_any_element(),
         };
+        // Hover reveal without a `group-hover` (gpui has none): the row's own
+        // wash fade — already driven by the `on_hover` below — doubles as the
+        // reveal progress, so the swap rides the same 150ms curve as the wash
+        // and needs no state of its own. Built only while that fade is off
+        // rest, so the many resting rows carry no extra hitbox or tooltip.
+        let reveal = motion::hover_t(&fade_key);
+        let settle_id = id.clone();
+        let settle_toggle: Option<AnyElement> = (reveal > 0.0).then(|| {
+            div()
+                .id(SharedString::from(format!("settle-{id}")))
+                // 13px fills the status band exactly: the reveal never changes
+                // the row's height, which the resort FLIP measures up front.
+                .size(px(13.0))
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .rounded(px(3.0))
+                .border_1()
+                .border_color(if settled {
+                    theme.success.opacity(0.55)
+                } else {
+                    theme.border_strong
+                })
+                .hover(|el| el.border_color(text).bg(crate::theme::ink(0.06)))
+                .cursor_pointer()
+                .tooltip(popover::text_tooltip(if settled {
+                    "Unsettle session"
+                } else {
+                    "Settle session"
+                }))
+                // The row underneath is clickable (select); see [`SettlePress`]
+                // for why the press — not `stop_propagation` — arbitrates.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, _| {
+                        this.settle_press.press_checkbox();
+                    }),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_chat_settled(settle_id.clone(), !settled, cx);
+                }))
+                .when(settled, |el| {
+                    el.child(icon(icons::CHECK).size(px(10.0)).text_color(theme.success))
+                })
+                .into_any_element()
+        });
         div()
             .id(SharedString::from(format!("chat-{id}")))
             .flex()
@@ -3299,7 +3391,19 @@ impl Shell {
             })
             .on_hover(motion::hover_listener(fade_key))
             .cursor_pointer()
+            // Claims the checkbox press raised just above (a descendant's press
+            // listener runs first), for EVERY left press the row contains — so
+            // no press is ever attributed to a later click ([`SettlePress`]).
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, _| {
+                    this.settle_press.press_row();
+                }),
+            )
             .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.settle_press.row_click_selects() {
+                    return;
+                }
                 let id = select_id.clone();
                 this.state
                     .update(cx, |state, cx| state.select_chat(Some(id), cx));
@@ -3329,13 +3433,27 @@ impl Shell {
                     )
                     .child(
                         // Fixed to the header line's 13px so dot/spinner/label
-                        // all center on the same baseline band.
+                        // all center on the same baseline band. The checkbox
+                        // rides an absolute overlay pinned to the band's right
+                        // edge: the read-out keeps owning the slot's width, so
+                        // the swap costs no reflow at any indicator width.
                         div()
                             .flex_none()
                             .h(px(13.0))
+                            .relative()
                             .flex()
                             .items_center()
-                            .child(status_slot),
+                            .child(div().opacity(1.0 - reveal).child(status_slot))
+                            .when_some(settle_toggle, |el, toggle| {
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .top(px(0.0))
+                                        .right(px(0.0))
+                                        .opacity(reveal)
+                                        .child(toggle),
+                                )
+                            }),
                     ),
             )
             .child(
@@ -5685,7 +5803,7 @@ impl Shell {
                         popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))
                             .id("chat-menu-archive")
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.archive_chat(archive_id.clone(), cx)
+                                this.set_chat_settled(archive_id.clone(), true, cx)
                             }))
                             .child(
                                 icon(icons::ARCHIVE_MINIMALISTIC)
@@ -7695,6 +7813,42 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::rc::Rc;
+
+    /// A press on the settle checkbox hands its click to the checkbox; the row
+    /// underneath must not also select the session.
+    #[test]
+    fn settle_checkbox_press_takes_the_click_from_row_selection() {
+        let mut press = SettlePress::default();
+        // One press, dispatched descendant-first: checkbox, then row.
+        press.press_checkbox();
+        press.press_row();
+        assert!(!press.row_click_selects());
+    }
+
+    /// The suppression covers exactly the click it belongs to: a settle press
+    /// must never swallow a later click on the row body — which is reachable
+    /// right after settling, since the row moves to the Settled list.
+    #[test]
+    fn settle_press_never_suppresses_a_later_row_click() {
+        let mut press = SettlePress::default();
+        press.press_checkbox();
+        press.press_row();
+        // Next press lands on the row body — no checkbox press precedes it.
+        press.press_row();
+        assert!(press.row_click_selects());
+    }
+
+    /// Settling twice in a row (toggling the same checkbox) suppresses each of
+    /// those clicks, not just the first.
+    #[test]
+    fn repeated_settle_presses_each_take_their_own_click() {
+        let mut press = SettlePress::default();
+        for _ in 0..2 {
+            press.press_checkbox();
+            press.press_row();
+            assert!(!press.row_click_selects());
+        }
+    }
 
     struct RightDrawerProbe;
 

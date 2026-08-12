@@ -12,8 +12,8 @@
 //! feed them measurements/events.
 
 use gpui::{
-    Anchor, AnyElement, ElementId, InteractiveElement as _, IntoElement, Pixels, Point,
-    SharedString, div, prelude::*, px,
+    Anchor, AnyElement, AnyView, App, ElementId, InteractiveElement as _, IntoElement, Pixels,
+    Point, SharedString, Window, div, prelude::*, px,
 };
 
 use crate::motion::{self, COMET_PULSE};
@@ -463,6 +463,49 @@ pub fn menu_check(theme: &Theme) -> impl IntoElement {
     crate::icons::icon(crate::icons::CHECK)
         .size(px(14.0))
         .text_color(theme.text.opacity(0.7))
+}
+
+/// A one-line hover tooltip: 24px band, hairline border over the raised
+/// surface, 11px muted label — the composer's mention-path chrome generalized
+/// for any hover hint. gpui's `.tooltip(..)` wants a builder closure returning
+/// a fresh view, so pair it with a `Stateful` element:
+/// `.id("settle-x").tooltip(popover::text_tooltip("Settle session"))`.
+pub fn text_tooltip(
+    label: impl Into<SharedString>,
+) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+    let label = label.into();
+    move |_, cx| {
+        cx.new(|_| TextTooltip {
+            label: label.clone(),
+        })
+        .into()
+    }
+}
+
+/// [`text_tooltip`]'s body view.
+struct TextTooltip {
+    label: SharedString,
+}
+
+impl Render for TextTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        motion::fade_quick(
+            "text-tooltip",
+            div()
+                .h(px(24.0))
+                .flex()
+                .items_center()
+                .px(px(8.0))
+                .rounded(px(5.0))
+                .border_1()
+                .border_color(theme.border_strong)
+                .bg(theme.surface_raised)
+                .text_size(px(11.0))
+                .text_color(theme.text_muted)
+                .child(self.label.clone()),
+        )
+    }
 }
 
 /// The recessed band tone for a palette/picker header or footer strip — a

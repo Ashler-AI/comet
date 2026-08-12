@@ -145,7 +145,7 @@ impl Shell {
             let next = next_after_close(&order, &chat_id);
             self.state.update(cx, |s, cx| s.select_chat(next, cx));
         }
-        self.archive_chat(chat_id, cx);
+        self.set_chat_settled(chat_id, true, cx);
     }
 
     /// Track the drop slot while a tab is dragged over the strip (150ms sibling

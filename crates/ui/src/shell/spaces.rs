@@ -982,6 +982,7 @@ impl Shell {
                     branch.map(SharedString::from),
                     meta,
                     status,
+                    settled,
                     is_selected,
                     theme,
                     cx,
