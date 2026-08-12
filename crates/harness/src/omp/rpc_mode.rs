@@ -35,7 +35,6 @@ use comet_proto::{
 
 use crate::{HarnessError, RunControls};
 
-const READY_DEADLINE: Duration = Duration::from_secs(15);
 const STATE_DEADLINE: Duration = Duration::from_secs(15);
 const INACTIVITY_LOG_INTERVAL: Duration = Duration::from_secs(300);
 /// Command metadata can change while skills, extensions, and MCP prompts finish
@@ -750,7 +749,7 @@ pub(crate) async fn run_rpc(
     };
 
     // Stage 1: the ready frame (always the first stdout object).
-    let ready = tokio::time::timeout(READY_DEADLINE, async {
+    let ready = tokio::time::timeout(super::RPC_STARTUP_DEADLINE, async {
         loop {
             match frames.recv().await {
                 Some(RpcFrame::Frame(frame))
@@ -768,7 +767,7 @@ pub(crate) async fn run_rpc(
         HarnessError::Protocol(format!(
             "{} ready frame timed out after {}s",
             options.process_label,
-            READY_DEADLINE.as_secs()
+            super::RPC_STARTUP_DEADLINE.as_secs()
         ))
     })?
     .map_err(|()| crash(&mut child, options.process_label))?;
