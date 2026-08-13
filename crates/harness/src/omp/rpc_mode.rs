@@ -1142,8 +1142,16 @@ pub(crate) async fn run_rpc(
                 None => steering_open = false,
             },
             _ = interrupt.cancelled() => {
-                let _ = client.request("abort", Map::new()).await;
-                let _ = tokio::time::timeout(interrupt_grace, child.wait()).await;
+                // The RPC peer may accept stdin while never answering `abort`,
+                // and a successful abort does not exit the persistent RPC host.
+                // Bound the acknowledgement phase, then reap the old writer
+                // before the engine's longer settlement deadline can expose
+                // the session as resumable.
+                let _ = tokio::time::timeout(
+                    interrupt_grace,
+                    client.request("abort", Map::new()),
+                )
+                .await;
                 let _ = child.kill().await;
                 events
                     .send(Ok(AgentEvent::Done {

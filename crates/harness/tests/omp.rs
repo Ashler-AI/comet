@@ -434,6 +434,105 @@ async fn active_resume_is_rejected_before_a_second_omp_process_starts() {
 }
 
 #[tokio::test]
+async fn hung_abort_is_force_killed_before_the_session_can_resume() {
+    let _env = env_lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let argv_log = temp.path().join("argv");
+    let pid_log = temp.path().join("pid");
+    let session_dir = temp.path().join("sessions");
+    write_omp_session(&session_dir, "hung-session");
+    unsafe {
+        std::env::set_var("OMP_ARGV_LOG", &argv_log);
+        std::env::set_var("OMP_RPC_PID_LOG", &pid_log);
+        std::env::set_var("OMP_WRITER_STATE", "auto");
+        std::env::set_var("OMP_STEER_SCENARIO", "1");
+        std::env::set_var("OMP_HANG_ABORT", "1");
+    }
+    let harness = OmpHarness::new()
+        .with_executable(fixture_path())
+        .with_session_dir(&session_dir)
+        .with_session_writer_probe(fixture_path())
+        .with_interrupt_grace(Duration::from_millis(50));
+    let interrupt = CancellationToken::new();
+    let (_steer_tx, steering) = mpsc::channel(4);
+    let run_controls = RunControls {
+        request_input: Box::new(|_| {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(Vec::new());
+            rx
+        }),
+        steering,
+        interrupt: interrupt.clone(),
+        context: None,
+    };
+    let mut stream = harness
+        .run(request(Some("hung-session")), run_controls)
+        .await
+        .expect("first resume starts");
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("session starts")
+            .expect("stream remains open")
+            .expect("valid RPC event");
+        if matches!(event, AgentEvent::SessionStarted { .. }) {
+            break;
+        }
+    }
+
+    let error = match harness.run(request(Some("hung-session")), controls()).await {
+        Ok(_) => panic!("active OMP session started a second writer"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("already running"));
+
+    interrupt.cancel();
+    let events = tokio::time::timeout(
+        Duration::from_secs(2),
+        stream
+            .map(|event| event.expect("valid interrupted event"))
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .expect("hung abort is force-killed within the interrupt deadline");
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Interrupted,
+            ..
+        })
+    ));
+
+    unsafe {
+        std::env::remove_var("OMP_HANG_ABORT");
+        std::env::remove_var("OMP_STEER_SCENARIO");
+    }
+    let resumed = harness
+        .run(request(Some("hung-session")), controls())
+        .await
+        .expect("session resumes after interrupt teardown");
+    let resumed_events = tokio::time::timeout(
+        Duration::from_secs(10),
+        resumed
+            .map(|event| event.expect("valid resumed event"))
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .expect("resumed turn completes");
+    assert!(matches!(
+        resumed_events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+    unsafe {
+        std::env::remove_var("OMP_RPC_PID_LOG");
+        std::env::remove_var("OMP_WRITER_STATE");
+    }
+}
+
+#[tokio::test]
 async fn unknown_writer_state_fails_closed_before_spawning_omp() {
     let _env = env_lock().await;
     let temp = tempfile::tempdir().unwrap();
