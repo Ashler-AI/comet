@@ -56,7 +56,8 @@ const SELF_UPDATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 // Release metadata
 // ---------------------------------------------------------------------------
 
-/// Private `manifest.json` written by the release workflow.
+/// Private platform-specific release manifest written by the release workflow.
+/// Desktop-only releases advance macOS without advertising an absent Linux host.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: String,
@@ -115,6 +116,13 @@ pub fn version_newer(latest: &str, current: &str) -> bool {
         _ => false,
     }
 }
+fn release_manifest_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "desktop-manifest.json"
+    } else {
+        "scaffold-manifest.json"
+    }
+}
 
 fn releases_base(edge_url: &str) -> anyhow::Result<String> {
     let mut url = reqwest::Url::parse(edge_url).context("invalid Comet edge URL")?;
@@ -145,10 +153,10 @@ fn authorized_get(
     }
 }
 
-/// Fetch the signed release manifest through the authenticated Comet edge.
+/// Fetch the latest compatible release manifest through the authenticated Comet edge.
 pub async fn fetch_latest(edge_url: &str, access_token: Option<&str>) -> anyhow::Result<Manifest> {
     let base = releases_base(edge_url)?;
-    let manifest_url = format!("{base}/manifest.json");
+    let manifest_url = format!("{base}/{}", release_manifest_name());
     let client = http_client()?;
     let manifest: Manifest = authorized_get(&client, &manifest_url, access_token)
         .send()
@@ -1142,6 +1150,18 @@ mod tests {
         assert_eq!(
             releases_base("http://127.0.0.1:8787").unwrap(),
             "http://127.0.0.1:8787/api/releases"
+        );
+    }
+
+    #[test]
+    fn release_manifest_matches_the_installed_platform() {
+        assert_eq!(
+            release_manifest_name(),
+            if cfg!(target_os = "macos") {
+                "desktop-manifest.json"
+            } else {
+                "scaffold-manifest.json"
+            }
         );
     }
 

@@ -8,7 +8,7 @@
 # `COMET_RELEASES_URL` must select the matching private immutable GCS feed.
 # `COMET_RELEASES_AUTHORIZATION` is consumed immediately and removed from the
 # environment before curl starts; it is never placed in argv or written to disk.
-# The release workflow publishes SHA256SUMS; missing or mismatched files fail.
+# The release workflow publishes scaffold-SHA256SUMS; missing or mismatched files fail.
 #
 # Installs the self-contained native binary to ~/.comet-native/app, puts
 # `comet` on PATH, and — once signed in — runs it as a systemd user service.
@@ -161,7 +161,7 @@ case "$arch" in
 esac
 
 # --- download ----------------------------------------------------------------
-ver="$(release_fetch -fsSL "$RELEASES/latest.txt" | tr -d '[:space:]')"
+ver="$(release_fetch -fsSL "$RELEASES/scaffold-latest.txt" | tr -d '[:space:]')"
 [ -n "$ver" ] || { echo "ashler comet install: could not resolve latest version" >&2; exit 1; }
 file="comet-$ver-$plat-$arch.tar.gz"
 data_root="$HOME/.comet-native"
@@ -175,9 +175,9 @@ else
   trap 'rm -rf "$tmp"' EXIT
   echo "downloading Ashler Comet $ver ($plat-$arch)…"
   release_fetch -fSL --progress-bar "$RELEASES/$file" -o "$tmp/$file"
-  release_fetch -fsSL "$RELEASES/SHA256SUMS" -o "$tmp/SHA256SUMS"
+  release_fetch -fsSL "$RELEASES/scaffold-SHA256SUMS" -o "$tmp/SHA256SUMS"
   expected="$(awk -v file="$file" '$2 == file || $2 == "*" file { print $1; exit }' "$tmp/SHA256SUMS")"
-  [ -n "$expected" ] || { echo "ashler comet install: $file is missing from SHA256SUMS" >&2; exit 1; }
+  [ -n "$expected" ] || { echo "ashler comet install: $file is missing from scaffold-SHA256SUMS" >&2; exit 1; }
   actual="$(sha256_file "$tmp/$file")"
   [ "$actual" = "$expected" ] || { echo "ashler comet install: checksum mismatch for $file" >&2; exit 1; }
   mkdir -p "$dest"

@@ -39,6 +39,25 @@ describe("authenticated release feed", () => {
     );
   });
 
+  it("keeps each moving desktop and Scaffold channel uncached", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("release bytes", { status: 200 }))
+    );
+
+    for (const file of [
+      "desktop-manifest.json",
+      "desktop-SHA256SUMS",
+      "desktop-latest.txt",
+      "scaffold-manifest.json",
+      "scaffold-SHA256SUMS",
+      "scaffold-latest.txt"
+    ]) {
+      const response = await fetchReleaseObject(env, file, "GET", async () => "token");
+      expect(response.headers.get("cache-control"), file).toBe("private, no-store");
+    }
+  });
+
   it("does not expose upstream authorization failures", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({ secret: "upstream" }, { status: 403 })));
 

@@ -113,26 +113,34 @@ Never reuse production credentials for the staging command.
 
 ## Release
 
-A `v<workspace-version>` tag builds and checks these artifacts:
+Manual releases choose an explicit surface:
 
-- `comet-<version>-linux-x86_64.tar.gz`
-- `comet-<version>-linux-aarch64.tar.gz`
-- `comet-<version>-macos-arm64.dmg`
-- `comet-<version>-macos-arm64-app.tar.gz`
-- `install.sh`
+- `desktop` builds and promotes only `comet-<version>-macos-arm64.dmg` and the macOS app tarball. It advances `desktop-manifest.json` and `desktop-latest.txt` only.
+- `desktop-and-scaffold` also builds both Linux archives, emits a `scaffold.comet-runtime.v1` compatibility manifest, and advances `scaffold-manifest.json` plus `scaffold-latest.txt`. Use this whenever headless engine, auth, relay, OMP, or Scaffold-host behavior changed.
 
-CI verifies the tag or dispatch version against both `[workspace.package].version` and Cargo metadata. It emits `SHA256SUMS`, `manifest.json`, source commit and workflow provenance, and a digest-sealed candidate. Staging and production consume that same archive. Every `releases/<version>/…` object and version-named root artifact is create-only; a byte-identical re-publish is a no-op and differing bytes fail. Only `latest.txt`, `manifest.json`, `SHA256SUMS`, and `install.sh` are moving latest-channel aliases. All objects remain private.
+Version tags remain complete `desktop-and-scaffold` releases for backward compatibility. CI verifies the tag or dispatch version against both `[workspace.package].version` and Cargo metadata. Every `releases/<version>/…` object and version-named root artifact is create-only; a byte-identical re-publish is a no-op and differing bytes fail. Moving desktop and Scaffold channel aliases are independent. All objects remain private.
 
 ```bash
 version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
+
+# Build or promote a desktop-only release.
+gh workflow run release.yml \
+  -f version="$version" \
+  -f release_surface=desktop \
+  -f promotion_target=staging
+
+# Build or promote a release that Scaffold may pin.
+gh workflow run release.yml \
+  -f version="$version" \
+  -f release_surface=desktop-and-scaffold \
+  -f promotion_target=staging
+
+# A version tag builds and promotes the complete release through production.
 git tag "v$version"
 git push origin "v$version"
-
-# Build without publishing
-gh workflow run release.yml -f version="$version" -f publish=false
 ```
 
-Manual publication still requires both private release environments and the production approval. It does not create a GitHub Release or public object. Cargo workspace packages keep `publish = false`, so the workflow cannot publish crates.
+Manual production publication still requires both private release environments and the production approval. It does not create a GitHub Release or public object. Cargo workspace packages keep `publish = false`, so the workflow cannot publish crates.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the runtime design.
 The required local/Scaffold cutover and multi-client acceptance contract is in [docs/ASHLER-SCAFFOLD-END-STATE.md](docs/ASHLER-SCAFFOLD-END-STATE.md).

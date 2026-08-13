@@ -9,12 +9,7 @@ type AccessTokenSource = (env: ReleaseFeedEnv) => Promise<string>;
 const encoder = new TextEncoder();
 const TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
 const STORAGE_SCOPE = "https://www.googleapis.com/auth/devstorage.read_only";
-const LATEST_ALIASES: Record<string, true> = {
-  "manifest.json": true,
-  SHA256SUMS: true,
-  "install.sh": true,
-  "latest.txt": true
-};
+const LATEST_ALIAS_RE = /^(?:(?:desktop|scaffold)-(?:manifest\.json|SHA256SUMS|latest\.txt)|manifest\.json|SHA256SUMS|install\.sh|latest\.txt)$/;
 
 const base64Url = (bytes: Uint8Array): string => {
   let binary = "";
@@ -112,7 +107,7 @@ export const fetchReleaseObject = async (
   }
   headers.set(
     "cache-control",
-    LATEST_ALIASES[file] ? "private, no-store" : "private, max-age=31536000, immutable"
+    LATEST_ALIAS_RE.test(file) ? "private, no-store" : "private, max-age=31536000, immutable"
   );
   return new Response(method === "HEAD" ? null : response.body, { status: 200, headers });
 };

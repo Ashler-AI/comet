@@ -9,6 +9,14 @@ on:
         description: "Workspace version to build (for example 0.2.0)"
         required: true
         type: string
+      release_surface:
+        description: "Build only the macOS desktop distribution, or also publish Linux artifacts for Scaffold"
+        required: true
+        default: desktop
+        type: choice
+        options:
+          - desktop
+          - desktop-and-scaffold
       promotion_target:
         description: "Choose where to promote the exact candidate"
         required: true
@@ -33,6 +41,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       source_epoch: ${{ steps.version.outputs.source_epoch }}
+      release_surface: ${{ steps.version.outputs.release_surface }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -42,15 +51,25 @@ jobs:
         shell: bash
         env:
           REQUESTED_VERSION: ${{ inputs.version }}
+          REQUESTED_RELEASE_SURFACE: ${{ inputs.release_surface }}
         run: |
           set -euo pipefail
           workspace_version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
           test -n "$workspace_version"
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             requested="${GITHUB_REF_NAME#v}"
+            release_surface="desktop-and-scaffold"
           else
             requested="$REQUESTED_VERSION"
+            release_surface="$REQUESTED_RELEASE_SURFACE"
           fi
+          case "$release_surface" in
+            desktop|desktop-and-scaffold) ;;
+            *)
+              echo "::error::unsupported release surface: $release_surface"
+              exit 1
+              ;;
+          esac
           if [[ "$requested" != "$workspace_version" ]]; then
             echo "::error::release version $requested does not match workspace version $workspace_version"
             exit 1
@@ -61,9 +80,11 @@ jobs:
             exit 1
           fi
           echo "version=$workspace_version" >> "$GITHUB_OUTPUT"
+          echo "release_surface=$release_surface" >> "$GITHUB_OUTPUT"
           echo "source_epoch=$(git show -s --format=%ct "$GITHUB_SHA")" >> "$GITHUB_OUTPUT"
 
   linux:
+    if: ${{ needs.version.outputs.release_surface == 'desktop-and-scaffold' }}
     needs: version
     strategy:
       fail-fast: false
@@ -135,6 +156,7 @@ jobs:
           if-no-files-found: error
 
   candidate:
+    if: ${{ always() && needs.version.result == 'success' && needs.macos.result == 'success' && (needs.linux.result == 'success' || needs.linux.result == 'skipped') }}
     needs: [version, linux, macos]
     runs-on: ubuntu-24.04
     outputs:
@@ -149,28 +171,54 @@ jobs:
         env:
           VERSION: ${{ needs.version.outputs.version }}
           SOURCE_EPOCH: ${{ needs.version.outputs.source_epoch }}
+          RELEASE_SURFACE: ${{ needs.version.outputs.release_surface }}
         run: |
           set -euo pipefail
           mkdir -p candidate
           find incoming -type f -name 'comet-*' -exec cp '{}' candidate/ \;
-          cp install.sh candidate/install.sh
-          expected=(
-            "comet-$VERSION-linux-x86_64.tar.gz"
-            "comet-$VERSION-linux-aarch64.tar.gz"
+
+          desktop_files=(
             "comet-$VERSION-macos-arm64.dmg"
             "comet-$VERSION-macos-arm64-app.tar.gz"
-            "install.sh"
           )
-          for file in "${expected[@]}"; do test -f "candidate/$file"; done
-          (cd candidate && sha256sum "${expected[@]}" > SHA256SUMS)
+          for file in "${desktop_files[@]}"; do test -f "candidate/$file"; done
+          (cd candidate && sha256sum "${desktop_files[@]}" > desktop-SHA256SUMS)
           jq -n \
             --arg version "$VERSION" \
             --arg commit "$GITHUB_SHA" \
             --arg repository "$GITHUB_REPOSITORY" \
             --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            --rawfile sums candidate/SHA256SUMS \
-            '{schemaVersion:1,version:$version,source:{repository:$repository,commit:$commit,workflowRun:$run},files:($sums|split("\n")|map(select(length>0)|capture("^(?<sha256>[0-9a-f]{64})  (?<name>.+)$"))|map({key:.name,value:{sha256:.sha256}})|from_entries)}' \
-            > candidate/manifest.json
+            --rawfile sums candidate/desktop-SHA256SUMS \
+            '{schemaVersion:2,releaseSurface:"desktop",version:$version,source:{repository:$repository,commit:$commit,workflowRun:$run},files:($sums|split("\n")|map(select(length>0)|capture("^(?<sha256>[0-9a-f]{64})  (?<name>.+)$"))|map({key:.name,value:{sha256:.sha256}})|from_entries)}' \
+            > candidate/desktop-manifest.json
+
+          if [[ "$RELEASE_SURFACE" == "desktop-and-scaffold" ]]; then
+            scaffold_files=(
+              "comet-$VERSION-linux-x86_64.tar.gz"
+              "comet-$VERSION-linux-aarch64.tar.gz"
+            )
+            for file in "${scaffold_files[@]}"; do test -f "candidate/$file"; done
+            cp install.sh candidate/install.sh
+            (cd candidate && sha256sum "${scaffold_files[@]}" > scaffold-SHA256SUMS)
+            jq -n \
+              --arg version "$VERSION" \
+              --arg commit "$GITHUB_SHA" \
+              --arg repository "$GITHUB_REPOSITORY" \
+              --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              --rawfile sums candidate/scaffold-SHA256SUMS \
+              '{schemaVersion:2,releaseSurface:"scaffold",scaffoldRuntimeVersion:"scaffold.comet-runtime.v1",version:$version,source:{repository:$repository,commit:$commit,workflowRun:$run},files:($sums|split("\n")|map(select(length>0)|capture("^(?<sha256>[0-9a-f]{64})  (?<name>.+)$"))|map({key:.name,value:{sha256:.sha256}})|from_entries)}' \
+              > candidate/scaffold-manifest.json
+            cat candidate/desktop-SHA256SUMS candidate/scaffold-SHA256SUMS > candidate/SHA256SUMS
+            jq -n \
+              --arg version "$VERSION" \
+              --arg commit "$GITHUB_SHA" \
+              --arg repository "$GITHUB_REPOSITORY" \
+              --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              --rawfile sums candidate/SHA256SUMS \
+              '{schemaVersion:1,version:$version,source:{repository:$repository,commit:$commit,workflowRun:$run},files:($sums|split("\n")|map(select(length>0)|capture("^(?<sha256>[0-9a-f]{64})  (?<name>.+)$"))|map({key:.name,value:{sha256:.sha256}})|from_entries)}' \
+              > candidate/manifest.json
+          fi
+
           tar --sort=name --mtime="@$SOURCE_EPOCH" --owner=0 --group=0 --numeric-owner \
             -czf release-candidate.tar.gz -C candidate .
           digest="$(sha256sum release-candidate.tar.gz | cut -d' ' -f1)"
@@ -196,6 +244,7 @@ jobs:
     env:
       GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
       COMET_RELEASES_GCS_BUCKET: ${{ secrets.COMET_RELEASES_GCS_BUCKET }}
+      RELEASE_SURFACE: ${{ needs.version.outputs.release_surface }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -237,7 +286,7 @@ jobs:
             echo "::error::release bucket must not grant public or all-authenticated-user access"
             exit 1
           fi
-      - name: Publish immutable staging release and latest aliases
+      - name: Publish immutable staging release and selected moving channels
         env:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
@@ -262,24 +311,41 @@ jobs:
               return 1
             fi
           }
+          require_forward_version() {
+            channel="$1"
+            current="$(gcloud storage cat "gs://$COMET_RELEASES_GCS_BUCKET/releases/$channel-latest.txt" 2>/dev/null || true)"
+            if [[ -n "$current" && "$current" != "$VERSION" ]] && ! dpkg --compare-versions "$VERSION" gt "$current"; then
+              echo "::error::$channel latest release is $current; refusing to move backward to $VERSION"
+              return 1
+            fi
+          }
           for file in candidate/*; do
             name="$(basename "$file")"
             publish_immutable "$file" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$VERSION/$name"
             case "$name" in
-              manifest.json|SHA256SUMS|install.sh) ;;
+              *manifest.json|*SHA256SUMS|install.sh) ;;
               *) publish_immutable "$file" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$name" ;;
             esac
           done
-          current="$(gcloud storage cat "gs://$COMET_RELEASES_GCS_BUCKET/releases/latest.txt" 2>/dev/null || true)"
-          if [ -n "$current" ] && [ "$current" != "$VERSION" ] && ! dpkg --compare-versions "$VERSION" gt "$current"; then
-            echo "::error::latest release is $current; refusing to move aliases backward to $VERSION"
-            exit 1
+          require_forward_version desktop
+          gcloud storage cp candidate/desktop-manifest.json "gs://$COMET_RELEASES_GCS_BUCKET/releases/desktop-manifest.json"
+          gcloud storage cp candidate/desktop-SHA256SUMS "gs://$COMET_RELEASES_GCS_BUCKET/releases/desktop-SHA256SUMS"
+          printf '%s' "$VERSION" > desktop-latest.txt
+          gcloud storage cp desktop-latest.txt "gs://$COMET_RELEASES_GCS_BUCKET/releases/desktop-latest.txt"
+
+          if [[ "$RELEASE_SURFACE" == "desktop-and-scaffold" ]]; then
+            require_forward_version scaffold
+            gcloud storage cp candidate/scaffold-manifest.json "gs://$COMET_RELEASES_GCS_BUCKET/releases/scaffold-manifest.json"
+            gcloud storage cp candidate/scaffold-SHA256SUMS "gs://$COMET_RELEASES_GCS_BUCKET/releases/scaffold-SHA256SUMS"
+            gcloud storage cp candidate/install.sh "gs://$COMET_RELEASES_GCS_BUCKET/releases/install.sh"
+            printf '%s' "$VERSION" > scaffold-latest.txt
+            gcloud storage cp scaffold-latest.txt "gs://$COMET_RELEASES_GCS_BUCKET/releases/scaffold-latest.txt"
+
+            # Preserve the unified channel for clients released before the split.
+            gcloud storage cp candidate/manifest.json "gs://$COMET_RELEASES_GCS_BUCKET/releases/manifest.json"
+            gcloud storage cp candidate/SHA256SUMS "gs://$COMET_RELEASES_GCS_BUCKET/releases/SHA256SUMS"
+            gcloud storage cp scaffold-latest.txt "gs://$COMET_RELEASES_GCS_BUCKET/releases/latest.txt"
           fi
-          for alias in manifest.json SHA256SUMS install.sh; do
-            gcloud storage cp "candidate/$alias" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$alias"
-          done
-          printf '%s' "$VERSION" > latest.txt
-          gcloud storage cp latest.txt "gs://$COMET_RELEASES_GCS_BUCKET/releases/latest.txt"
 
   publish-production:
     if: >-
@@ -291,6 +357,7 @@ jobs:
     env:
       GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
       COMET_RELEASES_GCS_BUCKET: ${{ secrets.COMET_RELEASES_GCS_BUCKET }}
+      RELEASE_SURFACE: ${{ needs.version.outputs.release_surface }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -332,7 +399,7 @@ jobs:
             echo "::error::release bucket must not grant public or all-authenticated-user access"
             exit 1
           fi
-      - name: Promote immutable production release and latest aliases
+      - name: Promote immutable production release and selected moving channels
         env:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
@@ -357,21 +424,38 @@ jobs:
               return 1
             fi
           }
+          require_forward_version() {
+            channel="$1"
+            current="$(gcloud storage cat "gs://$COMET_RELEASES_GCS_BUCKET/releases/$channel-latest.txt" 2>/dev/null || true)"
+            if [[ -n "$current" && "$current" != "$VERSION" ]] && ! dpkg --compare-versions "$VERSION" gt "$current"; then
+              echo "::error::$channel latest release is $current; refusing to move backward to $VERSION"
+              return 1
+            fi
+          }
           for file in candidate/*; do
             name="$(basename "$file")"
             publish_immutable "$file" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$VERSION/$name"
             case "$name" in
-              manifest.json|SHA256SUMS|install.sh) ;;
+              *manifest.json|*SHA256SUMS|install.sh) ;;
               *) publish_immutable "$file" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$name" ;;
             esac
           done
-          current="$(gcloud storage cat "gs://$COMET_RELEASES_GCS_BUCKET/releases/latest.txt" 2>/dev/null || true)"
-          if [ -n "$current" ] && [ "$current" != "$VERSION" ] && ! dpkg --compare-versions "$VERSION" gt "$current"; then
-            echo "::error::latest release is $current; refusing to move aliases backward to $VERSION"
-            exit 1
+          require_forward_version desktop
+          gcloud storage cp candidate/desktop-manifest.json "gs://$COMET_RELEASES_GCS_BUCKET/releases/desktop-manifest.json"
+          gcloud storage cp candidate/desktop-SHA256SUMS "gs://$COMET_RELEASES_GCS_BUCKET/releases/desktop-SHA256SUMS"
+          printf '%s' "$VERSION" > desktop-latest.txt
+          gcloud storage cp desktop-latest.txt "gs://$COMET_RELEASES_GCS_BUCKET/releases/desktop-latest.txt"
+
+          if [[ "$RELEASE_SURFACE" == "desktop-and-scaffold" ]]; then
+            require_forward_version scaffold
+            gcloud storage cp candidate/scaffold-manifest.json "gs://$COMET_RELEASES_GCS_BUCKET/releases/scaffold-manifest.json"
+            gcloud storage cp candidate/scaffold-SHA256SUMS "gs://$COMET_RELEASES_GCS_BUCKET/releases/scaffold-SHA256SUMS"
+            gcloud storage cp candidate/install.sh "gs://$COMET_RELEASES_GCS_BUCKET/releases/install.sh"
+            printf '%s' "$VERSION" > scaffold-latest.txt
+            gcloud storage cp scaffold-latest.txt "gs://$COMET_RELEASES_GCS_BUCKET/releases/scaffold-latest.txt"
+
+            # Preserve the unified channel for clients released before the split.
+            gcloud storage cp candidate/manifest.json "gs://$COMET_RELEASES_GCS_BUCKET/releases/manifest.json"
+            gcloud storage cp candidate/SHA256SUMS "gs://$COMET_RELEASES_GCS_BUCKET/releases/SHA256SUMS"
+            gcloud storage cp scaffold-latest.txt "gs://$COMET_RELEASES_GCS_BUCKET/releases/latest.txt"
           fi
-          for alias in manifest.json SHA256SUMS install.sh; do
-            gcloud storage cp "candidate/$alias" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$alias"
-          done
-          printf '%s' "$VERSION" > latest.txt
-          gcloud storage cp latest.txt "gs://$COMET_RELEASES_GCS_BUCKET/releases/latest.txt"
