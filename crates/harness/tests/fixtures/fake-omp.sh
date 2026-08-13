@@ -10,6 +10,16 @@ if [ "${1:-}" = "-F" ]; then
     inactive)
       exit 1
       ;;
+    auto)
+      if [ -n "${OMP_RPC_PID_LOG:-}" ] && [ -f "$OMP_RPC_PID_LOG" ]; then
+        IFS= read -r pid < "$OMP_RPC_PID_LOG"
+        if kill -0 "$pid" 2>/dev/null; then
+          printf '%s\n' "p$pid"
+          exit 0
+        fi
+      fi
+      exit 1
+      ;;
     *)
       exit 2
       ;;
@@ -22,6 +32,7 @@ if [ "${1:-}" = "models" ]; then
   exit 0
 fi
 [ "${1:-}" = "--mode" ] && [ "${2:-}" = "rpc" ] || exit 91
+[ -z "${OMP_RPC_PID_LOG:-}" ] || printf '%s\n' "$$" > "$OMP_RPC_PID_LOG"
 
 SESSION_ID="omp-session-1"
 prev=""
@@ -116,6 +127,7 @@ while IFS= read -r line; do
       finish_turn
       ;;
     abort)
+      [ -z "${OMP_HANG_ABORT:-}" ] || continue
       printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"abort\",\"success\":true}"
       ;;
   esac

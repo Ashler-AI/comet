@@ -580,7 +580,7 @@ impl Default for OmpHarness {
         Self {
             executable: None,
             scaffold_host: false,
-            interrupt_grace: Duration::from_secs(3),
+            interrupt_grace: Duration::from_secs(2),
             session_dirs: None,
             session_writer_probe: None,
             auth_broker_environment: None,
@@ -602,6 +602,13 @@ impl OmpHarness {
 
     pub fn with_executable(mut self, executable: impl Into<PathBuf>) -> Self {
         self.executable = Some(executable.into());
+        self
+    }
+
+    /// Override the graceful interrupt deadline for deterministic integration tests.
+    #[doc(hidden)]
+    pub fn with_interrupt_grace(mut self, interrupt_grace: Duration) -> Self {
+        self.interrupt_grace = interrupt_grace;
         self
     }
 
