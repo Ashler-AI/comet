@@ -48,6 +48,24 @@ fn test_repos(data_dir: &Path) -> Repos {
     Repos::with_worktrees_root(data_dir, "device-test", data_dir.join("worktrees"))
 }
 
+#[cfg(unix)]
+const LOW_NOFILE_WORKTREE_CHILD: &str = "COMET_TEST_LOW_NOFILE_WORKTREE_CHILD";
+
+#[cfg(unix)]
+fn lower_file_descriptor_limit(limit: libc::rlim_t) {
+    let mut current = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: the pointers are valid for these calls; this helper only runs in
+    // the isolated child process spawned by the test below.
+    unsafe {
+        assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut current), 0);
+        current.rlim_cur = current.rlim_cur.min(limit);
+        assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &current), 0);
+    }
+}
+
 fn assemble(dir: &Path) -> EngineCore {
     std::fs::create_dir_all(dir).expect("data dir");
     EngineCore::assemble(
@@ -91,6 +109,55 @@ async fn drain_until(
 // ---------------------------------------------------------------------------
 // Repos
 // ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worktree_creation_survives_tight_file_descriptor_budget() {
+    if std::env::var_os(LOW_NOFILE_WORKTREE_CHILD).is_none() {
+        let output = tokio::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "worktree_creation_survives_tight_file_descriptor_budget",
+                "--nocapture",
+            ])
+            .env(LOW_NOFILE_WORKTREE_CHILD, "1")
+            .output()
+            .await
+            .expect("spawn isolated low-nofile test");
+        assert!(
+            output.status.success(),
+            "isolated worktree test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("large-repo");
+    init_repo(&repo_dir).await;
+    let files = repo_dir.join("files");
+    std::fs::create_dir(&files).expect("files directory");
+    for index in 0..128 {
+        std::fs::write(files.join(format!("file-{index:03}.txt")), "fixture\n")
+            .expect("fixture file");
+    }
+    git(&repo_dir, &["add", "."]).await;
+    git(&repo_dir, &["commit", "-m", "large checkout"]).await;
+
+    lower_file_descriptor_limit(20);
+    let repos = test_repos(tmp.path());
+    let worktree = repos
+        .create_worktree(&repo_dir, "main")
+        .await
+        .expect("serial checkout under a tight descriptor budget");
+
+    assert!(
+        Path::new(&worktree.path)
+            .join("files/file-127.txt")
+            .is_file()
+    );
+}
 
 #[tokio::test]
 async fn repos_round_trip_add_branches_worktrees() {
