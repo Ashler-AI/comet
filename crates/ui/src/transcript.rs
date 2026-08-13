@@ -2014,6 +2014,12 @@ impl Transcript {
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
                     image: Some(self.inline_image_ui(cx)),
+                    link_cwd: self
+                        .state
+                        .read(cx)
+                        .selected_chat_row()
+                        .and_then(|chat| chat.cwd.clone())
+                        .map(SharedString::from),
                 };
                 let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                 render::render_block(
@@ -2058,6 +2064,12 @@ impl Transcript {
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
                     image: Some(self.inline_image_ui(cx)),
+                    link_cwd: self
+                        .state
+                        .read(cx)
+                        .selected_chat_row()
+                        .and_then(|chat| chat.cwd.clone())
+                        .map(SharedString::from),
                 };
                 let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                 let timer = frame_stats_enabled().then(Instant::now);

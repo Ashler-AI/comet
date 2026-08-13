@@ -81,6 +81,10 @@ pub struct RenderOptions {
     pub copy: Option<CopyUi>,
     /// Inline-image plumbing: `None` renders `![alt](url)` as a plain link.
     pub image: Option<ImageUi>,
+    /// Chat working directory used to resolve relative file links. `None`
+    /// leaves relative destinations untouched (markdown previews have no
+    /// owning workspace).
+    pub link_cwd: Option<SharedString>,
 }
 
 /// Inline `![alt](url)` plumbing: the transcript resolves URLs against the
@@ -123,6 +127,7 @@ impl RenderOptions {
             now: Instant::now(),
             copy: None,
             image: None,
+            link_cwd: None,
         }
     }
 }
@@ -1159,6 +1164,52 @@ fn flatten_cached(
     }
 }
 
+/// Turn a markdown destination into an OS-openable target. Web/custom URLs
+/// pass through. Absolute paths and paths relative to the chat workspace
+/// become encoded `file://` URLs; handing GPUI a bare relative path makes
+/// macOS construct a relative `NSURL`, which Finder rejects with error -50.
+fn link_target(url: &str, cwd: Option<&str>) -> String {
+    let trimmed = url.trim();
+    if trimmed.starts_with("file://") {
+        return trimmed.to_string();
+    }
+    let Some(path) = crate::attachments::inline_image_path(trimmed, cwd) else {
+        return url.to_string();
+    };
+    file_url(&path)
+}
+
+fn file_url(path: &str) -> String {
+    #[cfg(target_os = "windows")]
+    let path = path.replace('\\', "/");
+    #[cfg(not(target_os = "windows"))]
+    let path = path.to_string();
+
+    #[cfg(target_os = "windows")]
+    let mut url = if path.starts_with("//") {
+        String::from("file:")
+    } else {
+        String::from("file:///")
+    };
+    #[cfg(not(target_os = "windows"))]
+    let mut url = String::from("file://");
+
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/')
+            || cfg!(target_os = "windows") && byte == b':'
+        {
+            url.push(char::from(byte));
+        } else {
+            url.push('%');
+            url.push(char::from(HEX[(byte >> 4) as usize]));
+            url.push(char::from(HEX[(byte & 0x0f) as usize]));
+        }
+    }
+    url
+}
+
 /// Veiled, clickable text for a flattened block (no sizing wrapper).
 fn flat_text_element(
     flat: &FlatText,
@@ -1181,7 +1232,11 @@ fn flat_text_element(
     let text_el: AnyElement = if flat.links.is_empty() {
         styled.into_any_element()
     } else {
-        let (ranges, urls): (Vec<_>, Vec<_>) = flat.links.iter().cloned().unzip();
+        let (ranges, urls): (Vec<_>, Vec<_>) = flat
+            .links
+            .iter()
+            .map(|(range, url)| (range.clone(), link_target(url, opts.link_cwd.as_deref())))
+            .unzip();
         let id: SharedString = format!("{}-t{ix}", opts.row_key).into();
         InteractiveText::new(id, styled)
             .on_click(ranges, move |clicked_ix, _window, cx| {
@@ -1906,6 +1961,40 @@ mod tests {
     }
 
     #[test]
+    fn link_targets_resolve_csv_and_generic_files_against_chat_cwd() {
+        assert_eq!(
+            link_target("drawing-intelligence-original-textbooks.csv", Some("/repo")),
+            "file:///repo/drawing-intelligence-original-textbooks.csv"
+        );
+        assert_eq!(
+            link_target("reports/final draft #1.pdf", Some("/repo with spaces")),
+            "file:///repo%20with%20spaces/reports/final%20draft%20%231.pdf"
+        );
+        assert_eq!(
+            link_target("/tmp/naïve data.json", Some("/ignored")),
+            "file:///tmp/na%C3%AFve%20data.json"
+        );
+    }
+
+    #[test]
+    fn link_targets_leave_urls_and_unrooted_relative_links_unchanged() {
+        assert_eq!(
+            link_target("https://x.dev/a?b=1#c", Some("/repo")),
+            "https://x.dev/a?b=1#c"
+        );
+        assert_eq!(
+            link_target("mailto:user@example.com", Some("/repo")),
+            "mailto:user@example.com"
+        );
+        assert_eq!(
+            link_target("file:///tmp/a%20b.csv", Some("/repo")),
+            "file:///tmp/a%20b.csv"
+        );
+        assert_eq!(link_target("output.csv", None), "output.csv");
+        assert_eq!(link_target("~/output.csv", Some("/repo")), "~/output.csv");
+    }
+
+    #[test]
     fn table_columns_floor_and_padding() {
         // A short column keeps its content width (floored at MIN_COLUMN_CONTENT
         // + padding); a wide one may wrap but no narrower than minColumnWidth.
@@ -1967,6 +2056,55 @@ mod tests {
         ];
         let flat = flatten_runs(&runs, &theme, false);
         assert_eq!(flat.links, vec![(0..9, "https://x.dev".to_string())]);
+    }
+
+    #[gpui::test]
+    fn clicking_relative_file_link_opens_resolved_file_url(cx: &mut gpui::TestAppContext) {
+        struct LinkProbe;
+        impl gpui::Render for LinkProbe {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                let runs = vec![InlineRun {
+                    text: "report.csv".into(),
+                    style: InlineStyle {
+                        link: Some("report.csv".into()),
+                        ..Default::default()
+                    },
+                }];
+                div().w(px(240.0)).h(px(80.0)).child(
+                    div()
+                        .debug_selector(|| "FILE_LINK".into())
+                        .child(flat_text_element(
+                            &flatten_runs(&runs, &Theme::dark(), false),
+                            0,
+                            &RenderOptions {
+                                link_cwd: Some("/tmp/comet link proof".into()),
+                                ..RenderOptions::settled("row".into())
+                            },
+                            &Theme::dark(),
+                        )),
+                )
+            }
+        }
+
+        cx.update(|cx| Theme::install(crate::theme::Appearance::Dark, cx));
+        let window = cx.open_window(gpui::size(px(320.0), px(120.0)), |_, _| LinkProbe);
+        cx.run_until_parked();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let bounds = visual
+            .debug_bounds("FILE_LINK")
+            .expect("file link rendered");
+        visual.simulate_click(
+            gpui::point(bounds.origin.x + px(8.0), bounds.origin.y + px(11.0)),
+            gpui::Modifiers::default(),
+        );
+        assert_eq!(
+            visual.opened_url().as_deref(),
+            Some("file:///tmp/comet%20link%20proof/report.csv")
+        );
     }
 
     #[gpui::test]
