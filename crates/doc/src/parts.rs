@@ -29,6 +29,14 @@ pub enum MessagePart {
         id: String,
         text: String,
     },
+    /// Bounded read projection of an oversized stored `Text` part. The text is
+    /// the pure visible tail; omitted bytes stay scalar so streaming deltas do
+    /// not rewrite a marker embedded in the content.
+    TextWindow {
+        id: String,
+        text: String,
+        omitted_prefix_bytes: usize,
+    },
     #[serde(rename_all = "camelCase")]
     Tool {
         id: String,
@@ -57,6 +65,7 @@ impl MessagePart {
     pub fn id(&self) -> &str {
         match self {
             MessagePart::Text { id, .. }
+            | MessagePart::TextWindow { id, .. }
             | MessagePart::Tool { id, .. }
             | MessagePart::Input { id, .. }
             | MessagePart::Error { id, .. } => id,
@@ -65,7 +74,7 @@ impl MessagePart {
 
     pub fn byte_len(&self) -> usize {
         match self {
-            MessagePart::Text { text, .. } => text.len(),
+            MessagePart::Text { text, .. } | MessagePart::TextWindow { text, .. } => text.len(),
             MessagePart::Tool { call, .. } => serde_json::to_vec(call).map_or(0, |v| v.len()),
             MessagePart::Input { questions, .. } => {
                 serde_json::to_vec(questions).map_or(0, |v| v.len())

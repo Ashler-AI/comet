@@ -124,6 +124,15 @@ struct ChatParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ReadDocMessagesParams {
+    chat_id: String,
+    before: usize,
+    #[serde(default)]
+    room_projection: Option<SessionRoomProjection>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ListModelsParams {
     harness: HarnessId,
 }
@@ -1133,6 +1142,7 @@ fn forwardable(method: &str) -> bool {
             | methods::LIST_MODELS
             | methods::LIST_HARNESS_COMMANDS
             | methods::WATCH_DOC_MESSAGES
+            | methods::READ_DOC_MESSAGES
             | "WatchCollaboration"
             // Repos/worktrees/folders are device-local filesystem state.
             | methods::LIST_REPOS
@@ -1206,7 +1216,7 @@ where
 /// full `reset` first, then only changed entries per commit — the whole-Vec
 /// serialization here was the per-tick cost that scaled with transcript size.
 fn doc_messages_stream(
-    rx: watch::Receiver<Vec<comet_doc::SessionMessageEntry>>,
+    rx: watch::Receiver<comet_doc::SessionEntryWindow>,
 ) -> BoxStream<'static, serde_json::Value> {
     use comet_doc::transcript_delta::{TranscriptFrame, diff_transcript};
     futures::stream::unfold(
@@ -1216,12 +1226,12 @@ fn doc_messages_stream(
                 if prev.is_some() {
                     rx.changed().await.ok()?;
                 }
-                let current: Vec<_> = rx.borrow_and_update().clone();
+                let current = rx.borrow_and_update().clone();
                 let frame = match prev.as_deref() {
-                    None => TranscriptFrame::reset(&current),
-                    Some(prev) => diff_transcript(prev, &current),
+                    None => TranscriptFrame::reset(&current.entries, current.before),
+                    Some(prev) => diff_transcript(prev, &current.entries, current.before),
                 };
-                prev = Some(current);
+                prev = Some(current.entries);
                 // No-op commits (a second watcher attaching, command-only
                 // changes) produce empty deltas — skip the frame entirely.
                 if frame.is_empty_delta() {
@@ -1336,7 +1346,7 @@ fn merge_participant_presence(current: &mut ParticipantPresence, candidate: &Par
 }
 
 fn collaboration_stream(
-    messages_rx: watch::Receiver<Vec<comet_doc::SessionMessageEntry>>,
+    messages_rx: watch::Receiver<comet_doc::SessionEntryWindow>,
     authority_rx: watch::Receiver<u64>,
     doc: std::sync::Arc<comet_doc::SessionDoc>,
     doc_host: DocHost,
@@ -1815,6 +1825,18 @@ impl RpcService for EngineRpc {
                     thread_id: p.thread_id,
                     reply,
                 })
+            }
+            methods::READ_DOC_MESSAGES => {
+                let p: ReadDocMessagesParams = parse_params(params)?;
+                let handle = self
+                    .doc_host
+                    .open_projection(&p.chat_id, p.room_projection.as_ref())
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let page = handle
+                    .doc()
+                    .read_entry_window(Some(p.before), comet_doc::TAIL_MESSAGE_COUNT)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&page)
             }
             methods::WATCH_DOC_MESSAGES => {
                 let p: ChatParams = parse_params(params)?;

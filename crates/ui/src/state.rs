@@ -27,7 +27,10 @@ use gpui::{App, AsyncApp, Context, Entity, Task, WeakEntity};
 use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
-use comet_doc::{MessagePart, MessageRole, SessionMessageEntry, TranscriptDesync, TranscriptFrame};
+use comet_doc::{
+    MessagePart, MessageRole, SessionEntryWindow, SessionMessageEntry, TranscriptDesync,
+    TranscriptFrame,
+};
 use comet_engine::{Engine, EngineConfig, EngineRuntime, rpc::AuthRpc};
 use comet_proto::{
     AgentRoute, AuthState, Chat, ChatIndicator, CollaborationScope, CollaborationSnapshot, Device,
@@ -373,7 +376,9 @@ fn shared_session_preview(entries: &[SessionMessageEntry]) -> Option<String> {
         .parts
         .iter()
         .filter_map(|part| match part {
-            MessagePart::Text { text, .. } => Some(text.as_str()),
+            MessagePart::Text { text, .. } | MessagePart::TextWindow { text, .. } => {
+                Some(text.as_str())
+            }
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -793,6 +798,29 @@ pub(crate) async fn archive_and_pause_scaffold_session(
     pause_scaffold_session(handle, target).await
 }
 
+const TRANSCRIPT_CACHE_CHAT_LIMIT: usize = 8;
+const TRANSCRIPT_CACHE_BYTE_LIMIT: usize = 16 * 1024 * 1024;
+
+struct CachedTranscriptWindow {
+    entries: Vec<SessionMessageEntry>,
+    tail_start: usize,
+    tail_before: Option<usize>,
+    history_before: Option<usize>,
+}
+
+impl CachedTranscriptWindow {
+    fn byte_len(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|entry| {
+                entry.id.len()
+                    + entry.device_id.len()
+                    + entry.parts.iter().map(MessagePart::byte_len).sum::<usize>()
+            })
+            .sum()
+    }
+}
+
 /// Root application state. Reducer methods (`apply_*`, [`Self::session_for`], …)
 /// are plain `&mut self` functions so tests construct the struct directly; gpui
 /// glue ([`Self::bootstrap`], [`Self::select_chat`]) layers subscriptions on top.
@@ -832,6 +860,18 @@ pub struct AppState {
     pub auto_selected: bool,
     /// Joined transcript of the selected chat (continuations folded engine-side).
     pub transcript: Vec<SessionMessageEntry>,
+    /// First entry owned by the live bounded tail. Earlier entries were loaded
+    /// explicitly by upward paging and are not part of delta `count` checks.
+    transcript_tail_start: usize,
+    /// Cursor immediately before the live tail; refreshed by watch frames.
+    transcript_tail_before: Option<usize>,
+    /// Cursor immediately before the oldest explicitly loaded entry.
+    transcript_history_before: Option<usize>,
+    transcript_history_loading: bool,
+    transcript_history_task: Option<Task<()>>,
+    transcript_restored_from_cache: bool,
+    transcript_cache: HashMap<String, CachedTranscriptWindow>,
+    transcript_cache_lru: Vec<String>,
     /// Multiplayer projection for the selected shared thread. The last good
     /// snapshot remains visible while its watch reconnects or a model hands off.
     pub collaboration: Option<CollaborationSnapshot>,
@@ -932,6 +972,14 @@ impl AppState {
             selected_space_members: Vec::new(),
             selected_chat: None,
             transcript: Vec::new(),
+            transcript_tail_start: 0,
+            transcript_tail_before: None,
+            transcript_history_before: None,
+            transcript_history_loading: false,
+            transcript_history_task: None,
+            transcript_restored_from_cache: false,
+            transcript_cache: HashMap::new(),
+            transcript_cache_lru: Vec::new(),
             collaboration: None,
             selected_agent_session: None,
             pending_invitation: None,
@@ -1047,9 +1095,12 @@ impl AppState {
         if available {
             return;
         }
+        self.cache_selected_transcript();
         self.selected_chat = None;
-        self.transcript.clear();
+        self.restore_transcript(None);
         self.transcript_task = None;
+        self.transcript_history_task = None;
+        self.transcript_history_loading = false;
         self.collaboration = None;
         self.collaboration_task = None;
     }
@@ -1128,7 +1179,82 @@ impl AppState {
             echoes.retain(|echo| !entries.iter().any(|e| e.id == echo.id));
         }
         self.transcript = entries;
+        self.transcript_tail_start = 0;
+        self.transcript_tail_before = None;
+        self.transcript_history_before = None;
         self.update_selected_shared_preview();
+    }
+
+    fn cache_selected_transcript(&mut self) {
+        let Some(chat_id) = self.selected_chat.clone() else {
+            return;
+        };
+        if self.transcript.is_empty() {
+            return;
+        }
+        let entries = std::mem::take(&mut self.transcript);
+        self.transcript_cache.insert(
+            chat_id.clone(),
+            CachedTranscriptWindow {
+                entries,
+                tail_start: self.transcript_tail_start,
+                tail_before: self.transcript_tail_before,
+                history_before: self.transcript_history_before,
+            },
+        );
+        self.transcript_cache_lru.retain(|id| id != &chat_id);
+        self.transcript_cache_lru.push(chat_id);
+        while self.transcript_cache.len() > TRANSCRIPT_CACHE_CHAT_LIMIT
+            || self
+                .transcript_cache
+                .values()
+                .map(CachedTranscriptWindow::byte_len)
+                .sum::<usize>()
+                > TRANSCRIPT_CACHE_BYTE_LIMIT
+        {
+            let Some(oldest) = self.transcript_cache_lru.first().cloned() else {
+                break;
+            };
+            self.transcript_cache_lru.remove(0);
+            self.transcript_cache.remove(&oldest);
+        }
+    }
+
+    fn restore_transcript(&mut self, chat_id: Option<&str>) {
+        self.transcript.clear();
+        self.transcript_tail_start = 0;
+        self.transcript_tail_before = None;
+        self.transcript_history_before = None;
+        self.transcript_restored_from_cache = false;
+        let Some(chat_id) = chat_id else {
+            return;
+        };
+        let Some(cached) = self.transcript_cache.remove(chat_id) else {
+            return;
+        };
+        self.transcript_cache_lru.retain(|id| id != chat_id);
+        self.transcript = cached.entries;
+        self.transcript_tail_start = cached.tail_start.min(self.transcript.len());
+        self.transcript_tail_before = cached.tail_before;
+        self.transcript_history_before = cached.history_before;
+        self.transcript_restored_from_cache = true;
+    }
+
+    fn apply_transcript_page(&mut self, page: SessionEntryWindow) {
+        let first_loaded = self.transcript.first().map(|entry| entry.id.as_str());
+        let mut entries: Vec<_> = page
+            .entries
+            .into_iter()
+            .filter(|entry| Some(entry.id.as_str()) != first_loaded)
+            .filter(|entry| !self.transcript.iter().any(|known| known.id == entry.id))
+            .collect();
+        let added = entries.len();
+        if added > 0 {
+            entries.append(&mut self.transcript);
+            self.transcript = entries;
+            self.transcript_tail_start += added;
+        }
+        self.transcript_history_before = page.before;
     }
 
     pub fn apply_collaboration(&mut self, snapshot: CollaborationSnapshot) {
@@ -1209,13 +1335,60 @@ impl AppState {
         true
     }
 
-    /// Apply a `WatchDocMessages` delta frame in place. `Err` = this copy has
-    /// diverged; the watch task resubscribes for a fresh reset.
+    /// Apply a `WatchDocMessages` delta to the live bounded tail. Explicitly
+    /// paged history remains a stable prefix and does not enter frame counts.
     pub fn apply_transcript_frame(
         &mut self,
         frame: TranscriptFrame,
     ) -> Result<(), TranscriptDesync> {
-        comet_doc::apply_transcript_frame(&mut self.transcript, frame)?;
+        let before = frame.before();
+        if let Some(reset) = frame.reset_entries()
+            && self.transcript_restored_from_cache
+        {
+            let cached_before = self.transcript_tail_before;
+            let cached_tail_start = self.transcript_tail_start.min(self.transcript.len());
+            if self.transcript[cached_tail_start..] == *reset {
+                self.transcript_tail_before = before.or(cached_before);
+                self.transcript_restored_from_cache = false;
+                return Ok(());
+            }
+            let retired = self.transcript[cached_tail_start..]
+                .iter()
+                .take_while(|entry| !reset.iter().any(|next| next.id == entry.id))
+                .count();
+            self.transcript_tail_start = cached_tail_start + retired;
+            self.transcript.truncate(self.transcript_tail_start);
+            self.transcript.extend_from_slice(reset);
+        } else {
+            let tail_start = self.transcript_tail_start.min(self.transcript.len());
+            let retired = if tail_start > 0 {
+                if let Some(reset) = frame.reset_entries() {
+                    self.transcript[tail_start..]
+                        .iter()
+                        .take_while(|entry| !reset.iter().any(|next| next.id == entry.id))
+                        .count()
+                } else {
+                    let remove = frame.removed_entry_ids();
+                    self.transcript[tail_start..]
+                        .iter()
+                        .take_while(|entry| remove.iter().any(|id| id == &entry.id))
+                        .count()
+                }
+            } else {
+                0
+            };
+            if retired > 0 {
+                self.transcript_tail_start += retired;
+            }
+            let mut tail = self.transcript.split_off(self.transcript_tail_start);
+            comet_doc::apply_transcript_frame(&mut tail, frame)?;
+            self.transcript.append(&mut tail);
+        }
+        self.transcript_tail_before = before;
+        if self.transcript_tail_start == 0 {
+            self.transcript_history_before = before;
+        }
+        self.transcript_restored_from_cache = false;
         if let Some(chat_id) = self.selected_chat.as_deref()
             && let Some(echoes) = self.echoes.get_mut(chat_id)
         {
@@ -1858,8 +2031,10 @@ impl AppState {
             self.select_chat(Some(chat_id), cx);
             return;
         }
-        self.transcript.clear();
+        self.restore_transcript(None);
         self.transcript_task = None;
+        self.transcript_history_task = None;
+        self.transcript_history_loading = false;
         self.collaboration = None;
         self.collaboration_task = None;
         self.selected_agent_session = None;
@@ -2029,6 +2204,54 @@ impl AppState {
         .detach();
     }
 
+    pub fn load_older_transcript(&mut self, cx: &mut Context<Self>) {
+        if self.transcript_history_loading {
+            return;
+        }
+        let (Some(chat_id), Some(before), Some(handle)) = (
+            self.selected_chat.clone(),
+            self.transcript_history_before,
+            self.engine.clone(),
+        ) else {
+            return;
+        };
+        let projection = self.room_projections.get(&chat_id).cloned();
+        self.transcript_history_loading = true;
+        self.transcript_history_task = Some(cx.spawn(async move |this, cx| {
+            let result = handle
+                .client()
+                .call(
+                    methods::READ_DOC_MESSAGES,
+                    serde_json::json!({
+                        "chatId": chat_id,
+                        "before": before,
+                        "roomProjection": projection,
+                    }),
+                )
+                .await
+                .and_then(|value| {
+                    serde_json::from_value::<SessionEntryWindow>(value)
+                        .map_err(|error| RpcError::Failed(error.to_string()))
+                });
+            this.update(cx, |state, cx| {
+                if state.selected_chat.as_deref() == Some(chat_id.as_str())
+                    && state.transcript_history_before == Some(before)
+                {
+                    match result {
+                        Ok(page) => state.apply_transcript_page(page),
+                        Err(error) => {
+                            tracing::warn!(%chat_id, %error, "transcript history page failed")
+                        }
+                    }
+                }
+                state.transcript_history_loading = false;
+                state.transcript_history_task = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     /// Select a chat (or clear). Swaps the per-chat doc-transcript subscription:
     /// dropping the old task drops its stream receiver, which cancels the doc
     /// watch server-side. Selecting a chat also lands in its space and marks it
@@ -2051,10 +2274,13 @@ impl AppState {
             }
             return;
         }
+        self.cache_selected_transcript();
         self.selected_chat = chat_id.clone();
         self.auto_selected = true;
-        self.transcript.clear();
+        self.restore_transcript(chat_id.as_deref());
         self.transcript_task = None;
+        self.transcript_history_task = None;
+        self.transcript_history_loading = false;
         self.collaboration = None;
         self.collaboration_task = None;
         self.selected_agent_session = None;
@@ -3684,6 +3910,108 @@ mod tests {
             },
         );
         assert!(state.pending_echoes().is_empty());
+    }
+
+    fn transcript_entry(id: &str) -> SessionMessageEntry {
+        SessionMessageEntry {
+            id: id.into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: id.into(),
+            }],
+            created_at: 0,
+            device_id: "device".into(),
+            status: None,
+            continuation_of: None,
+        }
+    }
+
+    #[test]
+    fn older_pages_remain_a_prefix_of_live_tail_deltas() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("chat".into());
+        state
+            .apply_transcript_frame(TranscriptFrame::reset(
+                &[transcript_entry("m2"), transcript_entry("m3")],
+                Some(2),
+            ))
+            .unwrap();
+        state.apply_transcript_page(SessionEntryWindow {
+            entries: vec![transcript_entry("m0"), transcript_entry("m1")],
+            before: None,
+        });
+
+        let frame = comet_doc::diff_transcript(
+            &[transcript_entry("m2"), transcript_entry("m3")],
+            &[transcript_entry("m3"), transcript_entry("m4")],
+            Some(3),
+        );
+        state.apply_transcript_frame(frame).unwrap();
+
+        assert_eq!(
+            state
+                .transcript
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["m0", "m1", "m2", "m3", "m4"]
+        );
+        assert_eq!(state.transcript_tail_start, 3);
+        assert_eq!(state.transcript_tail_before, Some(3));
+        assert_eq!(state.transcript_history_before, None);
+    }
+
+    #[test]
+    fn recent_transcript_window_moves_into_and_out_of_cache() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("chat".into());
+        state.transcript = vec![transcript_entry("m1")];
+        state.transcript_tail_before = Some(4);
+        state.transcript_history_before = Some(2);
+        state.cache_selected_transcript();
+        assert!(state.transcript.is_empty());
+
+        state.restore_transcript(Some("chat"));
+        assert_eq!(state.transcript[0].id, "m1");
+        assert_eq!(state.transcript_tail_before, Some(4));
+        assert_eq!(state.transcript_history_before, Some(2));
+        assert!(state.transcript_restored_from_cache);
+    }
+
+    #[test]
+    fn cached_reset_preserves_rows_retired_from_the_live_tail() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("chat".into());
+        state.transcript = vec![
+            transcript_entry("m0"),
+            transcript_entry("m1"),
+            transcript_entry("m2"),
+            transcript_entry("m3"),
+        ];
+        state.transcript_tail_start = 2;
+        state.transcript_tail_before = Some(2);
+        state.transcript_history_before = None;
+        state.transcript_restored_from_cache = true;
+
+        state
+            .apply_transcript_frame(TranscriptFrame::reset(
+                &[transcript_entry("m3"), transcript_entry("m4")],
+                Some(3),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            state
+                .transcript
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["m0", "m1", "m2", "m3", "m4"]
+        );
+        assert_eq!(state.transcript_tail_start, 3);
+        assert_eq!(state.transcript_tail_before, Some(3));
+        assert!(!state.transcript_restored_from_cache);
     }
 
     #[test]

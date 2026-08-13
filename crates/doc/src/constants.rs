@@ -19,6 +19,11 @@ pub const DO_FLUSH_MS: u64 = 5_000;
 pub const DOC_LRU_BYTE_BUDGET: usize = 80 * 1024 * 1024;
 /// Number of trailing messages materialized into the tail sidecar.
 pub const TAIL_MESSAGE_COUNT: usize = 64;
+/// Total visible text bytes across an initial/paged transcript window.
+pub const TAIL_TEXT_BYTE_BUDGET: usize = 512 * 1024;
+/// Visible marker surrounding the omitted-byte count for a projected text tail.
+pub const TRANSCRIPT_TRUNCATED_PREFIX: &str = "[Earlier output not loaded: ";
+pub const TRANSCRIPT_TRUNCATED_SUFFIX: &str = " bytes]\n\n";
 /// Terminal output batching cadence (ms).
 pub const TERMINAL_OUTPUT_BATCH_MS: u64 = 12;
 /// Default TTL for durable commands.

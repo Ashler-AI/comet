@@ -34,7 +34,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use comet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
+use comet_doc::{
+    MessagePart, MessageRole, MessageStatus, SessionMessageEntry, TRANSCRIPT_TRUNCATED_PREFIX,
+    TRANSCRIPT_TRUNCATED_SUFFIX,
+};
 use comet_proto::ToolCall;
 
 use crate::markdown::highlight::{Lang, LineCarry, Token, lang_for_tag, tokenize_line};
@@ -315,6 +318,49 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
     fnv1a(&acc)
 }
 
+fn push_markdown_rows(
+    rows: &mut Vec<Row>,
+    entry: &SessionMessageEntry,
+    entry_id: &SharedString,
+    part_id: &str,
+    text: &str,
+    streaming: bool,
+    parse: &mut dyn FnMut(&str, &str) -> Arc<BlockTree>,
+) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let key = format!("{}#{}", entry.id, part_id);
+    let tree = parse(&key, text);
+    for block_ix in 0..tree.blocks.len() {
+        let range = &tree.blocks[block_ix].range;
+        let end = range.end.min(text.len());
+        let bytes = text
+            .as_bytes()
+            .get(range.start.min(end)..end)
+            .unwrap_or_default();
+        let version = (fnv1a(bytes) << 1) | streaming as u64;
+        rows.push(Row {
+            id: format!("{key}.{block_ix}").into(),
+            version,
+            turn_start: false,
+            entry_id: entry_id.clone(),
+            timestamp: None,
+            kind: if streaming {
+                RowKind::LiveMarkdown {
+                    tree: tree.clone(),
+                    block_ix,
+                }
+            } else {
+                RowKind::Markdown {
+                    tree: tree.clone(),
+                    block_ix,
+                }
+            },
+        });
+    }
+}
+
 /// Build the block rows of one (already continuation-joined) entry.
 ///
 /// `parse` maps `(part_key, text)` to a block tree — the entity supplies
@@ -334,7 +380,14 @@ pub fn rows_for_entry(
             .parts
             .iter()
             .filter_map(|p| match p {
-                MessagePart::Text { text, .. } => Some(text.as_str()),
+                MessagePart::Text { text, .. } => Some(text.clone()),
+                MessagePart::TextWindow {
+                    text,
+                    omitted_prefix_bytes,
+                    ..
+                } => Some(format!(
+                    "{TRANSCRIPT_TRUNCATED_PREFIX}{omitted_prefix_bytes}{TRANSCRIPT_TRUNCATED_SUFFIX}{text}"
+                )),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -428,45 +481,21 @@ pub fn rows_for_entry(
                 );
                 match other {
                     MessagePart::Text { id: part_id, text } => {
-                        if text.trim().is_empty() {
-                            continue;
-                        }
-                        let key = format!("{}#{}", entry.id, part_id);
-                        let tree = parse(&key, text);
-                        // Live and completed parts split identically — one row
-                        // per top-level block, same ids, so the live→complete
-                        // handoff never changes row identity. The version is a
-                        // content hash of the block's bytes (LSB = streaming),
-                        // so a commit only splices rows whose bytes actually
-                        // changed — the settled prefix of a live reply is
-                        // untouched (and its render caches stay valid).
-                        for block_ix in 0..tree.blocks.len() {
-                            let range = &tree.blocks[block_ix].range;
-                            let end = range.end.min(text.len());
-                            let bytes = text
-                                .as_bytes()
-                                .get(range.start.min(end)..end)
-                                .unwrap_or_default();
-                            let version = (fnv1a(bytes) << 1) | streaming as u64;
-                            rows.push(Row {
-                                id: format!("{key}.{block_ix}").into(),
-                                version,
-                                turn_start: false,
-                                entry_id: entry_id.clone(),
-                                timestamp: None,
-                                kind: if streaming {
-                                    RowKind::LiveMarkdown {
-                                        tree: tree.clone(),
-                                        block_ix,
-                                    }
-                                } else {
-                                    RowKind::Markdown {
-                                        tree: tree.clone(),
-                                        block_ix,
-                                    }
-                                },
-                            });
-                        }
+                        push_markdown_rows(
+                            &mut rows, entry, &entry_id, part_id, text, streaming, parse,
+                        );
+                    }
+                    MessagePart::TextWindow {
+                        id: part_id,
+                        text,
+                        omitted_prefix_bytes,
+                    } => {
+                        let visible = format!(
+                            "{TRANSCRIPT_TRUNCATED_PREFIX}{omitted_prefix_bytes}{TRANSCRIPT_TRUNCATED_SUFFIX}{text}"
+                        );
+                        push_markdown_rows(
+                            &mut rows, entry, &entry_id, part_id, &visible, streaming, parse,
+                        );
                     }
                     MessagePart::Input {
                         id: part_id,
@@ -891,6 +920,15 @@ struct CachedRows {
     rows: Vec<Row>,
 }
 
+const RENDER_WINDOW_CHAT_LIMIT: usize = 8;
+const RENDER_WINDOW_ROW_LIMIT: usize = 4096;
+
+struct CachedTranscriptRender {
+    rows: Vec<Row>,
+    row_cache: HashMap<String, CachedRows>,
+    tree_cache: HashMap<String, (usize, Arc<BlockTree>)>,
+}
+
 #[derive(Default, Clone, Copy)]
 struct FoldState {
     /// User pin (click); `None` follows the auto-open rule.
@@ -943,6 +981,8 @@ pub struct Transcript {
     row_cache: HashMap<String, CachedRows>,
     live_parsers: HashMap<String, IncrementalParser>,
     tree_cache: HashMap<String, (usize, Arc<BlockTree>)>,
+    render_windows: HashMap<String, CachedTranscriptRender>,
+    render_window_lru: Vec<String>,
     folds: HashMap<SharedString, FoldState>,
     /// Expanded chips (tool part ids) — pane state, cleared on chat switch
     /// like `folds`.
@@ -1035,6 +1075,8 @@ impl Transcript {
             row_cache: HashMap::new(),
             live_parsers: HashMap::new(),
             tree_cache: HashMap::new(),
+            render_windows: HashMap::new(),
+            render_window_lru: Vec::new(),
             folds: HashMap::new(),
             expanded_tools: std::collections::HashSet::new(),
             tool_details: HashMap::new(),
@@ -1133,6 +1175,10 @@ impl Transcript {
                 let distance = this.distance_from_bottom();
                 let previous = this.last_scroll_distance;
                 this.last_scroll_distance = distance;
+                if this.list.logical_scroll_top().item_ix == 0 {
+                    this.state
+                        .update(cx, |state, cx| state.load_older_transcript(cx));
+                }
                 if distance > previous + 1.0 && distance > AT_BOTTOM_PX {
                     // User input moving away from the bottom breaks the pin.
                     // Content growth never lands here — it doesn't fire the
@@ -1276,22 +1322,55 @@ impl Transcript {
 
     /// Rebuild rows from app state; splice minimal ranges into the list.
     fn sync(&mut self, cx: &mut Context<Self>) {
-        let (selected, entries, echoes) = {
-            let s = self.state.read(cx);
-            (
-                s.selected_chat.clone(),
-                s.transcript.clone(),
-                s.pending_echoes().to_vec(),
-            )
-        };
-
+        let state = self.state.clone();
+        let state = state.read(cx);
+        let selected = state.selected_chat.clone();
+        let echoes = state.pending_echoes().to_vec();
+        let entries = &state.transcript;
         let attached = selected != self.chat_id;
         if attached {
+            if let Some(previous) = self.chat_id.take()
+                && !self.rows.is_empty()
+            {
+                self.render_windows.insert(
+                    previous.clone(),
+                    CachedTranscriptRender {
+                        rows: std::mem::take(&mut self.rows),
+                        row_cache: std::mem::take(&mut self.row_cache),
+                        tree_cache: std::mem::take(&mut self.tree_cache),
+                    },
+                );
+                self.render_window_lru.retain(|id| id != &previous);
+                self.render_window_lru.push(previous);
+                while self.render_windows.len() > RENDER_WINDOW_CHAT_LIMIT
+                    || self
+                        .render_windows
+                        .values()
+                        .map(|cached| cached.rows.len())
+                        .sum::<usize>()
+                        > RENDER_WINDOW_ROW_LIMIT
+                {
+                    let Some(oldest) = self.render_window_lru.first().cloned() else {
+                        break;
+                    };
+                    self.render_window_lru.remove(0);
+                    self.render_windows.remove(&oldest);
+                }
+            }
             self.chat_id = selected;
-            self.rows.clear();
-            self.row_cache.clear();
+            if let Some(chat_id) = self.chat_id.as_deref()
+                && let Some(cached) = self.render_windows.remove(chat_id)
+            {
+                self.render_window_lru.retain(|id| id != chat_id);
+                self.rows = cached.rows;
+                self.row_cache = cached.row_cache;
+                self.tree_cache = cached.tree_cache;
+            } else {
+                self.rows.clear();
+                self.row_cache.clear();
+                self.tree_cache.clear();
+            }
             self.live_parsers.clear();
-            self.tree_cache.clear();
             self.folds.clear();
             self.expanded_tools.clear();
             self.tool_details.clear();
@@ -1299,7 +1378,7 @@ impl Transcript {
             self.veils.clear();
             self.render_cache.borrow_mut().clear();
             self.highlights.entries.clear();
-            self.list.reset(0);
+            self.list.reset(self.rows.len());
             self.pinned = true;
             self.spring.reset();
             self.spring_last_tick = None;
@@ -1309,7 +1388,7 @@ impl Transcript {
         }
 
         let mut new_rows: Vec<Row> = Vec::new();
-        for entry in &entries {
+        for entry in entries {
             new_rows.extend(self.rows_for(entry, false));
         }
         for echo in &echoes {
@@ -3254,6 +3333,14 @@ mod tests {
         }
     }
 
+    fn text_window(id: &str, text: &str, omitted_prefix_bytes: usize) -> MessagePart {
+        MessagePart::TextWindow {
+            id: id.into(),
+            text: text.into(),
+            omitted_prefix_bytes,
+        }
+    }
+
     fn tool_part(id: &str, command: &str) -> MessagePart {
         MessagePart::Tool {
             id: id.into(),
@@ -3441,6 +3528,34 @@ mod tests {
             &echoed[0].kind,
             RowKind::User { pending: true, .. }
         ));
+    }
+
+    #[test]
+    fn bounded_text_rows_show_omitted_byte_marker() {
+        let assistant = assistant(
+            "a-window",
+            MessageStatus::Complete,
+            vec![text_window("t0", "visible tail", 4096)],
+        );
+        let assistant_rows = rows_for_entry(&assistant, false, &mut parse);
+        let RowKind::Markdown { tree, block_ix } = &assistant_rows[0].kind else {
+            panic!("expected markdown omission marker");
+        };
+        let Block::Paragraph { runs } = &tree.blocks[*block_ix].block else {
+            panic!("expected marker paragraph");
+        };
+        assert!(runs.iter().any(|run| run.text.contains("4096 bytes")));
+
+        let mut user = assistant;
+        user.id = "u-window".into();
+        user.role = MessageRole::User;
+        user.status = None;
+        let user_rows = rows_for_entry(&user, false, &mut parse);
+        let RowKind::User { text, .. } = &user_rows[0].kind else {
+            panic!("expected user omission marker");
+        };
+        assert!(text.contains("Earlier output not loaded: 4096 bytes"));
+        assert!(text.contains("visible tail"));
     }
 
     #[test]
