@@ -970,6 +970,21 @@ impl AppState {
                 .as_deref()
                 .is_some_and(|id| id.starts_with(LEGACY_SCAFFOLD_SPACE_ID_PREFIX))
         });
+        // First-send setup may spend seconds materializing a large worktree.
+        // Preserve its optimistic row across unrelated watch frames so tabs and
+        // the sidebar acknowledge the session immediately. The authoritative
+        // row replaces it as soon as the watch publishes the same id.
+        self.pending_local_chat_ids
+            .retain(|chat_id| !chats.iter().any(|chat| chat.id == *chat_id));
+        for pending in self
+            .chats
+            .iter()
+            .filter(|chat| self.pending_local_chat_ids.contains(&chat.id))
+        {
+            if !chats.iter().any(|chat| chat.id == pending.id) {
+                chats.push(pending.clone());
+            }
+        }
         sort_chats(&mut chats);
         // An explicit "mark unread" must survive watch frames that raced the
         // mutate (they still carry the pre-clear seen stamp). Once the synced
@@ -994,8 +1009,6 @@ impl AppState {
                 .iter()
                 .any(|candidate| candidate.id == *candidate_id)
         });
-        self.pending_local_chat_ids
-            .retain(|chat_id| !chats.iter().any(|chat| chat.id == *chat_id));
         self.scaffold_starting_chats.retain(|chat_id| {
             chats.iter().any(|chat| chat.id == *chat_id)
                 || self.pending_local_chat_ids.contains(chat_id)
@@ -1242,10 +1255,24 @@ impl AppState {
         }
     }
 
+    /// Insert the presentation row for a first send before checkout setup.
+    /// The workspace watch replaces this row by id after `createChat` lands.
+    pub fn stage_pending_chat(&mut self, chat: Chat) {
+        if self.chats.iter().any(|existing| existing.id == chat.id) {
+            return;
+        }
+        self.pending_local_chat_ids.insert(chat.id.clone());
+        self.chats.push(chat);
+        sort_chats(&mut self.chats);
+    }
+
     /// Release a failed first-send reservation. If no row ever materialized,
     /// return to the new-session canvas instead of leaving a ghost selection.
     pub fn cancel_pending_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
-        self.pending_local_chat_ids.remove(chat_id);
+        let pending = self.pending_local_chat_ids.remove(chat_id);
+        if pending {
+            self.chats.retain(|chat| chat.id != chat_id);
+        }
         if self.selected_chat.as_deref() == Some(chat_id)
             && !self.chats.iter().any(|chat| chat.id == chat_id)
         {
@@ -1519,7 +1546,11 @@ impl AppState {
 
     /// Full display status for a chat (tab dots, Active list).
     pub fn display_status_for(&self, chat: &Chat, now: DateTime<Utc>) -> ChatIndicator {
-        display_status(chat, self.session_for(&chat.id), now)
+        if self.pending_local_chat_ids.contains(&chat.id) {
+            ChatIndicator::Working
+        } else {
+            display_status(chat, self.session_for(&chat.id), now)
+        }
     }
 
     /// The sidebar's Sessions list: every non-archived chat of a LIVE space,
@@ -1533,7 +1564,7 @@ impl AppState {
                     .as_deref()
                     .is_some_and(|id| self.space_row(id).is_some())
             })
-            .map(|c| (display_status(c, self.session_for(&c.id), now), c))
+            .map(|c| (self.display_status_for(c, now), c))
             .collect();
         sort_active(&mut rows);
         rows
@@ -3562,6 +3593,41 @@ mod tests {
         state.apply_chats(vec![chat("local-chat-fresh", 0, None)]);
         assert_eq!(state.selected_chat.as_deref(), Some("local-chat-fresh"));
         assert!(state.pending_local_chat_ids.is_empty());
+    }
+
+    #[test]
+    fn pending_chat_renders_while_worktree_setup_waits_for_the_workspace_watch() {
+        let mut state = AppState::new();
+        state.apply_spaces(vec![space("space", "dev", "/repo", 0)]);
+        let mut pending = chat("pending", 2, None);
+        pending.space_id = Some("space".into());
+        pending.cwd = Some("/repo".into());
+        state.stage_pending_chat(pending);
+
+        let now = Utc::now();
+        assert_eq!(state.overview_chats(now)[0].0, ChatIndicator::Working);
+        assert_eq!(state.chats_in_space("space")[0].id, "pending");
+
+        let mut unrelated = chat("unrelated", 1, None);
+        unrelated.space_id = Some("space".into());
+        state.apply_chats(vec![unrelated.clone()]);
+        assert!(state.chats.iter().any(|chat| chat.id == "pending"));
+
+        let mut materialized = chat("pending", 2, None);
+        materialized.space_id = Some("space".into());
+        materialized.cwd = Some("/worktrees/repo/fresh".into());
+        materialized.branch = Some("comet/fresh".into());
+        state.apply_chats(vec![unrelated, materialized]);
+
+        let row = state
+            .chats
+            .iter()
+            .find(|chat| chat.id == "pending")
+            .unwrap();
+        assert_eq!(row.cwd.as_deref(), Some("/worktrees/repo/fresh"));
+        assert_eq!(row.branch.as_deref(), Some("comet/fresh"));
+        assert!(!state.pending_local_chat_ids.contains("pending"));
+        assert_eq!(state.display_status_for(row, now), ChatIndicator::Idle);
     }
 
     #[test]

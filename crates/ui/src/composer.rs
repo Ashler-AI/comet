@@ -29,9 +29,9 @@ use comet_doc::{
     SessionMessageEntry,
 };
 use comet_proto::{
-    AgentProvider, AgentRoute, AgentSessionSource, ChatConfig, FileSearchMatch, HarnessCommand,
-    HarnessId, RunRequest, SandboxLevel, ScaffoldLifecycle, SteeringMode, UserInputAnswer,
-    UserInputQuestion,
+    AgentProvider, AgentRoute, AgentSessionSource, Chat, ChatConfig, FileSearchMatch,
+    HarnessCommand, HarnessId, RunRequest, SandboxLevel, ScaffoldLifecycle, SteeringMode,
+    UserInputAnswer, UserInputQuestion,
 };
 use comet_rpc::{RpcError, methods};
 
@@ -4795,6 +4795,24 @@ impl Composer {
         };
         let steering_mode = self.pickers.read(cx).steering_mode(cx);
         let echo_status = optimistic_message_status(effective_delivery, steering_mode);
+        let pending_chat = (is_new && !scaffold_demo).then(|| Chat {
+            id: chat_id.clone(),
+            device_id: device_id.clone(),
+            title: None,
+            archived: false,
+            cwd: space_path.clone(),
+            branch: scaffold_source_ref(&plan).map(str::to_string),
+            checkout_id: space.as_ref().and_then(|space| space.checkout_id.clone()),
+            config: resolved.chat_config(),
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: chrono::DateTime::from_timestamp_millis(created_at)
+                .expect("current timestamp is representable"),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: space_id.clone(),
+            last_seen_at: None,
+        });
 
         // Optimistic echo (client-minted id doubles as the persisted message id,
         // so the doc frame dedups it away).
@@ -4811,7 +4829,10 @@ impl Composer {
             continuation_of: None,
         };
         self.state.update(cx, |s, cx| {
-            if is_new {
+            if let Some(pending_chat) = pending_chat {
+                s.stage_pending_chat(pending_chat);
+                s.select_chat(Some(chat_id.clone()), cx);
+            } else if is_new {
                 s.mark_chat_pending(&chat_id);
                 s.select_chat(Some(chat_id.clone()), cx);
             }
