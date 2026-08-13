@@ -17,8 +17,8 @@ use tokio::sync::watch;
 use comet_doc::{
     COMMAND_DEFAULT_TTL_MS, CommandBasedOn, CommandDisposition, DocError, EvaluationContext,
     MessagePart, MessageRole, MessageStatus, SessionCommandEntry, SessionCommandPayload,
-    SessionCommandStatus, SessionControlAction, SessionDoc, SessionMessageEntry, evaluate_command,
-    join_continuation_entries,
+    SessionCommandStatus, SessionControlAction, SessionDoc, SessionEntryWindow,
+    SessionMessageEntry, TAIL_MESSAGE_COUNT, evaluate_command,
 };
 use comet_proto::{
     AgentSessionRecord, AuditEvent, AuditResult, COLLABORATION_SCHEMA_VERSION, CapabilityGrant,
@@ -371,9 +371,9 @@ pub struct ChatDocHandle {
     chat_id: String,
     device_id: String,
     doc: Arc<SessionDoc>,
-    messages_tx: watch::Sender<Vec<SessionMessageEntry>>,
-    /// True when the doc changed while nobody watched: the mirror rebuild is
-    /// deferred to the next `watch_messages` attach instead of paid per commit.
+    messages_tx: watch::Sender<SessionEntryWindow>,
+    /// True when the doc changed while nobody watched: the bounded tail mirror
+    /// is rebuilt on the next `watch_messages` attach.
     mirror_dirty: AtomicBool,
     /// Epoch ms of the last open/watch touch — the LRU eviction key.
     last_access: AtomicI64,
@@ -404,12 +404,12 @@ impl ChatDocHandle {
         self.doc.clone()
     }
 
-    /// Joined transcript watch — re-sent on every doc change (WatchDocMessages).
+    /// Bounded joined transcript tail watch (`WatchDocMessages`).
     ///
     /// Attach-time refresh: the mirror is only maintained while watched, so a
     /// doc that changed unwatched materializes here, once, instead of on every
     /// commit it sat through in the background.
-    pub fn watch_messages(&self) -> watch::Receiver<Vec<SessionMessageEntry>> {
+    pub fn watch_messages(&self) -> watch::Receiver<SessionEntryWindow> {
         self.touch();
         // Attach is a user signal: verify a quiet room is actually alive
         // (a doc-wedged DO keeps answering pings while delivering nothing,
@@ -535,12 +535,11 @@ impl ChatDocHandle {
 
     fn publish_messages(&self) {
         self.mirror_dirty.store(false, Ordering::Release);
-        match self.doc.read_entries() {
-            Ok(entries) => {
-                let joined = join_continuation_entries(entries);
-                // send_replace: update the watch even with no subscribers yet, so a
-                // late subscriber's first borrow sees the current transcript.
-                self.messages_tx.send_replace(joined);
+        match self.doc.read_entry_window(None, TAIL_MESSAGE_COUNT) {
+            Ok(window) => {
+                // send_replace: update the watch even with no subscribers yet,
+                // so a late subscriber's first borrow sees the current tail.
+                self.messages_tx.send_replace(window);
             }
             Err(err) => {
                 tracing::warn!(chat = %self.chat_id, error = %err, "transcript read failed");
@@ -549,13 +548,10 @@ impl ChatDocHandle {
     }
 
     /// Per-commit publish path: unwatched docs just mark the mirror dirty —
-    /// rebuilding a full transcript nobody reads was a per-tick cost on every
-    /// open doc (and kept a second transcript copy hot).
+    /// rebuilding even a bounded tail nobody reads is wasted work.
     fn publish_messages_if_watched(&self) {
         if self.messages_tx.receiver_count() == 0 {
             self.mirror_dirty.store(true, Ordering::Release);
-            // Shrink the stale mirror: watch_messages rebuilds on attach.
-            self.messages_tx.send_replace(Vec::new());
         } else {
             self.publish_messages();
         }
@@ -1067,11 +1063,12 @@ impl DocHost {
         let sub = doc.doc().subscribe_root(Arc::new(move |_diff| {
             changed_tx.send_modify(|v| *v = v.wrapping_add(1));
         }));
-        // The mirror starts dirty and empty: many opens (command queueing,
-        // drains, nudges) never watch the transcript, and the first
-        // watch_messages attach materializes it on demand.
-        let (messages_tx, _) = watch::channel(Vec::new());
-
+        // The mirror starts dirty and empty: many opens never watch a
+        // transcript, and the first attach materializes the bounded tail.
+        let (messages_tx, _) = watch::channel(SessionEntryWindow {
+            entries: Vec::new(),
+            before: None,
+        });
         let handle = Arc::new(ChatDocHandle {
             chat_id: chat_id.to_string(),
             device_id: self.inner.config.device_id.clone(),

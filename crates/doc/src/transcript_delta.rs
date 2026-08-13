@@ -20,6 +20,10 @@ use crate::schema::SessionMessageEntry;
 pub enum TranscriptFrame {
     Reset {
         reset: Vec<SessionMessageEntry>,
+        /// Raw-list cursor for the next older page; `None` means the window
+        /// already reaches the beginning of the transcript.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<usize>,
     },
     Delta {
         #[serde(default)]
@@ -31,6 +35,10 @@ pub enum TranscriptFrame {
         /// Expected transcript length after applying this frame — the desync
         /// tripwire: a consumer that lands elsewhere resubscribes for a reset.
         count: usize,
+        /// Updated raw-list cursor for the next older page. A tail append can
+        /// retire the oldest visible row and advance this cursor.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<usize>,
     },
 }
 
@@ -52,14 +60,41 @@ pub struct TextAppend {
     pub entry: String,
     pub part: String,
     pub text: String,
-    /// Total text length of the part after the append (desync tripwire).
+    /// Bytes removed from the visible text prefix before appending `text`.
+    #[serde(default)]
+    pub drop_prefix: usize,
+    /// Omitted source bytes represented by the resulting projected part.
+    #[serde(default)]
+    pub omitted_prefix_bytes: usize,
+    /// Total visible text length after applying this append.
     pub len: usize,
 }
 
 impl TranscriptFrame {
-    pub fn reset(entries: &[SessionMessageEntry]) -> Self {
+    pub fn reset(entries: &[SessionMessageEntry], before: Option<usize>) -> Self {
         Self::Reset {
             reset: entries.to_vec(),
+            before,
+        }
+    }
+
+    pub fn before(&self) -> Option<usize> {
+        match self {
+            Self::Reset { before, .. } | Self::Delta { before, .. } => *before,
+        }
+    }
+
+    pub fn reset_entries(&self) -> Option<&[SessionMessageEntry]> {
+        match self {
+            Self::Reset { reset, .. } => Some(reset),
+            Self::Delta { .. } => None,
+        }
+    }
+
+    pub fn removed_entry_ids(&self) -> &[String] {
+        match self {
+            Self::Reset { .. } => &[],
+            Self::Delta { remove, .. } => remove,
         }
     }
 
@@ -87,26 +122,47 @@ fn try_text_append(prev: &SessionMessageEntry, next: &SessionMessageEntry) -> Op
         return None;
     }
     let mut append = None;
-    for (p, n) in prev.parts.iter().zip(&next.parts) {
-        if p == n {
+    for (previous, current) in prev.parts.iter().zip(&next.parts) {
+        if previous == current {
             continue;
         }
-        let (MessagePart::Text { id: pid, text: pt }, MessagePart::Text { id: nid, text: nt }) =
-            (p, n)
-        else {
+        let (pid, previous_text, previous_omitted) = text_projection(previous)?;
+        let (nid, current_text, current_omitted) = text_projection(current)?;
+        if pid != nid || current_omitted < previous_omitted || append.is_some() {
             return None;
-        };
-        if pid != nid || !nt.starts_with(pt.as_str()) || append.is_some() {
+        }
+        let drop_prefix = current_omitted - previous_omitted;
+        if drop_prefix > previous_text.len() {
+            return None;
+        }
+        let overlap = previous_text.len() - drop_prefix;
+        if overlap > current_text.len()
+            || previous_text.as_bytes()[drop_prefix..] != current_text.as_bytes()[..overlap]
+        {
             return None;
         }
         append = Some(TextAppend {
             entry: next.id.clone(),
-            part: nid.clone(),
-            text: nt[pt.len()..].to_string(),
-            len: nt.len(),
+            part: nid.to_string(),
+            text: current_text[overlap..].to_string(),
+            drop_prefix,
+            omitted_prefix_bytes: current_omitted,
+            len: current_text.len(),
         });
     }
     append
+}
+
+fn text_projection(part: &MessagePart) -> Option<(&str, &str, usize)> {
+    match part {
+        MessagePart::Text { id, text } => Some((id, text, 0)),
+        MessagePart::TextWindow {
+            id,
+            text,
+            omitted_prefix_bytes,
+        } => Some((id, text, *omitted_prefix_bytes)),
+        _ => None,
+    }
 }
 
 /// Diff two transcript states into a frame. An entry is upserted when it is
@@ -116,6 +172,7 @@ fn try_text_append(prev: &SessionMessageEntry, next: &SessionMessageEntry) -> Op
 pub fn diff_transcript(
     prev: &[SessionMessageEntry],
     next: &[SessionMessageEntry],
+    before: Option<usize>,
 ) -> TranscriptFrame {
     let mut prev_by_id =
         std::collections::HashMap::<&str, (usize, &SessionMessageEntry)>::with_capacity(prev.len());
@@ -124,13 +181,13 @@ pub fn diff_transcript(
             .insert(entry.id.as_str(), (index, entry))
             .is_some()
         {
-            return TranscriptFrame::reset(next);
+            return TranscriptFrame::reset(next, before);
         }
     }
     let mut next_ids = std::collections::HashSet::<&str>::with_capacity(next.len());
     for entry in next {
         if !next_ids.insert(entry.id.as_str()) {
-            return TranscriptFrame::reset(next);
+            return TranscriptFrame::reset(next, before);
         }
     }
 
@@ -170,13 +227,14 @@ pub fn diff_transcript(
 
     // A delta touching most rows serializes like a reset but applies slower.
     if upsert.len() * 2 >= next.len().max(1) && next.len() > 4 {
-        return TranscriptFrame::reset(next);
+        return TranscriptFrame::reset(next, before);
     }
     TranscriptFrame::Delta {
         upsert,
         append,
         remove,
         count: next.len(),
+        before,
     }
 }
 
@@ -192,7 +250,7 @@ pub fn apply_transcript_frame(
     frame: TranscriptFrame,
 ) -> Result<(), TranscriptDesync> {
     match frame {
-        TranscriptFrame::Reset { reset } => {
+        TranscriptFrame::Reset { reset, .. } => {
             *current = reset;
             Ok(())
         }
@@ -201,6 +259,7 @@ pub fn apply_transcript_frame(
             append,
             remove,
             count,
+            before: _,
         } => {
             let mut current_ids = std::collections::HashSet::<&str>::with_capacity(current.len());
             if let Some(duplicate) = current
@@ -234,20 +293,22 @@ pub fn apply_transcript_frame(
             if !remove.is_empty() {
                 let gone: std::collections::HashSet<&str> =
                     remove.iter().map(String::as_str).collect();
-                current.retain(|e| !gone.contains(e.id.as_str()));
+                current.retain(|entry| !gone.contains(entry.id.as_str()));
             }
             for TranscriptUpsert { after, entry } in upsert {
-                if let Some(existing) = current.iter().position(|e| e.id == entry.id) {
+                if let Some(existing) = current
+                    .iter()
+                    .position(|candidate| candidate.id == entry.id)
+                {
                     current.remove(existing);
                 }
                 let at = match &after {
                     None => 0,
-                    Some(anchor) => match current.iter().position(|e| &e.id == anchor) {
-                        Some(ix) => ix + 1,
-                        None => {
-                            return Err(TranscriptDesync(format!("missing anchor {anchor}")));
-                        }
-                    },
+                    Some(anchor) => current
+                        .iter()
+                        .position(|candidate| &candidate.id == anchor)
+                        .map(|index| index + 1)
+                        .ok_or_else(|| TranscriptDesync(format!("missing anchor {anchor}")))?,
                 };
                 current.insert(at, entry);
             }
@@ -255,25 +316,59 @@ pub fn apply_transcript_frame(
                 entry,
                 part,
                 text,
+                drop_prefix,
+                omitted_prefix_bytes,
                 len,
             } in append
             {
-                let Some(target) = current.iter_mut().find(|e| e.id == entry) else {
-                    return Err(TranscriptDesync(format!("missing append entry {entry}")));
-                };
-                let Some(MessagePart::Text { text: tail, .. }) = target
+                let target = current
+                    .iter_mut()
+                    .find(|candidate| candidate.id == entry)
+                    .ok_or_else(|| TranscriptDesync(format!("missing append entry {entry}")))?;
+                let target_part = target
                     .parts
                     .iter_mut()
-                    .find(|p| matches!(p, MessagePart::Text { id, .. } if *id == part))
-                else {
-                    return Err(TranscriptDesync(format!("missing append part {part}")));
-                };
-                tail.push_str(&text);
-                if tail.len() != len {
-                    return Err(TranscriptDesync(format!(
-                        "append length mismatch on {entry}#{part}: have {}, expected {len}",
-                        tail.len()
-                    )));
+                    .find(|candidate| {
+                        matches!(candidate, MessagePart::Text { id, .. } | MessagePart::TextWindow { id, .. } if *id == part)
+                    })
+                    .ok_or_else(|| TranscriptDesync(format!("missing append part {part}")))?;
+                let project_text =
+                    matches!(target_part, MessagePart::Text { .. }) && omitted_prefix_bytes > 0;
+                {
+                    let tail = match target_part {
+                        MessagePart::Text { text, .. } => text,
+                        MessagePart::TextWindow {
+                            text,
+                            omitted_prefix_bytes: omitted,
+                            ..
+                        } => {
+                            *omitted = omitted_prefix_bytes;
+                            text
+                        }
+                        _ => unreachable!(),
+                    };
+                    if drop_prefix > tail.len() || !tail.is_char_boundary(drop_prefix) {
+                        return Err(TranscriptDesync(format!(
+                            "invalid append prefix drop on {entry}#{part}: {drop_prefix}"
+                        )));
+                    }
+                    tail.drain(..drop_prefix);
+                    tail.push_str(&text);
+                    if tail.len() != len {
+                        return Err(TranscriptDesync(format!(
+                            "append length mismatch on {entry}#{part}: have {}, expected {len}",
+                            tail.len()
+                        )));
+                    }
+                }
+                if project_text && let MessagePart::Text { id, text } = target_part {
+                    let id = std::mem::take(id);
+                    let text = std::mem::take(text);
+                    *target_part = MessagePart::TextWindow {
+                        id,
+                        text,
+                        omitted_prefix_bytes,
+                    };
                 }
             }
             if current.len() != count {
@@ -309,7 +404,7 @@ mod tests {
     }
 
     fn apply(prev: &[SessionMessageEntry], next: &[SessionMessageEntry]) {
-        let frame = diff_transcript(prev, next);
+        let frame = diff_transcript(prev, next, None);
         // Round-trip through JSON: the wire shape must survive serde.
         let json = serde_json::to_value(&frame).unwrap();
         let frame: TranscriptFrame = serde_json::from_value(json).unwrap();
@@ -343,7 +438,7 @@ mod tests {
         let a = entry("a", "prompt");
         let b0 = entry("b", "streaming…");
         let b1 = entry("b", "streaming… more");
-        let frame = diff_transcript(&[a.clone(), b0.clone()], &[a.clone(), b1.clone()]);
+        let frame = diff_transcript(&[a.clone(), b0.clone()], &[a.clone(), b1.clone()], None);
         match &frame {
             TranscriptFrame::Delta {
                 upsert,
@@ -363,11 +458,77 @@ mod tests {
     }
 
     #[test]
+    fn sliding_text_window_stays_on_append_deltas() {
+        let full = entry("a", "abcdef");
+        let mut first_window = full.clone();
+        first_window.parts = vec![MessagePart::TextWindow {
+            id: "t0".into(),
+            text: "cdefg".into(),
+            omitted_prefix_bytes: 2,
+        }];
+        let mut second_window = full.clone();
+        second_window.parts = vec![MessagePart::TextWindow {
+            id: "t0".into(),
+            text: "defgh".into(),
+            omitted_prefix_bytes: 3,
+        }];
+
+        let first_frame = diff_transcript(
+            std::slice::from_ref(&full),
+            std::slice::from_ref(&first_window),
+            None,
+        );
+        let TranscriptFrame::Delta { append, upsert, .. } = &first_frame else {
+            panic!("expected first sliding delta");
+        };
+        assert!(upsert.is_empty());
+        assert_eq!(append.len(), 1);
+        assert_eq!(append[0].drop_prefix, 2);
+        assert_eq!(append[0].text, "g");
+
+        let mut current = vec![full];
+        apply_transcript_frame(&mut current, first_frame).unwrap();
+        assert_eq!(current, vec![first_window.clone()]);
+
+        let second_frame = diff_transcript(
+            std::slice::from_ref(&first_window),
+            std::slice::from_ref(&second_window),
+            None,
+        );
+        let TranscriptFrame::Delta { append, upsert, .. } = &second_frame else {
+            panic!("expected second sliding delta");
+        };
+        assert!(upsert.is_empty());
+        assert_eq!(append.len(), 1);
+        assert_eq!(append[0].drop_prefix, 1);
+        assert_eq!(append[0].text, "h");
+
+        apply_transcript_frame(&mut current, second_frame).unwrap();
+        assert_eq!(current, vec![second_window]);
+    }
+
+    #[test]
+    fn bounded_tail_retires_oldest_entry_as_a_delta() {
+        let prev: Vec<_> = (0..64)
+            .map(|index| entry(&format!("m{index}"), "text"))
+            .collect();
+        let next: Vec<_> = (1..65)
+            .map(|index| entry(&format!("m{index}"), "text"))
+            .collect();
+        let frame = diff_transcript(&prev, &next, Some(1));
+        assert_eq!(frame.before(), Some(1));
+        assert!(matches!(frame, TranscriptFrame::Delta { .. }));
+        let mut current = prev;
+        apply_transcript_frame(&mut current, frame).unwrap();
+        assert_eq!(current, next);
+    }
+
+    #[test]
     fn non_append_change_falls_back_to_upsert() {
         // Same id but a rewritten (non-prefix) text must re-send the entry.
         let b0 = entry("b", "draft text");
         let b1 = entry("b", "final");
-        let frame = diff_transcript(std::slice::from_ref(&b0), std::slice::from_ref(&b1));
+        let frame = diff_transcript(std::slice::from_ref(&b0), std::slice::from_ref(&b1), None);
         match &frame {
             TranscriptFrame::Delta { upsert, append, .. } => {
                 assert_eq!(upsert.len(), 1);
@@ -386,10 +547,13 @@ mod tests {
                 entry: "a".into(),
                 part: "t0".into(),
                 text: "x".into(),
+                drop_prefix: 0,
+                omitted_prefix_bytes: 0,
                 len: 99,
             }],
             remove: vec![],
             count: 1,
+            before: None,
         };
         let mut current = vec![entry("a", "hello")];
         assert!(apply_transcript_frame(&mut current, frame).is_err());
@@ -400,7 +564,7 @@ mod tests {
         let prev: Vec<_> = (0..10).map(|i| entry(&format!("p{i}"), "x")).collect();
         let next: Vec<_> = (0..10).map(|i| entry(&format!("n{i}"), "y")).collect();
         assert!(matches!(
-            diff_transcript(&prev, &next),
+            diff_transcript(&prev, &next, None),
             TranscriptFrame::Reset { .. }
         ));
     }
@@ -415,7 +579,7 @@ mod tests {
         let next = vec![first, middle, second, inserted];
 
         assert!(matches!(
-            diff_transcript(&prev, &next),
+            diff_transcript(&prev, &next, None),
             TranscriptFrame::Reset { .. }
         ));
     }
@@ -427,6 +591,7 @@ mod tests {
             append: vec![],
             remove: vec![],
             count: 2,
+            before: None,
         };
         let mut current = vec![entry("duplicate", "first"), entry("duplicate", "second")];
 
@@ -443,6 +608,7 @@ mod tests {
             append: vec![],
             remove: vec![],
             count: 2,
+            before: None,
         };
         let mut current = Vec::new();
         assert!(apply_transcript_frame(&mut current, frame).is_err());

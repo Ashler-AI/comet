@@ -42,7 +42,9 @@ fn user_text(entry: &SessionMessageEntry) -> String {
         .parts
         .iter()
         .filter_map(|part| match part {
-            MessagePart::Text { text, .. } => Some(text.as_str()),
+            MessagePart::Text { text, .. } | MessagePart::TextWindow { text, .. } => {
+                Some(text.as_str())
+            }
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -59,7 +61,9 @@ fn first_reply_text(entries: &[SessionMessageEntry]) -> Option<String> {
         .find(|e| e.role == MessageRole::Assistant)
         .and_then(|entry| {
             entry.parts.iter().find_map(|part| match part {
-                MessagePart::Text { text, .. } if !text.trim().is_empty() => {
+                MessagePart::Text { text, .. } | MessagePart::TextWindow { text, .. }
+                    if !text.trim().is_empty() =>
+                {
                     Some(text.trim().to_string())
                 }
                 _ => None,
@@ -411,11 +415,10 @@ impl Transcript {
         if !self.rail_enabled() {
             return gpui::Empty.into_any_element();
         }
-        let (entries, echoes) = {
-            let state = self.state_entity().read(cx);
-            (state.transcript.clone(), state.pending_echoes().to_vec())
-        };
-        let ticks = rail_ticks(&entries, &echoes);
+        let state = self.state_entity().clone();
+        let state = state.read(cx);
+        let echoes = state.pending_echoes().to_vec();
+        let ticks = rail_ticks(&state.transcript, &echoes);
         // Map each tick to its transcript row (user rows share the entry id).
         let pairs: Vec<(RailTick, usize)> = ticks
             .into_iter()

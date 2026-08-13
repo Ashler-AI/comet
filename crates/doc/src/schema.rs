@@ -11,15 +11,20 @@
 //! isError?, questions?: json, resolved?, message? }. Text bodies are **LoroText** so streaming
 //! appends RLE-merge (1.03x oplog overhead vs 125x for whole-value rewrites).
 
+use std::collections::HashSet;
+
 use comet_proto::{
     COLLABORATION_SCHEMA_VERSION, CollaborationSnapshot, PublicationRecord, PublicationValue,
 };
-use loro::{ExportMode, LoroDoc, LoroError, LoroList, LoroMap, LoroText, LoroValue, ToJson};
+use loro::{
+    ExportMode, LoroDoc, LoroError, LoroList, LoroMap, LoroText, LoroValue, TextDelta, ToJson,
+    cursor::PosType,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::collaboration::validate_publication;
 use crate::commands::{SessionCommandEntry, SessionCommandStatus};
-use crate::constants::{SESSION_SCHEMA_VERSION, TAIL_MESSAGE_COUNT};
+use crate::constants::{SESSION_SCHEMA_VERSION, TAIL_MESSAGE_COUNT, TAIL_TEXT_BYTE_BUDGET};
 use crate::parts::{MessagePart, MessageStatus};
 
 #[derive(Debug, thiserror::Error)]
@@ -56,6 +61,15 @@ pub struct SessionMessageEntry {
     pub continuation_of: Option<String>,
 }
 
+/// A newest-first transcript page projected back into chronological order.
+/// `before` is an opaque raw-list cursor for the next older page.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionEntryWindow {
+    pub entries: Vec<SessionMessageEntry>,
+    pub before: Option<usize>,
+}
+
 /// The doc-resident flat part map (`DocMessagePart` in TS). Distinct from the app-layer
 /// [`MessagePart`]: input parts key on their request id, error parts store `message`.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -86,6 +100,11 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             text: Some(text.clone()),
             ..Default::default()
         },
+        MessagePart::TextWindow { .. } => {
+            return Err(DocError::Schema(
+                "projected text windows cannot be persisted".into(),
+            ));
+        }
         MessagePart::Tool {
             id,
             call,
@@ -201,18 +220,44 @@ impl SessionDoc {
         }
     }
 
-    /// Insert a complete message entry (user/system messages, command-side inserts).
-    /// Streaming assistant entries go through [`SegmentWriter`].
+    /// Insert one complete message entry (user/system messages, command-side
+    /// inserts). Streaming assistant entries go through [`SegmentWriter`].
     pub fn push_message(&self, entry: &SessionMessageEntry) -> Result<(), DocError> {
+        self.push_messages(std::slice::from_ref(entry))
+    }
+
+    /// Insert complete entries in one Loro commit. Native history imports use
+    /// this path so a thousand-message attach produces one publish/snapshot
+    /// wake instead of a thousand intermediate transcript states.
+    pub fn push_messages(&self, entries: &[SessionMessageEntry]) -> Result<(), DocError> {
         let messages = self.doc.get_list("messages");
-        let map = messages.push_container(LoroMap::new())?;
-        write_entry_scalar_fields(&map, entry)?;
-        let parts = map.insert_container("parts", LoroList::new())?;
-        for part in &entry.parts {
-            push_part(&parts, part)?;
+        for entry in entries {
+            let map = messages.push_container(LoroMap::new())?;
+            write_entry_scalar_fields(&map, entry)?;
+            let parts = map.insert_container("parts", LoroList::new())?;
+            for part in &entry.parts {
+                push_part(&parts, part)?;
+            }
         }
-        self.doc.commit();
+        if !entries.is_empty() {
+            self.doc.commit();
+        }
         Ok(())
+    }
+
+    /// Read message ids without materializing parts or text bodies.
+    pub fn message_ids(&self) -> HashSet<String> {
+        let messages = self.doc.get_list("messages");
+        let mut ids = HashSet::with_capacity(messages.len());
+        for index in 0..messages.len() {
+            if let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) =
+                messages.get(index)
+                && let Some(loro::ValueOrContainer::Value(LoroValue::String(id))) = map.get("id")
+            {
+                ids.insert(id.to_string());
+            }
+        }
+        ids
     }
 
     /// Read all entries (continuations NOT joined — see `join_continuation_entries`).
@@ -241,6 +286,53 @@ impl SessionDoc {
                 }
             })
             .collect())
+    }
+
+    /// Read at most `max_messages` joined messages ending before the raw-list
+    /// cursor `before` (`None` = current tail). Entries are materialized one at
+    /// a time from the end of the Loro list, so opening a chat never converts
+    /// the entire transcript container into JSON.
+    ///
+    /// Continuation rows do not consume the message limit. Scanning stops only
+    /// after their root row is included, so a page never starts with a partial
+    /// joined message when it is resumed using the returned cursor.
+    pub fn read_entry_window(
+        &self,
+        before: Option<usize>,
+        max_messages: usize,
+    ) -> Result<SessionEntryWindow, DocError> {
+        let messages = self.doc.get_list("messages");
+        let mut cursor = before.unwrap_or_else(|| messages.len()).min(messages.len());
+        let max_messages = max_messages.max(1);
+        let mut roots = 0usize;
+        let mut text_budget = TAIL_TEXT_BYTE_BUDGET;
+        let mut reversed = Vec::with_capacity(max_messages);
+
+        while cursor > 0 && roots < max_messages {
+            cursor -= 1;
+            let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) =
+                messages.get(cursor)
+            else {
+                continue;
+            };
+            match entry_from_map_window(&map, &mut text_budget) {
+                Ok(entry) => {
+                    if entry.continuation_of.is_none() {
+                        roots += 1;
+                    }
+                    reversed.push(entry);
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "skipping malformed transcript entry");
+                }
+            }
+        }
+
+        reversed.reverse();
+        Ok(SessionEntryWindow {
+            entries: join_continuation_entries(reversed),
+            before: (cursor > 0).then_some(cursor),
+        })
     }
 
     /// Append one immutable collaboration publication. Publication ids are durable
@@ -661,6 +753,124 @@ fn entry_from_json(v: serde_json::Value) -> Result<SessionMessageEntry, DocError
         status: raw.status,
         continuation_of: raw.continuation_of,
     })
+}
+
+fn scalar_string(map: &LoroMap, key: &str) -> Result<String, DocError> {
+    match map.get(key) {
+        Some(loro::ValueOrContainer::Value(LoroValue::String(value))) => Ok(value.to_string()),
+        _ => Err(DocError::Schema(format!("missing string field {key}"))),
+    }
+}
+
+fn optional_string(map: &LoroMap, key: &str) -> Option<String> {
+    match map.get(key) {
+        Some(loro::ValueOrContainer::Value(LoroValue::String(value))) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn scalar_i64(map: &LoroMap, key: &str) -> Result<i64, DocError> {
+    match map.get(key) {
+        Some(loro::ValueOrContainer::Value(LoroValue::I64(value))) => Ok(value),
+        _ => Err(DocError::Schema(format!("missing integer field {key}"))),
+    }
+}
+
+fn entry_from_map_window(
+    map: &LoroMap,
+    text_budget: &mut usize,
+) -> Result<SessionMessageEntry, DocError> {
+    let role = match scalar_string(map, "role")?.as_str() {
+        "user" => MessageRole::User,
+        "assistant" => MessageRole::Assistant,
+        "system" => MessageRole::System,
+        other => return Err(DocError::Schema(format!("unknown message role {other}"))),
+    };
+    let status = match optional_string(map, "status").as_deref() {
+        Some("streaming") => Some(MessageStatus::Streaming),
+        Some("complete") => Some(MessageStatus::Complete),
+        Some("aborted") => Some(MessageStatus::Aborted),
+        Some("queued") => Some(MessageStatus::Queued),
+        Some("steered") => Some(MessageStatus::Steered),
+        Some(other) => return Err(DocError::Schema(format!("unknown message status {other}"))),
+        None => None,
+    };
+    let parts = match map.get("parts") {
+        Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) => {
+            read_parts_window(&parts, text_budget)?
+        }
+        _ => Vec::new(),
+    };
+    Ok(SessionMessageEntry {
+        id: scalar_string(map, "id")?,
+        role,
+        parts,
+        created_at: scalar_i64(map, "createdAt")?,
+        device_id: scalar_string(map, "deviceId")?,
+        status,
+        continuation_of: optional_string(map, "continuationOf"),
+    })
+}
+
+fn text_tail(text: &LoroText, budget: usize) -> Result<(String, usize), DocError> {
+    let total = text.len_utf8();
+    if total <= budget {
+        return Ok((text.to_string(), 0));
+    }
+    let target = total - budget;
+    for start in target..=(target + 3).min(total) {
+        let Ok(delta) = text.slice_delta(start, total, PosType::Bytes) else {
+            continue;
+        };
+        let body = delta
+            .into_iter()
+            .filter_map(|delta| match delta {
+                TextDelta::Insert { insert, .. } => Some(insert),
+                _ => None,
+            })
+            .collect();
+        return Ok((body, start));
+    }
+    Err(DocError::Schema(
+        "could not find UTF-8 boundary for transcript tail".into(),
+    ))
+}
+
+fn read_parts_window(
+    parts: &LoroList,
+    text_budget: &mut usize,
+) -> Result<Vec<MessagePart>, DocError> {
+    let mut reversed = Vec::with_capacity(parts.len());
+    for index in (0..parts.len()).rev() {
+        let Some(loro::ValueOrContainer::Container(loro::Container::Map(part))) = parts.get(index)
+        else {
+            continue;
+        };
+        let id = scalar_string(&part, "id")?;
+        let kind = scalar_string(&part, "kind")?;
+        if kind == "text"
+            && let Some(loro::ValueOrContainer::Container(loro::Container::Text(text))) =
+                part.get("text")
+        {
+            let (body, omitted) = text_tail(&text, *text_budget)?;
+            *text_budget = text_budget.saturating_sub(body.len());
+            reversed.push(if omitted == 0 {
+                MessagePart::Text { id, text: body }
+            } else {
+                MessagePart::TextWindow {
+                    id,
+                    text: body,
+                    omitted_prefix_bytes: omitted,
+                }
+            });
+            continue;
+        }
+        reversed.push(from_doc_part(serde_json::from_value(
+            part.get_deep_value().to_json_value(),
+        )?));
+    }
+    reversed.reverse();
+    Ok(reversed)
 }
 
 /// Render-time continuation join at the entry level (`joinContinuations` in TS):
@@ -1163,5 +1373,106 @@ mod tests {
         assert_eq!(tail.messages.len(), 2);
         assert_eq!(tail.messages[1].id, "m4");
         assert_eq!(tail.chat_id, "chat-1");
+    }
+
+    #[test]
+    fn entry_window_pages_from_tail_without_overlap() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        for i in 0..5 {
+            doc.push_message(&user_entry(&format!("m{i}"), &format!("msg {i}")))
+                .unwrap();
+        }
+
+        let tail = doc.read_entry_window(None, 2).unwrap();
+        assert_eq!(
+            tail.entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["m3", "m4"]
+        );
+        assert_eq!(tail.before, Some(3));
+
+        let older = doc.read_entry_window(tail.before, 2).unwrap();
+        assert_eq!(
+            older
+                .entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["m1", "m2"]
+        );
+        assert_eq!(older.before, Some(1));
+
+        let oldest = doc.read_entry_window(older.before, 2).unwrap();
+        assert_eq!(
+            oldest
+                .entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["m0"]
+        );
+        assert_eq!(oldest.before, None);
+    }
+
+    #[test]
+    fn entry_window_truncates_oversized_utf8_text_at_a_boundary() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let source = format!("{}END", "é".repeat(TAIL_TEXT_BYTE_BUDGET / 2 + 8));
+        doc.push_message(&user_entry("large", &source)).unwrap();
+
+        let window = doc.read_entry_window(None, 1).unwrap();
+        let MessagePart::TextWindow {
+            text,
+            omitted_prefix_bytes,
+            ..
+        } = &window.entries[0].parts[0]
+        else {
+            panic!("oversized text should be projected as a bounded window");
+        };
+        assert!(*omitted_prefix_bytes > 0);
+        assert!(source.is_char_boundary(*omitted_prefix_bytes));
+        assert_eq!(text, &source[*omitted_prefix_bytes..]);
+        assert!(text.len() <= TAIL_TEXT_BYTE_BUDGET);
+        assert!(text.ends_with("END"));
+    }
+
+    #[test]
+    fn entry_window_includes_continuations_with_their_root() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        doc.push_message(&user_entry("older", "older")).unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "root".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: "first".into(),
+            }],
+            created_at: 2,
+            device_id: "dev-a".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        })
+        .unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "root#c1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Text {
+                id: "t1".into(),
+                text: "second".into(),
+            }],
+            created_at: 2,
+            device_id: "dev-a".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: Some("root".into()),
+        })
+        .unwrap();
+
+        let tail = doc.read_entry_window(None, 1).unwrap();
+        assert_eq!(tail.entries.len(), 1);
+        assert_eq!(tail.entries[0].id, "root");
+        assert_eq!(tail.entries[0].parts.len(), 2);
+        assert_eq!(tail.before, Some(1));
     }
 }

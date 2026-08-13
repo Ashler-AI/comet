@@ -38,6 +38,8 @@ pub mod methods {
     pub const LIST_HARNESS_COMMANDS: &str = "ListHarnessCommands";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
+    /// Read one older transcript page before an opaque raw-list cursor.
+    pub const READ_DOC_MESSAGES: &str = "ReadDocMessages";
     pub const SEND_PEER_MESSAGE: &str = "SendPeerMessage";
     pub const REPLY_PEER_MESSAGE: &str = "ReplyPeerMessage";
     pub const WAIT_PEER_REPLY: &str = "WaitPeerReply";
