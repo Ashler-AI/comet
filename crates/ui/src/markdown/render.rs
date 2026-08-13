@@ -161,6 +161,7 @@ pub struct CachedCode {
     /// Slice-pointer identity + len of the highlight Arc that produced this.
     hl_key: (usize, usize),
     lines: Vec<(SharedString, Vec<TextRun>)>,
+    content_width: f32,
 }
 
 impl RenderCache {
@@ -287,6 +288,7 @@ pub fn render_block(
                     ix,
                     opts,
                     theme,
+                    window,
                     highlight,
                 ),
             }
@@ -1604,6 +1606,7 @@ fn render_code_block(
     ix: usize,
     opts: &RenderOptions,
     theme: &Theme,
+    window: &Window,
     highlight: CodeHighlight,
 ) -> AnyElement {
     let mono = font(theme.font_mono.clone());
@@ -1625,10 +1628,22 @@ fn render_code_block(
                 )
             })
             .collect();
+        let content_width = lines
+            .iter()
+            .map(|(line, runs)| {
+                f32::from(
+                    window
+                        .text_system()
+                        .shape_line(line.clone(), px(CODE_TEXT_SIZE), runs, None)
+                        .width(),
+                )
+            })
+            .fold(0.0, f32::max);
         Rc::new(CachedCode {
             code_len: code.len(),
             hl_key,
             lines,
+            content_width,
         })
     };
     let cached: Rc<CachedCode> = match &opts.cache {
@@ -1646,6 +1661,11 @@ fn render_code_block(
         }
         None => build(),
     };
+    // The scroll viewport must contain a child wider than itself. A nowrap
+    // StyledText can paint past a stretched line div without contributing that
+    // width to GPUI's overflow extent, so resolve the block's max-content width
+    // from the same shaped runs used for paint. GPUI caches identical shapes.
+    let content_width = cached.content_width;
     // Streaming veil over appended code, tracked on the whole code text and
     // sliced per line below (paint-only run recolor — heights stay exact).
     let veil_spans = match &opts.veil {
@@ -1680,30 +1700,36 @@ fn render_code_block(
         .child(
             div()
                 .id(scroll_id)
+                .debug_selector(|| "CODE_SCROLL_VIEWPORT".into())
                 .overflow_x_scroll()
                 .px(px(CODE_PADDING_X))
                 .py(px(CODE_PADDING_Y))
-                .font_family(theme.font_mono.clone())
-                .text_size(px(CODE_TEXT_SIZE))
-                .line_height(px(CODE_LINE_HEIGHT))
-                .whitespace_nowrap()
-                .flex()
-                .flex_col()
-                .children((0..cached.lines.len()).scan(0usize, move |off, li| {
-                    let (line, runs) = &cached.lines[li];
-                    let start = *off;
-                    *off = start + line.len() + 1; // +1 for the '\n'
-                    let local = slice_spans(&veil_spans, start, start + line.len());
-                    let runs = apply_veil(runs.clone(), &local);
-                    Some(
-                        div()
-                            .h(px(CODE_LINE_HEIGHT))
-                            .flex_none()
-                            .child(StyledText::new(line.clone()).with_runs(runs)),
-                    )
-                })),
+                .child(
+                    div()
+                        .w(px(content_width))
+                        .font_family(theme.font_mono.clone())
+                        .text_size(px(CODE_TEXT_SIZE))
+                        .line_height(px(CODE_LINE_HEIGHT))
+                        .whitespace_nowrap()
+                        .flex()
+                        .flex_col()
+                        .items_start()
+                        .children((0..cached.lines.len()).scan(0usize, move |off, li| {
+                            let (line, runs) = &cached.lines[li];
+                            let start = *off;
+                            *off = start + line.len() + 1; // +1 for the '\n'
+                            let local = slice_spans(&veil_spans, start, start + line.len());
+                            let runs = apply_veil(runs.clone(), &local);
+                            Some(
+                                div()
+                                    .debug_selector(move || format!("CODE_SCROLL_LINE_{li}"))
+                                    .h(px(CODE_LINE_HEIGHT))
+                                    .flex_none()
+                                    .child(StyledText::new(line.clone()).with_runs(runs)),
+                            )
+                        })),
+                ),
         )
-        // Overlay LAST so it paints above the header/body.
         .children(copy_button)
         .into_any_element()
 }
@@ -2164,5 +2190,63 @@ mod tests {
         for pair in rects.windows(2) {
             assert_eq!(pair[1].origin.y - pair[0].origin.y, px(LINE_HEIGHT));
         }
+    }
+
+    #[gpui::test]
+    fn long_code_lines_scroll_horizontally(cx: &mut gpui::TestAppContext) {
+        struct CodeScrollProbe;
+        impl gpui::Render for CodeScrollProbe {
+            fn render(
+                &mut self,
+                window: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                let block = Block::CodeBlock {
+                    language: Some("text".into()),
+                    code: "/tmp/ashler-state-code-corpus-national-uncapped/state-code-corpus-candidates.pre-browser-validation.json".into(),
+                };
+                div().w(px(240.0)).child(render_block(
+                    &block,
+                    0,
+                    0,
+                    &RenderOptions::settled("scroll-probe".into()),
+                    &Theme::dark(),
+                    window,
+                    None,
+                ))
+            }
+        }
+
+        cx.update(|cx| Theme::install(crate::theme::Appearance::Dark, cx));
+        let window = cx.open_window(gpui::size(px(320.0), px(160.0)), |_, _| CodeScrollProbe);
+        cx.run_until_parked();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let viewport = visual
+            .debug_bounds("CODE_SCROLL_VIEWPORT")
+            .expect("code scroll viewport rendered");
+        let line_before = visual
+            .debug_bounds("CODE_SCROLL_LINE_0")
+            .expect("code line rendered");
+        assert!(
+            line_before.size.width > viewport.size.width,
+            "long code line must create horizontal overflow: line={}, viewport={}",
+            line_before.size.width,
+            viewport.size.width,
+        );
+
+        visual.simulate_event(gpui::ScrollWheelEvent {
+            position: gpui::point(viewport.center().x, viewport.center().y),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(-120.0), px(0.0))),
+            ..Default::default()
+        });
+        let line_after = visual
+            .debug_bounds("CODE_SCROLL_LINE_0")
+            .expect("code line rendered after scroll");
+        assert!(
+            line_after.origin.x < line_before.origin.x,
+            "horizontal scroll must reveal later code: before={}, after={}",
+            line_before.origin.x,
+            line_after.origin.x,
+        );
     }
 }
