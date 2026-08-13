@@ -285,6 +285,142 @@ mod tests {
         origin
     }
 
+    async fn transport_flaky_control_plane(
+        captured: mpsc::UnboundedSender<FailoverCapture>,
+    ) -> String {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let captured = captured.clone();
+                let attempts = attempts.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |request: Request<Incoming>| {
+                        let captured = captured.clone();
+                        let attempts = attempts.clone();
+                        async move {
+                            let path = request.uri().path().to_string();
+                            let headers = request.headers().clone();
+                            let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                            let body = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
+                            let expires_at =
+                                (Utc::now() + TimeDelta::minutes(5)).to_rfc3339();
+                            if path == "/api/agent-auth/grants" {
+                                return Ok(Response::builder()
+                                    .status(StatusCode::CREATED)
+                                    .header(CONTENT_TYPE, "application/json")
+                                    .body(Full::new(Bytes::from(
+                                        json!({
+                                            "token": "remote-account-1",
+                                            "expiresAt": expires_at,
+                                            "binding": {
+                                                "ownerSubject": "owner-1",
+                                                "logicalSessionId": "session-transport",
+                                                "provider": "openai",
+                                                "model": "gpt-5.6-sol",
+                                                "harness": "codex",
+                                                "routingMode": body["routingMode"],
+                                                "requestedAccountId": body["requestedAccountId"],
+                                                "source": "comet-local",
+                                                "lifecycleEpoch": 1,
+                                                "environment": "local",
+                                                "backend": "oauth",
+                                                "accountId": "account-1",
+                                                "accountGeneration": 1,
+                                            }
+                                        })
+                                        .to_string(),
+                                    )))
+                                    .unwrap());
+                            }
+                            if path == "/api/agent-auth/v1/responses" {
+                                captured
+                                    .send(FailoverCapture {
+                                        path,
+                                        authorization: headers[AUTHORIZATION]
+                                            .to_str()
+                                            .unwrap()
+                                            .to_string(),
+                                        request_id: headers
+                                            .get("x-agent-auth-request-id")
+                                            .and_then(|value| value.to_str().ok())
+                                            .map(str::to_string),
+                                        routing_mode: headers["x-agent-auth-routing-mode"]
+                                            .to_str()
+                                            .unwrap()
+                                            .to_string(),
+                                        requested_account_id: headers
+                                            .get("x-agent-auth-requested-account-id")
+                                            .and_then(|value| value.to_str().ok())
+                                            .map(str::to_string),
+                                        body,
+                                    })
+                                    .unwrap();
+                                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                                    return Err(std::io::Error::other(
+                                        "simulated connection close before response headers",
+                                    ));
+                                }
+                                return Ok(Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "application/json")
+                                    .body(Full::new(Bytes::from_static(b"{\"ok\":true}")))
+                                    .unwrap());
+                            }
+                            panic!("unexpected transport control-plane path {path}");
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        origin
+    }
+
+    #[tokio::test]
+    async fn retries_one_unstarted_transport_failure_on_the_same_account() {
+        let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
+        let origin = transport_flaky_control_plane(captured_tx).await;
+        let client = ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap();
+        let relay = InferenceRelay::start(client).unwrap();
+        let route = relay
+            .prepare(
+                "session-transport",
+                HarnessId::Codex,
+                Some("gpt-5.6-sol"),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let payload = json!({ "model": "gpt-5.6-sol", "input": "retry transport" });
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/responses", route.base_url))
+            .bearer_auth(&route.token)
+            .header("x-request-id", "transport-request")
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.json::<Value>().await.unwrap(), json!({ "ok": true }));
+
+        let first = captured_rx.recv().await.unwrap();
+        let second = captured_rx.recv().await.unwrap();
+        assert_eq!(first.path, "/api/agent-auth/v1/responses");
+        assert_eq!(first.authorization, "Bearer remote-account-1");
+        assert_eq!(second.authorization, first.authorization);
+        assert_eq!(first.request_id.as_deref(), Some("transport-request"));
+        assert_eq!(second.request_id, first.request_id);
+        assert_eq!(second.body, first.body);
+        assert_eq!(first.body, payload);
+        assert!(captured_rx.try_recv().is_err());
+    }
+
     async fn streaming_control_plane(
         captured: mpsc::UnboundedSender<CapturedRequest>,
         revoked: Arc<std::sync::atomic::AtomicBool>,
@@ -530,7 +666,13 @@ mod tests {
             captured_tx,
             vec![(
                 StatusCode::TOO_MANY_REQUESTS,
-                json!({ "error": { "code": "usage_limit_reached" } }),
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "rate_limit_error",
+                        "message": "This request would exceed your account's rate limit."
+                    }
+                }),
             )],
         )
         .await;

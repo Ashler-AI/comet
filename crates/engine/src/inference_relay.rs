@@ -33,7 +33,8 @@ use crate::{EngineError, new_id};
 const MAX_REQUEST_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CONNECTIONS: usize = 64;
 const REFRESH_SKEW_SECONDS: i64 = 60;
-const MAX_AUTOMATIC_REPLAYS: usize = 1;
+const MAX_ACCOUNT_FAILOVERS: usize = 1;
+const MAX_TRANSPORT_REPLAYS: usize = 1;
 
 struct RequestSpool {
     path: TempPath,
@@ -375,7 +376,8 @@ impl InferenceRelay {
         };
         let cancellation = route.cancellation.clone();
         let sanitized_headers = sanitize_request_headers(headers);
-        let mut failovers = 0_usize;
+        let mut account_failovers = 0_usize;
+        let mut transport_replays = 0_usize;
         loop {
             let body = match spool.body().await {
                 Ok(body) => body,
@@ -402,6 +404,15 @@ impl InferenceRelay {
                 .await
             {
                 Ok(response) => response,
+                Err(error) if transport_replays < MAX_TRANSPORT_REPLAYS => {
+                    transport_replays += 1;
+                    tracing::warn!(
+                        err = %error,
+                        attempt = transport_replays,
+                        "inference relay upstream failed before response headers; replaying request"
+                    );
+                    continue;
+                }
                 Err(error) => {
                     tracing::warn!(err = %error, "inference relay upstream failed");
                     return json_response(
@@ -410,7 +421,7 @@ impl InferenceRelay {
                     );
                 }
             };
-            if failovers >= MAX_AUTOMATIC_REPLAYS {
+            if account_failovers >= MAX_ACCOUNT_FAILOVERS {
                 return stream_response(upstream, cancellation);
             }
             let (upstream, failure_class) =
@@ -453,7 +464,7 @@ impl InferenceRelay {
                 );
             }
             drop(upstream);
-            failovers += 1;
+            account_failovers += 1;
             grant = replacement;
         }
     }
@@ -617,11 +628,12 @@ async fn retryable_response(
 }
 
 const MAX_FAILURE_RESPONSE_BYTES: usize = 64 * 1024;
-const SUBSCRIPTION_LIMIT_CODES: [&str; 3] = [
+const ACCOUNT_EXHAUSTION_CODES: [&str; 3] = [
     "insufficient_quota",
     "subscription_limit_reached",
     "usage_limit_reached",
 ];
+const ACCOUNT_EXHAUSTION_TYPES: [&str; 2] = ["rate_limit_error", "usage_limit_error"];
 
 fn confirmed_account_exhaustion(body: &[u8]) -> bool {
     let Ok(payload) = serde_json::from_slice::<serde_json::Value>(body) else {
@@ -640,10 +652,14 @@ fn confirmed_account_exhaustion(body: &[u8]) -> bool {
         .or_else(|| payload.get("type"))
         .and_then(serde_json::Value::as_str);
     code.is_some_and(|code| {
-        SUBSCRIPTION_LIMIT_CODES
+        ACCOUNT_EXHAUSTION_CODES
             .iter()
             .any(|expected| code.trim().eq_ignore_ascii_case(expected))
-    }) || failure_type.is_some_and(|value| value.trim().eq_ignore_ascii_case("usage_limit_error"))
+    }) || failure_type.is_some_and(|failure_type| {
+        ACCOUNT_EXHAUSTION_TYPES
+            .iter()
+            .any(|expected| failure_type.trim().eq_ignore_ascii_case(expected))
+    })
 }
 
 fn validate_grant(
