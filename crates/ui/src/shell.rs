@@ -2800,16 +2800,49 @@ impl Shell {
         cx.notify();
     }
 
-    /// Settle (archive) or unsettle a session — the sidebar's row button and
-    /// context menu, and the tab strip's close. `setChatArchived` is idempotent
-    /// and reversible; settling also stages the session's managed worktree for
-    /// deferred cleanup, which unsettling cancels (engine `rpc.rs`).
+    /// Settle (archive) or unsettle a session. Archiving an attached Scaffold
+    /// chat pauses its exact sandbox only after the durable chat mutation wins.
     fn set_chat_settled(&mut self, chat_id: String, settled: bool, cx: &mut Context<Self>) {
         self.chat_menu = None;
-        self.mutate(
-            serde_json::json!({ "op": "setChatArchived", "chatId": chat_id, "archived": settled }),
-            cx,
-        );
+        let scaffold_target = settled
+            .then(|| {
+                self.state
+                    .read(cx)
+                    .scaffold_control_target(&chat_id)
+                    .cloned()
+            })
+            .flatten();
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.sidebar_notice = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        let task = cx.spawn(async move |this, cx| {
+            let result = if let Some(target) = scaffold_target {
+                crate::state::archive_and_pause_scaffold_session(&engine, &chat_id, &target).await
+            } else {
+                engine
+                    .client()
+                    .call(
+                        methods::MUTATE,
+                        serde_json::json!({
+                            "op": "setChatArchived",
+                            "chatId": chat_id,
+                            "archived": settled,
+                        }),
+                    )
+                    .await
+                    .map(|_| ())
+            };
+            if let Err(error) = result {
+                this.update(cx, |shell, cx| {
+                    shell.sidebar_notice = Some(error.to_string().into());
+                    cx.notify();
+                })
+                .ok();
+            }
+        });
+        self.control_tasks.push(task);
         cx.notify();
     }
 

@@ -201,7 +201,11 @@ pub fn compatible_connected_accounts(
     snapshot
         .accounts
         .iter()
-        .filter(|account| !account.migration_available && account.harness == account_harness)
+        .filter(|account| {
+            !account.migration_available
+                && account.status == comet_proto::AgentAccountStatus::Connected
+                && account.harness == account_harness
+        })
         .collect()
 }
 
@@ -3340,22 +3344,51 @@ mod tests {
 
     #[test]
     fn account_filtering_excludes_other_providers_and_local_migrations() {
-        let account = |id: &str, harness: HarnessId, migration_available: bool| AgentAccount {
-            id: id.into(),
-            harness,
-            email: None,
-            plan_label: None,
-            usage_windows: vec![],
-            display_name: None,
-            organization: None,
-            auth_kind: None,
-            migration_available,
-        };
+        fn account(
+            id: &str,
+            harness: HarnessId,
+            status: comet_proto::AgentAccountStatus,
+            migration_available: bool,
+        ) -> AgentAccount {
+            AgentAccount {
+                id: id.into(),
+                harness,
+                email: None,
+                plan_label: None,
+                status,
+                usage_windows: vec![],
+                display_name: None,
+                organization: None,
+                auth_kind: None,
+                migration_available,
+            }
+        }
         let snapshot = AgentAccountsSnapshot {
             accounts: vec![
-                account("claude-connected", HarnessId::ClaudeCode, false),
-                account("codex-connected", HarnessId::Codex, false),
-                account("claude-local", HarnessId::ClaudeCode, true),
+                account(
+                    "claude-connected",
+                    HarnessId::ClaudeCode,
+                    comet_proto::AgentAccountStatus::Connected,
+                    false,
+                ),
+                account(
+                    "codex-connected",
+                    HarnessId::Codex,
+                    comet_proto::AgentAccountStatus::Connected,
+                    false,
+                ),
+                account(
+                    "claude-attention",
+                    HarnessId::ClaudeCode,
+                    comet_proto::AgentAccountStatus::AttentionRequired,
+                    false,
+                ),
+                account(
+                    "claude-local",
+                    HarnessId::ClaudeCode,
+                    comet_proto::AgentAccountStatus::Connected,
+                    true,
+                ),
             ],
             warnings: vec![],
         };
@@ -3397,6 +3430,7 @@ mod tests {
                 harness: HarnessId::ClaudeCode,
                 email: None,
                 plan_label: None,
+                status: comet_proto::AgentAccountStatus::Connected,
                 usage_windows: vec![],
                 display_name: None,
                 organization: None,

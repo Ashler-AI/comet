@@ -13,12 +13,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use comet_harness::CancellationToken;
 use comet_proto::{
-    AgentRoute, AgentRouteReceipt, AgentRoutingMode, CAPABILITY_SESSION_ANNOTATE,
-    CAPABILITY_SESSION_CHAT, CAPABILITY_SESSION_CONTROL, CAPABILITY_SESSION_ENVIRONMENT,
-    CAPABILITY_SESSION_FILES, CAPABILITY_SESSION_READ, CollaborationScope, OmpSessionArtifact,
-    ScaffoldControlGrant, ScaffoldEnvironmentControl, ScaffoldEnvironmentControlResult,
-    ScaffoldEnvironmentLinks, ScaffoldEnvironmentSnapshot, ScaffoldRuntimeMode, SessionEnvironment,
-    SessionEnvironmentSource, SessionRoomProjection,
+    AgentAccountStatus, AgentRoute, AgentRouteReceipt, AgentRoutingMode,
+    CAPABILITY_SESSION_ANNOTATE, CAPABILITY_SESSION_CHAT, CAPABILITY_SESSION_CONTROL,
+    CAPABILITY_SESSION_ENVIRONMENT, CAPABILITY_SESSION_FILES, CAPABILITY_SESSION_READ,
+    CollaborationScope, OmpSessionArtifact, ScaffoldControlGrant, ScaffoldEnvironmentControl,
+    ScaffoldEnvironmentControlResult, ScaffoldEnvironmentLinks, ScaffoldEnvironmentSnapshot,
+    ScaffoldRuntimeMode, SessionEnvironment, SessionEnvironmentSource, SessionRoomProjection,
 };
 use comet_rpc::TokenSource;
 use reqwest::{Method, StatusCode, Url};
@@ -153,7 +153,7 @@ pub(crate) struct RemoteAgentAccount {
     pub display_name: Option<String>,
     pub organization: Option<String>,
     pub plan: Option<String>,
-    pub status: String,
+    pub status: AgentAccountStatus,
     pub usage_fraction: Option<f32>,
     pub reset_at: Option<String>,
 }
@@ -2088,6 +2088,18 @@ mod tests {
     use super::*;
     use comet_rpc::StaticToken;
     use sha2::Digest as _;
+    #[test]
+    fn remote_agent_account_tolerates_unknown_status() {
+        let account: RemoteAgentAccount = serde_json::from_value(serde_json::json!({
+            "id": "account-1",
+            "provider": "openai",
+            "providerAccountId": "provider-1",
+            "status": "suspended"
+        }))
+        .expect("unknown Agent Auth status");
+        assert_eq!(account.status, AgentAccountStatus::Unknown);
+    }
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     #[test]

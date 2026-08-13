@@ -419,14 +419,20 @@ impl ScaffoldSessionDraft {
         }
     }
 }
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ScaffoldControlTarget {
+    pub sandbox_id: String,
+    pub scope: CollaborationScope,
+}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ScaffoldSessionAttachment {
     pub projection: SessionRoomProjection,
     pub grant_id: String,
     pub owner_device_id: String,
     pub actor_subject: String,
     pub source_ref: Option<String>,
+    pub control_target: ScaffoldControlTarget,
 }
 
 /// Start the staging sandbox without coupling creation to remote Comet
@@ -587,6 +593,10 @@ pub(crate) async fn attach_scaffold_session(
         owner_device_id,
         actor_subject: attached.environment.owner_principal,
         source_ref,
+        control_target: ScaffoldControlTarget {
+            sandbox_id: sandbox_id.to_string(),
+            scope,
+        },
     })
 }
 const SCAFFOLD_ATTACH_MAX_ATTEMPTS: usize = 60;
@@ -723,6 +733,65 @@ where
         attach_scaffold_session_with_retry(handle, &sandbox_id, authoritative_scope, wait).await?;
     Ok((sandbox_id, attachment))
 }
+/// Pause exactly the sandbox attached to a chat. The response must preserve
+/// both physical sandbox identity and logical session scope.
+pub(crate) async fn pause_scaffold_session(
+    handle: &EngineHandle,
+    target: &ScaffoldControlTarget,
+) -> Result<(), RpcError> {
+    let value = handle
+        .client()
+        .call(
+            methods::CONTROL_SCAFFOLD_ENVIRONMENT,
+            serde_json::to_value(ScaffoldEnvironmentControl::Pause {
+                sandbox_id: target.sandbox_id.clone(),
+                scope: target.scope.clone(),
+            })
+            .unwrap_or_default(),
+        )
+        .await?;
+    let paused: ScaffoldEnvironmentControlResult =
+        serde_json::from_value(value).map_err(|err| RpcError::Failed(err.to_string()))?;
+    if paused.environment.scope != target.scope {
+        return Err(RpcError::Failed(
+            "Scaffold pause returned a different sandbox scope".into(),
+        ));
+    }
+    let SessionEnvironmentSource::Scaffold {
+        sandbox_id,
+        lifecycle,
+        ..
+    } = paused.environment.source
+    else {
+        return Err(RpcError::Failed(
+            "Scaffold pause returned a local environment".into(),
+        ));
+    };
+    if sandbox_id != target.sandbox_id || lifecycle != ScaffoldLifecycle::Paused {
+        return Err(RpcError::Failed(
+            "Scaffold pause did not pause the attached sandbox".into(),
+        ));
+    }
+    Ok(())
+}
+pub(crate) async fn archive_and_pause_scaffold_session(
+    handle: &EngineHandle,
+    chat_id: &str,
+    target: &ScaffoldControlTarget,
+) -> Result<(), RpcError> {
+    handle
+        .client()
+        .call(
+            methods::MUTATE,
+            serde_json::json!({
+                "op": "setChatArchived",
+                "chatId": chat_id,
+                "archived": true,
+            }),
+        )
+        .await?;
+    pause_scaffold_session(handle, target).await
+}
 
 /// Root application state. Reducer methods (`apply_*`, [`Self::session_for`], …)
 /// are plain `&mut self` functions so tests construct the struct directly; gpui
@@ -785,6 +854,9 @@ pub struct AppState {
     /// Exact non-secret grant id returned by the attach that selected each
     /// Scaffold room. It is a route selector only; authority remains host-local.
     scaffold_control_grants: HashMap<String, String>,
+    /// Non-secret physical targets for attached Scaffold chats. Retained after
+    /// settlement so archive can pause the exact sandbox idempotently.
+    scaffold_control_targets: HashMap<String, ScaffoldControlTarget>,
     /// Exact local Comet session awaiting its first-prompt Scaffold attach.
     pending_scaffold_session: Option<ScaffoldSessionDraft>,
     /// A Comet chat row is being persisted for a user-selected Scaffold session.
@@ -867,6 +939,7 @@ impl AppState {
             pending_session_pin: None,
             room_projections: HashMap::new(),
             scaffold_control_grants: HashMap::new(),
+            scaffold_control_targets: HashMap::new(),
             pending_scaffold_session: None,
             scaffold_session_creating: false,
             scaffold_session_error: None,
@@ -1663,6 +1736,9 @@ impl AppState {
             .and_then(|chat_id| self.scaffold_control_grants.get(chat_id))
             .map(String::as_str)
     }
+    pub(crate) fn scaffold_control_target(&self, chat_id: &str) -> Option<&ScaffoldControlTarget> {
+        self.scaffold_control_targets.get(chat_id)
+    }
 
     pub fn selected_chat_is_scaffold_room(&self) -> bool {
         self.selected_chat
@@ -1774,6 +1850,8 @@ impl AppState {
             .insert(chat_id.clone(), attachment.projection.clone());
         self.scaffold_control_grants
             .insert(chat_id.clone(), attachment.grant_id.clone());
+        self.scaffold_control_targets
+            .insert(chat_id.clone(), attachment.control_target.clone());
         self.pending_scaffold_session = None;
         self.scaffold_session_error = None;
         if self.selected_chat.as_deref() != Some(chat_id.as_str()) {
@@ -2445,6 +2523,7 @@ mod tests {
         operations: Arc<StdMutex<Vec<String>>>,
         attach_failures_remaining: AtomicU16,
         inspect_lifecycle: &'static str,
+        archive_fails: bool,
     }
 
     #[async_trait::async_trait]
@@ -2454,6 +2533,24 @@ mod tests {
             method: &str,
             params: serde_json::Value,
         ) -> Result<RpcReply, RpcError> {
+            if method == methods::MUTATE {
+                assert_eq!(
+                    params,
+                    serde_json::json!({
+                        "op": "setChatArchived",
+                        "chatId": "session-ready",
+                        "archived": true,
+                    })
+                );
+                self.operations
+                    .lock()
+                    .expect("Scaffold operation log")
+                    .push("archive".into());
+                if self.archive_fails {
+                    return Err(RpcError::Failed("archive failed".into()));
+                }
+                return RpcReply::value(&serde_json::json!({ "ok": true }));
+            }
             assert_eq!(method, methods::CONTROL_SCAFFOLD_ENVIRONMENT);
             let operation = params
                 .get("operation")
@@ -2495,10 +2592,10 @@ mod tests {
                 .get("sessionId")
                 .and_then(serde_json::Value::as_str)
                 .expect("session id");
-            let lifecycle = if operation == "inspect" {
-                self.inspect_lifecycle
-            } else {
-                "starting"
+            let lifecycle = match operation {
+                "inspect" => self.inspect_lifecycle,
+                "pause" => "paused",
+                _ => "starting",
             };
             let environment = serde_json::json!({
                 "source": {
@@ -2535,7 +2632,10 @@ mod tests {
                     }
                 })
             } else {
-                assert!(matches!(operation, "create" | "inspect" | "resume"));
+                assert!(matches!(
+                    operation,
+                    "create" | "inspect" | "pause" | "resume"
+                ));
                 serde_json::json!({ "environment": environment })
             };
             RpcReply::value(&result)
@@ -2595,6 +2695,7 @@ mod tests {
             operations: Arc::clone(&operations),
             attach_failures_remaining: AtomicU16::new(0),
             inspect_lifecycle: "ready",
+            archive_fails: false,
         });
         let handle = EngineHandle {
             inner: Arc::new(RemoteEngine {
@@ -2654,6 +2755,23 @@ mod tests {
             attachment.source_ref.as_deref(),
             Some("387d6652abd642f0b85e8bd14f9131a9f23b7e70")
         );
+        assert_eq!(
+            attachment.control_target,
+            ScaffoldControlTarget {
+                sandbox_id: "sandbox-ready".into(),
+                scope: scope.clone(),
+            }
+        );
+        archive_and_pause_scaffold_session(&handle, "session-ready", &attachment.control_target)
+            .await
+            .unwrap();
+        assert_eq!(
+            operations
+                .lock()
+                .expect("Scaffold operation log")
+                .as_slice(),
+            ["create", "attach", "inspect", "archive", "pause"]
+        );
     }
 
     #[test]
@@ -2673,6 +2791,7 @@ mod tests {
                 operations: Arc::clone(&operations),
                 attach_failures_remaining: AtomicU16::new(2),
                 inspect_lifecycle: "ready",
+                archive_fails: false,
             });
             let handle = EngineHandle {
                 inner: Arc::new(RemoteEngine {
@@ -2714,12 +2833,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_archive_does_not_pause_scaffold() {
+        let operations = Arc::new(StdMutex::new(Vec::new()));
+        let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
+            operations: Arc::clone(&operations),
+            attach_failures_remaining: AtomicU16::new(0),
+            inspect_lifecycle: "ready",
+            archive_fails: true,
+        });
+        let handle = EngineHandle {
+            inner: Arc::new(RemoteEngine {
+                client: memory_client(service),
+                url: "memory://failed-archive".into(),
+            }),
+        };
+        let target = ScaffoldControlTarget {
+            sandbox_id: "sandbox-ready".into(),
+            scope: CollaborationScope {
+                project_id: "ashler-staging".into(),
+                deployment_id: Some("ashler-staging".into()),
+                session_id: Some("session-ready".into()),
+                unknown: Default::default(),
+            },
+        };
+
+        assert!(
+            archive_and_pause_scaffold_session(&handle, "session-ready", &target)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            operations
+                .lock()
+                .expect("Scaffold operation log")
+                .as_slice(),
+            ["archive"]
+        );
+    }
+
+    #[tokio::test]
     async fn paused_scaffold_resumes_before_reattaching() {
         let operations = Arc::new(StdMutex::new(Vec::new()));
         let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
             operations: Arc::clone(&operations),
             attach_failures_remaining: AtomicU16::new(0),
             inspect_lifecycle: "paused",
+            archive_fails: false,
         });
         let handle = EngineHandle {
             inner: Arc::new(RemoteEngine {
@@ -2968,6 +3127,7 @@ mod tests {
             operations: Arc::clone(&operations),
             attach_failures_remaining: AtomicU16::new(0),
             inspect_lifecycle: "ready",
+            archive_fails: false,
         });
         let handle = EngineHandle {
             inner: Arc::new(RemoteEngine {

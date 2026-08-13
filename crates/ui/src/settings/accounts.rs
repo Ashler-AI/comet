@@ -14,8 +14,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use comet_proto::{
-    AgentAccount, AgentAccountsSnapshot, AgentLoginMode, AgentLoginPoll, AgentLoginStart,
-    AgentLoginStatus, HarnessId,
+    AgentAccount, AgentAccountStatus, AgentAccountsSnapshot, AgentLoginMode, AgentLoginPoll,
+    AgentLoginStart, AgentLoginStatus, HarnessId,
 };
 use comet_rpc::methods;
 use comet_update::HarnessStatus;
@@ -51,6 +51,18 @@ pub fn usage_level(fraction: f32) -> UsageLevel {
         UsageLevel::Warn
     } else {
         UsageLevel::Normal
+    }
+}
+fn account_status_label(account: &AgentAccount) -> &'static str {
+    if account.migration_available {
+        return "Ready to import";
+    }
+    match account.status {
+        AgentAccountStatus::Connected => "Connected",
+        AgentAccountStatus::Disabled => "Disabled",
+        AgentAccountStatus::AttentionRequired => "Needs attention",
+        AgentAccountStatus::Revoked => "Revoked",
+        AgentAccountStatus::Unknown => "Needs attention",
     }
 }
 
@@ -675,7 +687,13 @@ impl AccountsPage {
             })
             .when_some(account.plan_label.clone(), |el, plan| {
                 el.child(widgets::badge(theme, plan))
-            });
+            })
+            .when(
+                !account.migration_available
+                    && account.status != AgentAccountStatus::Connected
+                    && !account.usage_windows.is_empty(),
+                |el| el.child(widgets::badge(theme, account_status_label(account))),
+            );
 
         let actions = if account.migration_available {
             let label = if is_busy { "Importing…" } else { "Import" };
@@ -752,11 +770,7 @@ impl AccountsPage {
                                     .truncate()
                                     .text_size(px(11.5))
                                     .text_color(theme.text_muted.opacity(0.6))
-                                    .child(SharedString::from(if account.migration_available {
-                                        "Ready to import"
-                                    } else {
-                                        "Usage unavailable"
-                                    })),
+                                    .child(SharedString::from(account_status_label(account))),
                             )
                         } else {
                             el.child(
@@ -1648,6 +1662,7 @@ mod tests {
             harness,
             email: None,
             plan_label: None,
+            status: AgentAccountStatus::Connected,
             usage_windows: vec![],
             display_name: None,
             organization: None,
@@ -1667,6 +1682,27 @@ mod tests {
         assert_eq!(ids, ["c1", "c2"]);
         assert_eq!(provider_accounts(&snapshot, HarnessId::Codex).len(), 1);
         assert!(provider_accounts(&snapshot, HarnessId::Cursor).is_empty());
+    }
+
+    #[test]
+    fn account_status_labels_distinguish_health_from_usage() {
+        let mut account = AgentAccount {
+            id: "account-1".into(),
+            harness: HarnessId::Codex,
+            email: None,
+            plan_label: None,
+            status: AgentAccountStatus::Connected,
+            usage_windows: vec![],
+            display_name: None,
+            organization: None,
+            auth_kind: None,
+            migration_available: false,
+        };
+        assert_eq!(account_status_label(&account), "Connected");
+        account.status = AgentAccountStatus::AttentionRequired;
+        assert_eq!(account_status_label(&account), "Needs attention");
+        account.migration_available = true;
+        assert_eq!(account_status_label(&account), "Ready to import");
     }
 
     #[test]
