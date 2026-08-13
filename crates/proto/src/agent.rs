@@ -102,11 +102,55 @@ impl OmpAdvisorSyncBacklog {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct HarnessCommandSubcommand {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HarnessCommand {
     pub name: String,
     pub description: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subcommands: Vec<HarnessCommandSubcommand>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// OMP executes `/goal` over RPC but current releases omit this TUI-backed
+/// command from `available_commands_update`. Both the harness adapter and the
+/// UI's cold-catalog fallback use one canonical command contract.
+pub fn omp_goal_command() -> HarnessCommand {
+    HarnessCommand {
+        name: "goal".into(),
+        description: "Toggle goal mode (persistent autonomous objective for this session)".into(),
+        input_hint: Some("[objective]".into()),
+        aliases: Vec::new(),
+        subcommands: [
+            ("set", "Set or replace the goal", Some("<objective>")),
+            ("show", "Show current goal details", None),
+            ("pause", "Pause the current goal", None),
+            ("resume", "Resume a paused goal", None),
+            ("drop", "Drop the current goal", None),
+            ("budget", "Adjust the token budget", Some("<N|off>")),
+        ]
+        .into_iter()
+        .map(|(name, description, usage)| HarnessCommandSubcommand {
+            name: name.into(),
+            description: description.into(),
+            usage: usage.map(str::to_string),
+        })
+        .collect(),
+        source: Some("builtin".into()),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -177,6 +221,11 @@ pub struct AgentActivity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 }
+
+/// Hidden transcript carrier for OMP's session-level goal state. The UI keeps
+/// it out of the conversation while using the persisted part for sidebar state.
+pub const OMP_GOAL_STATE_CALL_ID: &str = "omp-goal-state";
+pub const OMP_GOAL_STATE_CALL_NAME: &str = "omp_goal_state";
 
 /// A decoded tool invocation, reduced to the fields each kind renders.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

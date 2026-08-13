@@ -339,7 +339,6 @@ fn materialize_discovered(
     }
     if candidate.resumable {
         workspace.set_chat_harness_session(&chat_id, &candidate.session_id, &candidate.cwd);
-        doc_host.ensure_room_for_chat(&chat_id);
     }
     if existing
         .as_ref()
@@ -414,19 +413,14 @@ fn import_transcript(
     let entries = load_transcript(session, doc_host.device_id())?;
     let doc = doc_host.open(&candidate.chat_id)?;
     let session_doc = doc.doc_arc();
-    let existing_ids: HashSet<String> = session_doc
-        .read_entries()?
-        .into_iter()
-        .map(|entry| entry.id)
+    let existing_ids = session_doc.message_ids();
+    let new_entries: Vec<_> = entries
+        .iter()
+        .filter(|entry| !imported_after.is_some_and(|cutoff| entry.created_at <= cutoff))
+        .filter(|entry| !existing_ids.contains(&entry.id))
+        .cloned()
         .collect();
-    for entry in &entries {
-        if imported_after.is_some_and(|cutoff| entry.created_at <= cutoff) {
-            continue;
-        }
-        if !existing_ids.contains(&entry.id) {
-            session_doc.push_message(entry)?;
-        }
-    }
+    session_doc.push_messages(&new_entries)?;
     if let Some(preview) = entries
         .last()
         .and_then(|entry| entry.parts.iter().find_map(text_part))
@@ -1516,7 +1510,9 @@ fn message_text(value: &Value) -> Option<String> {
 
 fn text_part(part: &MessagePart) -> Option<&str> {
     match part {
-        MessagePart::Text { text, .. } => Some(text.as_str()),
+        MessagePart::Text { text, .. } | MessagePart::TextWindow { text, .. } => {
+            Some(text.as_str())
+        }
         _ => None,
     }
 }

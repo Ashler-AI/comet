@@ -23,11 +23,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use gpui::{App, Context, Entity, Task};
+use gpui::{App, AsyncApp, Context, Entity, Task, WeakEntity};
 use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
-use comet_doc::{MessagePart, MessageRole, SessionMessageEntry, TranscriptDesync, TranscriptFrame};
+use comet_doc::{
+    MessagePart, MessageRole, SessionEntryWindow, SessionMessageEntry, TranscriptDesync,
+    TranscriptFrame,
+};
 use comet_engine::{Engine, EngineConfig, EngineRuntime, rpc::AuthRpc};
 use comet_proto::{
     AgentRoute, AuthState, Chat, ChatIndicator, CollaborationScope, CollaborationSnapshot, Device,
@@ -37,6 +40,55 @@ use comet_proto::{
     SessionEnvironmentSource, SessionRef, SessionRoomProjection, Space,
 };
 use comet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActiveHarnessGoal {
+    pub objective: String,
+    pub status: String,
+}
+
+/// The newest normalized OMP goal-state carrier wins, including a null goal
+/// emitted by `/goal drop`. The transcript persists this hidden part, so every
+/// editor surface can project the active goal after navigation or restart.
+pub(crate) fn latest_active_omp_goal(entries: &[SessionMessageEntry]) -> Option<ActiveHarnessGoal> {
+    for part in entries
+        .iter()
+        .rev()
+        .flat_map(|entry| entry.parts.iter().rev())
+    {
+        let MessagePart::Tool {
+            id,
+            call:
+                comet_proto::ToolCall::Unknown {
+                    name,
+                    input: Some(input),
+                },
+            ..
+        } = part
+        else {
+            continue;
+        };
+        if id != comet_proto::OMP_GOAL_STATE_CALL_ID
+            || name != comet_proto::OMP_GOAL_STATE_CALL_NAME
+        {
+            continue;
+        }
+        let goal = input.get("goal")?;
+        let objective = goal
+            .get("objective")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|objective| !objective.is_empty())?
+            .to_string();
+        let status = goal
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("active")
+            .to_string();
+        return Some(ActiveHarnessGoal { objective, status });
+    }
+    None
+}
 /// Hidden compatibility artifact from the removed virtual Scaffold space.
 /// The synced data remains untouched; the headed app no longer presents it.
 const LEGACY_SCAFFOLD_SPACE_ID_PREFIX: &str = "comet-scaffold-space-";
@@ -324,7 +376,9 @@ fn shared_session_preview(entries: &[SessionMessageEntry]) -> Option<String> {
         .parts
         .iter()
         .filter_map(|part| match part {
-            MessagePart::Text { text, .. } => Some(text.as_str()),
+            MessagePart::Text { text, .. } | MessagePart::TextWindow { text, .. } => {
+                Some(text.as_str())
+            }
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -370,14 +424,20 @@ impl ScaffoldSessionDraft {
         }
     }
 }
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ScaffoldControlTarget {
+    pub sandbox_id: String,
+    pub scope: CollaborationScope,
+}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ScaffoldSessionAttachment {
     pub projection: SessionRoomProjection,
     pub grant_id: String,
     pub owner_device_id: String,
     pub actor_subject: String,
     pub source_ref: Option<String>,
+    pub control_target: ScaffoldControlTarget,
 }
 
 /// Start the staging sandbox without coupling creation to remote Comet
@@ -538,6 +598,10 @@ pub(crate) async fn attach_scaffold_session(
         owner_device_id,
         actor_subject: attached.environment.owner_principal,
         source_ref,
+        control_target: ScaffoldControlTarget {
+            sandbox_id: sandbox_id.to_string(),
+            scope,
+        },
     })
 }
 const SCAFFOLD_ATTACH_MAX_ATTEMPTS: usize = 60;
@@ -674,6 +738,88 @@ where
         attach_scaffold_session_with_retry(handle, &sandbox_id, authoritative_scope, wait).await?;
     Ok((sandbox_id, attachment))
 }
+/// Pause exactly the sandbox attached to a chat. The response must preserve
+/// both physical sandbox identity and logical session scope.
+pub(crate) async fn pause_scaffold_session(
+    handle: &EngineHandle,
+    target: &ScaffoldControlTarget,
+) -> Result<(), RpcError> {
+    let value = handle
+        .client()
+        .call(
+            methods::CONTROL_SCAFFOLD_ENVIRONMENT,
+            serde_json::to_value(ScaffoldEnvironmentControl::Pause {
+                sandbox_id: target.sandbox_id.clone(),
+                scope: target.scope.clone(),
+            })
+            .unwrap_or_default(),
+        )
+        .await?;
+    let paused: ScaffoldEnvironmentControlResult =
+        serde_json::from_value(value).map_err(|err| RpcError::Failed(err.to_string()))?;
+    if paused.environment.scope != target.scope {
+        return Err(RpcError::Failed(
+            "Scaffold pause returned a different sandbox scope".into(),
+        ));
+    }
+    let SessionEnvironmentSource::Scaffold {
+        sandbox_id,
+        lifecycle,
+        ..
+    } = paused.environment.source
+    else {
+        return Err(RpcError::Failed(
+            "Scaffold pause returned a local environment".into(),
+        ));
+    };
+    if sandbox_id != target.sandbox_id || lifecycle != ScaffoldLifecycle::Paused {
+        return Err(RpcError::Failed(
+            "Scaffold pause did not pause the attached sandbox".into(),
+        ));
+    }
+    Ok(())
+}
+pub(crate) async fn archive_and_pause_scaffold_session(
+    handle: &EngineHandle,
+    chat_id: &str,
+    target: &ScaffoldControlTarget,
+) -> Result<(), RpcError> {
+    handle
+        .client()
+        .call(
+            methods::MUTATE,
+            serde_json::json!({
+                "op": "setChatArchived",
+                "chatId": chat_id,
+                "archived": true,
+            }),
+        )
+        .await?;
+    pause_scaffold_session(handle, target).await
+}
+
+const TRANSCRIPT_CACHE_CHAT_LIMIT: usize = 8;
+const TRANSCRIPT_CACHE_BYTE_LIMIT: usize = 16 * 1024 * 1024;
+
+struct CachedTranscriptWindow {
+    entries: Vec<SessionMessageEntry>,
+    tail_start: usize,
+    tail_before: Option<usize>,
+    history_before: Option<usize>,
+}
+
+impl CachedTranscriptWindow {
+    fn byte_len(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|entry| {
+                entry.id.len()
+                    + entry.device_id.len()
+                    + entry.parts.iter().map(MessagePart::byte_len).sum::<usize>()
+            })
+            .sum()
+    }
+}
 
 /// Root application state. Reducer methods (`apply_*`, [`Self::session_for`], …)
 /// are plain `&mut self` functions so tests construct the struct directly; gpui
@@ -714,6 +860,18 @@ pub struct AppState {
     pub auto_selected: bool,
     /// Joined transcript of the selected chat (continuations folded engine-side).
     pub transcript: Vec<SessionMessageEntry>,
+    /// First entry owned by the live bounded tail. Earlier entries were loaded
+    /// explicitly by upward paging and are not part of delta `count` checks.
+    transcript_tail_start: usize,
+    /// Cursor immediately before the live tail; refreshed by watch frames.
+    transcript_tail_before: Option<usize>,
+    /// Cursor immediately before the oldest explicitly loaded entry.
+    transcript_history_before: Option<usize>,
+    transcript_history_loading: bool,
+    transcript_history_task: Option<Task<()>>,
+    transcript_restored_from_cache: bool,
+    transcript_cache: HashMap<String, CachedTranscriptWindow>,
+    transcript_cache_lru: Vec<String>,
     /// Multiplayer projection for the selected shared thread. The last good
     /// snapshot remains visible while its watch reconnects or a model hands off.
     pub collaboration: Option<CollaborationSnapshot>,
@@ -736,6 +894,9 @@ pub struct AppState {
     /// Exact non-secret grant id returned by the attach that selected each
     /// Scaffold room. It is a route selector only; authority remains host-local.
     scaffold_control_grants: HashMap<String, String>,
+    /// Non-secret physical targets for attached Scaffold chats. Retained after
+    /// settlement so archive can pause the exact sandbox idempotently.
+    scaffold_control_targets: HashMap<String, ScaffoldControlTarget>,
     /// Exact local Comet session awaiting its first-prompt Scaffold attach.
     pending_scaffold_session: Option<ScaffoldSessionDraft>,
     /// A Comet chat row is being persisted for a user-selected Scaffold session.
@@ -763,6 +924,12 @@ pub struct AppState {
     pub data_dir: Option<PathBuf>,
     runtime_profile: RuntimeProfile,
     engine: Option<EngineHandle>,
+    /// Boot config retained so a closed RPC transport can re-run the
+    /// probe-or-embed bootstrap (`on_engine_closed`).
+    boot_config: Option<EngineBootConfig>,
+    /// Quit in progress: the drained in-process engine's closing streams must
+    /// not trigger the reconnect supervisor mid-shutdown.
+    shutting_down: bool,
     watch_tasks: Vec<Task<()>>,
     transcript_task: Option<Task<()>>,
     collaboration_task: Option<Task<()>>,
@@ -805,6 +972,14 @@ impl AppState {
             selected_space_members: Vec::new(),
             selected_chat: None,
             transcript: Vec::new(),
+            transcript_tail_start: 0,
+            transcript_tail_before: None,
+            transcript_history_before: None,
+            transcript_history_loading: false,
+            transcript_history_task: None,
+            transcript_restored_from_cache: false,
+            transcript_cache: HashMap::new(),
+            transcript_cache_lru: Vec::new(),
             collaboration: None,
             selected_agent_session: None,
             pending_invitation: None,
@@ -812,6 +987,7 @@ impl AppState {
             pending_session_pin: None,
             room_projections: HashMap::new(),
             scaffold_control_grants: HashMap::new(),
+            scaffold_control_targets: HashMap::new(),
             pending_scaffold_session: None,
             scaffold_session_creating: false,
             scaffold_session_error: None,
@@ -824,6 +1000,8 @@ impl AppState {
             data_dir: None,
             runtime_profile: RuntimeProfile::LocalController,
             engine: None,
+            boot_config: None,
+            shutting_down: false,
             watch_tasks: Vec::new(),
             transcript_task: None,
             collaboration_task: None,
@@ -840,6 +1018,21 @@ impl AppState {
                 .as_deref()
                 .is_some_and(|id| id.starts_with(LEGACY_SCAFFOLD_SPACE_ID_PREFIX))
         });
+        // First-send setup may spend seconds materializing a large worktree.
+        // Preserve its optimistic row across unrelated watch frames so tabs and
+        // the sidebar acknowledge the session immediately. The authoritative
+        // row replaces it as soon as the watch publishes the same id.
+        self.pending_local_chat_ids
+            .retain(|chat_id| !chats.iter().any(|chat| chat.id == *chat_id));
+        for pending in self
+            .chats
+            .iter()
+            .filter(|chat| self.pending_local_chat_ids.contains(&chat.id))
+        {
+            if !chats.iter().any(|chat| chat.id == pending.id) {
+                chats.push(pending.clone());
+            }
+        }
         sort_chats(&mut chats);
         // An explicit "mark unread" must survive watch frames that raced the
         // mutate (they still carry the pre-clear seen stamp). Once the synced
@@ -864,8 +1057,6 @@ impl AppState {
                 .iter()
                 .any(|candidate| candidate.id == *candidate_id)
         });
-        self.pending_local_chat_ids
-            .retain(|chat_id| !chats.iter().any(|chat| chat.id == *chat_id));
         self.scaffold_starting_chats.retain(|chat_id| {
             chats.iter().any(|chat| chat.id == *chat_id)
                 || self.pending_local_chat_ids.contains(chat_id)
@@ -917,9 +1108,12 @@ impl AppState {
         if available {
             return;
         }
+        self.cache_selected_transcript();
         self.selected_chat = None;
-        self.transcript.clear();
+        self.restore_transcript(None);
         self.transcript_task = None;
+        self.transcript_history_task = None;
+        self.transcript_history_loading = false;
         self.collaboration = None;
         self.collaboration_task = None;
     }
@@ -998,7 +1192,82 @@ impl AppState {
             echoes.retain(|echo| !entries.iter().any(|e| e.id == echo.id));
         }
         self.transcript = entries;
+        self.transcript_tail_start = 0;
+        self.transcript_tail_before = None;
+        self.transcript_history_before = None;
         self.update_selected_shared_preview();
+    }
+
+    fn cache_selected_transcript(&mut self) {
+        let Some(chat_id) = self.selected_chat.clone() else {
+            return;
+        };
+        if self.transcript.is_empty() {
+            return;
+        }
+        let entries = std::mem::take(&mut self.transcript);
+        self.transcript_cache.insert(
+            chat_id.clone(),
+            CachedTranscriptWindow {
+                entries,
+                tail_start: self.transcript_tail_start,
+                tail_before: self.transcript_tail_before,
+                history_before: self.transcript_history_before,
+            },
+        );
+        self.transcript_cache_lru.retain(|id| id != &chat_id);
+        self.transcript_cache_lru.push(chat_id);
+        while self.transcript_cache.len() > TRANSCRIPT_CACHE_CHAT_LIMIT
+            || self
+                .transcript_cache
+                .values()
+                .map(CachedTranscriptWindow::byte_len)
+                .sum::<usize>()
+                > TRANSCRIPT_CACHE_BYTE_LIMIT
+        {
+            let Some(oldest) = self.transcript_cache_lru.first().cloned() else {
+                break;
+            };
+            self.transcript_cache_lru.remove(0);
+            self.transcript_cache.remove(&oldest);
+        }
+    }
+
+    fn restore_transcript(&mut self, chat_id: Option<&str>) {
+        self.transcript.clear();
+        self.transcript_tail_start = 0;
+        self.transcript_tail_before = None;
+        self.transcript_history_before = None;
+        self.transcript_restored_from_cache = false;
+        let Some(chat_id) = chat_id else {
+            return;
+        };
+        let Some(cached) = self.transcript_cache.remove(chat_id) else {
+            return;
+        };
+        self.transcript_cache_lru.retain(|id| id != chat_id);
+        self.transcript = cached.entries;
+        self.transcript_tail_start = cached.tail_start.min(self.transcript.len());
+        self.transcript_tail_before = cached.tail_before;
+        self.transcript_history_before = cached.history_before;
+        self.transcript_restored_from_cache = true;
+    }
+
+    fn apply_transcript_page(&mut self, page: SessionEntryWindow) {
+        let first_loaded = self.transcript.first().map(|entry| entry.id.as_str());
+        let mut entries: Vec<_> = page
+            .entries
+            .into_iter()
+            .filter(|entry| Some(entry.id.as_str()) != first_loaded)
+            .filter(|entry| !self.transcript.iter().any(|known| known.id == entry.id))
+            .collect();
+        let added = entries.len();
+        if added > 0 {
+            entries.append(&mut self.transcript);
+            self.transcript = entries;
+            self.transcript_tail_start += added;
+        }
+        self.transcript_history_before = page.before;
     }
 
     pub fn apply_collaboration(&mut self, snapshot: CollaborationSnapshot) {
@@ -1079,13 +1348,60 @@ impl AppState {
         true
     }
 
-    /// Apply a `WatchDocMessages` delta frame in place. `Err` = this copy has
-    /// diverged; the watch task resubscribes for a fresh reset.
+    /// Apply a `WatchDocMessages` delta to the live bounded tail. Explicitly
+    /// paged history remains a stable prefix and does not enter frame counts.
     pub fn apply_transcript_frame(
         &mut self,
         frame: TranscriptFrame,
     ) -> Result<(), TranscriptDesync> {
-        comet_doc::apply_transcript_frame(&mut self.transcript, frame)?;
+        let before = frame.before();
+        if let Some(reset) = frame.reset_entries()
+            && self.transcript_restored_from_cache
+        {
+            let cached_before = self.transcript_tail_before;
+            let cached_tail_start = self.transcript_tail_start.min(self.transcript.len());
+            if self.transcript[cached_tail_start..] == *reset {
+                self.transcript_tail_before = before.or(cached_before);
+                self.transcript_restored_from_cache = false;
+                return Ok(());
+            }
+            let retired = self.transcript[cached_tail_start..]
+                .iter()
+                .take_while(|entry| !reset.iter().any(|next| next.id == entry.id))
+                .count();
+            self.transcript_tail_start = cached_tail_start + retired;
+            self.transcript.truncate(self.transcript_tail_start);
+            self.transcript.extend_from_slice(reset);
+        } else {
+            let tail_start = self.transcript_tail_start.min(self.transcript.len());
+            let retired = if tail_start > 0 {
+                if let Some(reset) = frame.reset_entries() {
+                    self.transcript[tail_start..]
+                        .iter()
+                        .take_while(|entry| !reset.iter().any(|next| next.id == entry.id))
+                        .count()
+                } else {
+                    let remove = frame.removed_entry_ids();
+                    self.transcript[tail_start..]
+                        .iter()
+                        .take_while(|entry| remove.iter().any(|id| id == &entry.id))
+                        .count()
+                }
+            } else {
+                0
+            };
+            if retired > 0 {
+                self.transcript_tail_start += retired;
+            }
+            let mut tail = self.transcript.split_off(self.transcript_tail_start);
+            comet_doc::apply_transcript_frame(&mut tail, frame)?;
+            self.transcript.append(&mut tail);
+        }
+        self.transcript_tail_before = before;
+        if self.transcript_tail_start == 0 {
+            self.transcript_history_before = before;
+        }
+        self.transcript_restored_from_cache = false;
         if let Some(chat_id) = self.selected_chat.as_deref()
             && let Some(echoes) = self.echoes.get_mut(chat_id)
         {
@@ -1112,10 +1428,24 @@ impl AppState {
         }
     }
 
+    /// Insert the presentation row for a first send before checkout setup.
+    /// The workspace watch replaces this row by id after `createChat` lands.
+    pub fn stage_pending_chat(&mut self, chat: Chat) {
+        if self.chats.iter().any(|existing| existing.id == chat.id) {
+            return;
+        }
+        self.pending_local_chat_ids.insert(chat.id.clone());
+        self.chats.push(chat);
+        sort_chats(&mut self.chats);
+    }
+
     /// Release a failed first-send reservation. If no row ever materialized,
     /// return to the new-session canvas instead of leaving a ghost selection.
     pub fn cancel_pending_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
-        self.pending_local_chat_ids.remove(chat_id);
+        let pending = self.pending_local_chat_ids.remove(chat_id);
+        if pending {
+            self.chats.retain(|chat| chat.id != chat_id);
+        }
         if self.selected_chat.as_deref() == Some(chat_id)
             && !self.chats.iter().any(|chat| chat.id == chat_id)
         {
@@ -1389,7 +1719,11 @@ impl AppState {
 
     /// Full display status for a chat (tab dots, Active list).
     pub fn display_status_for(&self, chat: &Chat, now: DateTime<Utc>) -> ChatIndicator {
-        display_status(chat, self.session_for(&chat.id), now)
+        if self.pending_local_chat_ids.contains(&chat.id) {
+            ChatIndicator::Working
+        } else {
+            display_status(chat, self.session_for(&chat.id), now)
+        }
     }
 
     /// The sidebar's Sessions list: every non-archived chat of a LIVE space,
@@ -1403,7 +1737,7 @@ impl AppState {
                     .as_deref()
                     .is_some_and(|id| self.space_row(id).is_some())
             })
-            .map(|c| (display_status(c, self.session_for(&c.id), now), c))
+            .map(|c| (self.display_status_for(c, now), c))
             .collect();
         sort_active(&mut rows);
         rows
@@ -1458,11 +1792,13 @@ impl AppState {
         let data_dir = config.data_dir.clone();
         let runtime_profile = config.runtime_profile;
         let scaffold_scope = configured_scaffold_scope(&config);
+        let boot_config = config.clone();
         state.update(cx, |s, cx| {
             s.connection = ConnectionStatus::Connecting;
             s.data_dir = Some(data_dir);
             s.runtime_profile = runtime_profile;
             s.scaffold_scope = scaffold_scope;
+            s.boot_config = Some(boot_config);
             cx.notify();
         });
         let boot = Tokio::spawn(cx, EngineHandle::bootstrap(config));
@@ -1550,11 +1886,62 @@ impl AppState {
         cx.notify();
     }
 
+    /// A watch task saw the RPC transport die ([`RpcError::Closed`]). First
+    /// caller wins: flip back to Connecting and re-run the probe-or-embed
+    /// bootstrap — a restarted daemon is reattached, a vanished one is
+    /// replaced by an embedded engine. Without this the app is a zombie:
+    /// standing watches end silently and the transcript watch retries a dead
+    /// socket every 2s forever.
+    fn on_engine_closed(&mut self, cx: &mut Context<Self>) {
+        let Some(config) = self.reconnect_config() else {
+            return;
+        };
+        let old_engine = self.engine.take();
+        let entity = cx.entity();
+        cx.defer(move |cx| {
+            if let Some(old) = old_engine {
+                // Graceful for an in-process engine (releases the IPC port
+                // ahead of the re-probe); a no-op for a remote daemon.
+                Tokio::spawn(cx, async move { old.shutdown().await }).detach();
+            }
+            AppState::bootstrap(entity, config, cx);
+        });
+        cx.notify();
+    }
+
+    /// Guard half of the reconnect supervisor: only an attached, non-quitting
+    /// app with a retained boot config reconnects. The winner flips the status
+    /// to Connecting, collapsing concurrent detectors into one bootstrap.
+    fn reconnect_config(&mut self) -> Option<EngineBootConfig> {
+        if self.shutting_down || !matches!(self.connection, ConnectionStatus::Ready) {
+            return None; // already reconnecting, failed, or quitting
+        }
+        let config = self.boot_config.clone()?;
+        tracing::warn!("engine RPC connection closed; re-probing");
+        self.connection = ConnectionStatus::Connecting;
+        Some(config)
+    }
+
+    /// Async-context entry for watch tasks reporting a closed connection.
+    fn engine_connection_lost(this: &WeakEntity<AppState>, cx: &mut AsyncApp) {
+        this.update(cx, |state, cx| state.on_engine_closed(cx)).ok();
+    }
+
+    /// Mark the quit in progress and hand back the engine for teardown, so
+    /// its closing streams can't restart a fresh engine mid-shutdown.
+    pub fn begin_shutdown(&mut self) -> Option<EngineHandle> {
+        self.shutting_down = true;
+        self.engine.clone()
+    }
+
     pub fn selected_scaffold_control_grant_id(&self) -> Option<&str> {
         self.selected_chat
             .as_deref()
             .and_then(|chat_id| self.scaffold_control_grants.get(chat_id))
             .map(String::as_str)
+    }
+    pub(crate) fn scaffold_control_target(&self, chat_id: &str) -> Option<&ScaffoldControlTarget> {
+        self.scaffold_control_targets.get(chat_id)
     }
 
     pub fn selected_chat_is_scaffold_room(&self) -> bool {
@@ -1667,14 +2054,18 @@ impl AppState {
             .insert(chat_id.clone(), attachment.projection.clone());
         self.scaffold_control_grants
             .insert(chat_id.clone(), attachment.grant_id.clone());
+        self.scaffold_control_targets
+            .insert(chat_id.clone(), attachment.control_target.clone());
         self.pending_scaffold_session = None;
         self.scaffold_session_error = None;
         if self.selected_chat.as_deref() != Some(chat_id.as_str()) {
             self.select_chat(Some(chat_id), cx);
             return;
         }
-        self.transcript.clear();
+        self.restore_transcript(None);
         self.transcript_task = None;
+        self.transcript_history_task = None;
+        self.transcript_history_loading = false;
         self.collaboration = None;
         self.collaboration_task = None;
         self.selected_agent_session = None;
@@ -1844,6 +2235,54 @@ impl AppState {
         .detach();
     }
 
+    pub fn load_older_transcript(&mut self, cx: &mut Context<Self>) {
+        if self.transcript_history_loading {
+            return;
+        }
+        let (Some(chat_id), Some(before), Some(handle)) = (
+            self.selected_chat.clone(),
+            self.transcript_history_before,
+            self.engine.clone(),
+        ) else {
+            return;
+        };
+        let projection = self.room_projections.get(&chat_id).cloned();
+        self.transcript_history_loading = true;
+        self.transcript_history_task = Some(cx.spawn(async move |this, cx| {
+            let result = handle
+                .client()
+                .call(
+                    methods::READ_DOC_MESSAGES,
+                    serde_json::json!({
+                        "chatId": chat_id,
+                        "before": before,
+                        "roomProjection": projection,
+                    }),
+                )
+                .await
+                .and_then(|value| {
+                    serde_json::from_value::<SessionEntryWindow>(value)
+                        .map_err(|error| RpcError::Failed(error.to_string()))
+                });
+            this.update(cx, |state, cx| {
+                if state.selected_chat.as_deref() == Some(chat_id.as_str())
+                    && state.transcript_history_before == Some(before)
+                {
+                    match result {
+                        Ok(page) => state.apply_transcript_page(page),
+                        Err(error) => {
+                            tracing::warn!(%chat_id, %error, "transcript history page failed")
+                        }
+                    }
+                }
+                state.transcript_history_loading = false;
+                state.transcript_history_task = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     /// Select a chat (or clear). Swaps the per-chat doc-transcript subscription:
     /// dropping the old task drops its stream receiver, which cancels the doc
     /// watch server-side. Selecting a chat also lands in its space and marks it
@@ -1866,10 +2305,13 @@ impl AppState {
             }
             return;
         }
+        self.cache_selected_transcript();
         self.selected_chat = chat_id.clone();
         self.auto_selected = true;
-        self.transcript.clear();
+        self.restore_transcript(chat_id.as_deref());
         self.transcript_task = None;
+        self.transcript_history_task = None;
+        self.transcript_history_loading = false;
         self.collaboration = None;
         self.collaboration_task = None;
         self.selected_agent_session = None;
@@ -2041,6 +2483,10 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
             .await
         {
             Ok(rx) => rx,
+            Err(RpcError::Closed) => {
+                AppState::engine_connection_lost(&this, cx);
+                return;
+            }
             Err(err) => {
                 tracing::debug!(error = %err, "chats watch unavailable");
                 return;
@@ -2070,8 +2516,22 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
                 cx.notify();
             });
             if alive.is_err() {
-                break;
+                return;
             }
+        }
+        // Stream ended with the entity alive: dead transport, or a
+        // server-side end (an engine that doesn't serve the method replies
+        // with an err frame that just closes the stream). Only a dead
+        // transport reconnects — any unary reply, even "unknown method",
+        // proves the connection is still alive.
+        if matches!(
+            handle
+                .client()
+                .call(methods::LOCAL_DEVICE, serde_json::json!({}))
+                .await,
+            Err(RpcError::Closed)
+        ) {
+            AppState::engine_connection_lost(&this, cx);
         }
     })
 }
@@ -2089,6 +2549,10 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
             .await
         {
             Ok(rx) => rx,
+            Err(RpcError::Closed) => {
+                AppState::engine_connection_lost(&this, cx);
+                return;
+            }
             Err(err) => {
                 tracing::debug!(method, error = %err, "watch unavailable");
                 return;
@@ -2107,8 +2571,18 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
                 cx.notify();
             });
             if alive.is_err() {
-                break;
+                return;
             }
+        }
+        // See spawn_chats_watch: reconnect only on a provably dead transport.
+        if matches!(
+            handle
+                .client()
+                .call(methods::LOCAL_DEVICE, serde_json::json!({}))
+                .await,
+            Err(RpcError::Closed)
+        ) {
+            AppState::engine_connection_lost(&this, cx);
         }
     })
 }
@@ -2150,11 +2624,11 @@ fn spawn_transcript_watch(
         // Outer loop: a delta desync (missed frame) resubscribes immediately
         // and the fresh stream's opening reset heals the copy; a subscribe
         // failure, malformed frame, or stream end retries on a delay. Every
-        // path re-enters the loop — a return here freezes the transcript
-        // with no banner and no heal short of an app restart (this watch and
-        // its engine-side room are the ONLY transcript delivery path). The
-        // task itself is dropped by select_chat/apply_chats when the chat is
-        // deselected or deleted, so retrying can't outlive relevance.
+        // path re-enters the loop except a dead transport, which hands off to
+        // the reconnect supervisor (attach_engine re-spawns this watch for the
+        // selected chat once the engine is back). The task itself is dropped
+        // by select_chat/apply_chats when the chat is deselected or deleted,
+        // so retrying can't outlive relevance.
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
         'resubscribe: loop {
             let params = serde_json::json!({
@@ -2167,6 +2641,13 @@ fn spawn_transcript_watch(
                 .await
             {
                 Ok(rx) => rx,
+                Err(RpcError::Closed) => {
+                    // No resubscribe can heal a dead transport; without the
+                    // handoff this arm retried every 2s for hours (~8k warns
+                    // per zombie session in the field).
+                    AppState::engine_connection_lost(&this, cx);
+                    return;
+                }
                 Err(err) => {
                     tracing::warn!(%chat_id, error = %err, "transcript watch failed; retrying");
                     if this.update(cx, |_, _| {}).is_err() {
@@ -2236,6 +2717,12 @@ fn spawn_collaboration_watch(
                 .await
             {
                 Ok(rx) => rx,
+                Err(RpcError::Closed) => {
+                    // Dead transport — hand off to the reconnect supervisor;
+                    // attach_engine re-spawns this watch after reconnect.
+                    AppState::engine_connection_lost(&this, cx);
+                    return;
+                }
                 Err(err) => {
                     tracing::warn!(%chat_id, error = %err, "collaboration watch failed; retrying");
                     if this.update(cx, |_, _| {}).is_err() {
@@ -2293,6 +2780,7 @@ mod tests {
         operations: Arc<StdMutex<Vec<String>>>,
         attach_failures_remaining: AtomicU16,
         inspect_lifecycle: &'static str,
+        archive_fails: bool,
     }
 
     #[async_trait::async_trait]
@@ -2302,6 +2790,24 @@ mod tests {
             method: &str,
             params: serde_json::Value,
         ) -> Result<RpcReply, RpcError> {
+            if method == methods::MUTATE {
+                assert_eq!(
+                    params,
+                    serde_json::json!({
+                        "op": "setChatArchived",
+                        "chatId": "session-ready",
+                        "archived": true,
+                    })
+                );
+                self.operations
+                    .lock()
+                    .expect("Scaffold operation log")
+                    .push("archive".into());
+                if self.archive_fails {
+                    return Err(RpcError::Failed("archive failed".into()));
+                }
+                return RpcReply::value(&serde_json::json!({ "ok": true }));
+            }
             assert_eq!(method, methods::CONTROL_SCAFFOLD_ENVIRONMENT);
             let operation = params
                 .get("operation")
@@ -2343,10 +2849,10 @@ mod tests {
                 .get("sessionId")
                 .and_then(serde_json::Value::as_str)
                 .expect("session id");
-            let lifecycle = if operation == "inspect" {
-                self.inspect_lifecycle
-            } else {
-                "starting"
+            let lifecycle = match operation {
+                "inspect" => self.inspect_lifecycle,
+                "pause" => "paused",
+                _ => "starting",
             };
             let environment = serde_json::json!({
                 "source": {
@@ -2383,7 +2889,10 @@ mod tests {
                     }
                 })
             } else {
-                assert!(matches!(operation, "create" | "inspect" | "resume"));
+                assert!(matches!(
+                    operation,
+                    "create" | "inspect" | "pause" | "resume"
+                ));
                 serde_json::json!({ "environment": environment })
             };
             RpcReply::value(&result)
@@ -2443,6 +2952,7 @@ mod tests {
             operations: Arc::clone(&operations),
             attach_failures_remaining: AtomicU16::new(0),
             inspect_lifecycle: "ready",
+            archive_fails: false,
         });
         let handle = EngineHandle {
             inner: Arc::new(RemoteEngine {
@@ -2502,6 +3012,23 @@ mod tests {
             attachment.source_ref.as_deref(),
             Some("387d6652abd642f0b85e8bd14f9131a9f23b7e70")
         );
+        assert_eq!(
+            attachment.control_target,
+            ScaffoldControlTarget {
+                sandbox_id: "sandbox-ready".into(),
+                scope: scope.clone(),
+            }
+        );
+        archive_and_pause_scaffold_session(&handle, "session-ready", &attachment.control_target)
+            .await
+            .unwrap();
+        assert_eq!(
+            operations
+                .lock()
+                .expect("Scaffold operation log")
+                .as_slice(),
+            ["create", "attach", "inspect", "archive", "pause"]
+        );
     }
 
     #[test]
@@ -2521,6 +3048,7 @@ mod tests {
                 operations: Arc::clone(&operations),
                 attach_failures_remaining: AtomicU16::new(2),
                 inspect_lifecycle: "ready",
+                archive_fails: false,
             });
             let handle = EngineHandle {
                 inner: Arc::new(RemoteEngine {
@@ -2562,12 +3090,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_archive_does_not_pause_scaffold() {
+        let operations = Arc::new(StdMutex::new(Vec::new()));
+        let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
+            operations: Arc::clone(&operations),
+            attach_failures_remaining: AtomicU16::new(0),
+            inspect_lifecycle: "ready",
+            archive_fails: true,
+        });
+        let handle = EngineHandle {
+            inner: Arc::new(RemoteEngine {
+                client: memory_client(service),
+                url: "memory://failed-archive".into(),
+            }),
+        };
+        let target = ScaffoldControlTarget {
+            sandbox_id: "sandbox-ready".into(),
+            scope: CollaborationScope {
+                project_id: "ashler-staging".into(),
+                deployment_id: Some("ashler-staging".into()),
+                session_id: Some("session-ready".into()),
+                unknown: Default::default(),
+            },
+        };
+
+        assert!(
+            archive_and_pause_scaffold_session(&handle, "session-ready", &target)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            operations
+                .lock()
+                .expect("Scaffold operation log")
+                .as_slice(),
+            ["archive"]
+        );
+    }
+
+    #[tokio::test]
     async fn paused_scaffold_resumes_before_reattaching() {
         let operations = Arc::new(StdMutex::new(Vec::new()));
         let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
             operations: Arc::clone(&operations),
             attach_failures_remaining: AtomicU16::new(0),
             inspect_lifecycle: "paused",
+            archive_fails: false,
         });
         let handle = EngineHandle {
             inner: Arc::new(RemoteEngine {
@@ -2816,6 +3384,7 @@ mod tests {
             operations: Arc::clone(&operations),
             attach_failures_remaining: AtomicU16::new(0),
             inspect_lifecycle: "ready",
+            archive_fails: false,
         });
         let handle = EngineHandle {
             inner: Arc::new(RemoteEngine {
@@ -2848,6 +3417,50 @@ mod tests {
                 .expect("Scaffold operation log")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn reconnect_supervisor_gates_flips_and_dedupes() {
+        let config = EngineBootConfig {
+            data_dir: PathBuf::from("/tmp/comet-reconnect-test"),
+            ipc_port: 0,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None, // offline
+            project_scope: "test".into(),
+            deployment_id: None,
+            scaffold_url: None,
+            default_harness: HarnessId::Mock,
+            runtime_profile: RuntimeProfile::Mock,
+        };
+        let mut state = AppState::new();
+
+        // Closure before the first attach (still Connecting) never reconnects.
+        state.boot_config = Some(config);
+        assert!(state.reconnect_config().is_none());
+
+        // An attached app reconnects: the first detector wins and flips the
+        // status back to Connecting…
+        state.connection = ConnectionStatus::Ready;
+        assert!(state.reconnect_config().is_some());
+        assert!(
+            matches!(state.connection, ConnectionStatus::Connecting),
+            "a closed transport must flip the app back to Connecting"
+        );
+        // …so the other watch tasks noticing the same dead transport collapse
+        // into that one bootstrap instead of racing their own.
+        assert!(state.reconnect_config().is_none());
+
+        // Quit guard: after begin_shutdown the drained engine's closing
+        // streams must not restart a fresh engine mid-teardown.
+        state.connection = ConnectionStatus::Ready;
+        assert!(state.begin_shutdown().is_none()); // no engine attached here
+        assert!(state.reconnect_config().is_none());
+        assert!(matches!(state.connection, ConnectionStatus::Ready));
+
+        // A state that never bootstrapped has no config to reboot with.
+        let mut blank = AppState::new();
+        blank.connection = ConnectionStatus::Ready;
+        assert!(blank.reconnect_config().is_none());
     }
 
     #[test]
@@ -3209,6 +3822,41 @@ mod tests {
     }
 
     #[test]
+    fn pending_chat_renders_while_worktree_setup_waits_for_the_workspace_watch() {
+        let mut state = AppState::new();
+        state.apply_spaces(vec![space("space", "dev", "/repo", 0)]);
+        let mut pending = chat("pending", 2, None);
+        pending.space_id = Some("space".into());
+        pending.cwd = Some("/repo".into());
+        state.stage_pending_chat(pending);
+
+        let now = Utc::now();
+        assert_eq!(state.overview_chats(now)[0].0, ChatIndicator::Working);
+        assert_eq!(state.chats_in_space("space")[0].id, "pending");
+
+        let mut unrelated = chat("unrelated", 1, None);
+        unrelated.space_id = Some("space".into());
+        state.apply_chats(vec![unrelated.clone()]);
+        assert!(state.chats.iter().any(|chat| chat.id == "pending"));
+
+        let mut materialized = chat("pending", 2, None);
+        materialized.space_id = Some("space".into());
+        materialized.cwd = Some("/worktrees/repo/fresh".into());
+        materialized.branch = Some("comet/fresh".into());
+        state.apply_chats(vec![unrelated, materialized]);
+
+        let row = state
+            .chats
+            .iter()
+            .find(|chat| chat.id == "pending")
+            .unwrap();
+        assert_eq!(row.cwd.as_deref(), Some("/worktrees/repo/fresh"));
+        assert_eq!(row.branch.as_deref(), Some("comet/fresh"));
+        assert!(!state.pending_local_chat_ids.contains("pending"));
+        assert_eq!(state.display_status_for(row, now), ChatIndicator::Idle);
+    }
+
+    #[test]
     fn apply_chat_config_stamps_the_row() {
         let mut state = AppState::new();
         state.apply_chats(vec![chat("a", 0, None), chat("b", 1, None)]);
@@ -3328,6 +3976,108 @@ mod tests {
             },
         );
         assert!(state.pending_echoes().is_empty());
+    }
+
+    fn transcript_entry(id: &str) -> SessionMessageEntry {
+        SessionMessageEntry {
+            id: id.into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: id.into(),
+            }],
+            created_at: 0,
+            device_id: "device".into(),
+            status: None,
+            continuation_of: None,
+        }
+    }
+
+    #[test]
+    fn older_pages_remain_a_prefix_of_live_tail_deltas() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("chat".into());
+        state
+            .apply_transcript_frame(TranscriptFrame::reset(
+                &[transcript_entry("m2"), transcript_entry("m3")],
+                Some(2),
+            ))
+            .unwrap();
+        state.apply_transcript_page(SessionEntryWindow {
+            entries: vec![transcript_entry("m0"), transcript_entry("m1")],
+            before: None,
+        });
+
+        let frame = comet_doc::diff_transcript(
+            &[transcript_entry("m2"), transcript_entry("m3")],
+            &[transcript_entry("m3"), transcript_entry("m4")],
+            Some(3),
+        );
+        state.apply_transcript_frame(frame).unwrap();
+
+        assert_eq!(
+            state
+                .transcript
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["m0", "m1", "m2", "m3", "m4"]
+        );
+        assert_eq!(state.transcript_tail_start, 3);
+        assert_eq!(state.transcript_tail_before, Some(3));
+        assert_eq!(state.transcript_history_before, None);
+    }
+
+    #[test]
+    fn recent_transcript_window_moves_into_and_out_of_cache() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("chat".into());
+        state.transcript = vec![transcript_entry("m1")];
+        state.transcript_tail_before = Some(4);
+        state.transcript_history_before = Some(2);
+        state.cache_selected_transcript();
+        assert!(state.transcript.is_empty());
+
+        state.restore_transcript(Some("chat"));
+        assert_eq!(state.transcript[0].id, "m1");
+        assert_eq!(state.transcript_tail_before, Some(4));
+        assert_eq!(state.transcript_history_before, Some(2));
+        assert!(state.transcript_restored_from_cache);
+    }
+
+    #[test]
+    fn cached_reset_preserves_rows_retired_from_the_live_tail() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("chat".into());
+        state.transcript = vec![
+            transcript_entry("m0"),
+            transcript_entry("m1"),
+            transcript_entry("m2"),
+            transcript_entry("m3"),
+        ];
+        state.transcript_tail_start = 2;
+        state.transcript_tail_before = Some(2);
+        state.transcript_history_before = None;
+        state.transcript_restored_from_cache = true;
+
+        state
+            .apply_transcript_frame(TranscriptFrame::reset(
+                &[transcript_entry("m3"), transcript_entry("m4")],
+                Some(3),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            state
+                .transcript
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["m0", "m1", "m2", "m3", "m4"]
+        );
+        assert_eq!(state.transcript_tail_start, 3);
+        assert_eq!(state.transcript_tail_before, Some(3));
+        assert!(!state.transcript_restored_from_cache);
     }
 
     #[test]

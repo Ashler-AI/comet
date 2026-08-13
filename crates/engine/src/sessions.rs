@@ -1175,7 +1175,10 @@ impl SessionsEngine {
                     .find(|e| e.role == MessageRole::User)
                     .and_then(|e| {
                         e.parts.iter().find_map(|p| match p {
-                            MessagePart::Text { text, .. } => Some((e.id.clone(), text.clone())),
+                            MessagePart::Text { text, .. }
+                            | MessagePart::TextWindow { text, .. } => {
+                                Some((e.id.clone(), text.clone()))
+                            }
                             _ => None,
                         })
                     })
@@ -1568,7 +1571,9 @@ fn folded_text(parts: &[MessagePart]) -> String {
     parts
         .iter()
         .filter_map(|part| match part {
-            MessagePart::Text { text, .. } => Some(text.as_str()),
+            MessagePart::Text { text, .. } | MessagePart::TextWindow { text, .. } => {
+                Some(text.as_str())
+            }
             _ => None,
         })
         .collect::<Vec<_>>()

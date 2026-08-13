@@ -43,8 +43,11 @@ use crate::settings::{
     Density, KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
     SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
 };
+#[cfg(test)]
+use crate::state::ActiveHarnessGoal;
 use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, GatePhase, Indicator, format_time_ago,
+    latest_active_omp_goal,
 };
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
@@ -1060,6 +1063,41 @@ fn render_goal_group(
         .into_any_element()
 }
 
+/// Press bookkeeping for the session row's settle button: the row is
+/// clickable (select) and the button lives inside it, but gpui's
+/// `stop_propagation` does NOT suppress an ancestor's click listener from a
+/// descendant's — measured on the pinned rev, both fire, descendant first.
+/// So the row has to recognize the button's click and stand down.
+///
+/// The press is the only reliable signal: `on_mouse_down` is hitbox-gated,
+/// while hover leave is state-diffed per element path — a row moving between
+/// the active and settled lists lands on a fresh path and never sees one.
+/// A descendant's press listener runs first, so the button raises
+/// [`Self::press_button`] and the row's press claims it; the row presses for
+/// EVERY left press it contains, so nothing outlives the click it describes.
+#[derive(Default)]
+struct SettlePress {
+    /// The press in flight landed on a settle button.
+    on_button: bool,
+    /// The click in flight is the button's, not a row selection.
+    owns_click: bool,
+}
+
+impl SettlePress {
+    fn press_button(&mut self) {
+        self.on_button = true;
+    }
+
+    fn press_row(&mut self) {
+        self.owns_click = std::mem::take(&mut self.on_button);
+    }
+
+    /// Whether the click this press produced is the row's to act on.
+    fn row_click_selects(&self) -> bool {
+        !self.owns_click
+    }
+}
+
 pub struct Shell {
     state: Entity<AppState>,
     transcript: Entity<Transcript>,
@@ -1086,6 +1124,8 @@ pub struct Shell {
     shortcuts_sub: Option<Subscription>,
     /// Session-row context menu: (chat id, window position).
     chat_menu: Option<(String, Point<Pixels>)>,
+    /// Press bookkeeping for the session row's settle button.
+    settle_press: SettlePress,
     rename_dialog: Option<RenameChatDialog>,
     /// Chat id awaiting delete confirmation.
     delete_confirm: Option<String>,
@@ -1328,6 +1368,7 @@ impl Shell {
             advisor_page: None,
             shortcuts_sub: None,
             chat_menu: None,
+            settle_press: SettlePress::default(),
             rename_dialog: None,
             delete_confirm: None,
             space_menu: None,
@@ -1759,6 +1800,11 @@ impl Shell {
             self.toggle_right_pane(cx);
         }
         cx.notify();
+    }
+
+    fn drop_active_omp_goal(&mut self, cx: &mut Context<Self>) {
+        self.composer
+            .update(cx, |composer, cx| composer.submit_command("/goal drop", cx));
     }
 
     fn toggle_focus_mode(&mut self, cx: &mut Context<Self>) {
@@ -2754,12 +2800,49 @@ impl Shell {
         cx.notify();
     }
 
-    fn archive_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
+    /// Settle (archive) or unsettle a session. Archiving an attached Scaffold
+    /// chat pauses its exact sandbox only after the durable chat mutation wins.
+    fn set_chat_settled(&mut self, chat_id: String, settled: bool, cx: &mut Context<Self>) {
         self.chat_menu = None;
-        self.mutate(
-            serde_json::json!({ "op": "setChatArchived", "chatId": chat_id, "archived": true }),
-            cx,
-        );
+        let scaffold_target = settled
+            .then(|| {
+                self.state
+                    .read(cx)
+                    .scaffold_control_target(&chat_id)
+                    .cloned()
+            })
+            .flatten();
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.sidebar_notice = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        let task = cx.spawn(async move |this, cx| {
+            let result = if let Some(target) = scaffold_target {
+                crate::state::archive_and_pause_scaffold_session(&engine, &chat_id, &target).await
+            } else {
+                engine
+                    .client()
+                    .call(
+                        methods::MUTATE,
+                        serde_json::json!({
+                            "op": "setChatArchived",
+                            "chatId": chat_id,
+                            "archived": settled,
+                        }),
+                    )
+                    .await
+                    .map(|_| ())
+            };
+            if let Err(error) = result {
+                this.update(cx, |shell, cx| {
+                    shell.sidebar_notice = Some(error.to_string().into());
+                    cx.notify();
+                })
+                .ok();
+            }
+        });
+        self.control_tasks.push(task);
         cx.notify();
     }
 
@@ -3194,8 +3277,10 @@ impl Shell {
 
     /// Rich session row: room context, title, source/runtime/model, and the
     /// top-right status slot — a spinner while the agent works, an attention
-    /// dot when it finished or needs input, otherwise the recency label. The
-    /// row retains the same content at both density settings; compact only
+    /// dot when it finished or needs input, otherwise the recency label.
+    /// Hovering the row cross-fades that read-out out and a settle checkmark in
+    /// (`settled` tints it green, so the settled list unsettles). The row
+    /// retains the same content at both density settings; compact only
     /// tightens the vertical insets.
     #[allow(clippy::too_many_arguments)]
     fn render_chat_row(
@@ -3207,6 +3292,7 @@ impl Shell {
         branch: Option<SharedString>,
         meta: SidebarSessionMeta,
         status: comet_proto::ChatIndicator,
+        settled: bool,
         selected: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
@@ -3269,6 +3355,54 @@ impl Shell {
                 .child(time_ago)
                 .into_any_element(),
         };
+        // Hover reveal without a `group-hover` (gpui has none): the row's own
+        // wash fade — already driven by the `on_hover` below — doubles as the
+        // reveal progress, so the swap rides the same 150ms curve as the wash
+        // and needs no state of its own. Built only while that fade is off
+        // rest, so the many resting rows carry no extra hitbox or tooltip.
+        let reveal = motion::hover_t(&fade_key);
+        let settle_id = id.clone();
+        let settle_button: Option<AnyElement> = (reveal > 0.0).then(|| {
+            div()
+                .id(SharedString::from(format!("settle-{id}")))
+                // An 18px rounded hit target reads as an action, not a form
+                // checkbox. It overlays the 13px status band without reflow.
+                .size(px(18.0))
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .rounded(px(5.0))
+                .bg(if settled {
+                    theme.success.opacity(0.10)
+                } else {
+                    crate::theme::ink(0.06)
+                })
+                .hover(|el| el.bg(crate::theme::ink(0.13)))
+                .cursor_pointer()
+                .tooltip(popover::text_tooltip(if settled {
+                    "Unsettle session"
+                } else {
+                    "Settle session"
+                }))
+                // The row underneath is clickable (select); see [`SettlePress`]
+                // for why the press — not `stop_propagation` — arbitrates.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, _| {
+                        this.settle_press.press_button();
+                    }),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_chat_settled(settle_id.clone(), !settled, cx);
+                }))
+                .child(icon(icons::CHECK).size(px(12.0)).text_color(if settled {
+                    theme.success
+                } else {
+                    theme.text_muted.opacity(0.82)
+                }))
+                .into_any_element()
+        });
         div()
             .id(SharedString::from(format!("chat-{id}")))
             .flex()
@@ -3288,7 +3422,19 @@ impl Shell {
             })
             .on_hover(motion::hover_listener(fade_key))
             .cursor_pointer()
+            // Claims the checkbox press raised just above (a descendant's press
+            // listener runs first), for EVERY left press the row contains — so
+            // no press is ever attributed to a later click ([`SettlePress`]).
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, _| {
+                    this.settle_press.press_row();
+                }),
+            )
             .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.settle_press.row_click_selects() {
+                    return;
+                }
                 let id = select_id.clone();
                 this.state
                     .update(cx, |state, cx| state.select_chat(Some(id), cx));
@@ -3318,13 +3464,27 @@ impl Shell {
                     )
                     .child(
                         // Fixed to the header line's 13px so dot/spinner/label
-                        // all center on the same baseline band.
+                        // all center on the same baseline band. The button
+                        // rides an absolute overlay pinned to the band's right
+                        // edge: the read-out keeps owning the slot's width, so
+                        // the swap costs no reflow at any indicator width.
                         div()
                             .flex_none()
                             .h(px(13.0))
+                            .relative()
                             .flex()
                             .items_center()
-                            .child(status_slot),
+                            .child(div().opacity(1.0 - reveal).child(status_slot))
+                            .when_some(settle_button, |el, button| {
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .top(px(-2.5))
+                                        .right(px(0.0))
+                                        .opacity(reveal)
+                                        .child(button),
+                                )
+                            }),
                     ),
             )
             .child(
@@ -5584,7 +5744,6 @@ impl Shell {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
-                    tracing::warn!("SELECTION_COMMENT_ACTION_MOUSE_DOWN");
                     cx.stop_propagation();
                     this.open_selection_annotation(
                         message_id.clone(),
@@ -5675,7 +5834,7 @@ impl Shell {
                         popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))
                             .id("chat-menu-archive")
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.archive_chat(archive_id.clone(), cx)
+                                this.set_chat_settled(archive_id.clone(), true, cx)
                             }))
                             .child(
                                 icon(icons::ARCHIVE_MINIMALISTIC)
@@ -6034,9 +6193,12 @@ impl Shell {
             .filter(|branch| !branch.is_empty())
             .unwrap_or_else(|| "Worktree".to_string())
             .into();
-        let goal_groups = {
+        let (goal_groups, active_goal) = {
             let state = self.state.read(cx);
-            goal_group_rows(latest_goal_groups(&state.transcript))
+            (
+                goal_group_rows(latest_goal_groups(&state.transcript)),
+                latest_active_omp_goal(&state.transcript),
+            )
         };
         let goal_total = goal_groups
             .iter()
@@ -6096,7 +6258,7 @@ impl Shell {
             comet_proto::HarnessId::Codex => icons::OPENAI_MARK,
             comet_proto::HarnessId::ClaudeCode => icons::CLAUDE_MARK,
             comet_proto::HarnessId::Cursor => icons::CURSOR_MARK,
-            _ => icons::COMET_LOGO,
+            _ => icons::CREW_MARK,
         };
         let account_icon_color = if account_harness == comet_proto::HarnessId::ClaudeCode {
             icons::claude_brand()
@@ -6267,6 +6429,73 @@ impl Shell {
                     ),
             )
             .children(usage_meter_rows);
+        let has_active_goal = active_goal.is_some();
+        let active_goal_element = active_goal.map(|goal| {
+            let status: SharedString = goal.status.replace('-', " ").into();
+            div()
+                .id("workspace-active-omp-goal")
+                .mb(px(8.0))
+                .p(px(9.0))
+                .rounded(px(9.0))
+                .bg(theme.element_hover)
+                .flex()
+                .items_start()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(3.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(theme.accent)
+                                        .child("OMP goal"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(9.5))
+                                        .text_color(theme.text_faint)
+                                        .child(status),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.text)
+                                .child(SharedString::from(goal.objective)),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("workspace-drop-omp-goal")
+                        .size(px(24.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(6.0))
+                        .hover(|el| el.bg(theme.glass_hover()))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.drop_active_omp_goal(cx);
+                        }))
+                        .child(
+                            icon(icons::CLOSE)
+                                .size(px(11.0))
+                                .text_color(theme.text_faint),
+                        ),
+                )
+        });
+
         let goals_section = div()
             .id("workspace-status-goals")
             .flex()
@@ -6308,7 +6537,8 @@ impl Shell {
                     .track_scroll(&self.workspace_goals_scroll)
                     .px(px(14.0))
                     .pb(px(10.0))
-                    .when(goal_total == 0, |el| {
+                    .children(active_goal_element)
+                    .when(goal_total == 0 && !has_active_goal, |el| {
                         el.child(
                             div()
                                 .pb(px(4.0))
@@ -6433,9 +6663,8 @@ impl Shell {
                         .flex_col()
                         .items_center()
                         .child(
-                            icon(icons::COMET_LOGO)
-                                .w(px(41.9))
-                                .h(px(48.0))
+                            icon(icons::CREW_MARK)
+                                .size(px(48.0))
                                 .text_color(theme.text.opacity(0.09)),
                         )
                         .child(
@@ -6464,9 +6693,8 @@ impl Shell {
                 ))
                 .into_any_element()
         } else {
-            // New-chat canvas (comet index.tsx): the dim comet mark watermark
-            // (`h-12 text-foreground/[0.09]`) over the centered helper line —
-            // now naming the space the session will start in.
+            // New-chat canvas: the dim Crew mark watermark over the centered
+            // helper line, naming the space the session will start in.
             let helper: SharedString = if space_name.is_empty() {
                 "Send a message to start a new session.".into()
             } else {
@@ -6485,9 +6713,8 @@ impl Shell {
                         .flex_col()
                         .items_center()
                         .child(
-                            icon(icons::COMET_LOGO)
-                                .w(px(41.9))
-                                .h(px(48.0))
+                            icon(icons::CREW_MARK)
+                                .size(px(48.0))
                                 .text_color(theme.text.opacity(0.09)),
                         )
                         .child(
@@ -6943,9 +7170,8 @@ impl Shell {
                 .items_center()
                 .text_center()
                 .child(
-                    icon(icons::COMET_LOGO)
-                        .w(px(31.4))
-                        .h(px(36.0))
+                    icon(icons::CREW_MARK)
+                        .size(px(36.0))
                         .text_color(theme.text),
                 )
                 .child(
@@ -7627,6 +7853,42 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
+    /// A press on the settle button hands its click to the button; the row
+    /// underneath must not also select the session.
+    #[test]
+    fn settle_button_press_takes_the_click_from_row_selection() {
+        let mut press = SettlePress::default();
+        // One press, dispatched descendant-first: button, then row.
+        press.press_button();
+        press.press_row();
+        assert!(!press.row_click_selects());
+    }
+
+    /// The suppression covers exactly the click it belongs to: a settle press
+    /// must never swallow a later click on the row body — which is reachable
+    /// right after settling, since the row moves to the Settled list.
+    #[test]
+    fn settle_press_never_suppresses_a_later_row_click() {
+        let mut press = SettlePress::default();
+        press.press_button();
+        press.press_row();
+        // Next press lands on the row body — no button press precedes it.
+        press.press_row();
+        assert!(press.row_click_selects());
+    }
+
+    /// Settling twice in a row (toggling the same button) suppresses each of
+    /// those clicks, not just the first.
+    #[test]
+    fn repeated_settle_presses_each_take_their_own_click() {
+        let mut press = SettlePress::default();
+        for _ in 0..2 {
+            press.press_button();
+            press.press_row();
+            assert!(!press.row_click_selects());
+        }
+    }
+
     struct RightDrawerProbe;
 
     impl Render for RightDrawerProbe {
@@ -7772,6 +8034,45 @@ mod tests {
             annotation_prompt_context(&annotation),
             "Selected text:\nunsafe fallback\n\nComment:\nUse the typed helper here."
         );
+    }
+
+    #[test]
+    fn latest_active_omp_goal_obeys_the_newest_goal_update() {
+        let goal_entry = |id: &str, goal: serde_json::Value| comet_doc::SessionMessageEntry {
+            id: id.into(),
+            role: comet_doc::MessageRole::Assistant,
+            parts: vec![comet_doc::MessagePart::Tool {
+                id: comet_proto::OMP_GOAL_STATE_CALL_ID.into(),
+                call: comet_proto::ToolCall::Unknown {
+                    name: comet_proto::OMP_GOAL_STATE_CALL_NAME.into(),
+                    input: Some(serde_json::json!({ "goal": goal })),
+                },
+                is_error: false,
+                resolved: false,
+            }],
+            created_at: 0,
+            device_id: "device".into(),
+            status: Some(comet_doc::MessageStatus::Complete),
+            continuation_of: None,
+        };
+        let active = goal_entry(
+            "active",
+            serde_json::json!({
+                "id": "g1",
+                "objective": " Ship the release ",
+                "status": "active"
+            }),
+        );
+        assert_eq!(
+            latest_active_omp_goal(std::slice::from_ref(&active)),
+            Some(ActiveHarnessGoal {
+                objective: "Ship the release".into(),
+                status: "active".into(),
+            })
+        );
+
+        let dropped = goal_entry("dropped", serde_json::Value::Null);
+        assert_eq!(latest_active_omp_goal(&[active, dropped]), None);
     }
 
     #[test]

@@ -29,16 +29,16 @@ use comet_doc::{
     SessionMessageEntry,
 };
 use comet_proto::{
-    AgentProvider, AgentRoute, AgentSessionSource, ChatConfig, FileSearchMatch, HarnessCommand,
-    HarnessId, RunRequest, SandboxLevel, ScaffoldLifecycle, SteeringMode, UserInputAnswer,
-    UserInputQuestion,
+    AgentProvider, AgentRoute, AgentSessionSource, Chat, ChatConfig, FileSearchMatch,
+    HarnessCommand, HarnessId, RunRequest, SandboxLevel, ScaffoldLifecycle, SteeringMode,
+    UserInputAnswer, UserInputQuestion,
 };
 use comet_rpc::{RpcError, methods};
 
 use crate::attachments::{self, StagedAttachment};
 use crate::motion;
 use crate::pickers::{CheckoutPlan, Pickers};
-use crate::state::{AppState, Indicator};
+use crate::state::{AppState, Indicator, latest_active_omp_goal};
 use crate::theme::Theme;
 
 // ---------------------------------------------------------------------------
@@ -3421,26 +3421,41 @@ fn mention_token(text: &str, cursor: usize) -> Option<MentionToken> {
         kind: marker.1,
     })
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HarnessCompletion {
+    value: String,
+    description: String,
+    input_hint: Option<String>,
+    source: Option<String>,
+}
 
-fn matching_commands(commands: &[HarnessCommand], token: &MentionToken) -> Vec<HarnessCommand> {
+fn command_name_matches(name: &str, query: &str, kind: CompletionKind) -> bool {
+    let prefix_matches = |candidate: &str| {
+        query.len() <= candidate.len()
+            && candidate
+                .get(..query.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(query))
+    };
+    let skill_name = name.strip_prefix("skill:");
+    match kind {
+        CompletionKind::Mention => prefix_matches(skill_name.unwrap_or(name)),
+        CompletionKind::Slash => prefix_matches(name) || skill_name.is_some_and(prefix_matches),
+    }
+}
+fn matching_commands(commands: &[HarnessCommand], token: &MentionToken) -> Vec<HarnessCompletion> {
     commands
         .iter()
         .filter(|command| {
-            let candidate = match token.kind {
-                CompletionKind::Mention => command.name.strip_prefix("skill:"),
-                CompletionKind::Slash => command
-                    .name
-                    .strip_prefix("skill:")
-                    .or(Some(command.name.as_str())),
-            };
-            candidate.is_some_and(|name| {
-                token.query.len() <= name.len()
-                    && name
-                        .get(..token.query.len())
-                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&token.query))
-            })
+            std::iter::once(command.name.as_str())
+                .chain(command.aliases.iter().map(String::as_str))
+                .any(|name| command_name_matches(name, &token.query, token.kind))
         })
-        .cloned()
+        .map(|command| HarnessCompletion {
+            value: command.name.clone(),
+            description: command.description.clone(),
+            input_hint: command.input_hint.clone(),
+            source: command.source.clone(),
+        })
         .collect()
 }
 
@@ -3448,7 +3463,7 @@ fn matching_commands(commands: &[HarnessCommand], token: &MentionToken) -> Vec<H
 struct FileMentionState {
     token: Option<MentionToken>,
     results: Vec<FileSearchMatch>,
-    commands: Vec<HarnessCommand>,
+    commands: Vec<HarnessCompletion>,
     active: Option<usize>,
     request: u64,
     loading: bool,
@@ -3496,6 +3511,7 @@ pub struct Composer {
     picker_task: Option<Task<()>>,
     mention_task: Option<Task<()>>,
     mention: FileMentionState,
+    completion_scroll: gpui::ScrollHandle,
     current_key: String,
     /// Explicit independently-owned agent target. `start_agent` keeps the
     /// composer in start mode even while a teammate's session is working.
@@ -3596,6 +3612,7 @@ impl Composer {
             picker_task: None,
             mention_task: None,
             mention: FileMentionState::default(),
+            completion_scroll: gpui::ScrollHandle::new(),
             current_key,
             agent_target: None,
             start_agent: false,
@@ -3622,18 +3639,18 @@ impl Composer {
             _input_events: input_events,
         };
         // Dev knob: pre-stage attachments (drop/paste can't be synthesized on
-        // a rig) — `COMET_ATTACH=/path/a.png[,/path/b.png]`, and
-        // `COMET_ATTACH_PREVIEW=1` boots with the first one's lightbox open.
+        // a rig) — `COMET_ATTACH=/path/file[,/path/folder]`, and
+        // `COMET_ATTACH_PREVIEW=1` boots with the first image's lightbox open.
         if let Ok(spec) = std::env::var("COMET_ATTACH") {
             let staged: Vec<StagedAttachment> = spec
                 .split(',')
                 .filter(|s| !s.trim().is_empty())
-                .filter_map(|path| {
-                    match attachments::stage_file(std::path::Path::new(path.trim())) {
-                        Ok(att) => Some(att),
+                .flat_map(|path| {
+                    match attachments::stage_selected_path(std::path::Path::new(path.trim())) {
+                        Ok(attachments) => attachments,
                         Err(err) => {
                             tracing::warn!(%path, error = %err, "COMET_ATTACH stage failed");
-                            None
+                            Vec::new()
                         }
                     }
                 })
@@ -3644,7 +3661,7 @@ impl Composer {
                     .find_map(|att| att.image().map(|image| (att, image)))
             {
                 composer.preview = Some(attachments::PreviewImage {
-                    name: first.name.clone().into(),
+                    name: first.display_name.clone().into(),
                     image: image.clone(),
                 });
             }
@@ -3656,6 +3673,12 @@ impl Composer {
                     .extend(staged);
             }
         }
+        // Command providers (project skills, extensions, MCP prompts) finish
+        // asynchronously. Warm the catalog before the first `/` or `@` so its
+        // settle window normally completes while the user is reading/typing.
+        composer
+            .pickers
+            .update(cx, |pickers, cx| pickers.prepare_harness_commands(cx));
         composer
     }
 
@@ -3664,6 +3687,19 @@ impl Composer {
     pub fn debug_open_model_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.pickers
             .update(cx, |pickers, cx| pickers.open_model_menu(window, cx));
+    }
+
+    /// Submit a harness command from another first-party surface, such as the
+    /// active-goal control in the workspace sidebar.
+    pub fn submit_command(&mut self, command: &str, cx: &mut Context<Self>) {
+        if self.wizard.is_some() {
+            self.failure = Some("Finish the current question before running a command".into());
+            cx.notify();
+            return;
+        }
+        self.input
+            .update(cx, |input, cx| input.set_text(command, cx));
+        self.on_submit(cx);
     }
 
     pub fn is_sending(&self) -> bool {
@@ -3691,17 +3727,15 @@ impl Composer {
         cx.notify();
     }
 
-    /// Stage image files (picker / drop / pasted paths). Non-images are
-    /// skipped silently (matching the original's `image/*` filter); read
-    /// failures and oversize files surface in the failure notice.
+    /// Stage files or folders selected by the picker, dropped, or pasted from
+    /// the file manager. Folders expand recursively into deterministic,
+    /// folder-relative attachments. Images get thumbnails; other regular files
+    /// get document tiles. Failures surface in the composer notice.
     pub(crate) fn add_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         let mut staged = Vec::new();
         for path in &paths {
-            if attachments::format_by_extension(path).is_none() {
-                continue;
-            }
-            match attachments::stage_file(path) {
-                Ok(att) => staged.push(att),
+            match attachments::stage_selected_path(path) {
+                Ok(attachments) => staged.extend(attachments),
                 Err(message) => {
                     self.failure = Some(message.into());
                     cx.notify();
@@ -3722,12 +3756,12 @@ impl Composer {
     }
 
     /// Drop a deleted chat's per-chat composer state — staged attachments hold
-    /// raw image bytes, and a deleted chat's stage could never be sent again.
+    /// raw file bytes, and a deleted chat's stage could never be sent again.
     pub fn purge_chat(&mut self, chat_id: &str) {
         self.attachments.remove(chat_id);
     }
 
-    /// Staged attachment strip: 56px image thumbnails or text-file tiles with
+    /// Staged attachment strip: 56px image thumbnails or document tiles with
     /// a remove button revealed on hover. Images open the full-size preview.
     fn render_attachment_strip(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let staged = self.staged();
@@ -3745,7 +3779,7 @@ impl Composer {
             let group: SharedString = format!("composer-att-{}", att.id).into();
             let attachment: gpui::AnyElement = if let Some(image) = att.image() {
                 let preview = attachments::PreviewImage {
-                    name: att.name.clone().into(),
+                    name: att.display_name.clone().into(),
                     image: image.clone(),
                 };
                 div()
@@ -3764,7 +3798,7 @@ impl Composer {
                     .into_any_element()
             } else {
                 div()
-                    .id(("composer-att-text", ix))
+                    .id(("composer-att-file", ix))
                     .size(px(STRIP_THUMB))
                     .rounded(px(8.0))
                     .border_1()
@@ -3782,9 +3816,12 @@ impl Composer {
                     )
                     .child(
                         div()
+                            .max_w(px(STRIP_THUMB - 8.0))
+                            .overflow_hidden()
+                            .truncate()
                             .text_size(px(9.0))
                             .text_color(theme.text_muted)
-                            .child("Pasted text"),
+                            .child(att.display_basename().to_string()),
                     )
                     .into_any_element()
             };
@@ -3824,12 +3861,11 @@ impl Composer {
         Some(strip)
     }
 
-    /// Paperclip: the native image picker (the original's hidden
-    /// `<input type=file accept=image/* multiple>`).
+    /// Paperclip: the native multi-file and folder picker.
     fn open_file_picker(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
-            directories: false,
+            directories: true,
             multiple: true,
             prompt: Some("Attach".into()),
         });
@@ -3870,11 +3906,11 @@ impl Composer {
         let catalog = self.pickers.read(cx).harness_commands(cx).to_vec();
         self.mention.commands = matching_commands(&catalog, token);
         let count = self.mention.commands.len() + self.mention.results.len();
-        self.mention.active = if count == 0 {
-            None
-        } else {
-            Some(self.mention.active.unwrap_or(0).min(count - 1))
-        };
+        self.mention.active =
+            (count > 0).then_some(self.mention.active.unwrap_or(0).min(count - 1));
+        if let Some(active) = self.mention.active {
+            self.completion_scroll.scroll_to_item(active);
+        }
         self.sync_mention_controls(cx);
     }
 
@@ -4035,6 +4071,9 @@ impl Composer {
                         composer.mention.error = Some(mention_error_message(&err));
                     }
                 }
+                if let Some(active) = composer.mention.active {
+                    composer.completion_scroll.scroll_to_item(active);
+                }
                 composer.sync_mention_controls(cx);
                 cx.notify();
             })
@@ -4046,6 +4085,9 @@ impl Composer {
     fn move_mention(&mut self, delta: isize, cx: &mut Context<Self>) {
         let count = self.mention.commands.len() + self.mention.results.len();
         self.mention.active = crate::popover::menu_step(self.mention.active, count, delta);
+        if let Some(active) = self.mention.active {
+            self.completion_scroll.scroll_to_item(active);
+        }
         self.sync_mention_controls(cx);
         cx.notify();
     }
@@ -4070,7 +4112,7 @@ impl Composer {
             return;
         };
         if let Some(command) = self.mention.commands.get(active) {
-            let value = format!("/{}", command.name);
+            let value = format!("/{}", command.value);
             self.input.update(cx, |input, cx| {
                 input.replace_completion(token.range, &value, cx)
             });
@@ -4098,9 +4140,11 @@ impl Composer {
     ) -> Option<gpui::AnyElement> {
         let token = self.mention.token.as_ref()?;
         let mut card = crate::popover::popover_card(theme)
+            .id("completion-menu-scroll")
             .w(px(380.0))
             .max_h(px(280.0))
-            .overflow_hidden()
+            .overflow_y_scroll()
+            .track_scroll(&self.completion_scroll)
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_mention(cx)));
         let empty = self.mention.commands.is_empty() && self.mention.results.is_empty();
         if self.mention.loading && empty {
@@ -4118,8 +4162,12 @@ impl Composer {
                 match (token.kind, token.query.is_empty()) {
                     (CompletionKind::Slash, true) => "No commands available".into(),
                     (CompletionKind::Slash, false) => "No matching commands".into(),
-                    (CompletionKind::Mention, true) => "No files or skills available".into(),
-                    (CompletionKind::Mention, false) => "No matching files or skills".into(),
+                    (CompletionKind::Mention, true) => {
+                        "No files or harness commands available".into()
+                    }
+                    (CompletionKind::Mention, false) => {
+                        "No matching files or harness commands".into()
+                    }
                 }
             };
             card = card.child(
@@ -4137,10 +4185,15 @@ impl Composer {
         } else {
             for (ix, command) in self.mention.commands.iter().enumerate() {
                 let selected = self.mention.active == Some(ix);
-                let name = command.name.clone();
+                let name = command.value.clone();
                 let label = format!("/{name}");
                 let description = command.description.clone();
                 let input_hint = command.input_hint.clone();
+                let source = command.source.clone().map(|source| match source.as_str() {
+                    "mcp_prompt" => "MCP".to_string(),
+                    "builtin" => "built-in".to_string(),
+                    other => other.replace('_', " "),
+                });
                 card = card.child(
                     crate::popover::menu_row(theme, selected, format!("command-result-{ix}"))
                         .id(("command-result", ix))
@@ -4163,18 +4216,36 @@ impl Composer {
                                         .gap(px(8.0))
                                         .child(
                                             div()
+                                                .min_w_0()
+                                                .flex_1()
                                                 .truncate()
                                                 .text_size(px(12.5))
                                                 .text_color(theme.text)
                                                 .child(label),
                                         )
-                                        .children(input_hint.map(|hint| {
+                                        .child(
                                             div()
-                                                .flex_none()
-                                                .text_size(px(11.0))
-                                                .text_color(theme.text_faint)
-                                                .child(hint)
-                                        })),
+                                                .min_w_0()
+                                                .max_w(px(190.0))
+                                                .flex()
+                                                .items_center()
+                                                .justify_end()
+                                                .gap(px(6.0))
+                                                .children(source.map(|source| {
+                                                    div()
+                                                        .text_size(px(10.5))
+                                                        .text_color(theme.text_faint)
+                                                        .child(source)
+                                                }))
+                                                .children(input_hint.map(|hint| {
+                                                    div()
+                                                        .min_w_0()
+                                                        .truncate()
+                                                        .text_size(px(11.0))
+                                                        .text_color(theme.text_faint)
+                                                        .child(hint)
+                                                })),
+                                        ),
                                 )
                                 .child(
                                     div()
@@ -4709,10 +4780,10 @@ impl Composer {
         // Attachment-only sends echo the placeholder body used after upload,
         // so the bubble never renders empty while the files are staging.
         let echo_text = if text.is_empty() && !staged.is_empty() {
-            if staged.iter().all(StagedAttachment::is_text) {
-                attachments::TEXT_ATTACHMENT_ONLY_TEXT.to_string()
-            } else {
+            if staged.iter().all(|attachment| attachment.image().is_some()) {
                 attachments::ATTACHMENT_ONLY_TEXT.to_string()
+            } else {
+                attachments::FILE_ATTACHMENT_ONLY_TEXT.to_string()
             }
         } else {
             text.clone()
@@ -4724,6 +4795,24 @@ impl Composer {
         };
         let steering_mode = self.pickers.read(cx).steering_mode(cx);
         let echo_status = optimistic_message_status(effective_delivery, steering_mode);
+        let pending_chat = (is_new && !scaffold_demo).then(|| Chat {
+            id: chat_id.clone(),
+            device_id: device_id.clone(),
+            title: None,
+            archived: false,
+            cwd: space_path.clone(),
+            branch: scaffold_source_ref(&plan).map(str::to_string),
+            checkout_id: space.as_ref().and_then(|space| space.checkout_id.clone()),
+            config: resolved.chat_config(),
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: chrono::DateTime::from_timestamp_millis(created_at)
+                .expect("current timestamp is representable"),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: space_id.clone(),
+            last_seen_at: None,
+        });
 
         // Optimistic echo (client-minted id doubles as the persisted message id,
         // so the doc frame dedups it away).
@@ -4740,7 +4829,10 @@ impl Composer {
             continuation_of: None,
         };
         self.state.update(cx, |s, cx| {
-            if is_new {
+            if let Some(pending_chat) = pending_chat {
+                s.stage_pending_chat(pending_chat);
+                s.select_chat(Some(chat_id.clone()), cx);
+            } else if is_new {
                 s.mark_chat_pending(&chat_id);
                 s.select_chat(Some(chat_id.clone()), cx);
             }
@@ -5114,11 +5206,11 @@ impl Composer {
                 // Stage every attachment on the host device (sequential — the
                 // chunks share one channel), then thread typed refs into the
                 // persisted prompt. Only images enter RunRequest.attachments;
-                // pasted text is opened from the explicit local path.
+                // all other files are opened from their explicit local paths.
                 let mut content = text.clone();
                 let mut attachment_paths: Vec<String> = Vec::new();
                 let mut image_paths: Vec<String> = Vec::new();
-                let mut text_paths: Vec<String> = Vec::new();
+                let mut file_paths: Vec<String> = Vec::new();
                 if !staged.is_empty() {
                     for att in &staged {
                         match attachments::upload_attachment(
@@ -5131,7 +5223,7 @@ impl Composer {
                         {
                             Ok(path) => attachment_paths.push(path),
                             Err(err) => {
-                                tracing::warn!(name = %att.name, error = %err, "attachment upload failed");
+                                tracing::warn!(name = %att.display_name, error = %err, "attachment upload failed");
                                 return Err(
                                     "Couldn't upload the attachment — the device may be offline."
                                         .to_string(),
@@ -5146,23 +5238,23 @@ impl Composer {
                             attachments::seed_attachment(
                                 &seed_device,
                                 path,
-                                &att.name,
+                                &att.display_name,
                                 image.clone(),
                             );
                             if seed_device != device_id {
                                 attachments::seed_attachment(
                                     &device_id,
                                     path,
-                                    &att.name,
+                                    &att.display_name,
                                     image.clone(),
                                 );
                             }
                         } else {
-                            text_paths.push(path.clone());
+                            file_paths.push(path.clone());
                         }
                     }
                     content =
-                        attachments::with_attachment_files(&text, &image_paths, &text_paths);
+                        attachments::with_attachment_files(&text, &image_paths, &file_paths);
                     // Refresh the echo in place with the attachment refs
                     // (same id, same clock — the bubble grows its thumbnails
                     // without flickering).
@@ -5721,6 +5813,77 @@ impl Composer {
             .into_any_element()
     }
 
+    fn render_active_goal_indicator(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let goal = latest_active_omp_goal(&self.state.read(cx).transcript)?;
+        let status: SharedString = goal.status.replace('-', " ").into();
+        let objective: SharedString = goal.objective.into();
+        Some(
+            div()
+                .id("composer-active-omp-goal")
+                .mx(px(4.0))
+                .h(px(32.0))
+                .flex_none()
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(theme.accent.opacity(0.16))
+                .bg(theme.accent.opacity(0.055))
+                .px(px(9.0))
+                .flex()
+                .items_center()
+                .gap(px(7.0))
+                .child(div().size(px(6.0)).rounded_full().bg(theme.accent))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(10.5))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme.accent)
+                        .child("OMP goal"),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(10.5))
+                        .text_color(theme.text)
+                        .child(objective),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(9.5))
+                        .text_color(theme.text_faint)
+                        .child(status),
+                )
+                .child(
+                    div()
+                        .id("composer-drop-omp-goal")
+                        .size(px(22.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(6.0))
+                        .cursor_pointer()
+                        .hover(|element| element.bg(theme.glass_hover()))
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.submit_command("/goal drop", cx)),
+                        )
+                        .child(
+                            crate::icons::icon(crate::icons::CLOSE)
+                                .size(px(10.0))
+                                .text_color(theme.text_faint),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_send_button(
         &mut self,
         mode: SendButtonMode,
@@ -5901,6 +6064,7 @@ impl Render for Composer {
         let expanded = self.expanded_mode;
 
         let failure = self.failure.clone();
+        let active_goal = self.render_active_goal_indicator(&theme, cx);
         // Centered composer column (comet `mx-auto w-full max-w-3xl`).
         let container = div()
             .w_full()
@@ -5966,7 +6130,8 @@ impl Render for Composer {
                         )
                         .child(div().min_w_0().child(message)),
                 )
-            });
+            })
+            .children(active_goal);
 
         if wizard_active {
             let wizard = self.render_wizard(cx);
@@ -6418,24 +6583,30 @@ mod tests {
     }
 
     #[test]
-    fn command_completion_separates_slash_commands_from_mentionable_skills() {
+    fn command_completion_exposes_every_harness_command_from_slash_or_mention() {
         let commands = vec![
             HarnessCommand {
                 name: "ralplan".into(),
                 description: "Plan".into(),
                 input_hint: None,
+                aliases: vec!["consensus".into()],
+                subcommands: Vec::new(),
+                source: Some("builtin".into()),
             },
             HarnessCommand {
                 name: "skill:ralph".into(),
                 description: "Run Ralph".into(),
                 input_hint: None,
+                aliases: Vec::new(),
+                subcommands: Vec::new(),
+                source: Some("skill".into()),
             },
         ];
         let slash = mention_token("/ral", 4).unwrap();
         assert_eq!(
             matching_commands(&commands, &slash)
                 .into_iter()
-                .map(|command| command.name)
+                .map(|command| command.value)
                 .collect::<Vec<_>>(),
             vec!["ralplan", "skill:ralph"]
         );
@@ -6443,10 +6614,12 @@ mod tests {
         assert_eq!(
             matching_commands(&commands, &mention)
                 .into_iter()
-                .map(|command| command.name)
+                .map(|command| command.value)
                 .collect::<Vec<_>>(),
-            vec!["skill:ralph"]
+            vec!["ralplan", "skill:ralph"]
         );
+        let alias = mention_token("/con", 4).unwrap();
+        assert_eq!(matching_commands(&commands, &alias)[0].value, "ralplan");
     }
 
     #[test]

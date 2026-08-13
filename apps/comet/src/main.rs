@@ -166,7 +166,36 @@ fn scaffold_url_from_env(edge_token: &Option<String>) -> Option<String> {
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(unix)]
+const PROCESS_NOFILE_TARGET: libc::rlim_t = 65_536;
+
+/// Raise Comet's process-local descriptor budget without changing launchd or
+/// the user's shell configuration. GUI launches on macOS commonly inherit 256.
+#[cfg(unix)]
+fn raise_process_nofile_limit() -> std::io::Result<(libc::rlim_t, libc::rlim_t)> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is valid for both calls and remains initialized for the
+    // duration of each syscall.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let before = limit.rlim_cur;
+    let target = limit.rlim_max.min(PROCESS_NOFILE_TARGET);
+    if before < target {
+        limit.rlim_cur = target;
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok((before, limit.rlim_cur))
+}
+
 fn main() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    let nofile_limit = raise_process_nofile_limit();
     let mut args = std::env::args_os().collect::<Vec<_>>();
     let initial_url = args
         .get(1)
@@ -222,6 +251,16 @@ fn main() -> anyhow::Result<()> {
                 .init(),
             None => registry.init(),
         }
+    }
+    #[cfg(unix)]
+    match nofile_limit {
+        Ok((before, after)) if after > before => {
+            tracing::info!(before, after, "raised process file descriptor limit");
+        }
+        Err(error) => {
+            tracing::warn!(%error, "could not raise process file descriptor limit");
+        }
+        _ => {}
     }
 
     match cli.command {
@@ -507,7 +546,9 @@ fn open_log_file_in(dir: &std::path::Path, mode: &str) -> Option<std::fs::File> 
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
-        // Probe the CURRENT inode for a live writer before touching it.
+        // Probe and retain the canonical inode. Rotation copies its previous
+        // contents to `.old`, then truncates this same locked file; no path or
+        // lock handoff exists for a concurrent launcher to race.
         let preexisting = path.exists();
         let existing = std::fs::OpenOptions::new()
             .read(true)
@@ -524,17 +565,12 @@ fn open_log_file_in(dir: &std::path::Path, mode: &str) -> Option<std::fs::File> 
             )
             .ok();
         }
-        // No live writer: rotate, create fresh, and lock it as ours. (The
-        // probe's flock dies with `existing`; a first-ever launch has nothing
-        // to rotate — the probe itself created the empty file.)
-        drop(existing);
         if preexisting {
-            let _ = std::fs::rename(&path, dir.join(format!("comet-{mode}.log.old")));
+            let _ = std::fs::copy(&path, dir.join(format!("comet-{mode}.log.old")));
+            existing.set_len(0).ok()?;
         }
-        let file = std::fs::File::create(&path).ok()?;
-        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         sweep_stale_pid_logs(dir, mode);
-        Some(file)
+        Some(existing)
     }
     #[cfg(not(unix))]
     {
@@ -609,11 +645,76 @@ mod device_bootstrap_tests {
 }
 
 #[cfg(all(test, unix))]
+static PROCESS_RESOURCE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(all(test, unix))]
+mod process_limit_tests {
+    use super::{PROCESS_NOFILE_TARGET, raise_process_nofile_limit};
+
+    const LOW_NOFILE_CHILD: &str = "COMET_TEST_LOW_NOFILE_PROCESS_CHILD";
+
+    #[test]
+    fn raises_soft_limit_and_children_inherit_it() {
+        let _process_resource_guard = super::PROCESS_RESOURCE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if std::env::var_os(LOW_NOFILE_CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "process_limit_tests::raises_soft_limit_and_children_inherit_it",
+                    "--nocapture",
+                ])
+                .env(LOW_NOFILE_CHILD, "1")
+                .output()
+                .expect("spawn isolated descriptor-limit test");
+            assert!(
+                output.status.success(),
+                "isolated descriptor-limit test failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is valid for both calls; this mutation is confined to
+        // the isolated child test process.
+        unsafe {
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+            limit.rlim_cur = limit.rlim_cur.min(256);
+            assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
+        }
+
+        let (_, raised) = raise_process_nofile_limit().expect("raise descriptor limit");
+        assert_eq!(raised, limit.rlim_max.min(PROCESS_NOFILE_TARGET));
+
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "ulimit -n"])
+            .output()
+            .expect("spawn child process");
+        assert!(child.status.success());
+        let inherited: libc::rlim_t = String::from_utf8_lossy(&child.stdout)
+            .trim()
+            .parse()
+            .expect("numeric child descriptor limit");
+        assert_eq!(inherited, raised);
+    }
+}
+
+#[cfg(all(test, unix))]
 mod log_file_tests {
     use super::open_log_file_in;
+    use std::os::unix::io::AsRawFd;
 
     #[test]
     fn second_launch_never_rotates_a_live_processes_log() {
+        let _process_resource_guard = super::PROCESS_RESOURCE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let dir = dir.path();
         // First launch owns the canonical file and keeps writing.
@@ -637,6 +738,49 @@ mod log_file_tests {
             "rotation resumes"
         );
         drop(third);
+    }
+
+    #[test]
+    fn concurrent_launches_leave_one_locked_canonical_log() {
+        let _process_resource_guard = super::PROCESS_RESOURCE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let dir = std::sync::Arc::new(dir.path().to_path_buf());
+        std::fs::write(dir.join("comet-headed.log"), "previous launch\n").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
+        let launches: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = dir.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    open_log_file_in(&dir, "headed").expect("concurrent log")
+                })
+            })
+            .collect();
+        barrier.wait();
+        let files: Vec<_> = launches
+            .into_iter()
+            .map(|launch| launch.join().expect("launcher thread"))
+            .collect();
+
+        let canonical = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join("comet-headed.log"))
+            .expect("canonical log");
+        assert_ne!(
+            unsafe { libc::flock(canonical.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "one launch must retain the canonical lock"
+        );
+        assert!(dir.join("comet-headed.log.old").is_file());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("comet-headed.log.old")).unwrap(),
+            "previous launch\n"
+        );
+        drop(files);
     }
 }
 

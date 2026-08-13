@@ -10,6 +10,16 @@ if [ "${1:-}" = "-F" ]; then
     inactive)
       exit 1
       ;;
+    auto)
+      if [ -n "${OMP_RPC_PID_LOG:-}" ] && [ -f "$OMP_RPC_PID_LOG" ]; then
+        IFS= read -r pid < "$OMP_RPC_PID_LOG"
+        if kill -0 "$pid" 2>/dev/null; then
+          printf '%s\n' "p$pid"
+          exit 0
+        fi
+      fi
+      exit 1
+      ;;
     *)
       exit 2
       ;;
@@ -22,6 +32,7 @@ if [ "${1:-}" = "models" ]; then
   exit 0
 fi
 [ "${1:-}" = "--mode" ] && [ "${2:-}" = "rpc" ] || exit 91
+[ -z "${OMP_RPC_PID_LOG:-}" ] || printf '%s\n' "$$" > "$OMP_RPC_PID_LOG"
 
 SESSION_ID="omp-session-1"
 prev=""
@@ -31,9 +42,14 @@ for arg in "$@"; do
   fi
   prev="$arg"
 done
+ACTIVE_GOAL="${OMP_ACTIVE_GOAL:-}"
 
 printf '%s\n' '{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2],"maxFrameBytes":1048576,"maxReassembledFrameBytes":67108864}'
-printf '%s\n' '{"type":"available_commands_update","commands":[{"name":"ralplan","description":"Plan with consensus","input":{"hint":"goal"}},{"name":"security","description":"Run security review"}]}'
+if [ -n "$ACTIVE_GOAL" ]; then
+  printf '%s\n' '{"type":"available_commands_update","commands":[{"name":"goal","description":"Toggle goal mode","input":{"hint":"[objective]"},"subcommands":[{"name":"set","description":"Set or replace the goal","usage":"<objective>"},{"name":"drop","description":"Drop the current goal"}]},{"name":"ralplan","description":"Plan with consensus","input":{"hint":"goal"}},{"name":"security","description":"Run security review"}]}'
+else
+  printf '%s\n' '{"type":"available_commands_update","commands":[{"name":"ralplan","description":"Plan with consensus","input":{"hint":"goal"}},{"name":"security","description":"Run security review"}]}'
+fi
 
 finish_turn() {
   printf '%s\n' '{"type":"message_end","message":{"role":"assistant","stopReason":"stop","usage":{"input":6,"output":4,"cacheRead":100,"cacheWrite":0,"totalTokens":110}}}'
@@ -50,12 +66,30 @@ while IFS= read -r line; do
       ;;
     get_state)
       [ -z "${OMP_SESSION_LOG:-}" ] || printf '%s\n' "get_state" >> "$OMP_SESSION_LOG"
-      printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"get_state\",\"success\":true,\"data\":{\"sessionId\":\"$SESSION_ID\",\"model\":{\"provider\":\"openai-codex\",\"id\":\"gpt-5.6-sol\"},\"todoPhases\":[]}}"
+      if [ -n "$ACTIVE_GOAL" ]; then
+        printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"get_state\",\"success\":true,\"data\":{\"sessionId\":\"$SESSION_ID\",\"model\":{\"provider\":\"openai-codex\",\"id\":\"gpt-5.6-sol\"},\"todoPhases\":[],\"goalMode\":{\"enabled\":true,\"mode\":\"active\",\"goal\":{\"id\":\"goal-1\",\"objective\":\"$ACTIVE_GOAL\",\"status\":\"active\"}}}}"
+      else
+        printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"get_state\",\"success\":true,\"data\":{\"sessionId\":\"$SESSION_ID\",\"model\":{\"provider\":\"openai-codex\",\"id\":\"gpt-5.6-sol\"},\"todoPhases\":[]}}"
+      fi
       ;;
     prompt)
       [ -z "${OMP_PROMPT_LOG:-}" ] || printf '%s\n' "$line" >> "$OMP_PROMPT_LOG"
       if [ -n "${OMP_PROMPT_ERROR_DETAILS:-}" ]; then
         printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"prompt\",\"success\":false,\"error\":\"$OMP_PROMPT_ERROR_DETAILS\"}"
+        continue
+      fi
+      if has "$line" '/goal set'; then
+        ACTIVE_GOAL="Persistent editor indicator"
+        printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"prompt\",\"success\":true,\"data\":{\"agentInvoked\":false}}"
+        if [ -z "${OMP_OMIT_GOAL_EVENTS:-}" ]; then
+          printf '%s\n' '{"type":"goal_updated","goal":{"id":"goal-1","objective":"Persistent editor indicator","status":"active"}}'
+        fi
+        continue
+      fi
+      if has "$line" '/goal drop'; then
+        ACTIVE_GOAL=""
+        printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"prompt\",\"success\":true,\"data\":{\"agentInvoked\":false}}"
+        [ -n "${OMP_OMIT_GOAL_EVENTS:-}" ] || printf '%s\n' '{"type":"goal_updated","goal":null}'
         continue
       fi
       printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"prompt\",\"success\":true,\"data\":{\"agentInvoked\":true}}"
@@ -93,6 +127,7 @@ while IFS= read -r line; do
       finish_turn
       ;;
     abort)
+      [ -z "${OMP_HANG_ABORT:-}" ] || continue
       printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"abort\",\"success\":true}"
       ;;
   esac

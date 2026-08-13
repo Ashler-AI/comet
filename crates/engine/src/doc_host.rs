@@ -17,8 +17,8 @@ use tokio::sync::watch;
 use comet_doc::{
     COMMAND_DEFAULT_TTL_MS, CommandBasedOn, CommandDisposition, DocError, EvaluationContext,
     MessagePart, MessageRole, MessageStatus, SessionCommandEntry, SessionCommandPayload,
-    SessionCommandStatus, SessionControlAction, SessionDoc, SessionMessageEntry, evaluate_command,
-    join_continuation_entries,
+    SessionCommandStatus, SessionControlAction, SessionDoc, SessionEntryWindow,
+    SessionMessageEntry, TAIL_MESSAGE_COUNT, evaluate_command,
 };
 use comet_proto::{
     AgentSessionRecord, AuditEvent, AuditResult, COLLABORATION_SCHEMA_VERSION, CapabilityGrant,
@@ -229,6 +229,25 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Redial cadence ceiling once the edge has ANSWERED with an HTTP rejection
+/// (403 foreign scope, 404 unroutable room): the answer stays identical until
+/// something about the session or credential changes, so hammering at the
+/// 30s transport cap only spams the Worker and the logs (2026-08 field logs:
+/// 1.3k warns from three such chats). Mirrors the workspace room's 15-minute
+/// probe cadence; a system wake still resets to the fast base. 401 stays on
+/// the fast cap — the next dial re-reads the bearer, so an expired token
+/// heals within one refresh.
+const REJECTED_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Backoff ceiling for one failed session-room dial: policy rejections crawl,
+/// transport faults keep the fast reconnect cap.
+fn join_retry_cap(err: &comet_sync::SyncError) -> std::time::Duration {
+    match err {
+        comet_sync::SyncError::HttpRejected(403 | 404) => REJECTED_RETRY_CAP,
+        _ => crate::workspace_host::JOIN_RETRY_CAP,
+    }
+}
+
 /// Bind durable local authority to the complete immutable portion of a command.
 /// The SQLite row is written only after an authenticated local grant authorizes
 /// this exact entry, so a synced peer cannot reuse an id with altered payload.
@@ -352,9 +371,9 @@ pub struct ChatDocHandle {
     chat_id: String,
     device_id: String,
     doc: Arc<SessionDoc>,
-    messages_tx: watch::Sender<Vec<SessionMessageEntry>>,
-    /// True when the doc changed while nobody watched: the mirror rebuild is
-    /// deferred to the next `watch_messages` attach instead of paid per commit.
+    messages_tx: watch::Sender<SessionEntryWindow>,
+    /// True when the doc changed while nobody watched: the bounded tail mirror
+    /// is rebuilt on the next `watch_messages` attach.
     mirror_dirty: AtomicBool,
     /// Epoch ms of the last open/watch touch — the LRU eviction key.
     last_access: AtomicI64,
@@ -385,12 +404,12 @@ impl ChatDocHandle {
         self.doc.clone()
     }
 
-    /// Joined transcript watch — re-sent on every doc change (WatchDocMessages).
+    /// Bounded joined transcript tail watch (`WatchDocMessages`).
     ///
     /// Attach-time refresh: the mirror is only maintained while watched, so a
     /// doc that changed unwatched materializes here, once, instead of on every
     /// commit it sat through in the background.
-    pub fn watch_messages(&self) -> watch::Receiver<Vec<SessionMessageEntry>> {
+    pub fn watch_messages(&self) -> watch::Receiver<SessionEntryWindow> {
         self.touch();
         // Attach is a user signal: verify a quiet room is actually alive
         // (a doc-wedged DO keeps answering pings while delivering nothing,
@@ -516,12 +535,11 @@ impl ChatDocHandle {
 
     fn publish_messages(&self) {
         self.mirror_dirty.store(false, Ordering::Release);
-        match self.doc.read_entries() {
-            Ok(entries) => {
-                let joined = join_continuation_entries(entries);
-                // send_replace: update the watch even with no subscribers yet, so a
-                // late subscriber's first borrow sees the current transcript.
-                self.messages_tx.send_replace(joined);
+        match self.doc.read_entry_window(None, TAIL_MESSAGE_COUNT) {
+            Ok(window) => {
+                // send_replace: update the watch even with no subscribers yet,
+                // so a late subscriber's first borrow sees the current tail.
+                self.messages_tx.send_replace(window);
             }
             Err(err) => {
                 tracing::warn!(chat = %self.chat_id, error = %err, "transcript read failed");
@@ -530,13 +548,10 @@ impl ChatDocHandle {
     }
 
     /// Per-commit publish path: unwatched docs just mark the mirror dirty —
-    /// rebuilding a full transcript nobody reads was a per-tick cost on every
-    /// open doc (and kept a second transcript copy hot).
+    /// rebuilding even a bounded tail nobody reads is wasted work.
     fn publish_messages_if_watched(&self) {
         if self.messages_tx.receiver_count() == 0 {
             self.mirror_dirty.store(true, Ordering::Release);
-            // Shrink the stale mirror: watch_messages rebuilds on attach.
-            self.messages_tx.send_replace(Vec::new());
         } else {
             self.publish_messages();
         }
@@ -860,14 +875,13 @@ impl DocHost {
         &self.inner.config.device_id
     }
 
+    /// The session UUID is the only global room address (edge
+    /// `canonicalSessionId`, edge/src/session-room.ts): an imported local
+    /// reference dialing `/session/local-chat-…/ws` hits a route the Worker
+    /// can never serve, so the join loop would retry a permanent 404 forever.
+    /// Those docs stay local regardless of which controller they acquire.
     fn chat_allows_room_join(&self, chat_id: &str) -> bool {
-        if !chat_id.starts_with("local-chat-") {
-            return true;
-        }
-        self.workspace()
-            .and_then(|workspace| workspace.doc().chat(chat_id).ok().flatten())
-            .and_then(|chat| chat.harness_session_id)
-            .is_some_and(|session_id| !session_id.trim().is_empty())
+        !chat_id.starts_with("local-chat-")
     }
 
     fn start_room_join(&self, handle: Arc<ChatDocHandle>) {
@@ -902,7 +916,8 @@ impl DocHost {
                 }) {
                     return;
                 }
-                match RoomClient::connect_via(url.clone(), &chat, room_doc.clone()).await {
+                let cap = match RoomClient::connect_via(url.clone(), &chat, room_doc.clone()).await
+                {
                     Ok(client) => {
                         let Some(handle) = weak.upgrade() else {
                             return;
@@ -922,11 +937,12 @@ impl DocHost {
                             backoff_ms = backoff.as_millis() as u64,
                             "session room join failed; retrying"
                         );
+                        join_retry_cap(&err)
                     }
-                }
+                };
                 tokio::select! {
                     _ = tokio::time::sleep(backoff + crate::workspace_host::join_retry_jitter()) => {
-                        backoff = (backoff * 2).min(crate::workspace_host::JOIN_RETRY_CAP);
+                        backoff = (backoff * 2).min(cap);
                     }
                     _ = wake.recv() => {
                         backoff = crate::workspace_host::JOIN_RETRY_BASE;
@@ -936,8 +952,9 @@ impl DocHost {
         });
     }
 
-    /// Start room supervision for an already-open chat after it acquires a
-    /// native controller. History-only local imports remain local until then.
+    /// Start room supervision for an already-open chat (e.g. once a native run
+    /// claims it). Imported `local-chat-…` docs are never eligible — see
+    /// [`Self::chat_allows_room_join`].
     pub(crate) fn ensure_room_for_chat(&self, chat_id: &str) {
         let handle = lock(&self.inner.handles).get(chat_id).cloned();
         if let Some(handle) = handle {
@@ -1046,11 +1063,12 @@ impl DocHost {
         let sub = doc.doc().subscribe_root(Arc::new(move |_diff| {
             changed_tx.send_modify(|v| *v = v.wrapping_add(1));
         }));
-        // The mirror starts dirty and empty: many opens (command queueing,
-        // drains, nudges) never watch the transcript, and the first
-        // watch_messages attach materializes it on demand.
-        let (messages_tx, _) = watch::channel(Vec::new());
-
+        // The mirror starts dirty and empty: many opens never watch a
+        // transcript, and the first attach materializes the bounded tail.
+        let (messages_tx, _) = watch::channel(SessionEntryWindow {
+            entries: Vec::new(),
+            before: None,
+        });
         let handle = Arc::new(ChatDocHandle {
             chat_id: chat_id.to_string(),
             device_id: self.inner.config.device_id.clone(),
@@ -2653,7 +2671,7 @@ mod authority_tests {
     use loro::LoroMap;
 
     #[tokio::test]
-    async fn history_only_local_chat_requires_native_controller_for_room_join() {
+    async fn imported_local_chats_never_join_edge_rooms() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DocsStore::open(dir.path()).unwrap());
         let workspace = WorkspaceHost::open(
@@ -2685,20 +2703,12 @@ mod authority_tests {
         host.set_workspace(workspace.clone());
 
         assert!(!host.chat_allows_room_join("local-chat-history"));
-        let restarted_host = DocHost::new(
-            store,
-            DocHostConfig {
-                device_id: "device-a".into(),
-                default_harness: HarnessId::Mock,
-                edge: None,
-            },
-        );
-        restarted_host.set_workspace(workspace.clone());
-        assert!(!restarted_host.chat_allows_room_join("local-chat-history"));
+        // Acquiring a native controller must NOT unlock a room join: the edge
+        // routes only session-UUID room names, so `/session/local-chat-…/ws`
+        // is a permanent 404 the join loop would otherwise retry forever.
         workspace.set_chat_harness_session("local-chat-history", "native-a", "/tmp");
-        assert!(host.chat_allows_room_join("local-chat-history"));
-        assert!(restarted_host.chat_allows_room_join("local-chat-history"));
-        assert!(host.chat_allows_room_join("ordinary-chat"));
+        assert!(!host.chat_allows_room_join("local-chat-history"));
+        assert!(host.chat_allows_room_join("f38fe3c9-c235-4e3c-a50e-b2223653dd66"));
     }
 
     #[tokio::test]
@@ -3549,6 +3559,32 @@ mod edge_url_tests {
         assert_eq!(
             url,
             "wss://edge.example/session/session-a/ws?token=secret&device=device-a&deploymentId=deployment-a"
+        );
+    }
+
+    #[test]
+    fn policy_rejections_throttle_while_transport_faults_stay_fast() {
+        use comet_sync::SyncError;
+        // The edge answered: the verdict won't change until the session or
+        // credential does — crawl instead of hammering the Worker.
+        assert_eq!(
+            join_retry_cap(&SyncError::HttpRejected(403)),
+            REJECTED_RETRY_CAP
+        );
+        assert_eq!(
+            join_retry_cap(&SyncError::HttpRejected(404)),
+            REJECTED_RETRY_CAP
+        );
+        // An expired bearer heals on the very next dial (the URL provider
+        // re-reads the token), so 401 keeps the fast reconnect cap…
+        assert_eq!(
+            join_retry_cap(&SyncError::HttpRejected(401)),
+            crate::workspace_host::JOIN_RETRY_CAP
+        );
+        // …and so do genuine transport faults.
+        assert_eq!(
+            join_retry_cap(&SyncError::WebSocket("dial timeout".into())),
+            crate::workspace_host::JOIN_RETRY_CAP
         );
     }
 }

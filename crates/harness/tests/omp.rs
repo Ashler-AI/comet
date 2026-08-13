@@ -86,10 +86,73 @@ async fn model_and_command_catalogs_come_from_omp() {
     );
 
     let commands = harness.commands("").await.expect("command catalog");
-    assert_eq!(commands.len(), 2);
+    assert_eq!(commands.len(), 3);
     assert_eq!(commands[0].name, "ralplan");
     assert_eq!(commands[0].input_hint.as_deref(), Some("goal"));
     assert_eq!(commands[1].name, "security");
+    assert_eq!(commands[2].name, "goal");
+    assert_eq!(
+        commands[2]
+            .subcommands
+            .iter()
+            .map(|subcommand| subcommand.name.as_str())
+            .collect::<Vec<_>>(),
+        ["set", "show", "pause", "resume", "drop", "budget"]
+    );
+}
+
+#[tokio::test]
+async fn goal_command_ack_refreshes_state_without_goal_updated() {
+    let _env = env_lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("OMP_ARGV_LOG", temp.path().join("argv"));
+        std::env::set_var("OMP_OMIT_GOAL_EVENTS", "1");
+    }
+    let harness = OmpHarness::new().with_executable(fixture_path());
+    let mut run_request = request(None);
+    run_request.prompt = "/goal set Persistent editor indicator".into();
+    let stream = harness
+        .run(run_request, controls())
+        .await
+        .expect("run starts");
+    let events = tokio::time::timeout(
+        Duration::from_secs(10),
+        stream
+            .map(|event| event.expect("valid RPC event"))
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .expect("goal command completes");
+
+    let goal = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolCall {
+                id,
+                call:
+                    comet_proto::ToolCall::Unknown {
+                        input: Some(input), ..
+                    },
+            } if id == comet_proto::OMP_GOAL_STATE_CALL_ID => input.get("goal"),
+            _ => None,
+        })
+        .next_back()
+        .expect("refreshed goal state");
+    assert_eq!(
+        goal.get("objective").and_then(serde_json::Value::as_str),
+        Some("Persistent editor indicator")
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        }
+    )));
+    unsafe {
+        std::env::remove_var("OMP_OMIT_GOAL_EVENTS");
+    }
 }
 
 #[tokio::test]
@@ -269,7 +332,7 @@ async fn selected_model_and_reasoning_ride_the_spawn_flags() {
     }
     let harness = OmpHarness::new().with_executable(fixture_path());
     let mut request = request(None);
-    request.model = Some("openai-codex/gpt-5.6-sol".into());
+    request.model = Some("openrouter/~deepseek/deepseek-v4-flash-latest".into());
     request.reasoning = Some(ReasoningLevel::XHigh);
     let stream = harness.run(request, controls()).await.expect("run starts");
     tokio::time::timeout(
@@ -283,7 +346,7 @@ async fn selected_model_and_reasoning_ride_the_spawn_flags() {
 
     let argv = std::fs::read_to_string(argv_log).unwrap();
     assert!(
-        argv.contains("--model\nopenai-codex/gpt-5.6-sol\n"),
+        argv.contains("--model\nopenrouter/~deepseek/deepseek-v4-flash-latest\n"),
         "model must be pinned at spawn: {argv}"
     );
     assert!(
@@ -366,6 +429,105 @@ async fn active_resume_is_rejected_before_a_second_omp_process_starts() {
         "the OMP executable must not start while another writer is active"
     );
     unsafe {
+        std::env::remove_var("OMP_WRITER_STATE");
+    }
+}
+
+#[tokio::test]
+async fn hung_abort_is_force_killed_before_the_session_can_resume() {
+    let _env = env_lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let argv_log = temp.path().join("argv");
+    let pid_log = temp.path().join("pid");
+    let session_dir = temp.path().join("sessions");
+    write_omp_session(&session_dir, "hung-session");
+    unsafe {
+        std::env::set_var("OMP_ARGV_LOG", &argv_log);
+        std::env::set_var("OMP_RPC_PID_LOG", &pid_log);
+        std::env::set_var("OMP_WRITER_STATE", "auto");
+        std::env::set_var("OMP_STEER_SCENARIO", "1");
+        std::env::set_var("OMP_HANG_ABORT", "1");
+    }
+    let harness = OmpHarness::new()
+        .with_executable(fixture_path())
+        .with_session_dir(&session_dir)
+        .with_session_writer_probe(fixture_path())
+        .with_interrupt_grace(Duration::from_millis(50));
+    let interrupt = CancellationToken::new();
+    let (_steer_tx, steering) = mpsc::channel(4);
+    let run_controls = RunControls {
+        request_input: Box::new(|_| {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(Vec::new());
+            rx
+        }),
+        steering,
+        interrupt: interrupt.clone(),
+        context: None,
+    };
+    let mut stream = harness
+        .run(request(Some("hung-session")), run_controls)
+        .await
+        .expect("first resume starts");
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("session starts")
+            .expect("stream remains open")
+            .expect("valid RPC event");
+        if matches!(event, AgentEvent::SessionStarted { .. }) {
+            break;
+        }
+    }
+
+    let error = match harness.run(request(Some("hung-session")), controls()).await {
+        Ok(_) => panic!("active OMP session started a second writer"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("already running"));
+
+    interrupt.cancel();
+    let events = tokio::time::timeout(
+        Duration::from_secs(2),
+        stream
+            .map(|event| event.expect("valid interrupted event"))
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .expect("hung abort is force-killed within the interrupt deadline");
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Interrupted,
+            ..
+        })
+    ));
+
+    unsafe {
+        std::env::remove_var("OMP_HANG_ABORT");
+        std::env::remove_var("OMP_STEER_SCENARIO");
+    }
+    let resumed = harness
+        .run(request(Some("hung-session")), controls())
+        .await
+        .expect("session resumes after interrupt teardown");
+    let resumed_events = tokio::time::timeout(
+        Duration::from_secs(10),
+        resumed
+            .map(|event| event.expect("valid resumed event"))
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .expect("resumed turn completes");
+    assert!(matches!(
+        resumed_events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+    unsafe {
+        std::env::remove_var("OMP_RPC_PID_LOG");
         std::env::remove_var("OMP_WRITER_STATE");
     }
 }

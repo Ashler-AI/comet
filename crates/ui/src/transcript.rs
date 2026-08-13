@@ -34,7 +34,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use comet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
+use comet_doc::{
+    MessagePart, MessageRole, MessageStatus, SessionMessageEntry, TRANSCRIPT_TRUNCATED_PREFIX,
+    TRANSCRIPT_TRUNCATED_SUFFIX,
+};
 use comet_proto::ToolCall;
 
 use crate::markdown::highlight::{Lang, LineCarry, Token, lang_for_tag, tokenize_line};
@@ -73,8 +76,8 @@ const CHIPS_TOP_PAD: f32 = 2.0;
 /// spec's 200ms plus margin. Past this the fold renders statically — an armed
 /// tween replays on remount, i.e. on every scroll-back-into-view.
 const FOLD_TWEEN_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
-/// User-bubble attachment thumbnails (user-attachments.tsx): 112×80 thumbs in
-/// a FIXED-height strip (load-state flips never shift the virtualizer).
+/// User-bubble attachment cards. Every card has a fixed footprint, so wrapped
+/// rows stay stable while image load states change.
 pub const ATT_THUMB_W: f32 = 112.0;
 pub const ATT_THUMB_H: f32 = 80.0;
 pub const ATT_STRIP_H: f32 = ATT_THUMB_H + 10.0;
@@ -223,8 +226,8 @@ pub enum RowKind {
         /// Image refs parsed out of the message text: thumbnails load from the
         /// owning device via ReadAttachmentChunk.
         attachments: Arc<Vec<crate::attachments::UserImageAttachment>>,
-        /// Large clipboard pastes uploaded as readable text files.
-        text_attachments: Arc<Vec<crate::attachments::UserTextAttachment>>,
+        /// Non-image files uploaded to the agent host.
+        file_attachments: Arc<Vec<crate::attachments::UserFileAttachment>>,
         /// Optimistic echo not yet confirmed by a doc frame.
         pending: bool,
         delivery: UserDelivery,
@@ -315,6 +318,49 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
     fnv1a(&acc)
 }
 
+fn push_markdown_rows(
+    rows: &mut Vec<Row>,
+    entry: &SessionMessageEntry,
+    entry_id: &SharedString,
+    part_id: &str,
+    text: &str,
+    streaming: bool,
+    parse: &mut dyn FnMut(&str, &str) -> Arc<BlockTree>,
+) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let key = format!("{}#{}", entry.id, part_id);
+    let tree = parse(&key, text);
+    for block_ix in 0..tree.blocks.len() {
+        let range = &tree.blocks[block_ix].range;
+        let end = range.end.min(text.len());
+        let bytes = text
+            .as_bytes()
+            .get(range.start.min(end)..end)
+            .unwrap_or_default();
+        let version = (fnv1a(bytes) << 1) | streaming as u64;
+        rows.push(Row {
+            id: format!("{key}.{block_ix}").into(),
+            version,
+            turn_start: false,
+            entry_id: entry_id.clone(),
+            timestamp: None,
+            kind: if streaming {
+                RowKind::LiveMarkdown {
+                    tree: tree.clone(),
+                    block_ix,
+                }
+            } else {
+                RowKind::Markdown {
+                    tree: tree.clone(),
+                    block_ix,
+                }
+            },
+        });
+    }
+}
+
 /// Build the block rows of one (already continuation-joined) entry.
 ///
 /// `parse` maps `(part_key, text)` to a block tree — the entity supplies
@@ -334,14 +380,21 @@ pub fn rows_for_entry(
             .parts
             .iter()
             .filter_map(|p| match p {
-                MessagePart::Text { text, .. } => Some(text.as_str()),
+                MessagePart::Text { text, .. } => Some(text.clone()),
+                MessagePart::TextWindow {
+                    text,
+                    omitted_prefix_bytes,
+                    ..
+                } => Some(format!(
+                    "{TRANSCRIPT_TRUNCATED_PREFIX}{omitted_prefix_bytes}{TRANSCRIPT_TRUNCATED_SUFFIX}{text}"
+                )),
                 _ => None,
             })
             .collect::<Vec<_>>()
             .join("\n\n");
-        // Attachment refs ride the plain text (the `withAttachments`
-        // transport); split them back out for the thumbnail strip.
-        let parsed = crate::attachments::parse_user_message_images(&raw);
+        // Attachment refs ride the plain text transport; split them back out
+        // for the image thumbnail and file-card strips.
+        let parsed = crate::attachments::parse_user_message_attachments(&raw);
         // File mentions render as chips here too, not just in the composer.
         // The projection is pure over the text, so the raw-length row version
         // below stays a valid cache/diff key.
@@ -362,7 +415,7 @@ pub fn rows_for_entry(
                 text: text.into(),
                 mentions: Arc::new(mentions),
                 attachments: Arc::new(parsed.attachments),
-                text_attachments: Arc::new(parsed.text_attachments),
+                file_attachments: Arc::new(parsed.file_attachments),
                 pending,
                 delivery,
             },
@@ -408,6 +461,9 @@ pub fn rows_for_entry(
                 is_error,
                 resolved,
             } => {
+                if id == comet_proto::OMP_GOAL_STATE_CALL_ID {
+                    continue;
+                }
                 pending_group.push(ToolItem {
                     id: id.clone().into(),
                     call: call.clone(),
@@ -425,45 +481,21 @@ pub fn rows_for_entry(
                 );
                 match other {
                     MessagePart::Text { id: part_id, text } => {
-                        if text.trim().is_empty() {
-                            continue;
-                        }
-                        let key = format!("{}#{}", entry.id, part_id);
-                        let tree = parse(&key, text);
-                        // Live and completed parts split identically — one row
-                        // per top-level block, same ids, so the live→complete
-                        // handoff never changes row identity. The version is a
-                        // content hash of the block's bytes (LSB = streaming),
-                        // so a commit only splices rows whose bytes actually
-                        // changed — the settled prefix of a live reply is
-                        // untouched (and its render caches stay valid).
-                        for block_ix in 0..tree.blocks.len() {
-                            let range = &tree.blocks[block_ix].range;
-                            let end = range.end.min(text.len());
-                            let bytes = text
-                                .as_bytes()
-                                .get(range.start.min(end)..end)
-                                .unwrap_or_default();
-                            let version = (fnv1a(bytes) << 1) | streaming as u64;
-                            rows.push(Row {
-                                id: format!("{key}.{block_ix}").into(),
-                                version,
-                                turn_start: false,
-                                entry_id: entry_id.clone(),
-                                timestamp: None,
-                                kind: if streaming {
-                                    RowKind::LiveMarkdown {
-                                        tree: tree.clone(),
-                                        block_ix,
-                                    }
-                                } else {
-                                    RowKind::Markdown {
-                                        tree: tree.clone(),
-                                        block_ix,
-                                    }
-                                },
-                            });
-                        }
+                        push_markdown_rows(
+                            &mut rows, entry, &entry_id, part_id, text, streaming, parse,
+                        );
+                    }
+                    MessagePart::TextWindow {
+                        id: part_id,
+                        text,
+                        omitted_prefix_bytes,
+                    } => {
+                        let visible = format!(
+                            "{TRANSCRIPT_TRUNCATED_PREFIX}{omitted_prefix_bytes}{TRANSCRIPT_TRUNCATED_SUFFIX}{text}"
+                        );
+                        push_markdown_rows(
+                            &mut rows, entry, &entry_id, part_id, &visible, streaming, parse,
+                        );
                     }
                     MessagePart::Input {
                         id: part_id,
@@ -888,6 +920,15 @@ struct CachedRows {
     rows: Vec<Row>,
 }
 
+const RENDER_WINDOW_CHAT_LIMIT: usize = 8;
+const RENDER_WINDOW_ROW_LIMIT: usize = 4096;
+
+struct CachedTranscriptRender {
+    rows: Vec<Row>,
+    row_cache: HashMap<String, CachedRows>,
+    tree_cache: HashMap<String, (usize, Arc<BlockTree>)>,
+}
+
 #[derive(Default, Clone, Copy)]
 struct FoldState {
     /// User pin (click); `None` follows the auto-open rule.
@@ -940,6 +981,8 @@ pub struct Transcript {
     row_cache: HashMap<String, CachedRows>,
     live_parsers: HashMap<String, IncrementalParser>,
     tree_cache: HashMap<String, (usize, Arc<BlockTree>)>,
+    render_windows: HashMap<String, CachedTranscriptRender>,
+    render_window_lru: Vec<String>,
     folds: HashMap<SharedString, FoldState>,
     /// Expanded chips (tool part ids) — pane state, cleared on chat switch
     /// like `folds`.
@@ -1032,6 +1075,8 @@ impl Transcript {
             row_cache: HashMap::new(),
             live_parsers: HashMap::new(),
             tree_cache: HashMap::new(),
+            render_windows: HashMap::new(),
+            render_window_lru: Vec::new(),
             folds: HashMap::new(),
             expanded_tools: std::collections::HashSet::new(),
             tool_details: HashMap::new(),
@@ -1130,6 +1175,10 @@ impl Transcript {
                 let distance = this.distance_from_bottom();
                 let previous = this.last_scroll_distance;
                 this.last_scroll_distance = distance;
+                if this.list.logical_scroll_top().item_ix == 0 {
+                    this.state
+                        .update(cx, |state, cx| state.load_older_transcript(cx));
+                }
                 if distance > previous + 1.0 && distance > AT_BOTTOM_PX {
                     // User input moving away from the bottom breaks the pin.
                     // Content growth never lands here — it doesn't fire the
@@ -1273,22 +1322,55 @@ impl Transcript {
 
     /// Rebuild rows from app state; splice minimal ranges into the list.
     fn sync(&mut self, cx: &mut Context<Self>) {
-        let (selected, entries, echoes) = {
-            let s = self.state.read(cx);
-            (
-                s.selected_chat.clone(),
-                s.transcript.clone(),
-                s.pending_echoes().to_vec(),
-            )
-        };
-
+        let state = self.state.clone();
+        let state = state.read(cx);
+        let selected = state.selected_chat.clone();
+        let echoes = state.pending_echoes().to_vec();
+        let entries = &state.transcript;
         let attached = selected != self.chat_id;
         if attached {
+            if let Some(previous) = self.chat_id.take()
+                && !self.rows.is_empty()
+            {
+                self.render_windows.insert(
+                    previous.clone(),
+                    CachedTranscriptRender {
+                        rows: std::mem::take(&mut self.rows),
+                        row_cache: std::mem::take(&mut self.row_cache),
+                        tree_cache: std::mem::take(&mut self.tree_cache),
+                    },
+                );
+                self.render_window_lru.retain(|id| id != &previous);
+                self.render_window_lru.push(previous);
+                while self.render_windows.len() > RENDER_WINDOW_CHAT_LIMIT
+                    || self
+                        .render_windows
+                        .values()
+                        .map(|cached| cached.rows.len())
+                        .sum::<usize>()
+                        > RENDER_WINDOW_ROW_LIMIT
+                {
+                    let Some(oldest) = self.render_window_lru.first().cloned() else {
+                        break;
+                    };
+                    self.render_window_lru.remove(0);
+                    self.render_windows.remove(&oldest);
+                }
+            }
             self.chat_id = selected;
-            self.rows.clear();
-            self.row_cache.clear();
+            if let Some(chat_id) = self.chat_id.as_deref()
+                && let Some(cached) = self.render_windows.remove(chat_id)
+            {
+                self.render_window_lru.retain(|id| id != chat_id);
+                self.rows = cached.rows;
+                self.row_cache = cached.row_cache;
+                self.tree_cache = cached.tree_cache;
+            } else {
+                self.rows.clear();
+                self.row_cache.clear();
+                self.tree_cache.clear();
+            }
             self.live_parsers.clear();
-            self.tree_cache.clear();
             self.folds.clear();
             self.expanded_tools.clear();
             self.tool_details.clear();
@@ -1296,7 +1378,7 @@ impl Transcript {
             self.veils.clear();
             self.render_cache.borrow_mut().clear();
             self.highlights.entries.clear();
-            self.list.reset(0);
+            self.list.reset(self.rows.len());
             self.pinned = true;
             self.spring.reset();
             self.spring_last_tick = None;
@@ -1306,7 +1388,7 @@ impl Transcript {
         }
 
         let mut new_rows: Vec<Row> = Vec::new();
-        for entry in &entries {
+        for entry in entries {
             new_rows.extend(self.rows_for(entry, false));
         }
         for echo in &echoes {
@@ -1740,15 +1822,15 @@ impl Transcript {
         let device_ids = self.attachment_device_ids(cx);
         let mut strip = div()
             .w_full()
-            .h(px(ATT_STRIP_H))
+            .min_h(px(ATT_STRIP_H))
             .flex()
             .flex_row()
+            .flex_wrap()
             .justify_end()
             .items_start()
             .gap(px(8.0))
-            .overflow_hidden()
             .px(px(4.0))
-            .pt(px(4.0));
+            .py(px(4.0));
         for (aix, att) in atts.iter().enumerate() {
             let state = self.attachment_state(&device_ids, &att.path, cx);
             let frame = div()
@@ -1807,28 +1889,28 @@ impl Transcript {
         strip.into_any_element()
     }
 
-    /// Right-aligned cards for large clipboard pastes uploaded as text files.
-    fn render_user_text_attachments(
+    /// Right-aligned cards for non-image files.
+    fn render_user_file_attachments(
         &self,
         row_id: &SharedString,
-        atts: &[crate::attachments::UserTextAttachment],
+        atts: &[crate::attachments::UserFileAttachment],
         theme: &Theme,
     ) -> AnyElement {
         let mut strip = div()
             .w_full()
-            .h(px(ATT_STRIP_H))
+            .min_h(px(ATT_STRIP_H))
             .flex()
             .flex_row()
+            .flex_wrap()
             .justify_end()
             .items_start()
             .gap(px(8.0))
-            .overflow_hidden()
             .px(px(4.0))
-            .pt(px(4.0));
+            .py(px(4.0));
         for (aix, att) in atts.iter().enumerate() {
             strip = strip.child(
                 div()
-                    .id(SharedString::from(format!("{row_id}#text-att{aix}")))
+                    .id(SharedString::from(format!("{row_id}#file-att{aix}")))
                     .flex_none()
                     .w(px(ATT_THUMB_W))
                     .h(px(ATT_THUMB_H))
@@ -1853,7 +1935,7 @@ impl Transcript {
                             .truncate()
                             .text_size(px(10.0))
                             .text_color(theme.text_muted)
-                            .child(att.name.clone()),
+                            .child(crate::attachments::display_basename(&att.name).to_string()),
                     ),
             );
         }
@@ -1942,12 +2024,12 @@ impl Transcript {
                 text,
                 mentions,
                 attachments,
-                text_attachments,
+                file_attachments,
                 pending,
                 delivery,
             } => {
                 let attachments = attachments.clone();
-                let text_attachments = text_attachments.clone();
+                let file_attachments = file_attachments.clone();
                 let text = text.clone();
                 let mentions = mentions.clone();
                 let pending = *pending;
@@ -1958,10 +2040,10 @@ impl Transcript {
                 if !attachments.is_empty() {
                     column = column.child(self.render_user_attachments(&row.id, &attachments, cx));
                 }
-                if !text_attachments.is_empty() {
-                    column = column.child(self.render_user_text_attachments(
+                if !file_attachments.is_empty() {
+                    column = column.child(self.render_user_file_attachments(
                         &row.id,
-                        &text_attachments,
+                        &file_attachments,
                         &theme,
                     ));
                 }
@@ -2011,6 +2093,12 @@ impl Transcript {
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
                     image: Some(self.inline_image_ui(cx)),
+                    link_cwd: self
+                        .state
+                        .read(cx)
+                        .selected_chat_row()
+                        .and_then(|chat| chat.cwd.clone())
+                        .map(SharedString::from),
                 };
                 let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                 render::render_block(
@@ -2055,6 +2143,12 @@ impl Transcript {
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
                     image: Some(self.inline_image_ui(cx)),
+                    link_cwd: self
+                        .state
+                        .read(cx)
+                        .selected_chat_row()
+                        .and_then(|chat| chat.cwd.clone())
+                        .map(SharedString::from),
                 };
                 let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                 let timer = frame_stats_enabled().then(Instant::now);
@@ -3251,6 +3345,14 @@ mod tests {
         }
     }
 
+    fn text_window(id: &str, text: &str, omitted_prefix_bytes: usize) -> MessagePart {
+        MessagePart::TextWindow {
+            id: id.into(),
+            text: text.into(),
+            omitted_prefix_bytes,
+        }
+    }
+
     fn tool_part(id: &str, command: &str) -> MessagePart {
         MessagePart::Tool {
             id: id.into(),
@@ -3441,6 +3543,34 @@ mod tests {
     }
 
     #[test]
+    fn bounded_text_rows_show_omitted_byte_marker() {
+        let assistant = assistant(
+            "a-window",
+            MessageStatus::Complete,
+            vec![text_window("t0", "visible tail", 4096)],
+        );
+        let assistant_rows = rows_for_entry(&assistant, false, &mut parse);
+        let RowKind::Markdown { tree, block_ix } = &assistant_rows[0].kind else {
+            panic!("expected markdown omission marker");
+        };
+        let Block::Paragraph { runs } = &tree.blocks[*block_ix].block else {
+            panic!("expected marker paragraph");
+        };
+        assert!(runs.iter().any(|run| run.text.contains("4096 bytes")));
+
+        let mut user = assistant;
+        user.id = "u-window".into();
+        user.role = MessageRole::User;
+        user.status = None;
+        let user_rows = rows_for_entry(&user, false, &mut parse);
+        let RowKind::User { text, .. } = &user_rows[0].kind else {
+            panic!("expected user omission marker");
+        };
+        assert!(text.contains("Earlier output not loaded: 4096 bytes"));
+        assert!(text.contains("visible tail"));
+    }
+
+    #[test]
     fn user_rows_preserve_steered_and_queued_delivery_states() {
         let mut entry = assistant("u-delivery", MessageStatus::Complete, vec![]);
         entry.role = MessageRole::User;
@@ -3483,7 +3613,7 @@ mod tests {
         let RowKind::User {
             text,
             attachments,
-            text_attachments,
+            file_attachments,
             ..
         } = &rows[0].kind
         else {
@@ -3493,8 +3623,8 @@ mod tests {
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].path, "/data/uploads/ab12-red.png");
         assert_eq!(attachments[0].name, "ab12-red.png");
-        assert_eq!(text_attachments.len(), 1);
-        assert_eq!(text_attachments[0].name, "pasted-text.txt");
+        assert_eq!(file_attachments.len(), 1);
+        assert_eq!(file_attachments[0].name, "pasted-text.txt");
 
         // Image-only send: no bubble text, refs parsed.
         let only = crate::attachments::with_attachments("", &["/a/p.png".to_string()]);

@@ -195,10 +195,11 @@ pub fn run_app(config: UiConfig) {
         // doc snapshots before the process exits (remote engines outlive us).
         let quit_state = state.clone();
         cx.on_app_quit(move |cx| {
-            let shutdown =
-                quit_state.read(cx).engine().cloned().map(|handle| {
-                    gpui_tokio::Tokio::spawn(cx, async move { handle.shutdown().await })
-                });
+            // `begin_shutdown` marks the quit first so the engine's closing
+            // streams can't trigger the reconnect supervisor mid-teardown.
+            let shutdown = quit_state
+                .update(cx, |s, _| s.begin_shutdown())
+                .map(|handle| gpui_tokio::Tokio::spawn(cx, async move { handle.shutdown().await }));
             async move {
                 if let Some(task) = shutdown {
                     let _ = task.await;

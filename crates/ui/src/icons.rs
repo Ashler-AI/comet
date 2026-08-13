@@ -110,8 +110,11 @@ icon_assets![
     (CLOSE, "close"),
     (STOP, "stop"),
     (CHECK, "check"),
+    (STAR, "star"),
+    (STAR_BOLD, "star-bold"),
     (COPY, "copy"),
-    (COMET_LOGO, "comet-logo"),
+    // GPUI tints SVGs, so use the monochrome Crew mark.
+    (CREW_MARK, "crew-mark"),
     // Harness brand marks (icons.tsx).
     (CLAUDE_MARK, "claude-mark"),
     (OPENAI_MARK, "openai-mark"),

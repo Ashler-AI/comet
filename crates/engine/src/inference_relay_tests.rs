@@ -3,9 +3,8 @@ mod tests {
     use super::*;
     use crate::scaffold::AgentInferenceGrantBinding;
     use async_trait::async_trait;
-    use http_body_util::Full;
-    use hyper::body::Incoming;
-    use hyper::service::service_fn;
+    use http_body_util::{BodyExt, Full, StreamBody};
+    use hyper::{body::Frame, body::Incoming, service::service_fn};
     use serde_json::Value;
     use tokio::sync::mpsc;
 
@@ -286,6 +285,223 @@ mod tests {
         origin
     }
 
+    async fn transport_flaky_control_plane(
+        captured: mpsc::UnboundedSender<FailoverCapture>,
+    ) -> String {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let captured = captured.clone();
+                let attempts = attempts.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |request: Request<Incoming>| {
+                        let captured = captured.clone();
+                        let attempts = attempts.clone();
+                        async move {
+                            let path = request.uri().path().to_string();
+                            let headers = request.headers().clone();
+                            let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                            let body = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
+                            let expires_at =
+                                (Utc::now() + TimeDelta::minutes(5)).to_rfc3339();
+                            if path == "/api/agent-auth/grants" {
+                                return Ok(Response::builder()
+                                    .status(StatusCode::CREATED)
+                                    .header(CONTENT_TYPE, "application/json")
+                                    .body(Full::new(Bytes::from(
+                                        json!({
+                                            "token": "remote-account-1",
+                                            "expiresAt": expires_at,
+                                            "binding": {
+                                                "ownerSubject": "owner-1",
+                                                "logicalSessionId": "session-transport",
+                                                "provider": "openai",
+                                                "model": "gpt-5.6-sol",
+                                                "harness": "codex",
+                                                "routingMode": body["routingMode"],
+                                                "requestedAccountId": body["requestedAccountId"],
+                                                "source": "comet-local",
+                                                "lifecycleEpoch": 1,
+                                                "environment": "local",
+                                                "backend": "oauth",
+                                                "accountId": "account-1",
+                                                "accountGeneration": 1,
+                                            }
+                                        })
+                                        .to_string(),
+                                    )))
+                                    .unwrap());
+                            }
+                            if path == "/api/agent-auth/v1/responses" {
+                                captured
+                                    .send(FailoverCapture {
+                                        path,
+                                        authorization: headers[AUTHORIZATION]
+                                            .to_str()
+                                            .unwrap()
+                                            .to_string(),
+                                        request_id: headers
+                                            .get("x-agent-auth-request-id")
+                                            .and_then(|value| value.to_str().ok())
+                                            .map(str::to_string),
+                                        routing_mode: headers["x-agent-auth-routing-mode"]
+                                            .to_str()
+                                            .unwrap()
+                                            .to_string(),
+                                        requested_account_id: headers
+                                            .get("x-agent-auth-requested-account-id")
+                                            .and_then(|value| value.to_str().ok())
+                                            .map(str::to_string),
+                                        body,
+                                    })
+                                    .unwrap();
+                                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                                    return Err(std::io::Error::other(
+                                        "simulated connection close before response headers",
+                                    ));
+                                }
+                                return Ok(Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "application/json")
+                                    .body(Full::new(Bytes::from_static(b"{\"ok\":true}")))
+                                    .unwrap());
+                            }
+                            panic!("unexpected transport control-plane path {path}");
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        origin
+    }
+
+    #[tokio::test]
+    async fn retries_one_unstarted_transport_failure_on_the_same_account() {
+        let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
+        let origin = transport_flaky_control_plane(captured_tx).await;
+        let client = ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap();
+        let relay = InferenceRelay::start(client).unwrap();
+        let route = relay
+            .prepare(
+                "session-transport",
+                HarnessId::Codex,
+                Some("gpt-5.6-sol"),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let payload = json!({ "model": "gpt-5.6-sol", "input": "retry transport" });
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/responses", route.base_url))
+            .bearer_auth(&route.token)
+            .header("x-request-id", "transport-request")
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.json::<Value>().await.unwrap(), json!({ "ok": true }));
+
+        let first = captured_rx.recv().await.unwrap();
+        let second = captured_rx.recv().await.unwrap();
+        assert_eq!(first.path, "/api/agent-auth/v1/responses");
+        assert_eq!(first.authorization, "Bearer remote-account-1");
+        assert_eq!(second.authorization, first.authorization);
+        assert_eq!(first.request_id.as_deref(), Some("transport-request"));
+        assert_eq!(second.request_id, first.request_id);
+        assert_eq!(second.body, first.body);
+        assert_eq!(first.body, payload);
+        assert!(captured_rx.try_recv().is_err());
+    }
+
+    async fn streaming_control_plane(
+        captured: mpsc::UnboundedSender<CapturedRequest>,
+        revoked: Arc<std::sync::atomic::AtomicBool>,
+    ) -> String {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let captured = captured.clone();
+                let revoked = revoked.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |request: Request<Incoming>| {
+                        let captured = captured.clone();
+                        let revoked = revoked.clone();
+                        async move {
+                            let path = request.uri().path().to_string();
+                            let headers = request.headers().clone();
+                            let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                            if path == "/api/agent-auth/grants/revoke" {
+                                revoked.store(true, std::sync::atomic::Ordering::SeqCst);
+                                let body = futures::stream::once(async {
+                                    Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"{\"ok\":true}")))
+                                });
+                                return Ok::<_, Infallible>(Response::new(BodyExt::boxed(StreamBody::new(body))));
+                            }
+                            if path == "/api/agent-auth/v1/responses" {
+                                captured
+                                    .send(CapturedRequest {
+                                        authorization: headers[AUTHORIZATION].to_str().unwrap().to_string(),
+                                        api_key: None,
+                                        owner_subject: headers["x-agent-auth-owner-subject"].to_str().unwrap().to_string(),
+                                        session_id: headers["x-agent-auth-session-id"].to_str().unwrap().to_string(),
+                                        request_id: headers["x-agent-auth-request-id"].to_str().unwrap().to_string(),
+                                        routing_mode: headers["x-agent-auth-routing-mode"].to_str().unwrap().to_string(),
+                                        requested_account_id: None,
+                                        body: serde_json::from_slice(&bytes).unwrap(),
+                                    })
+                                    .unwrap();
+                                let body = futures::stream::once(async {
+                                    Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"data: first\n\n")))
+                                })
+                                .chain(futures::stream::pending());
+                                return Ok(Response::new(BodyExt::boxed(StreamBody::new(body))));
+                            }
+                            let expires_at = (Utc::now() + TimeDelta::minutes(5)).to_rfc3339();
+                            let body = json!({
+                                "token": "remote-agent-auth-grant",
+                                "expiresAt": expires_at,
+                                "binding": {
+                                    "ownerSubject": "owner-1",
+                                    "logicalSessionId": "session-1",
+                                    "provider": "openai",
+                                    "model": "gpt-5.6-sol",
+                                    "harness": "codex",
+                                    "routingMode": "automatic",
+                                    "requestedAccountId": null,
+                                    "source": "comet-local",
+                                    "lifecycleEpoch": 1,
+                                    "environment": "local",
+                                    "backend": "oauth",
+                                    "accountId": "account-1",
+                                    "accountGeneration": 1
+                                }
+                            });
+                            let body = futures::stream::once(async move {
+                                Ok::<_, Infallible>(Frame::data(Bytes::from(body.to_string())))
+                            });
+                            Ok(Response::new(BodyExt::boxed(StreamBody::new(body))))
+                        }
+                    });
+                    hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+        origin
+    }
+
     #[tokio::test]
     async fn issues_exact_grant_streams_through_loopback_and_revokes() {
         let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
@@ -361,6 +577,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_removal_ends_an_active_inference_stream() {
+        let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
+        let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let origin = streaming_control_plane(captured_tx, revoked.clone()).await;
+        let client = ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap();
+        let relay = InferenceRelay::start(client).unwrap();
+        let route = relay
+            .prepare(
+                "session-1",
+                HarnessId::Codex,
+                Some("gpt-5.6-sol"),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let route_to_remove = route.clone();
+        let http = reqwest::Client::new();
+        let response = http
+            .post(format!("{}/v1/responses", route.base_url))
+            .bearer_auth(&route.token)
+            .header("x-request-id", "request-cancel")
+            .json(&json!({ "model": "gpt-5.6-sol", "input": "hello" }))
+            .send()
+            .await
+            .unwrap();
+        captured_rx.recv().await.unwrap();
+
+        relay.remove(&route_to_remove.token).await;
+
+        assert!(revoked.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(response.bytes().await.unwrap(), Bytes::from_static(b"data: first\n\n"));
+    }
+
+    #[tokio::test]
     async fn streams_a_generic_429_without_reporting_or_replaying() {
         let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
         let generic_failure = json!({ "error": { "code": "rate_limit_exceeded" } });
@@ -415,7 +666,13 @@ mod tests {
             captured_tx,
             vec![(
                 StatusCode::TOO_MANY_REQUESTS,
-                json!({ "error": { "code": "usage_limit_reached" } }),
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "rate_limit_error",
+                        "message": "This request would exceed your account's rate limit."
+                    }
+                }),
             )],
         )
         .await;

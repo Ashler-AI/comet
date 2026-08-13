@@ -719,11 +719,11 @@ async fn two_authenticated_engines_sync_workspace_streams_and_reconnect_backfill
         loop {
             {
                 let messages = messages_b.borrow_and_update();
-                saw_remote_streaming |= messages.iter().any(|entry| {
+                saw_remote_streaming |= messages.entries.iter().any(|entry| {
                     entry.role == MessageRole::Assistant
                         && entry.status == Some(MessageStatus::Streaming)
                 });
-                let complete = messages.iter().any(|entry| {
+                let complete = messages.entries.iter().any(|entry| {
                     entry.role == MessageRole::Assistant
                         && entry.status == Some(MessageStatus::Complete)
                         && entry_contains(entry, "streamed reply")

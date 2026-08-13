@@ -156,6 +156,12 @@ const MAX_FULL_RESYNCS: u32 = 3;
 pub enum SyncError {
     #[error("websocket: {0}")]
     WebSocket(String),
+    /// The server answered the upgrade with a plain HTTP status. Unlike a
+    /// transport fault this is a policy answer (missing room, foreign scope,
+    /// expired credential) that stays identical until something about the
+    /// room or caller changes — callers may throttle accordingly.
+    #[error("websocket: HTTP error: {0}")]
+    HttpRejected(u16),
     #[error("protocol: {0}")]
     Protocol(String),
     #[error("join refused: {0}")]
@@ -308,7 +314,12 @@ impl Connector for WsConnector {
             let url = provider.url().await?;
             let (ws, _) = tokio_tungstenite::connect_async(&url)
                 .await
-                .map_err(|e| SyncError::WebSocket(e.to_string()))?;
+                .map_err(|e| match e {
+                    tokio_tungstenite::tungstenite::Error::Http(response) => {
+                        SyncError::HttpRejected(response.status().as_u16())
+                    }
+                    e => SyncError::WebSocket(e.to_string()),
+                })?;
             let (out_tx, out_rx) = mpsc::channel(64);
             let (in_tx, in_rx) = mpsc::channel(64);
             tokio::spawn(pump(ws, out_rx, in_tx));

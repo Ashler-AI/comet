@@ -1,5 +1,13 @@
 # Packaging
 
+App icons are sourced from `assets/brand`:
+
+| Target | Source |
+| --- | --- |
+| macOS `.icns` | `assets/brand/png/crew-icon-macos-1024.png` |
+| Linux hicolor | `assets/brand/png/crew-icon-1024.png` and `assets/brand/crew-icon.svg` |
+| iOS AppIcon | `assets/brand/png/crew-icon-1024.png` copied to `Assets.xcassets/AppIcon.appiconset/AppIcon1024.png` |
+
 ## Linux (implemented)
 
 ```sh
@@ -11,9 +19,9 @@ Produces `target/package/comet-<version>-linux-<arch>.tar.gz` containing:
 
 - `comet` — the binary (headed by default; `comet headless` runs the engine alone)
 - `comet.desktop` — XDG desktop entry
-- `comet.png` — 1024×1024 app icon (the comet mark from the original app;
-  vector source `comet.svg`)
-- `install.sh` — installs into `~/.local/{bin,share/applications,share/icons}`
+- `comet.png` / `comet.svg` — raster and scalable Crew app icons
+- `install.sh` — installs into `~/.local/{bin,share/applications,share/icons}`,
+  including both the `1024x1024` and scalable hicolor icon paths
 
 The release profile in the root `Cargo.toml` sets `lto = "thin"` and
 `strip = "symbols"` for distribution builds.
@@ -45,10 +53,12 @@ cross-build from Linux):
    sed "s/__VERSION__/$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')/" \
      dist/macos/Info.plist > Comet.app/Contents/Info.plist
    ```
-3. Icon: generate `comet.icns` from `dist/comet.png` (`iconutil`) and place it at
+3. Icon: generate `comet.icns` from the squircle Crew raster and place it at
    `Comet.app/Contents/Resources/comet.icns`:
    ```sh
-   mkdir comet.iconset && sips -z 256 256 dist/comet.png --out comet.iconset/icon_256x256.png
+   mkdir comet.iconset
+   sips -z 256 256 assets/brand/png/crew-icon-macos-1024.png \
+     --out comet.iconset/icon_256x256.png
    iconutil -c icns comet.iconset -o Comet.app/Contents/Resources/comet.icns
    ```
 4. Sign + notarize (required for distribution):

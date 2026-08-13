@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use comet_proto::{AgentEvent, ToolCall, UserInputQuestion};
+use comet_proto::{AgentEvent, OMP_GOAL_STATE_CALL_NAME, ToolCall, UserInputQuestion};
 
 use crate::constants::MSG_INLINE_MAX;
 
@@ -28,6 +28,14 @@ pub enum MessagePart {
     Text {
         id: String,
         text: String,
+    },
+    /// Bounded read projection of an oversized stored `Text` part. The text is
+    /// the pure visible tail; omitted bytes stay scalar so streaming deltas do
+    /// not rewrite a marker embedded in the content.
+    TextWindow {
+        id: String,
+        text: String,
+        omitted_prefix_bytes: usize,
     },
     #[serde(rename_all = "camelCase")]
     Tool {
@@ -57,6 +65,7 @@ impl MessagePart {
     pub fn id(&self) -> &str {
         match self {
             MessagePart::Text { id, .. }
+            | MessagePart::TextWindow { id, .. }
             | MessagePart::Tool { id, .. }
             | MessagePart::Input { id, .. }
             | MessagePart::Error { id, .. } => id,
@@ -65,7 +74,7 @@ impl MessagePart {
 
     pub fn byte_len(&self) -> usize {
         match self {
-            MessagePart::Text { text, .. } => text.len(),
+            MessagePart::Text { text, .. } | MessagePart::TextWindow { text, .. } => text.len(),
             MessagePart::Tool { call, .. } => serde_json::to_vec(call).map_or(0, |v| v.len()),
             MessagePart::Input { questions, .. } => {
                 serde_json::to_vec(questions).map_or(0, |v| v.len())
@@ -141,7 +150,8 @@ fn refresh_tool_call(existing: &mut ToolCall, incoming: &ToolCall) {
 /// - `ToolCall` appends, or refreshes in place when the id already exists (SDK retry idempotence).
 /// - `ToolResult` marks the matching tool part resolved / errored in place.
 /// - `InputRequested` appends an input part; `InputResolved` marks it resolved.
-/// - `Error` and `Done{error}` become visible error parts.
+/// - `Error` and `Done{error}` become visible error parts; a terminal `Done` reusing the latest
+///   error message is idempotent.
 pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
     match event {
         AgentEvent::SessionStarted { .. } | AgentEvent::Steered { .. } => {
@@ -237,7 +247,9 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
             });
         }
         AgentEvent::Done { error, .. } => {
-            if let Some(message) = error {
+            if let Some(message) = error
+                && !matches!(out.last(), Some(MessagePart::Error { message: existing, .. }) if existing == message)
+            {
                 let id = format!("e{}", out.len());
                 out.push(MessagePart::Error {
                     id,
@@ -253,8 +265,9 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
 
 /// Render-only privacy policy — strip heavy/sensitive tool inputs before a call enters the doc.
 ///
-/// Keeps: command / path / pattern / url / query / todo items / server+tool names.
-/// Drops: WriteFile content, EditFile old/new strings, WebFetch prompt, Mcp/Unknown input.
+/// Keeps: command / path / pattern / url / query / todo items / server+tool names,
+/// plus Comet's normalized OMP goal snapshot (the sidebar's persisted state).
+/// Drops: WriteFile content, EditFile old/new strings, WebFetch prompt, Mcp/other Unknown input.
 /// Full inputs remain only in the host's local run journal. Idempotent.
 pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
     match call {
@@ -276,6 +289,12 @@ pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
             tool: tool.clone(),
             input: None,
         },
+        ToolCall::Unknown { name, input } if name == OMP_GOAL_STATE_CALL_NAME => {
+            ToolCall::Unknown {
+                name: name.clone(),
+                input: input.clone(),
+            }
+        }
         ToolCall::Unknown { name, .. } => ToolCall::Unknown {
             name: name.clone(),
             input: None,
@@ -394,6 +413,55 @@ mod tests {
             },
         );
         assert!(parts.is_empty());
+    }
+
+    #[test]
+    fn terminal_done_does_not_duplicate_the_immediately_preceding_error() {
+        let message = "The socket connection was closed unexpectedly";
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Error {
+                message: message.into(),
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Done {
+                status: comet_proto::DoneStatus::Errored,
+                result: None,
+                error: Some(message.into()),
+                session_id: Some("omp-session".into()),
+            },
+        );
+
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Error { message: visible, .. } if visible == message
+        ));
+    }
+
+    #[test]
+    fn terminal_done_preserves_a_distinct_error() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Error {
+                message: "provider warning".into(),
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Done {
+                status: comet_proto::DoneStatus::Errored,
+                result: None,
+                error: Some("terminal failure".into()),
+                session_id: None,
+            },
+        );
+
+        assert_eq!(parts.len(), 2);
     }
 
     #[test]
@@ -579,6 +647,18 @@ mod tests {
             }
         );
         assert_eq!(sanitize_tool_call(&clean), clean);
+    }
+
+    #[test]
+    fn sanitize_preserves_normalized_omp_goal_state() {
+        let call = ToolCall::Unknown {
+            name: OMP_GOAL_STATE_CALL_NAME.into(),
+            input: Some(serde_json::json!({
+                "goal": { "id": "g1", "objective": "Ship the sidebar", "status": "active" },
+                "state": { "enabled": true, "mode": "active" },
+            })),
+        };
+        assert_eq!(sanitize_tool_call(&call), call);
     }
 
     #[test]

@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use comet_proto::{
-    AgentAccount, AgentAccountWarning, AgentAccountsSnapshot, AgentAuthKind, AgentLoginMode,
-    AgentLoginPoll, AgentLoginStart, AgentLoginStatus, AgentUsageWindow, HarnessId,
+    AgentAccount, AgentAccountStatus, AgentAccountWarning, AgentAccountsSnapshot, AgentAuthKind,
+    AgentLoginMode, AgentLoginPoll, AgentLoginStart, AgentLoginStatus, AgentUsageWindow, HarnessId,
 };
 
 use crate::repos::home_dir;
@@ -275,7 +275,7 @@ impl AgentAccounts {
             .collect::<Vec<_>>();
 
         for remote_account in &remote_accounts {
-            if remote_account.status != "connected"
+            if remote_account.status != AgentAccountStatus::Connected
                 && let Some(harness) = harness_for_provider(&remote_account.provider)
             {
                 warnings.push(AgentAccountWarning {
@@ -304,6 +304,7 @@ impl AgentAccounts {
                     harness,
                     email: Some(slot.profile.email),
                     plan_label: slot.profile.plan,
+                    status: AgentAccountStatus::Connected,
                     usage_windows: Vec::new(),
                     display_name: slot.profile.display_name,
                     organization: slot.profile.organization,
@@ -1080,6 +1081,7 @@ fn remote_account_for_view(account: &RemoteAgentAccount) -> Option<AgentAccount>
         harness,
         email: account.email.clone(),
         plan_label: account.plan.clone(),
+        status: account.status,
         usage_windows,
         display_name: account.display_name.clone(),
         organization: account.organization.clone(),

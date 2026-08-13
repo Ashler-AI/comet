@@ -576,6 +576,38 @@ async fn connect_via_surfaces_url_provider_auth_error() {
     }
 }
 
+/// A non-101 handshake answer is a policy verdict, not a transport fault:
+/// the status must surface structurally so join loops can throttle permanent
+/// rejections (403/404) instead of hammering the edge on the fast cap.
+#[tokio::test]
+async fn http_handshake_rejection_surfaces_structured_status() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n")
+                .await;
+        }
+    });
+    struct Fixed(String);
+    impl UrlProvider for Fixed {
+        fn url(&self) -> BoxFuture<'static, Result<String, SyncError>> {
+            let url = self.0.clone();
+            Box::pin(async move { Ok(url) })
+        }
+    }
+    let provider = Arc::new(Fixed(format!("ws://{addr}/session/room-x/ws")));
+    let result = RoomClient::connect_via(provider, "room-x", LoroDoc::new()).await;
+    match result {
+        Ok(_) => panic!("connect must fail"),
+        Err(err) => assert!(matches!(err, SyncError::HttpRejected(404)), "got: {err}"),
+    }
+}
+
 #[tokio::test]
 async fn first_connect_failure_is_returned() {
     struct FailingConnector;

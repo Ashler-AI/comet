@@ -151,6 +151,20 @@ pub struct LocalSessionAttachResult {
     pub space_id: String,
 }
 
+/// Owner-approved delayed cleanup for a Comet-managed worktree.
+///
+/// The record lives in the shared workspace document so an owner can settle
+/// from any device while the device that owns the checkout performs deletion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeDeletionStage {
+    pub chat_id: String,
+    pub path: String,
+    pub owner_subject: String,
+    pub owner_device_id: String,
+    pub delete_after: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Chat {
@@ -374,6 +388,18 @@ pub enum AuthState {
     },
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentAccountStatus {
+    #[default]
+    Connected,
+    Disabled,
+    AttentionRequired,
+    Revoked,
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentAccount {
@@ -383,6 +409,9 @@ pub struct AgentAccount {
     pub harness: HarnessId,
     pub email: Option<String>,
     pub plan_label: Option<String>,
+    /// Authoritative Agent Auth health. Missing on older snapshots means connected.
+    #[serde(default)]
+    pub status: AgentAccountStatus,
     #[serde(default)]
     pub usage_windows: Vec<AgentUsageWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -521,5 +550,38 @@ mod tests {
             serde_json::to_value(pinned).expect("pinned config")["agentAccountId"],
             "opaque-account-id"
         );
+    }
+
+    #[test]
+    fn agent_account_status_defaults_and_uses_agent_auth_wire_values() {
+        let legacy: AgentAccount = serde_json::from_value(serde_json::json!({
+            "id": "account-1",
+            "harness": "codex",
+            "email": null,
+            "planLabel": null,
+            "usageWindows": [],
+            "migrationAvailable": false
+        }))
+        .expect("legacy account");
+        assert_eq!(legacy.status, AgentAccountStatus::Connected);
+
+        let mut attention = legacy;
+        attention.status = AgentAccountStatus::AttentionRequired;
+        assert_eq!(
+            serde_json::to_value(attention).expect("status serialization")["status"],
+            "attention_required"
+        );
+
+        let unknown: AgentAccount = serde_json::from_value(serde_json::json!({
+            "id": "account-2",
+            "harness": "codex",
+            "email": null,
+            "planLabel": null,
+            "status": "suspended",
+            "usageWindows": [],
+            "migrationAvailable": false
+        }))
+        .expect("unknown status remains readable");
+        assert_eq!(unknown.status, AgentAccountStatus::Unknown);
     }
 }

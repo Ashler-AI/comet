@@ -48,6 +48,11 @@ const ACP_INITIALIZE_DEADLINE: Duration = Duration::from_secs(15);
 const ACP_SESSION_DEADLINE: Duration = Duration::from_secs(30);
 const ACP_CONFIGURE_DEADLINE: Duration = Duration::from_secs(15);
 const ACP_PROMPT_INACTIVITY_LOG_INTERVAL: Duration = Duration::from_secs(300);
+// Cold project capability discovery can legitimately exceed the old 15-second
+// boundary in large repositories. Warm launches still return as soon as ready.
+const RPC_STARTUP_DEADLINE: Duration = Duration::from_secs(60);
+// Includes the startup boundary plus the command stream's two-second settle.
+const RPC_COMMAND_CATALOG_DEADLINE: Duration = Duration::from_secs(65);
 const SCAFFOLD_PROFILE: &str = "scaffold-host";
 const AUTH_BROKER_URL_ENV: &str = "OMP_AUTH_BROKER_URL";
 const AUTH_BROKER_TOKEN_ENV: &str = "OMP_AUTH_BROKER_TOKEN";
@@ -575,7 +580,7 @@ impl Default for OmpHarness {
         Self {
             executable: None,
             scaffold_host: false,
-            interrupt_grace: Duration::from_secs(3),
+            interrupt_grace: Duration::from_secs(2),
             session_dirs: None,
             session_writer_probe: None,
             auth_broker_environment: None,
@@ -597,6 +602,13 @@ impl OmpHarness {
 
     pub fn with_executable(mut self, executable: impl Into<PathBuf>) -> Self {
         self.executable = Some(executable.into());
+        self
+    }
+
+    /// Override the graceful interrupt deadline for deterministic integration tests.
+    #[doc(hidden)]
+    pub fn with_interrupt_grace(mut self, interrupt_grace: Duration) -> Self {
+        self.interrupt_grace = interrupt_grace;
         self
     }
 
@@ -876,8 +888,8 @@ struct OmpCatalog {
 struct OmpCatalogModel {
     selector: String,
     name: String,
-    context_window: u64,
-    max_tokens: u64,
+    context_window: Option<u64>,
+    max_tokens: Option<u64>,
     #[serde(default)]
     thinking: Option<Vec<String>>,
 }
@@ -889,21 +901,29 @@ fn models_from_catalog(bytes: &[u8]) -> Result<Vec<Model>, HarnessError> {
     Ok(catalog
         .models
         .into_iter()
-        .filter(|model| crate::is_curated_comet_model(&model.selector))
-        .map(|model| Model {
-            id: model.selector,
-            label: model.name,
-            description: Some(format!(
-                "{} context · {} max output · Listed in OMP's catalog; run availability is not verified; authorization is not verified",
-                model.context_window, model.max_tokens
-            )),
-            reasoning_levels: model
-                .thinking
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|level| serde_json::from_value(Value::String(level)).ok())
-                .collect(),
-            options: Vec::new(),
+        .map(|model| {
+            let size_description = match (model.context_window, model.max_tokens) {
+                (Some(context_window), Some(max_tokens)) => {
+                    format!("{context_window} context · {max_tokens} max output · ")
+                }
+                (Some(context_window), None) => format!("{context_window} context · "),
+                (None, Some(max_tokens)) => format!("{max_tokens} max output · "),
+                (None, None) => String::new(),
+            };
+            Model {
+                id: model.selector,
+                label: model.name,
+                description: Some(format!(
+                    "{size_description}Listed in OMP's catalog; run availability is not verified; authorization is not verified",
+                )),
+                reasoning_levels: model
+                    .thinking
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|level| serde_json::from_value(Value::String(level)).ok())
+                    .collect(),
+                options: Vec::new(),
+            }
         })
         .collect())
 }
@@ -989,7 +1009,7 @@ impl Harness for OmpHarness {
                 frames,
                 stderr_tail,
             },
-            Duration::from_secs(10),
+            RPC_COMMAND_CATALOG_DEADLINE,
         )
         .await
     }
@@ -2539,17 +2559,14 @@ mod tests {
     }
 
     #[test]
-    fn catalog_keeps_only_curated_models_plus_default() {
+    fn catalog_keeps_every_model_selector() {
         let models = models_from_catalog(
             br#"{"models":[
                 {"selector":"openai-codex/gpt-5.6-luna","name":"GPT-5.6 Luna","contextWindow":1000,"maxTokens":100,"thinking":[]},
-                {"selector":"prime-inference/openai/gpt-5.6-terra-pro","name":"GPT-5.6 Terra Pro","contextWindow":1000,"maxTokens":100,"thinking":[]},
-                {"selector":"openai-codex/gpt-5.5","name":"GPT-5.5","contextWindow":1000,"maxTokens":100,"thinking":[]},
-                {"selector":"anthropic/claude-fable-5","name":"Fable 5","contextWindow":1000,"maxTokens":100,"thinking":[]},
-                {"selector":"prime-inference/anthropic/claude-sonnet-5","name":"Claude Sonnet 5","contextWindow":1000,"maxTokens":100,"thinking":[]},
-                {"selector":"prime-inference/moonshotai/kimi-k3","name":"Kimi K3","contextWindow":1000,"maxTokens":100,"thinking":[]},
-                {"selector":"prime-inference/x-ai/grok-4.20-multi-agent","name":"Grok 4.20 Multi-Agent","contextWindow":1000,"maxTokens":100,"thinking":[]},
-                {"selector":"prime-inference/z-ai/glm-5.2","name":"GLM 5.2","contextWindow":1000,"maxTokens":100,"thinking":[]}
+                {"selector":"openai/gpt-5.4","name":"GPT-5.4","contextWindow":1000,"maxTokens":100,"thinking":["low","high"]},
+                {"selector":"openrouter/deepseek/deepseek-v4-pro","name":"DeepSeek V4 Pro","contextWindow":1000,"maxTokens":100,"thinking":["high"]},
+                {"selector":"openrouter/tngtech/deepseek-r1t2-chimera","name":"DeepSeek R1T2 Chimera","contextWindow":1000,"maxTokens":100,"thinking":["high"]},
+                {"selector":"anthropic/claude-fable-5","name":"Fable 5","contextWindow":1000,"maxTokens":100,"thinking":[]}
             ]}"#,
         )
         .unwrap();
@@ -2561,12 +2578,45 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "openai-codex/gpt-5.6-luna",
-                "prime-inference/openai/gpt-5.6-terra-pro",
+                "openai/gpt-5.4",
+                "openrouter/deepseek/deepseek-v4-pro",
+                "openrouter/tngtech/deepseek-r1t2-chimera",
                 "anthropic/claude-fable-5",
-                "prime-inference/anthropic/claude-sonnet-5",
-                "prime-inference/moonshotai/kimi-k3",
-                "prime-inference/x-ai/grok-4.20-multi-agent",
             ]
+        );
+    }
+    #[test]
+    fn catalog_keeps_models_with_incomplete_size_metadata() {
+        let models = models_from_catalog(
+            br#"{"models":[
+                {"selector":"openrouter/meta/muse-glimmer-30b","name":"Muse Glimmer","contextWindow":131072,"maxTokens":null,"thinking":[]},
+                {"selector":"openrouter/deepseek/incomplete","name":"Incomplete DeepSeek","contextWindow":null,"maxTokens":100,"thinking":[]},
+                {"selector":"openrouter/unknown","name":"Unknown","contextWindow":null,"maxTokens":null,"thinking":[]}
+            ]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(models.len(), 3);
+        assert!(
+            models[0]
+                .description
+                .as_deref()
+                .unwrap()
+                .starts_with("131072 context")
+        );
+        assert!(
+            models[1]
+                .description
+                .as_deref()
+                .unwrap()
+                .starts_with("100 max output")
+        );
+        assert!(
+            models[2]
+                .description
+                .as_deref()
+                .unwrap()
+                .starts_with("Listed in OMP")
         );
     }
 
