@@ -5,8 +5,9 @@
 //! is saved debounced from its own boot-time copy, so the composer keeps its
 //! own file rather than racing it): last harness, last model per harness
 //! (id + label, so the chip names the pick before the model list loads),
-//! last reasoning level, and whether the next session should use the current
-//! checkout or a fresh worktree. Written synchronously on every pick.
+//! ordered favorite model selectors, last reasoning level, and whether the
+//! next session should use the current checkout or a fresh worktree. Written
+//! synchronously on every pick.
 
 use std::collections::HashMap;
 use std::io;
@@ -35,6 +36,9 @@ pub struct ComposerDefaults {
     pub harness: Option<HarnessId>,
     /// Last model picked, per harness (restored on harness switch).
     pub model_by_harness: HashMap<HarnessId, RememberedModel>,
+    /// Provider-qualified model selectors pinned from the model browser.
+    /// Order is pin order and drives the Favorites view.
+    pub favorite_model_ids: Vec<String>,
     /// Last reasoning level picked (global, like comet's `reasoning` key).
     pub reasoning: Option<ReasoningLevel>,
     /// Whether the last new-session draft used a fresh isolated worktree.
@@ -89,6 +93,28 @@ impl ComposerDefaults {
             .insert(harness, RememberedModel { id, label });
     }
 
+    /// Toggle a provider-qualified selector in the ordered Favorites list.
+    /// Returns the model's new favorite state.
+    pub fn toggle_favorite_model(&mut self, id: &str) -> bool {
+        if let Some(index) = self
+            .favorite_model_ids
+            .iter()
+            .position(|favorite| favorite == id)
+        {
+            self.favorite_model_ids.remove(index);
+            false
+        } else {
+            self.favorite_model_ids.push(id.to_string());
+            true
+        }
+    }
+
+    pub fn is_favorite_model(&self, id: &str) -> bool {
+        self.favorite_model_ids
+            .iter()
+            .any(|favorite| favorite == id)
+    }
+
     /// The cached display label for a model id, if ever seen.
     pub fn label_for(&self, id: &str) -> Option<&str> {
         self.model_labels.get(id).map(String::as_str)
@@ -130,12 +156,25 @@ mod tests {
             "Fable 5".into(),
         );
         defaults.remember_model(HarnessId::Codex, "gpt-5.2-codex".into(), "GPT-5.2".into());
+        let latest = "openrouter/~deepseek/deepseek-v4-flash-latest";
+        defaults.remember_model(
+            HarnessId::Omp,
+            latest.into(),
+            "DeepSeek V4 Flash Latest".into(),
+        );
+        defaults.toggle_favorite_model(latest);
         defaults.save(dir.path()).unwrap();
         let loaded = ComposerDefaults::load(dir.path());
         assert_eq!(loaded, defaults);
         assert_eq!(
             loaded.model_for(HarnessId::ClaudeCode).map(|m| &*m.label),
             Some("Fable 5")
+        );
+        assert_eq!(
+            loaded
+                .model_for(HarnessId::Omp)
+                .map(|model| model.id.as_str()),
+            loaded.favorite_model_ids.first().map(String::as_str)
         );
     }
 
@@ -146,6 +185,7 @@ mod tests {
         let loaded = ComposerDefaults::load(dir.path());
         assert_eq!(loaded.harness, Some(HarnessId::Codex));
         assert!(!loaded.new_worktree);
+        assert!(loaded.favorite_model_ids.is_empty());
     }
 
     #[test]
@@ -173,5 +213,22 @@ mod tests {
             Some("m2")
         );
         assert!(defaults.model_for(HarnessId::ClaudeCode).is_none());
+    }
+
+    #[test]
+    fn favorites_preserve_pin_order_and_toggle_cleanly() {
+        let mut defaults = ComposerDefaults::default();
+        assert!(defaults.toggle_favorite_model("openrouter/~deepseek/deepseek-v4-flash-latest"));
+        assert!(defaults.toggle_favorite_model("openai/gpt-5.4"));
+        assert_eq!(
+            defaults.favorite_model_ids,
+            [
+                "openrouter/~deepseek/deepseek-v4-flash-latest",
+                "openai/gpt-5.4"
+            ]
+        );
+        assert!(defaults.is_favorite_model("openai/gpt-5.4"));
+        assert!(!defaults.toggle_favorite_model("openrouter/~deepseek/deepseek-v4-flash-latest"));
+        assert_eq!(defaults.favorite_model_ids, ["openai/gpt-5.4"]);
     }
 }

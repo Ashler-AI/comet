@@ -332,7 +332,7 @@ async fn selected_model_and_reasoning_ride_the_spawn_flags() {
     }
     let harness = OmpHarness::new().with_executable(fixture_path());
     let mut request = request(None);
-    request.model = Some("openai-codex/gpt-5.6-sol".into());
+    request.model = Some("openrouter/~deepseek/deepseek-v4-flash-latest".into());
     request.reasoning = Some(ReasoningLevel::XHigh);
     let stream = harness.run(request, controls()).await.expect("run starts");
     tokio::time::timeout(
@@ -346,7 +346,7 @@ async fn selected_model_and_reasoning_ride_the_spawn_flags() {
 
     let argv = std::fs::read_to_string(argv_log).unwrap();
     assert!(
-        argv.contains("--model\nopenai-codex/gpt-5.6-sol\n"),
+        argv.contains("--model\nopenrouter/~deepseek/deepseek-v4-flash-latest\n"),
         "model must be pinned at spawn: {argv}"
     );
     assert!(

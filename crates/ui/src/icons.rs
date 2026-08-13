@@ -110,6 +110,8 @@ icon_assets![
     (CLOSE, "close"),
     (STOP, "stop"),
     (CHECK, "check"),
+    (STAR, "star"),
+    (STAR_BOLD, "star-bold"),
     (COPY, "copy"),
     // GPUI tints SVGs, so use the monochrome Crew mark.
     (CREW_MARK, "crew-mark"),

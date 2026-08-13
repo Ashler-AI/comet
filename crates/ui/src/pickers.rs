@@ -253,6 +253,90 @@ pub fn selected_agent_account_candidate(
                 .flatten()
         })
 }
+/// Provider views exposed by OMP's provider-qualified catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OmpModelProvider {
+    Favorites,
+    OpenAi,
+    Anthropic,
+    OpenRouter,
+}
+
+impl OmpModelProvider {
+    const ALL: [Self; 4] = [
+        Self::Favorites,
+        Self::OpenAi,
+        Self::Anthropic,
+        Self::OpenRouter,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Favorites => "Favorites",
+            Self::OpenAi => "OpenAI",
+            Self::Anthropic => "Anthropic",
+            Self::OpenRouter => "OpenRouter",
+        }
+    }
+
+    const fn icon(self) -> &'static str {
+        match self {
+            Self::Favorites => crate::icons::STAR,
+            Self::OpenAi => crate::icons::OPENAI_MARK,
+            Self::Anthropic => crate::icons::CLAUDE_MARK,
+            Self::OpenRouter => crate::icons::GLOBAL,
+        }
+    }
+
+    fn includes(self, model_id: &str, favorites: &[String]) -> bool {
+        match self {
+            Self::Favorites => favorites.iter().any(|favorite| favorite == model_id),
+            Self::OpenAi => {
+                model_id.starts_with("openai/") || model_id.starts_with("openai-codex/")
+            }
+            Self::Anthropic => model_id.starts_with("anthropic/"),
+            Self::OpenRouter => model_id.starts_with("openrouter/"),
+        }
+    }
+}
+
+/// Indices into a model catalog for the active provider/search projection.
+/// Favorites preserve pin order; other views preserve catalog order within
+/// the same prefix/substring search rank.
+fn filtered_model_indices(
+    models: &[Model],
+    provider: Option<OmpModelProvider>,
+    favorites: &[String],
+    query: &str,
+) -> Vec<usize> {
+    let candidates: Vec<usize> = match provider {
+        Some(OmpModelProvider::Favorites) => favorites
+            .iter()
+            .filter_map(|favorite| models.iter().position(|model| &model.id == favorite))
+            .collect(),
+        Some(provider) => models
+            .iter()
+            .enumerate()
+            .filter_map(|(index, model)| provider.includes(&model.id, favorites).then_some(index))
+            .collect(),
+        None => (0..models.len()).collect(),
+    };
+    let mut ranked = candidates
+        .into_iter()
+        .filter_map(|index| {
+            let model = &models[index];
+            let searchable = format!(
+                "{} {} {}",
+                model.label,
+                model.id,
+                model.description.as_deref().unwrap_or_default()
+            );
+            popover::match_rank(query, &searchable).map(|rank| (rank, index))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by_key(|(rank, _)| *rank);
+    ranked.into_iter().map(|(_, index)| index).collect()
+}
 
 // ---------------------------------------------------------------------------
 // Pure: labels + traits summary
@@ -451,6 +535,8 @@ pub struct Pickers {
     harnesses: Loadable<Vec<HarnessDescriptor>>,
     models: HashMap<HarnessId, Loadable<Vec<Model>>>,
     commands: HashMap<CommandCatalogKey, Loadable<Vec<HarnessCommand>>>,
+    /// OMP-only provider view. Other harnesses always project their full list.
+    omp_provider: OmpModelProvider,
     /// Synchronous cold-start metadata: `/goal` stays discoverable while the
     /// repository/device-specific OMP catalog is still loading.
     omp_command_fallback: HarnessCommand,
@@ -610,6 +696,7 @@ impl Pickers {
             model_scroll: gpui::ScrollHandle::new(),
             search,
             focus: cx.focus_handle(),
+            omp_provider: OmpModelProvider::OpenRouter,
             suppressed: None,
             boot_focus_pending: open.is_some(),
             load_task: None,
@@ -942,6 +1029,13 @@ impl Pickers {
                 let handle = self.search.read(cx).focus_handle(cx);
                 self.search.update(cx, |input, cx| {
                     input.set_placeholder("Search refs…", cx);
+                });
+                window.focus(&handle, cx);
+            }
+            PickerKind::HarnessModel => {
+                let handle = self.search.read(cx).focus_handle(cx);
+                self.search.update(cx, |input, cx| {
+                    input.set_placeholder("Search models…", cx);
                 });
                 window.focus(&handle, cx);
             }
@@ -1453,6 +1547,22 @@ impl Pickers {
         cx.notify();
     }
 
+    fn pick_omp_provider(&mut self, provider: OmpModelProvider, cx: &mut Context<Self>) {
+        self.omp_provider = provider;
+        self.active = 0;
+        self.model_scroll.set_offset(gpui::Point::default());
+        cx.notify();
+    }
+
+    fn toggle_favorite_model(&mut self, model_id: &str, cx: &mut Context<Self>) {
+        self.defaults.toggle_favorite_model(model_id);
+        self.save_defaults();
+        self.active = self
+            .active
+            .min(self.filtered_model_indices(cx).len().saturating_sub(1));
+        cx.notify();
+    }
+
     fn pick_model(&mut self, model_id: String, cx: &mut Context<Self>) {
         if self.scaffold_route_picker_locked(cx) {
             return;
@@ -1625,23 +1735,43 @@ impl Pickers {
             .unwrap_or_default()
     }
 
-    /// The viewed harness's model list, when loaded (keyboard nav rows).
-    fn model_rows_len(&self, cx: &App) -> usize {
-        self.effective_harness(cx)
-            .and_then(|h| self.models.get(&h))
-            .and_then(|l| l.ready())
-            .map(|m| m.len())
-            .unwrap_or(0)
+    /// Catalog indices visible under the current OMP provider and search.
+    /// Click, arrows, and Enter all resolve through this same projection.
+    fn filtered_model_indices(&self, cx: &App) -> Vec<usize> {
+        let Some(harness) = self.effective_harness(cx) else {
+            return Vec::new();
+        };
+        let Some(models) = self.models.get(&harness).and_then(Loadable::ready) else {
+            return Vec::new();
+        };
+        let provider = (harness == HarnessId::Omp).then_some(self.omp_provider);
+        filtered_model_indices(
+            models,
+            provider,
+            &self.defaults.favorite_model_ids,
+            self.search.read(cx).text(),
+        )
     }
 
-    /// Enter on the harness/model popover: pick the highlighted model.
+    /// The viewed harness's filtered model count (keyboard nav rows).
+    fn model_rows_len(&self, cx: &App) -> usize {
+        self.filtered_model_indices(cx).len()
+    }
+
+    /// Enter on the harness/model popover: pick the highlighted filtered row.
     fn activate_model_row(&mut self, cx: &mut Context<Self>) {
+        let Some(harness) = self.effective_harness(cx) else {
+            return;
+        };
+        let Some(model_index) = self.filtered_model_indices(cx).get(self.active).copied() else {
+            return;
+        };
         let Some(id) = self
-            .effective_harness(cx)
-            .and_then(|h| self.models.get(&h))
-            .and_then(|l| l.ready())
-            .and_then(|m| m.get(self.active))
-            .map(|m| m.id.clone())
+            .models
+            .get(&harness)
+            .and_then(Loadable::ready)
+            .and_then(|models| models.get(model_index))
+            .map(|model| model.id.clone())
         else {
             return;
         };
@@ -1745,10 +1875,14 @@ impl Pickers {
     }
 
     fn on_search_submit(&mut self, cx: &mut Context<Self>) {
-        if self.open == Some(PickerKind::Branch)
-            && let Some(row) = self.filtered_ref_rows(cx).into_iter().nth(self.active)
-        {
-            self.pick_ref(row, cx);
+        match self.open {
+            Some(PickerKind::Branch) => {
+                if let Some(row) = self.filtered_ref_rows(cx).into_iter().nth(self.active) {
+                    self.pick_ref(row, cx);
+                }
+            }
+            Some(PickerKind::HarnessModel) => self.activate_model_row(cx),
+            _ => {}
         }
     }
 
@@ -2375,6 +2509,74 @@ impl Pickers {
         let effective = self.effective_harness(cx);
         let model_scroll = self.model_scroll.clone();
         let scaffold_only = self.is_scaffold_selection(cx);
+        let is_omp = effective == Some(HarnessId::Omp);
+
+        let provider_rows: AnyElement =
+            if is_omp {
+                let selected_provider = self.omp_provider;
+                div()
+                    .mt(px(4.0))
+                    .pt(px(4.0))
+                    .border_t_1()
+                    .border_color(crate::theme::hairline(0.06))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(popover::menu_heading(&theme, "Providers"))
+                    .children(OmpModelProvider::ALL.into_iter().enumerate().map(
+                        |(ix, provider)| {
+                            let is_viewed = selected_provider == provider;
+                            div()
+                                .id(("omp-provider-tab", ix))
+                                .h(px(30.0))
+                                .px(px(8.0))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.0))
+                                .rounded(px(8.0))
+                                .text_size(px(12.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(if is_viewed {
+                                    theme.text
+                                } else {
+                                    theme.text_muted
+                                })
+                                .when(is_viewed, |el| {
+                                    el.bg(crate::theme::card_selected_bg())
+                                        .shadow(crate::theme::card_selected_shadows())
+                                })
+                                .when(!is_viewed, |el| {
+                                    el.hover(|style| style.bg(crate::theme::ink(0.06)))
+                                })
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.pick_omp_provider(provider, cx);
+                                }))
+                                .child(
+                                    crate::icons::icon(provider.icon())
+                                        .size(px(15.0))
+                                        .flex_none()
+                                        .text_color(if provider == OmpModelProvider::Anthropic {
+                                            crate::icons::claude_brand()
+                                        } else if is_viewed {
+                                            theme.text
+                                        } else {
+                                            theme.text_muted
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .child(SharedString::from(provider.label())),
+                                )
+                        },
+                    ))
+                    .into_any_element()
+            } else {
+                gpui::Empty.into_any_element()
+            };
 
         let rail: AnyElement = match &self.harnesses {
             Loadable::Loading | Loadable::Idle => div()
@@ -2399,16 +2601,15 @@ impl Pickers {
             }
             Loadable::Ready(list) => {
                 let mut descriptors = visible_harnesses_for_selection(list, scaffold_only);
-                // The committed harness always gets its rail tab, even when
-                // it's the (normally hidden) mock harness of a dev session.
                 if let Some(effective) = effective
-                    && !descriptors.iter().any(|d| d.id == effective)
-                    && let Some(descriptor) = list.iter().find(|d| d.id == effective)
+                    && !descriptors
+                        .iter()
+                        .any(|descriptor| descriptor.id == effective)
+                    && let Some(descriptor) =
+                        list.iter().find(|descriptor| descriptor.id == effective)
                 {
                     descriptors.insert(0, descriptor.clone());
                 }
-                // Vertical agents rail (the palette's Devices-rail language):
-                // brand icon + name per row, active carries the glass ring.
                 div()
                     .flex()
                     .flex_col()
@@ -2420,7 +2621,7 @@ impl Pickers {
                         let is_viewed = effective == Some(harness);
                         let is_disabled = locked && !is_viewed;
                         let (icon_path, tint) = harness_brand_icon(harness);
-                        let name: SharedString = descriptor.name.clone().into();
+                        let name: SharedString = descriptor.name.into();
                         div()
                             .id(("harness-tab", ix))
                             .h(px(30.0))
@@ -2443,12 +2644,8 @@ impl Pickers {
                             })
                             .when(is_disabled, |el| el.opacity(0.35))
                             .when(!is_disabled, |el| el.cursor_pointer())
-                            // Hover must not replace the viewed row's selected
-                            // fill with the weaker wash — that dims the active
-                            // row under the pointer (same rule as the sidebar
-                            // rows in shell.rs).
                             .when(!is_disabled && !is_viewed, |el| {
-                                el.hover(|s| s.bg(crate::theme::ink(0.06)))
+                                el.hover(|style| style.bg(crate::theme::ink(0.06)))
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.pick_harness(harness, cx);
@@ -2465,48 +2662,68 @@ impl Pickers {
                             )
                             .child(div().min_w_0().truncate().child(name))
                     }))
+                    .child(provider_rows)
                     .into_any_element()
             }
         };
 
-        let _ = locked; // the lock still dims foreign rail rows above
-
-        // The rows are collected FLAT — they become the scroll container's
-        // direct children so `scroll_to_item(active)` maps 1:1 (the palette's
-        // keyboard-follow standard).
-        let model_children: Vec<AnyElement> = match effective.map(|h| (h, self.models.get(&h))) {
+        let visible_indices = self.filtered_model_indices(cx);
+        let query_is_empty = self.search.read(cx).text().trim().is_empty();
+        let favorite_ids = self.defaults.favorite_model_ids.clone();
+        let model_children: Vec<AnyElement> = match effective
+            .map(|harness| (harness, self.models.get(&harness)))
+        {
+            Some((_, Some(Loadable::Ready(_)))) if visible_indices.is_empty() => {
+                let message =
+                    if is_omp && self.omp_provider == OmpModelProvider::Favorites && query_is_empty
+                    {
+                        "No favorites yet."
+                    } else {
+                        "No models found."
+                    };
+                vec![
+                    div()
+                        .px(px(8.0))
+                        .py(px(24.0))
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted.opacity(0.6))
+                        .text_center()
+                        .child(SharedString::from(message))
+                        .into_any_element(),
+                ]
+            }
             Some((_, Some(Loadable::Ready(models)))) => {
-                // The check mirrors the chip: the resolved concrete pick (draft
-                // / chat config / remembered, else the harness default row).
-                let selected = self.selected_model(cx).map(|m| m.id.clone());
+                let selected = self.selected_model(cx).map(|model| model.id.clone());
                 let active = self.active;
                 let models = models.clone();
-                models
+                visible_indices
                     .into_iter()
                     .enumerate()
-                    .map(|(ix, model)| {
+                    .filter_map(|(row_index, model_index)| {
+                        let model = models.get(model_index)?.clone();
                         let label: SharedString = model.label.clone().into();
                         let description: Option<SharedString> =
                             model.description.clone().map(Into::into);
-                        let id = model.id.clone();
-                        let is_selected = selected.as_deref() == Some(model.id.as_str())
-                            || (selected.is_none() && ix == 0);
-                        popover::menu_row_nav(
+                        let model_id = model.id.clone();
+                        let favorite_id = model.id.clone();
+                        let is_selected = selected.as_deref() == Some(model.id.as_str());
+                        let is_favorite = favorite_ids.iter().any(|favorite| favorite == &model.id);
+                        let select = popover::menu_row_nav(
                             &theme,
                             is_selected,
-                            ix == active,
-                            format!("model-row-{ix}"),
+                            row_index == active,
+                            format!("model-row-{row_index}"),
                         )
-                        .when(is_selected || ix == active, |el| {
+                        .flex_1()
+                        .min_w_0()
+                        .when(is_selected || row_index == active, |el| {
                             el.shadow(crate::theme::card_selected_shadows())
                         })
-                        .id(("model-row", ix))
+                        .id(("model-row", row_index))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.pick_model(id.clone(), cx);
+                            this.pick_model(model_id.clone(), cx);
                         }))
                         .child(
-                            // Name + 11px muted description subline, per
-                            // harness-model-picker.tsx (`min-w-0 flex-1` column).
                             div()
                                 .flex_1()
                                 .min_w_0()
@@ -2524,8 +2741,47 @@ impl Pickers {
                                     )
                                 }),
                         )
-                        .when(is_selected, |el| el.child(popover::menu_check(&theme)))
-                        .into_any_element()
+                        .when(is_selected, |el| el.child(popover::menu_check(&theme)));
+                        Some(
+                            div()
+                                .id(("model-row-shell", row_index))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(2.0))
+                                .child(select)
+                                .when(is_omp, |el| {
+                                    el.child(
+                                        div()
+                                            .id(("favorite-model", row_index))
+                                            .size(px(30.0))
+                                            .flex_none()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded(px(8.0))
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(crate::theme::ink(0.06)))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.toggle_favorite_model(&favorite_id, cx);
+                                            }))
+                                            .child(
+                                                crate::icons::icon(if is_favorite {
+                                                    crate::icons::STAR_BOLD
+                                                } else {
+                                                    crate::icons::STAR
+                                                })
+                                                .size(px(15.0))
+                                                .text_color(if is_favorite {
+                                                    theme.text
+                                                } else {
+                                                    theme.text_muted.opacity(0.55)
+                                                }),
+                                            ),
+                                    )
+                                })
+                                .into_any_element(),
+                        )
                     })
                     .collect()
             }
@@ -2551,15 +2807,7 @@ impl Pickers {
             ],
         };
 
-        // One combined menu (user request): harness tabs across the top,
-        // then the viewed harness's models, then the reasoning ladder and
-        // model options that used to live in the separate traits popover.
         let traits = self.render_traits_sections(cx);
-        // The palette architecture: agents rail LEFT, models pane beside it
-        // with the traits INSPECTOR pinned below (models are the decision;
-        // reasoning/options are properties of it — they never scroll away
-        // with the list), legend footer under everything. FIXED height so
-        // harness switches and loading skeletons don't resize the card.
         div()
             .h(px(420.0))
             .flex()
@@ -2573,8 +2821,10 @@ impl Pickers {
                     .items_stretch()
                     .child(
                         div()
+                            .id("model-provider-rail")
                             .w(px(148.0))
                             .flex_none()
+                            .overflow_y_scroll()
                             .border_r_1()
                             .border_color(crate::theme::hairline(0.06))
                             .child(rail),
@@ -2586,19 +2836,14 @@ impl Pickers {
                             .flex()
                             .flex_col()
                             .child(
-                                // Pinned heading (the palette's crumbs slot).
                                 div()
                                     .flex_none()
                                     .px(px(4.0))
                                     .pt(px(4.0))
-                                    .child(popover::menu_heading(&theme, "Models")),
+                                    .child(popover::menu_heading(&theme, "Models"))
+                                    .child(self.search_box(&theme)),
                             )
                             .child(
-                                // Models scroll — gutters on the WRAPPER,
-                                // outside the scroll viewport (in-content
-                                // bottom padding is eaten by the extent), and
-                                // rows as DIRECT children so keyboard
-                                // `scroll_to_item` indices line up.
                                 div().flex_1().min_h_0().pb(px(4.0)).child(
                                     div()
                                         .id("model-menu-scroll")
@@ -2613,8 +2858,6 @@ impl Pickers {
                                 ),
                             )
                             .child(
-                                // The pinned inspector tray (scrolls only if
-                                // a model advertises many option groups).
                                 div()
                                     .id("model-traits-scroll")
                                     .flex_none()
@@ -2628,7 +2871,6 @@ impl Pickers {
                     ),
             )
             .child(
-                // The palette's legend footer, on the recessed band.
                 div()
                     .flex_none()
                     .bg(popover::band())
@@ -3003,9 +3245,17 @@ impl Render for Pickers {
         // first-paint fallback focuses the composer after our first render).
         if self.boot_focus_pending {
             match self.open {
-                Some(PickerKind::Branch) => {
+                Some(PickerKind::Branch) | Some(PickerKind::HarnessModel) => {
+                    let model_picker = self.open == Some(PickerKind::HarnessModel);
                     self.search.update(cx, |input, cx| {
-                        input.set_placeholder("Search refs…", cx);
+                        input.set_placeholder(
+                            if model_picker {
+                                "Search models…"
+                            } else {
+                                "Search refs…"
+                            },
+                            cx,
+                        );
                     });
                     let handle = self.search.read(cx).focus_handle(cx);
                     if handle.is_focused(window) {
@@ -3094,7 +3344,7 @@ impl Render for Pickers {
                 let content = self.render_harness_model_popover(cx);
                 Some((
                     PickerKind::HarnessModel,
-                    self.popover_frame_flush(460.0, content, cx),
+                    self.popover_frame_flush(500.0, content, cx),
                 ))
             }
             // Traits merged into the HarnessModel popover.
@@ -3154,6 +3404,49 @@ impl Render for Pickers {
 mod tests {
     use super::*;
     use comet_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+
+    #[test]
+    fn model_projection_filters_providers_search_and_favorites() {
+        let model = |id: &str, label: &str| Model {
+            id: id.into(),
+            label: label.into(),
+            description: Some("Catalog entry".into()),
+            reasoning_levels: vec![],
+            options: vec![],
+        };
+        let models = vec![
+            model(
+                "openrouter/~deepseek/deepseek-v4-flash-latest",
+                "DeepSeek V4 Flash Latest",
+            ),
+            model("openai/gpt-5.4", "GPT-5.4"),
+            model("openai-codex/gpt-5.6-sol", "GPT-5.6 Sol"),
+            model("anthropic/claude-opus-4-6", "Claude Opus 4.6"),
+        ];
+        let favorites = vec![models[3].id.clone(), models[0].id.clone()];
+
+        assert_eq!(
+            filtered_model_indices(&models, Some(OmpModelProvider::Favorites), &favorites, "",),
+            [3, 0]
+        );
+        assert_eq!(
+            filtered_model_indices(&models, Some(OmpModelProvider::OpenAi), &favorites, "",),
+            [1, 2]
+        );
+        assert_eq!(
+            filtered_model_indices(
+                &models,
+                Some(OmpModelProvider::OpenRouter),
+                &favorites,
+                "deepseek-v4",
+            ),
+            [0]
+        );
+        assert_eq!(
+            filtered_model_indices(&models, None, &favorites, "openai-codex/gpt-5.6"),
+            [2]
+        );
+    }
 
     #[test]
     fn pending_scaffold_chat_keeps_first_send_draft_config() {
@@ -3325,24 +3618,6 @@ mod tests {
     }
 
     #[test]
-    fn resolved_chat_config_requires_harness() {
-        let mut resolved = ResolvedRunConfig::default();
-        assert!(resolved.chat_config().is_none());
-        resolved.harness = Some(HarnessId::ClaudeCode);
-        resolved.model = Some("opus".into());
-        resolved.reasoning = Some(ReasoningLevel::High);
-        resolved.agent_account_id = Some("opaque-account-id".into());
-        let config = resolved.chat_config().expect("harness set");
-        assert_eq!(config.harness, HarnessId::ClaudeCode);
-        assert_eq!(config.model.as_deref(), Some("opus"));
-        assert_eq!(
-            config.agent_account_id.as_deref(),
-            Some("opaque-account-id")
-        );
-        assert_eq!(config.sandbox, SandboxLevel::WorkspaceWrite);
-    }
-
-    #[test]
     fn account_filtering_excludes_other_providers_and_local_migrations() {
         fn account(
             id: &str,
@@ -3509,6 +3784,23 @@ mod tests {
             Some("draft-account")
         );
         assert_eq!(selected_agent_account_candidate(None, &draft, false), None);
+    }
+    #[test]
+    fn resolved_chat_config_requires_harness() {
+        let mut resolved = ResolvedRunConfig::default();
+        assert!(resolved.chat_config().is_none());
+        resolved.harness = Some(HarnessId::ClaudeCode);
+        resolved.model = Some("opus".into());
+        resolved.reasoning = Some(ReasoningLevel::High);
+        resolved.agent_account_id = Some("opaque-account-id".into());
+        let config = resolved.chat_config().expect("harness set");
+        assert_eq!(config.harness, HarnessId::ClaudeCode);
+        assert_eq!(config.model.as_deref(), Some("opus"));
+        assert_eq!(
+            config.agent_account_id.as_deref(),
+            Some("opaque-account-id")
+        );
+        assert_eq!(config.sandbox, SandboxLevel::WorkspaceWrite);
     }
 
     #[test]

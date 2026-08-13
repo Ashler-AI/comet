@@ -110,7 +110,9 @@ pub mod shell_env;
 /// Product-curated model set shared by ACP-backed harness catalogs.
 ///
 /// Exact ids keep renamed/legacy variants out. GPT-5.6 is admitted by family
-/// prefix because both Codex and Prime publish multiple current profiles.
+/// prefix because both Codex and Prime publish multiple current profiles;
+/// OpenRouter's official DeepSeek namespace is admitted as a family so new
+/// first-party DeepSeek releases appear without also admitting repackages.
 pub(crate) fn is_curated_comet_model(model_id: &str) -> bool {
     let is_gpt_56_family = |prefix: &str| {
         model_id == prefix
@@ -118,8 +120,12 @@ pub(crate) fn is_curated_comet_model(model_id: &str) -> bool {
                 .strip_prefix(prefix)
                 .is_some_and(|suffix| suffix.starts_with('-'))
     };
+    let is_openrouter_deepseek = model_id
+        .strip_prefix("openrouter/")
+        .is_some_and(|id| id.starts_with("deepseek/") || id.starts_with("~deepseek/"));
     is_gpt_56_family("openai-codex/gpt-5.6")
         || is_gpt_56_family("prime-inference/openai/gpt-5.6")
+        || is_openrouter_deepseek
         || matches!(
             model_id,
             "anthropic/claude-opus-5"
