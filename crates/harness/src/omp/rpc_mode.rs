@@ -261,6 +261,7 @@ pub(crate) struct RpcModeProcess {
     pub client: RpcModeClient,
     pub frames: mpsc::Receiver<RpcFrame>,
     pub stderr_tail: crate::StderrTail,
+    pub run_config: Option<super::OmpRunConfig>,
 }
 
 fn rpc_assistant_message_id(session_id: &str, nonce: &uuid::Uuid, turn: u64) -> String {
@@ -733,6 +734,7 @@ pub(crate) async fn run_rpc(
         client,
         mut frames,
         stderr_tail,
+        run_config: _run_config,
     } = process;
     let RunControls {
         request_input,
@@ -813,6 +815,7 @@ pub(crate) async fn run_rpc(
             options.process_label
         )));
     }
+
     let model = state
         .get("model")
         .map(|model| {
@@ -855,6 +858,7 @@ pub(crate) async fn run_rpc(
 
     // Stage 4: first prompt. The ack is immediate (acceptance, not
     // completion); its response is matched inline by the session loop below.
+
     let mut outstanding_prompts = vec![PendingPrompt::new(
         client.send_command(
             "prompt",

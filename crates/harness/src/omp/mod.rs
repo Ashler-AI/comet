@@ -14,7 +14,7 @@ pub(crate) mod rpc_mode;
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::future::Future;
-use std::io::{BufRead as _, BufReader, Read as _};
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
@@ -57,8 +57,68 @@ const SCAFFOLD_PROFILE: &str = "scaffold-host";
 const AUTH_BROKER_URL_ENV: &str = "OMP_AUTH_BROKER_URL";
 const AUTH_BROKER_TOKEN_ENV: &str = "OMP_AUTH_BROKER_TOKEN";
 const AUTH_BROKER_TOKEN_FILE_ENV: &str = "OMP_AUTH_BROKER_TOKEN_FILE";
+const PI_CONFIG_FILES_ENV: &str = "PI_CONFIG_FILES";
 const SCAFFOLD_INFERENCE_PROFILE_FILE: &str = "omp-inference/profile.json";
 const SCAFFOLD_INFERENCE_PROFILE_BYTES: u64 = 4 * 1024;
+const OMP_RUN_CONFIG: &[u8] = b"retry:\n  enabled: true\n  maxRetries: 1\n  baseDelayMs: 1000\n  provider:\n    maxRetries: 0\n";
+
+#[derive(Debug)]
+pub(crate) struct OmpRunConfig {
+    path: PathBuf,
+}
+
+impl OmpRunConfig {
+    fn create() -> Result<Self, HarnessError> {
+        let temp_dir = std::env::temp_dir();
+        let temp_dir = if temp_dir.is_absolute() {
+            temp_dir
+        } else {
+            std::env::current_dir()?.join(temp_dir)
+        };
+        let path = temp_dir.join(format!("comet-omp-{}.yml", uuid::Uuid::new_v4()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path)?;
+        if let Err(error) = file.write_all(OMP_RUN_CONFIG) {
+            let _ = std::fs::remove_file(&path);
+            return Err(error.into());
+        }
+        Ok(Self { path })
+    }
+
+    fn apply(&self, command: &mut Command) -> Result<(), HarnessError> {
+        let value =
+            config_overlay_paths(std::env::var_os(PI_CONFIG_FILES_ENV).as_deref(), &self.path)?;
+        command.env(PI_CONFIG_FILES_ENV, value);
+        Ok(())
+    }
+}
+
+fn config_overlay_paths(
+    inherited: Option<&std::ffi::OsStr>,
+    run_config: &Path,
+) -> Result<OsString, HarnessError> {
+    let mut paths = inherited
+        .map(|value| std::env::split_paths(value).collect::<Vec<_>>())
+        .unwrap_or_default();
+    paths.push(run_config.to_path_buf());
+    std::env::join_paths(paths).map_err(|error| {
+        HarnessError::Protocol(format!(
+            "Could not construct OMP config overlay path: {error}"
+        ))
+    })
+}
+
+impl Drop for OmpRunConfig {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1008,6 +1068,7 @@ impl Harness for OmpHarness {
                 client,
                 frames,
                 stderr_tail,
+                run_config: None,
             },
             RPC_COMMAND_CATALOG_DEADLINE,
         )
@@ -1022,6 +1083,8 @@ impl Harness for OmpHarness {
         let executable = self.resolve_executable()?;
         self.ensure_resume_has_no_writer(request.resume.as_deref())?;
         let mut command = self.run_command(&executable, &request);
+        let run_config = OmpRunConfig::create()?;
+        run_config.apply(&mut command)?;
         crate::apply_run_context(&mut command, controls.context.as_ref());
         if let Some(inference) = controls
             .context
@@ -1072,6 +1135,7 @@ impl Harness for OmpHarness {
                     client,
                     frames,
                     stderr_tail,
+                    run_config: Some(run_config),
                 },
                 request,
                 controls,
@@ -2044,6 +2108,34 @@ mod tests {
             acp_assistant_message_id(session_id, &first_run, 0),
             acp_assistant_message_id(session_id, &resumed_run, 0)
         );
+    }
+
+    #[test]
+    fn run_config_preserves_inherited_overlays_and_wins_last() {
+        let inherited =
+            std::env::join_paths([Path::new("/tmp/user-a.yml"), Path::new("/tmp/user-b.yml")])
+                .unwrap();
+        let combined =
+            config_overlay_paths(Some(&inherited), Path::new("/tmp/comet-retry.yml")).unwrap();
+        assert_eq!(
+            std::env::split_paths(&combined).collect::<Vec<_>>(),
+            [
+                PathBuf::from("/tmp/user-a.yml"),
+                PathBuf::from("/tmp/user-b.yml"),
+                PathBuf::from("/tmp/comet-retry.yml"),
+            ]
+        );
+    }
+
+    #[test]
+    fn run_config_bounds_layered_retries_and_removes_file() {
+        let path;
+        {
+            let config = OmpRunConfig::create().unwrap();
+            path = config.path.clone();
+            assert_eq!(std::fs::read(&path).unwrap(), OMP_RUN_CONFIG);
+        }
+        assert!(!path.exists(), "temporary OMP overlay must be removed");
     }
 
     #[test]

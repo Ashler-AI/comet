@@ -16,6 +16,16 @@ use tokio::sync::{mpsc, oneshot};
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-omp.sh")
 }
+fn run_config_path(session_log: &str) -> PathBuf {
+    let value = session_log
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("config:"))
+        .expect("fixture config environment");
+    std::env::split_paths(value)
+        .last()
+        .expect("Comet retry overlay path")
+}
 
 fn write_omp_session(session_dir: &std::path::Path, session_id: &str) -> PathBuf {
     let project_dir = session_dir.join("project");
@@ -160,8 +170,10 @@ async fn fake_omp_proves_rpc_mode_execution_and_event_mapping() {
     let _env = env_lock().await;
     let temp = tempfile::tempdir().unwrap();
     let argv_log = temp.path().join("argv");
+    let session_log = temp.path().join("sessions");
     unsafe {
         std::env::set_var("OMP_ARGV_LOG", &argv_log);
+        std::env::set_var("OMP_SESSION_LOG", &session_log);
     }
     let harness = OmpHarness::new().with_executable(fixture_path());
     let mut run_request = request(None);
@@ -193,6 +205,22 @@ async fn fake_omp_proves_rpc_mode_execution_and_event_mapping() {
             "spawned forbidden harness: {argv}"
         );
     }
+    assert!(
+        !argv.lines().any(|argument| argument == "--config"),
+        "Comet should use the process-only PI_CONFIG_FILES interface: {argv}"
+    );
+    let session_log = std::fs::read_to_string(session_log).unwrap();
+    let run_config = run_config_path(&session_log);
+    assert!(
+        run_config.is_absolute(),
+        "overlay path must be absolute: {session_log}"
+    );
+    assert_eq!(session_log.lines().nth(1), Some("get_state"));
+    assert!(
+        !run_config.exists(),
+        "run overlay must be removed after OMP exits: {}",
+        run_config.display()
+    );
     let assistant_message_id = events
         .iter()
         .find_map(|event| match event {
@@ -257,6 +285,9 @@ async fn fake_omp_proves_rpc_mode_execution_and_event_mapping() {
             session_id: Some("omp-session-1".into()),
         })
     );
+    unsafe {
+        std::env::remove_var("OMP_SESSION_LOG");
+    }
 }
 
 #[tokio::test]
@@ -603,9 +634,10 @@ async fn persistent_run_steers_the_live_turn() {
     let _env = env_lock().await;
     let temp = tempfile::tempdir().unwrap();
     let prompt_log = temp.path().join("prompts");
+    let argv_log = temp.path().join("argv");
     let session_log = temp.path().join("sessions");
     unsafe {
-        std::env::set_var("OMP_ARGV_LOG", temp.path().join("argv"));
+        std::env::set_var("OMP_ARGV_LOG", &argv_log);
         std::env::set_var("OMP_PROMPT_LOG", &prompt_log);
         std::env::set_var("OMP_SESSION_LOG", &session_log);
         std::env::set_var("OMP_STEER_SCENARIO", "1");
@@ -690,10 +722,22 @@ async fn persistent_run_steers_the_live_turn() {
         boundary < steered_output && steered_output < done,
         "events: {events:?}"
     );
+    let session_log = std::fs::read_to_string(session_log).unwrap();
     assert_eq!(
-        std::fs::read_to_string(session_log).unwrap(),
-        "get_state\n",
-        "one RPC session must serve the whole run"
+        session_log.lines().nth(1),
+        Some("get_state"),
+        "one RPC session must serve the whole run without mutating OMP settings"
+    );
+    let argv = std::fs::read_to_string(argv_log).unwrap();
+    assert!(
+        !argv.lines().any(|argument| argument == "--config"),
+        "persistent runs should use PI_CONFIG_FILES: {argv}"
+    );
+    let run_config = run_config_path(&session_log);
+    assert!(
+        !run_config.exists(),
+        "persistent run overlay must be removed after OMP exits: {}",
+        run_config.display()
     );
     let prompts = std::fs::read_to_string(prompt_log).unwrap();
     assert_eq!(prompts.lines().count(), 2);

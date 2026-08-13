@@ -8,6 +8,104 @@ mod tests {
     use serde_json::Value;
     use tokio::sync::mpsc;
 
+    #[derive(Clone)]
+    struct LogWriter(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn relay_stream_context(request_id: &str) -> RelayStreamContext {
+        RelayStreamContext {
+            session_id: "diagnostic-session".into(),
+            request_id: request_id.into(),
+        }
+    }
+
+    fn instrumented_test_stream(
+        items: Vec<Result<Bytes, BoxError>>,
+        cancellation: comet_harness::CancellationToken,
+        request_id: &str,
+    ) -> InstrumentedRelayStream {
+        InstrumentedRelayStream::new(
+            Box::pin(stream::iter(items)),
+            cancellation,
+            relay_stream_context(request_id),
+            StatusCode::OK,
+        )
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn logs_every_relay_stream_termination_with_request_context() {
+        let logs = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer({
+                let logs = logs.clone();
+                move || LogWriter(logs.clone())
+            })
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+
+        let mut complete = instrumented_test_stream(
+            vec![Ok(Bytes::from_static(b"abc"))],
+            comet_harness::CancellationToken::new(),
+            "request-complete",
+        );
+        assert_eq!(complete.next().await.unwrap().unwrap(), Bytes::from_static(b"abc"));
+        assert!(complete.next().await.is_none());
+
+        let cancellation = comet_harness::CancellationToken::new();
+        let mut cancelled = InstrumentedRelayStream::new(
+            Box::pin(stream::pending()),
+            cancellation.clone(),
+            relay_stream_context("request-cancelled"),
+            StatusCode::OK,
+        );
+        cancellation.cancel();
+        assert!(cancelled.next().await.is_none());
+
+        let mut failed = instrumented_test_stream(
+            vec![Err(Box::new(std::io::Error::other("body closed")))],
+            comet_harness::CancellationToken::new(),
+            "request-failed",
+        );
+        assert_eq!(failed.next().await.unwrap().unwrap_err().to_string(), "body closed");
+
+        drop(InstrumentedRelayStream::new(
+            Box::pin(stream::pending()),
+            comet_harness::CancellationToken::new(),
+            relay_stream_context("request-dropped"),
+            StatusCode::OK,
+        ));
+        let logs = String::from_utf8(logs.lock().clone()).unwrap();
+        for (request_id, outcome) in [
+            ("request-complete", "complete"),
+            ("request-cancelled", "cancelled"),
+            ("request-failed", "upstream_error"),
+            ("request-dropped", "downstream_dropped"),
+        ] {
+            let line = logs
+                .lines()
+                .find(|line| line.contains(request_id))
+                .unwrap_or_else(|| panic!("missing diagnostic for {request_id}: {logs}"));
+            assert!(line.contains(&format!("outcome=\"{outcome}\"")), "{line}");
+            assert!(line.contains("session_id=diagnostic-session"), "{line}");
+            assert!(line.contains("status=200"), "{line}");
+            assert!(line.contains("bytes_received="), "{line}");
+        }
+        assert!(logs.lines().any(|line| line.contains("request-failed") && line.contains("body closed")));
+    }
+
     struct StaticToken;
 
     #[async_trait]

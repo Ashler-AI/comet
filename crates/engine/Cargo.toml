@@ -41,3 +41,5 @@ tokio-util.workspace = true
 [dev-dependencies]
 tokio-tungstenite.workspace = true
 loro-protocol.workspace = true
+tracing-subscriber.workspace = true
+parking_lot.workspace = true

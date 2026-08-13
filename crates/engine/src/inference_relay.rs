@@ -1,15 +1,6 @@
-use std::collections::HashMap;
-use std::convert::Infallible;
-use std::error::Error;
-use std::io;
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener as StdTcpListener};
-use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-
 use bytes::Bytes;
 use chrono::{DateTime, TimeDelta, Utc};
-use futures::{StreamExt, stream};
+use futures::{Stream, StreamExt, stream};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
@@ -18,6 +9,15 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::json;
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::error::Error;
+use std::io;
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener as StdTcpListener};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::{Context, Poll};
 use tempfile::TempPath;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -76,6 +76,101 @@ struct Route {
 struct GrantState {
     grant: AgentInferenceGrant,
     expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone)]
+struct RelayStreamContext {
+    session_id: String,
+    request_id: String,
+}
+
+struct InstrumentedRelayStream {
+    upstream: RelayByteStream,
+    cancellation: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+    context: RelayStreamContext,
+    status: StatusCode,
+    bytes_received: u64,
+    terminated: bool,
+}
+
+impl InstrumentedRelayStream {
+    fn new(
+        upstream: RelayByteStream,
+        cancellation: comet_harness::CancellationToken,
+        context: RelayStreamContext,
+        status: StatusCode,
+    ) -> Self {
+        Self {
+            upstream,
+            cancellation: Box::pin(cancellation.cancelled_owned()),
+            context,
+            status,
+            bytes_received: 0,
+            terminated: false,
+        }
+    }
+
+    fn finish(&mut self, outcome: &'static str, error: Option<&(dyn Error + Send + Sync)>) {
+        self.terminated = true;
+        if let Some(error) = error {
+            tracing::warn!(
+                outcome,
+                session_id = %self.context.session_id,
+                request_id = %self.context.request_id,
+                status = self.status.as_u16(),
+                bytes_received = self.bytes_received,
+                err = %error,
+                "inference relay response stream terminated"
+            );
+        } else {
+            tracing::debug!(
+                outcome,
+                session_id = %self.context.session_id,
+                request_id = %self.context.request_id,
+                status = self.status.as_u16(),
+                bytes_received = self.bytes_received,
+                "inference relay response stream terminated"
+            );
+        }
+    }
+}
+
+impl Stream for InstrumentedRelayStream {
+    type Item = Result<Bytes, BoxError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.terminated {
+            return Poll::Ready(None);
+        }
+        if this.cancellation.as_mut().poll(cx).is_ready() {
+            this.finish("cancelled", None);
+            return Poll::Ready(None);
+        }
+        match this.upstream.as_mut().poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(Ok(bytes))) => {
+                this.bytes_received = this.bytes_received.saturating_add(bytes.len() as u64);
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                this.finish("upstream_error", Some(error.as_ref()));
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                this.finish("complete", None);
+                Poll::Ready(None)
+            }
+        }
+    }
+}
+
+impl Drop for InstrumentedRelayStream {
+    fn drop(&mut self) {
+        if !self.terminated {
+            self.finish("downstream_dropped", None);
+        }
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -354,6 +449,10 @@ impl InferenceRelay {
             .filter(|value| !value.is_empty() && value.len() <= 128)
             .map(str::to_string)
             .unwrap_or_else(new_id);
+        let stream_context = RelayStreamContext {
+            session_id: route.request.logical_session_id.clone(),
+            request_id: request_id.clone(),
+        };
         let spool = match spool_request_body(request.into_body(), content_length).await {
             Ok(spool) => spool,
             Err(error) => {
@@ -422,10 +521,16 @@ impl InferenceRelay {
                 }
             };
             if account_failovers >= MAX_ACCOUNT_FAILOVERS {
-                return stream_response(upstream, cancellation);
+                return stream_response(upstream, cancellation, stream_context.clone());
             }
-            let (upstream, failure_class) =
-                retryable_response(&route.request, &grant, upstream, cancellation.clone()).await;
+            let (upstream, failure_class) = retryable_response(
+                &route.request,
+                &grant,
+                upstream,
+                cancellation.clone(),
+                stream_context.clone(),
+            )
+            .await;
             let Some(failure_class) = failure_class else {
                 return upstream;
             };
@@ -547,13 +652,17 @@ async fn retryable_response(
     grant: &AgentInferenceGrant,
     upstream: reqwest::Response,
     cancellation: comet_harness::CancellationToken,
+    stream_context: RelayStreamContext,
 ) -> (Response<RelayBody>, Option<&'static str>) {
     if request.routing_mode == AgentRoutingMode::Pinned || grant.binding.backend != "oauth" {
-        return (stream_response(upstream, cancellation), None);
+        return (
+            stream_response(upstream, cancellation, stream_context),
+            None,
+        );
     }
     if upstream.status() == StatusCode::UNAUTHORIZED {
         return (
-            stream_response(upstream, cancellation),
+            stream_response(upstream, cancellation, stream_context),
             Some("authentication_required"),
         );
     }
@@ -571,7 +680,10 @@ async fn retryable_response(
             .and_then(|value| value.parse::<usize>().ok())
             .is_some_and(|length| length > MAX_FAILURE_RESPONSE_BYTES)
     {
-        return (stream_response(upstream, cancellation), None);
+        return (
+            stream_response(upstream, cancellation, stream_context),
+            None,
+        );
     }
 
     let status = upstream.status();
@@ -586,7 +698,13 @@ async fn retryable_response(
                 let prefix = stream::iter(chunks.into_iter().map(Ok::<Bytes, BoxError>));
                 let failure = stream::once(async move { Err::<Bytes, BoxError>(Box::new(error)) });
                 return (
-                    streamed_response(status, headers, Box::pin(prefix.chain(failure))),
+                    instrumented_streamed_response(
+                        status,
+                        headers,
+                        Box::pin(prefix.chain(failure)),
+                        cancellation,
+                        stream_context,
+                    ),
                     None,
                 );
             }
@@ -599,7 +717,13 @@ async fn retryable_response(
                 let rest =
                     remaining.map(|chunk| chunk.map_err(|error| -> BoxError { Box::new(error) }));
                 return (
-                    streamed_response(status, headers, Box::pin(prefix.chain(rest))),
+                    instrumented_streamed_response(
+                        status,
+                        headers,
+                        Box::pin(prefix.chain(rest)),
+                        cancellation,
+                        stream_context,
+                    ),
                     None,
                 );
             }
@@ -610,7 +734,13 @@ async fn retryable_response(
             let rest =
                 remaining.map(|chunk| chunk.map_err(|error| -> BoxError { Box::new(error) }));
             return (
-                streamed_response(status, headers, Box::pin(prefix.chain(rest))),
+                instrumented_streamed_response(
+                    status,
+                    headers,
+                    Box::pin(prefix.chain(rest)),
+                    cancellation,
+                    stream_context,
+                ),
                 None,
             );
         }
@@ -784,13 +914,24 @@ fn json_response(status: StatusCode, body: serde_json::Value) -> Response<RelayB
 fn stream_response(
     upstream: reqwest::Response,
     cancellation: comet_harness::CancellationToken,
+    context: RelayStreamContext,
 ) -> Response<RelayBody> {
     let status = upstream.status();
     let headers = upstream.headers().clone();
-    let stream = upstream
+    let upstream = upstream
         .bytes_stream()
-        .map(|chunk| chunk.map_err(|error| -> BoxError { Box::new(error) }))
-        .take_until(cancellation.cancelled_owned());
+        .map(|chunk| chunk.map_err(|error| -> BoxError { Box::new(error) }));
+    instrumented_streamed_response(status, headers, Box::pin(upstream), cancellation, context)
+}
+
+fn instrumented_streamed_response(
+    status: StatusCode,
+    headers: HeaderMap,
+    stream: RelayByteStream,
+    cancellation: comet_harness::CancellationToken,
+    context: RelayStreamContext,
+) -> Response<RelayBody> {
+    let stream = InstrumentedRelayStream::new(stream, cancellation, context, status);
     streamed_response(status, headers, Box::pin(stream))
 }
 
