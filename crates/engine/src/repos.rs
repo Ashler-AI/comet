@@ -571,15 +571,13 @@ impl Repos {
             name.ok_or_else(|| EngineError::Other("Could not allocate a worktree name".into()))?;
         let path = base.join(&name);
         let branch_name = format!("comet/{name}");
-        // Materializing a large monorepo is the dominant cost of `worktree add`.
-        // Git otherwise checks out blobs on one worker; keep the parallelism
-        // command-scoped so Comet does not mutate the user's repository config.
+        // GUI apps on macOS commonly inherit a 256-descriptor soft limit. Git's
+        // parallel checkout needs extra pipes and can fail before the chat row
+        // is persisted, so keep managed worktree materialization serial.
         self.git(
             &[
                 "-c",
-                "checkout.workers=8",
-                "-c",
-                "checkout.thresholdForParallelism=100",
+                "checkout.workers=1",
                 "worktree",
                 "add",
                 "-b",
