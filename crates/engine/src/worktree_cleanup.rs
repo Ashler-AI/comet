@@ -285,7 +285,7 @@ mod tests {
         let repos =
             Repos::with_worktrees_root(temp.path(), "device-a", temp.path().join("worktrees"));
         let worktree = repos.create_worktree(&repo, "main").await.unwrap();
-        let store = Arc::new(DocsStore::open(&temp.path().join("store")).unwrap());
+        let store = Arc::new(DocsStore::open(temp.path().join("store")).unwrap());
         let workspace = WorkspaceHost::open(
             store,
             WorkspaceHostConfig {
