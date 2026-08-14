@@ -299,6 +299,14 @@ impl AgentAccounts {
                     continue;
                 }
 
+                if remote_accounts
+                    .iter()
+                    .any(|account| remote_account_matches_slot(account, &slot))
+                {
+                    self.delete_slot(&slot)?;
+                    continue;
+                }
+
                 accounts.push(AgentAccount {
                     id: slot.id,
                     harness,
@@ -1061,20 +1069,25 @@ fn harness_for_provider(provider: &str) -> Option<HarnessId> {
     }
 }
 
+fn remote_account_matches_slot(account: &RemoteAgentAccount, slot: &Slot) -> bool {
+    harness_for_provider(&account.provider) == Some(slot.harness)
+        && account.provider_account_id == slot.account_key
+}
+
 fn remote_account_for_view(account: &RemoteAgentAccount) -> Option<AgentAccount> {
     let harness = harness_for_provider(&account.provider)?;
     let usage_windows = account
-        .usage_fraction
-        .map(|used_fraction| AgentUsageWindow {
-            label: "Usage".into(),
-            used_fraction,
-            resets_at: account
+        .usage_windows
+        .iter()
+        .map(|window| AgentUsageWindow {
+            label: window.label.clone(),
+            used_fraction: window.used_fraction,
+            resets_at: window
                 .reset_at
                 .as_deref()
                 .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
                 .map(|value| value.with_timezone(&Utc)),
         })
-        .into_iter()
         .collect();
     Some(AgentAccount {
         id: account.id.clone(),
@@ -1602,11 +1615,77 @@ mod tests {
                 "organization": "Example",
                 "plan": "Pro",
                 "status": "connected",
-                "usageFraction": null,
-                "resetAt": null
+                "usageWindows": [{
+                    "modelPattern": "claude-opus-5",
+                    "label": "Opus 5",
+                    "usedFraction": 1,
+                    "resetAt": "2026-08-13T12:00:00.000Z"
+                }]
             }
         })
         .to_string()
+    }
+
+    #[tokio::test]
+    async fn list_removes_an_acknowledged_recovery_snapshot_instead_of_rendering_a_duplicate() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tmp.path());
+        let account =
+            serde_json::from_str::<serde_json::Value>(&imported_claude_account_response()).unwrap()
+                ["account"]
+                .clone();
+        let (remote_origin, remote_requests) = scripted_server(vec![(
+            200,
+            serde_json::json!({ "accounts": [account] }).to_string(),
+        )])
+        .await;
+        let remote =
+            ScaffoldClient::new(&remote_origin, "project-1", Arc::new(StaticToken)).unwrap();
+        let accounts = AgentAccounts::new(config);
+        accounts.set_remote(remote);
+        let slot = Slot {
+            id: "ignored-local-id".into(),
+            harness: HarnessId::ClaudeCode,
+            account_key: "account-1".into(),
+            profile: SlotProfile {
+                email: "person@example.com".into(),
+                display_name: Some("Person".into()),
+                organization: Some("Example".into()),
+                plan: Some("Pro".into()),
+                auth_kind: AgentAuthKind::Oauth,
+            },
+            credentials: serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "access",
+                    "refreshToken": "refresh",
+                    "expiresAt": 4_000_000_000_000_i64,
+                }
+            }),
+            claude_config: None,
+            saved_at: now_ms(),
+            created_at: None,
+        };
+        accounts.write_slot(&slot).expect("write recovery snapshot");
+
+        let snapshot = accounts.list().await.expect("list accounts");
+
+        assert_eq!(snapshot.accounts.len(), 1);
+        assert!(!snapshot.accounts[0].migration_available);
+        assert!(accounts.read_slots(HarnessId::ClaudeCode).is_empty());
+        assert_eq!(snapshot.accounts[0].usage_windows.len(), 1);
+        assert_eq!(snapshot.accounts[0].usage_windows[0].label, "Opus 5");
+        assert_eq!(snapshot.accounts[0].usage_windows[0].used_fraction, 1.0);
+        assert_eq!(
+            snapshot.accounts[0].usage_windows[0]
+                .resets_at
+                .as_ref()
+                .map(DateTime::to_rfc3339)
+                .as_deref(),
+            Some("2026-08-13T12:00:00+00:00")
+        );
+        let requests = remote_requests.await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /api/agent-accounts "));
     }
 
     fn test_config(root: &Path) -> AgentAccountsConfig {
