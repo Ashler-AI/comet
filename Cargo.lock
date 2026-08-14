@@ -1218,6 +1218,7 @@ dependencies = [
  "loro",
  "loro-protocol",
  "notify",
+ "parking_lot",
  "portable-pty",
  "reqwest",
  "rusqlite",
@@ -1230,6 +1231,7 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

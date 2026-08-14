@@ -223,6 +223,7 @@ impl Drop for DispatchPreparationGuard {
 
 struct RunHandle {
     run_id: String,
+    user_message_id: String,
     route: RunRoute,
     steerable: bool,
     steering_mode: SteeringMode,
@@ -244,6 +245,12 @@ struct RunHandle {
     cancel: watch::Sender<bool>,
     engine_tx: mpsc::UnboundedSender<AgentEvent>,
     pending_inputs: PendingInputs,
+}
+
+struct RouteRestartState {
+    lifecycle_epoch: u64,
+    restarting_from_run_id: String,
+    restart_pending: bool,
 }
 
 impl RunHandle {
@@ -282,6 +289,9 @@ struct Inner {
     doc_host: OnceLock<DocHost>,
     /// chat_id → live run.
     runs: Mutex<HashMap<String, RunHandle>>,
+    /// One automatic route-lifecycle restart may remain pending until the
+    /// replacement run proves inference progress.
+    route_restarts: Mutex<HashMap<String, RouteRestartState>>,
     /// Per-chat dispatch serialization. The weak values disappear when the
     /// final waiter leaves, while the map preserves one lock for all dispatches
     /// that overlap grant preparation or harness startup.
@@ -342,6 +352,7 @@ impl SessionsEngine {
                 ipc_port,
                 doc_host: OnceLock::new(),
                 runs: Mutex::new(HashMap::new()),
+                route_restarts: Mutex::new(HashMap::new()),
                 dispatch_locks: Mutex::new(HashMap::new()),
                 preparations: Mutex::new(HashMap::new()),
                 last_routes: Mutex::new(HashMap::new()),
@@ -370,7 +381,34 @@ impl SessionsEngine {
     }
 
     pub(crate) fn set_inference_relay(&self, relay: crate::inference_relay::InferenceRelay) {
-        let _ = self.inner.inference_relay.set(relay);
+        let mut expired_routes = relay.subscribe_expired_routes();
+        if self.inner.inference_relay.set(relay).is_err() {
+            return;
+        }
+        let weak = Arc::downgrade(&self.inner);
+        tokio::spawn(async move {
+            loop {
+                match expired_routes.recv().await {
+                    Ok(expired_route) => {
+                        let Some(inner) = weak.upgrade() else {
+                            break;
+                        };
+                        tokio::spawn(async move {
+                            SessionsEngine { inner }
+                                .restart_expired_route(
+                                    &expired_route.logical_session_id,
+                                    expired_route.lifecycle_epoch,
+                                )
+                                .await;
+                        });
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "inference route restart signals lagged");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
     }
 
     pub(crate) fn set_auth(&self, auth: crate::Auth) {
@@ -640,13 +678,24 @@ impl SessionsEngine {
         &self,
         chat_id: &str,
         harness_id: HarnessId,
-        mut request: RunRequest,
+        request: RunRequest,
         message_id: Option<String>,
         inject_resume: bool,
     ) -> Result<String, EngineError> {
         let dispatch_lock = self.dispatch_lock(chat_id);
         let _dispatch_guard = dispatch_lock.lock().await;
+        self.dispatch_inner_locked(chat_id, harness_id, request, message_id, inject_resume)
+            .await
+    }
 
+    async fn dispatch_inner_locked(
+        &self,
+        chat_id: &str,
+        harness_id: HarnessId,
+        mut request: RunRequest,
+        message_id: Option<String>,
+        inject_resume: bool,
+    ) -> Result<String, EngineError> {
         enum ExistingRunDecision {
             None,
             Routed {
@@ -689,6 +738,7 @@ impl SessionsEngine {
                             }
                         } else {
                             let status = handle.mailbox_message_status(was_turn_active, message);
+                            handle.user_message_id = user_id.clone();
                             ExistingRunDecision::Routed {
                                 run_id: handle.run_id.clone(),
                                 status,
@@ -699,6 +749,7 @@ impl SessionsEngine {
             }
         };
         if let ExistingRunDecision::Routed { run_id, status } = &existing {
+            lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
             let handle = self.doc_handle(chat_id)?;
             handle.write_user_message_with_status(&user_id, &request.prompt, now_ms(), *status)?;
             // The optimistic echo may already exist with a composer-guessed
@@ -855,6 +906,7 @@ impl SessionsEngine {
         lock(&self.inner.runs).insert(
             chat_id.to_string(),
             RunHandle {
+                user_message_id: user_id.clone(),
                 run_id: run_id.clone(),
                 route: requested_route,
                 steerable: harness.supports_steering(),
@@ -1269,6 +1321,94 @@ impl SessionsEngine {
         Ok(recovered)
     }
 
+    async fn restart_expired_route(&self, chat_id: &str, lifecycle_epoch: u64) {
+        enum Decision {
+            Duplicate,
+            Restart,
+            Terminate,
+        }
+
+        let dispatch_lock = self.dispatch_lock(chat_id);
+        let _dispatch_guard = dispatch_lock.lock().await;
+        let target = lock(&self.inner.runs).get(chat_id).map(|handle| {
+            (
+                handle.run_id.clone(),
+                handle.route.harness,
+                handle.user_message_id.clone(),
+            )
+        });
+        let Some((run_id, harness_id, user_message_id)) = target else {
+            return;
+        };
+        let decision = {
+            let mut restarts = lock(&self.inner.route_restarts);
+            match restarts.get_mut(chat_id) {
+                Some(state) if lifecycle_epoch <= state.lifecycle_epoch => Decision::Duplicate,
+                Some(state) if state.restart_pending => {
+                    state.lifecycle_epoch = lifecycle_epoch;
+                    Decision::Terminate
+                }
+                Some(state) => {
+                    state.lifecycle_epoch = lifecycle_epoch;
+                    state.restarting_from_run_id = run_id.clone();
+                    state.restart_pending = true;
+                    Decision::Restart
+                }
+                None => {
+                    restarts.insert(
+                        chat_id.to_string(),
+                        RouteRestartState {
+                            lifecycle_epoch,
+                            restarting_from_run_id: run_id.clone(),
+                            restart_pending: true,
+                        },
+                    );
+                    Decision::Restart
+                }
+            }
+        };
+        match decision {
+            Decision::Duplicate => return,
+            Decision::Terminate => {
+                tracing::error!(
+                    chat = %chat_id,
+                    lifecycle_epoch,
+                    "replacement inference route expired before making progress"
+                );
+                self.inner.mark_run_tearing_down(chat_id, &run_id);
+                if let Err(error) = self.interrupt(chat_id).await {
+                    tracing::error!(chat = %chat_id, %error, "failed replacement run teardown failed");
+                }
+                return;
+            }
+            Decision::Restart => {}
+        }
+
+        let Some(mut request) = self.last_request(chat_id) else {
+            tracing::error!(chat = %chat_id, "expired inference route has no restart request");
+            return;
+        };
+        tracing::warn!(
+            chat = %chat_id,
+            run = %run_id,
+            lifecycle_epoch,
+            "restarting run after local inference route expired"
+        );
+        self.inner.mark_run_tearing_down(chat_id, &run_id);
+        if let Err(error) = self.interrupt(chat_id).await {
+            tracing::error!(chat = %chat_id, %error, "expired-route run teardown failed");
+            return;
+        }
+        request.resume = None;
+        request.attachments.clear();
+        if let Err(error) = self
+            .dispatch_inner_locked(chat_id, harness_id, request, Some(user_message_id), true)
+            .await
+        {
+            tracing::error!(chat = %chat_id, %error, "expired-route run restart failed");
+        }
+    }
+
     /// Graceful shutdown: interrupt every live run so streaming entries settle.
     pub async fn shutdown(&self) {
         let chats: Vec<String> = lock(&self.inner.runs).keys().cloned().collect();
@@ -1487,6 +1627,16 @@ impl Inner {
         // Cache the journal hit (memory + row) so later dispatches skip the scan.
         self.remember_harness_session(chat_id, &session_id, &session_cwd);
         cwd_ok(&session_cwd).then_some(session_id)
+    }
+
+    fn note_route_restart_progress(&self, chat_id: &str, run_id: &str) {
+        let mut restarts = lock(&self.route_restarts);
+        if let Some(state) = restarts.get_mut(chat_id)
+            && state.restart_pending
+            && state.restarting_from_run_id != run_id
+        {
+            state.restart_pending = false;
+        }
     }
 
     /// The last harness session id named anywhere in the chat's journal, with
@@ -1781,6 +1931,20 @@ async fn drive_run(
         // per long turn observed) — the touch above already did their job.
         if matches!(&event, AgentEvent::ReasoningDelta { text } if text.is_empty()) {
             continue;
+        }
+        if matches!(
+            &event,
+            AgentEvent::TextDelta { .. }
+                | AgentEvent::ToolCall { .. }
+                | AgentEvent::Usage { .. }
+                | AgentEvent::AssistantMessageCompleted { .. }
+                | AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    ..
+                }
+        ) || matches!(&event, AgentEvent::ReasoningDelta { text } if !text.is_empty())
+        {
+            inner.note_route_restart_progress(&chat_id, &run_id);
         }
 
         // ACP session names are workspace metadata, not transcript content.
@@ -2160,7 +2324,9 @@ async fn drive_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use comet_proto::SessionRoomProjection;
+    use comet_proto::{Model, ReasoningLevel, RuntimeProfile, SandboxLevel};
     use comet_sync::DocsStore;
 
     use crate::doc_host::DocHostConfig;
@@ -2393,5 +2559,207 @@ mod tests {
         let mut changed_account = route.clone();
         changed_account.agent_account_id = Some("account-b".into());
         assert!(sessions.no_live_route_requires_rebind("chat-a", &changed_account));
+    }
+    struct RouteRestartHarness {
+        requests: Arc<Mutex<Vec<RunRequest>>>,
+    }
+
+    #[async_trait]
+    impl Harness for RouteRestartHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+
+        fn display_name(&self) -> &str {
+            "Route restart"
+        }
+
+        fn supports_steering(&self) -> bool {
+            false
+        }
+
+        fn steering_mode(&self) -> SteeringMode {
+            SteeringMode::TurnBoundary
+        }
+
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[ReasoningLevel::Medium]
+        }
+
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+            Ok(Vec::new())
+        }
+
+        async fn run(
+            &self,
+            request: RunRequest,
+            controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            lock(&self.requests).push(request.clone());
+            let (tx, rx) = mpsc::channel(8);
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(Ok(AgentEvent::SessionStarted {
+                        harness: HarnessId::Mock,
+                        model: "mock-route".into(),
+                        tools: Vec::new(),
+                        cwd: request.cwd,
+                        session_id: "route-session".into(),
+                        assistant_message_id: "route-assistant".into(),
+                    }))
+                    .await;
+                controls.interrupt.cancelled().await;
+                let _ = tx
+                    .send(Ok(AgentEvent::Done {
+                        status: DoneStatus::Interrupted,
+                        result: None,
+                        error: None,
+                        session_id: Some("route-session".into()),
+                    }))
+                    .await;
+            });
+            Ok(futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|event| (event, rx))
+            })
+            .boxed())
+        }
+    }
+
+    struct RouteRestartToken;
+
+    #[async_trait]
+    impl comet_rpc::TokenSource for RouteRestartToken {
+        async fn token(&self) -> Option<String> {
+            Some("route-restart-token".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_route_restarts_once_with_the_same_session_and_user_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path().join("store")).unwrap());
+        let workspace = WorkspaceHost::open(
+            store.clone(),
+            WorkspaceHostConfig {
+                device_id: "device-route-restart".into(),
+                device_name: "test".into(),
+                platform: "test".into(),
+                project_scope: "project-a".into(),
+                user_id: "owner-a".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        workspace
+            .create_space("space-route", "device-route-restart", "/tmp", None, false)
+            .unwrap();
+        workspace
+            .create_chat("chat-route", "space-route", None, None)
+            .unwrap();
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "device-route-restart".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        host.set_workspace(workspace);
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let registry = HarnessRegistry::for_profile(RuntimeProfile::Mock);
+        registry.register(Arc::new(RouteRestartHarness {
+            requests: requests.clone(),
+        }));
+        let sessions = SessionsEngine::new(
+            "device-route-restart".into(),
+            Arc::new(RunJournal::open(dir.path().join("journal")).unwrap()),
+            Arc::new(registry),
+            27654,
+        );
+        sessions.set_doc_host(host);
+        sessions
+            .dispatch(
+                "chat-route",
+                HarnessId::Mock,
+                RunRequest {
+                    prompt: "continue safely".into(),
+                    model: None,
+                    agent_account_id: None,
+                    reasoning: None,
+                    model_options: Default::default(),
+                    cwd: "/tmp".into(),
+                    sandbox: SandboxLevel::WorkspaceWrite,
+                    auto_approve: true,
+                    attachments: Vec::new(),
+                    resume: None,
+                },
+                Some("route-user-message".into()),
+            )
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while lock(&sessions.inner.harness_sessions)
+            .get("chat-route")
+            .is_none()
+        {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let relay = crate::inference_relay::InferenceRelay::start(
+            crate::scaffold::ScaffoldClient::new(
+                "http://127.0.0.1:1",
+                "project-a",
+                Arc::new(RouteRestartToken),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        sessions.set_inference_relay(relay.clone());
+
+        relay.notify_expired_route("chat-route", 1);
+        let restart_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while lock(&requests).len() < 2 {
+            assert!(tokio::time::Instant::now() < restart_deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let recorded = lock(&requests).clone();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[1].prompt, "continue safely");
+        assert_eq!(recorded[1].resume.as_deref(), Some("route-session"));
+        assert!(recorded[1].attachments.is_empty());
+
+        relay.notify_expired_route("chat-route", 1);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(lock(&sessions.inner.runs).contains_key("chat-route"));
+        assert_eq!(lock(&requests).len(), 2, "duplicate expiry must be ignored");
+
+        relay.notify_expired_route("chat-route", 2);
+        let stop_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while lock(&sessions.inner.runs).contains_key("chat-route") {
+            assert!(tokio::time::Instant::now() < stop_deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            lock(&requests).len(),
+            2,
+            "restart must be bounded until inference makes progress"
+        );
+        let entries = sessions
+            .doc_handle("chat-route")
+            .unwrap()
+            .doc()
+            .read_entries()
+            .unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.id == "route-user-message")
+                .count(),
+            1,
+            "restart must reuse the existing user entry"
+        );
+        sessions.shutdown().await;
     }
 }

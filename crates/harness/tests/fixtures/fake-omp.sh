@@ -35,14 +35,32 @@ fi
 [ -z "${OMP_RPC_PID_LOG:-}" ] || printf '%s\n' "$$" > "$OMP_RPC_PID_LOG"
 
 SESSION_ID="omp-session-1"
+NO_SESSION=0
 prev=""
 for arg in "$@"; do
   if [ "$prev" = "--resume" ]; then
     SESSION_ID="$arg"
+  elif [ "$arg" = "--no-session" ]; then
+    NO_SESSION=1
   fi
   prev="$arg"
 done
 ACTIVE_GOAL="${OMP_ACTIVE_GOAL:-}"
+
+
+if [ "$NO_SESSION" != "1" ]; then
+  CONFIG_PATH="${PI_CONFIG_FILES##*:}"
+  if [ -z "${PI_CONFIG_FILES:-}" ] || [ ! -f "$CONFIG_PATH" ] ||
+    [ "$(sed -n '1p' "$CONFIG_PATH")" != "retry:" ] ||
+    [ "$(sed -n '2p' "$CONFIG_PATH")" != "  enabled: true" ] ||
+    [ "$(sed -n '3p' "$CONFIG_PATH")" != "  maxRetries: 1" ] ||
+    [ "$(sed -n '4p' "$CONFIG_PATH")" != "  baseDelayMs: 1000" ] ||
+    [ "$(sed -n '5p' "$CONFIG_PATH")" != "  provider:" ] ||
+    [ "$(sed -n '6p' "$CONFIG_PATH")" != "    maxRetries: 0" ] ||
+    [ "$(sed -n '7p' "$CONFIG_PATH")" != "" ]; then
+    exit 92
+  fi
+fi
 
 printf '%s\n' '{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2],"maxFrameBytes":1048576,"maxReassembledFrameBytes":67108864}'
 if [ -n "$ACTIVE_GOAL" ]; then
@@ -65,7 +83,10 @@ while IFS= read -r line; do
       printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"negotiate_protocol\",\"success\":true}"
       ;;
     get_state)
-      [ -z "${OMP_SESSION_LOG:-}" ] || printf '%s\n' "get_state" >> "$OMP_SESSION_LOG"
+      if [ -n "${OMP_SESSION_LOG:-}" ]; then
+        printf 'config:%s\n' "${PI_CONFIG_FILES:-}" >> "$OMP_SESSION_LOG"
+        printf '%s\n' "get_state" >> "$OMP_SESSION_LOG"
+      fi
       if [ -n "$ACTIVE_GOAL" ]; then
         printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"get_state\",\"success\":true,\"data\":{\"sessionId\":\"$SESSION_ID\",\"model\":{\"provider\":\"openai-codex\",\"id\":\"gpt-5.6-sol\"},\"todoPhases\":[],\"goalMode\":{\"enabled\":true,\"mode\":\"active\",\"goal\":{\"id\":\"goal-1\",\"objective\":\"$ACTIVE_GOAL\",\"status\":\"active\"}}}}"
       else
