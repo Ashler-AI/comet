@@ -34,6 +34,9 @@ struct MdSelection {
     /// Byte offset of the anchor within its element.
     anchor_ix: usize,
     dragging: bool,
+    /// Document direction from the anchor to the current head. This lets a
+    /// drag keep extending after virtualization scrolls the anchor off-screen.
+    forward: bool,
     /// Resolved spans, document order. Empty while a click hasn't moved.
     spans: Vec<Span>,
     /// Window-space pointer position captured when the drag settles. The shell
@@ -77,6 +80,7 @@ pub fn begin(key: &str, ix: usize) {
             anchor_key: key.to_string(),
             anchor_ix: ix,
             dragging: true,
+            forward: true,
             spans: Vec::new(),
             action_position: None,
         });
@@ -86,10 +90,12 @@ pub fn begin(key: &str, ix: usize) {
 /// Begin with an immediate span (double/triple click inside one element).
 pub fn begin_with_span(key: &str, text: &str, range: Range<usize>) {
     STATE.with(|state| {
+        let anchor_ix = range.start;
         *state.borrow_mut() = Some(MdSelection {
             anchor_key: key.to_string(),
-            anchor_ix: range.start,
+            anchor_ix,
             dragging: true,
+            forward: true,
             spans: vec![Span {
                 key: key.to_string(),
                 range,
@@ -108,6 +114,80 @@ pub fn drag_anchor() -> Option<(String, usize)> {
         selection
             .dragging
             .then(|| (selection.anchor_key.clone(), selection.anchor_ix))
+    })
+}
+
+/// Resume a settled selection from its original anchor for Shift-click.
+pub fn resume_drag() -> bool {
+    STATE.with(|state| {
+        let mut guard = state.borrow_mut();
+        let Some(selection) = guard.as_mut() else {
+            return false;
+        };
+        if selection.spans.is_empty() {
+            return false;
+        }
+        selection.dragging = true;
+        selection.action_position = None;
+        true
+    })
+}
+
+/// Extend the active selection to `head` in the currently painted document
+/// slice. When the original anchor has scrolled out, overlapping spans bridge
+/// the old and new virtualized slices without losing already-selected text.
+pub fn extend_to(elements: &[(&str, &str)], head: (usize, usize)) -> bool {
+    STATE.with(|state| {
+        let mut guard = state.borrow_mut();
+        let Some(selection) = guard.as_mut() else {
+            return false;
+        };
+        if !selection.dragging || elements.is_empty() || head.0 >= elements.len() {
+            return false;
+        }
+
+        let next = if let Some(anchor_ei) = elements
+            .iter()
+            .position(|(key, _)| *key == selection.anchor_key)
+        {
+            selection.forward = (anchor_ei, selection.anchor_ix) <= head;
+            resolve_spans(elements, (anchor_ei, selection.anchor_ix), head)
+        } else {
+            let overlaps = elements
+                .iter()
+                .enumerate()
+                .filter_map(|(element_ix, (key, _))| {
+                    selection
+                        .spans
+                        .iter()
+                        .position(|span| span.key == *key)
+                        .map(|span_ix| (element_ix, span_ix))
+                })
+                .collect::<Vec<_>>();
+            if selection.forward {
+                let Some(&(element_ix, span_ix)) = overlaps.first() else {
+                    return false;
+                };
+                let bridge_ix = selection.spans[span_ix].range.start;
+                let mut spans = selection.spans[..span_ix].to_vec();
+                spans.extend(resolve_spans(elements, (element_ix, bridge_ix), head));
+                spans
+            } else {
+                let Some(&(element_ix, span_ix)) = overlaps.last() else {
+                    return false;
+                };
+                let bridge_ix = selection.spans[span_ix].range.end;
+                let mut spans = resolve_spans(elements, head, (element_ix, bridge_ix));
+                spans.extend_from_slice(&selection.spans[span_ix + 1..]);
+                spans
+            }
+        };
+
+        if selection.spans == next {
+            return false;
+        }
+        selection.spans = next;
+        true
     })
 }
 
@@ -296,6 +376,31 @@ mod tests {
         assert!(clear());
         assert!(!clear());
         assert_eq!(selected_text(), None);
+    }
+
+    #[test]
+    fn drag_extends_across_overlapping_virtualized_slices() {
+        begin("p1", 6);
+        assert!(extend_to(&elems(), (1, 6)));
+        assert_eq!(selected_text().as_deref(), Some("paragraph\nsecond"));
+
+        let scrolled = [("p2", "second"), ("p3", "third one")];
+        assert!(extend_to(&scrolled, (1, 5)));
+        assert_eq!(selected_text().as_deref(), Some("paragraph\nsecond\nthird"));
+        assert_eq!(end_drag("p1", None).as_deref(), selected_text().as_deref());
+    }
+
+    #[test]
+    fn shift_extension_resumes_from_original_anchor() {
+        begin("p1", 6);
+        assert!(extend_to(&elems(), (1, 3)));
+        assert!(end_drag("p1", None).is_some());
+        assert!(resume_drag());
+        assert!(extend_to(&elems(), (2, 5)));
+        assert_eq!(
+            end_drag("p1", None).as_deref(),
+            Some("paragraph\nsecond\nthird")
+        );
     }
 
     #[test]

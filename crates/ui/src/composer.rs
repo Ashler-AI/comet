@@ -101,7 +101,6 @@ struct ScaffoldAgentBinding {
 fn scaffold_agent_binding(
     harness: Option<HarnessId>,
     selected_model: Option<&str>,
-    agent_account_id: Option<&str>,
 ) -> Option<ScaffoldAgentBinding> {
     if harness? != HarnessId::Omp {
         return None;
@@ -122,11 +121,7 @@ fn scaffold_agent_binding(
         return None;
     }
     let model_id = selected.to_string();
-    let account_id = agent_account_id.map(str::trim).filter(|id| !id.is_empty());
-    let route = match account_id {
-        Some(account_id) => AgentRoute::pinned(provider, model, account_id),
-        None => AgentRoute::automatic(provider, model),
-    };
+    let route = AgentRoute::automatic(provider, model);
     Some(ScaffoldAgentBinding { route, model_id })
 }
 
@@ -135,7 +130,7 @@ fn scaffold_attached_chat_config(binding: &ScaffoldAgentBinding) -> ChatConfig {
         harness: HarnessId::Omp,
         model: Some(binding.model_id.clone()),
         reasoning: None,
-        agent_account_id: binding.route.account_id.clone(),
+        agent_account_id: None,
         model_options: Default::default(),
         sandbox: SandboxLevel::WorkspaceWrite,
     }
@@ -267,6 +262,17 @@ fn input_drag_scroll_delta(
         return 0.0;
     };
     distance.signum() * (distance.abs() * 0.2).clamp(1.0, line_height)
+}
+
+/// Selection produced by a multi-click in the prompt. Single clicks keep the
+/// normal caret/drag path; double clicks select a word and triple clicks select
+/// the complete prompt.
+fn input_click_selection(text: &str, index: usize, click_count: usize) -> Option<Range<usize>> {
+    match click_count {
+        2 => Some(crate::markdown::selection::word_range(text, index)),
+        count if count >= 3 => Some(0..text.len()),
+        _ => None,
+    }
 }
 
 /// Staged-attachment strip metrics (comet attachment-ui.tsx AttachmentStrip:
@@ -1215,6 +1221,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("shift-enter", Newline, ctx),
         KeyBinding::new("backspace", Backspace, ctx),
         KeyBinding::new("delete", Delete, ctx),
+        KeyBinding::new("shift-backspace", Backspace, ctx),
+        KeyBinding::new("shift-delete", Delete, ctx),
         KeyBinding::new("left", Left, ctx),
         KeyBinding::new("right", Right, ctx),
         KeyBinding::new("up", Up, ctx),
@@ -1296,6 +1304,8 @@ pub fn init(cx: &mut App) {
     let mut palette_bindings = vec![
         KeyBinding::new("backspace", Backspace, palette),
         KeyBinding::new("delete", Delete, palette),
+        KeyBinding::new("shift-backspace", Backspace, palette),
+        KeyBinding::new("shift-delete", Delete, palette),
         KeyBinding::new("home", Home, palette),
         KeyBinding::new("end", End, palette),
         KeyBinding::new("shift-left", SelectLeft, palette),
@@ -2432,6 +2442,9 @@ impl ComposerInput {
         let index = self.index_for_mouse_position(event.position);
         if event.modifiers.shift {
             self.select_to(index, cx);
+        } else if let Some(range) = input_click_selection(&self.content, index, event.click_count) {
+            self.move_to(range.start, cx);
+            self.select_to(range.end, cx);
         } else {
             self.move_to(index, cx);
         }
@@ -4714,11 +4727,8 @@ impl Composer {
             .then(|| scaffold_source_ref(&plan).map(str::to_string))
             .flatten();
         let scaffold_agent_binding = if scaffold_demo {
-            let Some(binding) = scaffold_agent_binding(
-                resolved.harness,
-                resolved.model.as_deref(),
-                resolved.agent_account_id.as_deref(),
-            ) else {
+            let Some(binding) = scaffold_agent_binding(resolved.harness, resolved.model.as_deref())
+            else {
                 self.failure = Some("Select a supported model before starting Scaffold".into());
                 cx.notify();
                 return;
@@ -5288,7 +5298,7 @@ impl Composer {
                         scaffold_agent_binding.as_ref(),
                         resolved.model.as_deref(),
                     ),
-                    agent_account_id: resolved.agent_account_id.clone(),
+                    agent_account_id: None,
                     reasoning: resolved.reasoning,
                     model_options: resolved.model_options.clone(),
                     cwd: cwd.clone(),
@@ -6404,15 +6414,16 @@ mod tests {
     #[test]
     fn scaffold_openai_binding_persists_and_sends_exact_model_identity() {
         let binding =
-            scaffold_agent_binding(Some(HarnessId::Omp), Some("openai-codex/gpt-5.6-sol"), None)
-                .unwrap();
+            scaffold_agent_binding(Some(HarnessId::Omp), Some("openai-codex/gpt-5.6-sol")).unwrap();
         assert_eq!(binding.route.provider, AgentProvider::OpenAi);
         assert_eq!(binding.route.model, "gpt-5.6-sol");
+        assert_eq!(binding.route.account_id, None);
         assert_eq!(binding.model_id, "openai-codex/gpt-5.6-sol");
 
         let persisted = scaffold_attached_chat_config(&binding);
         assert_eq!(persisted.harness, HarnessId::Omp);
         assert_eq!(persisted.model.as_deref(), Some("openai-codex/gpt-5.6-sol"));
+        assert_eq!(persisted.agent_account_id, None);
         assert_eq!(
             scaffold_run_model(true, Some(&binding), Some("wrong-model")).as_deref(),
             persisted.model.as_deref()
@@ -6420,24 +6431,18 @@ mod tests {
     }
 
     #[test]
-    fn scaffold_anthropic_binding_persists_and_sends_exact_model_identity() {
-        let binding = scaffold_agent_binding(
-            Some(HarnessId::Omp),
-            Some("anthropic/claude-opus-5"),
-            Some("opaque-account-id"),
-        )
-        .unwrap();
+    fn scaffold_anthropic_binding_uses_automatic_routing() {
+        let binding =
+            scaffold_agent_binding(Some(HarnessId::Omp), Some("anthropic/claude-opus-5")).unwrap();
         assert_eq!(binding.route.provider, AgentProvider::Anthropic);
         assert_eq!(binding.route.model, "claude-opus-5");
+        assert_eq!(binding.route.account_id, None);
         assert_eq!(binding.model_id, "anthropic/claude-opus-5");
 
         let persisted = scaffold_attached_chat_config(&binding);
         assert_eq!(persisted.harness, HarnessId::Omp);
         assert_eq!(persisted.model.as_deref(), Some("anthropic/claude-opus-5"));
-        assert_eq!(
-            persisted.agent_account_id.as_deref(),
-            Some("opaque-account-id")
-        );
+        assert_eq!(persisted.agent_account_id, None);
         assert_eq!(
             scaffold_run_model(true, Some(&binding), Some("wrong-model")).as_deref(),
             persisted.model.as_deref()
@@ -6453,23 +6458,14 @@ mod tests {
             HarnessId::PrimeAgent,
         ] {
             assert!(
-                scaffold_agent_binding(
-                    Some(harness),
-                    Some("openai-codex/gpt-5.6-sol"),
-                    Some("opaque-account-id")
-                )
-                .is_none(),
+                scaffold_agent_binding(Some(harness), Some("openai-codex/gpt-5.6-sol")).is_none(),
                 "Scaffold must run exclusively through OMP"
             );
         }
         assert!(
-            scaffold_agent_binding(
-                Some(HarnessId::Omp),
-                Some("prime-inference/x-ai/grok-4.20"),
-                Some("opaque-account-id")
-            )
-            .is_none(),
-            "third-party models must not request an OAuth-backed Scaffold route"
+            scaffold_agent_binding(Some(HarnessId::Omp), Some("prime-inference/x-ai/grok-4.20"),)
+                .is_none(),
+            "third-party models cannot use an OAuth-backed Scaffold route"
         );
     }
 
@@ -6909,6 +6905,16 @@ mod tests {
         assert_eq!(input_drag_scroll_delta(315.0, top, bottom, line), 3.0);
         assert_eq!(input_drag_scroll_delta(-100.0, top, bottom, line), -line);
         assert_eq!(input_drag_scroll_delta(500.0, top, bottom, line), line);
+    }
+
+    #[test]
+    fn prompt_multi_click_selects_word_then_all_text() {
+        let text = "one héllo world";
+        let word = input_click_selection(text, 6, 2).expect("double click selection");
+        assert_eq!(&text[word], "héllo");
+        assert_eq!(input_click_selection(text, 6, 3), Some(0..text.len()));
+        assert_eq!(input_click_selection(text, 6, 4), Some(0..text.len()));
+        assert_eq!(input_click_selection(text, 6, 1), None);
     }
 
     /// One frame short of the full morph timeline (never rounds up to done).
