@@ -1501,42 +1501,32 @@ impl Shell {
                 _ => {}
             }
         }
-        // Session chimes (herdr semantics, `sound::sound_for_transition`): a
-        // question rings whenever a session flips to AwaitingInput, a
-        // completion rings on the Working→Idle edge — for ANY session on any
-        // device. A row's first appearance only seeds the baseline, so boot
-        // (restored rows) and fresh sends stay silent.
-        //
-        // STALENESS-GATED like the dot (`effective_indicator`), for the same
-        // reason: raw row statuses include the past. A dead turn's Working row
-        // (host killed mid-run, Idle write lost to a wedged room) seeded
-        // prev=Working here, and the moment the old Idle finally synced in —
-        // typically piggybacked on the round-trip of a fresh send — the chime
-        // heard a phantom Working→Idle and rang "done" on send (user report
-        // 2026-07-31). The dot never showed that ghost; the chime must judge
-        // by the identical clock.
+        // Session chimes follow factual session-row updates, never the
+        // time-derived display indicator. `effective_indicator` intentionally
+        // turns a 45s-old Working row into `None`; treating that visual expiry
+        // as Idle produced a phantom Working→Idle completion chime even when no
+        // session had updated. Fresh raw transitions still ring for ANY session
+        // on any device. A row's first appearance only seeds the baseline, and
+        // delayed/backfilled transitions older than the freshness window stay
+        // silent.
         {
             let now = Utc::now();
-            let sessions: Vec<(String, comet_proto::SessionStatus)> = state
-                .read(cx)
-                .sessions
-                .iter()
-                .map(|s| {
-                    use comet_proto::view::Indicator;
-                    let status = match comet_proto::view::effective_indicator(Some(s), now) {
-                        Indicator::Working => comet_proto::SessionStatus::Working,
-                        Indicator::AwaitingInput => comet_proto::SessionStatus::AwaitingInput,
-                        Indicator::Errored => comet_proto::SessionStatus::Errored,
-                        Indicator::None => comet_proto::SessionStatus::Idle,
-                    };
-                    (s.chat_id.clone(), status)
-                })
-                .collect();
-            for (chat_id, status) in sessions {
-                let prev = self.sound_prev.insert(chat_id, status);
-                if let Some(prev) = prev
-                    && self.settings.sound_enabled
-                    && let Some(sound) = crate::sound::sound_for_transition(prev, status)
+            let app_state = state.read(cx);
+            for session in &app_state.sessions {
+                let prev = match self.sound_prev.get_mut(session.chat_id.as_str()) {
+                    Some(prev) => {
+                        let old = *prev;
+                        *prev = session.status;
+                        old
+                    }
+                    None => {
+                        self.sound_prev
+                            .insert(session.chat_id.clone(), session.status);
+                        continue;
+                    }
+                };
+                if self.settings.sound_enabled
+                    && let Some(sound) = crate::sound::sound_for_session_update(prev, session, now)
                 {
                     crate::sound::play(sound);
                 }

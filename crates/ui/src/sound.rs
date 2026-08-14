@@ -12,6 +12,7 @@
 //! - failures are logged and swallowed — a missing player must never bother
 //!   the session flow.
 
+use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -148,7 +149,7 @@ fn run_checked(program: &str, args: &[&str], path: &Path) -> Result<(), String> 
 // Transition mapping (pure — herdr's notification_sound_for_state_change)
 // ---------------------------------------------------------------------------
 
-use comet_proto::SessionStatus;
+use comet_proto::{Session, SessionStatus};
 
 /// Which chime (if any) a session-status transition deserves. Same-state
 /// updates never chime; a question always chimes; a completion chimes on the
@@ -162,6 +163,24 @@ pub fn sound_for_transition(prev: SessionStatus, new: SessionStatus) -> Option<S
         SessionStatus::Idle if prev == SessionStatus::Working => Some(Sound::Done),
         _ => None,
     }
+}
+
+/// Which chime a factual session-row update deserves. Status expiry is a
+/// display-only derivation: an old `Working` row becoming visually stale must
+/// never masquerade as a completed run. Delayed/backfilled updates older than
+/// the shared session freshness window are silent for the same reason.
+pub fn sound_for_session_update(
+    prev: SessionStatus,
+    session: &Session,
+    now: DateTime<Utc>,
+) -> Option<Sound> {
+    let age_ms = now
+        .signed_duration_since(session.updated_at)
+        .num_milliseconds();
+    if age_ms > comet_proto::view::SESSION_STALE_MS {
+        return None;
+    }
+    sound_for_transition(prev, session.status)
 }
 
 #[cfg(test)]
@@ -188,6 +207,47 @@ mod tests {
         assert_eq!(sound_for_transition(Working, Working), None);
         assert_eq!(sound_for_transition(Idle, Working), None);
         assert_eq!(sound_for_transition(Working, Errored), None);
+    }
+
+    #[test]
+    fn display_staleness_is_not_a_session_update() {
+        use SessionStatus::*;
+
+        fn session(status: SessionStatus, updated_at: DateTime<Utc>) -> Session {
+            Session {
+                chat_id: "chat-a".into(),
+                device_id: "device-a".into(),
+                status,
+                started_at: None,
+                updated_at,
+            }
+        }
+
+        let now = Utc::now();
+        let fresh_at = now - chrono::Duration::milliseconds(comet_proto::view::SESSION_STALE_MS);
+        let stale_at = fresh_at - chrono::Duration::milliseconds(1);
+        let stale_working = session(Working, stale_at);
+
+        assert_eq!(
+            comet_proto::view::effective_indicator(Some(&stale_working), now),
+            comet_proto::view::Indicator::None,
+            "the display may expire a working row"
+        );
+        assert_eq!(
+            sound_for_session_update(Working, &stale_working, now),
+            None,
+            "display expiry without a raw status change must stay silent"
+        );
+        assert_eq!(
+            sound_for_session_update(Working, &session(Idle, stale_at), now),
+            None,
+            "a delayed completion must not ring after the live row expired"
+        );
+        assert_eq!(
+            sound_for_session_update(Working, &session(Idle, fresh_at), now),
+            Some(Sound::Done),
+            "a fresh factual completion still rings"
+        );
     }
 
     #[test]
