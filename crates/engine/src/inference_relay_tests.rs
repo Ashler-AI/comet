@@ -229,6 +229,33 @@ mod tests {
         });
         origin
     }
+    async fn rebind_control_plane(captured: mpsc::UnboundedSender<Value>) -> String {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let captured = captured.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |request: Request<Incoming>| {
+                        let captured = captured.clone();
+                        async move {
+                            assert_eq!(request.uri().path(), "/api/agent-auth/grants/rebind");
+                            let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                            captured.send(serde_json::from_slice(&bytes).unwrap()).unwrap();
+                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"{}"))))
+                        }
+                    });
+                    hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+        origin
+    }
+
 
     #[derive(Debug)]
     struct FailoverCapture {
@@ -686,6 +713,77 @@ mod tests {
         );
     }
 
+    #[test]
+    fn projects_only_local_import_ids_to_stable_agent_auth_uuids() {
+        let local_id = "local-chat-b5b85d0f52a29e39da7656ab";
+        let projected = agent_auth_logical_session_id(local_id).into_owned();
+        let parsed = uuid::Uuid::parse_str(&projected).unwrap();
+
+        assert_eq!(projected, agent_auth_logical_session_id(local_id));
+        assert_eq!(parsed.as_bytes()[6] >> 4, 8);
+        assert_eq!(parsed.as_bytes()[8] & 0xc0, 0x80);
+        assert_eq!(agent_auth_logical_session_id("session-1"), "session-1");
+    }
+
+    #[tokio::test]
+    async fn projects_local_import_id_for_rebind_and_restores_it_on_expiration() {
+        let local_id = "local-chat-b5b85d0f52a29e39da7656ab";
+        let projected = agent_auth_logical_session_id(local_id).into_owned();
+        let (rebind_tx, mut rebind_rx) = mpsc::unbounded_channel();
+        let rebind_origin = rebind_control_plane(rebind_tx).await;
+        let rebind_client =
+            ScaffoldClient::new(rebind_origin, "project-1", Arc::new(StaticToken)).unwrap();
+        InferenceRelay::start(rebind_client)
+            .unwrap()
+            .rebind(local_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            rebind_rx.recv().await.unwrap(),
+            json!({ "logicalSessionId": projected })
+        );
+
+        let (captured_tx, _captured_rx) = mpsc::unbounded_channel();
+        let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let origin = test_control_plane(captured_tx, revoked.clone()).await;
+        let client = ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap();
+        let relay = InferenceRelay::start(client).unwrap();
+        let route = relay
+            .prepare(
+                local_id,
+                HarnessId::Omp,
+                Some("openai-codex/gpt-5.6-sol"),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        {
+            let state = lock(&relay.inner.route_state);
+            let active = state.active.get(&route.token).unwrap();
+            assert_eq!(active.request.logical_session_id, projected);
+            assert_eq!(active.session_id(), local_id);
+        }
+
+        let mut expired_routes = relay.subscribe_expired_routes();
+        relay.remove(&route.token).await;
+        assert!(revoked.load(std::sync::atomic::Ordering::SeqCst));
+        let removed = reqwest::Client::new()
+            .get(format!("{}/v1/models", route.base_url))
+            .bearer_auth(&route.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(removed.status(), reqwest::StatusCode::GONE);
+        assert_eq!(
+            expired_routes.recv().await.unwrap(),
+            ExpiredRoute {
+                logical_session_id: local_id.into(),
+                lifecycle_epoch: 1,
+            }
+        );
+    }
+
     #[tokio::test]
     async fn rebinds_retired_local_credential_to_the_next_route_for_the_same_session() {
         let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
@@ -817,6 +915,7 @@ mod tests {
                 "persistent-worker-token".into(),
                 RetiredRoute {
                     logical_session_id: "persistent-session".into(),
+                    local_session_id: None,
                     owner_subject: "owner-1".into(),
                     provider: "anthropic".into(),
                     lifecycle_epoch: 1,
