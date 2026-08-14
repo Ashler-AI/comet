@@ -58,6 +58,7 @@ const AUTH_BROKER_URL_ENV: &str = "OMP_AUTH_BROKER_URL";
 const AUTH_BROKER_TOKEN_ENV: &str = "OMP_AUTH_BROKER_TOKEN";
 const AUTH_BROKER_TOKEN_FILE_ENV: &str = "OMP_AUTH_BROKER_TOKEN_FILE";
 const PI_CONFIG_FILES_ENV: &str = "PI_CONFIG_FILES";
+const LOCAL_RUNTIME_ENV: &str = "COMET_LOCAL_AGENT_RUNTIME";
 const SCAFFOLD_INFERENCE_PROFILE_FILE: &str = "omp-inference/profile.json";
 const SCAFFOLD_INFERENCE_PROFILE_BYTES: u64 = 4 * 1024;
 const OMP_RUN_CONFIG: &[u8] = b"retry:\n  enabled: true\n  maxRetries: 1\n  baseDelayMs: 1000\n  provider:\n    maxRetries: 0\n";
@@ -784,6 +785,16 @@ impl OmpHarness {
         include_auth_broker_token: bool,
     ) -> Command {
         let mut command = self.base_command(executable, cwd, include_auth_broker_token);
+        // OMP sets CI on tool children independently of its launch environment.
+        // Repository-owned wrappers use this local-only marker to recover local
+        // command semantics; Scaffold explicitly omits it and stays CI.
+        if self.scaffold_host {
+            command.env("CI", "true");
+            command.env_remove(LOCAL_RUNTIME_ENV);
+        } else {
+            command.env("CI", "false");
+            command.env(LOCAL_RUNTIME_ENV, "1");
+        }
         command.args(["--mode", "rpc", "--approval-mode", "yolo"]);
         if self.scaffold_host {
             command.args([
@@ -2098,6 +2109,15 @@ fn normalize_update(params: &Value, harness: HarnessId) -> Option<AgentEvent> {
 mod tests {
     use super::*;
 
+    fn configured_env(command: &Command, key: &str) -> Option<String> {
+        command
+            .as_std()
+            .get_envs()
+            .find(|(name, _)| name.to_string_lossy() == key)
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned())
+    }
+
     #[test]
     fn resumed_acp_runs_use_distinct_assistant_message_ids() {
         let session_id = "same-durable-session";
@@ -2136,6 +2156,29 @@ mod tests {
             assert_eq!(std::fs::read(&path).unwrap(), OMP_RUN_CONFIG);
         }
         assert!(!path.exists(), "temporary OMP overlay must be removed");
+    }
+
+    #[test]
+    fn local_commands_are_marked_while_scaffold_commands_stay_ci() {
+        let local =
+            OmpHarness::new().rpc_mode_command(Path::new("/usr/local/bin/omp"), "/workspace", true);
+        let scaffold = OmpHarness::scaffold_host().rpc_mode_command(
+            Path::new("/usr/local/bin/omp"),
+            "/workspace",
+            true,
+        );
+
+        assert_eq!(configured_env(&local, "CI").as_deref(), Some("false"));
+        assert_eq!(
+            configured_env(&local, LOCAL_RUNTIME_ENV).as_deref(),
+            Some("1")
+        );
+        assert_eq!(configured_env(&scaffold, "CI").as_deref(), Some("true"));
+        assert_eq!(
+            configured_env(&scaffold, LOCAL_RUNTIME_ENV),
+            None,
+            "Scaffold must not mark commands as local"
+        );
     }
 
     #[test]
