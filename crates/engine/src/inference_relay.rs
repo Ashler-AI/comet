@@ -18,10 +18,11 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 use tempfile::TempPath;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, Semaphore, broadcast};
 use tokio_util::io::ReaderStream;
 
 use comet_harness::InferenceRoute;
@@ -35,6 +36,7 @@ const MAX_CONNECTIONS: usize = 64;
 const REFRESH_SKEW_SECONDS: i64 = 60;
 const MAX_ACCOUNT_FAILOVERS: usize = 1;
 const MAX_TRANSPORT_REPLAYS: usize = 1;
+const RETIRED_ROUTE_TTL: Duration = Duration::from_secs(30 * 60);
 
 struct RequestSpool {
     path: TempPath,
@@ -60,15 +62,23 @@ pub(crate) struct InferenceRelay {
     inner: Arc<Inner>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExpiredRoute {
+    pub(crate) logical_session_id: String,
+    pub(crate) lifecycle_epoch: u64,
+}
+
 struct Inner {
     client: ScaffoldClient,
     port: u16,
-    routes: Mutex<HashMap<String, Arc<Route>>>,
+    route_state: Mutex<RouteState>,
+    route_expired_tx: broadcast::Sender<ExpiredRoute>,
     next_lifecycle_epoch: AtomicU64,
 }
 
 struct Route {
     request: AgentInferenceGrantRequest,
+    owner_subject: String,
     grant: AsyncMutex<GrantState>,
     cancellation: comet_harness::CancellationToken,
 }
@@ -76,6 +86,47 @@ struct Route {
 struct GrantState {
     grant: AgentInferenceGrant,
     expires_at: DateTime<Utc>,
+}
+
+#[derive(Default)]
+struct RouteState {
+    active: HashMap<String, Arc<Route>>,
+    retired: HashMap<String, RetiredRoute>,
+}
+
+struct RetiredRoute {
+    logical_session_id: String,
+    owner_subject: String,
+    provider: String,
+    lifecycle_epoch: u64,
+    retired_at: Instant,
+}
+
+impl RouteState {
+    fn prune_retired(&mut self) {
+        self.retired
+            .retain(|_, route| route.retired_at.elapsed() < RETIRED_ROUTE_TTL);
+    }
+
+    fn take_retired_token(
+        &mut self,
+        logical_session_id: &str,
+        owner_subject: &str,
+        provider: &str,
+    ) -> Option<String> {
+        let token = self
+            .retired
+            .iter()
+            .filter(|(_, route)| {
+                route.logical_session_id == logical_session_id
+                    && route.owner_subject == owner_subject
+                    && route.provider == provider
+            })
+            .max_by_key(|(_, route)| route.retired_at)
+            .map(|(token, _)| token.clone())?;
+        self.retired.remove(&token);
+        Some(token)
+    }
 }
 
 #[derive(Clone)]
@@ -249,11 +300,13 @@ impl InferenceRelay {
         let listener = StdTcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
+        let (route_expired_tx, _) = broadcast::channel(64);
         let relay = Self {
             inner: Arc::new(Inner {
                 client,
                 port,
-                routes: Mutex::new(HashMap::new()),
+                route_state: Mutex::new(RouteState::default()),
+                route_expired_tx,
                 next_lifecycle_epoch: AtomicU64::new(0),
             }),
         };
@@ -261,6 +314,18 @@ impl InferenceRelay {
         let serving = relay.clone();
         tokio::spawn(async move { serving.serve(runtime_listener).await });
         Ok(relay)
+    }
+
+    pub(crate) fn subscribe_expired_routes(&self) -> broadcast::Receiver<ExpiredRoute> {
+        self.inner.route_expired_tx.subscribe()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn notify_expired_route(&self, logical_session_id: &str, lifecycle_epoch: u64) {
+        let _ = self.inner.route_expired_tx.send(ExpiredRoute {
+            logical_session_id: logical_session_id.to_string(),
+            lifecycle_epoch,
+        });
     }
 
     pub(crate) async fn prepare(
@@ -295,23 +360,32 @@ impl InferenceRelay {
                 EngineError::Other(format!("Agent Auth grant issuance failed: {error}"))
             })?;
         let expires_at = validate_grant(&grant, &request)?;
-        let local_token = format!("{}{}", new_id().replace('-', ""), new_id().replace('-', ""));
-        let route = InferenceRoute {
-            base_url: format!("http://127.0.0.1:{}", self.inner.port),
-            token: local_token.clone(),
-            provider: request.provider.clone(),
-            model: request.model.clone(),
+        let provider = request.provider.clone();
+        let model = request.model.clone();
+        let owner_subject = grant.binding.owner_subject.clone();
+        let route = Arc::new(Route {
+            request,
+            owner_subject: owner_subject.clone(),
+            cancellation: comet_harness::CancellationToken::new(),
+            grant: AsyncMutex::new(GrantState { grant, expires_at }),
+        });
+        let local_token = {
+            let mut state = lock(&self.inner.route_state);
+            state.prune_retired();
+            let token = state
+                .take_retired_token(logical_session_id, &owner_subject, &provider)
+                .unwrap_or_else(|| {
+                    format!("{}{}", new_id().replace('-', ""), new_id().replace('-', ""))
+                });
+            state.active.insert(token.clone(), route);
+            token
         };
-        let cancellation = comet_harness::CancellationToken::new();
-        lock(&self.inner.routes).insert(
-            local_token,
-            Arc::new(Route {
-                request,
-                cancellation,
-                grant: AsyncMutex::new(GrantState { grant, expires_at }),
-            }),
-        );
-        Ok(Some(route))
+        Ok(Some(InferenceRoute {
+            base_url: format!("http://127.0.0.1:{}", self.inner.port),
+            token: local_token,
+            provider,
+            model,
+        }))
     }
 
     pub(crate) async fn rebind(&self, logical_session_id: &str) -> Result<(), EngineError> {
@@ -326,7 +400,34 @@ impl InferenceRelay {
     }
 
     pub(crate) async fn remove(&self, local_token: &str) {
-        let route = lock(&self.inner.routes).remove(local_token);
+        let route = {
+            let mut state = lock(&self.inner.route_state);
+            state.prune_retired();
+            let route = state.active.get(local_token).cloned();
+            if let Some(route) = route.as_ref() {
+                let aliases = state
+                    .active
+                    .iter()
+                    .filter(|(_, candidate)| Arc::ptr_eq(candidate, route))
+                    .map(|(token, _)| token.clone())
+                    .collect::<Vec<_>>();
+                let retired_at = Instant::now();
+                for token in aliases {
+                    state.active.remove(&token);
+                    state.retired.insert(
+                        token,
+                        RetiredRoute {
+                            logical_session_id: route.request.logical_session_id.clone(),
+                            owner_subject: route.owner_subject.clone(),
+                            provider: route.request.provider.clone(),
+                            lifecycle_epoch: route.request.lifecycle_epoch,
+                            retired_at,
+                        },
+                    );
+                }
+            }
+            route
+        };
         let Some(route) = route else {
             return;
         };
@@ -387,10 +488,70 @@ impl InferenceRelay {
 
     async fn handle(&self, request: Request<Incoming>) -> Response<RelayBody> {
         let token = relay_token(request.headers());
-        let route = token
-            .as_deref()
-            .and_then(|token| lock(&self.inner.routes).get(token).cloned());
+        let (route, retired_session) = {
+            let mut state = lock(&self.inner.route_state);
+            state.prune_retired();
+            let mut route = token
+                .as_deref()
+                .and_then(|token| state.active.get(token).cloned());
+            let retired = if route.is_none() {
+                token.as_deref().and_then(|token| {
+                    state.retired.get(token).map(|route| {
+                        (
+                            route.logical_session_id.clone(),
+                            route.owner_subject.clone(),
+                            route.provider.clone(),
+                            route.lifecycle_epoch,
+                        )
+                    })
+                })
+            } else {
+                None
+            };
+            let retired_route =
+                if let Some((logical_session_id, owner_subject, provider, lifecycle_epoch)) =
+                    retired
+                {
+                    let replacement = state
+                        .active
+                        .values()
+                        .find(|candidate| {
+                            candidate.request.logical_session_id == logical_session_id
+                                && candidate.owner_subject == owner_subject
+                                && candidate.request.provider == provider
+                        })
+                        .cloned();
+                    if let (Some(local_token), Some(replacement)) = (token.as_ref(), replacement) {
+                        state.retired.remove(local_token);
+                        state
+                            .active
+                            .insert(local_token.clone(), replacement.clone());
+                        route = Some(replacement);
+                        None
+                    } else {
+                        let restart_required = !state.active.values().any(|candidate| {
+                            candidate.request.logical_session_id == logical_session_id
+                        });
+                        Some((logical_session_id, lifecycle_epoch, restart_required))
+                    }
+                } else {
+                    None
+                };
+            (route, retired_route)
+        };
         let Some(route) = route else {
+            if let Some((session_id, lifecycle_epoch, restart_required)) = retired_session {
+                if restart_required {
+                    let _ = self.inner.route_expired_tx.send(ExpiredRoute {
+                        logical_session_id: session_id,
+                        lifecycle_epoch,
+                    });
+                }
+                return json_response(
+                    StatusCode::GONE,
+                    json!({ "error": "inference_route_expired", "restart_required": restart_required }),
+                );
+            }
             return json_response(
                 StatusCode::UNAUTHORIZED,
                 json!({ "error": "invalid_grant" }),

@@ -152,7 +152,7 @@ mod tests {
                                     let expires_at =
                                         (Utc::now() + TimeDelta::minutes(5)).to_rfc3339();
                                     json!({
-                                        "token": "remote-agent-auth-grant",
+                                        "token": format!("remote-agent-auth-grant-{}", input["lifecycleEpoch"]),
                                         "expiresAt": expires_at,
                                         "binding": {
                                             "ownerSubject": "owner-1",
@@ -655,7 +655,7 @@ mod tests {
         );
 
         let captured = captured_rx.recv().await.unwrap();
-        assert_eq!(captured.authorization, "Bearer remote-agent-auth-grant");
+        assert_eq!(captured.authorization, "Bearer remote-agent-auth-grant-1");
         assert_eq!(captured.owner_subject, "owner-1");
         assert_eq!(captured.session_id, "session-1");
         assert_eq!(captured.request_id, "request-1");
@@ -663,6 +663,7 @@ mod tests {
         assert_eq!(captured.requested_account_id, None);
         assert_eq!(captured.body["input"], "hello");
 
+        let mut expired_routes = relay.subscribe_expired_routes();
         relay.remove(&route.token).await;
         assert!(revoked.load(std::sync::atomic::Ordering::SeqCst));
         let removed = http
@@ -671,7 +672,197 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(removed.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(removed.status(), reqwest::StatusCode::GONE);
+        assert_eq!(
+            removed.json::<Value>().await.unwrap(),
+            json!({ "error": "inference_route_expired", "restart_required": true })
+        );
+        assert_eq!(
+            expired_routes.recv().await.unwrap(),
+            ExpiredRoute {
+                logical_session_id: "session-1".into(),
+                lifecycle_epoch: 1,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn rebinds_retired_local_credential_to_the_next_route_for_the_same_session() {
+        let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
+        let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let origin = test_control_plane(captured_tx, revoked.clone()).await;
+        let client = ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap();
+        let relay = InferenceRelay::start(client).unwrap();
+        let first = relay
+            .prepare(
+                "persistent-session",
+                HarnessId::Omp,
+                Some("anthropic/claude-opus-5"),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let original_token = first.token.clone();
+
+        relay.remove(&original_token).await;
+        assert!(revoked.load(std::sync::atomic::Ordering::SeqCst));
+
+        let replacement = relay
+            .prepare(
+                "persistent-session",
+                HarnessId::Omp,
+                Some("anthropic/claude-opus-5"),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replacement.token, original_token);
+
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/messages", replacement.base_url))
+            .bearer_auth(&original_token)
+            .header("x-request-id", "persistent-worker-request")
+            .json(&json!({ "model": "claude-opus-5", "messages": [] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(captured_rx.recv().await.unwrap().session_id, "persistent-session");
+
+        let unrelated = relay
+            .prepare(
+                "unrelated-session",
+                HarnessId::Omp,
+                Some("anthropic/claude-opus-5"),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(unrelated.token, original_token);
+    }
+
+    #[tokio::test]
+    async fn provider_switch_does_not_rebind_the_retired_credential() {
+        let (captured_tx, _captured_rx) = mpsc::unbounded_channel();
+        let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let origin = test_control_plane(captured_tx, revoked).await;
+        let client = ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap();
+        let relay = InferenceRelay::start(client).unwrap();
+        let anthropic = relay
+            .prepare(
+                "provider-switch-session",
+                HarnessId::Omp,
+                Some("anthropic/claude-opus-5"),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        relay.remove(&anthropic.token).await;
+        let openai = relay
+            .prepare(
+                "provider-switch-session",
+                HarnessId::Omp,
+                Some("openai-codex/gpt-5.6-sol"),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(openai.token, anthropic.token);
+
+        let mut expired_routes = relay.subscribe_expired_routes();
+        let response = reqwest::Client::new()
+            .get(format!("{}/v1/models", anthropic.base_url))
+            .bearer_auth(&anthropic.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::GONE);
+        assert_eq!(
+            response.json::<Value>().await.unwrap(),
+            json!({ "error": "inference_route_expired", "restart_required": false })
+        );
+        assert!(matches!(
+            expired_routes.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn retired_worker_credential_uses_the_post_revoke_parent_grant() {
+        let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
+        let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let origin = test_control_plane(captured_tx, revoked.clone()).await;
+        let client = ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap();
+        let relay = InferenceRelay::start(client).unwrap();
+        let first = relay
+            .prepare(
+                "persistent-session",
+                HarnessId::Omp,
+                Some("anthropic/claude-opus-5"),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        relay.remove(&first.token).await;
+        assert!(revoked.load(std::sync::atomic::Ordering::SeqCst));
+        {
+            let mut state = lock(&relay.inner.route_state);
+            state.retired.insert(
+                "persistent-worker-token".into(),
+                RetiredRoute {
+                    logical_session_id: "persistent-session".into(),
+                    owner_subject: "owner-1".into(),
+                    provider: "anthropic".into(),
+                    lifecycle_epoch: 1,
+                    retired_at: Instant::now() - Duration::from_secs(1),
+                },
+            );
+        }
+
+        let parent = relay
+            .prepare(
+                "persistent-session",
+                HarnessId::Omp,
+                Some("anthropic/claude-opus-5"),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent.token, first.token);
+
+        let mut expired_routes = relay.subscribe_expired_routes();
+        let rebound = reqwest::Client::new()
+            .post(format!("{}/v1/messages", parent.base_url))
+            .bearer_auth("persistent-worker-token")
+            .header("x-request-id", "rebound-worker-request")
+            .json(&json!({ "model": "claude-opus-5", "messages": [] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rebound.status(), reqwest::StatusCode::OK);
+        let captured = captured_rx.recv().await.unwrap();
+        assert_eq!(captured.authorization, "Bearer remote-agent-auth-grant-2");
+        assert_eq!(captured.session_id, "persistent-session");
+        assert!(matches!(
+            expired_routes.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        relay.remove(&parent.token).await;
+        let retired = reqwest::Client::new()
+            .get(format!("{}/v1/models", parent.base_url))
+            .bearer_auth("persistent-worker-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(retired.status(), reqwest::StatusCode::GONE);
     }
 
     #[tokio::test]
@@ -987,7 +1178,7 @@ mod tests {
         );
 
         let captured = captured_rx.recv().await.unwrap();
-        assert_eq!(captured.authorization, "Bearer remote-agent-auth-grant");
+        assert_eq!(captured.authorization, "Bearer remote-agent-auth-grant-1");
         assert_eq!(captured.api_key, None);
         assert_eq!(captured.session_id, "session-anthropic");
         assert_eq!(captured.body["model"], "claude-opus-5");
