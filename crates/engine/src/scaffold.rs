@@ -32,6 +32,9 @@ use crate::now_ms;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const JOIN_GRANT_TTL_SECONDS: u32 = 15 * 60;
 const DEVICE_ACCESS_TTL_MS: i64 = 12 * 60 * 60 * 1000;
+
+pub(crate) const SCAFFOLD_COMET_RUNTIME_VERSION: &str =
+    include_str!("../../../scaffold-runtime-version.txt");
 const JOIN_GRANT_PATH: [&str; 2] = ["auth", "device-grants"];
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -146,6 +149,14 @@ pub(crate) struct AgentAccountOAuthCredential {
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct RemoteAgentUsageWindow {
+    pub label: String,
+    pub used_fraction: f32,
+    pub reset_at: Option<String>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct RemoteAgentAccount {
     pub id: String,
     pub provider: String,
@@ -155,8 +166,8 @@ pub(crate) struct RemoteAgentAccount {
     pub organization: Option<String>,
     pub plan: Option<String>,
     pub status: AgentAccountStatus,
-    pub usage_fraction: Option<f32>,
-    pub reset_at: Option<String>,
+    #[serde(default)]
+    pub usage_windows: Vec<RemoteAgentUsageWindow>,
 }
 
 #[derive(Deserialize)]
@@ -594,7 +605,7 @@ impl ScaffoldClient {
             database_environment,
             agent_route,
             comet_runtime_profile: CreateCometRuntimeProfile {
-                version: "scaffold.comet-runtime.v1",
+                version: SCAFFOLD_COMET_RUNTIME_VERSION,
                 project_id: &scope.project_id,
                 deployment_id,
                 session_id: scope.session_id.as_deref().expect("validated sessionId"),
@@ -1173,7 +1184,7 @@ impl ScaffoldSandbox {
                     self.id
                 ))
             })?;
-            if profile.version != "scaffold.comet-runtime.v1"
+            if profile.version != SCAFFOLD_COMET_RUNTIME_VERSION
                 || profile.project_id != scope.project_id
                 || Some(profile.deployment_id.as_str()) != scope.deployment_id.as_deref()
                 || Some(profile.session_id.as_str()) != scope.session_id.as_deref()

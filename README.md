@@ -120,6 +120,23 @@ Manual releases choose an explicit surface:
 
 Version tags remain complete `desktop-and-scaffold` releases for backward compatibility. CI verifies the tag or dispatch version against both `[workspace.package].version` and Cargo metadata. Every `releases/<version>/…` object and version-named root artifact is create-only; a byte-identical re-publish is a no-op and differing bytes fail. Moving desktop and Scaffold channel aliases are independent. All objects remain private.
 
+`scaffold-runtime-version.txt` is the compatibility boundary between Comet and
+the Scaffold control plane. A breaking runtime change is platform-first:
+
+1. Increment that file and update both repositories to accept the new contract.
+2. Deploy and verify the compatible ashler-platform change in Scaffold staging.
+3. Publish Comet with `release_surface=desktop-and-scaffold` and
+   `scaffold_runtime_deployment=staging-deployed`.
+4. Deploy and verify the compatible Scaffold change in production before a
+   production Comet publication with
+   `scaffold_runtime_deployment=production-deployed`.
+
+The release workflow compares the candidate runtime version with the currently
+published Scaffold manifest before writing any release objects. A changed
+contract cannot ship as a desktop-only release. An unacknowledged bump,
+including one introduced by a tag push, fails with the required deployment
+sequence.
+
 ```bash
 version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
 

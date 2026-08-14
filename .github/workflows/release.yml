@@ -26,6 +26,15 @@ on:
           - none
           - staging
           - production
+      scaffold_runtime_deployment:
+        description: "When scaffold-runtime-version.txt changes, confirm compatible Scaffold is already deployed"
+        required: true
+        default: unchanged
+        type: choice
+        options:
+          - unchanged
+          - staging-deployed
+          - production-deployed
 
 permissions:
   contents: read
@@ -174,6 +183,7 @@ jobs:
           RELEASE_SURFACE: ${{ needs.version.outputs.release_surface }}
         run: |
           set -euo pipefail
+          scaffold_runtime_version="$(cat scaffold-runtime-version.txt)"
           mkdir -p candidate
           find incoming -type f -name 'comet-*' -exec cp '{}' candidate/ \;
 
@@ -188,8 +198,9 @@ jobs:
             --arg commit "$GITHUB_SHA" \
             --arg repository "$GITHUB_REPOSITORY" \
             --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg scaffoldRuntimeVersion "$scaffold_runtime_version" \
             --rawfile sums candidate/desktop-SHA256SUMS \
-            '{schemaVersion:2,releaseSurface:"desktop",version:$version,source:{repository:$repository,commit:$commit,workflowRun:$run},files:($sums|split("\n")|map(select(length>0)|capture("^(?<sha256>[0-9a-f]{64})  (?<name>.+)$"))|map({key:.name,value:{sha256:.sha256}})|from_entries)}' \
+            '{schemaVersion:2,releaseSurface:"desktop",scaffoldRuntimeVersion:$scaffoldRuntimeVersion,version:$version,source:{repository:$repository,commit:$commit,workflowRun:$run},files:($sums|split("\n")|map(select(length>0)|capture("^(?<sha256>[0-9a-f]{64})  (?<name>.+)$"))|map({key:.name,value:{sha256:.sha256}})|from_entries)}' \
             > candidate/desktop-manifest.json
 
           if [[ "$RELEASE_SURFACE" == "desktop-and-scaffold" ]]; then
@@ -205,8 +216,9 @@ jobs:
               --arg commit "$GITHUB_SHA" \
               --arg repository "$GITHUB_REPOSITORY" \
               --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              --arg scaffoldRuntimeVersion "$scaffold_runtime_version" \
               --rawfile sums candidate/scaffold-SHA256SUMS \
-              '{schemaVersion:2,releaseSurface:"scaffold",scaffoldRuntimeVersion:"scaffold.comet-runtime.v1",version:$version,source:{repository:$repository,commit:$commit,workflowRun:$run},files:($sums|split("\n")|map(select(length>0)|capture("^(?<sha256>[0-9a-f]{64})  (?<name>.+)$"))|map({key:.name,value:{sha256:.sha256}})|from_entries)}' \
+              '{schemaVersion:2,releaseSurface:"scaffold",scaffoldRuntimeVersion:$scaffoldRuntimeVersion,version:$version,source:{repository:$repository,commit:$commit,workflowRun:$run},files:($sums|split("\n")|map(select(length>0)|capture("^(?<sha256>[0-9a-f]{64})  (?<name>.+)$"))|map({key:.name,value:{sha256:.sha256}})|from_entries)}' \
               > candidate/scaffold-manifest.json
             cat candidate/desktop-SHA256SUMS candidate/scaffold-SHA256SUMS > candidate/SHA256SUMS
             jq -n \
@@ -289,6 +301,7 @@ jobs:
       - name: Publish immutable staging release and selected moving channels
         env:
           VERSION: ${{ needs.version.outputs.version }}
+          SCAFFOLD_RUNTIME_DEPLOYMENT: ${{ inputs.scaffold_runtime_deployment || 'unchanged' }}
         run: |
           set -euo pipefail
           publish_immutable() {
@@ -319,6 +332,18 @@ jobs:
               return 1
             fi
           }
+          current_scaffold_manifest="$RUNNER_TEMP/current-scaffold-manifest.json"
+          if ! gcloud storage cp \
+            "gs://$COMET_RELEASES_GCS_BUCKET/releases/scaffold-manifest.json" \
+            "$current_scaffold_manifest" >/dev/null 2>&1; then
+            rm -f "$current_scaffold_manifest"
+          fi
+          node scripts/guard-scaffold-runtime-release.mjs \
+            candidate/desktop-manifest.json \
+            "$current_scaffold_manifest" \
+            staging \
+            "$SCAFFOLD_RUNTIME_DEPLOYMENT" \
+            "$RELEASE_SURFACE"
           for file in candidate/*; do
             name="$(basename "$file")"
             publish_immutable "$file" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$VERSION/$name"
@@ -402,6 +427,7 @@ jobs:
       - name: Promote immutable production release and selected moving channels
         env:
           VERSION: ${{ needs.version.outputs.version }}
+          SCAFFOLD_RUNTIME_DEPLOYMENT: ${{ inputs.scaffold_runtime_deployment || 'unchanged' }}
         run: |
           set -euo pipefail
           publish_immutable() {
@@ -432,6 +458,18 @@ jobs:
               return 1
             fi
           }
+          current_scaffold_manifest="$RUNNER_TEMP/current-scaffold-manifest.json"
+          if ! gcloud storage cp \
+            "gs://$COMET_RELEASES_GCS_BUCKET/releases/scaffold-manifest.json" \
+            "$current_scaffold_manifest" >/dev/null 2>&1; then
+            rm -f "$current_scaffold_manifest"
+          fi
+          node scripts/guard-scaffold-runtime-release.mjs \
+            candidate/desktop-manifest.json \
+            "$current_scaffold_manifest" \
+            production \
+            "$SCAFFOLD_RUNTIME_DEPLOYMENT" \
+            "$RELEASE_SURFACE"
           for file in candidate/*; do
             name="$(basename "$file")"
             publish_immutable "$file" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$VERSION/$name"
