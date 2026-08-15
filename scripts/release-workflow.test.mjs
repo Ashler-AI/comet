@@ -27,6 +27,19 @@ describe("Comet release surfaces", () => {
     assert.doesNotMatch(jobBlock(workflow, "macos"), /release_surface == 'desktop-and-scaffold'/);
   });
 
+  it("publishes a private immutable candidate without moving staging channels", async () => {
+    const workflow = await read(".github/workflows/release.yml");
+    const staging = jobBlock(workflow, "publish-staging");
+    assert.match(workflow, /promotion_target:[\s\S]*- staging-candidate[\s\S]*- staging[\s\S]*- production/);
+    assert.match(staging, /inputs\.promotion_target == 'staging-candidate'/);
+    const immutable = staging.indexOf('publish_immutable "$file" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$VERSION/$name"');
+    const candidateStop = staging.indexOf('if [[ "$PROMOTION_TARGET" == "staging-candidate" ]]');
+    const guard = staging.indexOf("node scripts/guard-scaffold-runtime-release.mjs");
+    const channels = staging.indexOf("require_forward_version desktop");
+    assert.ok(immutable >= 0 && immutable < candidateStop);
+    assert.ok(candidateStop < guard && guard < channels);
+  });
+
   it("advances desktop and Scaffold moving channels independently", async () => {
     const [workflow, runtimeVersion, engine, edge] = await Promise.all([
       read(".github/workflows/release.yml"),
@@ -53,22 +66,26 @@ describe("Comet release surfaces", () => {
     );
   });
 
-  it("blocks runtime version bumps until Scaffold is deployed first", async () => {
+  it("blocks runtime version channel promotions until Scaffold is deployed first", async () => {
     const workflow = await read(".github/workflows/release.yml");
     assert.match(workflow, /scaffold_runtime_deployment:[\s\S]*default: unchanged[\s\S]*- staging-deployed[\s\S]*- production-deployed/);
-    for (const [job, target] of [["publish-staging", "staging"], ["publish-production", "production"]]) {
-      const block = jobBlock(workflow, job);
-      const guard = block.indexOf("node scripts/guard-scaffold-runtime-release.mjs");
-      const publish = block.indexOf("for file in candidate/*");
-      assert.notEqual(guard, -1, `${job} is missing the runtime release guard`);
-      assert.ok(guard < publish, `${job} must guard before publishing immutable objects`);
-      assert.match(
-        block,
-        new RegExp(
-          `candidate/desktop-manifest\\.json[\\s\\S]*${target}[\\s\\S]*\\$SCAFFOLD_RUNTIME_DEPLOYMENT[\\s\\S]*\\$RELEASE_SURFACE`,
-        ),
-      );
-    }
+    const staging = jobBlock(workflow, "publish-staging");
+    const stagingGuard = staging.indexOf("node scripts/guard-scaffold-runtime-release.mjs");
+    assert.notEqual(stagingGuard, -1);
+    assert.ok(stagingGuard < staging.indexOf("require_forward_version desktop"));
+    assert.match(
+      staging,
+      /candidate\/desktop-manifest\.json[\s\S]*staging[\s\S]*\$SCAFFOLD_RUNTIME_DEPLOYMENT[\s\S]*\$RELEASE_SURFACE/,
+    );
+
+    const production = jobBlock(workflow, "publish-production");
+    const productionGuard = production.indexOf("node scripts/guard-scaffold-runtime-release.mjs");
+    assert.notEqual(productionGuard, -1);
+    assert.ok(productionGuard < production.indexOf("for file in candidate/*"));
+    assert.match(
+      production,
+      /candidate\/desktop-manifest\.json[\s\S]*production[\s\S]*\$SCAFFOLD_RUNTIME_DEPLOYMENT[\s\S]*\$RELEASE_SURFACE/,
+    );
   });
 
   it("routes desktop updates and Linux installs to compatible manifests", async () => {

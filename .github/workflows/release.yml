@@ -24,6 +24,7 @@ on:
         type: choice
         options:
           - none
+          - staging-candidate
           - staging
           - production
       scaffold_runtime_deployment:
@@ -247,7 +248,7 @@ jobs:
   publish-staging:
     if: >-
       github.repository_owner == 'Ashler-AI' &&
-      (startsWith(github.ref, 'refs/tags/v') || inputs.promotion_target == 'staging' || inputs.promotion_target == 'production')
+      (startsWith(github.ref, 'refs/tags/v') || inputs.promotion_target == 'staging-candidate' || inputs.promotion_target == 'staging' || inputs.promotion_target == 'production')
     needs: [version, candidate]
     runs-on: ubuntu-24.04
     environment: comet-release-staging
@@ -257,6 +258,7 @@ jobs:
       GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
       COMET_RELEASES_GCS_BUCKET: ${{ secrets.COMET_RELEASES_GCS_BUCKET }}
       RELEASE_SURFACE: ${{ needs.version.outputs.release_surface }}
+      PROMOTION_TARGET: ${{ startsWith(github.ref, 'refs/tags/v') && 'staging' || inputs.promotion_target }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -332,6 +334,14 @@ jobs:
               return 1
             fi
           }
+          for file in candidate/*; do
+            name="$(basename "$file")"
+            publish_immutable "$file" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$VERSION/$name"
+          done
+          if [[ "$PROMOTION_TARGET" == "staging-candidate" ]]; then
+            echo "Published immutable private staging candidate $VERSION without moving release channels."
+            exit 0
+          fi
           current_scaffold_manifest="$RUNNER_TEMP/current-scaffold-manifest.json"
           if ! gcloud storage cp \
             "gs://$COMET_RELEASES_GCS_BUCKET/releases/scaffold-manifest.json" \
@@ -346,7 +356,6 @@ jobs:
             "$RELEASE_SURFACE"
           for file in candidate/*; do
             name="$(basename "$file")"
-            publish_immutable "$file" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$VERSION/$name"
             case "$name" in
               *manifest.json|*SHA256SUMS|install.sh) ;;
               *) publish_immutable "$file" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$name" ;;
