@@ -109,18 +109,17 @@ fn scaffold_agent_binding(
         .map(str::trim)
         .filter(|model| !model.is_empty() && *model != "default")?;
     let lower = selected.to_ascii_lowercase();
-    let provider = if lower.starts_with("anthropic/") {
-        AgentProvider::Anthropic
-    } else if lower.starts_with("openai/") || lower.starts_with("openai-codex/") {
-        AgentProvider::OpenAi
-    } else {
-        return None;
-    };
     let (_, model) = selected.rsplit_once('/')?;
     if model.is_empty() {
         return None;
     }
-    let model_id = selected.to_string();
+    let (provider, model_id) = if lower.starts_with("anthropic/") {
+        (AgentProvider::Anthropic, format!("anthropic/{model}"))
+    } else if lower.starts_with("openai/") || lower.starts_with("openai-codex/") {
+        (AgentProvider::OpenAi, format!("openai-codex/{model}"))
+    } else {
+        return None;
+    };
     let route = AgentRoute::automatic(provider, model);
     Some(ScaffoldAgentBinding { route, model_id })
 }
@@ -6497,9 +6496,9 @@ mod tests {
     }
 
     #[test]
-    fn scaffold_openai_binding_persists_and_sends_exact_model_identity() {
+    fn scaffold_openai_binding_normalizes_local_alias_for_remote_omp() {
         let binding =
-            scaffold_agent_binding(Some(HarnessId::Omp), Some("openai-codex/gpt-5.6-sol")).unwrap();
+            scaffold_agent_binding(Some(HarnessId::Omp), Some("openai/gpt-5.6-sol")).unwrap();
         assert_eq!(binding.route.provider, AgentProvider::OpenAi);
         assert_eq!(binding.route.model, "gpt-5.6-sol");
         assert_eq!(binding.route.account_id, None);
