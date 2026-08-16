@@ -36,8 +36,8 @@ use comet_proto::{
     AgentRoute, AuthState, Chat, ChatIndicator, CollaborationScope, CollaborationSnapshot, Device,
     HarnessId, LocalSessionAttachResult, LocalSessionCandidate, MessageProvenance,
     ParticipantPresence, RuntimeProfile, ScaffoldDatabaseEnvironment, ScaffoldEnvironmentControl,
-    ScaffoldEnvironmentControlResult, ScaffoldLifecycle, Session, SessionEnvironmentSource,
-    SessionRef, SessionRoomProjection, Space,
+    ScaffoldEnvironmentControlResult, ScaffoldEnvironmentSnapshot, ScaffoldLifecycle, Session,
+    SessionEnvironment, SessionEnvironmentSource, SessionRef, SessionRoomProjection, Space,
 };
 use comet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
 
@@ -436,6 +436,7 @@ pub(crate) struct ScaffoldControlTarget {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ScaffoldSessionAttachment {
+    pub environment: SessionEnvironment,
     pub projection: SessionRoomProjection,
     pub grant_id: String,
     pub owner_device_id: String,
@@ -449,13 +450,14 @@ pub(crate) struct ScaffoldSessionAttachment {
 pub(crate) async fn create_scaffold_session(
     handle: &EngineHandle,
     scope: &CollaborationScope,
+    name: Option<&str>,
     source_ref: Option<&str>,
     database_environment: ScaffoldDatabaseEnvironment,
     agent_route: &AgentRoute,
 ) -> Result<(String, CollaborationScope), RpcError> {
     let create = ScaffoldEnvironmentControl::Create {
         scope: scope.clone(),
-        name: Some("Crew Scaffold session".into()),
+        name: name.map(str::to_string),
         source_ref: source_ref.map(str::to_string),
         region: None,
         database_environment,
@@ -541,6 +543,7 @@ pub(crate) async fn attach_scaffold_session(
         .await?;
     let attached: ScaffoldEnvironmentControlResult =
         serde_json::from_value(value).map_err(|err| RpcError::Failed(err.to_string()))?;
+    let environment = attached.environment.clone();
     let source_ref = attached.environment.source_ref.clone();
     let SessionEnvironmentSource::Scaffold {
         sandbox_id: attached_sandbox_id,
@@ -598,6 +601,7 @@ pub(crate) async fn attach_scaffold_session(
         ));
     }
     Ok(ScaffoldSessionAttachment {
+        environment,
         projection,
         grant_id: grant.id,
         owner_device_id,
@@ -782,6 +786,7 @@ where
 pub(crate) async fn create_and_attach_scaffold_session<Wait, WaitFuture>(
     handle: &EngineHandle,
     scope: &CollaborationScope,
+    name: Option<&str>,
     source_ref: Option<&str>,
     database_environment: ScaffoldDatabaseEnvironment,
     agent_route: &AgentRoute,
@@ -791,9 +796,15 @@ where
     Wait: Fn(std::time::Duration) -> WaitFuture,
     WaitFuture: Future<Output = ()>,
 {
-    let (sandbox_id, authoritative_scope) =
-        create_scaffold_session(handle, scope, source_ref, database_environment, agent_route)
-            .await?;
+    let (sandbox_id, authoritative_scope) = create_scaffold_session(
+        handle,
+        scope,
+        name,
+        source_ref,
+        database_environment,
+        agent_route,
+    )
+    .await?;
     let attachment =
         attach_scaffold_session_with_retry(handle, &sandbox_id, authoritative_scope, wait).await?;
     Ok((sandbox_id, attachment))
@@ -957,6 +968,8 @@ pub struct AppState {
     /// Non-secret physical targets for attached Scaffold chats. Retained after
     /// settlement so archive can pause the exact sandbox idempotently.
     scaffold_control_targets: HashMap<String, ScaffoldControlTarget>,
+    /// Latest control-plane metadata keyed by the Crew chat/session id.
+    scaffold_environments: HashMap<String, SessionEnvironment>,
     /// Exact local Comet session awaiting its first-prompt Scaffold attach.
     pending_scaffold_session: Option<ScaffoldSessionDraft>,
     /// A Comet chat row is being persisted for a user-selected Scaffold session.
@@ -1048,6 +1061,7 @@ impl AppState {
             room_projections: HashMap::new(),
             scaffold_control_grants: HashMap::new(),
             scaffold_control_targets: HashMap::new(),
+            scaffold_environments: HashMap::new(),
             pending_scaffold_session: None,
             scaffold_session_creating: false,
             scaffold_session_error: None,
@@ -1139,6 +1153,17 @@ impl AppState {
 
     pub fn apply_sessions(&mut self, sessions: Vec<Session>) {
         self.sessions = sessions;
+    }
+
+    pub fn apply_scaffold_environments(&mut self, snapshot: ScaffoldEnvironmentSnapshot) {
+        self.scaffold_environments = snapshot
+            .environments
+            .into_iter()
+            .filter_map(|environment| {
+                let chat_id = environment.scope.session_id.clone()?;
+                Some((chat_id, environment))
+            })
+            .collect();
     }
 
     pub fn apply_session_refs(&mut self, mut refs: Vec<SessionRef>) {
@@ -1331,6 +1356,12 @@ impl AppState {
     }
 
     pub fn apply_collaboration(&mut self, snapshot: CollaborationSnapshot) {
+        for session in &snapshot.sessions {
+            if let Some(environment) = &session.environment {
+                self.scaffold_environments
+                    .insert(session.chat_id.clone(), environment.clone());
+            }
+        }
         if self.apply_pending_invitation(&snapshot) {
             self.collaboration = Some(snapshot);
             return;
@@ -1915,6 +1946,13 @@ impl AppState {
                 methods::WATCH_SPACES,
                 AppState::apply_spaces,
             ),
+            spawn_watch(
+                cx,
+                handle.clone(),
+                methods::WATCH_SCAFFOLD_ENVIRONMENTS,
+                AppState::apply_scaffold_environments,
+            ),
+            spawn_scaffold_environment_refresh(cx, handle.clone(), self.scaffold_scope.clone()),
             // Auth frames parse tolerantly — engine and proto tags differ today.
             spawn_watch(
                 cx,
@@ -2003,17 +2041,21 @@ impl AppState {
     pub(crate) fn scaffold_control_target(&self, chat_id: &str) -> Option<&ScaffoldControlTarget> {
         self.scaffold_control_targets.get(chat_id)
     }
+    pub(crate) fn scaffold_environment(&self, chat_id: &str) -> Option<&SessionEnvironment> {
+        self.scaffold_environments.get(chat_id)
+    }
 
     pub fn selected_chat_is_scaffold_room(&self) -> bool {
         self.selected_chat
             .as_ref()
-            .is_some_and(|chat_id| self.room_projections.contains_key(chat_id))
+            .is_some_and(|chat_id| self.chat_is_scaffold(chat_id))
     }
     pub fn chat_is_scaffold(&self, chat_id: &str) -> bool {
         self.pending_scaffold_session
             .as_ref()
             .is_some_and(|draft| draft.chat_id == chat_id)
             || self.room_projections.contains_key(chat_id)
+            || self.scaffold_environments.contains_key(chat_id)
     }
 
     pub fn can_start_scaffold_session(&self) -> bool {
@@ -2161,6 +2203,8 @@ impl AppState {
             .insert(chat_id.clone(), attachment.grant_id.clone());
         self.scaffold_control_targets
             .insert(chat_id.clone(), attachment.control_target.clone());
+        self.scaffold_environments
+            .insert(chat_id.clone(), attachment.environment.clone());
         self.pending_scaffold_session = None;
         self.scaffold_session_error = None;
         if self.selected_chat.as_deref() != Some(chat_id.as_str()) {
@@ -2719,6 +2763,35 @@ fn spawn_local_device_probe(cx: &mut Context<AppState>, handle: EngineHandle) ->
     })
 }
 
+/// Load existing control-plane metadata once after engine attach. The watch
+/// above carries all later lifecycle changes; this call is not a poll loop.
+fn spawn_scaffold_environment_refresh(
+    cx: &mut Context<AppState>,
+    handle: EngineHandle,
+    scope: Option<(String, String)>,
+) -> Task<()> {
+    cx.spawn(async move |_, _| {
+        let Some((project_id, deployment_id)) = scope else {
+            return;
+        };
+        if let Err(error) = handle
+            .client()
+            .call(
+                methods::REFRESH_SCAFFOLD_ENVIRONMENTS,
+                serde_json::json!({
+                    "scope": {
+                        "projectId": project_id,
+                        "deploymentId": deployment_id,
+                    }
+                }),
+            )
+            .await
+        {
+            tracing::debug!(%error, "Scaffold environment refresh unavailable");
+        }
+    })
+}
+
 fn spawn_transcript_watch(
     cx: &mut Context<AppState>,
     handle: EngineHandle,
@@ -2920,6 +2993,10 @@ mod tests {
                 .expect("typed Scaffold operation");
             if operation == "create" {
                 assert_eq!(
+                    params.get("name").and_then(serde_json::Value::as_str),
+                    Some("Investigate staging resume delivery")
+                );
+                assert_eq!(
                     params.get("source_ref").and_then(serde_json::Value::as_str),
                     Some("feat/comet-identity-integration")
                 );
@@ -2973,8 +3050,11 @@ mod tests {
                     "region": "default",
                     "lifecycle": lifecycle,
                     "lifecycle_epoch": 1,
-                    "links": {}
+                    "links": {
+                        "web": "https://scaffold.example/sessions/sandbox-ready/web"
+                    }
                 },
+                "name": "Investigate staging resume delivery",
                 "ownerPrincipal": "accounts.google.com:ready@example.com",
                 "sourceRef": "387d6652abd642f0b85e8bd14f9131a9f23b7e70",
                 "scope": {
@@ -3100,6 +3180,7 @@ mod tests {
         let (sandbox_id, attachment) = create_and_attach_scaffold_session(
             &handle,
             &scope,
+            Some("Investigate staging resume delivery"),
             Some("feat/comet-identity-integration"),
             ScaffoldDatabaseEnvironment::StagingSnapshot,
             &AgentRoute::automatic(comet_proto::AgentProvider::OpenAi, "gpt-5.6-sol"),
@@ -3129,6 +3210,18 @@ mod tests {
             ["create", "attach", "inspect"]
         );
         assert_eq!(attachment.projection.session_id, "session-ready");
+        assert_eq!(
+            attachment.environment.name.as_deref(),
+            Some("Investigate staging resume delivery")
+        );
+        let SessionEnvironmentSource::Scaffold { links, .. } = &attachment.environment.source
+        else {
+            panic!("expected Scaffold environment")
+        };
+        assert_eq!(
+            links.web.as_deref(),
+            Some("https://scaffold.example/sessions/sandbox-ready/web")
+        );
         assert_eq!(
             attachment.owner_device_id,
             "comet-scaffold-sandbox-ready-e1"
@@ -3213,6 +3306,7 @@ mod tests {
             let (sandbox_id, attachment) = create_and_attach_scaffold_session(
                 &handle,
                 &scope,
+                Some("Investigate staging resume delivery"),
                 Some("feat/comet-identity-integration"),
                 ScaffoldDatabaseEnvironment::ProductionSnapshot,
                 &AgentRoute::automatic(comet_proto::AgentProvider::OpenAi, "gpt-5.6-sol"),
@@ -4416,6 +4510,23 @@ mod tests {
                     "ownerSubject": "iap:owner@example.com",
                     "ownerDeviceId": "device-owner",
                     "source": "local",
+                    "environment": {
+                        "source": {
+                            "kind": "scaffold",
+                            "sandbox_id": "sandbox-invited",
+                            "lifecycle": "ready",
+                            "links": {
+                                "web": "https://scaffold.example/sessions/sandbox-invited/web"
+                            }
+                        },
+                        "name": "Investigate staging resume delivery",
+                        "ownerPrincipal": "iap:owner@example.com",
+                        "scope": {
+                            "projectId": "project-a",
+                            "deploymentId": "deployment-a",
+                            "sessionId": "chat-a"
+                        }
+                    },
                     "createdAt": now
                 }
             ],
@@ -4461,6 +4572,13 @@ mod tests {
         // No chat row for the invited session: verified membership arms the
         // sidebar pin that replaces the manual exact-id import dialog.
         assert_eq!(state.pending_session_pin.as_deref(), Some("chat-a"));
+        assert_eq!(
+            state
+                .scaffold_environment("chat-a")
+                .and_then(|environment| environment.name.as_deref()),
+            Some("Investigate staging resume delivery")
+        );
+        assert!(state.chat_is_scaffold("chat-a"));
     }
     #[test]
     fn imported_membership_keeps_selection_without_a_chat_row() {

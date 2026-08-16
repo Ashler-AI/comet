@@ -153,6 +153,14 @@ fn scaffold_run_model(
     }
 }
 
+fn scaffold_turn_requires_start(
+    start_agent_mode: bool,
+    previous_owner_device_id: Option<&str>,
+    attached_owner_device_id: &str,
+) -> bool {
+    start_agent_mode || previous_owner_device_id != Some(attached_owner_device_id)
+}
+
 /// Hysteresis slack for the expanded→compact flip: once expanded, the composer
 /// only collapses when the text is comfortably narrower than the compact
 /// capacity — expanding and collapsing share no boundary, so a width right at
@@ -4795,6 +4803,9 @@ impl Composer {
         } else {
             text.clone()
         };
+        let scaffold_title = scaffold_demo
+            .then(|| comet_engine::title_from_prompt(&echo_text))
+            .filter(|title| !title.is_empty());
         let effective_delivery = if is_new {
             SubmitDelivery::Send
         } else {
@@ -4900,6 +4911,7 @@ impl Composer {
                     let launch = crate::state::create_and_attach_scaffold_session(
                         &engine,
                         &scope,
+                        scaffold_title.as_deref(),
                         requested_scaffold_source_ref.as_deref(),
                         scaffold_database_environment,
                         &scaffold_agent_binding
@@ -5072,6 +5084,9 @@ impl Composer {
                     let scaffold_retry_executor = cx.background_executor().clone();
                     let scaffold_retry_delay =
                         move |delay| scaffold_retry_executor.timer(delay);
+                    let previous_owner_device_id = control_route
+                        .as_ref()
+                        .map(|route| route.owner_device_id.clone());
                     let attachment = crate::state::ensure_scaffold_session_attached(
                         &engine,
                         &target.sandbox_id,
@@ -5087,6 +5102,11 @@ impl Composer {
                         );
                         "Reconnect to control this session".to_string()
                     })?;
+                    start_agent_mode = scaffold_turn_requires_start(
+                        start_agent_mode,
+                        previous_owner_device_id.as_deref(),
+                        &attachment.owner_device_id,
+                    );
                     host_device_id = Some(attachment.owner_device_id.clone());
                     attached_scaffold_source_ref = attachment
                         .source_ref
@@ -5206,6 +5226,12 @@ impl Composer {
                             object.insert(
                                 "branch".into(),
                                 serde_json::Value::String(branch.clone()),
+                            );
+                        }
+                        if let Some(title) = &scaffold_title {
+                            object.insert(
+                                "title".into(),
+                                serde_json::Value::String(title.clone()),
                             );
                         }
                         let config = if scaffold_attached {
@@ -6407,6 +6433,25 @@ mod tests {
         assert!(should_queue_steer(true, false, false));
         assert!(!should_queue_steer(false, false, false));
         assert!(!should_queue_steer(true, true, true));
+    }
+
+    #[test]
+    fn scaffold_reconnect_starts_after_the_host_device_changes() {
+        assert!(!scaffold_turn_requires_start(
+            false,
+            Some("comet-scaffold-sandbox-e1"),
+            "comet-scaffold-sandbox-e1",
+        ));
+        assert!(scaffold_turn_requires_start(
+            false,
+            Some("comet-scaffold-sandbox-e1"),
+            "comet-scaffold-sandbox-e2",
+        ));
+        assert!(scaffold_turn_requires_start(
+            true,
+            Some("comet-scaffold-sandbox-e1"),
+            "comet-scaffold-sandbox-e1",
+        ));
     }
 
     #[test]

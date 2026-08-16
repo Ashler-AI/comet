@@ -1111,6 +1111,7 @@ struct SandboxEnvelope {
 #[serde(rename_all = "camelCase")]
 struct ScaffoldSandbox {
     id: String,
+    name: Option<String>,
     lifecycle_epoch: Option<u64>,
     status: comet_proto::ScaffoldLifecycle,
     kind: Option<String>,
@@ -1213,6 +1214,7 @@ impl ScaffoldSandbox {
                 lifecycle_epoch,
                 links: Box::new(self.links),
             },
+            name: self.name,
             owner_principal,
             scope,
             source_ref: self.source_ref,

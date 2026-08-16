@@ -148,7 +148,7 @@ impl TitleGenerator {
     }
 }
 
-fn title_from_prompt(prompt: &str) -> String {
+pub fn title_from_prompt(prompt: &str) -> String {
     let mut title = String::with_capacity(48);
     let mut char_count = 0;
     for word in prompt.split_whitespace().take(7) {

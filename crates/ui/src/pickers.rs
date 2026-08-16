@@ -22,8 +22,8 @@ use gpui::{
 
 use comet_engine::registry::HarnessDescriptor;
 use comet_proto::{
-    AgentAccount, AgentAccountsSnapshot, AuthState, ChatConfig, FolderListing, HarnessCommand,
-    HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel, SteeringMode,
+    ChatConfig, FolderListing, HarnessCommand, HarnessId, Model, ReasoningLevel, RepoRef,
+    SandboxLevel, SteeringMode,
 };
 use comet_rpc::methods;
 
@@ -194,50 +194,15 @@ pub fn account_harness_for_model(
     }
 }
 
-pub fn compatible_connected_accounts(
-    snapshot: &AgentAccountsSnapshot,
-    account_harness: HarnessId,
-) -> Vec<&AgentAccount> {
-    snapshot
-        .accounts
-        .iter()
-        .filter(|account| {
-            !account.migration_available
-                && account.status == comet_proto::AgentAccountStatus::Connected
-                && account.harness == account_harness
-        })
-        .collect()
-}
-
-/// Preserve an explicit pin until Agent Auth validates it. Snapshot absence,
-/// staleness, or a transient load failure must never turn pinned routing into
-/// automatic routing. Models without an Agent Auth provider ignore the pin.
+/// Preserve an explicit pin until Agent Auth validates it. Models without an
+/// Agent Auth provider ignore the pin.
 pub fn resolve_agent_account_id(
     candidate: Option<&str>,
     account_harness: Option<HarnessId>,
-    _snapshot: Option<&AgentAccountsSnapshot>,
 ) -> Option<String> {
     account_harness?;
     let candidate = candidate?.trim();
     (!candidate.is_empty()).then(|| candidate.to_string())
-}
-
-fn agent_account_label(account: &AgentAccount) -> &str {
-    account
-        .display_name
-        .as_deref()
-        .filter(|label| !label.trim().is_empty())
-        .or_else(|| {
-            account
-                .email
-                .as_deref()
-                .filter(|label| !label.trim().is_empty())
-        })
-        .unwrap_or(match account.harness {
-            HarnessId::ClaudeCode => "Anthropic",
-            HarnessId::Codex => "OpenAI",
-            _ => "Account",
-        })
 }
 
 pub fn selected_agent_account_candidate(
@@ -475,16 +440,6 @@ fn scaffold_route_picker_locked(
     selected_chat_is_scaffold_room && !draft_config_applies(selected_chat, pending_scaffold_chat)
 }
 
-fn agent_accounts_owner(auth: Option<&AuthState>) -> Option<(String, String)> {
-    match auth? {
-        AuthState::SignedIn {
-            user,
-            project_scope,
-        } => Some((user.id.clone(), project_scope.clone())),
-        AuthState::SignedOut => None,
-    }
-}
-
 /// Command catalogs vary by harness, repository, and owning device: project
 /// commands and skills are discovered from `cwd`, while remote hosts can have a
 /// different OMP installation and plugin set.
@@ -540,9 +495,6 @@ pub struct Pickers {
     /// Synchronous cold-start metadata: `/goal` stays discoverable while the
     /// repository/device-specific OMP catalog is still loading.
     omp_command_fallback: HarnessCommand,
-    agent_accounts: Loadable<AgentAccountsSnapshot>,
-    /// Owner and project scope of the cached account snapshot.
-    agent_accounts_owner: Option<(String, String)>,
     refs: Loadable<Vec<RepoRef>>,
     /// Space id the `refs` slot belongs to (invalidated on space change).
     refs_space: Option<String>,
@@ -565,8 +517,6 @@ pub struct Pickers {
     /// Own slot: the refs load runs concurrently with the eager
     /// harness/model loads — sharing `load_task` would abort one mid-flight.
     refs_task: Option<Task<()>>,
-    /// Own slot so account loading cannot abort harness or refs loading.
-    accounts_task: Option<Task<()>>,
     /// In-flight mid-session `SwitchRef` (the ref being switched to).
     switching: Option<String>,
     switch_task: Option<Task<()>>,
@@ -611,12 +561,6 @@ impl Pickers {
                 .map(|draft| draft.chat_id.as_str());
             let pending_scaffold =
                 is_pending_scaffold_selection(selected.as_deref(), pending_scaffold_chat);
-            let accounts_owner = agent_accounts_owner(state.auth.as_ref());
-            if accounts_owner != this.agent_accounts_owner {
-                this.agent_accounts_owner = accounts_owner;
-                this.accounts_task = None;
-                this.agent_accounts = Loadable::Idle;
-            }
             if selected != this.draft_owner {
                 this.draft_owner = selected.clone();
                 if !pending_scaffold {
@@ -675,7 +619,6 @@ impl Pickers {
         };
         let draft_owner = state.read(cx).selected_chat.clone();
         let space_owner = state.read(cx).selected_space.clone();
-        let agent_accounts_owner = agent_accounts_owner(state.read(cx).auth.as_ref());
         Self {
             state,
             space_owner,
@@ -688,8 +631,6 @@ impl Pickers {
             models: HashMap::new(),
             commands: HashMap::new(),
             omp_command_fallback: comet_proto::omp_goal_command(),
-            agent_accounts: Loadable::Idle,
-            agent_accounts_owner,
             refs: Loadable::Idle,
             refs_space: None,
             active: 0,
@@ -701,7 +642,6 @@ impl Pickers {
             boot_focus_pending: open.is_some(),
             load_task: None,
             refs_task: None,
-            accounts_task: None,
             switching: None,
             switch_task: None,
             switch_error: None,
@@ -915,11 +855,7 @@ impl Pickers {
                 .map(|model| model.id.as_str())
                 .or_else(|| self.effective_model_id(cx)),
         );
-        resolve_agent_account_id(
-            candidate.as_deref(),
-            account_harness,
-            self.agent_accounts.ready(),
-        )
+        resolve_agent_account_id(candidate.as_deref(), account_harness)
     }
 
     /// The fully-resolved config the composer threads into the Run request and
@@ -1052,7 +988,6 @@ impl Pickers {
                     self.ensure_models(harness, cx);
                     self.ensure_commands(harness, cx);
                 }
-                self.ensure_agent_accounts(cx);
             }
         }
         cx.notify();
@@ -1096,36 +1031,6 @@ impl Pickers {
                     pickers.ensure_models(harness, cx);
                     pickers.ensure_commands(harness, cx);
                 }
-                cx.notify();
-            })
-            .ok();
-        }));
-    }
-
-    fn ensure_agent_accounts(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.agent_accounts, Loadable::Idle) {
-            return;
-        }
-        if self.agent_accounts_owner.is_none() {
-            return;
-        }
-        let Some(engine) = self.engine(cx) else {
-            return;
-        };
-        self.agent_accounts = Loadable::Loading;
-        self.accounts_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::LIST_AGENT_ACCOUNTS, serde_json::json!({}))
-                .await;
-            this.update(cx, |pickers, cx| {
-                pickers.agent_accounts = match result {
-                    Ok(value) => match serde_json::from_value::<AgentAccountsSnapshot>(value) {
-                        Ok(snapshot) => Loadable::Ready(snapshot),
-                        Err(err) => Loadable::Error(err.to_string()),
-                    },
-                    Err(err) => Loadable::Error(err.to_string()),
-                };
                 cx.notify();
             })
             .ok();
@@ -1536,6 +1441,7 @@ impl Pickers {
             // defaults fallback; a foreign pick must not linger.
             self.config.model = None;
             self.config.reasoning = None;
+            self.config.agent_account_id = None;
             self.config.model_options.clear();
         }
         self.config.harness = Some(harness);
@@ -1571,10 +1477,14 @@ impl Pickers {
         if self.state.read(cx).selected_chat.is_some() {
             // Existing chat: persist to the chat row (Mutate setChatConfig) —
             // survives restarts and syncs; next runs in this chat use it.
-            self.update_chat_config(cx, move |config| config.model = Some(model_id));
+            self.update_chat_config(cx, move |config| {
+                config.model = Some(model_id);
+                config.agent_account_id = None;
+            });
         } else {
             // New chat: draft pick + sticky last-used memory for this harness.
             self.config.model = Some(model_id.clone());
+            self.config.agent_account_id = None;
             if let Some(harness) = self.effective_harness(cx) {
                 let label = self
                     .models
@@ -1598,20 +1508,6 @@ impl Pickers {
             self.config.reasoning = Some(level);
             self.defaults.reasoning = Some(level);
             self.save_defaults();
-        }
-        cx.notify();
-    }
-
-    fn pick_agent_account(&mut self, agent_account_id: Option<String>, cx: &mut Context<Self>) {
-        if self.scaffold_route_picker_locked(cx) {
-            return;
-        }
-        if self.draft_config_applies(cx) {
-            self.config.agent_account_id = agent_account_id;
-        } else {
-            self.update_chat_config(cx, move |config| {
-                config.agent_account_id = agent_account_id;
-            });
         }
         cx.notify();
     }
@@ -1688,13 +1584,10 @@ impl Pickers {
                 config.reasoning = clamp_reasoning(config.reasoning, &ladder);
             }
         }
-        if self.agent_accounts.ready().is_some() {
-            config.agent_account_id = resolve_agent_account_id(
-                config.agent_account_id.as_deref(),
-                account_harness_for_model(Some(config.harness), config.model.as_deref()),
-                self.agent_accounts.ready(),
-            );
-        }
+        config.agent_account_id = resolve_agent_account_id(
+            config.agent_account_id.as_deref(),
+            account_harness_for_model(Some(config.harness), config.model.as_deref()),
+        );
         self.state.update(cx, |state, cx| {
             state.apply_chat_config(&chat_id, config.clone());
             cx.notify();
@@ -2268,33 +2161,6 @@ impl Pickers {
                             this.models.clear();
                             this.ensure_harnesses(cx);
                         }
-                    }))
-                    .child(SharedString::from("Retry")),
-            )
-            .into_any_element()
-    }
-
-    fn retry_agent_accounts_row(
-        &self,
-        message: &str,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        popover::error_row(theme, message)
-            .child(
-                div()
-                    .id("agent-accounts-retry")
-                    .px(px(Theme::SPACE_SM))
-                    .py(px(3.0))
-                    .rounded(px(Theme::CONTROL_RADIUS))
-                    .border_1()
-                    .border_color(theme.border)
-                    .text_color(theme.text)
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme.element_hover))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.agent_accounts = Loadable::Idle;
-                        this.ensure_agent_accounts(cx);
                     }))
                     .child(SharedString::from("Retry")),
             )
@@ -2893,89 +2759,6 @@ impl Pickers {
             .into_any_element()
     }
 
-    fn render_account_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = Theme::of(cx).clone();
-        let selected = self.effective_agent_account_id(cx);
-        let automatic = popover::menu_row(&theme, selected.is_none(), "agent-account-automatic")
-            .id("agent-account-automatic")
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.pick_agent_account(None, cx);
-            }))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .child(SharedString::from("Automatic")),
-            )
-            .when(selected.is_none(), |el| {
-                el.child(popover::menu_check(&theme))
-            })
-            .into_any_element();
-
-        let account_rows: AnyElement = match &self.agent_accounts {
-            Loadable::Loading | Loadable::Idle => div()
-                .px(px(4.0))
-                .child(popover::skeleton_rows(
-                    "agent-accounts-skeleton",
-                    &theme,
-                    2,
-                    cx.entity_id(),
-                    cx,
-                ))
-                .into_any_element(),
-            Loadable::Error(message) => {
-                let message = message.clone();
-                self.retry_agent_accounts_row(&message, &theme, cx)
-            }
-            Loadable::Ready(snapshot) => {
-                let accounts = account_harness_for_model(
-                    self.effective_harness(cx),
-                    self.selected_model(cx)
-                        .map(|model| model.id.as_str())
-                        .or_else(|| self.effective_model_id(cx)),
-                )
-                .map(|harness| compatible_connected_accounts(snapshot, harness))
-                .unwrap_or_default()
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>();
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .children(accounts.into_iter().enumerate().map(|(ix, account)| {
-                        let id = account.id.clone();
-                        let is_selected = selected.as_deref() == Some(account.id.as_str());
-                        let label: SharedString = agent_account_label(&account).to_string().into();
-                        popover::menu_row(&theme, is_selected, format!("agent-account-row-{ix}"))
-                            .id(("agent-account-row", ix))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.pick_agent_account(Some(id.clone()), cx);
-                            }))
-                            .child(div().flex_1().min_w_0().truncate().child(label))
-                            .when(is_selected, |el| el.child(popover::menu_check(&theme)))
-                    }))
-                    .into_any_element()
-            }
-        };
-
-        div()
-            .flex()
-            .flex_col()
-            .child(popover::menu_heading(&theme, "Account"))
-            .child(
-                div()
-                    .px(px(4.0))
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .child(automatic)
-                    .child(account_rows),
-            )
-            .into_any_element()
-    }
-
     /// The traits INSPECTOR: the reasoning ladder plus every advertised
     /// model option as headed segmented-chip sections, pinned under the
     /// models pane (formerly menu rows in the shared scroll). Selecting
@@ -2990,7 +2773,6 @@ impl Pickers {
         // Display the effective level (draft pick or the chat's config), so
         // the ladder check mirrors the chip summary.
         let current = self.effective_reasoning(cx);
-        let accounts = self.render_account_section(cx);
 
         let ladder: AnyElement = if levels.is_empty() {
             gpui::Empty.into_any_element()
@@ -3072,7 +2854,6 @@ impl Pickers {
             .gap(px(4.0))
             .pb(px(4.0))
             .child(ladder)
-            .child(accounts)
             .child(options)
             .into_any_element()
     }
@@ -3290,9 +3071,6 @@ impl Render for Pickers {
         ) && matches!(self.refs, Loadable::Idle)
         {
             self.ensure_refs(false, cx);
-        }
-        if self.open == Some(PickerKind::HarnessModel) {
-            self.ensure_agent_accounts(cx);
         }
         // Chip shows the model's display name alone (comet `modelText`); the
         // harness reads from the brand mark beside it. Never "Default model":
@@ -3618,56 +3396,7 @@ mod tests {
     }
 
     #[test]
-    fn account_filtering_excludes_other_providers_and_local_migrations() {
-        fn account(
-            id: &str,
-            harness: HarnessId,
-            status: comet_proto::AgentAccountStatus,
-            migration_available: bool,
-        ) -> AgentAccount {
-            AgentAccount {
-                id: id.into(),
-                harness,
-                email: None,
-                plan_label: None,
-                status,
-                usage_windows: vec![],
-                display_name: None,
-                organization: None,
-                auth_kind: None,
-                migration_available,
-            }
-        }
-        let snapshot = AgentAccountsSnapshot {
-            accounts: vec![
-                account(
-                    "claude-connected",
-                    HarnessId::ClaudeCode,
-                    comet_proto::AgentAccountStatus::Connected,
-                    false,
-                ),
-                account(
-                    "codex-connected",
-                    HarnessId::Codex,
-                    comet_proto::AgentAccountStatus::Connected,
-                    false,
-                ),
-                account(
-                    "claude-attention",
-                    HarnessId::ClaudeCode,
-                    comet_proto::AgentAccountStatus::AttentionRequired,
-                    false,
-                ),
-                account(
-                    "claude-local",
-                    HarnessId::ClaudeCode,
-                    comet_proto::AgentAccountStatus::Connected,
-                    true,
-                ),
-            ],
-            warnings: vec![],
-        };
-
+    fn account_routing_follows_the_selected_provider() {
         assert_eq!(
             account_harness_for_model(Some(HarnessId::Omp), Some("anthropic/claude-opus-5")),
             Some(HarnessId::ClaudeCode)
@@ -3690,44 +3419,18 @@ mod tests {
             ),
             None
         );
-        let ids = compatible_connected_accounts(&snapshot, HarnessId::ClaudeCode)
-            .into_iter()
-            .map(|account| account.id.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(ids, ["claude-connected"]);
     }
 
     #[test]
     fn unresolved_agent_account_pin_never_becomes_automatic() {
-        let snapshot = AgentAccountsSnapshot {
-            accounts: vec![AgentAccount {
-                id: "claude-connected".into(),
-                harness: HarnessId::ClaudeCode,
-                email: None,
-                plan_label: None,
-                status: comet_proto::AgentAccountStatus::Connected,
-                usage_windows: vec![],
-                display_name: None,
-                organization: None,
-                auth_kind: None,
-                migration_available: false,
-            }],
-            warnings: vec![],
-        };
-
-        for (candidate, harness, snapshot) in [
-            (
-                "claude-connected",
-                Some(HarnessId::ClaudeCode),
-                Some(&snapshot),
-            ),
-            ("claude-connected", Some(HarnessId::Codex), Some(&snapshot)),
-            ("codex-local", Some(HarnessId::Codex), Some(&snapshot)),
-            ("missing", Some(HarnessId::ClaudeCode), Some(&snapshot)),
-            ("missing", Some(HarnessId::ClaudeCode), None),
+        for (candidate, harness) in [
+            ("claude-connected", Some(HarnessId::ClaudeCode)),
+            ("claude-connected", Some(HarnessId::Codex)),
+            ("codex-local", Some(HarnessId::Codex)),
+            ("missing", Some(HarnessId::ClaudeCode)),
         ] {
             assert_eq!(
-                resolve_agent_account_id(Some(candidate), harness, snapshot).as_deref(),
+                resolve_agent_account_id(Some(candidate), harness).as_deref(),
                 Some(candidate)
             );
         }
@@ -3738,27 +3441,9 @@ mod tests {
                     Some(HarnessId::PrimeAgent),
                     Some("prime-inference/x-ai/grok-4.20")
                 ),
-                Some(&snapshot)
             ),
             None
         );
-    }
-
-    #[test]
-    fn account_cache_scope_tracks_owner_and_project() {
-        let signed_in = AuthState::SignedIn {
-            user: comet_proto::UserProfile {
-                id: "owner-a".into(),
-                email: "owner@example.com".into(),
-                name: None,
-            },
-            project_scope: "project-a".into(),
-        };
-        assert_eq!(
-            agent_accounts_owner(Some(&signed_in)),
-            Some(("owner-a".into(), "project-a".into()))
-        );
-        assert_eq!(agent_accounts_owner(Some(&AuthState::SignedOut)), None);
     }
 
     #[test]

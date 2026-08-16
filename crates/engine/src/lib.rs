@@ -51,7 +51,7 @@ pub use scaffold::{
 pub use sessions::{JournaledEvent, SessionsEngine, SteerOutcome};
 pub use spaces::SpacesSync;
 pub use terminals::Terminals;
-pub use titles::TitleGenerator;
+pub use titles::{TitleGenerator, title_from_prompt};
 pub use uploads::{AttachmentChunk, Uploads};
 pub use workspace_host::{
     DEFAULT_PROJECT_SCOPE, DEFAULT_USER_ID, WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig,

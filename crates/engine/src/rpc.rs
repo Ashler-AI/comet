@@ -400,6 +400,8 @@ enum MutateParams {
         /// The space the chat is created in — fixes host device + base cwd.
         space_id: String,
         #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
         config: Option<ChatConfig>,
         /// The picked ref, named on the row from the first frame (the footer
         /// read "Select ref" until the diff reconciler stamped it).
@@ -993,6 +995,7 @@ impl EngineRpc {
             MutateParams::CreateChat {
                 chat_id,
                 space_id,
+                title,
                 config,
                 branch,
                 cwd,
@@ -1000,6 +1003,11 @@ impl EngineRpc {
                 self.workspace
                     .create_chat(&chat_id, &space_id, config, cwd)
                     .map_err(failed)?;
+                if let Some(title) = title.as_deref().filter(|title| !title.is_empty()) {
+                    self.workspace
+                        .rename_chat(&chat_id, title)
+                        .map_err(failed)?;
+                }
                 if let Some(branch) = branch.as_deref().filter(|b| !b.is_empty()) {
                     self.workspace
                         .set_chat_branch(&chat_id, branch)

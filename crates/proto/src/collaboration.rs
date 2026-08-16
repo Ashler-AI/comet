@@ -502,6 +502,8 @@ pub enum SessionEnvironmentSource {
 #[serde(rename_all = "camelCase")]
 pub struct SessionEnvironment {
     pub source: SessionEnvironmentSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Control-plane-verified owner subject. Display email is not an authority key.
     pub owner_principal: String,
     pub scope: CollaborationScope,

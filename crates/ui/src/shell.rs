@@ -536,6 +536,8 @@ fn local_session_age(updated_at: i64, now: chrono::DateTime<Utc>) -> String {
 struct SidebarSessionMeta {
     source: comet_proto::AgentSessionSource,
     runtime_model: SharedString,
+    scaffold_web: Option<SharedString>,
+    scaffold_ide: Option<SharedString>,
 }
 /// Flex gap between sidebar list items.
 const SIDEBAR_LIST_GAP: f32 = 2.0;
@@ -3446,6 +3448,69 @@ impl Shell {
                 }))
                 .into_any_element()
         });
+        let link_actions = (reveal > 0.0
+            && (meta.scaffold_web.is_some() || meta.scaffold_ide.is_some()))
+        .then(|| {
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(2.0))
+                .opacity(reveal)
+                .when_some(meta.scaffold_web.clone(), |actions, link| {
+                    actions.child(
+                        div()
+                            .id(SharedString::from(format!("scaffold-web-{id}")))
+                            .size(px(18.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .hover(|el| el.bg(crate::theme::ink(0.10)))
+                            .tooltip(popover::text_tooltip("Open web"))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.open_url(&link);
+                            }))
+                            .child(
+                                icon(icons::GLOBAL)
+                                    .size(px(11.0))
+                                    .text_color(theme.text_muted),
+                            ),
+                    )
+                })
+                .when_some(meta.scaffold_ide.clone(), |actions, link| {
+                    actions.child(
+                        div()
+                            .id(SharedString::from(format!("scaffold-ide-{id}")))
+                            .size(px(18.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .hover(|el| el.bg(crate::theme::ink(0.10)))
+                            .tooltip(popover::text_tooltip("Open IDE"))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.open_url(&link);
+                            }))
+                            .child(
+                                icon(icons::MONITOR)
+                                    .size(px(11.0))
+                                    .text_color(theme.text_muted),
+                            ),
+                    )
+                })
+                .into_any_element()
+        });
         div()
             .id(SharedString::from(format!("chat-{id}")))
             .flex()
@@ -3578,7 +3643,8 @@ impl Shell {
                                     .text_color(subline)
                                     .child(branch),
                             )
-                    }),
+                    })
+                    .when_some(link_actions, |el, actions| el.child(actions)),
             )
             .into_any_element()
     }

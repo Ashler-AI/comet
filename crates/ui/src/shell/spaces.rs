@@ -911,6 +911,7 @@ impl Shell {
             comet_proto::Chat,
             String,
             Option<String>,
+            String,
             super::SidebarSessionMeta,
         )> = {
             let state = self.state.read(cx);
@@ -932,6 +933,20 @@ impl Shell {
                         folder = format!("{folder} · {device}");
                     }
                     let branch = sidebar_branch_label(&chat);
+                    let scaffold_environment = state.scaffold_environment(&chat.id);
+                    let scaffold_title =
+                        scaffold_environment.and_then(|environment| environment.name.clone());
+                    let (scaffold_web, scaffold_ide) = scaffold_environment
+                        .and_then(|environment| match &environment.source {
+                            comet_proto::SessionEnvironmentSource::Scaffold { links, .. } => {
+                                Some((links.web.clone(), links.opencode.clone()))
+                            }
+                            comet_proto::SessionEnvironmentSource::Local => None,
+                        })
+                        .unwrap_or_default();
+                    let title = scaffold_title
+                        .or_else(|| chat.title.clone())
+                        .unwrap_or_else(|| "New session".into());
                     let agent_session = state.collaboration_sessions(&chat.id).next();
                     let source = sidebar_session_source(
                         state.local_device_id.as_deref(),
@@ -956,9 +971,12 @@ impl Shell {
                         chat,
                         folder,
                         branch,
+                        title,
                         super::SidebarSessionMeta {
                             source,
                             runtime_model,
+                            scaffold_web: scaffold_web.map(SharedString::from),
+                            scaffold_ide: scaffold_ide.map(SharedString::from),
                         },
                     )
                 })
@@ -966,17 +984,14 @@ impl Shell {
         };
         let selected = self.state.read(cx).selected_chat.clone();
         rows.into_iter()
-            .map(|(status, chat, folder, branch, meta)| {
+            .map(|(status, chat, folder, branch, title, meta)| {
                 let time_ago: SharedString =
                     format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
                 let is_selected = selected.as_deref() == Some(chat.id.as_str());
                 let height = super::chat_row_height(self.settings.density);
                 let element = self.render_chat_row(
                     chat.id.clone(),
-                    transcript::single_line(
-                        &chat.title.clone().unwrap_or_else(|| "New session".into()),
-                    )
-                    .into(),
+                    transcript::single_line(&title).into(),
                     time_ago,
                     folder.into(),
                     branch.map(SharedString::from),
