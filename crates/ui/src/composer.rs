@@ -4762,9 +4762,9 @@ impl Composer {
             .as_ref()
             .map(|draft| draft.database_environment)
             .unwrap_or_default();
-        let scaffold_handoff_local_chat_id = scaffold_draft
+        let scaffold_omp_handoff = scaffold_draft
             .as_ref()
-            .and_then(|draft| draft.handoff_local_chat_id.clone());
+            .and_then(|draft| draft.omp_handoff.clone());
         start_agent_mode |= scaffold_demo;
         let local_device_id = self.state.read(cx).local_device_id.clone();
         let device_id = if is_new {
@@ -5012,14 +5012,13 @@ impl Composer {
                                     }
                                 };
                             if ready {
-                                if let Some(local_chat_id) =
-                                    scaffold_handoff_local_chat_id.as_deref()
-                                {
+                                if let Some(handoff) = scaffold_omp_handoff.as_ref() {
                                     match crate::state::handoff_omp_session(
                                         &engine,
                                         created_id,
                                         &authoritative_scope,
-                                        local_chat_id,
+                                        &handoff.native_session_id,
+                                        &handoff.cwd,
                                     )
                                     .await
                                     {

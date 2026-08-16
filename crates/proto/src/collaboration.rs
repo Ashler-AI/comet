@@ -562,16 +562,17 @@ pub enum ScaffoldEnvironmentControl {
         sandbox_id: String,
         scope: CollaborationScope,
     },
-    /// Copy the exact native OMP session backing a local Crew chat into a
-    /// Scaffold host. This only materializes and verifies the native store; the
-    /// first remote run performs ACP `session/load` through its ordinary
-    /// `RunRequest.resume` path.
+    /// Copy an exact native OMP session into a Scaffold host. The local
+    /// controller resolves the durable native id/cwd pair to a discovered file;
+    /// callers cannot provide a path. The first remote run then performs ACP
+    /// `session/load` through its ordinary `RunRequest.resume` path.
     HandoffOmpSession {
         #[serde(rename = "sandboxId")]
         sandbox_id: String,
         scope: CollaborationScope,
-        #[serde(rename = "localChatId")]
-        local_chat_id: String,
+        #[serde(rename = "nativeSessionId")]
+        native_session_id: String,
+        cwd: String,
     },
 }
 
@@ -927,12 +928,14 @@ mod tests {
                 session_id: Some("session-a".into()),
                 unknown: Default::default(),
             },
-            local_chat_id: "local-chat-a".into(),
+            native_session_id: "omp-native-a".into(),
+            cwd: "/repo".into(),
         };
         let value = serde_json::to_value(control).unwrap();
         assert_eq!(value["operation"], "handoffOmpSession");
         assert_eq!(value["sandboxId"], "sandbox-a");
-        assert_eq!(value["localChatId"], "local-chat-a");
+        assert_eq!(value["nativeSessionId"], "omp-native-a");
+        assert_eq!(value["cwd"], "/repo");
         assert_eq!(value["scope"]["sessionId"], "session-a");
     }
 

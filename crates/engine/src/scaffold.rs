@@ -1782,7 +1782,8 @@ impl ScaffoldRuntime {
             ScaffoldEnvironmentControl::HandoffOmpSession {
                 sandbox_id,
                 scope,
-                local_chat_id,
+                native_session_id,
+                cwd,
             } => {
                 let environment = self
                     .inner
@@ -1797,8 +1798,11 @@ impl ScaffoldRuntime {
                 ) {
                     return Err(ScaffoldError::OmpSessionHandoffFailed);
                 }
-                let artifact = crate::local_sessions::capture_omp_artifact_for_chat(&local_chat_id)
-                    .map_err(|_| ScaffoldError::OmpSessionHandoffFailed)?;
+                let artifact = crate::local_sessions::capture_omp_artifact_for_session(
+                    &native_session_id,
+                    &cwd,
+                )
+                .map_err(|_| ScaffoldError::OmpSessionHandoffFailed)?;
                 self.inner
                     .client
                     .handoff_omp_session(&sandbox_id, &artifact, cancellation)

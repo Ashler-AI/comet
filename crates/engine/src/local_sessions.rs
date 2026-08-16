@@ -126,16 +126,17 @@ pub fn capture_omp_artifact(candidate_id: &str) -> Result<OmpSessionArtifact, En
     capture_omp_artifact_with_roots(candidate_id, &session_roots())
 }
 
-/// Capture the OMP session backing a deterministic local Crew chat id.
+/// Capture the OMP session identified by the durable native id and cwd stored
+/// on a Crew chat row.
 ///
-/// The chat id is derived from the discovered native session; callers cannot
-/// supply a path. Re-discovery therefore keeps the same no-follow boundary as
-/// candidate-based capture while remaining usable after an imported candidate
-/// disappears from the picker.
-pub fn capture_omp_artifact_for_chat(
-    local_chat_id: &str,
+/// Re-discovery resolves that trusted pair to a concrete OMP candidate, then
+/// capture revalidates the same identity against the bytes under a stable
+/// no-follow file handle. Callers never provide a filesystem path.
+pub fn capture_omp_artifact_for_session(
+    native_session_id: &str,
+    cwd: &str,
 ) -> Result<OmpSessionArtifact, EngineError> {
-    capture_omp_artifact_for_chat_with_roots(local_chat_id, &session_roots())
+    capture_omp_artifact_for_session_with_roots(native_session_id, cwd, &session_roots())
 }
 
 fn capture_omp_artifact_with_roots(
@@ -149,14 +150,19 @@ fn capture_omp_artifact_with_roots(
     capture_discovered_omp_artifact(&session, roots)
 }
 
-fn capture_omp_artifact_for_chat_with_roots(
-    local_chat_id: &str,
+fn capture_omp_artifact_for_session_with_roots(
+    native_session_id: &str,
+    cwd: &str,
     roots: &SessionRoots,
 ) -> Result<OmpSessionArtifact, EngineError> {
     let session = discover_with_roots(roots)
         .into_iter()
-        .find(|session| session.candidate.chat_id == local_chat_id)
-        .ok_or_else(|| EngineError::Other("local OMP chat is no longer available".into()))?;
+        .find(|session| {
+            session.candidate.harness == HarnessId::Omp
+                && session.candidate.session_id == native_session_id
+                && session.candidate.cwd == cwd
+        })
+        .ok_or_else(|| EngineError::Other("local OMP session is no longer available".into()))?;
     capture_discovered_omp_artifact(&session, roots)
 }
 
@@ -2337,9 +2343,15 @@ mod tests {
             artifact.sha256,
             format!("{:x}", Sha256::digest(&artifact.bytes))
         );
-        let by_chat =
-            capture_omp_artifact_for_chat_with_roots(&candidate.candidate.chat_id, &roots).unwrap();
-        assert_eq!(by_chat, artifact);
+        let by_native_session = capture_omp_artifact_for_session_with_roots(
+            &candidate.candidate.session_id,
+            &candidate.candidate.cwd,
+            &roots,
+        )
+        .unwrap();
+        assert_eq!(by_native_session, artifact);
+        assert!(capture_omp_artifact_for_session_with_roots("omp-other", "/repo", &roots).is_err());
+        assert!(capture_omp_artifact_for_session_with_roots("omp-1", "/other", &roots).is_err());
     }
 
     #[test]

@@ -405,6 +405,13 @@ fn session_ref_fallback(chat_id: &str) -> String {
 // AppState entity
 // ---------------------------------------------------------------------------
 
+/// Durable OMP identity copied into Scaffold before the first remote run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScaffoldOmpHandoffDraft {
+    pub native_session_id: String,
+    pub cwd: String,
+}
+
 /// A local Comet session selected for Scaffold. The sandbox does not exist
 /// until this session's first prompt is submitted.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -414,9 +421,9 @@ pub(crate) struct ScaffoldSessionDraft {
     pub space_id: String,
     pub chat_id: String,
     pub database_environment: ScaffoldDatabaseEnvironment,
-    /// Existing local OMP chat whose native transcript must be materialized in
-    /// Scaffold before the first remote run. `None` creates a blank session.
-    pub handoff_local_chat_id: Option<String>,
+    /// Existing local OMP session to materialize in Scaffold. `None` creates a
+    /// blank session.
+    pub omp_handoff: Option<ScaffoldOmpHandoffDraft>,
 }
 impl ScaffoldSessionDraft {
     pub fn collaboration_scope(&self) -> CollaborationScope {
@@ -614,13 +621,14 @@ pub(crate) async fn attach_scaffold_session(
     })
 }
 
-/// Materialize the native OMP transcript backing `local_chat_id` in an already
-/// ready Scaffold host and return the exact resume id for its first remote run.
+/// Materialize an exact native OMP session in an already ready Scaffold host
+/// and return its resume id for the first remote run.
 pub(crate) async fn handoff_omp_session(
     handle: &EngineHandle,
     sandbox_id: &str,
     scope: &CollaborationScope,
-    local_chat_id: &str,
+    native_session_id: &str,
+    cwd: &str,
 ) -> Result<String, RpcError> {
     let value = handle
         .client()
@@ -629,7 +637,8 @@ pub(crate) async fn handoff_omp_session(
             serde_json::to_value(ScaffoldEnvironmentControl::HandoffOmpSession {
                 sandbox_id: sandbox_id.to_string(),
                 scope: scope.clone(),
-                local_chat_id: local_chat_id.to_string(),
+                native_session_id: native_session_id.to_string(),
+                cwd: cwd.to_string(),
             })
             .unwrap_or_default(),
         )
@@ -2099,7 +2108,7 @@ impl AppState {
             cx.notify();
             return;
         };
-        let handoff_local_chat_id = self.selected_chat.as_deref().and_then(|selected| {
+        let handoff_source = self.selected_chat.as_deref().and_then(|selected| {
             self.chats
                 .iter()
                 .find(|chat| chat.id == selected)
@@ -2109,18 +2118,30 @@ impl AppState {
                             .config
                             .as_ref()
                             .is_some_and(|config| config.harness == HarnessId::Omp)
-                        && chat
-                            .harness_session_id
-                            .as_deref()
-                            .is_some_and(|session_id| !session_id.is_empty())
                         && !self.room_projections.contains_key(selected)
                 })
-                .map(|chat| chat.id.clone())
+                .and_then(|chat| {
+                    let native_session_id = chat
+                        .harness_session_id
+                        .as_deref()
+                        .filter(|session_id| !session_id.is_empty())?;
+                    let cwd = chat
+                        .harness_session_cwd
+                        .as_deref()
+                        .filter(|cwd| !cwd.is_empty())?;
+                    Some((
+                        chat.id.clone(),
+                        ScaffoldOmpHandoffDraft {
+                            native_session_id: native_session_id.to_string(),
+                            cwd: cwd.to_string(),
+                        },
+                    ))
+                })
         });
-        let source_space_id = handoff_local_chat_id.as_deref().and_then(|chat_id| {
+        let source_space_id = handoff_source.as_ref().and_then(|(chat_id, _)| {
             self.chats
                 .iter()
-                .find(|chat| chat.id == chat_id)
+                .find(|chat| chat.id == *chat_id)
                 .and_then(|chat| chat.space_id.clone())
         });
         let Some(space_id) = source_space_id.or_else(|| self.selected_space.clone()) else {
@@ -2128,16 +2149,16 @@ impl AppState {
             cx.notify();
             return;
         };
-        if let Some(local_chat_id) = handoff_local_chat_id {
+        if let Some((local_chat_id, omp_handoff)) = handoff_source {
             self.scaffold_session_error = None;
             self.select_pending_scaffold_chat(
                 ScaffoldSessionDraft {
                     project_id,
                     deployment_id,
                     space_id,
-                    chat_id: local_chat_id.clone(),
+                    chat_id: local_chat_id,
                     database_environment,
-                    handoff_local_chat_id: Some(local_chat_id),
+                    omp_handoff: Some(omp_handoff),
                 },
                 cx,
             );
@@ -2174,7 +2195,7 @@ impl AppState {
                             space_id,
                             chat_id,
                             database_environment,
-                            handoff_local_chat_id: None,
+                            omp_handoff: None,
                         },
                         cx,
                     ),
@@ -3086,9 +3107,13 @@ mod tests {
             } else if operation == "handoffOmpSession" {
                 assert_eq!(
                     params
-                        .get("localChatId")
+                        .get("nativeSessionId")
                         .and_then(serde_json::Value::as_str),
-                    Some("local-chat-a")
+                    Some("omp-session-a")
+                );
+                assert_eq!(
+                    params.get("cwd").and_then(serde_json::Value::as_str),
+                    Some("/workspace/ashler-platform")
                 );
                 serde_json::json!({
                     "environment": environment,
@@ -3246,9 +3271,15 @@ mod tests {
             }
         );
         assert_eq!(
-            handoff_omp_session(&handle, "sandbox-ready", &scope, "local-chat-a")
-                .await
-                .unwrap(),
+            handoff_omp_session(
+                &handle,
+                "sandbox-ready",
+                &scope,
+                "omp-session-a",
+                "/workspace/ashler-platform",
+            )
+            .await
+            .unwrap(),
             "omp-session-a"
         );
         archive_and_pause_scaffold_session(&handle, "session-ready", &attachment.control_target)
@@ -3593,7 +3624,10 @@ mod tests {
             space_id: "space-a".into(),
             chat_id: "chat-a".into(),
             database_environment: ScaffoldDatabaseEnvironment::StagingSnapshot,
-            handoff_local_chat_id: Some("local-chat-a".into()),
+            omp_handoff: Some(ScaffoldOmpHandoffDraft {
+                native_session_id: "omp-native-a".into(),
+                cwd: "/repo".into(),
+            }),
         };
 
         let scope = draft.collaboration_scope();
@@ -3601,18 +3635,25 @@ mod tests {
         assert_eq!(scope.project_id, "project-a");
         assert_eq!(scope.deployment_id.as_deref(), Some("deployment-a"));
         assert_eq!(scope.session_id.as_deref(), Some("chat-a"));
-        assert_eq!(draft.handoff_local_chat_id.as_deref(), Some("local-chat-a"));
+        assert_eq!(
+            draft.omp_handoff,
+            Some(ScaffoldOmpHandoffDraft {
+                native_session_id: "omp-native-a".into(),
+                cwd: "/repo".into(),
+            })
+        );
     }
 
     #[gpui::test]
-    fn imported_omp_session_becomes_a_scaffold_handoff_draft(cx: &mut gpui::TestAppContext) {
+    fn new_local_omp_session_becomes_a_scaffold_handoff_draft(cx: &mut gpui::TestAppContext) {
         let state = cx.new(|_| AppState::new());
         state.update(cx, |state, cx| {
-            let mut imported = chat("local-chat-a", 0, Some(1));
-            imported.device_id = "device-a".into();
-            imported.space_id = Some("space-a".into());
-            imported.harness_session_id = Some("omp-session-a".into());
-            imported.config = Some(comet_proto::ChatConfig {
+            let mut local = chat("a6c3c748-7fb2-4fa0-bf5c-ccb26b471599", 0, Some(1));
+            local.device_id = "device-a".into();
+            local.space_id = Some("space-a".into());
+            local.harness_session_id = Some("omp-session-a".into());
+            local.harness_session_cwd = Some("/repo".into());
+            local.config = Some(comet_proto::ChatConfig {
                 harness: HarnessId::Omp,
                 model: Some("gpt-5.6-sol".into()),
                 reasoning: None,
@@ -3623,14 +3664,20 @@ mod tests {
             state.local_device_id = Some("device-a".into());
             state.scaffold_scope = Some(("project-a".into(), "deployment-a".into()));
             state.selected_space = Some("space-a".into());
-            state.selected_chat = Some(imported.id.clone());
-            state.chats = vec![imported];
+            state.selected_chat = Some(local.id.clone());
+            state.chats = vec![local];
 
             state.start_scaffold_session(ScaffoldDatabaseEnvironment::Local, cx);
 
             let draft = state.scaffold_session_draft().expect("OMP handoff draft");
-            assert_eq!(draft.chat_id, "local-chat-a");
-            assert_eq!(draft.handoff_local_chat_id.as_deref(), Some("local-chat-a"));
+            assert_eq!(draft.chat_id, "a6c3c748-7fb2-4fa0-bf5c-ccb26b471599");
+            assert_eq!(
+                draft.omp_handoff,
+                Some(ScaffoldOmpHandoffDraft {
+                    native_session_id: "omp-session-a".into(),
+                    cwd: "/repo".into(),
+                })
+            );
             assert!(!state.scaffold_session_creating());
         });
     }
@@ -3645,7 +3692,7 @@ mod tests {
                 space_id: "space-a".into(),
                 chat_id: "chat-a".into(),
                 database_environment: ScaffoldDatabaseEnvironment::Local,
-                handoff_local_chat_id: None,
+                omp_handoff: None,
             });
 
             state.select_chat(Some("chat-a".into()), cx);
@@ -3683,7 +3730,7 @@ mod tests {
                     space_id: "space-a".into(),
                     chat_id: "chat-a".into(),
                     database_environment: ScaffoldDatabaseEnvironment::ProductionSnapshot,
-                    handoff_local_chat_id: None,
+                    omp_handoff: None,
                 },
                 cx,
             );
