@@ -1141,6 +1141,7 @@ fn forwardable(method: &str) -> bool {
         methods::LIST_HARNESSES
             | methods::LIST_MODELS
             | methods::LIST_HARNESS_COMMANDS
+            | methods::TAKE_OVER_OMP_SESSION
             | methods::WATCH_DOC_MESSAGES
             | methods::READ_DOC_MESSAGES
             | "WatchCollaboration"
@@ -1629,6 +1630,15 @@ impl RpcService for EngineRpc {
                     .queue_command(&p.chat_id, p.command)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "commandId": command_id }))
+            }
+            methods::TAKE_OVER_OMP_SESSION => {
+                let p: ChatParams = parse_params(params)?;
+                let run_id = self
+                    .sessions
+                    .take_over_omp_session(&p.chat_id)
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "runId": run_id }))
             }
             methods::SEND_PEER_MESSAGE => {
                 let p: SendPeerMessageParams = parse_params(params)?;

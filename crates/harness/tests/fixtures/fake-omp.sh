@@ -4,7 +4,7 @@ has() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 if [ "${1:-}" = "-F" ]; then
   case "${OMP_WRITER_STATE:-unknown}" in
     active)
-      printf '%s\n' "p4242"
+      printf '%s\n' "p4242" "f35" "aw" "n${3:-session.jsonl}"
       exit 0
       ;;
     inactive)
@@ -14,7 +14,7 @@ if [ "${1:-}" = "-F" ]; then
       if [ -n "${OMP_RPC_PID_LOG:-}" ] && [ -f "$OMP_RPC_PID_LOG" ]; then
         IFS= read -r pid < "$OMP_RPC_PID_LOG"
         if kill -0 "$pid" 2>/dev/null; then
-          printf '%s\n' "p$pid"
+          printf '%s\n' "p$pid" "f35" "aw" "n${3:-session.jsonl}"
           exit 0
         fi
       fi

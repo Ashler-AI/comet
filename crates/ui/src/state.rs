@@ -274,6 +274,11 @@ impl EngineHandle {
             project_scope: config.project_scope,
             deployment_id: config.deployment_id,
             scaffold_url: config.scaffold_url,
+            harness_supervisor_executable: std::env::current_exe().ok().filter(|path| {
+                path.file_stem()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.eq_ignore_ascii_case("comet"))
+            }),
         };
         let auth = Engine::build_auth(&engine_config).await;
         let refresh_task = auth.spawn_refresh_loop();
@@ -836,6 +841,11 @@ pub struct AppState {
     /// Harness-native session metadata discovered on this device. Transcripts
     /// remain engine-private until the user attaches one candidate explicitly.
     pub local_session_candidates: Vec<LocalSessionCandidate>,
+    /// OMP takeover state is keyed by the exact transcript error row, not only
+    /// by chat, so a resolved historical error never becomes actionable again.
+    omp_takeovers: HashSet<String>,
+    omp_takeover_errors: HashMap<String, String>,
+    omp_takeover_completed: HashSet<String>,
     pub local_sessions_loading: bool,
     pub local_sessions_error: Option<String>,
     pub local_session_attaching: HashSet<String>,
@@ -958,6 +968,9 @@ impl AppState {
             devices: Vec::new(),
             spaces: Vec::new(),
             chats: Vec::new(),
+            omp_takeovers: HashSet::new(),
+            omp_takeover_errors: HashMap::new(),
+            omp_takeover_completed: HashSet::new(),
             local_session_candidates: Vec::new(),
             local_sessions_loading: false,
             local_sessions_error: None,
@@ -2230,6 +2243,85 @@ impl AppState {
                         cx.notify();
                     }
                 }
+            });
+        })
+        .detach();
+    }
+    pub(crate) fn omp_takeover_in_progress(&self, error_id: &str) -> bool {
+        self.omp_takeovers.contains(error_id)
+    }
+
+    pub(crate) fn omp_takeover_error(&self, error_id: &str) -> Option<String> {
+        self.omp_takeover_errors.get(error_id).cloned()
+    }
+
+    pub(crate) fn omp_takeover_completed(&self, error_id: &str) -> bool {
+        self.omp_takeover_completed.contains(error_id)
+    }
+
+    pub(crate) fn take_over_omp_session(
+        &mut self,
+        chat_id: String,
+        error_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.omp_takeovers.contains(&error_id) || self.omp_takeover_completed.contains(&error_id)
+        {
+            return;
+        }
+        let Some(engine) = self.engine.clone() else {
+            self.omp_takeover_errors
+                .insert(error_id, "Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        let target_device_id = self
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .map(|chat| chat.device_id.clone())
+            .or_else(|| {
+                self.sessions
+                    .iter()
+                    .find(|session| session.chat_id == chat_id)
+                    .map(|session| session.device_id.clone())
+            });
+        let Some(target_device_id) = target_device_id else {
+            self.omp_takeover_errors.insert(
+                error_id,
+                "The device running this OMP session is unavailable".into(),
+            );
+            cx.notify();
+            return;
+        };
+        self.omp_takeovers.insert(error_id.clone());
+        self.omp_takeover_errors.remove(&error_id);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::TAKE_OVER_OMP_SESSION,
+                    serde_json::json!({
+                        "chatId": chat_id,
+                        "targetDeviceId": target_device_id,
+                    }),
+                )
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                state.omp_takeovers.remove(&error_id);
+                match result {
+                    Ok(_) => {
+                        state.omp_takeover_errors.remove(&error_id);
+                        state.omp_takeover_completed.insert(error_id);
+                    }
+                    Err(error) => {
+                        state
+                            .omp_takeover_errors
+                            .insert(error_id, format!("Takeover failed: {error}"));
+                    }
+                }
+                cx.notify();
             });
         })
         .detach();
