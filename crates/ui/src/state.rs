@@ -622,14 +622,15 @@ pub(crate) async fn attach_scaffold_session(
 }
 
 /// Materialize an authenticated OMP session in an already ready Scaffold host,
-/// rebind it to the remote workspace, and return its id for the first run.
+/// rebind it to the remote workspace, and return the native id plus remote cwd
+/// for the first run.
 pub(crate) async fn handoff_omp_session(
     handle: &EngineHandle,
     sandbox_id: &str,
     scope: &CollaborationScope,
     native_session_id: &str,
     cwd: &str,
-) -> Result<String, RpcError> {
+) -> Result<(String, String), RpcError> {
     let value = handle
         .client()
         .call(
@@ -670,10 +671,15 @@ pub(crate) async fn handoff_omp_session(
             "OMP handoff returned a different session room".into(),
         ));
     }
-    handed_off
+    let native_session_id = handed_off
         .handoff_native_session_id
         .filter(|session_id| !session_id.trim().is_empty())
-        .ok_or_else(|| RpcError::Failed("OMP handoff returned no native session id".into()))
+        .ok_or_else(|| RpcError::Failed("OMP handoff returned no native session id".into()))?;
+    let remote_cwd = handed_off
+        .handoff_cwd
+        .filter(|cwd| !cwd.trim().is_empty())
+        .ok_or_else(|| RpcError::Failed("OMP handoff returned no remote cwd".into()))?;
+    Ok((native_session_id, remote_cwd))
 }
 // Half-second retries match the composer's ten-minute Scaffold readiness budget.
 const SCAFFOLD_ATTACH_MAX_ATTEMPTS: usize = 1_200;
@@ -3280,7 +3286,7 @@ mod tests {
             )
             .await
             .unwrap(),
-            "omp-session-a"
+            ("omp-session-a".into(), "/workspace/ashler-platform".into())
         );
         archive_and_pause_scaffold_session(&handle, "session-ready", &attachment.control_target)
             .await

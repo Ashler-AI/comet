@@ -153,6 +153,10 @@ fn scaffold_run_model(
     }
 }
 
+fn scaffold_run_cwd<'a>(local_cwd: &'a str, handoff_cwd: Option<&'a str>) -> &'a str {
+    handoff_cwd.unwrap_or(local_cwd)
+}
+
 fn scaffold_turn_requires_start(
     start_agent_mode: bool,
     previous_owner_device_id: Option<&str>,
@@ -4919,6 +4923,7 @@ impl Composer {
                 let mut host_device_id = host_device_id;
                 let mut attached_scaffold_source_ref = requested_scaffold_source_ref.clone();
                 let mut scaffold_resume_session_id = None;
+                let mut scaffold_resume_cwd = None;
                 if let Some(scope) = scaffold_scope {
                     let wait_started = Instant::now();
                     let mut sandbox_id = None;
@@ -5021,8 +5026,9 @@ impl Composer {
                                     )
                                     .await
                                     {
-                                        Ok(native_session_id) => {
+                                        Ok((native_session_id, remote_cwd)) => {
                                             scaffold_resume_session_id = Some(native_session_id);
+                                            scaffold_resume_cwd = Some(remote_cwd);
                                         }
                                         Err(error) => {
                                             last_error = Some(format!(
@@ -5366,7 +5372,7 @@ impl Composer {
                     agent_account_id: None,
                     reasoning: resolved.reasoning,
                     model_options: resolved.model_options.clone(),
-                    cwd: cwd.clone(),
+                    cwd: scaffold_run_cwd(&cwd, scaffold_resume_cwd.as_deref()).to_string(),
                     sandbox: SandboxLevel::WorkspaceWrite,
                     auto_approve: true,
                     resume: scaffold_resume_session_id.clone(),
@@ -6470,6 +6476,18 @@ mod tests {
             Some("comet-scaffold-sandbox-e1"),
             "comet-scaffold-sandbox-e1",
         ));
+    }
+
+    #[test]
+    fn scaffold_handoff_uses_the_remote_workspace_cwd() {
+        assert_eq!(
+            scaffold_run_cwd("/Users/alice/project", Some("/workspace/ashler-platform")),
+            "/workspace/ashler-platform"
+        );
+        assert_eq!(
+            scaffold_run_cwd("/Users/alice/project", None),
+            "/Users/alice/project"
+        );
     }
 
     #[test]

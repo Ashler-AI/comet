@@ -32,6 +32,7 @@ use crate::now_ms;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const JOIN_GRANT_TTL_SECONDS: u32 = 15 * 60;
 const DEVICE_ACCESS_TTL_MS: i64 = 12 * 60 * 60 * 1000;
+const SCAFFOLD_WORKSPACE_CWD: &str = "/workspace/ashler-platform";
 
 pub(crate) const SCAFFOLD_COMET_RUNTIME_VERSION: &str =
     include_str!("../../../scaffold-runtime-version.txt");
@@ -676,7 +677,7 @@ impl ScaffoldClient {
         sandbox_id: &str,
         artifact: &OmpSessionArtifact,
         cancellation: &CancellationToken,
-    ) -> Result<(), ScaffoldError> {
+    ) -> Result<String, ScaffoldError> {
         validate_handoff_artifact(artifact)?;
         // Scaffold owns the absolute destination selection and must constrain it
         // below PI_CODING_AGENT_DIR. The archive itself contains only the
@@ -731,7 +732,7 @@ impl ScaffoldClient {
         {
             return Err(ScaffoldError::OmpSessionHandoffFailed);
         }
-        Ok(())
+        Ok(SCAFFOLD_WORKSPACE_CWD.to_string())
     }
 
     async fn upload_granted_archive(
@@ -1913,11 +1914,12 @@ impl ScaffoldRuntime {
                     &cwd,
                 )
                 .map_err(|_| ScaffoldError::OmpSessionHandoffFailed)?;
-                self.inner
+                let remote_cwd = self
+                    .inner
                     .client
                     .handoff_omp_session(&sandbox_id, &artifact, cancellation)
                     .await?;
-                let handoff = Some((artifact.native_session_id, artifact.cwd));
+                let handoff = Some((artifact.native_session_id, remote_cwd));
                 (environment, None, None, handoff)
             }
         };
@@ -2896,10 +2898,11 @@ mod tests {
             Arc::new(StaticToken("scaffold_control_secret".into())),
         )
         .unwrap();
-        client
+        let remote_cwd = client
             .handoff_omp_session("sandbox-a", &artifact, &CancellationToken::new())
             .await
             .unwrap();
+        assert_eq!(remote_cwd, SCAFFOLD_WORKSPACE_CWD);
 
         let requests = captured.await.unwrap();
         assert_eq!(requests.len(), 3);
