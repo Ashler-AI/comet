@@ -770,7 +770,15 @@ impl AccountsPage {
                                     .truncate()
                                     .text_size(px(11.5))
                                     .text_color(theme.text_muted.opacity(0.6))
-                                    .child(SharedString::from(account_status_label(account))),
+                                    .child(SharedString::from(
+                                        if account.status == AgentAccountStatus::Connected
+                                            && !account.migration_available
+                                        {
+                                            "Remaining usage unavailable"
+                                        } else {
+                                            account_status_label(account)
+                                        },
+                                    )),
                             )
                         } else {
                             el.child(
