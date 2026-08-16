@@ -564,6 +564,76 @@ async fn hung_abort_is_force_killed_before_the_session_can_resume() {
 }
 
 #[tokio::test]
+async fn errored_rpc_run_releases_writer_before_done() {
+    let _env = env_lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let argv_log = temp.path().join("argv");
+    let pid_log = temp.path().join("pid");
+    let session_dir = temp.path().join("sessions");
+    write_omp_session(&session_dir, "errored-session");
+    unsafe {
+        std::env::set_var("OMP_ARGV_LOG", &argv_log);
+        std::env::set_var("OMP_RPC_PID_LOG", &pid_log);
+        std::env::set_var("OMP_WRITER_STATE", "auto");
+        std::env::set_var("OMP_TURN_ERROR", "1");
+    }
+    let harness = OmpHarness::new()
+        .with_executable(fixture_path())
+        .with_session_dir(&session_dir)
+        .with_session_writer_probe(fixture_path());
+    let mut stream = harness
+        .run(request(Some("errored-session")), controls())
+        .await
+        .expect("errored turn starts");
+    let mut saw_provider_error = false;
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("errored turn settles")
+            .expect("stream remains open")
+            .expect("valid errored event");
+        match event {
+            AgentEvent::Error { message } => {
+                saw_provider_error = message.contains("No API key for provider");
+            }
+            AgentEvent::Done { status, .. } => {
+                assert_eq!(status, DoneStatus::Errored);
+                assert!(saw_provider_error);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    unsafe {
+        std::env::remove_var("OMP_TURN_ERROR");
+    }
+    let resumed = harness
+        .run(request(Some("errored-session")), controls())
+        .await
+        .expect("session resumes as soon as errored Done is visible");
+    let resumed_events = tokio::time::timeout(
+        Duration::from_secs(10),
+        resumed
+            .map(|event| event.expect("valid resumed event"))
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .expect("resumed turn completes");
+    assert!(matches!(
+        resumed_events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+    unsafe {
+        std::env::remove_var("OMP_RPC_PID_LOG");
+        std::env::remove_var("OMP_WRITER_STATE");
+    }
+}
+
+#[tokio::test]
 async fn unknown_writer_state_fails_closed_before_spawning_omp() {
     let _env = env_lock().await;
     let temp = tempfile::tempdir().unwrap();
