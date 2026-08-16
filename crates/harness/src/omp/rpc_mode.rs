@@ -1135,7 +1135,7 @@ pub(crate) async fn run_rpc(
                                 "type": "host_tool_result",
                                 "id": id,
                                 "isError": true,
-                                "result": { "content": [{ "type": "text", "text": "Comet registers no host tools" }] },
+                                "result": { "content": [{ "type": "text", "text": "Crew registers no host tools" }] },
                             }));
                         }
                     }
@@ -1145,7 +1145,7 @@ pub(crate) async fn run_rpc(
                                 "type": "host_uri_result",
                                 "id": id,
                                 "isError": true,
-                                "error": "Comet registers no host URI schemes",
+                                "error": "Crew registers no host URI schemes",
                             }));
                         }
                     }

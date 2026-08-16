@@ -2586,9 +2586,9 @@ pub fn peer_message_prompt(
     text: &str,
 ) -> String {
     format!(
-        "Message from Comet session {source_chat_id} (thread {thread_id}):\n\n\
+        "Message from Crew session {source_chat_id} (thread {thread_id}):\n\n\
          {text}\n\n\
-         To reply through Comet, run:\n\
+         To reply through Crew, run:\n\
          comet session reply --session {target_chat_id} --command {command_id} \"<reply>\""
     )
 }

@@ -1146,7 +1146,7 @@ impl ScaffoldSandbox {
                 .is_some_and(|profile| !matches!(profile, "remote_code" | "comet_remote"))
         {
             return Err(ScaffoldError::InvalidResponse(format!(
-                "{} is not a Comet-compatible remote sandbox",
+                "{} is not a Crew-compatible remote sandbox",
                 self.id
             )));
         }
@@ -1169,7 +1169,7 @@ impl ScaffoldSandbox {
         let scope = if self.runtime_profile.as_deref() == Some("comet_remote") {
             let profile = self.comet_runtime_profile.as_ref().ok_or_else(|| {
                 ScaffoldError::InvalidResponse(format!(
-                    "sandbox {} has no authoritative Comet runtime profile",
+                    "sandbox {} has no authoritative Crew runtime profile",
                     self.id
                 ))
             })?;
@@ -1180,7 +1180,7 @@ impl ScaffoldSandbox {
                 || profile.sandbox_id != self.id
             {
                 return Err(ScaffoldError::InvalidResponse(format!(
-                    "sandbox {} returned a mismatched Comet runtime profile",
+                    "sandbox {} returned a mismatched Crew runtime profile",
                     self.id
                 )));
             }

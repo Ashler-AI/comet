@@ -863,7 +863,7 @@ async fn disposable_worker<T: Send + 'static>(
 fn list_folders_blocking(target: &Path) -> Result<FolderListing, EngineError> {
     let read = std::fs::read_dir(target).map_err(|e| match e.kind() {
         std::io::ErrorKind::PermissionDenied => {
-            EngineError::Other("Comet doesn't have access to this folder on the device.".into())
+            EngineError::Other("Crew doesn’t have access to this folder on the device.".into())
         }
         _ => EngineError::Other(format!("could not read that folder: {e}")),
     })?;

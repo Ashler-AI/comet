@@ -233,7 +233,7 @@ impl AgentAccounts {
 
     fn remote(&self) -> Result<ScaffoldClient, EngineError> {
         lock(&self.inner.remote).clone().ok_or_else(|| {
-            EngineError::Other("Agent Auth is unavailable. Sign in to Comet and retry.".into())
+            EngineError::Other("Agent Auth is unavailable. Sign in to Crew and retry.".into())
         })
     }
 
