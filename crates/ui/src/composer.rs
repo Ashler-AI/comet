@@ -129,6 +129,12 @@ fn scaffold_agent_binding(
     };
     Some(ScaffoldAgentBinding { route, model_id })
 }
+fn scaffold_send_requires_binding(
+    scaffold_draft: bool,
+    control_source: Option<AgentSessionSource>,
+) -> bool {
+    scaffold_draft || control_source == Some(AgentSessionSource::Scaffold)
+}
 
 fn scaffold_attached_chat_config(binding: &ScaffoldAgentBinding) -> ChatConfig {
     ChatConfig {
@@ -4721,7 +4727,11 @@ impl Composer {
         let requested_scaffold_source_ref = scaffold_demo
             .then(|| scaffold_source_ref(&plan).map(str::to_string))
             .flatten();
-        let scaffold_agent_binding = if scaffold_demo {
+        let scaffold_send_requires_binding = scaffold_send_requires_binding(
+            scaffold_demo,
+            control_route.as_ref().map(|route| route.source),
+        );
+        let scaffold_agent_binding = if scaffold_send_requires_binding {
             let Some(binding) = scaffold_agent_binding(
                 resolved.harness,
                 resolved.model.as_deref(),
@@ -6518,6 +6528,19 @@ mod tests {
             scaffold_run_model(true, Some(&binding), Some("wrong-model")).as_deref(),
             persisted.model.as_deref()
         );
+    }
+    #[test]
+    fn existing_scaffold_send_requires_the_provider_qualified_model_binding() {
+        assert!(scaffold_send_requires_binding(
+            false,
+            Some(AgentSessionSource::Scaffold)
+        ));
+        assert!(scaffold_send_requires_binding(true, None));
+        assert!(!scaffold_send_requires_binding(
+            false,
+            Some(AgentSessionSource::Local)
+        ));
+        assert!(!scaffold_send_requires_binding(false, None));
     }
 
     #[test]

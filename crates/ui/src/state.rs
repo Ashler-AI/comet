@@ -666,7 +666,8 @@ pub(crate) async fn handoff_omp_session(
         .filter(|session_id| !session_id.trim().is_empty())
         .ok_or_else(|| RpcError::Failed("OMP handoff returned no native session id".into()))
 }
-const SCAFFOLD_ATTACH_MAX_ATTEMPTS: usize = 60;
+// Half-second retries match the composer's ten-minute Scaffold readiness budget.
+const SCAFFOLD_ATTACH_MAX_ATTEMPTS: usize = 1_200;
 #[cfg(not(test))]
 const SCAFFOLD_ATTACH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 #[cfg(test)]
@@ -680,6 +681,8 @@ fn is_retryable_scaffold_attach_error(error: &RpcError) -> bool {
                 || message.contains(
                     "scaffold_api_error:409:sandbox_provider_error:Sandbox lifecycle changed while the operation was in flight",
                 )
+                || (message.contains("scaffold_response_invalid: sandbox ")
+                    && message.contains(" is not ready"))
     )
 }
 
@@ -3268,9 +3271,12 @@ mod tests {
     }
 
     #[test]
-    fn scaffold_attach_retries_transient_provider_claim_conflicts() {
+    fn scaffold_attach_retries_transient_provider_and_readiness_failures() {
         assert!(is_retryable_scaffold_attach_error(&RpcError::Failed(
             "scaffold_api_error:502:scaffold_request_rejected".into()
+        )));
+        assert!(is_retryable_scaffold_attach_error(&RpcError::Failed(
+            "scaffold_response_invalid: sandbox rcs_1 is not ready".into()
         )));
         assert!(!is_retryable_scaffold_attach_error(&RpcError::Failed(
             "scaffold_response_invalid: sandbox failed".into()
