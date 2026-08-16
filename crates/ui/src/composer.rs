@@ -4730,6 +4730,13 @@ impl Composer {
         let scaffold_scope = scaffold_draft
             .as_ref()
             .map(|draft| draft.collaboration_scope());
+        let scaffold_database_environment = scaffold_draft
+            .as_ref()
+            .map(|draft| draft.database_environment)
+            .unwrap_or_default();
+        let scaffold_handoff_local_chat_id = scaffold_draft
+            .as_ref()
+            .and_then(|draft| draft.handoff_local_chat_id.clone());
         start_agent_mode |= scaffold_demo;
         let local_device_id = self.state.read(cx).local_device_id.clone();
         let device_id = if is_new {
@@ -4881,6 +4888,7 @@ impl Composer {
                 let mut control_route = control_route;
                 let mut host_device_id = host_device_id;
                 let mut attached_scaffold_source_ref = requested_scaffold_source_ref.clone();
+                let mut scaffold_resume_session_id = None;
                 if let Some(scope) = scaffold_scope {
                     let wait_started = Instant::now();
                     let mut sandbox_id = None;
@@ -4893,6 +4901,7 @@ impl Composer {
                         &engine,
                         &scope,
                         requested_scaffold_source_ref.as_deref(),
+                        scaffold_database_environment,
                         &scaffold_agent_binding
                             .as_ref()
                             .expect("Scaffold route is resolved before launch")
@@ -4971,6 +4980,28 @@ impl Composer {
                                     }
                                 };
                             if ready {
+                                if let Some(local_chat_id) =
+                                    scaffold_handoff_local_chat_id.as_deref()
+                                {
+                                    match crate::state::handoff_omp_session(
+                                        &engine,
+                                        created_id,
+                                        &authoritative_scope,
+                                        local_chat_id,
+                                    )
+                                    .await
+                                    {
+                                        Ok(native_session_id) => {
+                                            scaffold_resume_session_id = Some(native_session_id);
+                                        }
+                                        Err(error) => {
+                                            last_error = Some(format!(
+                                                "could not hand off the OMP session: {error}"
+                                            ));
+                                            break;
+                                        }
+                                    }
+                                }
                                 let Some(actor_device_id) = local_device_id.clone() else {
                                     last_error = Some("Local device unavailable".into());
                                     break;
@@ -5294,7 +5325,7 @@ impl Composer {
                     cwd: cwd.clone(),
                     sandbox: SandboxLevel::WorkspaceWrite,
                     auto_approve: true,
-                    resume: None,
+                    resume: scaffold_resume_session_id.clone(),
                     attachments: image_paths.clone(),
                 };
                 let command = if let Some(route) = control_route {

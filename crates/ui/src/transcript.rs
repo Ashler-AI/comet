@@ -245,6 +245,9 @@ pub enum RowKind {
         tree: Arc<BlockTree>,
         block_ix: usize,
     },
+    Thinking {
+        completed: bool,
+    },
     ToolGroup {
         tools: Arc<Vec<ToolItem>>,
         auto_open: bool,
@@ -496,6 +499,22 @@ pub fn rows_for_entry(
                         push_markdown_rows(
                             &mut rows, entry, &entry_id, part_id, &visible, streaming, parse,
                         );
+                    }
+                    MessagePart::Thinking {
+                        id: part_id,
+                        completed,
+                        ..
+                    } => {
+                        rows.push(Row {
+                            id: format!("{}#{}", entry.id, part_id).into(),
+                            version: u64::from(*completed),
+                            turn_start: false,
+                            kind: RowKind::Thinking {
+                                completed: *completed,
+                            },
+                            entry_id: entry_id.clone(),
+                            timestamp: None,
+                        });
                     }
                     MessagePart::Input {
                         id: part_id,
@@ -2181,6 +2200,16 @@ impl Transcript {
                 }
                 el
             }
+            RowKind::Thinking { completed } => div()
+                .text_size(px(11.0))
+                .line_height(px(16.0))
+                .text_color(
+                    theme
+                        .text_muted
+                        .opacity(if *completed { 0.56 } else { 0.8 }),
+                )
+                .child(if *completed { "Thought" } else { "Thinking…" })
+                .into_any_element(),
             RowKind::ToolGroup { tools, auto_open } => {
                 self.render_tool_group(&row.id, tools, *auto_open, &theme, cx)
             }
@@ -3039,6 +3068,12 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
         if let MessagePart::Input { resolved, .. } = part {
             acc.push(0x10 | *resolved as u8);
         }
+        if let MessagePart::Thinking {
+            started, completed, ..
+        } = part
+        {
+            acc.push(0x20 | (*started as u8) << 1 | *completed as u8);
+        }
     }
     fnv1a(&acc)
 }
@@ -3365,6 +3400,40 @@ mod tests {
     }
 
     const MD: &str = "# Title\n\npara one\n\n```rust\nlet x = 1;\n```";
+
+    #[test]
+    fn thinking_row_tracks_reasoning_lifecycle() {
+        let started = assistant(
+            "m-thinking",
+            MessageStatus::Streaming,
+            vec![MessagePart::Thinking {
+                id: "thinking-0".into(),
+                started: true,
+                completed: false,
+            }],
+        );
+        let mut completed = started.clone();
+        completed.parts[0] = MessagePart::Thinking {
+            id: "thinking-0".into(),
+            started: true,
+            completed: true,
+        };
+
+        let started_rows = rows_for_entry(&started, false, &mut parse);
+        let completed_rows = rows_for_entry(&completed, false, &mut parse);
+        assert!(matches!(
+            started_rows[0].kind,
+            RowKind::Thinking { completed: false }
+        ));
+        assert!(matches!(
+            completed_rows[0].kind,
+            RowKind::Thinking { completed: true }
+        ));
+        assert_ne!(
+            entry_fingerprint(&started, false),
+            entry_fingerprint(&completed, false)
+        );
+    }
 
     #[test]
     fn live_entry_splits_per_block_with_id_continuity() {

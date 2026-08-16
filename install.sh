@@ -1,5 +1,5 @@
 #!/bin/sh
-# Ashler Comet headless installer.
+# Crew headless installer.
 #
 #   export COMET_RELEASES_URL=https://storage.googleapis.com/<private-bucket>/releases
 #   export COMET_RELEASES_AUTHORIZATION="Bearer $(gcloud auth print-access-token)"
@@ -112,7 +112,7 @@ case "${1:-}" in
   *) echo "usage: install.sh [--install-omp]" >&2; exit 2 ;;
 esac
 
-RELEASES="${COMET_RELEASES_URL:?set COMET_RELEASES_URL to the private Ashler Comet GCS HTTPS prefix}"
+RELEASES="${COMET_RELEASES_URL:?set COMET_RELEASES_URL to the private Crew GCS HTTPS prefix}"
 RELEASE_AUTHORIZATION="${COMET_RELEASES_AUTHORIZATION:-}"
 unset COMET_RELEASES_AUTHORIZATION
 
@@ -173,7 +173,7 @@ if [ -x "$dest/comet" ]; then
 else
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
-  echo "downloading Ashler Comet $ver ($plat-$arch)…"
+  echo "downloading Crew $ver ($plat-$arch)…"
   release_fetch -fSL --progress-bar "$RELEASES/$file" -o "$tmp/$file"
   release_fetch -fsSL "$RELEASES/scaffold-SHA256SUMS" -o "$tmp/SHA256SUMS"
   expected="$(awk -v file="$file" '$2 == file || $2 == "*" file { print $1; exit }' "$tmp/SHA256SUMS")"
@@ -200,7 +200,7 @@ if command -v systemctl >/dev/null 2>&1 && [ -n "${XDG_RUNTIME_DIR:-}" ]; then
   mkdir -p "$HOME/.config/systemd/user"
   cat >"$HOME/.config/systemd/user/comet-native.service" <<'UNIT'
 [Unit]
-Description=Ashler Comet headless engine
+Description=Crew headless engine
 After=network-online.target
 StartLimitIntervalSec=60
 StartLimitBurst=5
@@ -273,7 +273,7 @@ case ":$PATH:" in
 esac
 
 echo ""
-echo "Ashler Comet $ver installed$path_hint"
+echo "Crew $ver installed$path_hint"
 echo ""
 case "$service" in
   running)

@@ -444,11 +444,23 @@ pub enum ScaffoldLifecycle {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ScaffoldRuntimeMode {
-    Tilt,
-    Compose,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScaffoldDatabaseEnvironment {
+    #[default]
+    Local,
+    StagingSnapshot,
+    ProductionSnapshot,
+}
+
+impl ScaffoldDatabaseEnvironment {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::StagingSnapshot => "staging_snapshot",
+            Self::ProductionSnapshot => "production_snapshot",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -497,6 +509,8 @@ pub struct SessionEnvironment {
     pub source_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_environment: Option<ScaffoldDatabaseEnvironment>,
     #[serde(flatten, default)]
     pub unknown: UnknownFields,
 }
@@ -525,8 +539,8 @@ pub enum ScaffoldEnvironmentControl {
         source_ref: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         region: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        runtime_mode: Option<ScaffoldRuntimeMode>,
+        #[serde(default)]
+        database_environment: ScaffoldDatabaseEnvironment,
         #[serde(rename = "agentRoute")]
         agent_route: AgentRoute,
     },
@@ -546,15 +560,16 @@ pub enum ScaffoldEnvironmentControl {
         sandbox_id: String,
         scope: CollaborationScope,
     },
-    /// Copy an exact local OMP session into a Scaffold host. This only
-    /// materializes and verifies the native store; the first remote run performs
-    /// ACP `session/load` through its ordinary `RunRequest.resume` path.
+    /// Copy the exact native OMP session backing a local Crew chat into a
+    /// Scaffold host. This only materializes and verifies the native store; the
+    /// first remote run performs ACP `session/load` through its ordinary
+    /// `RunRequest.resume` path.
     HandoffOmpSession {
         #[serde(rename = "sandboxId")]
         sandbox_id: String,
         scope: CollaborationScope,
-        #[serde(rename = "localCandidateId")]
-        local_candidate_id: String,
+        #[serde(rename = "localChatId")]
+        local_chat_id: String,
     },
 }
 
@@ -910,12 +925,12 @@ mod tests {
                 session_id: Some("session-a".into()),
                 unknown: Default::default(),
             },
-            local_candidate_id: "opaque-local-id".into(),
+            local_chat_id: "local-chat-a".into(),
         };
         let value = serde_json::to_value(control).unwrap();
         assert_eq!(value["operation"], "handoffOmpSession");
         assert_eq!(value["sandboxId"], "sandbox-a");
-        assert_eq!(value["localCandidateId"], "opaque-local-id");
+        assert_eq!(value["localChatId"], "local-chat-a");
         assert_eq!(value["scope"]["sessionId"], "session-a");
     }
 

@@ -37,6 +37,13 @@ pub enum MessagePart {
         text: String,
         omitted_prefix_bytes: usize,
     },
+    /// Render-only reasoning lifecycle marker. Private reasoning text is never
+    /// persisted; the booleans capture observable start/completion state.
+    Thinking {
+        id: String,
+        started: bool,
+        completed: bool,
+    },
     #[serde(rename_all = "camelCase")]
     Tool {
         id: String,
@@ -66,6 +73,7 @@ impl MessagePart {
         match self {
             MessagePart::Text { id, .. }
             | MessagePart::TextWindow { id, .. }
+            | MessagePart::Thinking { id, .. }
             | MessagePart::Tool { id, .. }
             | MessagePart::Input { id, .. }
             | MessagePart::Error { id, .. } => id,
@@ -75,6 +83,7 @@ impl MessagePart {
     pub fn byte_len(&self) -> usize {
         match self {
             MessagePart::Text { text, .. } | MessagePart::TextWindow { text, .. } => text.len(),
+            MessagePart::Thinking { .. } => 0,
             MessagePart::Tool { call, .. } => serde_json::to_vec(call).map_or(0, |v| v.len()),
             MessagePart::Input { questions, .. } => {
                 serde_json::to_vec(questions).map_or(0, |v| v.len())
@@ -168,8 +177,41 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 });
             }
         }
+        AgentEvent::ReasoningStarted => {
+            if let Some(MessagePart::Thinking {
+                started, completed, ..
+            }) = out
+                .iter_mut()
+                .rev()
+                .find(|part| matches!(part, MessagePart::Thinking { .. }))
+            {
+                *started = true;
+                *completed = false;
+            } else {
+                out.push(MessagePart::Thinking {
+                    id: format!("thinking-{}", out.len()),
+                    started: true,
+                    completed: false,
+                });
+            }
+        }
         AgentEvent::ReasoningDelta { .. } => {
-            // Reasoning is not rendered as a transcript part (matches comet).
+            // Private reasoning text is deliberately not persisted or rendered.
+        }
+        AgentEvent::ReasoningCompleted => {
+            if let Some(MessagePart::Thinking { completed, .. }) = out
+                .iter_mut()
+                .rev()
+                .find(|part| matches!(part, MessagePart::Thinking { .. }))
+            {
+                *completed = true;
+            } else {
+                out.push(MessagePart::Thinking {
+                    id: format!("thinking-{}", out.len()),
+                    started: true,
+                    completed: true,
+                });
+            }
         }
         AgentEvent::ToolCall { id, call } => {
             let intrinsic_state = intrinsic_call_state(call);
@@ -196,6 +238,9 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     resolved,
                 });
             }
+        }
+        AgentEvent::ToolProgress { .. } => {
+            // Progress stays in the local run journal for the expanded detail view.
         }
         AgentEvent::ToolResult { id, is_error, .. } => {
             for p in out.iter_mut() {
@@ -630,6 +675,28 @@ mod tests {
                 ..
             } if items.len() == 1 && items[0].text == "New goal" && !items[0].done
         ));
+    }
+
+    #[test]
+    fn reasoning_lifecycle_persists_only_public_markers() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(&mut parts, &AgentEvent::ReasoningStarted);
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ReasoningDelta {
+                text: "private chain of thought".into(),
+            },
+        );
+        fold_event_into_parts(&mut parts, &AgentEvent::ReasoningCompleted);
+
+        assert_eq!(
+            parts,
+            vec![MessagePart::Thinking {
+                id: "thinking-0".into(),
+                started: true,
+                completed: true,
+            }]
+        );
     }
 
     #[test]

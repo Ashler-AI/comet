@@ -31,7 +31,7 @@ struct SignInView: View {
                     CrewMark()
                         .frame(width: 72, height: 72)
                     VStack(spacing: 6) {
-                        Text("Comet")
+                        Text("Crew")
                             .font(Theme.sans(28, weight: .semibold))
                             .kerning(-0.5)
                             .foregroundStyle(Theme.text)
@@ -50,7 +50,7 @@ struct SignInView: View {
                                 ProgressView()
                                     .tint(Theme.bg)
                             } else {
-                                Text("Log in to Comet")
+                                Text("Log in to Crew")
                                     .font(Theme.sans(15, weight: .semibold))
                                     .foregroundStyle(Theme.bg)
                             }
@@ -262,7 +262,7 @@ final class AuthSessionCoordinator: NSObject, ASWebAuthenticationPresentationCon
         }
         respond(
             status: "200 OK",
-            body: "Sign-in complete. You can return to Comet.",
+            body: "Sign-in complete. You can return to Crew.",
             connection: connection,
             then: { [weak self] in self?.finish(.success(flow, callback)) }
         )

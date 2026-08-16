@@ -126,6 +126,18 @@ pub fn capture_omp_artifact(candidate_id: &str) -> Result<OmpSessionArtifact, En
     capture_omp_artifact_with_roots(candidate_id, &session_roots())
 }
 
+/// Capture the OMP session backing a deterministic local Crew chat id.
+///
+/// The chat id is derived from the discovered native session; callers cannot
+/// supply a path. Re-discovery therefore keeps the same no-follow boundary as
+/// candidate-based capture while remaining usable after an imported candidate
+/// disappears from the picker.
+pub fn capture_omp_artifact_for_chat(
+    local_chat_id: &str,
+) -> Result<OmpSessionArtifact, EngineError> {
+    capture_omp_artifact_for_chat_with_roots(local_chat_id, &session_roots())
+}
+
 fn capture_omp_artifact_with_roots(
     candidate_id: &str,
     roots: &SessionRoots,
@@ -134,6 +146,24 @@ fn capture_omp_artifact_with_roots(
         .into_iter()
         .find(|session| session.candidate.id == candidate_id)
         .ok_or_else(|| EngineError::Other("local session is no longer available".into()))?;
+    capture_discovered_omp_artifact(&session, roots)
+}
+
+fn capture_omp_artifact_for_chat_with_roots(
+    local_chat_id: &str,
+    roots: &SessionRoots,
+) -> Result<OmpSessionArtifact, EngineError> {
+    let session = discover_with_roots(roots)
+        .into_iter()
+        .find(|session| session.candidate.chat_id == local_chat_id)
+        .ok_or_else(|| EngineError::Other("local OMP chat is no longer available".into()))?;
+    capture_discovered_omp_artifact(&session, roots)
+}
+
+fn capture_discovered_omp_artifact(
+    session: &DiscoveredSession,
+    roots: &SessionRoots,
+) -> Result<OmpSessionArtifact, EngineError> {
     if session.candidate.harness != HarnessId::Omp {
         return Err(EngineError::Other(
             "only OMP native sessions support exact artifact capture".into(),
@@ -2307,6 +2337,9 @@ mod tests {
             artifact.sha256,
             format!("{:x}", Sha256::digest(&artifact.bytes))
         );
+        let by_chat =
+            capture_omp_artifact_for_chat_with_roots(&candidate.candidate.chat_id, &roots).unwrap();
+        assert_eq!(by_chat, artifact);
     }
 
     #[test]

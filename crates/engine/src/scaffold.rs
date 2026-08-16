@@ -16,9 +16,10 @@ use comet_proto::{
     AgentAccountStatus, AgentRoute, AgentRouteReceipt, AgentRoutingMode,
     CAPABILITY_SESSION_ANNOTATE, CAPABILITY_SESSION_CHAT, CAPABILITY_SESSION_CONTROL,
     CAPABILITY_SESSION_ENVIRONMENT, CAPABILITY_SESSION_FILES, CAPABILITY_SESSION_READ,
-    CollaborationScope, OmpSessionArtifact, ScaffoldControlGrant, ScaffoldEnvironmentControl,
-    ScaffoldEnvironmentControlResult, ScaffoldEnvironmentLinks, ScaffoldEnvironmentSnapshot,
-    ScaffoldRuntimeMode, SessionEnvironment, SessionEnvironmentSource, SessionRoomProjection,
+    CollaborationScope, OmpSessionArtifact, ScaffoldControlGrant, ScaffoldDatabaseEnvironment,
+    ScaffoldEnvironmentControl, ScaffoldEnvironmentControlResult, ScaffoldEnvironmentLinks,
+    ScaffoldEnvironmentSnapshot, SessionEnvironment, SessionEnvironmentSource,
+    SessionRoomProjection,
 };
 use comet_rpc::TokenSource;
 use reqwest::{Method, StatusCode, Url};
@@ -576,7 +577,7 @@ impl ScaffoldClient {
             name,
             source_ref,
             region,
-            runtime_mode,
+            database_environment,
         } = options;
         self.validate_scope(scope)?;
         agent_route
@@ -590,7 +591,7 @@ impl ScaffoldClient {
             name,
             source: source_ref.map(|reference| CreateSandboxSource { reference }),
             region,
-            runtime_mode,
+            database_environment,
             agent_route,
             comet_runtime_profile: CreateCometRuntimeProfile {
                 version: "scaffold.comet-runtime.v1",
@@ -1106,6 +1107,8 @@ struct ScaffoldSandbox {
     region: Option<String>,
     selected_region: Option<String>,
     source_ref: Option<String>,
+    #[serde(default)]
+    database_environment: ScaffoldDatabaseEnvironment,
     owner_email: Option<String>,
     created_at: String,
     updated_at: String,
@@ -1203,6 +1206,7 @@ impl ScaffoldSandbox {
             scope,
             source_ref: self.source_ref,
             last_activity_at,
+            database_environment: Some(self.database_environment),
             unknown: Default::default(),
         })
     }
@@ -1219,7 +1223,7 @@ pub(crate) struct CreateSandboxOptions<'a> {
     pub name: Option<&'a str>,
     pub source_ref: Option<&'a str>,
     pub region: Option<&'a str>,
-    pub runtime_mode: Option<ScaffoldRuntimeMode>,
+    pub database_environment: ScaffoldDatabaseEnvironment,
 }
 
 #[derive(Debug, Serialize)]
@@ -1231,8 +1235,7 @@ struct CreateSandboxBody<'a> {
     source: Option<CreateSandboxSource<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     region: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    runtime_mode: Option<ScaffoldRuntimeMode>,
+    database_environment: ScaffoldDatabaseEnvironment,
     agent_route: &'a AgentRoute,
     comet_runtime_profile: CreateCometRuntimeProfile<'a>,
 }
@@ -1703,7 +1706,7 @@ impl ScaffoldRuntime {
                 name,
                 source_ref,
                 region,
-                runtime_mode,
+                database_environment,
                 agent_route,
             } => (
                 self.inner
@@ -1714,7 +1717,7 @@ impl ScaffoldRuntime {
                             name: name.as_deref(),
                             source_ref: source_ref.as_deref(),
                             region: region.as_deref(),
-                            runtime_mode,
+                            database_environment,
                         },
                         &agent_route,
                         cancellation,
@@ -1766,7 +1769,7 @@ impl ScaffoldRuntime {
             ScaffoldEnvironmentControl::HandoffOmpSession {
                 sandbox_id,
                 scope,
-                local_candidate_id,
+                local_chat_id,
             } => {
                 let environment = self
                     .inner
@@ -1781,7 +1784,7 @@ impl ScaffoldRuntime {
                 ) {
                     return Err(ScaffoldError::OmpSessionHandoffFailed);
                 }
-                let artifact = crate::local_sessions::capture_omp_artifact(&local_candidate_id)
+                let artifact = crate::local_sessions::capture_omp_artifact_for_chat(&local_chat_id)
                     .map_err(|_| ScaffoldError::OmpSessionHandoffFailed)?;
                 self.inner
                     .client
@@ -2429,10 +2432,10 @@ mod tests {
             .create(
                 &scope(),
                 CreateSandboxOptions {
-                    name: Some("Comet"),
+                    name: Some("Crew"),
                     source_ref: Some("main"),
                     region: Some("us-central1"),
-                    runtime_mode: Some(ScaffoldRuntimeMode::Tilt),
+                    database_environment: ScaffoldDatabaseEnvironment::StagingSnapshot,
                 },
                 &AgentRoute::automatic(comet_proto::AgentProvider::OpenAi, "gpt-5.6-sol"),
                 &cancellation,
@@ -2484,7 +2487,7 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("authorization: bearer sc_rc_control_secret")
         }));
-        assert!(requests[2].contains(r#""runtimeMode":"tilt""#));
+        assert!(requests[2].contains(r#""databaseEnvironment":"staging_snapshot""#));
         assert!(requests[2].contains(
             r#""agentRoute":{"provider":"openai","model":"gpt-5.6-sol","fallback":"disabled","routingMode":"automatic"}"#
         ));
@@ -2505,7 +2508,7 @@ mod tests {
             name: None,
             source: None,
             region: None,
-            runtime_mode: Some(ScaffoldRuntimeMode::Compose),
+            database_environment: ScaffoldDatabaseEnvironment::Local,
             agent_route: &route,
             comet_runtime_profile: CreateCometRuntimeProfile {
                 version: "scaffold.comet-runtime.v1",

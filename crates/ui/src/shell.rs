@@ -1173,6 +1173,8 @@ pub struct Shell {
     account_usage_loading: bool,
     account_usage_loaded_at: Option<Instant>,
     account_usage_task: Option<Task<()>>,
+    scaffold_create_open: bool,
+    scaffold_database_environment: comet_proto::ScaffoldDatabaseEnvironment,
     /// On-demand native session picker. Discovery starts only when this opens.
     session_import_open: bool,
     /// Candidate chat selected from the picker; success closes the picker once
@@ -1340,9 +1342,7 @@ impl Shell {
         let debug_dialog = std::env::var("COMET_OPEN_DIALOG").ok();
         let debug_gate = match std::env::var("COMET_FORCE_GATE").ok().as_deref() {
             Some("signin") => Some(GatePhase::SignIn),
-            Some("failed") => Some(GatePhase::Failed(
-                "Could not reach the Ashler Comet engine".into(),
-            )),
+            Some("failed") => Some(GatePhase::Failed("Could not reach the Crew engine".into())),
             _ => None,
         };
         let nav = NavHistory::new(match route {
@@ -1390,6 +1390,8 @@ impl Shell {
             activity_open: false,
             invite_open: false,
             workspace_goals_scroll: gpui::ScrollHandle::new(),
+            scaffold_create_open: false,
+            scaffold_database_environment: comet_proto::ScaffoldDatabaseEnvironment::Local,
             account_usage: None,
             account_usage_error: None,
             account_usage_loading: false,
@@ -1902,12 +1904,51 @@ impl Shell {
             ));
     }
 
+    fn scaffold_database_row(
+        &self,
+        environment: comet_proto::ScaffoldDatabaseEnvironment,
+        label: &'static str,
+        detail: &'static str,
+        id: &'static str,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let selected = self.scaffold_database_environment == environment;
+        popover::menu_row(theme, selected, id)
+            .id(id)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.scaffold_database_environment = environment;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_color(theme.text)
+                            .child(SharedString::from(label)),
+                    )
+                    .child(
+                        div()
+                            .mt(px(2.0))
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(detail)),
+                    ),
+            )
+            .when(selected, |row| row.child(popover::menu_check(theme)))
+    }
+
     fn open_session_import(&mut self, cx: &mut Context<Self>) {
         self.session_import_open = true;
         self.session_import_target_chat = None;
         self.activity_open = false;
         self.invite_open = false;
         self.command_palette_open = false;
+        self.scaffold_create_open = false;
         self.session_import_groups_scroll
             .set_offset(Point::default());
         self.sync_session_import_sections(cx);
@@ -1924,6 +1965,8 @@ impl Shell {
             self.activity_open = false;
         } else if self.invite_open {
             self.invite_open = false;
+        } else if self.scaffold_create_open {
+            self.scaffold_create_open = false;
         } else if self.session_import_open {
             self.session_import_open = false;
             self.session_import_target_chat = None;
@@ -4337,9 +4380,12 @@ impl Shell {
                             button
                                 .cursor_pointer()
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.state.update(cx, |state, cx| {
-                                        state.start_scaffold_session(cx);
-                                    });
+                                    this.scaffold_create_open = true;
+                                    this.session_import_open = false;
+                                    this.activity_open = false;
+                                    this.invite_open = false;
+                                    this.command_palette_open = false;
+                                    cx.notify();
                                 }))
                         })
                         .child(
@@ -5946,6 +5992,76 @@ impl Shell {
             overlays.push(popover::menu_at("chat-context-menu", position, menu));
         }
 
+        if self.scaffold_create_open {
+            let card = popover::dialog_card(&theme)
+                .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
+                    if ev.keystroke.key == "escape" {
+                        this.scaffold_create_open = false;
+                        cx.notify();
+                    }
+                }))
+                .child(popover::dialog_title(&theme, "Create Scaffold session"))
+                .child(
+                    div()
+                        .mt(px(10.0))
+                        .child(popover::menu_heading(&theme, "Database"))
+                        .child(self.scaffold_database_row(
+                            comet_proto::ScaffoldDatabaseEnvironment::Local,
+                            "Local",
+                            "Empty local database",
+                            "scaffold-database-local",
+                            &theme,
+                            cx,
+                        ))
+                        .child(self.scaffold_database_row(
+                            comet_proto::ScaffoldDatabaseEnvironment::StagingSnapshot,
+                            "Staging snapshot",
+                            "Managed staging snapshot",
+                            "scaffold-database-staging",
+                            &theme,
+                            cx,
+                        ))
+                        .child(self.scaffold_database_row(
+                            comet_proto::ScaffoldDatabaseEnvironment::ProductionSnapshot,
+                            "Production snapshot",
+                            "Managed production snapshot",
+                            "scaffold-database-production",
+                            &theme,
+                            cx,
+                        )),
+                )
+                .child(
+                    div()
+                        .mt(px(16.0))
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap(px(8.0))
+                        .child(
+                            popover::btn_ghost(&theme, "Cancel", "scaffold-create-cancel")
+                                .id("scaffold-create-cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.scaffold_create_open = false;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            popover::btn_primary(&theme, "Create")
+                                .id("scaffold-create-submit")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let environment = this.scaffold_database_environment;
+                                    this.scaffold_create_open = false;
+                                    this.state.update(cx, |state, cx| {
+                                        state.start_scaffold_session(environment, cx);
+                                    });
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .into_any_element();
+            overlays.push(popover::modal("scaffold-create-dialog", viewport, card));
+        }
+
         if let Some(dialog) = &mut self.rename_dialog {
             if std::mem::take(&mut dialog.focus_pending) {
                 window.focus(&dialog.input.focus_handle(cx), cx);
@@ -7154,7 +7270,7 @@ impl Shell {
                         .child(SharedString::from("Retry")),
                 )
                 .into_any_element(),
-            // Login card: centered on the grid with the Ashler Comet mark and
+            // Login card: centered on the grid with the Crew mark and
             // one full-width sign-in action.
             _ => div()
                 .w(px(360.0))
@@ -7180,7 +7296,7 @@ impl Shell {
                         .text_size(px(18.0))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(theme.text)
-                        .child(SharedString::from("Log in to Ashler Comet")),
+                        .child(SharedString::from("Log in to Crew")),
                 )
                 .child(
                     div()

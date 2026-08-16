@@ -63,5 +63,5 @@ fi
 COPYFILE_DISABLE=1 tar -czf "$APP_TARBALL" -C "$OUT_DIR" Comet.app
 echo "packaged: $APP_TARBALL"
 
-hdiutil create -volname "Ashler Comet" -srcfolder "$APP" -ov -format UDZO "$DMG"
+hdiutil create -volname "Crew" -srcfolder "$APP" -ov -format UDZO "$DMG"
 echo "packaged: $DMG"

@@ -89,6 +89,10 @@ struct DocPartJson {
     resolved: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    started: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completed: Option<bool>,
 }
 
 /// App parts → doc part json (mirror of `toDocParts`).
@@ -105,6 +109,17 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
                 "projected text windows cannot be persisted".into(),
             ));
         }
+        MessagePart::Thinking {
+            id,
+            started,
+            completed,
+        } => DocPartJson {
+            id: id.clone(),
+            kind: "thinking".into(),
+            started: Some(*started),
+            completed: Some(*completed),
+            ..Default::default()
+        },
         MessagePart::Tool {
             id,
             call,
@@ -154,6 +169,11 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
                 id: p.id,
                 text: String::new(),
             },
+        },
+        "thinking" => MessagePart::Thinking {
+            id: p.id,
+            started: p.started.unwrap_or(true),
+            completed: p.completed.unwrap_or(false),
         },
         "input" => MessagePart::Input {
             id: p.id.clone(),

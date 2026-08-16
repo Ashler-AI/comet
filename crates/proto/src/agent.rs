@@ -368,6 +368,8 @@ pub enum AgentEvent {
     TextDelta {
         text: String,
     },
+    ReasoningStarted,
+    ReasoningCompleted,
     ReasoningDelta {
         text: String,
     },
@@ -389,6 +391,14 @@ pub enum AgentEvent {
         /// never folded into doc parts — the transcript fetches it on demand
         /// via `ToolCallDetail`. Serde-defaulted so old journal lines and old
         /// peers stay readable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+    },
+    /// Bounded in-progress tool output. Unlike [`Self::ToolResult`], this does
+    /// not resolve the matching transcript tool chip.
+    #[serde(rename_all = "camelCase")]
+    ToolProgress {
+        id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
     },

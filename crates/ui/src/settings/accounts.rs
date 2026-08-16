@@ -549,7 +549,7 @@ impl AccountsPage {
         cx.notify();
     }
 
-    /// Persist the "update agents after Comet updates" toggle. Optimistic:
+    /// Persist the "update agents after Crew updates" toggle. Optimistic:
     /// the local frame flips now, the next `UpdateStatus` frame confirms (or
     /// corrects, if the engine-side write failed).
     fn set_harness_auto_update(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -1234,7 +1234,7 @@ impl AccountsPage {
             .into_any_element()
     }
 
-    /// The "Update agents after Comet updates" row: title + description left,
+    /// The "Update agents after Crew updates" row: title + description left,
     /// a 36×20 pill toggle right (the advisor settings toggle idiom).
     fn render_auto_update_row(
         &self,
@@ -1260,7 +1260,7 @@ impl AccountsPage {
                             .text_size(px(13.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text)
-                            .child(SharedString::from("Update agents after Comet updates")),
+                            .child(SharedString::from("Update agents after Crew updates")),
                     )
                     .child(
                         div()

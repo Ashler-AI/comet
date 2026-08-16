@@ -1,6 +1,6 @@
-# Ashler Comet
+# Crew
 
-Ashler Comet is Ashler's internal, multi-device controller for Claude Code and Codex sessions. Each device runs a small engine; shared threads merge agent output while each owning device remains responsible for its own session commands.
+Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
 ## Install the Linux daemon
 
@@ -147,7 +147,7 @@ The required local/Scaffold cutover and multi-client acceptance contract is in [
 
 ## Provenance and licensing
 
-Ashler Comet is derived from `zeronsh/comet` at commit `82ce44193a32b5ae5610f8a4542e5e30b992e6a9`. The inherited [MIT LICENSE](LICENSE) is preserved verbatim.
+Crew is derived from `zeronsh/comet` at commit `82ce44193a32b5ae5610f8a4542e5e30b992e6a9`. The inherited [MIT LICENSE](LICENSE) is preserved verbatim.
 
 The native UI depends only on the Apache-2.0 GPUI packages and uses permitted GPUI examples as API references. GPL-licensed Zed application crates, UI code, and editor code are not copied, linked, or redistributed.
 

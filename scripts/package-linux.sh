@@ -49,7 +49,7 @@ install -m 644 "$ROOT/assets/brand/crew-icon.svg" "$STAGE/comet.svg"
 
 cat >"$STAGE/install.sh" <<'INSTALL'
 #!/usr/bin/env bash
-# Install Ashler Comet into ~/.local (no root needed).
+# Install Crew into ~/.local (no root needed).
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 install -Dm755 "$HERE/comet" "$HOME/.local/bin/comet"
@@ -58,7 +58,7 @@ install -Dm644 "$HERE/comet.png" "$HOME/.local/share/icons/hicolor/1024x1024/app
 install -Dm644 "$HERE/comet.svg" "$HOME/.local/share/icons/hicolor/scalable/apps/comet.svg"
 command -v update-desktop-database >/dev/null 2>&1 \
   && update-desktop-database "$HOME/.local/share/applications" || true
-echo "Ashler Comet installed. Make sure ~/.local/bin is on your PATH."
+echo "Crew installed. Make sure ~/.local/bin is on your PATH."
 INSTALL
 chmod 755 "$STAGE/install.sh"
 

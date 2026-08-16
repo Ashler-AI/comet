@@ -623,6 +623,12 @@ impl SessionsEngine {
                     let slot = detail.get_or_insert_with(ToolCallDetail::default);
                     slot.input = comet_proto::view::tool_call_input_text(call);
                 }
+                AgentEvent::ToolProgress { ref id, ref output } if id == tool_id => {
+                    let slot = detail.get_or_insert_with(ToolCallDetail::default);
+                    if output.is_some() {
+                        slot.output = output.clone();
+                    }
+                }
                 AgentEvent::ToolResult {
                     ref id,
                     is_error,
