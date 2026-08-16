@@ -1352,7 +1352,7 @@ struct UploadGrant {
     _command: String,
 }
 
-const VERIFY_HANDOFF_PYTHON: &str = r#"import hashlib, os, pathlib, stat, sys, uuid
+const VERIFY_HANDOFF_PYTHON: &str = r#"import hashlib, json, os, pathlib, stat, sys, uuid
 staging_root = pathlib.Path(sys.argv[1]).resolve(strict=True)
 workspace = pathlib.Path("/workspace/ashler-platform").resolve(strict=True)
 if workspace not in staging_root.parents or staging_root.relative_to(workspace).as_posix() != ".scaffold/omp-handoff-staging":
@@ -1379,6 +1379,25 @@ def exact_file(path, require_mode):
             count += len(block); h.update(block)
     return count == expected_count and h.hexdigest() == expected_sha
 
+def bounded_regular(path, allowed_modes, limit):
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except (FileNotFoundError, OSError):
+        return None
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode) or stat.S_IMODE(st.st_mode) not in allowed_modes or st.st_size <= 0 or st.st_size > limit:
+            return None
+        contents = f.read(limit + 1)
+    return contents if len(contents) == st.st_size else None
+
+def exact_dir(path):
+    try:
+        st = path.lstat()
+    except (FileNotFoundError, OSError):
+        return False
+    return stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode)
+
 def secure_dirs(root, parts):
     current = root
     for part in parts:
@@ -1402,8 +1421,41 @@ try:
         raise SystemExit(22)
     if not exact_file(staged, 0o600):
         raise SystemExit(22)
-    sessions = pathlib.Path("/workspace/.omp/profiles/scaffold-host/agent/sessions")
-    parent = secure_dirs(pathlib.Path("/workspace"), sessions.relative_to("/workspace").parts + rel.parts[:-1])
+
+    runtime_value = os.environ.get("SCAFFOLD_RUNTIME_DIR", "")
+    runtime_input = pathlib.Path(runtime_value)
+    if not runtime_value or not runtime_input.is_absolute():
+        raise SystemExit(28)
+    try:
+        runtime_dir = runtime_input.resolve(strict=True)
+        profile_path = (runtime_dir / "omp-inference/profile.json").resolve(strict=True)
+    except (FileNotFoundError, OSError):
+        raise SystemExit(28)
+    profile_bytes = bounded_regular(profile_path, (0o600, 0o644), 4096)
+    if profile_bytes is None:
+        raise SystemExit(28)
+    try:
+        profile = json.loads(profile_bytes)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raise SystemExit(28)
+    models_value = profile.get("modelsPath") if isinstance(profile, dict) else None
+    if not isinstance(models_value, str) or not models_value or len(models_value) > 4096:
+        raise SystemExit(28)
+    models_input = pathlib.Path(models_value)
+    if not models_input.is_absolute() or models_input.name != "models.yml":
+        raise SystemExit(28)
+    try:
+        models_path = models_input.resolve(strict=True)
+    except (FileNotFoundError, OSError):
+        raise SystemExit(28)
+    if models_path.name != "models.yml" or bounded_regular(models_path, (0o600,), 1024 * 1024) is None:
+        raise SystemExit(28)
+    agent_dir = models_path.parent
+    if tuple(agent_dir.parts[-4:]) != (".omp", "profiles", "scaffold-host", "agent") or not exact_dir(agent_dir):
+        raise SystemExit(28)
+    os.chmod(agent_dir, 0o700, follow_symlinks=False)
+
+    parent = secure_dirs(agent_dir, ("sessions",) + rel.parts[:-1])
     target = parent / rel.name
     try:
         if target.exists() or target.is_symlink():
@@ -2821,7 +2873,10 @@ mod tests {
         let verify = String::from_utf8_lossy(&requests[2]);
         assert!(verify.starts_with("POST /api/code-sandboxes/sandbox-a/exec HTTP/1.1"));
         let verify_body = verify.split_once("\r\n\r\n").unwrap().1;
-        assert!(verify_body.contains("/workspace/.omp/profiles/scaffold-host/agent/sessions"));
+        assert!(verify_body.contains("omp-inference/profile.json"));
+        assert!(verify_body.contains("modelsPath"));
+        assert!(verify_body.contains("secure_dirs(agent_dir"));
+        assert!(!verify_body.contains("/workspace/.omp"));
         assert!(verify_body.contains("/workspace/ashler-platform/.scaffold/omp-handoff-staging"));
         assert!(verify_body.contains("staged.unlink()"));
         assert!(verify_body.contains("by-cwd/native-1.jsonl"));
@@ -2859,9 +2914,32 @@ mod tests {
         let staged = staging.join("native-1.jsonl");
         let bytes = b"native omp bytes\n";
         let sha = format!("{:x}", sha2::Sha256::digest(bytes));
+        let runtime = root.join(".scaffold");
+        let profile_dir = runtime.join("omp-inference");
+        let profile_agent_dir = root.join("runtime-home/.omp/profiles/scaffold-host/agent");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::create_dir_all(&profile_agent_dir).unwrap();
+        std::fs::set_permissions(&profile_agent_dir, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let models_path = profile_agent_dir.join("models.yml");
+        std::fs::write(&models_path, "providers: {}\n").unwrap();
+        std::fs::set_permissions(&models_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let profile_path = profile_dir.join("profile.json");
+        std::fs::write(
+            &profile_path,
+            serde_json::to_vec(&serde_json::json!({
+                "profile": "scaffold-host",
+                "model": "scaffold-openai/gpt-5.6-sol",
+                "modelsPath": models_path,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&profile_path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let script = VERIFY_HANDOFF_PYTHON.replace("/workspace", root.to_str().unwrap());
         let run = |script: &str| {
             Command::new("python3")
+                .env("SCAFFOLD_RUNTIME_DIR", &runtime)
                 .args([
                     "-c",
                     script,
@@ -2885,7 +2963,7 @@ mod tests {
             String::from_utf8_lossy(&first.stderr)
         );
         assert!(!staged.exists(), "staged file must be consumed");
-        let target = root.join(".omp/profiles/scaffold-host/agent/sessions/by-cwd/native-1.jsonl");
+        let target = profile_agent_dir.join("sessions/by-cwd/native-1.jsonl");
         assert_eq!(std::fs::read(&target).unwrap(), bytes);
         assert_eq!(
             std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
