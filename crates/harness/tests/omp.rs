@@ -16,6 +16,14 @@ use tokio::sync::{mpsc, oneshot};
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-omp.sh")
 }
+
+#[cfg(unix)]
+fn process_exists(pid: i32) -> bool {
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
 fn run_config_path(session_log: &str) -> PathBuf {
     let value = session_log
         .lines()
@@ -599,6 +607,18 @@ async fn errored_rpc_run_releases_writer_before_done() {
             AgentEvent::Done { status, .. } => {
                 assert_eq!(status, DoneStatus::Errored);
                 assert!(saw_provider_error);
+                #[cfg(unix)]
+                {
+                    let pid = std::fs::read_to_string(&pid_log)
+                        .expect("fixture recorded the OMP pid")
+                        .trim()
+                        .parse::<i32>()
+                        .expect("recorded OMP pid is numeric");
+                    assert!(
+                        !process_exists(pid),
+                        "errored Done became visible while OMP pid {pid} still owned the session"
+                    );
+                }
                 break;
             }
             _ => {}
