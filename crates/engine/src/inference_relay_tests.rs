@@ -271,6 +271,19 @@ mod tests {
         captured: mpsc::UnboundedSender<FailoverCapture>,
         upstream_responses: Vec<(StatusCode, Value)>,
     ) -> String {
+        failover_control_plane_with_content_type(
+            captured,
+            upstream_responses,
+            "application/json",
+        )
+        .await
+    }
+
+    async fn failover_control_plane_with_content_type(
+        captured: mpsc::UnboundedSender<FailoverCapture>,
+        upstream_responses: Vec<(StatusCode, Value)>,
+        content_type: &'static str,
+    ) -> String {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let upstream_responses = Arc::new(upstream_responses);
@@ -294,6 +307,8 @@ mod tests {
                             let body = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
                             let expires_at =
                                 (Utc::now() + TimeDelta::minutes(5)).to_rfc3339();
+                            let is_inference_response =
+                                path == "/api/agent-auth/v1/responses";
                             let (status, response) = match path.as_str() {
                                 "/api/agent-auth/grants" => (
                                     StatusCode::CREATED,
@@ -391,11 +406,24 @@ mod tests {
                                 }
                                 other => panic!("unexpected failover control-plane path {other}"),
                             };
+                            let is_sse_failure = is_inference_response
+                                && status == StatusCode::TOO_MANY_REQUESTS
+                                && content_type.eq_ignore_ascii_case("text/event-stream");
+                            let response_body = if is_sse_failure {
+                                format!("event: error\ndata: {response}\n\n")
+                            } else {
+                                response.to_string()
+                            };
+                            let response_content_type = if is_sse_failure {
+                                content_type
+                            } else {
+                                "application/json"
+                            };
                             Ok::<_, Infallible>(
                                 Response::builder()
                                     .status(status)
-                                    .header(CONTENT_TYPE, "application/json")
-                                    .body(Full::new(Bytes::from(response.to_string())))
+                                    .header(CONTENT_TYPE, response_content_type)
+                                    .body(Full::new(Bytes::from(response_body)))
                                     .unwrap(),
                             )
                         }
@@ -1113,6 +1141,55 @@ mod tests {
         assert_eq!(later.status(), reqwest::StatusCode::OK);
         let later_capture = captured_rx.recv().await.unwrap();
         assert_eq!(later_capture.authorization, "Bearer remote-account-2");
+    }
+
+    #[tokio::test]
+    async fn replays_usage_limit_reached_type_from_sse_error() {
+        let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
+        let origin = failover_control_plane_with_content_type(
+            captured_tx,
+            vec![(
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({
+                    "error": {
+                        "type": "usage_limit_reached",
+                        "message": "The usage limit has been reached"
+                    }
+                }),
+            )],
+            "text/event-stream",
+        )
+        .await;
+        let client = ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap();
+        let relay = InferenceRelay::start(client).unwrap();
+        let route = relay
+            .prepare(
+                "session-failover",
+                HarnessId::Codex,
+                Some("gpt-5.6-sol"),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let payload = json!({ "model": "gpt-5.6-sol", "input": "rotate accounts" });
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/responses", route.base_url))
+            .bearer_auth(&route.token)
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.json::<Value>().await.unwrap(), json!({ "ok": true }));
+
+        let first = captured_rx.recv().await.unwrap();
+        let report = captured_rx.recv().await.unwrap();
+        let second = captured_rx.recv().await.unwrap();
+        assert_eq!(first.authorization, "Bearer remote-account-1");
+        assert_eq!(report.path, "/api/agent-auth/grants/failure");
+        assert_eq!(report.body["failureClass"], "account_exhausted");
+        assert_eq!(second.authorization, "Bearer remote-account-2");
     }
 
     #[tokio::test]

@@ -874,12 +874,6 @@ async fn retryable_response(
     if upstream.status() != StatusCode::TOO_MANY_REQUESTS
         || upstream
             .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(';').next())
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
-        || upstream
-            .headers()
             .get(CONTENT_LENGTH)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<usize>().ok())
@@ -968,9 +962,21 @@ const ACCOUNT_EXHAUSTION_CODES: [&str; 3] = [
     "subscription_limit_reached",
     "usage_limit_reached",
 ];
-const ACCOUNT_EXHAUSTION_TYPES: [&str; 2] = ["rate_limit_error", "usage_limit_error"];
+const ACCOUNT_EXHAUSTION_TYPES: [&str; 3] = [
+    "rate_limit_error",
+    "usage_limit_error",
+    "usage_limit_reached",
+];
 
 fn confirmed_account_exhaustion(body: &[u8]) -> bool {
+    confirmed_account_exhaustion_payload(body)
+        || body
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| line.strip_prefix(b"data:"))
+            .any(confirmed_account_exhaustion_payload)
+}
+
+fn confirmed_account_exhaustion_payload(body: &[u8]) -> bool {
     let Ok(payload) = serde_json::from_slice::<serde_json::Value>(body) else {
         return false;
     };
