@@ -58,6 +58,10 @@ pub const STICK_THRESHOLD_PX: f32 = 70.0;
 pub const OVERDRAW_PX: f32 = 320.0;
 /// Show the scroll-to-bottom button beyond this distance from the end.
 pub const SCROLL_BUTTON_THRESHOLD_PX: f32 = 320.0;
+/// Transcript range-selection autoscroll cadence and edge band.
+const TRANSCRIPT_DRAG_SCROLL_FRAME_MS: u64 = 16;
+const TRANSCRIPT_DRAG_SCROLL_EDGE_PX: f32 = 32.0;
+const TRANSCRIPT_DRAG_SCROLL_MAX_PX: f32 = 18.0;
 /// Vertical gap opening a new turn (new message entry).
 pub const GAP_TURN: f32 = 14.0;
 /// Vertical gap between blocks within a turn.
@@ -81,6 +85,19 @@ const FOLD_TWEEN_WINDOW: std::time::Duration = std::time::Duration::from_millis(
 pub const ATT_THUMB_W: f32 = 112.0;
 pub const ATT_THUMB_H: f32 = 80.0;
 pub const ATT_STRIP_H: f32 = ATT_THUMB_H + 10.0;
+
+fn transcript_drag_scroll_delta(pointer_y: f32, viewport_top: f32, viewport_bottom: f32) -> f32 {
+    let distance = if pointer_y < viewport_top + TRANSCRIPT_DRAG_SCROLL_EDGE_PX {
+        pointer_y - (viewport_top + TRANSCRIPT_DRAG_SCROLL_EDGE_PX)
+    } else if pointer_y > viewport_bottom - TRANSCRIPT_DRAG_SCROLL_EDGE_PX {
+        pointer_y - (viewport_bottom - TRANSCRIPT_DRAG_SCROLL_EDGE_PX)
+    } else {
+        return 0.0;
+    };
+    distance.signum()
+        * (distance.abs() / TRANSCRIPT_DRAG_SCROLL_EDGE_PX * TRANSCRIPT_DRAG_SCROLL_MAX_PX)
+            .clamp(1.0, TRANSCRIPT_DRAG_SCROLL_MAX_PX)
+}
 
 // ---------------------------------------------------------------------------
 // Stick-to-bottom spring (mugen §1e — same constants as its DEFAULT_SPRING,
@@ -1049,6 +1066,10 @@ pub struct Transcript {
     /// One `on_next_frame` callback in flight at most.
     spring_scheduled: bool,
     scroll_anim: Option<Task<()>>,
+    /// Pointer and generation for edge autoscroll during transcript selection.
+    selection_drag_position: Option<gpui::Point<gpui::Pixels>>,
+    selection_drag_generation: u64,
+    selection_drag_scroll_active: bool,
     /// MessageRail width gate (set by the shell from the container width).
     rail_enabled: bool,
     /// Hovered rail tick (grows + shows the preview card).
@@ -1079,7 +1100,8 @@ impl Transcript {
         // not the list's per-layout hard snap.
         let list = ListState::new(0, ListAlignment::Bottom, px(OVERDRAW_PX));
         let weak = cx.weak_entity();
-        list.set_scroll_handler(move |event: &ListScrollEvent, _window, cx| {
+        list.set_scroll_handler(move |event: &ListScrollEvent, window, cx| {
+            render::selection_scroll_to(window.mouse_position());
             weak.update(cx, |this: &mut Transcript, cx| {
                 this.handle_scroll(event, cx)
             })
@@ -1114,6 +1136,9 @@ impl Transcript {
             spring_kick: false,
             spring_scheduled: false,
             scroll_anim: None,
+            selection_drag_position: None,
+            selection_drag_generation: 0,
+            selection_drag_scroll_active: false,
             rail_enabled: true,
             rail_hover: None,
             hovered_entry: None,
@@ -1222,6 +1247,66 @@ impl Transcript {
             })
             .ok();
         });
+    }
+
+    fn selection_drag_scroll_delta(&self, position: gpui::Point<gpui::Pixels>) -> f32 {
+        let bounds = self.list.viewport_bounds();
+        transcript_drag_scroll_delta(
+            f32::from(position.y),
+            f32::from(bounds.top()),
+            f32::from(bounds.bottom()),
+        )
+    }
+
+    fn start_selection_drag_autoscroll(&mut self, cx: &mut Context<Self>) {
+        self.selection_drag_scroll_active = true;
+        let generation = self.selection_drag_generation;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(TRANSCRIPT_DRAG_SCROLL_FRAME_MS))
+                    .await;
+                let keep_running = this
+                    .update(cx, |transcript, cx| {
+                        transcript.selection_drag_autoscroll_tick(generation, cx)
+                    })
+                    .unwrap_or(false);
+                if !keep_running {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn selection_drag_autoscroll_tick(&mut self, generation: u64, cx: &mut Context<Self>) -> bool {
+        if self.selection_drag_generation != generation {
+            return false;
+        }
+        let Some(position) = self.selection_drag_position else {
+            self.selection_drag_scroll_active = false;
+            return false;
+        };
+        let delta = self.selection_drag_scroll_delta(position);
+        if delta == 0.0 {
+            self.selection_drag_scroll_active = false;
+            return false;
+        }
+        let before = self.list.scroll_px_offset_for_scrollbar().y;
+        self.list.scroll_by(px(delta));
+        if self.list.scroll_px_offset_for_scrollbar().y == before {
+            self.selection_drag_scroll_active = false;
+            return false;
+        }
+        render::selection_scroll_to(position);
+        cx.notify();
+        true
+    }
+
+    fn stop_selection_drag(&mut self) {
+        self.selection_drag_position = None;
+        self.selection_drag_generation = self.selection_drag_generation.wrapping_add(1);
+        self.selection_drag_scroll_active = false;
     }
 
     /// Own-send re-engage: glide to the end, then stay pinned.
@@ -3110,30 +3195,59 @@ impl Render for Transcript {
         let root = div()
             .relative()
             .size_full()
-            .on_mouse_down(MouseButton::Left, |event, window, _| {
-                if render::selection_mouse_down(event.position, event.click_count) {
-                    window.refresh();
-                }
-            })
-            .on_mouse_move(|event, window, _| {
-                if event.dragging() && render::selection_mouse_move(event.position) {
-                    window.refresh();
-                }
-            })
-            .on_mouse_up(MouseButton::Left, |event, window, _cx| {
-                if let Some(_text) = render::selection_mouse_up(event.position) {
-                    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-                    _cx.write_to_primary(ClipboardItem::new_string(_text));
-                    window.refresh();
-                }
-            })
-            .on_mouse_up_out(MouseButton::Left, |event, window, _cx| {
-                if let Some(_text) = render::selection_mouse_up(event.position) {
-                    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-                    _cx.write_to_primary(ClipboardItem::new_string(_text));
-                    window.refresh();
-                }
-            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseDownEvent, window, _| {
+                    this.stop_selection_drag();
+                    if render::selection_mouse_down(
+                        event.position,
+                        event.click_count,
+                        event.modifiers.shift,
+                    ) {
+                        if crate::markdown::selection::drag_anchor().is_some() {
+                            this.selection_drag_position = Some(event.position);
+                        }
+                        window.refresh();
+                    }
+                }),
+            )
+            .on_mouse_move(
+                cx.listener(|this, event: &gpui::MouseMoveEvent, window, cx| {
+                    if event.dragging() {
+                        this.selection_drag_position = Some(event.position);
+                        if render::selection_mouse_move(event.position) {
+                            window.refresh();
+                        }
+                        if this.selection_drag_scroll_delta(event.position) != 0.0
+                            && !this.selection_drag_scroll_active
+                        {
+                            this.start_selection_drag_autoscroll(cx);
+                        }
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseUpEvent, window, _cx| {
+                    this.stop_selection_drag();
+                    if let Some(_text) = render::selection_mouse_up(event.position) {
+                        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                        _cx.write_to_primary(ClipboardItem::new_string(_text));
+                        window.refresh();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseUpEvent, window, _cx| {
+                    this.stop_selection_drag();
+                    if let Some(_text) = render::selection_mouse_up(event.position) {
+                        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                        _cx.write_to_primary(ClipboardItem::new_string(_text));
+                        window.refresh();
+                    }
+                }),
+            )
             .min_h_0()
             // FIRST child ⇒ paints first: clears the frame's markdown text-
             // selection registry before any row's text elements re-register
@@ -3144,6 +3258,7 @@ impl Render for Transcript {
                     .size_full()
                     .with_sizing_behavior(gpui::ListSizingBehavior::Auto),
             )
+            .child(crate::markdown::render::selection_frame_finalize())
             .child(rail);
         // Full-size viewer for a clicked user-bubble thumbnail
         // (AttachmentPreviewDialog: bare lightbox, click closes).
@@ -3355,6 +3470,23 @@ mod tests {
         assert!(!Transcript::should_restick(200.0, 300.0));
         // No movement — leave the pin alone.
         assert!(!Transcript::should_restick(50.0, 50.0));
+    }
+
+    #[test]
+    fn selection_drag_autoscroll_uses_edge_band_and_caps_speed() {
+        let top = 100.0;
+        let bottom = 500.0;
+        assert_eq!(transcript_drag_scroll_delta(300.0, top, bottom), 0.0);
+        assert!(transcript_drag_scroll_delta(110.0, top, bottom) < 0.0);
+        assert!(transcript_drag_scroll_delta(490.0, top, bottom) > 0.0);
+        assert_eq!(
+            transcript_drag_scroll_delta(-100.0, top, bottom),
+            -TRANSCRIPT_DRAG_SCROLL_MAX_PX
+        );
+        assert_eq!(
+            transcript_drag_scroll_delta(700.0, top, bottom),
+            TRANSCRIPT_DRAG_SCROLL_MAX_PX
+        );
     }
 
     fn parse(_: &str, text: &str) -> Arc<BlockTree> {

@@ -50,7 +50,6 @@ pub struct DraftConfig {
     pub harness: Option<HarnessId>,
     pub model: Option<String>,
     pub reasoning: Option<ReasoningLevel>,
-    pub agent_account_id: Option<String>,
     /// option id → choice id (only non-defaults are meaningful).
     pub model_options: serde_json::Map<String, serde_json::Value>,
     /// The picked ref (base branch in NewWorktree mode; a worktree's branch
@@ -106,7 +105,6 @@ pub struct ResolvedRunConfig {
     pub harness: Option<HarnessId>,
     pub model: Option<String>,
     pub reasoning: Option<ReasoningLevel>,
-    pub agent_account_id: Option<String>,
     pub model_options: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -117,7 +115,7 @@ impl ResolvedRunConfig {
             harness: self.harness?,
             model: self.model.clone(),
             reasoning: self.reasoning,
-            agent_account_id: self.agent_account_id.clone(),
+            agent_account_id: None,
             model_options: self.model_options.clone(),
             sandbox: SandboxLevel::WorkspaceWrite,
         })
@@ -163,61 +161,6 @@ pub fn clamp_reasoning(
     }
 }
 
-/// Shared-account provider for a selected coding-agent model.
-pub fn account_harness_for_model(
-    harness: Option<HarnessId>,
-    model_id: Option<&str>,
-) -> Option<HarnessId> {
-    let harness = harness?;
-    if !matches!(
-        harness,
-        HarnessId::ClaudeCode | HarnessId::Codex | HarnessId::Omp | HarnessId::PrimeAgent
-    ) {
-        return None;
-    }
-    let model = model_id?.trim().to_ascii_lowercase();
-    if model.is_empty() || model == "default" {
-        return match harness {
-            HarnessId::ClaudeCode => Some(HarnessId::ClaudeCode),
-            HarnessId::Codex => Some(HarnessId::Codex),
-            _ => None,
-        };
-    }
-    match harness {
-        HarnessId::ClaudeCode if !model.contains('/') => Some(HarnessId::ClaudeCode),
-        HarnessId::Codex if !model.contains('/') => Some(HarnessId::Codex),
-        _ if model.starts_with("anthropic/") => Some(HarnessId::ClaudeCode),
-        _ if model.starts_with("openai/") || model.starts_with("openai-codex/") => {
-            Some(HarnessId::Codex)
-        }
-        _ => None,
-    }
-}
-
-/// Preserve an explicit pin until Agent Auth validates it. Models without an
-/// Agent Auth provider ignore the pin.
-pub fn resolve_agent_account_id(
-    candidate: Option<&str>,
-    account_harness: Option<HarnessId>,
-) -> Option<String> {
-    account_harness?;
-    let candidate = candidate?.trim();
-    (!candidate.is_empty()).then(|| candidate.to_string())
-}
-
-pub fn selected_agent_account_candidate(
-    persisted: Option<&ChatConfig>,
-    draft: &DraftConfig,
-    draft_applies: bool,
-) -> Option<String> {
-    persisted
-        .and_then(|config| config.agent_account_id.clone())
-        .or_else(|| {
-            draft_applies
-                .then(|| draft.agent_account_id.clone())
-                .flatten()
-        })
-}
 /// Provider views exposed by OMP's provider-qualified catalog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OmpModelProvider {
@@ -567,7 +510,6 @@ impl Pickers {
                     this.config.harness = None;
                     this.config.model = None;
                     this.config.reasoning = None;
-                    this.config.agent_account_id = None;
                     this.config.model_options.clear();
                 }
                 this.switch_error = None;
@@ -576,7 +518,6 @@ impl Pickers {
                 this.config.harness = Some(HarnessId::Omp);
                 this.config.model = None;
                 this.config.reasoning = None;
-                this.config.agent_account_id = None;
                 this.config.model_options.clear();
             }
             // A space switch invalidates the branch draft + cache — the folder
@@ -839,25 +780,6 @@ impl Pickers {
         serde_json::Map::new()
     }
 
-    fn effective_agent_account_id(&self, cx: &App) -> Option<String> {
-        let draft_applies = self.draft_config_applies(cx);
-        let state = self.state.read(cx);
-        let candidate = selected_agent_account_candidate(
-            state
-                .selected_chat_row()
-                .and_then(|chat| chat.config.as_ref()),
-            &self.config,
-            draft_applies,
-        );
-        let account_harness = account_harness_for_model(
-            self.effective_harness(cx),
-            self.selected_model(cx)
-                .map(|model| model.id.as_str())
-                .or_else(|| self.effective_model_id(cx)),
-        );
-        resolve_agent_account_id(candidate.as_deref(), account_harness)
-    }
-
     /// The fully-resolved config the composer threads into the Run request and
     /// `Mutate createChat`: concrete model + reasoning whenever the catalog is
     /// loaded (no "engine picks a default" passthrough).
@@ -870,7 +792,6 @@ impl Pickers {
                 // Catalog not loaded (offline): still send the id we know.
                 .or_else(|| self.effective_model_id(cx).map(str::to_string)),
             reasoning: self.effective_reasoning(cx),
-            agent_account_id: self.effective_agent_account_id(cx),
             model_options: self.explicit_options(cx),
         }
     }
@@ -1441,7 +1362,6 @@ impl Pickers {
             // defaults fallback; a foreign pick must not linger.
             self.config.model = None;
             self.config.reasoning = None;
-            self.config.agent_account_id = None;
             self.config.model_options.clear();
         }
         self.config.harness = Some(harness);
@@ -1484,7 +1404,6 @@ impl Pickers {
         } else {
             // New chat: draft pick + sticky last-used memory for this harness.
             self.config.model = Some(model_id.clone());
-            self.config.agent_account_id = None;
             if let Some(harness) = self.effective_harness(cx) {
                 let label = self
                     .models
@@ -1584,10 +1503,8 @@ impl Pickers {
                 config.reasoning = clamp_reasoning(config.reasoning, &ladder);
             }
         }
-        config.agent_account_id = resolve_agent_account_id(
-            config.agent_account_id.as_deref(),
-            account_harness_for_model(Some(config.harness), config.model.as_deref()),
-        );
+        // Account choice is intentionally delegated to automatic routing.
+        config.agent_account_id = None;
         self.state.update(cx, |state, cx| {
             state.apply_chat_config(&chat_id, config.clone());
             cx.notify();
@@ -3396,95 +3313,16 @@ mod tests {
     }
 
     #[test]
-    fn account_routing_follows_the_selected_provider() {
-        assert_eq!(
-            account_harness_for_model(Some(HarnessId::Omp), Some("anthropic/claude-opus-5")),
-            Some(HarnessId::ClaudeCode)
-        );
-        assert_eq!(
-            account_harness_for_model(Some(HarnessId::PrimeAgent), Some("openai/gpt-5.6-sol")),
-            Some(HarnessId::Codex)
-        );
-        assert_eq!(
-            account_harness_for_model(
-                Some(HarnessId::PrimeAgent),
-                Some("prime-inference/x-ai/grok-4.20")
-            ),
-            None
-        );
-        assert_eq!(
-            account_harness_for_model(
-                Some(HarnessId::Omp),
-                Some("prime-inference/moonshotai/kimi-k3")
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn unresolved_agent_account_pin_never_becomes_automatic() {
-        for (candidate, harness) in [
-            ("claude-connected", Some(HarnessId::ClaudeCode)),
-            ("claude-connected", Some(HarnessId::Codex)),
-            ("codex-local", Some(HarnessId::Codex)),
-            ("missing", Some(HarnessId::ClaudeCode)),
-        ] {
-            assert_eq!(
-                resolve_agent_account_id(Some(candidate), harness).as_deref(),
-                Some(candidate)
-            );
-        }
-        assert_eq!(
-            resolve_agent_account_id(
-                Some("unused-pin"),
-                account_harness_for_model(
-                    Some(HarnessId::PrimeAgent),
-                    Some("prime-inference/x-ai/grok-4.20")
-                ),
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn persisted_account_wins_and_draft_only_applies_to_first_send() {
-        let draft = DraftConfig {
-            agent_account_id: Some("draft-account".into()),
-            ..DraftConfig::default()
-        };
-        let persisted = ChatConfig {
-            harness: HarnessId::ClaudeCode,
-            model: Some("claude-opus-5".into()),
-            reasoning: None,
-            agent_account_id: Some("persisted-account".into()),
-            model_options: Default::default(),
-            sandbox: SandboxLevel::WorkspaceWrite,
-        };
-        assert_eq!(
-            selected_agent_account_candidate(Some(&persisted), &draft, true).as_deref(),
-            Some("persisted-account")
-        );
-        assert_eq!(
-            selected_agent_account_candidate(None, &draft, true).as_deref(),
-            Some("draft-account")
-        );
-        assert_eq!(selected_agent_account_candidate(None, &draft, false), None);
-    }
-    #[test]
-    fn resolved_chat_config_requires_harness() {
+    fn resolved_chat_config_requires_harness_and_uses_automatic_routing() {
         let mut resolved = ResolvedRunConfig::default();
         assert!(resolved.chat_config().is_none());
         resolved.harness = Some(HarnessId::ClaudeCode);
         resolved.model = Some("opus".into());
         resolved.reasoning = Some(ReasoningLevel::High);
-        resolved.agent_account_id = Some("opaque-account-id".into());
         let config = resolved.chat_config().expect("harness set");
         assert_eq!(config.harness, HarnessId::ClaudeCode);
         assert_eq!(config.model.as_deref(), Some("opus"));
-        assert_eq!(
-            config.agent_account_id.as_deref(),
-            Some("opaque-account-id")
-        );
+        assert_eq!(config.agent_account_id, None);
         assert_eq!(config.sandbox, SandboxLevel::WorkspaceWrite);
     }
 

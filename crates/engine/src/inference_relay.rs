@@ -9,6 +9,8 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::error::Error;
@@ -77,9 +79,19 @@ struct Inner {
 
 struct Route {
     request: AgentInferenceGrantRequest,
+    /// Original local chat id when Agent Auth needs a UUID projection.
+    local_session_id: Option<String>,
     owner_subject: String,
     grant: AsyncMutex<GrantState>,
     cancellation: comet_harness::CancellationToken,
+}
+
+impl Route {
+    fn session_id(&self) -> &str {
+        self.local_session_id
+            .as_deref()
+            .unwrap_or(&self.request.logical_session_id)
+    }
 }
 
 struct GrantState {
@@ -95,10 +107,19 @@ struct RouteState {
 
 struct RetiredRoute {
     logical_session_id: String,
+    local_session_id: Option<String>,
     owner_subject: String,
     provider: String,
     lifecycle_epoch: u64,
     retired_at: Instant,
+}
+
+impl RetiredRoute {
+    fn session_id(&self) -> &str {
+        self.local_session_id
+            .as_deref()
+            .unwrap_or(&self.logical_session_id)
+    }
 }
 
 impl RouteState {
@@ -109,7 +130,7 @@ impl RouteState {
 
     fn take_retired_token(
         &mut self,
-        logical_session_id: &str,
+        session_id: &str,
         owner_subject: &str,
         provider: &str,
     ) -> Option<String> {
@@ -117,7 +138,7 @@ impl RouteState {
             .retired
             .iter()
             .filter(|(_, route)| {
-                route.logical_session_id == logical_session_id
+                route.session_id() == session_id
                     && route.owner_subject == owner_subject
                     && route.provider == provider
             })
@@ -254,6 +275,24 @@ fn inference_binding(
         .unwrap_or(selected.as_str());
     (!provider_model.is_empty()).then(|| (provider, provider_model.to_string()))
 }
+/// Agent Auth keys routes by UUID. Imported local transcripts intentionally use
+/// `local-chat-*` ids so they never dial an Edge session room; project only that
+/// local namespace to a stable RFC 9562 v8 UUID at the control-plane boundary.
+fn agent_auth_logical_session_id(session_id: &str) -> Cow<'_, str> {
+    if !session_id.starts_with("local-chat-") {
+        return Cow::Borrowed(session_id);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"comet-agent-auth-session\0");
+    hasher.update(session_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Cow::Owned(uuid::Uuid::from_bytes(bytes).to_string())
+}
 
 fn inference_grant_request(
     logical_session_id: &str,
@@ -329,7 +368,7 @@ impl InferenceRelay {
 
     pub(crate) async fn prepare(
         &self,
-        logical_session_id: &str,
+        session_id: &str,
         harness: HarnessId,
         model: Option<&str>,
         requested_account_id: Option<&str>,
@@ -339,8 +378,11 @@ impl InferenceRelay {
             .next_lifecycle_epoch
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
+        let agent_auth_session_id = agent_auth_logical_session_id(session_id);
+        let local_session_id =
+            matches!(&agent_auth_session_id, Cow::Owned(_)).then(|| session_id.to_string());
         let Some(request) = inference_grant_request(
-            logical_session_id,
+            agent_auth_session_id.as_ref(),
             harness,
             model,
             requested_account_id,
@@ -364,6 +406,7 @@ impl InferenceRelay {
         let owner_subject = grant.binding.owner_subject.clone();
         let route = Arc::new(Route {
             request,
+            local_session_id,
             owner_subject: owner_subject.clone(),
             cancellation: comet_harness::CancellationToken::new(),
             grant: AsyncMutex::new(GrantState { grant, expires_at }),
@@ -372,7 +415,7 @@ impl InferenceRelay {
             let mut state = lock(&self.inner.route_state);
             state.prune_retired();
             let token = state
-                .take_retired_token(logical_session_id, &owner_subject, &provider)
+                .take_retired_token(session_id, &owner_subject, &provider)
                 .unwrap_or_else(|| {
                     format!("{}{}", new_id().replace('-', ""), new_id().replace('-', ""))
                 });
@@ -387,11 +430,12 @@ impl InferenceRelay {
         }))
     }
 
-    pub(crate) async fn rebind(&self, logical_session_id: &str) -> Result<(), EngineError> {
+    pub(crate) async fn rebind(&self, session_id: &str) -> Result<(), EngineError> {
+        let agent_auth_session_id = agent_auth_logical_session_id(session_id);
         self.inner
             .client
             .rebind_agent_inference_route(
-                logical_session_id,
+                agent_auth_session_id.as_ref(),
                 &comet_harness::CancellationToken::new(),
             )
             .await
@@ -417,6 +461,7 @@ impl InferenceRelay {
                         token,
                         RetiredRoute {
                             logical_session_id: route.request.logical_session_id.clone(),
+                            local_session_id: route.local_session_id.clone(),
                             owner_subject: route.owner_subject.clone(),
                             provider: route.request.provider.clone(),
                             lifecycle_epoch: route.request.lifecycle_epoch,
@@ -497,7 +542,7 @@ impl InferenceRelay {
                 token.as_deref().and_then(|token| {
                     state.retired.get(token).map(|route| {
                         (
-                            route.logical_session_id.clone(),
+                            route.session_id().to_string(),
                             route.owner_subject.clone(),
                             route.provider.clone(),
                             route.lifecycle_epoch,
@@ -508,14 +553,12 @@ impl InferenceRelay {
                 None
             };
             let retired_route =
-                if let Some((logical_session_id, owner_subject, provider, lifecycle_epoch)) =
-                    retired
-                {
+                if let Some((session_id, owner_subject, provider, lifecycle_epoch)) = retired {
                     let replacement = state
                         .active
                         .values()
                         .find(|candidate| {
-                            candidate.request.logical_session_id == logical_session_id
+                            candidate.session_id() == session_id
                                 && candidate.owner_subject == owner_subject
                                 && candidate.request.provider == provider
                         })
@@ -528,10 +571,11 @@ impl InferenceRelay {
                         route = Some(replacement);
                         None
                     } else {
-                        let restart_required = !state.active.values().any(|candidate| {
-                            candidate.request.logical_session_id == logical_session_id
-                        });
-                        Some((logical_session_id, lifecycle_epoch, restart_required))
+                        let restart_required = !state
+                            .active
+                            .values()
+                            .any(|candidate| candidate.session_id() == session_id);
+                        Some((session_id, lifecycle_epoch, restart_required))
                     }
                 } else {
                     None
@@ -823,12 +867,6 @@ async fn retryable_response(
     if upstream.status() != StatusCode::TOO_MANY_REQUESTS
         || upstream
             .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(';').next())
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
-        || upstream
-            .headers()
             .get(CONTENT_LENGTH)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<usize>().ok())
@@ -917,9 +955,21 @@ const ACCOUNT_EXHAUSTION_CODES: [&str; 3] = [
     "subscription_limit_reached",
     "usage_limit_reached",
 ];
-const ACCOUNT_EXHAUSTION_TYPES: [&str; 2] = ["rate_limit_error", "usage_limit_error"];
+const ACCOUNT_EXHAUSTION_TYPES: [&str; 3] = [
+    "rate_limit_error",
+    "usage_limit_error",
+    "usage_limit_reached",
+];
 
 fn confirmed_account_exhaustion(body: &[u8]) -> bool {
+    confirmed_account_exhaustion_payload(body)
+        || body
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| line.strip_prefix(b"data:"))
+            .any(confirmed_account_exhaustion_payload)
+}
+
+fn confirmed_account_exhaustion_payload(body: &[u8]) -> bool {
     let Ok(payload) = serde_json::from_slice::<serde_json::Value>(body) else {
         return false;
     };

@@ -1364,6 +1364,8 @@ struct RegEntry {
 
 thread_local! {
     static REGISTRY: RefCell<Vec<RegEntry>> = const { RefCell::new(Vec::new()) };
+    static PENDING_SELECTION_HEAD: RefCell<Option<gpui::Point<gpui::Pixels>>> =
+        const { RefCell::new(None) };
 }
 
 /// A zero-size canvas that clears the selection registry — paint it FIRST in
@@ -1373,6 +1375,24 @@ pub fn selection_frame_reset() -> impl IntoElement {
     canvas(
         |_, _, _| (),
         |_, _, _, _| REGISTRY.with(|r| r.borrow_mut().clear()),
+    )
+    .absolute()
+    .w(px(0.0))
+    .h(px(0.0))
+}
+
+/// A zero-size canvas painted after the transcript list. Wheel scrolling can
+/// move content under a stationary drag pointer without emitting MouseMove;
+/// this resolves that pending head only after the new visible rows registered.
+pub fn selection_frame_finalize() -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        |_, _, window, _| {
+            let position = PENDING_SELECTION_HEAD.with(|head| head.borrow_mut().take());
+            if position.is_some_and(selection_mouse_move) {
+                window.refresh();
+            }
+        },
     )
     .absolute()
     .w(px(0.0))
@@ -1410,28 +1430,37 @@ fn registry_point(position: gpui::Point<gpui::Pixels>) -> Option<(usize, usize)>
     })
 }
 
-/// Resolve the anchor + head into document-ordered spans over the frame's
-/// registry and store them; true if the selection changed.
-fn resolve_drag(anchor_key: &str, anchor_ix: usize, head: (usize, usize)) -> bool {
+/// Resolve the active anchor + head over the frame's visible registry. The
+/// selection state bridges overlapping virtualized slices when the anchor is
+/// no longer painted.
+fn resolve_drag(head: (usize, usize)) -> bool {
     REGISTRY.with(|r| {
         let reg = r.borrow();
-        let Some(anchor_ei) = reg.iter().position(|e| e.key.as_ref() == anchor_key) else {
-            return false; // anchor scrolled out of the frame — keep spans
-        };
         let elements: Vec<(&str, &str)> = reg
             .iter()
-            .map(|e| (e.key.as_ref(), e.text.as_ref()))
+            .map(|entry| (entry.key.as_ref(), entry.text.as_ref()))
             .collect();
-        let spans = super::selection::resolve_spans(&elements, (anchor_ei, anchor_ix), head);
-        super::selection::update_spans(spans)
+        super::selection::extend_to(&elements, head)
     })
 }
 
-/// Start or clear transcript selection from a root-level pointer down.
+/// Start, extend, or clear transcript selection from a root-level pointer down.
 pub(crate) fn selection_mouse_down(
     position: gpui::Point<gpui::Pixels>,
     click_count: usize,
+    shift: bool,
 ) -> bool {
+    PENDING_SELECTION_HEAD.with(|head| head.borrow_mut().take());
+    // Native Shift-click extends to the cursor's nearest text position, not
+    // only when the pointer lands directly inside a glyph layout. Row padding,
+    // list gutters, and block gaps must therefore keep the existing anchor.
+    if shift && super::selection::resume_drag() {
+        if let Some(head) = registry_point(position) {
+            let _ = resolve_drag(head);
+        }
+        return true;
+    }
+
     let hit = REGISTRY.with(|registry| {
         registry.borrow().iter().find_map(|entry| {
             entry.layout.bounds().contains(&position).then(|| {
@@ -1461,22 +1490,32 @@ pub(crate) fn selection_mouse_down(
 
 /// Extend the active transcript selection to the nearest painted text point.
 pub(crate) fn selection_mouse_move(position: gpui::Point<gpui::Pixels>) -> bool {
-    let Some((anchor_key, anchor_ix)) = super::selection::drag_anchor() else {
+    if super::selection::drag_anchor().is_none() {
         return false;
-    };
+    }
     let Some(head) = registry_point(position) else {
         return false;
     };
-    resolve_drag(&anchor_key, anchor_ix, head)
+    resolve_drag(head)
 }
 
 /// Settle the active transcript selection.
 pub(crate) fn selection_mouse_up(position: gpui::Point<gpui::Pixels>) -> Option<String> {
+    PENDING_SELECTION_HEAD.with(|head| head.borrow_mut().take());
     let (anchor_key, _) = super::selection::drag_anchor()?;
     super::selection::end_drag(
         &anchor_key,
         Some((f32::from(position.x), f32::from(position.y))),
     )
+}
+
+/// Re-resolve a stationary drag after a wheel/touch scroll paints a new slice.
+pub(crate) fn selection_scroll_to(position: gpui::Point<gpui::Pixels>) -> bool {
+    if super::selection::drag_anchor().is_none() {
+        return false;
+    }
+    PENDING_SELECTION_HEAD.with(|head| *head.borrow_mut() = Some(position));
+    true
 }
 
 /// The wash boxes for one byte range: one box per visual line the range
@@ -1720,12 +1759,20 @@ fn render_code_block(
                             *off = start + line.len() + 1; // +1 for the '\n'
                             let local = slice_spans(&veil_spans, start, start + line.len());
                             let runs = apply_veil(runs.clone(), &local);
+                            let styled = StyledText::new(line.clone()).with_runs(runs);
+                            let selection_key: SharedString =
+                                format!("{}:code{ix}.{li}", opts.row_key).into();
                             Some(
                                 div()
                                     .debug_selector(move || format!("CODE_SCROLL_LINE_{li}"))
                                     .h(px(CODE_LINE_HEIGHT))
                                     .flex_none()
-                                    .child(StyledText::new(line.clone()).with_runs(runs)),
+                                    .child(selectable_styled_text(
+                                        selection_key,
+                                        line.clone(),
+                                        styled,
+                                        theme,
+                                    )),
                             )
                         })),
                 ),
@@ -2248,5 +2295,80 @@ mod tests {
             line_before.origin.x,
             line_after.origin.x,
         );
+    }
+
+    #[gpui::test]
+    fn shift_click_extends_to_nearest_text_through_row_padding(cx: &mut gpui::TestAppContext) {
+        struct SelectionProbe;
+        impl gpui::Render for SelectionProbe {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                let theme = Theme::dark();
+                let first = StyledText::new("alpha");
+                let second = StyledText::new("second");
+                div()
+                    .w(px(300.0))
+                    .on_mouse_down(gpui::MouseButton::Left, |event, window, _| {
+                        if selection_mouse_down(
+                            event.position,
+                            event.click_count,
+                            event.modifiers.shift,
+                        ) {
+                            window.refresh();
+                        }
+                    })
+                    .on_mouse_up(gpui::MouseButton::Left, |event, window, _| {
+                        let _ = selection_mouse_up(event.position);
+                        window.refresh();
+                    })
+                    .child(selection_frame_reset())
+                    .child(div().h(px(30.0)).child(selectable_styled_text(
+                        "first".into(),
+                        "alpha".into(),
+                        first,
+                        &theme,
+                    )))
+                    .child(
+                        div()
+                            .debug_selector(|| "SHIFT_TARGET_ROW".into())
+                            .w(px(260.0))
+                            .h(px(30.0))
+                            .child(selectable_styled_text(
+                                "second".into(),
+                                "second".into(),
+                                second,
+                                &theme,
+                            )),
+                    )
+                    .child(selection_frame_finalize())
+            }
+        }
+
+        super::super::selection::clear();
+        cx.update(|cx| Theme::install(crate::theme::Appearance::Dark, cx));
+        let window = cx.open_window(gpui::size(px(340.0), px(100.0)), |_, _| SelectionProbe);
+        cx.run_until_parked();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        super::super::selection::begin_with_span("first", "alpha", 0..5);
+        assert!(super::super::selection::end_drag("first", None).is_some());
+
+        let target = visual
+            .debug_bounds("SHIFT_TARGET_ROW")
+            .expect("target row rendered");
+        visual.simulate_click(
+            gpui::point(target.right() - px(4.0), target.center().y),
+            gpui::Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            super::super::selection::selected_text().as_deref(),
+            Some("alpha\nsecond")
+        );
+        super::super::selection::clear();
     }
 }

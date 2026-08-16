@@ -299,6 +299,35 @@ mod tests {
         origin
     }
 
+    async fn rebind_control_plane(captured: mpsc::UnboundedSender<Value>) -> String {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let captured = captured.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |request: Request<Incoming>| {
+                        let captured = captured.clone();
+                        async move {
+                            assert_eq!(request.uri().path(), "/api/agent-auth/grants/rebind");
+                            let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                            captured
+                                .send(serde_json::from_slice(&bytes).unwrap())
+                                .unwrap();
+                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"{}"))))
+                        }
+                    });
+                    hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+        origin
+    }
+
 
     #[derive(Debug)]
     struct FailoverCapture {
@@ -313,6 +342,19 @@ mod tests {
     async fn failover_control_plane(
         captured: mpsc::UnboundedSender<FailoverCapture>,
         upstream_responses: Vec<(StatusCode, Value)>,
+    ) -> String {
+        failover_control_plane_with_content_type(
+            captured,
+            upstream_responses,
+            "application/json",
+        )
+        .await
+    }
+
+    async fn failover_control_plane_with_content_type(
+        captured: mpsc::UnboundedSender<FailoverCapture>,
+        upstream_responses: Vec<(StatusCode, Value)>,
+        content_type: &'static str,
     ) -> String {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -337,6 +379,8 @@ mod tests {
                             let body = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
                             let expires_at =
                                 (Utc::now() + TimeDelta::minutes(5)).to_rfc3339();
+                            let is_inference_response =
+                                path == "/api/agent-auth/v1/responses";
                             let (status, response) = match path.as_str() {
                                 "/api/agent-auth/grants" => (
                                     StatusCode::CREATED,
@@ -434,11 +478,24 @@ mod tests {
                                 }
                                 other => panic!("unexpected failover control-plane path {other}"),
                             };
+                            let is_sse_failure = is_inference_response
+                                && status == StatusCode::TOO_MANY_REQUESTS
+                                && content_type.eq_ignore_ascii_case("text/event-stream");
+                            let response_body = if is_sse_failure {
+                                format!("event: error\ndata: {response}\n\n")
+                            } else {
+                                response.to_string()
+                            };
+                            let response_content_type = if is_sse_failure {
+                                content_type
+                            } else {
+                                "application/json"
+                            };
                             Ok::<_, Infallible>(
                                 Response::builder()
                                     .status(status)
-                                    .header(CONTENT_TYPE, "application/json")
-                                    .body(Full::new(Bytes::from(response.to_string())))
+                                    .header(CONTENT_TYPE, response_content_type)
+                                    .body(Full::new(Bytes::from(response_body)))
                                     .unwrap(),
                             )
                         }
@@ -793,6 +850,77 @@ mod tests {
     }
 
 
+    #[test]
+    fn projects_only_local_import_ids_to_stable_agent_auth_uuids() {
+        let local_id = "local-chat-b5b85d0f52a29e39da7656ab";
+        let projected = agent_auth_logical_session_id(local_id).into_owned();
+        let parsed = uuid::Uuid::parse_str(&projected).unwrap();
+
+        assert_eq!(projected, agent_auth_logical_session_id(local_id));
+        assert_eq!(parsed.as_bytes()[6] >> 4, 8);
+        assert_eq!(parsed.as_bytes()[8] & 0xc0, 0x80);
+        assert_eq!(agent_auth_logical_session_id("session-1"), "session-1");
+    }
+
+    #[tokio::test]
+    async fn projects_local_import_id_for_rebind_and_restores_it_on_expiration() {
+        let local_id = "local-chat-b5b85d0f52a29e39da7656ab";
+        let projected = agent_auth_logical_session_id(local_id).into_owned();
+        let (rebind_tx, mut rebind_rx) = mpsc::unbounded_channel();
+        let rebind_origin = rebind_control_plane(rebind_tx).await;
+        let rebind_client =
+            ScaffoldClient::new(rebind_origin, "project-1", Arc::new(StaticToken)).unwrap();
+        InferenceRelay::start(rebind_client)
+            .unwrap()
+            .rebind(local_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            rebind_rx.recv().await.unwrap(),
+            json!({ "logicalSessionId": projected })
+        );
+
+        let (captured_tx, _captured_rx) = mpsc::unbounded_channel();
+        let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let origin = test_control_plane(captured_tx, revoked.clone()).await;
+        let client = ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap();
+        let relay = InferenceRelay::start(client).unwrap();
+        let route = relay
+            .prepare(
+                local_id,
+                HarnessId::Omp,
+                Some("openai-codex/gpt-5.6-sol"),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        {
+            let state = lock(&relay.inner.route_state);
+            let active = state.active.get(&route.token).unwrap();
+            assert_eq!(active.request.logical_session_id, projected);
+            assert_eq!(active.session_id(), local_id);
+        }
+
+        let mut expired_routes = relay.subscribe_expired_routes();
+        relay.remove(&route.token).await;
+        assert!(revoked.load(std::sync::atomic::Ordering::SeqCst));
+        let removed = reqwest::Client::new()
+            .get(format!("{}/v1/models", route.base_url))
+            .bearer_auth(&route.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(removed.status(), reqwest::StatusCode::GONE);
+        assert_eq!(
+            expired_routes.recv().await.unwrap(),
+            ExpiredRoute {
+                logical_session_id: local_id.into(),
+                lifecycle_epoch: 1,
+            }
+        );
+    }
+
     #[tokio::test]
     async fn rebinds_retired_local_credential_to_the_next_route_for_the_same_session() {
         let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
@@ -924,6 +1052,7 @@ mod tests {
                 "persistent-worker-token".into(),
                 RetiredRoute {
                     logical_session_id: "persistent-session".into(),
+                    local_session_id: None,
                     owner_subject: "owner-1".into(),
                     provider: "anthropic".into(),
                     lifecycle_epoch: 1,
@@ -1121,6 +1250,55 @@ mod tests {
         assert_eq!(later.status(), reqwest::StatusCode::OK);
         let later_capture = captured_rx.recv().await.unwrap();
         assert_eq!(later_capture.authorization, "Bearer remote-account-2");
+    }
+
+    #[tokio::test]
+    async fn replays_usage_limit_reached_type_from_sse_error() {
+        let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
+        let origin = failover_control_plane_with_content_type(
+            captured_tx,
+            vec![(
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({
+                    "error": {
+                        "type": "usage_limit_reached",
+                        "message": "The usage limit has been reached"
+                    }
+                }),
+            )],
+            "text/event-stream",
+        )
+        .await;
+        let client = ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap();
+        let relay = InferenceRelay::start(client).unwrap();
+        let route = relay
+            .prepare(
+                "session-failover",
+                HarnessId::Codex,
+                Some("gpt-5.6-sol"),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let payload = json!({ "model": "gpt-5.6-sol", "input": "rotate accounts" });
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/responses", route.base_url))
+            .bearer_auth(&route.token)
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.json::<Value>().await.unwrap(), json!({ "ok": true }));
+
+        let first = captured_rx.recv().await.unwrap();
+        let report = captured_rx.recv().await.unwrap();
+        let second = captured_rx.recv().await.unwrap();
+        assert_eq!(first.authorization, "Bearer remote-account-1");
+        assert_eq!(report.path, "/api/agent-auth/grants/failure");
+        assert_eq!(report.body["failureClass"], "account_exhausted");
+        assert_eq!(second.authorization, "Bearer remote-account-2");
     }
 
     #[tokio::test]

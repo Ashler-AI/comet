@@ -1025,6 +1025,11 @@ pub(crate) async fn run_rpc(
                             let _ = child.kill().await;
                             return Ok(());
                         }
+                        // A terminal error closes the persistent RPC run. Reap its
+                        // session writer before Done makes queued recovery dispatchable.
+                        if status == DoneStatus::Errored {
+                            let _ = child.kill().await;
+                        }
                         done_emitted = true;
                         if events
                             .send(Ok(AgentEvent::Done {
@@ -1039,10 +1044,7 @@ pub(crate) async fn run_rpc(
                             let _ = child.kill().await;
                             return Ok(());
                         }
-                        // An errored turn ends the run: the engine surfaces the
-                        // failure instead of parking a broken session.
                         if status == DoneStatus::Errored {
-                            let _ = child.kill().await;
                             return Ok(());
                         }
                     }

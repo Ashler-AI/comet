@@ -58,9 +58,22 @@ const AUTH_BROKER_URL_ENV: &str = "OMP_AUTH_BROKER_URL";
 const AUTH_BROKER_TOKEN_ENV: &str = "OMP_AUTH_BROKER_TOKEN";
 const AUTH_BROKER_TOKEN_FILE_ENV: &str = "OMP_AUTH_BROKER_TOKEN_FILE";
 const PI_CONFIG_FILES_ENV: &str = "PI_CONFIG_FILES";
+const LOCAL_RUNTIME_ENV: &str = "COMET_LOCAL_AGENT_RUNTIME";
 const SCAFFOLD_INFERENCE_PROFILE_FILE: &str = "omp-inference/profile.json";
 const SCAFFOLD_INFERENCE_PROFILE_BYTES: u64 = 4 * 1024;
-const OMP_RUN_CONFIG: &[u8] = b"retry:\n  enabled: true\n  maxRetries: 1\n  baseDelayMs: 1000\n  provider:\n    maxRetries: 0\n";
+// Agent Auth accepts at most 8 MiB per inference request. OMP's 3840x2400
+// Computer default can retain multi-megabyte PNGs in Responses history, so use
+// its documented coordinate-safe capture cap for every Comet-owned OMP run.
+const OMP_RUN_CONFIG: &[u8] = br#"retry:
+  enabled: true
+  maxRetries: 1
+  baseDelayMs: 1000
+  provider:
+    maxRetries: 0
+computer:
+  maxWidth: 1280
+  maxHeight: 896
+"#;
 
 #[derive(Debug)]
 pub(crate) struct OmpRunConfig {
@@ -784,6 +797,16 @@ impl OmpHarness {
         include_auth_broker_token: bool,
     ) -> Command {
         let mut command = self.base_command(executable, cwd, include_auth_broker_token);
+        // OMP sets CI on tool children independently of its launch environment.
+        // Repository-owned wrappers use this local-only marker to recover local
+        // command semantics; Scaffold explicitly omits it and stays CI.
+        if self.scaffold_host {
+            command.env("CI", "true");
+            command.env_remove(LOCAL_RUNTIME_ENV);
+        } else {
+            command.env("CI", "false");
+            command.env(LOCAL_RUNTIME_ENV, "1");
+        }
         command.args(["--mode", "rpc", "--approval-mode", "yolo"]);
         if self.scaffold_host {
             command.args([
@@ -2098,6 +2121,15 @@ fn normalize_update(params: &Value, harness: HarnessId) -> Option<AgentEvent> {
 mod tests {
     use super::*;
 
+    fn configured_env(command: &Command, key: &str) -> Option<String> {
+        command
+            .as_std()
+            .get_envs()
+            .find(|(name, _)| name.to_string_lossy() == key)
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned())
+    }
+
     #[test]
     fn resumed_acp_runs_use_distinct_assistant_message_ids() {
         let session_id = "same-durable-session";
@@ -2128,7 +2160,7 @@ mod tests {
     }
 
     #[test]
-    fn run_config_bounds_layered_retries_and_removes_file() {
+    fn run_config_bounds_retries_and_computer_screenshots() {
         let path;
         {
             let config = OmpRunConfig::create().unwrap();
@@ -2136,6 +2168,29 @@ mod tests {
             assert_eq!(std::fs::read(&path).unwrap(), OMP_RUN_CONFIG);
         }
         assert!(!path.exists(), "temporary OMP overlay must be removed");
+    }
+
+    #[test]
+    fn local_commands_are_marked_while_scaffold_commands_stay_ci() {
+        let local =
+            OmpHarness::new().rpc_mode_command(Path::new("/usr/local/bin/omp"), "/workspace", true);
+        let scaffold = OmpHarness::scaffold_host().rpc_mode_command(
+            Path::new("/usr/local/bin/omp"),
+            "/workspace",
+            true,
+        );
+
+        assert_eq!(configured_env(&local, "CI").as_deref(), Some("false"));
+        assert_eq!(
+            configured_env(&local, LOCAL_RUNTIME_ENV).as_deref(),
+            Some("1")
+        );
+        assert_eq!(configured_env(&scaffold, "CI").as_deref(), Some("true"));
+        assert_eq!(
+            configured_env(&scaffold, LOCAL_RUNTIME_ENV),
+            None,
+            "Scaffold must not mark commands as local"
+        );
     }
 
     #[test]

@@ -57,7 +57,10 @@ if [ "$NO_SESSION" != "1" ]; then
     [ "$(sed -n '4p' "$CONFIG_PATH")" != "  baseDelayMs: 1000" ] ||
     [ "$(sed -n '5p' "$CONFIG_PATH")" != "  provider:" ] ||
     [ "$(sed -n '6p' "$CONFIG_PATH")" != "    maxRetries: 0" ] ||
-    [ "$(sed -n '7p' "$CONFIG_PATH")" != "" ]; then
+    [ "$(sed -n '7p' "$CONFIG_PATH")" != "computer:" ] ||
+    [ "$(sed -n '8p' "$CONFIG_PATH")" != "  maxWidth: 1280" ] ||
+    [ "$(sed -n '9p' "$CONFIG_PATH")" != "  maxHeight: 896" ] ||
+    [ "$(sed -n '10p' "$CONFIG_PATH")" != "" ]; then
     exit 92
   fi
 fi
@@ -70,7 +73,11 @@ else
 fi
 
 finish_turn() {
-  printf '%s\n' '{"type":"message_end","message":{"role":"assistant","stopReason":"stop","usage":{"input":6,"output":4,"cacheRead":100,"cacheWrite":0,"totalTokens":110}}}'
+  if [ -n "${OMP_TURN_ERROR:-}" ]; then
+    printf '%s\n' '{"type":"message_end","message":{"role":"assistant","stopReason":"error","errorMessage":"No API key for provider: comet-anthropic","usage":{"input":6,"output":4,"cacheRead":100,"cacheWrite":0,"totalTokens":110}}}'
+  else
+    printf '%s\n' '{"type":"message_end","message":{"role":"assistant","stopReason":"stop","usage":{"input":6,"output":4,"cacheRead":100,"cacheWrite":0,"totalTokens":110}}}'
+  fi
   printf '%s\n' '{"type":"agent_end","isTerminal":true,"messages":[]}'
 }
 
