@@ -700,9 +700,9 @@ impl ScaffoldClient {
         self.upload_granted_archive(&grant, archive, cancellation)
             .await?;
 
-        // Do not start OMP ACP here: that would create a second writer. The
-        // ordinary first remote RunRequest uses the returned native id and
-        // reaches ACP session/load in the harness adapter.
+        // Do not start OMP here: that would create a second writer. The
+        // ordinary first remote RunRequest resumes the returned native id after
+        // the verified transcript has been materialized in the active profile.
         let verify_argv = vec![
             "python3".to_string(),
             "-c".to_string(),
@@ -711,6 +711,8 @@ impl ScaffoldClient {
             artifact.storage_relative_path.clone(),
             artifact.sha256.clone(),
             artifact.byte_count.to_string(),
+            artifact.native_session_id.clone(),
+            artifact.cwd.clone(),
         ];
         let verified = self
             .exec(
@@ -1352,7 +1354,7 @@ struct UploadGrant {
     _command: String,
 }
 
-const VERIFY_HANDOFF_PYTHON: &str = r#"import hashlib, json, os, pathlib, stat, sys, uuid
+const VERIFY_HANDOFF_PYTHON: &str = r#"import hashlib, json, os, pathlib, shutil, stat, sys, tempfile, uuid
 staging_root = pathlib.Path(sys.argv[1]).resolve(strict=True)
 workspace = pathlib.Path("/workspace/ashler-platform").resolve(strict=True)
 if workspace not in staging_root.parents or staging_root.relative_to(workspace).as_posix() != ".scaffold/omp-handoff-staging":
@@ -1361,23 +1363,31 @@ rel = pathlib.PurePosixPath(sys.argv[2])
 if rel.is_absolute() or not rel.parts or any(p in ("", ".", "..") for p in rel.parts):
     raise SystemExit(21)
 staged = staging_root.joinpath(*rel.parts)
-expected_sha, expected_count = sys.argv[3], int(sys.argv[4])
+expected_digest = (sys.argv[3], int(sys.argv[4]))
+expected_native_id, expected_local_cwd = sys.argv[5], sys.argv[6]
+if not expected_native_id or len(expected_native_id) > 128 or any(ord(c) < 32 for c in expected_native_id):
+    raise SystemExit(29)
+if not expected_local_cwd or len(expected_local_cwd) > 4096 or any(ord(c) < 32 for c in expected_local_cwd):
+    raise SystemExit(29)
 
-def exact_file(path, require_mode):
+def file_digest(path, require_mode):
     try:
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except (FileNotFoundError, OSError):
-        return False
+        return None
     with os.fdopen(fd, "rb") as f:
         st = os.fstat(f.fileno())
         if not stat.S_ISREG(st.st_mode) or stat.S_IMODE(st.st_mode) != require_mode:
-            return False
+            return None
         h, count = hashlib.sha256(), 0
         while True:
             block = f.read(1024 * 1024)
             if not block: break
             count += len(block); h.update(block)
-    return count == expected_count and h.hexdigest() == expected_sha
+    return h.hexdigest(), count
+
+def exact_file(path, require_mode, digest):
+    return file_digest(path, require_mode) == digest
 
 def bounded_regular(path, allowed_modes, limit):
     try:
@@ -1397,6 +1407,59 @@ def exact_dir(path):
     except (FileNotFoundError, OSError):
         return False
     return stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode)
+
+def write_rebased_session(source, out):
+    scanned = 0
+    while scanned <= 65536:
+        line = source.readline(65537)
+        if not line:
+            break
+        scanned += len(line)
+        if scanned > 65536:
+            raise SystemExit(29)
+        body = line[:-1] if line.endswith(b"\n") else line
+        try:
+            record = json.loads(body)
+        except (UnicodeDecodeError, ValueError):
+            out.write(line)
+            continue
+        if not isinstance(record, dict) or record.get("type") != "session":
+            out.write(line)
+            continue
+        if record.get("id") != expected_native_id or record.get("cwd") != expected_local_cwd:
+            raise SystemExit(29)
+        record["cwd"] = str(workspace)
+        encoded = json.dumps(record, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+        out.write(encoded + (b"\n" if line.endswith(b"\n") else b""))
+        shutil.copyfileobj(source, out, length=1024 * 1024)
+        return
+    raise SystemExit(29)
+
+def relative_under(root, path):
+    if path == root:
+        return ""
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return None
+
+def encode_relative_session_dir(prefix, relative):
+    encoded = relative.replace("/", "-").replace("\\", "-").replace(":", "-")
+    if not encoded:
+        return prefix
+    return prefix + encoded if prefix.endswith("-") else prefix + "-" + encoded
+
+def omp_session_dir_name(cwd):
+    home_relative = relative_under(pathlib.Path.home().resolve(strict=True), cwd)
+    if home_relative is not None:
+        return encode_relative_session_dir("-", home_relative)
+    temp_relative = relative_under(pathlib.Path(tempfile.gettempdir()).resolve(strict=True), cwd)
+    if temp_relative is not None:
+        return encode_relative_session_dir("-tmp", temp_relative)
+    absolute = str(cwd)
+    if absolute.startswith(("/", "\\")):
+        absolute = absolute[1:]
+    return "--" + absolute.replace("/", "-").replace("\\", "-").replace(":", "-") + "--"
 
 def secure_dirs(root, parts):
     current = root
@@ -1419,7 +1482,7 @@ try:
         raise SystemExit(22)
     if staging_root not in staged_resolved.parents or staged_resolved != staged:
         raise SystemExit(22)
-    if not exact_file(staged, 0o600):
+    if not exact_file(staged, 0o600, expected_digest):
         raise SystemExit(22)
 
     runtime_value = os.environ.get("SCAFFOLD_RUNTIME_DIR", "")
@@ -1455,37 +1518,32 @@ try:
         raise SystemExit(28)
     os.chmod(agent_dir, 0o700, follow_symlinks=False)
 
-    parent = secure_dirs(agent_dir, ("sessions",) + rel.parts[:-1])
+    parent = secure_dirs(agent_dir, ("sessions", omp_session_dir_name(workspace)))
     target = parent / rel.name
+    temporary = parent / (".comet-handoff-" + uuid.uuid4().hex)
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
+        with os.fdopen(fd, "wb") as out, staged.open("rb") as source:
+            write_rebased_session(source, out)
+            out.flush(); os.fsync(out.fileno())
+        os.chmod(temporary, 0o600, follow_symlinks=False)
+        transformed_digest = file_digest(temporary, 0o600)
+        if transformed_digest is None:
+            raise SystemExit(27)
         if target.exists() or target.is_symlink():
-            if target.is_symlink() or not exact_file(target, 0o600):
+            if target.is_symlink() or not exact_file(target, 0o600, transformed_digest):
                 raise SystemExit(26)
         else:
-            temporary = parent / (".comet-handoff-" + uuid.uuid4().hex)
-            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
             try:
-                with os.fdopen(fd, "wb") as out, staged.open("rb") as source:
-                    while True:
-                        block = source.read(1024 * 1024)
-                        if not block: break
-                        out.write(block)
-                    out.flush(); os.fsync(out.fileno())
-                os.chmod(temporary, 0o600, follow_symlinks=False)
-                try:
-                    os.link(temporary, target, follow_symlinks=False)
-                    temporary.unlink()
-                except FileExistsError:
-                    if target.is_symlink() or not exact_file(target, 0o600):
-                        raise SystemExit(26)
-                    temporary.unlink()
-            finally:
-                try: temporary.unlink()
-                except FileNotFoundError: pass
-        if not exact_file(target, 0o600):
+                os.link(temporary, target, follow_symlinks=False)
+            except FileExistsError:
+                if target.is_symlink() or not exact_file(target, 0o600, transformed_digest):
+                    raise SystemExit(26)
+        if not exact_file(target, 0o600, transformed_digest):
             raise SystemExit(27)
     finally:
-        pass
+        try: temporary.unlink()
+        except FileNotFoundError: pass
     print("verified")
 finally:
     try: staged.unlink()
@@ -2766,7 +2824,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn omp_handoff_uses_one_use_raw_tar_and_verifies_without_starting_acp() {
+    async fn omp_handoff_uses_one_use_raw_tar_and_verifies_without_starting_omp() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let upload_url = format!("{origin}/one-use-upload");
@@ -2876,6 +2934,7 @@ mod tests {
         assert!(verify_body.contains("omp-inference/profile.json"));
         assert!(verify_body.contains("modelsPath"));
         assert!(verify_body.contains("secure_dirs(agent_dir"));
+        assert!(verify_body.contains("omp_session_dir_name(workspace)"));
         assert!(!verify_body.contains("/workspace/.omp"));
         assert!(verify_body.contains("/workspace/ashler-platform/.scaffold/omp-handoff-staging"));
         assert!(verify_body.contains("staged.unlink()"));
@@ -2912,7 +2971,7 @@ mod tests {
         let staging = workspace.join(".scaffold/omp-handoff-staging/by-cwd");
         std::fs::create_dir_all(&staging).unwrap();
         let staged = staging.join("native-1.jsonl");
-        let bytes = b"native omp bytes\n";
+        let bytes = b"{\"type\":\"session\",\"version\":3,\"id\":\"native-1\",\"timestamp\":\"2026-08-16T00:00:00.000Z\",\"cwd\":\"/repo\"}\n{\"type\":\"message\",\"id\":\"message-1\"}\n";
         let sha = format!("{:x}", sha2::Sha256::digest(bytes));
         let runtime = root.join(".scaffold");
         let profile_dir = runtime.join("omp-inference");
@@ -2950,6 +3009,8 @@ mod tests {
                     "by-cwd/native-1.jsonl",
                     &sha,
                     &bytes.len().to_string(),
+                    "native-1",
+                    "/repo",
                 ])
                 .output()
                 .unwrap()
@@ -2963,8 +3024,33 @@ mod tests {
             String::from_utf8_lossy(&first.stderr)
         );
         assert!(!staged.exists(), "staged file must be consumed");
-        let target = profile_agent_dir.join("sessions/by-cwd/native-1.jsonl");
-        assert_eq!(std::fs::read(&target).unwrap(), bytes);
+        let sessions = profile_agent_dir.join("sessions");
+        let target = std::fs::read_dir(&sessions)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("native-1.jsonl"))
+            .find(|path| path.is_file())
+            .expect("materializer must use OMP's cwd-scoped session directory");
+        assert!(
+            target
+                .parent()
+                .and_then(std::path::Path::file_name)
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|name| name.starts_with("-tmp"))
+        );
+        let transformed = std::fs::read(&target).unwrap();
+        let mut transformed_lines = transformed.split(|byte| *byte == b'\n');
+        let header: serde_json::Value =
+            serde_json::from_slice(transformed_lines.next().unwrap()).unwrap();
+        assert_eq!(header["id"], "native-1");
+        assert_eq!(
+            header["cwd"],
+            workspace.canonicalize().unwrap().to_str().unwrap()
+        );
+        assert_eq!(
+            transformed_lines.next().unwrap(),
+            b"{\"type\":\"message\",\"id\":\"message-1\"}"
+        );
         assert_eq!(
             std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
             0o600
@@ -2982,7 +3068,7 @@ mod tests {
         std::fs::write(&staged, bytes).unwrap();
         std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(run(&script).status.success());
-        assert_eq!(std::fs::read(&target).unwrap(), bytes);
+        assert_eq!(std::fs::read(&target).unwrap(), transformed);
 
         // An existing mismatched destination fails closed and still cleans staging.
         std::fs::write(&target, b"different").unwrap();

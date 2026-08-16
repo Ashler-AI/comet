@@ -562,10 +562,10 @@ pub enum ScaffoldEnvironmentControl {
         sandbox_id: String,
         scope: CollaborationScope,
     },
-    /// Copy an exact native OMP session into a Scaffold host. The local
+    /// Transfer an authenticated native OMP session into a Scaffold host. The
     /// controller resolves the durable native id/cwd pair to a discovered file;
-    /// callers cannot provide a path. The first remote run then performs ACP
-    /// `session/load` through its ordinary `RunRequest.resume` path.
+    /// callers cannot provide a path. Scaffold rebinds the header to its remote
+    /// workspace before the first ordinary `RunRequest.resume`.
     HandoffOmpSession {
         #[serde(rename = "sandboxId")]
         sandbox_id: String,

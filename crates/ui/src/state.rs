@@ -621,8 +621,8 @@ pub(crate) async fn attach_scaffold_session(
     })
 }
 
-/// Materialize an exact native OMP session in an already ready Scaffold host
-/// and return its resume id for the first remote run.
+/// Materialize an authenticated OMP session in an already ready Scaffold host,
+/// rebind it to the remote workspace, and return its id for the first run.
 pub(crate) async fn handoff_omp_session(
     handle: &EngineHandle,
     sandbox_id: &str,
