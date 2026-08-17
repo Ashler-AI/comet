@@ -315,6 +315,16 @@ async fn target_device_id_routes_over_the_relay() {
         message_id: "m-a-1".into(),
     })
     .expect("serialize command");
+    core_a
+        .workspace
+        .claim_chat("chat-remote", Some("/tmp"))
+        .expect("claim chat on A");
+    assert!(
+        core_a
+            .workspace
+            .set_chat_archived("chat-remote", true)
+            .expect("archive chat on A")
+    );
     let queued = client
         .call(
             methods::QUEUE_COMMAND,
@@ -326,6 +336,16 @@ async fn target_device_id_routes_over_the_relay() {
         )
         .await
         .expect("queue in shared local document");
+    assert_eq!(
+        core_a
+            .workspace
+            .doc()
+            .chat("chat-remote")
+            .expect("read chat on A")
+            .map(|chat| chat.archived),
+        Some(false),
+        "new local input must reactivate an archived chat before remote execution"
+    );
     let command_id = queued["commandId"]
         .as_str()
         .expect("command id")

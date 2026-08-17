@@ -4751,8 +4751,8 @@ impl Shell {
             return;
         };
         match comet_update::apply_mac_app(&staged, &bundle) {
-            Ok(()) => {
-                comet_update::relaunch_app_after_exit(&bundle);
+            Ok(installed) => {
+                comet_update::relaunch_app_after_exit(&installed);
                 cx.quit();
             }
             Err(err) => {
@@ -7182,11 +7182,27 @@ impl Shell {
                 )
                 .into_any_element();
         }
-        let indicator = state.indicator_for(&chat_id, now);
+        let local_indicator = state.indicator_for(&chat_id, now);
+        let indicator = if local_indicator == Indicator::None {
+            state.selected_agent_indicator(now)
+        } else {
+            local_indicator
+        };
         let elapsed_secs = state
             .session_for(&chat_id)
             .and_then(|s| s.started_at)
             .map(|t| now.signed_duration_since(t).num_seconds())
+            .or_else(|| {
+                state
+                    .selected_agent_session()
+                    .filter(|session| session.chat_id == chat_id)
+                    .map(|session| {
+                        now.timestamp_millis()
+                            .saturating_sub(session.created_at)
+                            .max(0)
+                            / 1_000
+                    })
+            })
             .unwrap_or(0);
         let sending = self.composer.read(cx).is_sending();
 

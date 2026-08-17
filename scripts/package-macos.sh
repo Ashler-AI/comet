@@ -2,7 +2,7 @@
 # macOS packaging: build the release binary for the host arch and produce
 #   target/package/comet-<version>-macos-<arch>.dmg          (user download)
 #   target/package/comet-<version>-macos-<arch>-app.tar.gz   (auto-updater)
-# containing Comet.app (unsigned unless CODESIGN_IDENTITY is set).
+# containing Crew.app (unsigned unless CODESIGN_IDENTITY is set).
 #
 # Usage: scripts/package-macos.sh
 # Env:   CODESIGN_IDENTITY="Developer ID Application: …" to sign the bundle.
@@ -27,14 +27,15 @@ if [[ "$ARCH" != "arm64" ]]; then
   exit 1
 fi
 OUT_DIR="$ROOT/target/package"
-APP="$OUT_DIR/Comet.app"
+APP="$OUT_DIR/Crew.app"
+LEGACY_APP="$OUT_DIR/Comet.app"
 DMG="$OUT_DIR/comet-$VERSION-macos-$ARCH.dmg"
 APP_TARBALL="$OUT_DIR/comet-$VERSION-macos-$ARCH-app.tar.gz"
 
 cd "$ROOT"
 cargo build --release -p comet
 
-rm -rf "$APP" "$DMG" "$APP_TARBALL"
+rm -rf "$APP" "$LEGACY_APP" "$DMG" "$APP_TARBALL"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 install -m 755 "$ROOT/target/release/comet" "$APP/Contents/MacOS/comet"
 sed "s/__VERSION__/$VERSION/" "$ROOT/dist/macos/Info.plist" >"$APP/Contents/Info.plist"
@@ -60,7 +61,7 @@ else
 fi
 
 # The auto-updater artifact is the exact signed bundle promoted by CI.
-COPYFILE_DISABLE=1 tar -czf "$APP_TARBALL" -C "$OUT_DIR" Comet.app
+COPYFILE_DISABLE=1 tar -czf "$APP_TARBALL" -C "$OUT_DIR" Crew.app
 echo "packaged: $APP_TARBALL"
 
 hdiutil create -volname "Crew" -srcfolder "$APP" -ov -format UDZO "$DMG"

@@ -567,6 +567,13 @@ impl WorkspaceDoc {
         row.insert("userId", user_id)?;
         row.insert("chatId", session_ref.chat_id.as_str())?;
         row.insert("addedAt", session_ref.added_at.timestamp_millis())?;
+        match &session_ref.environment {
+            Some(environment) => row.insert(
+                "environment",
+                LoroValue::from(serde_json::to_value(environment)?),
+            )?,
+            None => row.delete("environment")?,
+        }
         self.doc.commit();
         Ok(())
     }
@@ -900,6 +907,8 @@ struct RawSessionRef {
     user_id: String,
     chat_id: String,
     added_at: i64,
+    #[serde(default)]
+    environment: Option<comet_proto::SessionEnvironment>,
 }
 
 impl From<RawSessionRef> for SessionRef {
@@ -907,6 +916,7 @@ impl From<RawSessionRef> for SessionRef {
         SessionRef {
             chat_id: raw.chat_id,
             added_at: dt(raw.added_at),
+            environment: raw.environment,
         }
     }
 }
@@ -985,6 +995,7 @@ mod tests {
         SessionRef {
             chat_id: chat_id.into(),
             added_at: ts(added_at),
+            environment: None,
         }
     }
 
@@ -1090,6 +1101,43 @@ mod tests {
         );
         assert!(restored.read_session_refs_for("user-b").unwrap().is_empty());
         assert!(restored.read_chats().unwrap().is_empty());
+    }
+
+    #[test]
+    fn session_ref_snapshot_retains_verified_scaffold_reconnect_route() {
+        let ws = WorkspaceDoc::new();
+        let mut imported = session_ref("session-a", 7_000);
+        imported.environment = Some(
+            serde_json::from_value(serde_json::json!({
+                "source": {
+                    "kind": "scaffold",
+                    "sandbox_id": "sandbox-a",
+                    "lifecycle": "paused",
+                    "lifecycle_epoch": 2,
+                    "links": {}
+                },
+                "ownerPrincipal": "accounts.google.com:subject-alice",
+                "scope": {
+                    "projectId": "project-a",
+                    "deploymentId": "deployment-a",
+                    "sessionId": "session-a"
+                }
+            }))
+            .unwrap(),
+        );
+        ws.upsert_session_ref("accounts.google.com:subject-alice", &imported)
+            .unwrap();
+
+        let snapshot = ws.export_snapshot().unwrap();
+        let restored_doc = LoroDoc::new();
+        restored_doc.import(&snapshot).unwrap();
+        let restored = WorkspaceDoc::from_doc(restored_doc);
+        assert_eq!(
+            restored
+                .session_ref("accounts.google.com:subject-alice", "session-a")
+                .unwrap(),
+            Some(imported)
+        );
     }
 
     #[test]

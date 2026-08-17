@@ -11,7 +11,7 @@
 //!   installer): download the headless tarball into a new versioned dir, flip
 //!   the symlink, restart the service. Same flow the installer script performs,
 //!   natively.
-//! - **MacApp** (running out of `Comet.app`): download the app tarball, swap the
+//! - **MacApp** (running out of `Crew.app`): download the app tarball, swap the
 //!   bundle directory, relaunch. Driven by the UI.
 //! - **Unmanaged** (source builds, hand-copied binaries): report only.
 //!
@@ -92,7 +92,7 @@ pub fn headless_artifact(version: &str) -> String {
     format!("comet-{version}-{os}-{arch}.tar.gz")
 }
 
-/// `comet-<ver>-macos-<arch>-app.tar.gz` — the packaged `Comet.app` bundle.
+/// `comet-<ver>-macos-<arch>-app.tar.gz` — the packaged `Crew.app` bundle.
 pub fn mac_app_artifact(version: &str) -> String {
     let (_, arch) = platform_key();
     format!("comet-{version}-macos-{arch}-app.tar.gz")
@@ -393,7 +393,7 @@ pub fn restart_service() -> anyhow::Result<()> {
 // macOS app-bundle installs — the desktop path
 // ---------------------------------------------------------------------------
 
-/// Download + unpack the app tarball into `{data_dir}/updates/<ver>/Comet.app`
+/// Download + unpack the app tarball into `{data_dir}/updates/<ver>/Crew.app`
 /// (idempotent). Returns the staged bundle path.
 pub async fn stage_mac_app(
     edge_url: &str,
@@ -403,7 +403,7 @@ pub async fn stage_mac_app(
 ) -> anyhow::Result<PathBuf> {
     let version = &manifest.version;
     let dir = data_dir.join("updates").join(version);
-    let staged = dir.join("Comet.app");
+    let staged = dir.join("Crew.app");
     if staged.join("Contents/MacOS/comet").exists() {
         return Ok(staged);
     }
@@ -423,38 +423,64 @@ pub async fn stage_mac_app(
     )?;
     std::fs::remove_file(&tarball).ok();
     if !staged.join("Contents/MacOS/comet").exists() {
-        bail!("app tarball {file} did not contain Comet.app");
+        bail!("app tarball {file} did not contain Crew.app");
     }
     Ok(staged)
 }
 
-/// Swap the installed bundle for the staged one: `ditto` the staged copy next to
-/// the target (metadata-preserving, cross-volume safe), then two renames — the
-/// old bundle is restored if the second rename fails.
-pub fn apply_mac_app(staged: &Path, bundle: &Path) -> anyhow::Result<()> {
+/// Install the staged bundle next to the current app, preserving metadata and
+/// migrating legacy `Comet.app` installs to the user-facing `Crew.app` name.
+/// Any existing target bundle is restored if the replacement fails.
+pub fn apply_mac_app(staged: &Path, bundle: &Path) -> anyhow::Result<PathBuf> {
     let parent = bundle
         .parent()
         .context("app bundle has no parent directory")?;
-    let name = bundle
+    let target_name = staged
+        .file_name()
+        .context("staged app bundle has no name")?;
+    let target = parent.join(target_name);
+    let current_name = bundle
         .file_name()
         .context("app bundle has no name")?
         .to_string_lossy();
+    let target_name = target_name.to_string_lossy();
     let pid = std::process::id();
-    let fresh = parent.join(format!(".{name}.new-{pid}"));
-    let old = parent.join(format!(".{name}.old-{pid}"));
+    let fresh = parent.join(format!(".{target_name}.new-{pid}"));
+    let old = parent.join(format!(".{current_name}.old-{pid}"));
+    let displaced_target = (target.as_path() != bundle && target.exists())
+        .then(|| parent.join(format!(".{target_name}.old-{pid}")));
     let _ = std::fs::remove_dir_all(&fresh);
+    let _ = std::fs::remove_dir_all(&old);
+    if let Some(displaced) = displaced_target.as_ref() {
+        let _ = std::fs::remove_dir_all(displaced);
+    }
     run(
         "ditto",
         &[&staged.to_string_lossy(), &fresh.to_string_lossy()],
     )?;
-    std::fs::rename(bundle, &old).context("moving the current app aside")?;
-    if let Err(err) = std::fs::rename(&fresh, bundle) {
+    if let Some(displaced) = displaced_target.as_ref() {
+        std::fs::rename(&target, displaced).context("moving the existing target app aside")?;
+    }
+    if let Err(err) = std::fs::rename(bundle, &old) {
+        if let Some(displaced) = displaced_target.as_ref() {
+            let _ = std::fs::rename(displaced, &target);
+        }
+        let _ = std::fs::remove_dir_all(&fresh);
+        return Err(err).context("moving the current app aside");
+    }
+    if let Err(err) = std::fs::rename(&fresh, &target) {
         let _ = std::fs::rename(&old, bundle);
+        if let Some(displaced) = displaced_target.as_ref() {
+            let _ = std::fs::rename(displaced, &target);
+        }
         let _ = std::fs::remove_dir_all(&fresh);
         return Err(err).context("installing the new app bundle");
     }
     let _ = std::fs::remove_dir_all(&old);
-    Ok(())
+    if let Some(displaced) = displaced_target {
+        let _ = std::fs::remove_dir_all(displaced);
+    }
+    Ok(target)
 }
 
 /// Detached relauncher: waits for THIS process to exit, then `open`s the bundle.
@@ -1185,6 +1211,15 @@ mod tests {
                 bundle: PathBuf::from("/Applications/Comet.app")
             }
         );
+        assert_eq!(
+            detect_install_from(
+                Path::new("/Applications/Crew.app/Contents/MacOS/comet"),
+                Some(Path::new("/Users/u")),
+            ),
+            InstallKind::MacApp {
+                bundle: PathBuf::from("/Applications/Crew.app")
+            }
+        );
         // A path merely containing `.app` without the bundle layout is not a bundle.
         assert_eq!(
             detect_install_from(Path::new("/tmp/foo.app/comet"), None),
@@ -1196,6 +1231,56 @@ mod tests {
                 Some(Path::new("/home/u"))
             ),
             InstallKind::Unmanaged
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn app_update_migrates_legacy_bundle_name_to_crew() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = tmp.path().join("Comet.app");
+        let staged = tmp.path().join("updates").join("Crew.app");
+        let legacy_binary = legacy.join("Contents/MacOS/comet");
+        let staged_binary = staged.join("Contents/MacOS/comet");
+        std::fs::create_dir_all(legacy_binary.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(staged_binary.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_binary, b"old").unwrap();
+        std::fs::write(&staged_binary, b"new").unwrap();
+
+        let installed = apply_mac_app(&staged, &legacy).unwrap();
+
+        assert_eq!(installed, tmp.path().join("Crew.app"));
+        assert!(!legacy.exists());
+        assert_eq!(
+            std::fs::read(installed.join("Contents/MacOS/comet")).unwrap(),
+            b"new"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn app_update_replaces_a_stale_crew_bundle_during_legacy_migration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = tmp.path().join("Comet.app");
+        let target = tmp.path().join("Crew.app");
+        let staged = tmp.path().join("updates").join("Crew.app");
+        for (bundle, contents) in [
+            (&legacy, b"legacy".as_slice()),
+            (&target, b"stale".as_slice()),
+            (&staged, b"current".as_slice()),
+        ] {
+            let binary = bundle.join("Contents/MacOS/comet");
+            std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+            std::fs::write(binary, contents).unwrap();
+        }
+
+        let installed = apply_mac_app(&staged, &legacy).unwrap();
+
+        assert_eq!(installed, target);
+        assert!(!legacy.exists());
+        assert_eq!(
+            std::fs::read(installed.join("Contents/MacOS/comet")).unwrap(),
+            b"current"
         );
     }
 

@@ -562,6 +562,13 @@ pub enum ScaffoldEnvironmentControl {
         sandbox_id: String,
         scope: CollaborationScope,
     },
+    UpdateAgentRoute {
+        #[serde(rename = "sandboxId")]
+        sandbox_id: String,
+        scope: CollaborationScope,
+        #[serde(rename = "agentRoute")]
+        agent_route: AgentRoute,
+    },
     /// Transfer an authenticated native OMP session into a Scaffold host. The
     /// controller resolves the durable native id/cwd pair to a discovered file;
     /// callers cannot provide a path. Scaffold rebinds the header to its remote
@@ -937,6 +944,37 @@ mod tests {
         assert_eq!(value["nativeSessionId"], "omp-native-a");
         assert_eq!(value["cwd"], "/repo");
         assert_eq!(value["scope"]["sessionId"], "session-a");
+    }
+    #[test]
+    fn agent_route_update_control_uses_camel_case_wire_shape() {
+        let control = ScaffoldEnvironmentControl::UpdateAgentRoute {
+            sandbox_id: "sandbox-a".into(),
+            scope: CollaborationScope {
+                project_id: "project-a".into(),
+                deployment_id: Some("deployment-a".into()),
+                session_id: Some("session-a".into()),
+                unknown: Default::default(),
+            },
+            agent_route: AgentRoute::automatic(AgentProvider::OpenAi, "gpt-5.5"),
+        };
+        assert_eq!(
+            serde_json::to_value(control).unwrap(),
+            serde_json::json!({
+                "operation": "updateAgentRoute",
+                "sandboxId": "sandbox-a",
+                "scope": {
+                    "projectId": "project-a",
+                    "deploymentId": "deployment-a",
+                    "sessionId": "session-a",
+                },
+                "agentRoute": {
+                    "provider": "openai",
+                    "model": "gpt-5.5",
+                    "fallback": "disabled",
+                    "routingMode": "automatic",
+                },
+            })
+        );
     }
 
     #[test]

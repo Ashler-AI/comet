@@ -522,16 +522,16 @@ pub fn rows_for_entry(
                         completed,
                         ..
                     } => {
-                        rows.push(Row {
-                            id: format!("{}#{}", entry.id, part_id).into(),
-                            version: u64::from(*completed),
-                            turn_start: false,
-                            kind: RowKind::Thinking {
-                                completed: *completed,
-                            },
-                            entry_id: entry_id.clone(),
-                            timestamp: None,
-                        });
+                        if *completed {
+                            rows.push(Row {
+                                id: format!("{}#{}", entry.id, part_id).into(),
+                                version: 1,
+                                turn_start: false,
+                                kind: RowKind::Thinking { completed: true },
+                                entry_id: entry_id.clone(),
+                                timestamp: None,
+                            });
+                        }
                     }
                     MessagePart::Input {
                         id: part_id,
@@ -3534,7 +3534,7 @@ mod tests {
     const MD: &str = "# Title\n\npara one\n\n```rust\nlet x = 1;\n```";
 
     #[test]
-    fn thinking_row_tracks_reasoning_lifecycle() {
+    fn thinking_row_appears_only_after_reasoning_completes() {
         let started = assistant(
             "m-thinking",
             MessageStatus::Streaming,
@@ -3553,10 +3553,10 @@ mod tests {
 
         let started_rows = rows_for_entry(&started, false, &mut parse);
         let completed_rows = rows_for_entry(&completed, false, &mut parse);
-        assert!(matches!(
-            started_rows[0].kind,
-            RowKind::Thinking { completed: false }
-        ));
+        assert!(
+            started_rows.is_empty(),
+            "active reasoning belongs in the composer status strip"
+        );
         assert!(matches!(
             completed_rows[0].kind,
             RowKind::Thinking { completed: true }

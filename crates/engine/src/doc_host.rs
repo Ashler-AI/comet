@@ -23,8 +23,8 @@ use comet_doc::{
 use comet_proto::{
     AgentSessionRecord, AuditEvent, AuditResult, COLLABORATION_SCHEMA_VERSION, CapabilityGrant,
     FileTargetReference, HarnessId, MessageProvenance, ModelHandoff, PublicationRecord,
-    PublicationValue, SemanticAnchor, SemanticAnnotation, SessionRoomProjection, UserInputAnswer,
-    UserInputQuestion, VerifiedCapabilityGrantEnvelope,
+    PublicationValue, SemanticAnchor, SemanticAnnotation, SessionRoomProjection, SessionStatus,
+    UserInputAnswer, UserInputQuestion, VerifiedCapabilityGrantEnvelope,
 };
 use comet_sync::{DocsStore, RoomClient};
 
@@ -562,6 +562,76 @@ impl ChatDocHandle {
         (self.snapshot_bytes.load(Ordering::Relaxed) * RESIDENT_BYTES_PER_SNAPSHOT_BYTE)
             .max(DOC_RESIDENT_FLOOR_BYTES)
     }
+}
+
+fn append_agent_session_status(
+    handle: &ChatDocHandle,
+    session_id: &str,
+    status: comet_proto::SessionStatus,
+    published_by: &str,
+    publication_id: String,
+) -> Result<(), EngineError> {
+    let Some(mut session) = handle
+        .doc
+        .collaboration_snapshot()?
+        .sessions
+        .into_iter()
+        .find(|session| session.session_id == session_id)
+    else {
+        return Ok(());
+    };
+    let at = now_ms();
+    session.status = Some(status);
+    session.updated_at = Some(at);
+    handle.doc.append_publication(&PublicationRecord {
+        id: publication_id,
+        schema_version: COLLABORATION_SCHEMA_VERSION,
+        published_at: at,
+        published_by: published_by.to_string(),
+        value: PublicationValue::AgentSession(Box::new(session)),
+        unknown: Default::default(),
+    })?;
+    Ok(())
+}
+
+fn monitor_agent_session_terminal(
+    sessions: &SessionsEngine,
+    handle: Arc<ChatDocHandle>,
+    execution_key: String,
+    session_id: String,
+    published_by: String,
+    command_id: String,
+) {
+    let mut statuses = sessions.watch_sessions();
+    tokio::spawn(async move {
+        loop {
+            let status = statuses
+                .borrow()
+                .iter()
+                .find(|session| session.chat_id == execution_key)
+                .map(|session| session.status);
+            if let Some(status @ (SessionStatus::Idle | SessionStatus::Errored)) = status {
+                if let Err(err) = append_agent_session_status(
+                    &handle,
+                    &session_id,
+                    status,
+                    &published_by,
+                    format!("session/{session_id}/terminal/{command_id}"),
+                ) {
+                    tracing::warn!(
+                        chat = %handle.chat_id,
+                        session = %session_id,
+                        error = %err,
+                        "terminal session state publication failed"
+                    );
+                }
+                return;
+            }
+            if statuses.changed().await.is_err() {
+                return;
+            }
+        }
+    });
 }
 
 impl DocHost {
@@ -1882,9 +1952,6 @@ impl DocHost {
                 session_id, action, ..
             } = &entry.payload
             && let Some(next_status) = match action.as_ref() {
-                SessionControlAction::Start { .. } | SessionControlAction::Resume {} => {
-                    Some(comet_proto::SessionStatus::Working)
-                }
                 SessionControlAction::Pause {} | SessionControlAction::Stop {} => {
                     Some(comet_proto::SessionStatus::Idle)
                 }
@@ -2164,6 +2231,14 @@ impl DocHost {
                             })?;
                             return Err(error);
                         }
+                        monitor_agent_session_terminal(
+                            sessions,
+                            handle.clone(),
+                            execution_key.clone(),
+                            session_id.clone(),
+                            actor_subject.clone(),
+                            entry.id.clone(),
+                        );
                         Ok((SessionCommandStatus::Applied, None))
                     }
                     SessionControlAction::Steer { prompt, message_id } => {
@@ -2203,6 +2278,21 @@ impl DocHost {
                         sessions
                             .dispatch(&execution_key, self.harness_for(chat_id), request, None)
                             .await?;
+                        append_agent_session_status(
+                            handle,
+                            session_id,
+                            SessionStatus::Working,
+                            actor_subject,
+                            format!("session/{session_id}/resume/{}", entry.id),
+                        )?;
+                        monitor_agent_session_terminal(
+                            sessions,
+                            handle.clone(),
+                            execution_key.clone(),
+                            session_id.clone(),
+                            actor_subject.clone(),
+                            entry.id.clone(),
+                        );
                         Ok((SessionCommandStatus::Applied, Some("resumed".into())))
                     }
                     SessionControlAction::Stop {} => {
@@ -2799,6 +2889,7 @@ mod authority_tests {
                 &comet_proto::SessionRef {
                     chat_id: "session-a".into(),
                     added_at: chrono::Utc::now(),
+                    environment: None,
                 },
             )
             .unwrap();
@@ -3137,7 +3228,12 @@ mod authority_tests {
             .unwrap();
         let registry = crate::HarnessRegistry::for_profile(comet_proto::RuntimeProfile::Mock);
         registry.register(Arc::new(comet_harness::mock::MockHarness {
-            script: vec![],
+            script: vec![comet_proto::AgentEvent::Done {
+                status: comet_proto::DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: None,
+            }],
         }));
         let sessions = SessionsEngine::new(
             "comet-scaffold-smoke-001-e1".into(),
@@ -3184,6 +3280,24 @@ mod authority_tests {
             host.execute(&sessions, &handle, &command).await.unwrap(),
             (SessionCommandStatus::Applied, None)
         );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let completed = handle
+                    .doc
+                    .collaboration_snapshot()
+                    .unwrap()
+                    .sessions
+                    .into_iter()
+                    .find(|session| session.session_id == "session-a")
+                    .is_some_and(|session| session.status == Some(SessionStatus::Idle));
+                if completed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed owner runs must publish their terminal session status");
     }
 
     #[tokio::test]

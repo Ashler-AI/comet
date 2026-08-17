@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{HarnessId, ReasoningLevel, SandboxLevel};
+use crate::{HarnessId, ReasoningLevel, SandboxLevel, SessionEnvironment};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -242,13 +242,17 @@ pub fn chat_indicator(chat: &Chat, live: Option<&Session>) -> ChatIndicator {
 }
 /// A workspace-local pointer to an existing global session room.
 ///
-/// Unlike [`Chat`], a session ref carries no host placement or cached session
-/// metadata. Knowing the exact chat id is sufficient to open the existing room.
+/// Unlike [`Chat`], a session ref carries no host placement. Scaffold imports
+/// retain only the verified environment route required to reconnect the room.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRef {
     pub chat_id: String,
     pub added_at: DateTime<Utc>,
+    /// Verified Scaffold route metadata for reconnecting this imported room
+    /// after Crew restarts. Capability grant ids are intentionally not stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<SessionEnvironment>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

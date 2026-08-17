@@ -12,7 +12,7 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::{AuthState, Chat, ChatIndicator, Session, SessionStatus, Space};
+use crate::{AgentSessionRecord, AuthState, Chat, ChatIndicator, Session, SessionStatus, Space};
 
 // ---------------------------------------------------------------------------
 // Connection + status
@@ -55,6 +55,33 @@ pub fn effective_indicator(session: Option<&Session>, now: DateTime<Utc>) -> Ind
             if age_ms > SESSION_STALE_MS {
                 Indicator::None
             } else if session.status == SessionStatus::Working {
+                Indicator::Working
+            } else {
+                Indicator::AwaitingInput
+            }
+        }
+    }
+}
+
+/// Staleness-checked indicator for a shared remote agent session.
+///
+/// Collaboration sessions use millisecond timestamps rather than chrono
+/// values, but follow the same expiry contract as local sessions.
+pub fn effective_agent_indicator(
+    session: Option<&AgentSessionRecord>,
+    now: DateTime<Utc>,
+) -> Indicator {
+    let Some(session) = session else {
+        return Indicator::None;
+    };
+    match session.status {
+        None | Some(SessionStatus::Idle) => Indicator::None,
+        Some(SessionStatus::Errored) => Indicator::Errored,
+        Some(SessionStatus::Working | SessionStatus::AwaitingInput) => {
+            let updated_at = session.updated_at.unwrap_or(session.created_at);
+            if now.timestamp_millis().saturating_sub(updated_at) > SESSION_STALE_MS {
+                Indicator::None
+            } else if session.status == Some(SessionStatus::Working) {
                 Indicator::Working
             } else {
                 Indicator::AwaitingInput

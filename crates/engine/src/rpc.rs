@@ -1631,11 +1631,28 @@ impl RpcService for EngineRpc {
             }
             methods::QUEUE_COMMAND => {
                 let p: QueueCommandParams = parse_params(params)?;
+                let activates_chat = match &p.command {
+                    SessionCommandPayload::Run { .. }
+                    | SessionCommandPayload::Steer { .. }
+                    | SessionCommandPayload::Queue { .. } => true,
+                    SessionCommandPayload::Control { action, .. } => matches!(
+                        action.as_ref(),
+                        comet_doc::SessionControlAction::Start { .. }
+                            | comet_doc::SessionControlAction::Steer { .. }
+                            | comet_doc::SessionControlAction::Queue { .. }
+                    ),
+                    _ => false,
+                };
                 self.install_local_owner_grant(&p.command)?;
                 let command_id = self
                     .doc_host
                     .queue_command(&p.chat_id, p.command)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                if activates_chat {
+                    self.workspace
+                        .set_chat_archived(&p.chat_id, false)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                }
                 RpcReply::value(&serde_json::json!({ "commandId": command_id }))
             }
             methods::SEND_PEER_MESSAGE => {
@@ -1671,7 +1688,7 @@ impl RpcService for EngineRpc {
                 // Membership MUST precede DocHost::open inside queue_command_with_id;
                 // otherwise the missing-chat fallback could self-claim a foreign room.
                 self.workspace
-                    .upsert_session_ref(&target_chat_id)
+                    .upsert_session_ref(&target_chat_id, None)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 let existing = self
                     .doc_host
@@ -1761,7 +1778,7 @@ impl RpcService for EngineRpc {
                     None
                 };
                 self.workspace
-                    .upsert_session_ref(&target_chat_id)
+                    .upsert_session_ref(&target_chat_id, None)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 // One reply is correlated to one stored command. Deriving its id
                 // makes transport retries append/execute exactly once without
@@ -1926,7 +1943,7 @@ impl RpcService for EngineRpc {
                     .ok_or_else(|| RpcError::Failed("invalid_session_id".into()))?;
                 let session_ref = self
                     .workspace
-                    .upsert_session_ref(&chat_id)
+                    .upsert_session_ref(&chat_id, None)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&session_ref)
             }
@@ -1963,6 +1980,24 @@ impl RpcService for EngineRpc {
                     .control(control, &cancellation)
                     .await
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
+                if let Some(projection) = result.room_projection.as_ref() {
+                    if result.environment.scope.project_id != projection.project_id
+                        || result.environment.scope.deployment_id.as_deref()
+                            != Some(projection.deployment_id.as_str())
+                        || result.environment.scope.session_id.as_deref()
+                            != Some(projection.session_id.as_str())
+                    {
+                        return Err(RpcError::Failed(
+                            "Scaffold attachment environment projection mismatch".into(),
+                        ));
+                    }
+                    self.workspace
+                        .upsert_session_ref(
+                            &projection.session_id,
+                            Some(result.environment.clone()),
+                        )
+                        .map_err(|error| RpcError::Failed(error.to_string()))?;
+                }
                 if let Err(error) = self.install_scaffold_control_grant(&result) {
                     tracing::warn!(
                         error = %error,

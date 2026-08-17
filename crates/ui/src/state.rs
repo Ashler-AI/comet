@@ -28,8 +28,8 @@ use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
 use comet_doc::{
-    MessagePart, MessageRole, SessionEntryWindow, SessionMessageEntry, TranscriptDesync,
-    TranscriptFrame,
+    MessagePart, MessageRole, MessageStatus, SessionEntryWindow, SessionMessageEntry,
+    TranscriptDesync, TranscriptFrame,
 };
 use comet_engine::{Engine, EngineConfig, EngineRuntime, rpc::AuthRpc};
 use comet_proto::{
@@ -362,8 +362,9 @@ impl EngineHandle {
 // this crate reads them as `state::…`.
 pub use comet_proto::view::{
     ChatGroup, ConnectionStatus, GatePhase, Indicator, SESSION_STALE_MS, attention_rank,
-    chat_location, display_status, effective_indicator, format_time_ago, gate_phase, group_chats,
-    parse_auth_state, project_label, sort_active, sort_chats, sort_spaces, sort_tabs,
+    chat_location, display_status, effective_agent_indicator, effective_indicator, format_time_ago,
+    gate_phase, group_chats, parse_auth_state, project_label, sort_active, sort_chats, sort_spaces,
+    sort_tabs,
 };
 
 /// A compact transcript-derived label for an imported session. The first user
@@ -394,6 +395,32 @@ fn shared_session_preview(entries: &[SessionMessageEntry]) -> Option<String> {
     } else {
         preview
     })
+}
+
+fn agent_indicator_with_transcript(
+    session: Option<&comet_proto::AgentSessionRecord>,
+    transcript: &[SessionMessageEntry],
+    now: DateTime<Utc>,
+) -> Indicator {
+    let indicator = effective_agent_indicator(session, now);
+    let Some(session) = session else {
+        return indicator;
+    };
+    let run_started_at = session.updated_at.unwrap_or(session.created_at);
+    let latest_run_entry = transcript.iter().rev().find(|entry| {
+        entry.role == MessageRole::Assistant
+            && entry.device_id == session.owner_device_id
+            && entry.created_at >= run_started_at
+    });
+    match latest_run_entry.and_then(|entry| entry.status) {
+        Some(MessageStatus::Streaming) => Indicator::Working,
+        Some(MessageStatus::Complete | MessageStatus::Aborted)
+            if indicator == Indicator::Working =>
+        {
+            Indicator::None
+        }
+        _ => indicator,
+    }
 }
 
 fn session_ref_fallback(chat_id: &str) -> String {
@@ -682,63 +709,69 @@ pub(crate) async fn handoff_omp_session(
     Ok((native_session_id, remote_cwd))
 }
 // Half-second retries match the composer's ten-minute Scaffold readiness budget.
-const SCAFFOLD_ATTACH_MAX_ATTEMPTS: usize = 1_200;
+const SCAFFOLD_CONTROL_MAX_ATTEMPTS: usize = 1_200;
 #[cfg(not(test))]
-const SCAFFOLD_ATTACH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+const SCAFFOLD_CONTROL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 #[cfg(test)]
-const SCAFFOLD_ATTACH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
+const SCAFFOLD_CONTROL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
 
-fn is_retryable_scaffold_attach_error(error: &RpcError) -> bool {
+fn is_retryable_scaffold_control_error(error: &RpcError) -> bool {
     matches!(
         error,
         RpcError::Failed(message)
-            if message.contains("scaffold_api_error:502:scaffold_request_rejected")
+            if message.contains("scaffold_api_error:500:scaffold_request_rejected")
+                || message.contains("scaffold_api_error:502:scaffold_request_rejected")
+                || message.contains("scaffold_api_error:503:scaffold_request_rejected")
+                || message.contains("scaffold_api_error:504:scaffold_request_rejected")
+                || message.contains(
+                    "scaffold_api_error:404:not_found:Sandbox agent route projection failed",
+                )
                 || message.contains(
                     "scaffold_api_error:409:sandbox_provider_error:Sandbox lifecycle changed while the operation was in flight",
                 )
+                || message.contains("scaffold_session_owner_room_unavailable")
                 || (message.contains("scaffold_response_invalid: sandbox ")
                     && message.contains(" is not ready"))
+                || message.contains(
+                    "Scaffold agent route update returned unavailable lifecycle",
+                )
     )
 }
 
-async fn attach_scaffold_session_with_retry<Wait, WaitFuture>(
-    handle: &EngineHandle,
-    sandbox_id: &str,
-    scope: CollaborationScope,
+async fn retry_scaffold_control_operation<T, Operation, OperationFuture, Wait, WaitFuture>(
+    mut operation: Operation,
     wait: &Wait,
-) -> Result<ScaffoldSessionAttachment, RpcError>
+) -> Result<T, RpcError>
 where
+    Operation: FnMut() -> OperationFuture,
+    OperationFuture: Future<Output = Result<T, RpcError>>,
     Wait: Fn(std::time::Duration) -> WaitFuture,
     WaitFuture: Future<Output = ()>,
 {
     let mut attempt = 1;
     loop {
-        match attach_scaffold_session(handle, sandbox_id, scope.clone()).await {
-            Ok(attachment) => return Ok(attachment),
+        match operation().await {
+            Ok(value) => return Ok(value),
             Err(error)
-                if attempt < SCAFFOLD_ATTACH_MAX_ATTEMPTS
-                    && is_retryable_scaffold_attach_error(&error) =>
+                if attempt < SCAFFOLD_CONTROL_MAX_ATTEMPTS
+                    && is_retryable_scaffold_control_error(&error) =>
             {
                 attempt += 1;
-                wait(SCAFFOLD_ATTACH_RETRY_DELAY).await;
+                wait(SCAFFOLD_CONTROL_RETRY_DELAY).await;
             }
             Err(error) => return Err(error),
         }
     }
 }
 
-/// Reconnect an existing Scaffold room. Paused sandboxes resume before a fresh,
-/// lifecycle-bound device grant is installed; active sandboxes only reattach.
-pub(crate) async fn ensure_scaffold_session_attached<Wait, WaitFuture>(
+/// Reconnect an existing Scaffold room once. Paused sandboxes resume before a
+/// fresh, lifecycle-bound device grant is installed; active sandboxes only
+/// reattach.
+async fn ensure_scaffold_session_attached_once(
     handle: &EngineHandle,
     sandbox_id: &str,
     scope: &CollaborationScope,
-    wait: &Wait,
-) -> Result<ScaffoldSessionAttachment, RpcError>
-where
-    Wait: Fn(std::time::Duration) -> WaitFuture,
-    WaitFuture: Future<Output = ()>,
-{
+) -> Result<ScaffoldSessionAttachment, RpcError> {
     match inspect_scaffold_session(handle, sandbox_id, scope).await? {
         ScaffoldLifecycle::Paused => {
             let value = handle
@@ -795,7 +828,94 @@ where
         | ScaffoldLifecycle::AgentRunning
         | ScaffoldLifecycle::Resuming => {}
     }
-    attach_scaffold_session_with_retry(handle, sandbox_id, scope.clone(), wait).await
+    attach_scaffold_session(handle, sandbox_id, scope.clone()).await
+}
+
+/// Reconnect an existing Scaffold room with bounded automatic recovery for
+/// transient provider rollout, lifecycle, and room-readiness races.
+pub(crate) async fn ensure_scaffold_session_attached<Wait, WaitFuture>(
+    handle: &EngineHandle,
+    sandbox_id: &str,
+    scope: &CollaborationScope,
+    wait: &Wait,
+) -> Result<ScaffoldSessionAttachment, RpcError>
+where
+    Wait: Fn(std::time::Duration) -> WaitFuture,
+    WaitFuture: Future<Output = ()>,
+{
+    retry_scaffold_control_operation(
+        || ensure_scaffold_session_attached_once(handle, sandbox_id, scope),
+        wait,
+    )
+    .await
+}
+async fn update_scaffold_session_agent_route_once(
+    handle: &EngineHandle,
+    sandbox_id: &str,
+    scope: &CollaborationScope,
+    agent_route: &comet_proto::AgentRoute,
+) -> Result<(), RpcError> {
+    let value = handle
+        .client()
+        .call(
+            methods::CONTROL_SCAFFOLD_ENVIRONMENT,
+            serde_json::to_value(ScaffoldEnvironmentControl::UpdateAgentRoute {
+                sandbox_id: sandbox_id.to_string(),
+                scope: scope.clone(),
+                agent_route: agent_route.clone(),
+            })
+            .unwrap_or_default(),
+        )
+        .await?;
+    let updated: ScaffoldEnvironmentControlResult =
+        serde_json::from_value(value).map_err(|err| RpcError::Failed(err.to_string()))?;
+    if updated.environment.scope != *scope {
+        return Err(RpcError::Failed(
+            "Scaffold agent route update returned a different sandbox scope".into(),
+        ));
+    }
+    let SessionEnvironmentSource::Scaffold {
+        sandbox_id: updated_id,
+        lifecycle,
+        ..
+    } = updated.environment.source
+    else {
+        return Err(RpcError::Failed(
+            "Scaffold agent route update returned a local environment".into(),
+        ));
+    };
+    if updated_id != sandbox_id {
+        return Err(RpcError::Failed(
+            "Scaffold agent route update returned a different sandbox".into(),
+        ));
+    }
+    if !matches!(
+        lifecycle,
+        ScaffoldLifecycle::Ready | ScaffoldLifecycle::AgentRunning
+    ) {
+        return Err(RpcError::Failed(format!(
+            "Scaffold agent route update returned unavailable lifecycle {lifecycle:?}"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) async fn update_scaffold_session_agent_route<Wait, WaitFuture>(
+    handle: &EngineHandle,
+    sandbox_id: &str,
+    scope: &CollaborationScope,
+    agent_route: &comet_proto::AgentRoute,
+    wait: &Wait,
+) -> Result<(), RpcError>
+where
+    Wait: Fn(std::time::Duration) -> WaitFuture,
+    WaitFuture: Future<Output = ()>,
+{
+    retry_scaffold_control_operation(
+        || update_scaffold_session_agent_route_once(handle, sandbox_id, scope, agent_route),
+        wait,
+    )
+    .await
 }
 
 /// Create the sandbox and immediately dispatch its supervised Comet bootstrap.
@@ -823,8 +943,11 @@ where
         agent_route,
     )
     .await?;
-    let attachment =
-        attach_scaffold_session_with_retry(handle, &sandbox_id, authoritative_scope, wait).await?;
+    let attachment = retry_scaffold_control_operation(
+        || attach_scaffold_session(handle, &sandbox_id, authoritative_scope.clone()),
+        wait,
+    )
+    .await?;
     Ok((sandbox_id, attachment))
 }
 /// Pause exactly the sandbox attached to a chat. The response must preserve
@@ -1648,6 +1771,31 @@ impl AppState {
             .sessions
             .iter()
             .find(|session| session.session_id == selected)
+    }
+
+    pub fn agent_indicator_for(&self, session_id: &str, now: DateTime<Utc>) -> Indicator {
+        let selected_chat = self.selected_chat.as_deref();
+        agent_indicator_with_transcript(
+            self.collaboration
+                .as_ref()
+                .and_then(|snapshot| {
+                    snapshot
+                        .sessions
+                        .iter()
+                        .find(|session| session.session_id == session_id)
+                })
+                .filter(|session| Some(session.chat_id.as_str()) == selected_chat),
+            &self.transcript,
+            now,
+        )
+    }
+
+    pub fn selected_agent_indicator(&self, now: DateTime<Utc>) -> Indicator {
+        self.selected_agent_session
+            .as_deref()
+            .map_or(Indicator::None, |session_id| {
+                self.agent_indicator_for(session_id, now)
+            })
     }
 
     pub fn select_agent_session(&mut self, session_id: Option<String>) {
@@ -2976,9 +3124,10 @@ mod tests {
     use chrono::TimeDelta;
     use comet_engine::{EngineCore, default_registry};
     use gpui::AppContext;
-    // `SessionStatus` is only needed to build the fixtures below — the module
-    // itself derives everything through `comet_proto::view`.
-    use comet_proto::{SessionStatus, UserProfile};
+    // Session records are only needed to build fixtures below; production
+    // state derives indicators through `comet_proto::view`.
+    use comet_proto::{AgentSessionRecord, AgentSessionSource, SessionStatus, UserProfile};
+    use std::collections::BTreeMap;
     use std::sync::{
         Mutex as StdMutex,
         atomic::{AtomicU16, Ordering},
@@ -2987,6 +3136,7 @@ mod tests {
     struct ReadyScaffoldRpc {
         operations: Arc<StdMutex<Vec<String>>>,
         attach_failures_remaining: AtomicU16,
+        update_route_failures_remaining: AtomicU16,
         inspect_lifecycle: &'static str,
         archive_fails: bool,
     }
@@ -3063,6 +3213,18 @@ mod tests {
                     "scaffold_api_error:502:scaffold_request_rejected".into(),
                 ));
             }
+            if operation == "updateAgentRoute"
+                && self
+                    .update_route_failures_remaining
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+            {
+                return Err(RpcError::Failed(
+                    "scaffold_api_error:500:scaffold_request_rejected".into(),
+                ));
+            }
             let scope = params.get("scope").expect("Scaffold scope");
             let session_id = scope
                 .get("sessionId")
@@ -3071,6 +3233,7 @@ mod tests {
             let lifecycle = match operation {
                 "inspect" | "handoffOmpSession" => self.inspect_lifecycle,
                 "pause" => "paused",
+                "updateAgentRoute" => "ready",
                 _ => "starting",
             };
             let environment = serde_json::json!({
@@ -3134,7 +3297,7 @@ mod tests {
             } else {
                 assert!(matches!(
                     operation,
-                    "create" | "inspect" | "pause" | "resume"
+                    "create" | "inspect" | "pause" | "resume" | "updateAgentRoute"
                 ));
                 serde_json::json!({ "environment": environment })
             };
@@ -3196,6 +3359,7 @@ mod tests {
             attach_failures_remaining: AtomicU16::new(0),
             inspect_lifecycle: "ready",
             archive_fails: false,
+            update_route_failures_remaining: AtomicU16::new(0),
         });
         let handle = EngineHandle {
             inner: Arc::new(RemoteEngine {
@@ -3308,14 +3472,26 @@ mod tests {
     }
 
     #[test]
-    fn scaffold_attach_retries_transient_provider_and_readiness_failures() {
-        assert!(is_retryable_scaffold_attach_error(&RpcError::Failed(
+    fn scaffold_control_retries_transient_provider_and_readiness_failures() {
+        assert!(is_retryable_scaffold_control_error(&RpcError::Failed(
+            "scaffold_api_error:500:scaffold_request_rejected".into()
+        )));
+        assert!(is_retryable_scaffold_control_error(&RpcError::Failed(
             "scaffold_api_error:502:scaffold_request_rejected".into()
         )));
-        assert!(is_retryable_scaffold_attach_error(&RpcError::Failed(
+        assert!(is_retryable_scaffold_control_error(&RpcError::Failed(
+            "scaffold_api_error:404:not_found:Sandbox agent route projection failed".into()
+        )));
+        assert!(is_retryable_scaffold_control_error(&RpcError::Failed(
             "scaffold_response_invalid: sandbox rcs_1 is not ready".into()
         )));
-        assert!(!is_retryable_scaffold_attach_error(&RpcError::Failed(
+        assert!(is_retryable_scaffold_control_error(&RpcError::Failed(
+            "scaffold_session_owner_room_unavailable".into()
+        )));
+        assert!(!is_retryable_scaffold_control_error(&RpcError::Failed(
+            "scaffold_api_error:404:scaffold_request_rejected".into()
+        )));
+        assert!(!is_retryable_scaffold_control_error(&RpcError::Failed(
             "scaffold_response_invalid: sandbox failed".into()
         )));
 
@@ -3328,6 +3504,7 @@ mod tests {
                 attach_failures_remaining: AtomicU16::new(2),
                 inspect_lifecycle: "ready",
                 archive_fails: false,
+                update_route_failures_remaining: AtomicU16::new(0),
             });
             let handle = EngineHandle {
                 inner: Arc::new(RemoteEngine {
@@ -3371,6 +3548,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scaffold_send_route_update_retries_transient_provider_rejection() {
+        let operations = Arc::new(StdMutex::new(Vec::new()));
+        let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
+            operations: Arc::clone(&operations),
+            attach_failures_remaining: AtomicU16::new(0),
+            update_route_failures_remaining: AtomicU16::new(1),
+            inspect_lifecycle: "ready",
+            archive_fails: false,
+        });
+        let handle = EngineHandle {
+            inner: Arc::new(RemoteEngine {
+                client: memory_client(service),
+                url: "memory://transient-route-update".into(),
+            }),
+        };
+        let scope = CollaborationScope {
+            project_id: "ashler-staging".into(),
+            deployment_id: Some("ashler-staging".into()),
+            session_id: Some("session-transient-route".into()),
+            unknown: Default::default(),
+        };
+        let route = AgentRoute::automatic(comet_proto::AgentProvider::OpenAi, "gpt-5.6-sol");
+        let no_wait = |_| futures::future::ready(());
+
+        update_scaffold_session_agent_route(&handle, "sandbox-ready", &scope, &route, &no_wait)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            operations
+                .lock()
+                .expect("Scaffold operation log")
+                .as_slice(),
+            ["updateAgentRoute", "updateAgentRoute"]
+        );
+    }
+
+    #[tokio::test]
     async fn failed_archive_does_not_pause_scaffold() {
         let operations = Arc::new(StdMutex::new(Vec::new()));
         let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
@@ -3378,6 +3593,7 @@ mod tests {
             attach_failures_remaining: AtomicU16::new(0),
             inspect_lifecycle: "ready",
             archive_fails: true,
+            update_route_failures_remaining: AtomicU16::new(0),
         });
         let handle = EngineHandle {
             inner: Arc::new(RemoteEngine {
@@ -3417,6 +3633,7 @@ mod tests {
             attach_failures_remaining: AtomicU16::new(0),
             inspect_lifecycle: "paused",
             archive_fails: false,
+            update_route_failures_remaining: AtomicU16::new(0),
         });
         let handle = EngineHandle {
             inner: Arc::new(RemoteEngine {
@@ -3718,6 +3935,7 @@ mod tests {
             attach_failures_remaining: AtomicU16::new(0),
             inspect_lifecycle: "ready",
             archive_fails: false,
+            update_route_failures_remaining: AtomicU16::new(0),
         });
         let handle = EngineHandle {
             inner: Arc::new(RemoteEngine {
@@ -3875,6 +4093,29 @@ mod tests {
         }
     }
 
+    fn agent_session(
+        chat_id: &str,
+        status: SessionStatus,
+        updated_secs_ago: i64,
+        now: DateTime<Utc>,
+    ) -> AgentSessionRecord {
+        AgentSessionRecord {
+            session_id: "remote-session".into(),
+            chat_id: chat_id.into(),
+            owner_subject: "owner".into(),
+            owner_device_id: "remote-device".into(),
+            source: AgentSessionSource::Scaffold,
+            environment: None,
+            harness: Some(HarnessId::Omp),
+            model: Some("openai-codex/gpt-5.6-sol".into()),
+            harness_session_id: None,
+            status: Some(status),
+            updated_at: Some((now - TimeDelta::seconds(updated_secs_ago)).timestamp_millis()),
+            created_at: (now - TimeDelta::minutes(1)).timestamp_millis(),
+            unknown: BTreeMap::new(),
+        }
+    }
+
     #[test]
     fn chats_sort_by_last_message_desc_with_created_fallback() {
         let mut chats = vec![
@@ -3910,6 +4151,61 @@ mod tests {
         // Future timestamps (clock skew) count as fresh.
         let skewed = session("c", SessionStatus::Working, -30, now);
         assert_eq!(effective_indicator(Some(&skewed), now), Indicator::Working);
+    }
+
+    #[test]
+    fn scaffold_agent_indicator_matches_local_session_status() {
+        let now = Utc::now();
+        let fresh = agent_session("c", SessionStatus::Working, 10, now);
+        assert_eq!(
+            effective_agent_indicator(Some(&fresh), now),
+            Indicator::Working
+        );
+        let stale = agent_session("c", SessionStatus::Working, 46, now);
+        assert_eq!(
+            effective_agent_indicator(Some(&stale), now),
+            Indicator::None
+        );
+        let awaiting = agent_session("c", SessionStatus::AwaitingInput, 5, now);
+        assert_eq!(
+            effective_agent_indicator(Some(&awaiting), now),
+            Indicator::AwaitingInput
+        );
+        let mut streaming = transcript_entry("streaming");
+        streaming.status = Some(MessageStatus::Streaming);
+        streaming.device_id = stale.owner_device_id.clone();
+        streaming.created_at = now.timestamp_millis();
+        assert_eq!(
+            agent_indicator_with_transcript(Some(&stale), &[streaming], now),
+            Indicator::Working,
+            "live transcript activity must keep a long-running remote turn visible"
+        );
+        let idle = agent_session("c", SessionStatus::Idle, 0, now);
+        assert_eq!(
+            agent_indicator_with_transcript(Some(&idle), &[], now),
+            Indicator::None,
+            "the owner's terminal publication must clear the remote working state"
+        );
+        let fresh_working = agent_session("c", SessionStatus::Working, 5, now);
+        let mut completed = transcript_entry("completed");
+        completed.status = Some(MessageStatus::Complete);
+        completed.device_id = fresh_working.owner_device_id.clone();
+        completed.created_at = now.timestamp_millis();
+        assert_eq!(
+            agent_indicator_with_transcript(
+                Some(&fresh_working),
+                std::slice::from_ref(&completed),
+                now,
+            ),
+            Indicator::None,
+            "a completed owner transcript must bridge older owners that lack terminal publications"
+        );
+        completed.created_at = fresh_working.updated_at.unwrap() - 1;
+        assert_eq!(
+            agent_indicator_with_transcript(Some(&fresh_working), &[completed], now),
+            Indicator::Working,
+            "a completed prior turn must not hide the next turn before its first frame"
+        );
     }
 
     #[test]
@@ -4647,6 +4943,7 @@ mod tests {
         state.apply_session_refs(vec![SessionRef {
             chat_id: chat_id.into(),
             added_at: Utc::now(),
+            environment: None,
         }]);
 
         state.apply_chats(Vec::new());
@@ -4666,6 +4963,7 @@ mod tests {
         state.apply_session_refs(vec![SessionRef {
             chat_id: chat_id.into(),
             added_at: Utc::now(),
+            environment: None,
         }]);
         assert_eq!(state.shared_session_title(chat_id), "Session aaaaaaaa");
 
@@ -4694,6 +4992,7 @@ mod tests {
         state.apply_session_refs(vec![SessionRef {
             chat_id: chat_id.into(),
             added_at: Utc::now(),
+            environment: None,
         }]);
         state.apply_chats(vec![chat(chat_id, 1, None)]);
 

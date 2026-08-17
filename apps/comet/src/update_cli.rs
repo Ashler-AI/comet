@@ -74,8 +74,8 @@ pub async fn update(config: EngineConfig, check_only: bool) -> anyhow::Result<()
                 &data_dir,
             )
             .await?;
-            comet_update::apply_mac_app(&staged, &bundle)?;
-            println!("updated {}. Relaunch Crew to finish.", bundle.display());
+            let installed = comet_update::apply_mac_app(&staged, &bundle)?;
+            println!("updated {}. Relaunch Crew to finish.", installed.display());
             Ok(())
         }
         InstallKind::Unmanaged => {

@@ -19,7 +19,9 @@ use chrono::Utc;
 use tokio::sync::watch;
 
 use comet_doc::{DeletedSpace, WorkspaceDoc, presence_key};
-use comet_proto::{Chat, ChatConfig, Device, Session, SessionRef, Space, WorktreeDeletionStage};
+use comet_proto::{
+    Chat, ChatConfig, Device, Session, SessionEnvironment, SessionRef, Space, WorktreeDeletionStage,
+};
 use comet_sync::{DocsStore, RoomClient};
 
 use crate::doc_host::EdgeConfig;
@@ -379,16 +381,26 @@ impl WorkspaceHost {
     }
 
     /// Add an exact-id pointer to a global session without creating a local
-    /// chat host row. Repeated adds preserve the original membership timestamp.
-    pub fn upsert_session_ref(&self, chat_id: &str) -> Result<SessionRef, EngineError> {
+    /// chat host row. Repeated adds preserve the original membership timestamp;
+    /// a verified Scaffold environment refreshes the reconnect route.
+    pub fn upsert_session_ref(
+        &self,
+        chat_id: &str,
+        environment: Option<SessionEnvironment>,
+    ) -> Result<SessionRef, EngineError> {
         let user_id = &self.inner.config.user_id;
-        if let Some(existing) = self.inner.doc.session_ref(user_id, chat_id)? {
-            return Ok(existing);
+        let mut session_ref = self
+            .inner
+            .doc
+            .session_ref(user_id, chat_id)?
+            .unwrap_or_else(|| SessionRef {
+                chat_id: chat_id.to_string(),
+                added_at: Utc::now(),
+                environment: None,
+            });
+        if let Some(environment) = environment {
+            session_ref.environment = Some(environment);
         }
-        let session_ref = SessionRef {
-            chat_id: chat_id.to_string(),
-            added_at: Utc::now(),
-        };
         self.inner.doc.upsert_session_ref(user_id, &session_ref)?;
         Ok(session_ref)
     }

@@ -652,6 +652,24 @@ impl ScaffoldClient {
         self.lifecycle(sandbox_id, "stop", scope, cancellation)
             .await
     }
+    pub async fn update_agent_route(
+        &self,
+        sandbox_id: &str,
+        scope: &CollaborationScope,
+        agent_route: &AgentRoute,
+        cancellation: &CancellationToken,
+    ) -> Result<SessionEnvironment, ScaffoldError> {
+        self.validate_scope(scope)?;
+        let response: SandboxEnvelope = self
+            .request(
+                Method::POST,
+                self.sandbox_url(sandbox_id, Some("agent-route"))?,
+                Some(&AgentRouteBody { agent_route }),
+                cancellation,
+            )
+            .await?;
+        response.sandbox.into_environment(scope.clone())
+    }
 
     async fn lifecycle(
         &self,
@@ -1273,6 +1291,11 @@ struct CreateCometRuntimeProfile<'a> {
 
 #[derive(Debug, Serialize)]
 struct EmptyBody {}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentRouteBody<'a> {
+    agent_route: &'a AgentRoute,
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1873,6 +1896,19 @@ impl ScaffoldRuntime {
                 self.inner
                     .client
                     .stop(&sandbox_id, &scope, cancellation)
+                    .await?,
+                None,
+                None,
+                None,
+            ),
+            ScaffoldEnvironmentControl::UpdateAgentRoute {
+                sandbox_id,
+                scope,
+                agent_route,
+            } => (
+                self.inner
+                    .client
+                    .update_agent_route(&sandbox_id, &scope, &agent_route, cancellation)
                     .await?,
                 None,
                 None,
@@ -2542,6 +2578,7 @@ mod tests {
             comet_sandbox("creating"),
             sandbox("paused"),
             sandbox("resuming"),
+            sandbox("ready"),
             sandbox("stopped"),
         ];
         let (origin, captured) = mock_server(responses).await;
@@ -2583,6 +2620,15 @@ mod tests {
             .resume("sandbox-a", &scope(), &cancellation)
             .await
             .unwrap();
+        client
+            .update_agent_route(
+                "sandbox-a",
+                &scope(),
+                &AgentRoute::automatic(comet_proto::AgentProvider::OpenAi, "gpt-5.5"),
+                &cancellation,
+            )
+            .await
+            .unwrap();
         let stopped = client
             .stop("sandbox-a", &scope(), &cancellation)
             .await
@@ -2608,6 +2654,7 @@ mod tests {
                 "POST /api/code-sandboxes HTTP/1.1",
                 "POST /api/code-sandboxes/sandbox-a/pause HTTP/1.1",
                 "POST /api/code-sandboxes/sandbox-a/resume HTTP/1.1",
+                "POST /api/code-sandboxes/sandbox-a/agent-route HTTP/1.1",
                 "POST /api/code-sandboxes/sandbox-a/stop HTTP/1.1",
             ]
         );
@@ -2619,6 +2666,9 @@ mod tests {
         assert!(requests[2].contains(r#""databaseEnvironment":"staging_snapshot""#));
         assert!(requests[2].contains(
             r#""agentRoute":{"provider":"openai","model":"gpt-5.6-sol","fallback":"disabled","routingMode":"automatic"}"#
+        ));
+        assert!(requests[5].contains(
+            r#""agentRoute":{"provider":"openai","model":"gpt-5.5","fallback":"disabled","routingMode":"automatic"}"#
         ));
         assert!(requests[2].contains(r#""version":"scaffold.comet-runtime.v1""#));
         assert!(requests[2].contains(r#""projectId":"project-a""#));

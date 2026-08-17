@@ -165,6 +165,10 @@ fn scaffold_turn_requires_start(
     start_agent_mode || previous_owner_device_id != Some(attached_owner_device_id)
 }
 
+fn scaffold_control_uses_start(start_agent_mode: bool, steer_cmd: bool, queue_cmd: bool) -> bool {
+    start_agent_mode || (!steer_cmd && !queue_cmd)
+}
+
 /// Hysteresis slack for the expanded→compact flip: once expanded, the composer
 /// only collapses when the text is comfortably narrower than the compact
 /// capacity — expanding and collapsing share no boundary, so a width right at
@@ -3355,6 +3359,81 @@ fn control_route_grant_id(
         now,
     )
 }
+
+fn persisted_scaffold_reconnect_target(
+    session_refs: &[comet_proto::SessionRef],
+    principal: &comet_proto::CollaborationPrincipal,
+    session_id: &str,
+    owner_device_id: &str,
+    required_capability: &str,
+) -> Option<ScaffoldControlTarget> {
+    let owner_sandbox_id =
+        comet_proto::parse_scaffold_device_id(owner_device_id).map(|(sandbox_id, _)| sandbox_id)?;
+    session_refs
+        .iter()
+        .find(|session_ref| session_ref.chat_id == session_id)
+        .and_then(|session_ref| session_ref.environment.as_ref())
+        .filter(|environment| {
+            environment.owner_principal == principal.subject
+                && environment.scope.project_id == principal.project_id
+                && environment.scope.deployment_id.is_some()
+                && environment.scope.session_id.as_deref() == Some(session_id)
+                && principal.has_capability(required_capability)
+        })
+        .and_then(|environment| {
+            let comet_proto::SessionEnvironmentSource::Scaffold { sandbox_id, .. } =
+                &environment.source
+            else {
+                return None;
+            };
+            (sandbox_id == owner_sandbox_id).then(|| ScaffoldControlTarget {
+                sandbox_id: sandbox_id.clone(),
+                scope: environment.scope.clone(),
+            })
+        })
+}
+
+fn scaffold_reconnect_target(
+    snapshot: &comet_proto::CollaborationSnapshot,
+    principal: &comet_proto::CollaborationPrincipal,
+    session_id: &str,
+    owner_device_id: &str,
+    required_capability: &str,
+    now: i64,
+) -> Option<ScaffoldControlTarget> {
+    snapshot
+        .grants
+        .iter()
+        .filter(|grant| {
+            grant.granted_by == "comet-edge-device-room"
+                && grant.principal_subject == principal.subject
+                && principal.authorizes_scope(&grant.scope)
+                && grant.revoked_at.is_none_or(|revoked| now < revoked)
+                && grant
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == required_capability)
+                && principal.has_capability(required_capability)
+                && grant.scope.session_id.as_deref() == Some(session_id)
+                && grant.device_id.as_deref() == Some(owner_device_id)
+                && grant.device_id.as_deref().is_some_and(|device_id| {
+                    comet_proto::parse_scaffold_device_id(device_id).is_some_and(
+                        |(sandbox_id, lifecycle_epoch)| {
+                            Some(sandbox_id) == grant.sandbox_id.as_deref()
+                                && Some(lifecycle_epoch) == grant.lifecycle_epoch
+                        },
+                    )
+                })
+        })
+        .max_by_key(|grant| grant.granted_at)
+        .and_then(|grant| {
+            Some(ScaffoldControlTarget {
+                sandbox_id: grant.sandbox_id.clone()?,
+                scope: grant.scope.clone(),
+            })
+            .filter(|_| grant.scope.deployment_id.is_some())
+        })
+}
 fn scaffold_start_control_route(
     snapshot: &comet_proto::CollaborationSnapshot,
     required_capability: &str,
@@ -4407,35 +4486,68 @@ impl Composer {
             .local_device_id
             .clone()
             .ok_or_else(|| SharedString::from("Device unavailable"))?;
-        if !principal.has_capability(required_capability) {
-            return Err(SharedString::from("Agent control not allowed"));
-        }
+        let principal_can_control = principal.has_capability(required_capability);
         let now = chrono::Utc::now().timestamp_millis();
-        let selected_chat_has_scaffold_session = snapshot
-            .sessions
-            .iter()
-            .any(|session| session.source == AgentSessionSource::Scaffold);
+        let selected_chat = state.selected_chat.as_deref();
+        let selected_scaffold_session = state
+            .selected_agent_session
+            .as_deref()
+            .and_then(|id| {
+                snapshot
+                    .sessions
+                    .iter()
+                    .find(|session| session.session_id == id)
+            })
+            .filter(|session| {
+                session.source == AgentSessionSource::Scaffold
+                    && Some(session.chat_id.as_str()) == selected_chat
+            })
+            .or_else(|| {
+                snapshot.sessions.iter().find(|session| {
+                    session.source == AgentSessionSource::Scaffold
+                        && Some(session.chat_id.as_str()) == selected_chat
+                })
+            });
+        let selected_chat_has_scaffold_session = selected_scaffold_session.is_some();
         let (session_id, owner_device_id, source, grant_id) = if self.start_agent {
-            if let Some(preferred_grant_id) = scaffold_start_grant_id(
-                state.selected_chat_is_scaffold_room() || selected_chat_has_scaffold_session,
-                state.selected_scaffold_control_grant_id(),
-            )
-            .map_err(|()| SharedString::from("Reconnect to control this session"))?
-            {
-                let (session_id, owner_device_id, grant_id) = scaffold_start_control_route(
-                    snapshot,
-                    required_capability,
-                    preferred_grant_id,
-                    now,
-                )
-                .ok_or_else(|| SharedString::from("Reconnect to control this session"))?;
-                (
-                    session_id,
-                    owner_device_id,
-                    AgentSessionSource::Scaffold,
-                    grant_id,
-                )
+            let scaffold_room =
+                state.selected_chat_is_scaffold_room() || selected_chat_has_scaffold_session;
+            if scaffold_room {
+                let valid_route =
+                    scaffold_start_grant_id(true, state.selected_scaffold_control_grant_id())
+                        .ok()
+                        .flatten()
+                        .and_then(|preferred_grant_id| {
+                            scaffold_start_control_route(
+                                snapshot,
+                                required_capability,
+                                preferred_grant_id,
+                                now,
+                            )
+                        });
+                valid_route
+                    .or_else(|| {
+                        selected_scaffold_session.map(|session| {
+                            (
+                                session.session_id.clone(),
+                                session.owner_device_id.clone(),
+                                String::new(),
+                            )
+                        })
+                    })
+                    .map(|(session_id, owner_device_id, grant_id)| {
+                        (
+                            session_id,
+                            owner_device_id,
+                            AgentSessionSource::Scaffold,
+                            grant_id,
+                        )
+                    })
+                    .ok_or_else(|| SharedString::from("Could not reconnect to this session"))?
             } else {
+                if !principal_can_control {
+                    return Err(SharedString::from("Agent control not allowed"));
+                }
                 (
                     uuid::Uuid::new_v4().to_string(),
                     actor_device_id.clone(),
@@ -4457,18 +4569,32 @@ impl Composer {
             let grant_id = if target.source == AgentSessionSource::Local
                 && target.owner_device_id == actor_device_id
             {
+                if !principal_can_control {
+                    return Err(SharedString::from("Agent control not allowed"));
+                }
                 // The local engine derives and installs this single-action grant
                 // from its authenticated identity before queueing the command.
                 uuid::Uuid::new_v4().to_string()
+            } else if let Some(grant_id) = principal_can_control
+                .then(|| {
+                    control_route_grant_id(
+                        snapshot,
+                        target,
+                        required_capability,
+                        state.selected_invitation_grant.as_deref(),
+                        now,
+                    )
+                })
+                .flatten()
+            {
+                grant_id
+            } else if target.source == AgentSessionSource::Scaffold {
+                // A paused sandbox invalidates its lifecycle-bound grant. The
+                // async send path must resume+attach and replace this sentinel
+                // before it can queue any agent command.
+                String::new()
             } else {
-                control_route_grant_id(
-                    snapshot,
-                    target,
-                    required_capability,
-                    state.selected_invitation_grant.as_deref(),
-                    now,
-                )
-                .ok_or_else(|| SharedString::from("Agent control not allowed"))?
+                return Err(SharedString::from("Agent control not allowed"));
             };
             (
                 target.session_id.clone(),
@@ -4478,18 +4604,34 @@ impl Composer {
             )
         };
         let scaffold = if source == AgentSessionSource::Scaffold {
-            let grant = snapshot
-                .grants
-                .iter()
-                .find(|grant| grant.id == grant_id)
-                .ok_or_else(|| SharedString::from("Reconnect to control this session"))?;
-            Some(ScaffoldControlTarget {
-                sandbox_id: grant
-                    .sandbox_id
-                    .clone()
-                    .ok_or_else(|| SharedString::from("Reconnect to control this session"))?,
-                scope: grant.scope.clone(),
-            })
+            state
+                .scaffold_control_target(&session_id)
+                .filter(|target| principal_can_control && principal.authorizes_scope(&target.scope))
+                .map(|target| ScaffoldControlTarget {
+                    sandbox_id: target.sandbox_id.clone(),
+                    scope: target.scope.clone(),
+                })
+                .or_else(|| {
+                    persisted_scaffold_reconnect_target(
+                        &state.session_refs,
+                        principal,
+                        &session_id,
+                        &owner_device_id,
+                        required_capability,
+                    )
+                })
+                .or_else(|| {
+                    scaffold_reconnect_target(
+                        snapshot,
+                        principal,
+                        &session_id,
+                        &owner_device_id,
+                        required_capability,
+                        now,
+                    )
+                })
+                .map(Some)
+                .ok_or_else(|| SharedString::from("Could not reconnect to this session"))?
         } else {
             None
         };
@@ -4596,23 +4738,10 @@ impl Composer {
             return false;
         }
         if let Some(target) = self.agent_target.as_deref() {
-            return state
-                .collaboration
-                .as_ref()
-                .and_then(|snapshot| {
-                    snapshot
-                        .sessions
-                        .iter()
-                        .find(|session| session.session_id == target)
-                })
-                .and_then(|session| session.status)
-                .is_some_and(|status| {
-                    matches!(
-                        status,
-                        comet_proto::SessionStatus::Working
-                            | comet_proto::SessionStatus::AwaitingInput
-                    )
-                });
+            return matches!(
+                state.agent_indicator_for(target, chrono::Utc::now()),
+                Indicator::Working | Indicator::AwaitingInput
+            );
         }
         let Some(chat_id) = state.selected_chat.as_deref() else {
             return false;
@@ -5090,7 +5219,7 @@ impl Composer {
                             error = %reason,
                             "Scaffold readiness deadline reached"
                         );
-                        return Err(format!("Could not start Scaffold session: {reason}"));
+                        return Err("Could not start Scaffold session".into());
                     }
                     this.update(cx, |composer, cx| {
                         composer.state.update(cx, |state, cx| {
@@ -5124,7 +5253,26 @@ impl Composer {
                             error = %error,
                             "Scaffold session reconnect failed"
                         );
-                        "Reconnect to control this session".to_string()
+                        "Could not reconnect to this session".to_string()
+                    })?;
+                    crate::state::update_scaffold_session_agent_route(
+                        &engine,
+                        &target.sandbox_id,
+                        &target.scope,
+                        &scaffold_agent_binding
+                            .as_ref()
+                            .expect("attached Scaffold session has a resolved route")
+                            .route,
+                        &scaffold_retry_delay,
+                    )
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!(
+                            sandbox_id = %target.sandbox_id,
+                            error = %error,
+                            "Scaffold session agent route update failed"
+                        );
+                        "Could not reconnect to this session".to_string()
                     })?;
                     start_agent_mode = scaffold_turn_requires_start(
                         start_agent_mode,
@@ -5141,6 +5289,7 @@ impl Composer {
                         .expect("Scaffold reconnect preserves its control route");
                     route.session_id = attachment.projection.session_id.clone();
                     route.owner_device_id = attachment.owner_device_id.clone();
+                    route.actor_subject = attachment.actor_subject.clone();
                     route.grant_id = attachment.grant_id.clone();
                     this.update(cx, |composer, cx| {
                         composer.state.update(cx, |state, cx| {
@@ -5379,12 +5528,16 @@ impl Composer {
                     attachments: image_paths.clone(),
                 };
                 let command = if let Some(route) = control_route {
-                    let action = if start_agent_mode {
-                        SessionControlAction::Start {
-                            request: run_request(),
-                            message_id: message_id.clone(),
-                        }
-                    } else if queue_cmd {
+                    if route.source == AgentSessionSource::Scaffold && route.grant_id.is_empty() {
+                        return Err("Could not reconnect to this session".into());
+                    }
+                    let action =
+                        if scaffold_control_uses_start(start_agent_mode, steer_cmd, queue_cmd) {
+                            SessionControlAction::Start {
+                                request: run_request(),
+                                message_id: message_id.clone(),
+                            }
+                        } else if queue_cmd {
                         SessionControlAction::Queue {
                             prompt: content.clone(),
                             message_id: Some(message_id.clone()),
@@ -6479,6 +6632,14 @@ mod tests {
     }
 
     #[test]
+    fn completed_scaffold_send_starts_a_new_turn_with_latest_config() {
+        assert!(scaffold_control_uses_start(false, false, false));
+        assert!(scaffold_control_uses_start(true, true, false));
+        assert!(!scaffold_control_uses_start(false, true, false));
+        assert!(!scaffold_control_uses_start(false, false, true));
+    }
+
+    #[test]
     fn scaffold_handoff_uses_the_remote_workspace_cwd() {
         assert_eq!(
             scaffold_run_cwd("/Users/alice/project", Some("/workspace/ashler-platform")),
@@ -6548,6 +6709,20 @@ mod tests {
         assert_eq!(
             scaffold_run_model(true, Some(&binding), Some("wrong-model")).as_deref(),
             persisted.model.as_deref()
+        );
+    }
+
+    #[test]
+    fn existing_scaffold_turn_uses_the_latest_model_binding() {
+        let initial =
+            scaffold_agent_binding(Some(HarnessId::Omp), Some("anthropic/claude-opus-5")).unwrap();
+        let changed =
+            scaffold_agent_binding(Some(HarnessId::Omp), Some("openai/gpt-5.6-sol")).unwrap();
+
+        assert_ne!(initial.model_id, changed.model_id);
+        assert_eq!(
+            scaffold_run_model(true, Some(&changed), Some(&initial.model_id)),
+            Some("openai-codex/gpt-5.6-sol".into())
         );
     }
     #[test]
@@ -7488,6 +7663,65 @@ mod tests {
                 "grant-a".into(),
             ))
         );
+        snapshot.grants[0].expires_at = Some(5_000);
+        let reconnect = scaffold_reconnect_target(
+            &snapshot,
+            snapshot.principal.as_ref().unwrap(),
+            "session-a",
+            "comet-scaffold-sandbox-a-e1",
+            comet_proto::CAPABILITY_SESSION_CHAT,
+            10_000,
+        )
+        .expect("an expired lifecycle grant must retain only the reconnect target");
+        assert_eq!(reconnect.sandbox_id, "sandbox-a");
+        assert_eq!(
+            reconnect.scope.deployment_id.as_deref(),
+            Some("deployment-a")
+        );
+
+        snapshot.grants[0].revoked_at = Some(9_000);
+        assert!(
+            scaffold_reconnect_target(
+                &snapshot,
+                snapshot.principal.as_ref().unwrap(),
+                "session-a",
+                "comet-scaffold-sandbox-a-e1",
+                comet_proto::CAPABILITY_SESSION_CHAT,
+                10_000,
+            )
+            .is_none(),
+            "revoked grants must not supply reconnect targets"
+        );
+        snapshot.grants[0].revoked_at = None;
+        snapshot.grants[0].principal_subject = "accounts.google.com:subject-mallory".into();
+        assert!(
+            scaffold_reconnect_target(
+                &snapshot,
+                snapshot.principal.as_ref().unwrap(),
+                "session-a",
+                "comet-scaffold-sandbox-a-e1",
+                comet_proto::CAPABILITY_SESSION_CHAT,
+                10_000,
+            )
+            .is_none(),
+            "another principal's grant must not supply a reconnect target"
+        );
+        snapshot.grants[0].principal_subject = "accounts.google.com:subject-alice".into();
+        snapshot.grants[0].capabilities.clear();
+        assert!(
+            scaffold_reconnect_target(
+                &snapshot,
+                snapshot.principal.as_ref().unwrap(),
+                "session-a",
+                "comet-scaffold-sandbox-a-e1",
+                comet_proto::CAPABILITY_SESSION_CHAT,
+                10_000,
+            )
+            .is_none(),
+            "a grant without the requested capability must not supply a reconnect target"
+        );
+        snapshot.grants[0].capabilities = vec![comet_proto::CAPABILITY_SESSION_CHAT.into()];
+        snapshot.grants[0].expires_at = Some(60_000);
 
         snapshot.grants[0].sandbox_id = Some("wrong-sandbox".into());
         assert_eq!(
@@ -7498,6 +7732,62 @@ mod tests {
                 10_000,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn persisted_scaffold_environment_restores_reconnect_target_after_restart() {
+        let principal: comet_proto::CollaborationPrincipal =
+            serde_json::from_value(serde_json::json!({
+                "subject": "accounts.google.com:subject-alice",
+                "projectId": "project-a",
+                "capabilities": ["session.chat"]
+            }))
+            .unwrap();
+        let mut session_ref: comet_proto::SessionRef = serde_json::from_value(serde_json::json!({
+            "chatId": "session-a",
+            "addedAt": "2026-08-16T00:00:00Z",
+            "environment": {
+                "source": {
+                    "kind": "scaffold",
+                    "sandbox_id": "sandbox-a",
+                    "lifecycle": "paused",
+                    "lifecycle_epoch": 2,
+                    "links": {}
+                },
+                "ownerPrincipal": "accounts.google.com:subject-alice",
+                "scope": {
+                    "projectId": "project-a",
+                    "deploymentId": "deployment-a",
+                    "sessionId": "session-a"
+                }
+            }
+        }))
+        .unwrap();
+
+        let target = persisted_scaffold_reconnect_target(
+            std::slice::from_ref(&session_ref),
+            &principal,
+            "session-a",
+            "comet-scaffold-sandbox-a-e1",
+            comet_proto::CAPABILITY_SESSION_CHAT,
+        )
+        .expect("persisted verified environment should restore the exact reconnect route");
+        assert_eq!(target.sandbox_id, "sandbox-a");
+        assert_eq!(target.scope.deployment_id.as_deref(), Some("deployment-a"));
+
+        session_ref.environment.as_mut().unwrap().owner_principal =
+            "accounts.google.com:subject-mallory".into();
+        assert!(
+            persisted_scaffold_reconnect_target(
+                &[session_ref],
+                &principal,
+                "session-a",
+                "comet-scaffold-sandbox-a-e1",
+                comet_proto::CAPABILITY_SESSION_CHAT,
+            )
+            .is_none(),
+            "another principal's persisted environment must not restore control"
         );
     }
 
