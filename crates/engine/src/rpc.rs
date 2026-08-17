@@ -582,13 +582,12 @@ impl EngineRpc {
             .ok_or_else(|| RpcError::Failed("scaffold_control_plane_unavailable".into()))
     }
 
-    async fn prepare_scaffold_attach(
+    fn prepare_scaffold_attach(
         &self,
         control: &ScaffoldEnvironmentControl,
-        cancellation: &comet_harness::CancellationToken,
-    ) -> Result<(), RpcError> {
+    ) -> Result<Option<std::sync::Arc<crate::doc_host::ChatDocHandle>>, RpcError> {
         let ScaffoldEnvironmentControl::Attach { scope, .. } = control else {
-            return Ok(());
+            return Ok(None);
         };
         let auth_state = self.auth()?.state();
         let project_scope = auth_state
@@ -602,24 +601,34 @@ impl EngineRpc {
             .as_deref()
             .filter(|value| !value.trim().is_empty())
         else {
-            return Ok(());
+            return Ok(None);
         };
         let Some(session_id) = scope
             .session_id
             .as_deref()
             .filter(|value| !value.trim().is_empty())
         else {
-            return Ok(());
+            return Ok(None);
         };
         let projection = SessionRoomProjection {
             project_id: scope.project_id.clone(),
             deployment_id: deployment_id.to_string(),
             session_id: session_id.to_string(),
         };
-        let handle = self
-            .doc_host
+        self.doc_host
             .open_projection(session_id, Some(&projection))
-            .map_err(|error| RpcError::Failed(error.to_string()))?;
+            .map(Some)
+            .map_err(|error| RpcError::Failed(error.to_string()))
+    }
+
+    async fn await_scaffold_owner_room(
+        &self,
+        handle: Option<&crate::doc_host::ChatDocHandle>,
+        cancellation: &comet_harness::CancellationToken,
+    ) -> Result<(), RpcError> {
+        let Some(handle) = handle else {
+            return Ok(());
+        };
         tokio::time::timeout(SCAFFOLD_OWNER_ROOM_READY_TIMEOUT, async {
             while !handle.connected() {
                 tokio::select! {
@@ -1974,8 +1983,7 @@ impl RpcService for EngineRpc {
                 let control: ScaffoldEnvironmentControl = parse_params(params)?;
                 let cancellation = comet_harness::CancellationToken::new();
                 let scaffold = self.scaffold()?;
-                self.prepare_scaffold_attach(&control, &cancellation)
-                    .await?;
+                let owner_room = self.prepare_scaffold_attach(&control)?;
                 let result = scaffold
                     .control(control, &cancellation)
                     .await
@@ -2004,6 +2012,8 @@ impl RpcService for EngineRpc {
                         "Scaffold attached without local control grant projection"
                     );
                 }
+                self.await_scaffold_owner_room(owner_room.as_deref(), &cancellation)
+                    .await?;
                 RpcReply::value(&result)
             }
             methods::WATCH_SESSIONS => {
@@ -2715,6 +2725,39 @@ mod tests {
             Some(comet_proto::Utf8ByteRange { start: 7, end: 15 })
         );
         assert_eq!(projected.state, comet_proto::AnnotationState::Reanchored);
+    }
+
+    #[tokio::test]
+    async fn scaffold_attach_preparation_does_not_wait_for_the_remote_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = crate::EngineCore::assemble_with_identity(
+            dir.path(),
+            std::sync::Arc::new(crate::default_registry(RuntimeProfile::Mock)),
+            HarnessId::Mock,
+            None,
+            "project-a",
+            "accounts.google.com:subject-alice",
+            RuntimeProfile::Mock,
+        )
+        .unwrap();
+        let rpc = core.rpc_service();
+        let control = ScaffoldEnvironmentControl::Attach {
+            sandbox_id: "sandbox-a".into(),
+            scope: CollaborationScope {
+                project_id: "project-a".into(),
+                deployment_id: Some("deployment-a".into()),
+                session_id: Some("session-a".into()),
+                unknown: Default::default(),
+            },
+        };
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            rpc.prepare_scaffold_attach(&control)
+        })
+        .await
+        .expect("preparing an attach must not wait for the stopped remote owner")
+        .unwrap();
+        core.shutdown().await;
     }
 
     #[test]

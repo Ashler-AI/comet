@@ -730,6 +730,9 @@ fn is_retryable_scaffold_control_error(error: &RpcError) -> bool {
                     "scaffold_api_error:409:sandbox_provider_error:Sandbox lifecycle changed while the operation was in flight",
                 )
                 || message.contains("scaffold_session_owner_room_unavailable")
+                || message.contains(
+                    "scaffold_api_error:404:sandbox_provider_error:E2B sandbox control channel is unavailable",
+                )
                 || (message.contains("scaffold_response_invalid: sandbox ")
                     && message.contains(" is not ready"))
                 || message.contains(
@@ -3481,6 +3484,10 @@ mod tests {
         )));
         assert!(is_retryable_scaffold_control_error(&RpcError::Failed(
             "scaffold_api_error:404:not_found:Sandbox agent route projection failed".into()
+        )));
+        assert!(is_retryable_scaffold_control_error(&RpcError::Failed(
+            "scaffold_api_error:404:sandbox_provider_error:E2B sandbox control channel is unavailable"
+                .into()
         )));
         assert!(is_retryable_scaffold_control_error(&RpcError::Failed(
             "scaffold_response_invalid: sandbox rcs_1 is not ready".into()
