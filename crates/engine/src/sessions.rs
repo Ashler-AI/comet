@@ -148,6 +148,13 @@ struct HarnessSessionRef {
     cwd: String,
 }
 
+#[derive(Debug, Clone)]
+struct BlockedOmpTakeover {
+    session_id: String,
+    request: RunRequest,
+    user_message_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RunAuthIdentity {
     Unattached,
@@ -316,6 +323,10 @@ struct Inner {
     /// (comet kept the same pair on `chats.harness_session_id`). An empty
     /// session id is the "do not resume" tombstone after a rejected resume.
     harness_sessions: Mutex<HashMap<String, HarnessSessionRef>>,
+    /// Failed OMP resumes whose exact request can be retried after a verified
+    /// writer stop. Process-local by design: takeover only controls a process
+    /// visible to this engine host.
+    blocked_omp_takeovers: Mutex<HashMap<String, BlockedOmpTakeover>>,
     /// One local live waiter per `(source chat, thread)`. Intentionally process-local:
     /// the command ledger remains the only durable outbox.
     peer_waiters: Mutex<HashMap<(String, String), LivePeerWaiter>>,
@@ -361,6 +372,7 @@ impl SessionsEngine {
                 sessions_tx,
                 last_requests: Mutex::new(HashMap::new()),
                 harness_sessions: Mutex::new(HashMap::new()),
+                blocked_omp_takeovers: Mutex::new(HashMap::new()),
                 peer_waiters: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
                 inference_relay: OnceLock::new(),
@@ -658,6 +670,40 @@ impl SessionsEngine {
             .await
     }
 
+    /// Stop the verified process writing this chat's blocked OMP session, wait
+    /// for the exact journal to become inactive, then retry the original user
+    /// request idempotently under this engine.
+    pub async fn take_over_omp_session(&self, chat_id: &str) -> Result<String, EngineError> {
+        let dispatch_lock = self.dispatch_lock(chat_id);
+        let _dispatch_guard = dispatch_lock.lock().await;
+        if lock(&self.inner.runs).contains_key(chat_id) {
+            return Err(EngineError::Other(
+                "This Comet engine already owns a live run for the session".into(),
+            ));
+        }
+        let blocked = lock(&self.inner.blocked_omp_takeovers)
+            .get(chat_id)
+            .cloned()
+            .ok_or_else(|| {
+                EngineError::Other("No externally running OMP session is awaiting takeover".into())
+            })?;
+        let harness = self.inner.registry.resolve(HarnessId::Omp)?;
+        harness.stop_session(&blocked.session_id).await?;
+        let result = self
+            .dispatch_inner_locked(
+                chat_id,
+                HarnessId::Omp,
+                blocked.request,
+                Some(blocked.user_message_id),
+                true,
+            )
+            .await;
+        if result.is_ok() {
+            lock(&self.inner.blocked_omp_takeovers).remove(chat_id);
+        }
+        result
+    }
+
     /// [`Self::dispatch`] with resume injection controllable: the failed-resume
     /// retry re-dispatches with `inject_resume = false` so a session id the
     /// harness just rejected can never be re-injected from the journal.
@@ -938,6 +984,16 @@ impl SessionsEngine {
         let stream = match harness.run(request.clone(), controls).await {
             Ok(stream) => stream,
             Err(err) => {
+                if let HarnessError::SessionBusy { session_id } = &err {
+                    lock(&self.inner.blocked_omp_takeovers).insert(
+                        chat_id.to_string(),
+                        BlockedOmpTakeover {
+                            session_id: session_id.clone(),
+                            request: request.clone(),
+                            user_message_id: user_id.clone(),
+                        },
+                    );
+                }
                 self.inner.mark_run_tearing_down(chat_id, &run_id);
                 if let (Some(relay), Some(token)) =
                     (self.inner.inference_relay.get(), inference_token.as_deref())
@@ -986,6 +1042,7 @@ impl SessionsEngine {
                 return Err(err.into());
             }
         };
+        lock(&self.inner.blocked_omp_takeovers).remove(chat_id);
 
         tokio::spawn(drive_run(
             self.inner.clone(),
@@ -2560,6 +2617,177 @@ mod tests {
         changed_account.agent_account_id = Some("account-b".into());
         assert!(sessions.no_live_route_requires_rebind("chat-a", &changed_account));
     }
+    struct TakeoverHarness {
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+        stops: Arc<std::sync::atomic::AtomicUsize>,
+        requests: Arc<Mutex<Vec<RunRequest>>>,
+    }
+
+    #[async_trait]
+    impl Harness for TakeoverHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Omp
+        }
+
+        fn display_name(&self) -> &str {
+            "OMP takeover test"
+        }
+
+        fn supports_steering(&self) -> bool {
+            true
+        }
+
+        fn steering_mode(&self) -> SteeringMode {
+            SteeringMode::StepBoundary
+        }
+
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[ReasoningLevel::Medium]
+        }
+
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+            Ok(Vec::new())
+        }
+
+        async fn stop_session(&self, session_id: &str) -> Result<(), HarnessError> {
+            assert_eq!(session_id, "native-takeover-session");
+            self.stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn run(
+            &self,
+            request: RunRequest,
+            _controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            lock(&self.requests).push(request.clone());
+            if self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Err(HarnessError::SessionBusy {
+                    session_id: "native-takeover-session".into(),
+                });
+            }
+            Ok(futures::stream::iter([
+                Ok(AgentEvent::SessionStarted {
+                    harness: HarnessId::Omp,
+                    model: "test-model".into(),
+                    tools: Vec::new(),
+                    cwd: request.cwd,
+                    session_id: "native-takeover-session".into(),
+                    assistant_message_id: "takeover-assistant".into(),
+                }),
+                Ok(AgentEvent::TextDelta {
+                    text: "resumed".into(),
+                }),
+                Ok(AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: Some("native-takeover-session".into()),
+                }),
+            ])
+            .boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn takeover_stops_writer_and_retries_the_exact_failed_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path().join("store")).unwrap());
+        let workspace = WorkspaceHost::open(
+            store.clone(),
+            WorkspaceHostConfig {
+                device_id: "takeover-device".into(),
+                device_name: "test".into(),
+                platform: "test".into(),
+                project_scope: "project-a".into(),
+                user_id: "owner-a".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        workspace
+            .create_space("takeover-space", "takeover-device", "/tmp", None, false)
+            .unwrap();
+        workspace
+            .create_chat("takeover-chat", "takeover-space", None, Some("/tmp".into()))
+            .unwrap();
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "takeover-device".into(),
+                default_harness: HarnessId::Omp,
+                edge: None,
+            },
+        );
+        host.set_workspace(workspace);
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let registry = HarnessRegistry::for_profile(RuntimeProfile::LocalController);
+        registry.register(Arc::new(TakeoverHarness {
+            runs: runs.clone(),
+            stops: stops.clone(),
+            requests: requests.clone(),
+        }));
+        let sessions = SessionsEngine::new(
+            "takeover-device".into(),
+            Arc::new(RunJournal::open(dir.path().join("journal")).unwrap()),
+            Arc::new(registry),
+            27654,
+        );
+        sessions.set_doc_host(host);
+        let request = RunRequest {
+            prompt: "finish the original request".into(),
+            model: Some("test-model".into()),
+            agent_account_id: None,
+            reasoning: Some(ReasoningLevel::Medium),
+            model_options: Default::default(),
+            cwd: "/tmp".into(),
+            sandbox: SandboxLevel::WorkspaceWrite,
+            auto_approve: true,
+            attachments: Vec::new(),
+            resume: Some("native-takeover-session".into()),
+        };
+        let error = sessions
+            .dispatch(
+                "takeover-chat",
+                HarnessId::Omp,
+                request.clone(),
+                Some("takeover-user-message".into()),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("already running"));
+        assert!(lock(&sessions.inner.blocked_omp_takeovers).contains_key("takeover-chat"));
+
+        sessions
+            .take_over_omp_session("takeover-chat")
+            .await
+            .expect("takeover resumes the blocked request");
+        assert_eq!(stops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let requests = lock(&requests);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].prompt, request.prompt);
+        assert_eq!(requests[1].prompt, request.prompt);
+        assert_eq!(requests[1].resume, request.resume);
+        assert!(!lock(&sessions.inner.blocked_omp_takeovers).contains_key("takeover-chat"));
+        let entries = sessions
+            .doc_handle("takeover-chat")
+            .unwrap()
+            .doc_arc()
+            .read_entries()
+            .unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.id == "takeover-user-message")
+                .count(),
+            1,
+            "retry must reuse the original user message id"
+        );
+    }
+
     struct RouteRestartHarness {
         requests: Arc<Mutex<Vec<RunRequest>>>,
     }

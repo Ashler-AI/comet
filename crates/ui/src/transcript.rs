@@ -2272,7 +2272,24 @@ impl Transcript {
             RowKind::InputChip { header, resolved } => {
                 input_chip(header.clone(), *resolved, &theme)
             }
-            RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
+            RowKind::ErrorChip { message } => {
+                let takeover = if is_omp_session_busy_error(message.as_ref()) {
+                    self.chat_id.clone().and_then(|chat_id| {
+                        let error_id = row.id.to_string();
+                        let state = self.state.read(cx);
+                        (!state.omp_takeover_completed(&error_id)).then(|| OmpTakeoverChip {
+                            chat_id,
+                            error_id: error_id.clone(),
+                            in_progress: state.omp_takeover_in_progress(&error_id),
+                            error: state.omp_takeover_error(&error_id).map(Into::into),
+                            state: self.state.clone(),
+                        })
+                    })
+                } else {
+                    None
+                };
+                error_chip(message.clone(), &theme, takeover, cx)
+            }
         };
 
         // Hover-revealed timestamp strip (comet chat-view.tsx `Timestamp`):
@@ -2847,64 +2864,118 @@ fn user_mention_text(
         .into_any_element()
 }
 
+fn is_omp_session_busy_error(message: &str) -> bool {
+    message.contains("OMP session is already running")
+}
+
+struct OmpTakeoverChip {
+    chat_id: String,
+    error_id: String,
+    in_progress: bool,
+    error: Option<SharedString>,
+    state: Entity<AppState>,
+}
+
 /// The transcript ErrorChip — an exact port of comet chat-view.tsx
 /// `ErrorChip`: a 34px row (`rounded-[10px] border border-red-400/[0.16]
 /// bg-red-400/[0.05] px-2 text-[12px]`) with a 20px red-washed tile holding a
 /// 12px DangerTriangle (`bg-red-400/[0.12] text-red-300/80`), a medium
 /// "Error" label, then the human message truncating at `text-foreground/80` —
 /// a subtle red-tinted wash, never a bare red-stroke box.
-fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
+fn error_chip(
+    message: SharedString,
+    theme: &Theme,
+    takeover: Option<OmpTakeoverChip>,
+    cx: &mut Context<Transcript>,
+) -> AnyElement {
     let red_300 = theme.danger_muted; // tailwind red-300
     let danger = theme.danger; // red-400
-    div()
-        .py(px(4.0))
+    let visible_message = takeover
+        .as_ref()
+        .and_then(|takeover| takeover.error.clone())
+        .unwrap_or(message);
+    let mut chip = div()
+        .h(px(34.0))
         .w_full()
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .overflow_hidden()
+        .rounded(px(10.0))
+        .border_1()
+        .border_color(danger.opacity(0.16))
+        .bg(danger.opacity(0.05))
+        .px(px(8.0))
+        .text_size(px(12.0))
         .child(
             div()
-                .h(px(34.0))
-                .w_full()
+                .flex_none()
+                .size(px(20.0))
+                .rounded(px(6.0))
+                .bg(danger.opacity(0.12))
                 .flex()
                 .items_center()
-                .gap(px(8.0))
-                .overflow_hidden()
-                .rounded(px(10.0))
-                .border_1()
-                .border_color(danger.opacity(0.16))
-                .bg(danger.opacity(0.05))
-                .px(px(8.0))
-                .text_size(px(12.0))
+                .justify_center()
                 .child(
-                    div()
-                        .flex_none()
-                        .size(px(20.0))
-                        .rounded(px(6.0))
-                        .bg(danger.opacity(0.12))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            crate::icons::icon(crate::icons::DANGER_TRIANGLE)
-                                .size(px(12.0))
-                                .text_color(red_300.opacity(0.8)),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(red_300.opacity(0.8))
-                        .child(SharedString::from("Error")),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .truncate()
-                        .text_color(theme.text.opacity(0.8))
-                        .child(message),
+                    crate::icons::icon(crate::icons::DANGER_TRIANGLE)
+                        .size(px(12.0))
+                        .text_color(red_300.opacity(0.8)),
                 ),
         )
-        .into_any_element()
+        .child(
+            div()
+                .flex_none()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(red_300.opacity(0.8))
+                .child(SharedString::from("Error")),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .flex_1()
+                .truncate()
+                .text_color(theme.text.opacity(0.8))
+                .child(visible_message),
+        );
+    if let Some(takeover) = takeover {
+        let label = if takeover.in_progress {
+            "Stopping OMP…"
+        } else if takeover.error.is_some() {
+            "Retry takeover"
+        } else {
+            "Stop & resume in Comet"
+        };
+        let button_id = fnv1a(takeover.error_id.as_bytes());
+        let state = takeover.state.clone();
+        let chat_id = takeover.chat_id.clone();
+        let error_id = takeover.error_id.clone();
+        chip = chip.child(
+            div()
+                .id(("omp-takeover", button_id))
+                .flex_none()
+                .h(px(24.0))
+                .px(px(8.0))
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(theme.accent.opacity(0.24))
+                .bg(theme.accent.opacity(0.1))
+                .text_color(theme.accent)
+                .flex()
+                .items_center()
+                .when(!takeover.in_progress, |button| {
+                    button
+                        .cursor_pointer()
+                        .hover(|button| button.bg(theme.accent.opacity(0.16)))
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            state.update(cx, |state, cx| {
+                                state.take_over_omp_session(chat_id.clone(), error_id.clone(), cx);
+                            })
+                        }))
+                })
+                .child(label),
+        );
+    }
+    div().py(px(4.0)).w_full().child(chip).into_any_element()
 }
 
 /// A passive one-line chip marking a question the agent asked — the
@@ -3249,6 +3320,17 @@ impl Render for Transcript {
 mod tests {
     use super::*;
     use comet_doc::MessagePart;
+
+    #[test]
+    fn only_omp_busy_errors_offer_takeover() {
+        assert!(is_omp_session_busy_error(
+            "harness protocol error: This OMP session is already running. Close it before resuming here."
+        ));
+        assert!(is_omp_session_busy_error(
+            "This OMP session is already running. Stop it before resuming in Comet."
+        ));
+        assert!(!is_omp_session_busy_error("OMP exited with status 1"));
+    }
 
     // ---- streaming parse wiring (the transcript side, not the parser) ----
 

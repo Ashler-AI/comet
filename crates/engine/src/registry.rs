@@ -139,6 +139,15 @@ impl HarnessRegistry {
 /// `claude-code` slot resolved through `comet_harness` on first use (subprocess
 /// discovery only happens when a run/model call actually needs it).
 pub fn default_registry(profile: RuntimeProfile) -> HarnessRegistry {
+    default_registry_with_omp_supervisor(profile, None)
+}
+
+/// Production registry with an optional Comet binary that supervises
+/// persistent OMP children. Tests and library embedders may omit it.
+pub fn default_registry_with_omp_supervisor(
+    profile: RuntimeProfile,
+    omp_supervisor: Option<std::path::PathBuf>,
+) -> HarnessRegistry {
     // Warm the login-shell PATH snapshot in the background so the first
     // claude/codex resolve doesn't pay the shell-startup latency inline.
     comet_harness::shell_env::prewarm();
@@ -251,6 +260,10 @@ pub fn default_registry(profile: RuntimeProfile) -> HarnessRegistry {
                 comet_harness::OmpHarness::scaffold_host()
             } else {
                 comet_harness::OmpHarness::new()
+            };
+            let harness = match omp_supervisor.as_ref() {
+                Some(executable) => harness.with_supervisor_executable(executable),
+                None => harness,
             };
             Ok(Arc::new(harness) as Arc<dyn Harness>)
         }),

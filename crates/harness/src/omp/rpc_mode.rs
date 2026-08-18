@@ -256,12 +256,63 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<RpcFr
     let _ = tx.send(RpcFrame::Eof).await;
 }
 
+pub(crate) struct ProcessGroupGuard {
+    group: Option<i32>,
+}
+
+impl ProcessGroupGuard {
+    pub(crate) fn new(group: Option<i32>) -> Self {
+        Self { group }
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(group) = self.group.filter(|group| {
+            *group > 1 && {
+                // SAFETY: getpgrp has no preconditions.
+                *group != unsafe { libc::getpgrp() }
+            }
+        }) {
+            // SAFETY: this guard is created only for an OMP command launched
+            // into its own process group. ESRCH after explicit teardown is fine.
+            unsafe {
+                libc::kill(-group, libc::SIGKILL);
+            }
+        }
+    }
+}
+
 pub(crate) struct RpcModeProcess {
     pub child: Child,
+    /// Dedicated process group for this persistent run (supervisor + OMP +
+    /// tool descendants). `None` only for one-shot catalogs and legacy tests.
+    pub process_group: Option<i32>,
+    /// Drop guard for task cancellation, panic unwind, and setup failures.
+    pub process_group_guard: ProcessGroupGuard,
     pub client: RpcModeClient,
     pub frames: mpsc::Receiver<RpcFrame>,
     pub stderr_tail: crate::StderrTail,
     pub run_config: Option<super::OmpRunConfig>,
+}
+
+async fn kill_rpc_process(child: &mut Child, process_group: Option<i32>) {
+    #[cfg(unix)]
+    if let Some(group) = process_group.filter(|group| {
+        *group > 1 && {
+            // SAFETY: getpgrp has no preconditions.
+            *group != unsafe { libc::getpgrp() }
+        }
+    }) {
+        // SAFETY: OMP run commands create this dedicated group before exec.
+        unsafe {
+            libc::kill(-group, libc::SIGKILL);
+        }
+        let _ = child.wait().await;
+        return;
+    }
+    let _ = child.kill().await;
 }
 
 fn rpc_assistant_message_id(session_id: &str, nonce: &uuid::Uuid, turn: u64) -> String {
@@ -734,6 +785,8 @@ pub(crate) async fn run_rpc(
         client,
         mut frames,
         stderr_tail,
+        process_group,
+        process_group_guard: _process_group_guard,
         run_config: _run_config,
     } = process;
     let RunControls {
@@ -846,13 +899,13 @@ pub(crate) async fn run_rpc(
         .await
         .is_err()
     {
-        let _ = child.kill().await;
+        kill_rpc_process(&mut child, process_group).await;
         return Ok(());
     }
     if let Some(goal_event) = goal_state_event_from_session_state(&state)
         && events.send(Ok(goal_event)).await.is_err()
     {
-        let _ = child.kill().await;
+        kill_rpc_process(&mut child, process_group).await;
         return Ok(());
     }
 
@@ -913,7 +966,7 @@ pub(crate) async fn run_rpc(
                             _ => None,
                         };
                         if let Some(event) = mapped && events.send(Ok(event)).await.is_err() {
-                            let _ = child.kill().await;
+                            kill_rpc_process(&mut child, process_group).await;
                             return Ok(());
                         }
                     }
@@ -925,7 +978,7 @@ pub(crate) async fn run_rpc(
                             if let Some(usage) = usage_event(message)
                                 && events.send(Ok(usage)).await.is_err()
                             {
-                                let _ = child.kill().await;
+                                kill_rpc_process(&mut child, process_group).await;
                                 return Ok(());
                             }
                         }
@@ -934,7 +987,7 @@ pub(crate) async fn run_rpc(
                         if let Some(event) = tool_call_from_start(&frame)
                             && events.send(Ok(event)).await.is_err()
                         {
-                            let _ = child.kill().await;
+                            kill_rpc_process(&mut child, process_group).await;
                             return Ok(());
                         }
                     }
@@ -944,7 +997,7 @@ pub(crate) async fn run_rpc(
                         if let Some(event) = tool_result_from_end(&frame)
                             && events.send(Ok(event)).await.is_err()
                         {
-                            let _ = child.kill().await;
+                            kill_rpc_process(&mut child, process_group).await;
                             return Ok(());
                         }
                         // The todo tool mutates session-held state; the frame
@@ -961,7 +1014,7 @@ pub(crate) async fn run_rpc(
                                 .await
                                 .is_err()
                             {
-                                let _ = child.kill().await;
+                                kill_rpc_process(&mut child, process_group).await;
                                 return Ok(());
                             }
                         }
@@ -970,7 +1023,7 @@ pub(crate) async fn run_rpc(
                         if let Some(event) = goal_state_event_from_frame(&frame)
                             && events.send(Ok(event)).await.is_err()
                         {
-                            let _ = child.kill().await;
+                            kill_rpc_process(&mut child, process_group).await;
                             return Ok(());
                         }
                     }
@@ -987,13 +1040,13 @@ pub(crate) async fn run_rpc(
                         if let Some(message) = turn_error.clone()
                             && events.send(Ok(AgentEvent::Error { message })).await.is_err()
                         {
-                            let _ = child.kill().await;
+                            kill_rpc_process(&mut child, process_group).await;
                             return Ok(());
                         }
                         // A terminal error closes the persistent RPC run. Reap its
                         // session writer before Done makes queued recovery dispatchable.
                         if status == DoneStatus::Errored {
-                            let _ = child.kill().await;
+                            kill_rpc_process(&mut child, process_group).await;
                         }
                         done_emitted = true;
                         if events
@@ -1006,7 +1059,7 @@ pub(crate) async fn run_rpc(
                             .await
                             .is_err()
                         {
-                            let _ = child.kill().await;
+                            kill_rpc_process(&mut child, process_group).await;
                             return Ok(());
                         }
                         if status == DoneStatus::Errored {
@@ -1028,7 +1081,7 @@ pub(crate) async fn run_rpc(
                                 .await
                                 .is_err()
                             {
-                                let _ = child.kill().await;
+                                kill_rpc_process(&mut child, process_group).await;
                                 return Ok(());
                             }
                         }
@@ -1043,7 +1096,7 @@ pub(crate) async fn run_rpc(
                                     .and_then(Value::as_str)
                                     .unwrap_or("prompt was rejected")
                                     .to_string();
-                                let _ = child.kill().await;
+                                kill_rpc_process(&mut child, process_group).await;
                                 return Err(HarnessError::Protocol(format!(
                                     "{} prompt failed: {message}",
                                     options.process_label
@@ -1059,7 +1112,7 @@ pub(crate) async fn run_rpc(
                                         let event = goal_state_event_from_session_state(&state)
                                             .unwrap_or_else(|| goal_state_event(Value::Null, None));
                                         if events.send(Ok(event)).await.is_err() {
-                                            let _ = child.kill().await;
+                                            kill_rpc_process(&mut child, process_group).await;
                                             return Ok(());
                                         }
                                     }
@@ -1087,7 +1140,7 @@ pub(crate) async fn run_rpc(
                                     .await
                                     .is_err()
                                 {
-                                    let _ = child.kill().await;
+                                    kill_rpc_process(&mut child, process_group).await;
                                     return Ok(());
                                 }
                             }
@@ -1136,7 +1189,7 @@ pub(crate) async fn run_rpc(
                         .await
                         .is_err()
                     {
-                        let _ = child.kill().await;
+                        kill_rpc_process(&mut child, process_group).await;
                         return Ok(());
                     }
                     done_emitted = false;
@@ -1158,7 +1211,7 @@ pub(crate) async fn run_rpc(
                     client.request("abort", Map::new()),
                 )
                 .await;
-                let _ = child.kill().await;
+                kill_rpc_process(&mut child, process_group).await;
                 events
                     .send(Ok(AgentEvent::Done {
                         status: DoneStatus::Interrupted,
@@ -1182,7 +1235,7 @@ pub(crate) async fn run_rpc(
                 inactivity.as_mut().reset(Instant::now() + INACTIVITY_LOG_INTERVAL);
             }
             _ = events.closed() => {
-                let _ = child.kill().await;
+                kill_rpc_process(&mut child, process_group).await;
                 return Ok(());
             }
         }
@@ -1190,7 +1243,7 @@ pub(crate) async fn run_rpc(
         // has fully settled: an early mailbox close (engine teardown racing
         // agent_start) must never kill a turn that is still owed its Done.
         if !steering_open && !streaming && done_emitted && outstanding_prompts.is_empty() {
-            let _ = child.kill().await;
+            kill_rpc_process(&mut child, process_group).await;
             return Ok(());
         }
     }
@@ -1255,13 +1308,38 @@ pub(crate) async fn command_catalog(
     })
     .await
     .map_err(|_| HarnessError::Protocol("OMP command catalog timed out".into()))?;
-    let _ = process.child.kill().await;
+    kill_rpc_process(&mut process.child, process.process_group).await;
     result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn process_group_guard_kills_child_when_run_future_drops() {
+        use std::os::unix::process::CommandExt as _;
+
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "trap '' TERM; while :; do sleep 1; done"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        let guard = ProcessGroupGuard::new(Some(child.id() as i32));
+        drop(guard);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if child.try_wait().unwrap().is_none() {
+            let _ = child.kill();
+            panic!("process group survived its run guard");
+        }
+    }
 
     #[test]
     fn chunk_reassembly_round_trips() {

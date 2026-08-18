@@ -40,7 +40,9 @@ pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
 pub use instance_lock::InstanceLock;
 pub use local_sessions::capture_omp_artifact;
 pub use omp_session_artifact::MAX_OMP_SESSION_ARTIFACT_BYTES;
-pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
+pub use registry::{
+    HarnessDescriptor, HarnessRegistry, default_registry, default_registry_with_omp_supervisor,
+};
 pub use repos::{CheckoutIdentity, Repos, worktree_branch_from_title};
 pub use rpc::EngineRpc;
 pub use run_journal::{JournalError, RunJournal};
@@ -103,6 +105,8 @@ pub struct EngineConfig {
     pub deployment_id: Option<String>,
     /// Scaffold control-plane origin; `None` enables explicit dev bearer mode.
     pub scaffold_url: Option<String>,
+    /// This Comet executable's hidden OMP supervisor entrypoint.
+    pub harness_supervisor_executable: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -592,7 +596,10 @@ impl Engine {
             .unwrap_or_else(|| env_or("COMET_USER_ID", DEFAULT_USER_ID));
         let core = EngineCore::assemble_with_identity_and_ipc_port(
             &config.data_dir,
-            Arc::new(default_registry(config.runtime_profile)),
+            Arc::new(default_registry_with_omp_supervisor(
+                config.runtime_profile,
+                config.harness_supervisor_executable.clone(),
+            )),
             config.default_harness,
             edge.clone(),
             AssemblyContext {
