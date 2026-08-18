@@ -3247,6 +3247,7 @@ mod tests {
                     "lifecycle": lifecycle,
                     "lifecycle_epoch": 1,
                     "links": {
+                        "session": "https://scaffold.example/?q=sandbox-ready",
                         "web": "https://scaffold.example/sessions/sandbox-ready/web"
                     }
                 },
@@ -3422,6 +3423,10 @@ mod tests {
         assert_eq!(
             links.web.as_deref(),
             Some("https://scaffold.example/sessions/sandbox-ready/web")
+        );
+        assert_eq!(
+            links.session.as_deref(),
+            Some("https://scaffold.example/?q=sandbox-ready")
         );
         assert_eq!(
             attachment.owner_device_id,

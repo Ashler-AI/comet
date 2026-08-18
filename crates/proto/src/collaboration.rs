@@ -467,6 +467,8 @@ impl ScaffoldDatabaseEnvironment {
 #[serde(rename_all = "camelCase")]
 pub struct ScaffoldEnvironmentLinks {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opencode: Option<String>,

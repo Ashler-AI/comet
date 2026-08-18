@@ -537,7 +537,7 @@ struct SidebarSessionMeta {
     source: comet_proto::AgentSessionSource,
     runtime_model: SharedString,
     scaffold_web: Option<SharedString>,
-    scaffold_ide: Option<SharedString>,
+    scaffold_session: Option<SharedString>,
 }
 /// Flex gap between sidebar list items.
 const SIDEBAR_LIST_GAP: f32 = 2.0;
@@ -3439,7 +3439,7 @@ impl Shell {
                 .into_any_element()
         });
         let link_actions = (reveal > 0.0
-            && (meta.scaffold_web.is_some() || meta.scaffold_ide.is_some()))
+            && (meta.scaffold_web.is_some() || meta.scaffold_session.is_some()))
         .then(|| {
             div()
                 .flex()
@@ -3473,10 +3473,10 @@ impl Shell {
                             ),
                     )
                 })
-                .when_some(meta.scaffold_ide.clone(), |actions, link| {
+                .when_some(meta.scaffold_session.clone(), |actions, link| {
                     actions.child(
                         div()
-                            .id(SharedString::from(format!("scaffold-ide-{id}")))
+                            .id(SharedString::from(format!("scaffold-session-{id}")))
                             .size(px(18.0))
                             .flex()
                             .items_center()
@@ -3484,7 +3484,7 @@ impl Shell {
                             .rounded(px(5.0))
                             .cursor_pointer()
                             .hover(|el| el.bg(crate::theme::ink(0.10)))
-                            .tooltip(popover::text_tooltip("Open IDE"))
+                            .tooltip(popover::text_tooltip("Open session"))
                             .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                 cx.stop_propagation();
                             })

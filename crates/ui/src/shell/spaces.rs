@@ -39,6 +39,12 @@ fn folder_device_name(name: Option<&str>) -> &str {
         .unwrap_or("Remote device")
 }
 
+fn scaffold_sidebar_surfaces(
+    links: &comet_proto::ScaffoldEnvironmentLinks,
+) -> (Option<String>, Option<String>) {
+    (links.web.clone(), links.session.clone())
+}
+
 /// One logical source in the sidebar. `space` is presentation-only: every
 /// persisted member row remains in `member_ids`, and none of their chats move.
 #[derive(Clone, Debug)]
@@ -936,10 +942,10 @@ impl Shell {
                     let scaffold_environment = state.scaffold_environment(&chat.id);
                     let scaffold_title =
                         scaffold_environment.and_then(|environment| environment.name.clone());
-                    let (scaffold_web, scaffold_ide) = scaffold_environment
+                    let (scaffold_web, scaffold_session) = scaffold_environment
                         .and_then(|environment| match &environment.source {
                             comet_proto::SessionEnvironmentSource::Scaffold { links, .. } => {
-                                Some((links.web.clone(), links.opencode.clone()))
+                                Some(scaffold_sidebar_surfaces(links))
                             }
                             comet_proto::SessionEnvironmentSource::Local => None,
                         })
@@ -976,7 +982,7 @@ impl Shell {
                             source,
                             runtime_model,
                             scaffold_web: scaffold_web.map(SharedString::from),
-                            scaffold_ide: scaffold_ide.map(SharedString::from),
+                            scaffold_session: scaffold_session.map(SharedString::from),
                         },
                     )
                 })
@@ -2146,10 +2152,11 @@ impl Shell {
 mod tests {
     use super::{
         collapse_sidebar_sources, detached_worktree_label, folder_device_name,
-        sidebar_session_source, source_picker_spaces, spaces_with_visible_sessions,
+        scaffold_sidebar_surfaces, sidebar_session_source, source_picker_spaces,
+        spaces_with_visible_sessions,
     };
     use chrono::{DateTime, Utc};
-    use comet_proto::{AgentSessionSource, Space};
+    use comet_proto::{AgentSessionSource, ScaffoldEnvironmentLinks, Space};
     use std::path::PathBuf;
 
     fn space(id: &str, device_id: &str, path: &str, created_at: i64) -> Space {
@@ -2195,6 +2202,24 @@ mod tests {
         assert_eq!(
             sidebar_session_source(Some("device-current"), "device-current", false, None),
             AgentSessionSource::Local
+        );
+    }
+
+    #[test]
+    fn scaffold_sidebar_opens_web_and_session_surfaces() {
+        let links = ScaffoldEnvironmentLinks {
+            session: Some("https://scaffold.example/?q=sandbox-ready".into()),
+            web: Some("https://scaffold.example/sessions/sandbox-ready/web".into()),
+            opencode: Some("https://scaffold.example/sessions/sandbox-ready/opencode".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            scaffold_sidebar_surfaces(&links),
+            (
+                links.web.clone(),
+                Some("https://scaffold.example/?q=sandbox-ready".into())
+            )
         );
     }
 
