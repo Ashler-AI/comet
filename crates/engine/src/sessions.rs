@@ -1163,12 +1163,13 @@ impl SessionsEngine {
         let target = lock(&self.inner.runs).get(chat_id).map(|h| {
             (
                 h.run_id.clone(),
+                h.route.harness,
                 h.interrupt_token.clone(),
                 h.cancel.clone(),
                 h.pending_inputs.clone(),
             )
         });
-        let Some((run_id, token, cancel, pending)) = target else {
+        let Some((run_id, harness_id, token, cancel, pending)) = target else {
             return Ok(false);
         };
         // Unpark any blocked question FIRST (mirrors comet: harness teardown can await a
@@ -1189,7 +1190,42 @@ impl SessionsEngine {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        Ok(true)
+
+        // Process-group teardown cannot reach a tool that daemonized into its
+        // own group. Probe the exact native OMP journal and attempt to terminate
+        // a verified residual holder, but do not turn an already-settled
+        // interrupt into a Stop failure when the ownership probe is unavailable
+        // or races the writer's exit. The live-run deadline below remains the
+        // authoritative Stop result.
+        if harness_id == HarnessId::Omp {
+            let session_id = lock(&self.inner.harness_sessions)
+                .get(chat_id)
+                .map(|session| session.session_id.clone());
+            if let Some(session_id) = session_id {
+                let cleanup = match self.inner.registry.resolve(HarnessId::Omp) {
+                    Ok(harness) => harness.stop_session(&session_id).await,
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = cleanup {
+                    tracing::warn!(
+                        chat = %chat_id,
+                        session = %session_id,
+                        error = %error,
+                        "residual OMP writer cleanup could not be verified after interrupt"
+                    );
+                }
+            }
+        }
+
+        for _ in 0..100 {
+            if !self.is_live(chat_id, &run_id) {
+                return Ok(true);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        Err(EngineError::Other(
+            "The agent process did not stop before the interrupt deadline".into(),
+        ))
     }
 
     async fn interrupt_runs_with_stale_auth_identity(&self, current: &RunAuthIdentity) {
@@ -2621,6 +2657,7 @@ mod tests {
         runs: Arc<std::sync::atomic::AtomicUsize>,
         stops: Arc<std::sync::atomic::AtomicUsize>,
         requests: Arc<Mutex<Vec<RunRequest>>>,
+        fail_cleanup: Arc<std::sync::atomic::AtomicBool>,
     }
 
     #[async_trait]
@@ -2652,7 +2689,13 @@ mod tests {
         async fn stop_session(&self, session_id: &str) -> Result<(), HarnessError> {
             assert_eq!(session_id, "native-takeover-session");
             self.stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
+            if self.fail_cleanup.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(HarnessError::Protocol(
+                    "writer ownership probe unavailable".into(),
+                ))
+            } else {
+                Ok(())
+            }
         }
 
         async fn run(
@@ -2685,12 +2728,13 @@ mod tests {
                     session_id: Some("native-takeover-session".into()),
                 }),
             ])
+            .chain(futures::stream::pending())
             .boxed())
         }
     }
 
     #[tokio::test]
-    async fn takeover_stops_writer_and_retries_the_exact_failed_request() {
+    async fn takeover_retries_exact_request_and_stop_survives_cleanup_probe_failure() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DocsStore::open(dir.path().join("store")).unwrap());
         let workspace = WorkspaceHost::open(
@@ -2723,11 +2767,13 @@ mod tests {
         let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let stops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let fail_cleanup = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let registry = HarnessRegistry::for_profile(RuntimeProfile::LocalController);
         registry.register(Arc::new(TakeoverHarness {
             runs: runs.clone(),
             stops: stops.clone(),
             requests: requests.clone(),
+            fail_cleanup: fail_cleanup.clone(),
         }));
         let sessions = SessionsEngine::new(
             "takeover-device".into(),
@@ -2760,7 +2806,7 @@ mod tests {
         assert!(error.to_string().contains("already running"));
         assert!(lock(&sessions.inner.blocked_omp_takeovers).contains_key("takeover-chat"));
 
-        sessions
+        let run_id = sessions
             .take_over_omp_session("takeover-chat")
             .await
             .expect("takeover resumes the blocked request");
@@ -2786,6 +2832,20 @@ mod tests {
             1,
             "retry must reuse the original user message id"
         );
+
+        drop(requests);
+        fail_cleanup.store(true, std::sync::atomic::Ordering::SeqCst);
+        let interrupted = sessions.interrupt("takeover-chat").await;
+        assert!(
+            matches!(interrupted, Ok(true)),
+            "successful interrupt must survive cleanup probe failure: {interrupted:?}"
+        );
+        assert_eq!(
+            stops.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "Stop must still attempt exact-journal cleanup after interrupt"
+        );
+        assert!(!sessions.is_live("takeover-chat", &run_id));
     }
 
     struct RouteRestartHarness {

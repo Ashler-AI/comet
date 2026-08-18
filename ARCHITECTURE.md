@@ -96,9 +96,10 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
 Send/steer/interrupt/respondInput = durable command entries in the session doc (`QueueCommand`),
 executed by the chat's **host** device (executor gated on chat ownership; mark-processed BEFORE
 execute; steer with no live run dispatches as the next turn). Offline sends queue in the doc.
-`TakeOverOmpSession` is a device-routed recovery exception: the owning engine verifies the exact
-journal writers, stops only the matching OMP process group, waits for writer release, then retries
-the blocked user message idempotently.
+This is comet's proven design, kept verbatim.
+`TakeOverOmpSession` is a device-routed recovery exception: the owning engine verifies exact
+write-capable journal holders, stops only a configured OMP process tree or a same-user orphaned
+OMP tool, waits for writer release, then retries the blocked user message idempotently.
 
 ## 3. Cargo workspace
 
@@ -196,12 +197,15 @@ Direct ports of comet behaviors (spec: feature-inventory §3):
   segments at 120ms commits, drain commands host-only with processed-ledger idempotence, publish
   diff sidecar, presence); warm-open recent chats (14d/cap 30); nudge-driven cold open; SQLite
   snapshot store.
-- **Harness**: trait mirroring comet's `HarnessShape`; Claude Code via `claude` CLI stream-json
-  in/out; Codex via app-server JSON-RPC; OMP via persistent native RPC. Persistent OMP runs launch
-  under a separate Comet supervisor and process group on macOS and Linux, so parent death, task
-  cancellation, and explicit interrupts reap OMP plus tool descendants. Resume probes count only
-  write/append journal descriptors; a verified external writer can be stopped and resumed through
-  the engine takeover RPC.
+- **Harness**: one `Harness` trait over Claude Code stream-json, Codex app-server JSON-RPC, and
+  persistent OMP native RPC. Persistent OMP runs launch under a separate Comet supervisor and
+  process group on macOS and Linux. Explicit interrupts send `SIGTERM`, poll the child through the
+  configured harness grace, and send `SIGKILL` only while it remains alive. After settlement the
+  engine best-effort probes the exact journal for daemonized residual holders; an inconclusive
+  cleanup probe is logged without reversing a successful Stop. Resume probes count only
+  write/append journal descriptors; verified takeover accepts configured OMP ancestry or a
+  same-user holder orphaned directly under PID 1, while unrelated live holders
+  fail closed.
 - **Repos/diffs**: git2 or `git` subprocess (subprocess — matches comet, avoids libgit2 edge
   cases); worktrees under `~/.comet-native/worktrees`; fs watchers (`notify`) + 2min repair; diff
   capture (patch + numstat + untracked, 3MiB cap, sha256) → workspace doc summary + DO diff

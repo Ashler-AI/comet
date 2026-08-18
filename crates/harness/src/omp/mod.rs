@@ -640,20 +640,17 @@ fn same_executable(left: &Path, right: &Path) -> bool {
 }
 
 #[cfg(unix)]
-fn is_descendant_of(mut pid: u32, roots: &[u32]) -> bool {
+fn omp_ancestor(mut identity: ProcessIdentity, omp_executable: &Path) -> Option<ProcessIdentity> {
     for _ in 0..64 {
-        let Some(identity) = process_identity(pid) else {
-            return false;
-        };
-        if roots.contains(&identity.ppid) {
-            return true;
+        if same_executable(&identity.executable, omp_executable) {
+            return Some(identity);
         }
-        if identity.ppid <= 1 || identity.ppid == pid {
-            return false;
+        if identity.ppid <= 1 || identity.ppid == identity.pid {
+            return None;
         }
-        pid = identity.ppid;
+        identity = process_identity(identity.ppid)?;
     }
-    false
+    None
 }
 
 #[cfg(unix)]
@@ -695,30 +692,39 @@ fn stop_plan(files: &[PathBuf], omp_executable: &Path) -> Result<Vec<StopTarget>
             "The OMP session writer belongs to another user".into(),
         ));
     }
-    let roots = identities
-        .iter()
-        .filter(|identity| same_executable(&identity.executable, omp_executable))
-        .map(|identity| identity.pid)
-        .collect::<Vec<_>>();
-    if roots.is_empty() {
-        return Err(HarnessError::Protocol(
-            "The write-capable holder is not the configured OMP executable".into(),
-        ));
-    }
-    if identities
-        .iter()
-        .any(|identity| !roots.contains(&identity.pid) && !is_descendant_of(identity.pid, &roots))
-    {
-        return Err(HarnessError::Protocol(
-            "An unrelated process also has this OMP session open for writing".into(),
-        ));
+
+    // A tool can inherit OMP's append descriptor while moving into another
+    // process group. Resolve the configured OMP executable through ancestry,
+    // not only among the processes that still hold the descriptor. If OMP has
+    // already died, accept only a same-user holder orphaned directly under PID
+    // 1: the exact write-capable journal descriptor is then the surviving
+    // ownership proof. A live unrelated process still fails closed.
+    let mut roots = Vec::<ProcessIdentity>::new();
+    let mut writer_roots = Vec::with_capacity(identities.len());
+    for identity in &identities {
+        match omp_ancestor(identity.clone(), omp_executable) {
+            Some(root) => {
+                if root.uid != uid {
+                    return Err(HarnessError::Protocol(
+                        "The OMP session writer belongs to another user".into(),
+                    ));
+                }
+                writer_roots.push(Some(root.pid));
+                if !roots.iter().any(|existing| existing.pid == root.pid) {
+                    roots.push(root);
+                }
+            }
+            None if identity.ppid == 1 => writer_roots.push(None),
+            None => {
+                return Err(HarnessError::Protocol(
+                    "The write-capable holder is not OMP or an orphaned OMP tool".into(),
+                ));
+            }
+        }
     }
 
     let mut targets = Vec::new();
-    for root in identities
-        .iter()
-        .filter(|identity| roots.contains(&identity.pid))
-    {
+    for root in &roots {
         let supervised_group = root.pgid > 1
             && root.pgid != current_group
             && (root.pgid == root.pid as i32
@@ -735,14 +741,24 @@ fn stop_plan(files: &[PathBuf], omp_executable: &Path) -> Result<Vec<StopTarget>
             targets.push(target);
         }
     }
-    // Legacy OMP processes shared Comet's group. Terminate only the verified
-    // inherited write holders before their OMP root; never signal Comet's group.
-    for identity in identities.iter().rev() {
-        if !roots.contains(&identity.pid) {
-            let target = StopTarget::Process(identity.pid);
-            if !targets.contains(&target) {
-                targets.insert(0, target);
-            }
+    // Terminate inherited write holders before their OMP root. An orphaned
+    // group leader is itself the only safely attributable root left, so stop
+    // its isolated group; otherwise signal only the exact holder process.
+    for (identity, root_pid) in identities.iter().zip(writer_roots).rev() {
+        if root_pid == Some(identity.pid) {
+            continue;
+        }
+        let target = if root_pid.is_none()
+            && identity.pgid == identity.pid as i32
+            && identity.pgid > 1
+            && identity.pgid != current_group
+        {
+            StopTarget::Group(identity.pgid)
+        } else {
+            StopTarget::Process(identity.pid)
+        };
+        if !targets.contains(&target) {
+            targets.insert(0, target);
         }
     }
     Ok(targets)

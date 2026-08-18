@@ -72,6 +72,29 @@ fn omp_writer_process_helper() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+#[ignore = "subprocess helper for orphaned writer takeover"]
+fn orphaned_omp_writer_process_helper() {
+    let Some(path) = std::env::var_os("COMET_TEST_OMP_WRITER_PATH") else {
+        return;
+    };
+    let ready = std::env::var_os("COMET_TEST_OMP_WRITER_READY").unwrap();
+    std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("exec 3>>\"$COMET_TEST_OMP_WRITER_PATH\"; echo $$ >\"$COMET_TEST_OMP_WRITER_READY\"; exec /bin/sleep 600")
+        .env("COMET_TEST_OMP_WRITER_PATH", path)
+        .env("COMET_TEST_OMP_WRITER_READY", ready)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn orphaned writer");
+    // The outer test launched this helper into an isolated process group. Exit
+    // now so the write-capable tool is reparented to PID 1, matching the real
+    // agent-browser zombie left after OMP died.
+    std::process::exit(0);
+}
 fn controls() -> RunControls {
     let (_steer_tx, steer_rx) = mpsc::channel(4);
     RunControls {
@@ -947,6 +970,71 @@ async fn verified_takeover_stops_exact_writer_and_releases_journal() {
         child.try_wait().unwrap().is_some(),
         "writer process survived takeover"
     );
+    assert_eq!(
+        comet_harness::omp::session_writer_state(&journal),
+        comet_harness::omp::SessionWriterState::Inactive
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn verified_takeover_stops_orphaned_tool_holding_the_journal() {
+    use std::os::unix::process::CommandExt as _;
+
+    let temp = tempfile::tempdir().unwrap();
+    let session_dir = temp.path().join("sessions");
+    let journal = write_omp_session(&session_dir, "orphaned-takeover-session");
+    let ready = temp.path().join("orphaned-writer-ready");
+    let executable = std::env::current_exe().unwrap();
+    let mut launcher = std::process::Command::new(&executable)
+        .args([
+            "--ignored",
+            "--exact",
+            "orphaned_omp_writer_process_helper",
+            "--nocapture",
+        ])
+        .env("COMET_TEST_OMP_WRITER_PATH", &journal)
+        .env("COMET_TEST_OMP_WRITER_READY", &ready)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    assert!(launcher.wait().unwrap().success());
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let pid = std::fs::read_to_string(&ready)
+        .expect("orphaned writer started")
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    assert!(process_exists(pid));
+    assert_eq!(
+        comet_harness::omp::session_writer_state(&journal),
+        comet_harness::omp::SessionWriterState::Active
+    );
+
+    let result = OmpHarness::new()
+        .with_executable(fixture_path())
+        .with_session_dir(&session_dir)
+        .stop_session("orphaned-takeover-session")
+        .await;
+    if let Err(error) = result {
+        // SAFETY: the test created this exact process and recorded its PID.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        panic!("orphaned writer takeover failed: {error}");
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while process_exists(pid) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!process_exists(pid), "orphaned tool survived takeover");
     assert_eq!(
         comet_harness::omp::session_writer_state(&journal),
         comet_harness::omp::SessionWriterState::Inactive
