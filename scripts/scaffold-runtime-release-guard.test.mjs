@@ -8,15 +8,15 @@ const manifest = (scaffoldRuntimeVersion) => ({ scaffoldRuntimeVersion });
 describe("Scaffold runtime release guard", () => {
   it("allows unchanged runtime contracts without deployment acknowledgement", () => {
     assert.deepEqual(validateRuntimePromotion({
-      candidate: manifest("scaffold.comet-runtime.v1"),
-      current: manifest("scaffold.comet-runtime.v1"),
+      candidate: manifest("scaffold.comet-runtime.v2"),
+      current: manifest("scaffold.comet-runtime.v2"),
       target: "production",
       acknowledgement: "unchanged",
       releaseSurface: "desktop",
     }), {
       changed: false,
-      candidateVersion: "scaffold.comet-runtime.v1",
-      currentVersion: "scaffold.comet-runtime.v1",
+      candidateVersion: "scaffold.comet-runtime.v2",
+      currentVersion: "scaffold.comet-runtime.v2",
     });
   });
 
@@ -68,7 +68,7 @@ describe("Scaffold runtime release guard", () => {
 
   it("treats a missing published manifest as a guarded first runtime release", () => {
     assert.throws(() => validateRuntimePromotion({
-      candidate: manifest("scaffold.comet-runtime.v1"),
+      candidate: manifest("scaffold.comet-runtime.v2"),
       current: undefined,
       target: "staging",
       acknowledgement: "unchanged",

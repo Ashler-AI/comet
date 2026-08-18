@@ -61,6 +61,7 @@ const PI_CONFIG_FILES_ENV: &str = "PI_CONFIG_FILES";
 const LOCAL_RUNTIME_ENV: &str = "COMET_LOCAL_AGENT_RUNTIME";
 const SCAFFOLD_INFERENCE_PROFILE_FILE: &str = "omp-inference/profile.json";
 const SCAFFOLD_INFERENCE_PROFILE_BYTES: u64 = 4 * 1024;
+const SCAFFOLD_INFERENCE_EXTENSION_BYTES: u64 = 64 * 1024;
 // Agent Auth accepts at most 8 MiB per inference request. OMP's 3840x2400
 // Computer default can retain multi-megabyte PNGs in Responses history, so use
 // its documented coordinate-safe capture cap for every Comet-owned OMP run.
@@ -138,12 +139,47 @@ impl Drop for OmpRunConfig {
 struct ScaffoldInferenceProfile {
     profile: String,
     model: String,
+    extension_path: Option<PathBuf>,
 }
 
-fn scaffold_inference_model_at(
+#[derive(Debug)]
+struct ScaffoldInferenceSelection {
+    model: String,
+    extension_path: Option<PathBuf>,
+}
+
+fn scaffold_inference_extension(path: PathBuf) -> Result<PathBuf, HarnessError> {
+    if !path.is_absolute() {
+        return Err(HarnessError::Protocol(
+            "Scaffold OMP inference extension path is not absolute".into(),
+        ));
+    }
+    let metadata = std::fs::symlink_metadata(&path)?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() == 0
+        || metadata.len() > SCAFFOLD_INFERENCE_EXTENSION_BYTES
+    {
+        return Err(HarnessError::Protocol(
+            "Scaffold OMP inference extension is not a bounded regular file".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(HarnessError::Protocol(
+                "Scaffold OMP inference extension is not private".into(),
+            ));
+        }
+    }
+    Ok(path)
+}
+
+fn scaffold_inference_selection_at(
     runtime_dir: &Path,
     requested_model: Option<&str>,
-) -> Result<String, HarnessError> {
+) -> Result<ScaffoldInferenceSelection, HarnessError> {
     let path = runtime_dir.join(SCAFFOLD_INFERENCE_PROFILE_FILE);
     let metadata = std::fs::symlink_metadata(&path)?;
     if !metadata.is_file()
@@ -192,7 +228,24 @@ fn scaffold_inference_model_at(
             "Scaffold OMP inference profile does not match the requested model".into(),
         ));
     }
-    Ok(profile.model)
+    let extension_path = match (profile_provider, profile.extension_path) {
+        ("scaffold-anthropic", Some(path)) => Some(scaffold_inference_extension(path)?),
+        ("scaffold-anthropic", None) => {
+            return Err(HarnessError::Protocol(
+                "Scaffold Anthropic inference profile requires an explicit extension".into(),
+            ));
+        }
+        ("scaffold-openai", None) => None,
+        _ => {
+            return Err(HarnessError::Protocol(
+                "Scaffold OMP inference profile has an invalid extension binding".into(),
+            ));
+        }
+    };
+    Ok(ScaffoldInferenceSelection {
+        model: profile.model,
+        extension_path,
+    })
 }
 
 fn configure_scaffold_inference_profile(
@@ -204,7 +257,21 @@ fn configure_scaffold_inference_profile(
         .ok_or_else(|| {
             HarnessError::Protocol("SCAFFOLD_RUNTIME_DIR is required for Scaffold OMP".into())
         })?;
-    let model = scaffold_inference_model_at(&runtime_dir, requested_model)?;
+    configure_scaffold_inference_profile_at(command, &runtime_dir, requested_model)
+}
+
+fn configure_scaffold_inference_profile_at(
+    command: &mut Command,
+    runtime_dir: &Path,
+    requested_model: Option<&str>,
+) -> Result<(), HarnessError> {
+    let ScaffoldInferenceSelection {
+        model,
+        extension_path,
+    } = scaffold_inference_selection_at(runtime_dir, requested_model)?;
+    if let Some(extension_path) = extension_path {
+        command.arg("--extension").arg(extension_path);
+    }
     command.args(["--model", &model]);
     Ok(())
 }
@@ -2318,43 +2385,94 @@ mod tests {
     }
 
     #[test]
-    fn scaffold_inference_profile_pins_the_scoped_model() {
+    fn scaffold_inference_profile_pins_the_model_and_explicit_extension() {
         let runtime_dir = tempfile::tempdir().unwrap();
         let profile_dir = runtime_dir.path().join("omp-inference");
         std::fs::create_dir_all(&profile_dir).unwrap();
+        let profile_path = profile_dir.join("profile.json");
         std::fs::write(
-            profile_dir.join("profile.json"),
+            &profile_path,
             r#"{"profile":"scaffold-host","model":"scaffold-openai/gpt-5.6-sol"}"#,
         )
         .unwrap();
 
-        let model =
-            scaffold_inference_model_at(runtime_dir.path(), Some("openai-codex/gpt-5.6-sol"))
+        let selection =
+            scaffold_inference_selection_at(runtime_dir.path(), Some("openai-codex/gpt-5.6-sol"))
                 .unwrap();
 
-        assert_eq!(model, "scaffold-openai/gpt-5.6-sol");
+        assert_eq!(selection.model, "scaffold-openai/gpt-5.6-sol");
+        assert!(selection.extension_path.is_none());
         assert!(
-            scaffold_inference_model_at(runtime_dir.path(), Some("openai-codex/gpt-5.6-terra"),)
-                .unwrap_err()
-                .to_string()
-                .contains("does not match")
+            scaffold_inference_selection_at(
+                runtime_dir.path(),
+                Some("openai-codex/gpt-5.6-terra"),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("does not match")
+        );
+
+        let extension_path = runtime_dir.path().join("scaffold-anthropic-provider.ts");
+        std::fs::write(&extension_path, "export default function provider() {}\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&extension_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+        std::fs::write(
+            &profile_path,
+            serde_json::to_vec(&json!({
+                "profile": "scaffold-host",
+                "model": "scaffold-anthropic/claude-opus-4-1",
+                "extensionPath": extension_path,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let selection =
+            scaffold_inference_selection_at(runtime_dir.path(), Some("anthropic/claude-opus-4-1"))
+                .unwrap();
+        assert_eq!(selection.model, "scaffold-anthropic/claude-opus-4-1");
+        assert_eq!(
+            selection.extension_path.as_deref(),
+            Some(extension_path.as_path())
+        );
+
+        let mut command = Command::new("/usr/local/bin/omp");
+        command.arg("--no-extensions");
+        configure_scaffold_inference_profile_at(
+            &mut command,
+            runtime_dir.path(),
+            Some("anthropic/claude-opus-4-1"),
+        )
+        .unwrap();
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.windows(2).any(|pair| {
+            pair == [
+                "--extension".to_string(),
+                extension_path.to_string_lossy().into_owned(),
+            ]
+        }));
+        assert_eq!(
+            &args[args.len() - 2..],
+            ["--model", "scaffold-anthropic/claude-opus-4-1"]
         );
 
         std::fs::write(
-            profile_dir.join("profile.json"),
+            &profile_path,
             r#"{"profile":"scaffold-host","model":"scaffold-anthropic/claude-opus-4-1"}"#,
         )
         .unwrap();
-        assert_eq!(
-            scaffold_inference_model_at(runtime_dir.path(), Some("anthropic/claude-opus-4-1"),)
-                .unwrap(),
-            "scaffold-anthropic/claude-opus-4-1"
-        );
         assert!(
-            scaffold_inference_model_at(runtime_dir.path(), Some("openai-codex/claude-opus-4-1"),)
+            scaffold_inference_selection_at(runtime_dir.path(), Some("anthropic/claude-opus-4-1"),)
                 .unwrap_err()
                 .to_string()
-                .contains("does not match")
+                .contains("requires an explicit extension")
         );
     }
 
