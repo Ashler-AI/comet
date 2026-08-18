@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 comet-engine.workspace = true
+comet-harness.workspace = true
 comet-rpc.workspace = true
 comet-ui.workspace = true
 comet-update.workspace = true

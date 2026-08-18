@@ -194,6 +194,9 @@ fn raise_process_nofile_limit() -> std::io::Result<(libc::rlim_t, libc::rlim_t)>
 }
 
 fn main() -> anyhow::Result<()> {
+    if let Some(result) = comet_harness::omp::run_supervisor_from_env() {
+        return result.map_err(anyhow::Error::from);
+    }
     #[cfg(unix)]
     let nofile_limit = raise_process_nofile_limit();
     let mut args = std::env::args_os().collect::<Vec<_>>();
@@ -404,6 +407,7 @@ fn engine_config_from_env() -> comet_engine::EngineConfig {
         // room. Only validated device bootstrap populates this field.
         deployment_id: None,
         scaffold_url: scaffold_url_from_env(&edge_token),
+        harness_supervisor_executable: std::env::current_exe().ok(),
         edge_token,
     }
 }

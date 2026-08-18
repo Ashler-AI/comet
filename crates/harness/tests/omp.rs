@@ -54,6 +54,48 @@ fn write_omp_session(session_dir: &std::path::Path, session_id: &str) -> PathBuf
     path
 }
 
+#[cfg(unix)]
+#[test]
+#[ignore = "subprocess helper for verified writer takeover"]
+fn omp_writer_process_helper() {
+    let Some(path) = std::env::var_os("COMET_TEST_OMP_WRITER_PATH") else {
+        return;
+    };
+    let ready = std::env::var_os("COMET_TEST_OMP_WRITER_READY").unwrap();
+    let _journal = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("open test journal for append");
+    std::fs::write(ready, std::process::id().to_string()).unwrap();
+    loop {
+        std::thread::sleep(Duration::from_secs(60));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "subprocess helper for orphaned writer takeover"]
+fn orphaned_omp_writer_process_helper() {
+    let Some(path) = std::env::var_os("COMET_TEST_OMP_WRITER_PATH") else {
+        return;
+    };
+    let ready = std::env::var_os("COMET_TEST_OMP_WRITER_READY").unwrap();
+    std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("exec 3>>\"$COMET_TEST_OMP_WRITER_PATH\"; echo $$ >\"$COMET_TEST_OMP_WRITER_READY\"; exec /bin/sleep 600")
+        .env("COMET_TEST_OMP_WRITER_PATH", path)
+        .env("COMET_TEST_OMP_WRITER_READY", ready)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn orphaned writer");
+    // The outer test launched this helper into an isolated process group. Exit
+    // now so the write-capable tool is reparented to PID 1, matching the real
+    // agent-browser zombie left after OMP died.
+    std::process::exit(0);
+}
+
 fn controls() -> RunControls {
     let (_steer_tx, steer_rx) = mpsc::channel(4);
     RunControls {
@@ -877,10 +919,178 @@ async fn rpc_error_details_reach_the_harness_error() {
     unsafe { std::env::remove_var("OMP_PROMPT_ERROR_DETAILS") };
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn verified_takeover_stops_exact_writer_and_releases_journal() {
+    use std::os::unix::process::CommandExt as _;
+
+    let temp = tempfile::tempdir().unwrap();
+    let session_dir = temp.path().join("sessions");
+    let journal = write_omp_session(&session_dir, "takeover-session");
+    let ready = temp.path().join("writer-ready");
+    let executable = std::env::current_exe().unwrap();
+    let mut command = std::process::Command::new(&executable);
+    command
+        .args([
+            "--ignored",
+            "--exact",
+            "omp_writer_process_helper",
+            "--nocapture",
+        ])
+        .env("COMET_TEST_OMP_WRITER_PATH", &journal)
+        .env("COMET_TEST_OMP_WRITER_READY", &ready)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0);
+    let mut child = command.spawn().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(ready.exists(), "writer helper did not start");
+    assert_eq!(
+        comet_harness::omp::session_writer_state(&journal),
+        comet_harness::omp::SessionWriterState::Active
+    );
+
+    let result = OmpHarness::new()
+        .with_executable(&executable)
+        .with_session_dir(&session_dir)
+        .stop_session("takeover-session")
+        .await;
+    if let Err(error) = result {
+        let _ = child.kill();
+        panic!("verified takeover failed: {error}");
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        child.try_wait().unwrap().is_some(),
+        "writer process survived takeover"
+    );
+    assert_eq!(
+        comet_harness::omp::session_writer_state(&journal),
+        comet_harness::omp::SessionWriterState::Inactive
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn verified_takeover_stops_orphaned_tool_holding_the_journal() {
+    use std::os::unix::process::CommandExt as _;
+
+    let temp = tempfile::tempdir().unwrap();
+    let session_dir = temp.path().join("sessions");
+    let journal = write_omp_session(&session_dir, "orphaned-takeover-session");
+    let ready = temp.path().join("orphaned-writer-ready");
+    let executable = std::env::current_exe().unwrap();
+    let mut launcher = std::process::Command::new(&executable)
+        .args([
+            "--ignored",
+            "--exact",
+            "orphaned_omp_writer_process_helper",
+            "--nocapture",
+        ])
+        .env("COMET_TEST_OMP_WRITER_PATH", &journal)
+        .env("COMET_TEST_OMP_WRITER_READY", &ready)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    assert!(launcher.wait().unwrap().success());
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let pid = std::fs::read_to_string(&ready)
+        .expect("orphaned writer started")
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    assert!(process_exists(pid));
+    assert_eq!(
+        comet_harness::omp::session_writer_state(&journal),
+        comet_harness::omp::SessionWriterState::Active
+    );
+
+    let result = OmpHarness::new()
+        .with_executable(fixture_path())
+        .with_session_dir(&session_dir)
+        .stop_session("orphaned-takeover-session")
+        .await;
+    if let Err(error) = result {
+        // SAFETY: the test created this exact process and recorded its PID.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        panic!("orphaned writer takeover failed: {error}");
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while process_exists(pid) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!process_exists(pid), "orphaned tool survived takeover");
+    assert_eq!(
+        comet_harness::omp::session_writer_state(&journal),
+        comet_harness::omp::SessionWriterState::Inactive
+    );
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn supervised_omp_run_is_its_process_group_leader() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _env = env_lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let supervisor = temp.path().join("supervisor.sh");
+    let group_log = temp.path().join("group");
+    let argv_log = temp.path().join("argv");
+    std::fs::write(
+        &supervisor,
+        "#!/bin/sh\nset -eu\n[ \"$1\" = \"__comet-omp-supervisor\" ]\nprintf '%s %s\\n' \"$$\" \"$(/bin/ps -o pgid= -p $$ | tr -d ' ')\" > \"$OMP_SUPERVISOR_GROUP_LOG\"\nexecutable=$3\nshift 3\nexec \"$executable\" \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&supervisor, std::fs::Permissions::from_mode(0o700)).unwrap();
+    unsafe {
+        std::env::set_var("OMP_ARGV_LOG", &argv_log);
+        std::env::set_var("OMP_SUPERVISOR_GROUP_LOG", &group_log);
+    }
+    let stream = OmpHarness::new()
+        .with_executable(fixture_path())
+        .with_supervisor_executable(&supervisor)
+        .run(request(None), controls())
+        .await
+        .expect("supervised OMP starts");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        stream.collect::<Vec<Result<AgentEvent, _>>>(),
+    )
+    .await
+    .expect("supervised OMP settles");
+    let ids = std::fs::read_to_string(&group_log)
+        .unwrap()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids[0], ids[1], "supervisor must lead its own process group");
+    unsafe {
+        std::env::remove_var("OMP_SUPERVISOR_GROUP_LOG");
+        std::env::remove_var("OMP_ARGV_LOG");
+    }
+}
+
 /// Live smoke against the installed omp CLI: one streamed turn, a parked
 /// followup as the next turn, and a clean mailbox-close teardown.
 #[tokio::test]
 #[ignore = "requires installed+authenticated omp CLI; spends tokens"]
+
 async fn real_omp_streams_turns_over_rpc_mode() {
     let temp = tempfile::tempdir().unwrap();
     let (steer_tx, steer_rx) = mpsc::channel(4);

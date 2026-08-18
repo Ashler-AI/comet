@@ -97,6 +97,9 @@ Send/steer/interrupt/respondInput = durable command entries in the session doc (
 executed by the chat's **host** device (executor gated on chat ownership; mark-processed BEFORE
 execute; steer with no live run dispatches as the next turn). Offline sends queue in the doc.
 This is comet's proven design, kept verbatim.
+`TakeOverOmpSession` is a device-routed recovery exception: the owning engine verifies exact
+write-capable journal holders, stops only a configured OMP process tree or a same-user orphaned
+OMP tool, waits for writer release, then retries the blocked user message idempotently.
 
 ## 3. Cargo workspace
 
@@ -194,10 +197,15 @@ Direct ports of comet behaviors (spec: feature-inventory §3):
   segments at 120ms commits, drain commands host-only with processed-ledger idempotence, publish
   diff sidecar, presence); warm-open recent chats (14d/cap 30); nudge-driven cold open; SQLite
   snapshot store.
-- **Harness** (research pending — `docs/research/harness.md`): trait mirroring comet's
-  `HarnessShape`; Claude Code via `claude` CLI stream-json in/out (control protocol for
-  permissions/AskUserQuestion→requestInput, resume, steering); Codex via app-server JSON-RPC or
-  `codex exec --json`; model/reasoning/option catalogs ported from `packages/harness`.
+- **Harness**: one `Harness` trait over Claude Code stream-json, Codex app-server JSON-RPC, and
+  persistent OMP native RPC. Persistent OMP runs launch under a separate Comet supervisor and
+  process group on macOS and Linux. Explicit interrupts send `SIGTERM`, poll the child through the
+  configured harness grace, and send `SIGKILL` only while it remains alive. After settlement the
+  engine best-effort probes the exact journal for daemonized residual holders; an inconclusive
+  cleanup probe is logged without reversing a successful Stop. Resume probes count only
+  write/append journal descriptors; verified takeover accepts configured OMP ancestry or a
+  same-user holder orphaned directly under PID 1, while unrelated live holders
+  fail closed.
 - **Repos/diffs**: git2 or `git` subprocess (subprocess — matches comet, avoids libgit2 edge
   cases); worktrees under `~/.comet-native/worktrees`; fs watchers (`notify`) + 2min repair; diff
   capture (patch + numstat + untracked, 3MiB cap, sha256) → workspace doc summary + DO diff

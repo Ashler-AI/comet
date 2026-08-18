@@ -24,6 +24,8 @@ pub enum HarnessError {
     NotInstalled(String),
     #[error("harness protocol error: {0}")]
     Protocol(String),
+    #[error("This OMP session is already running. Stop it before resuming in Comet.")]
+    SessionBusy { session_id: String },
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -96,6 +98,14 @@ pub trait Harness: Send + Sync {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError>;
+    /// Stop the process currently writing a harness-native session so this
+    /// harness can resume it. Implementations must verify process ownership;
+    /// the default refuses rather than signaling an unknown process.
+    async fn stop_session(&self, _session_id: &str) -> Result<(), HarnessError> {
+        Err(HarnessError::Protocol(
+            "This harness cannot stop an externally owned session".into(),
+        ))
+    }
 }
 
 mod approval;

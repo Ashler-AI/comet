@@ -74,6 +74,88 @@ computer:
   maxWidth: 1280
   maxHeight: 896
 "#;
+pub const OMP_SUPERVISOR_MARKER: &str = "__comet-omp-supervisor";
+
+/// Run the hidden OMP supervisor command when this process was invoked for it.
+///
+/// The supervisor is a separate process in the OMP process group. It inherits
+/// the engine's RPC stdio unchanged, watches the exact engine parent PID, and
+/// terminates OMP plus its tool descendants when that parent disappears.
+pub fn run_supervisor_from_env() -> Option<Result<(), HarnessError>> {
+    let mut args = std::env::args_os();
+    let _program = args.next();
+    if args.next().as_deref() != Some(std::ffi::OsStr::new(OMP_SUPERVISOR_MARKER)) {
+        return None;
+    }
+    Some(run_omp_supervisor(args))
+}
+
+#[cfg(unix)]
+fn run_omp_supervisor(mut args: impl Iterator<Item = OsString>) -> Result<(), HarnessError> {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let parent_pid = args
+        .next()
+        .and_then(|value| value.to_str().and_then(|value| value.parse::<u32>().ok()))
+        .ok_or_else(|| HarnessError::Protocol("OMP supervisor has no valid parent PID".into()))?;
+    let executable = args
+        .next()
+        .ok_or_else(|| HarnessError::Protocol("OMP supervisor has no child executable".into()))?;
+    let mut child = ProcessCommand::new(executable)
+        .args(args)
+        .spawn()
+        .map_err(HarnessError::Io)?;
+
+    // Installed after spawn so OMP keeps the default disposition. The
+    // supervisor must survive the group's graceful SIGTERM long enough to reap
+    // OMP and escalate if OMP ignores it.
+    // SAFETY: installing SIG_IGN for SIGTERM has no pointer or lifetime input.
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+    }
+    loop {
+        if let Some(status) = child.try_wait()? {
+            std::process::exit(
+                status
+                    .code()
+                    .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)),
+            );
+        }
+        // A Unix child is never attached to a reused PID. Once reparented, an
+        // equal numeric PID cannot make this relationship live again.
+        // SAFETY: getppid/getpgrp have no preconditions.
+        let parent_changed = unsafe { libc::getppid() } != parent_pid as libc::pid_t;
+        if parent_changed {
+            // SAFETY: the engine launched this supervisor as the process-group
+            // leader; a negative id targets only that dedicated group.
+            let group = unsafe { libc::getpgrp() };
+            unsafe {
+                libc::kill(-group, libc::SIGTERM);
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                if child.try_wait()?.is_some() {
+                    std::process::exit(0);
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            // SAFETY: same dedicated group; SIGKILL intentionally includes the
+            // supervisor itself so no guardian can become the next orphan.
+            unsafe {
+                libc::kill(-group, libc::SIGKILL);
+            }
+            std::process::abort();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(not(unix))]
+fn run_omp_supervisor(_args: impl Iterator<Item = OsString>) -> Result<(), HarnessError> {
+    Err(HarnessError::Protocol(
+        "OMP supervision requires a Unix host".into(),
+    ))
+}
 
 #[derive(Debug)]
 pub(crate) struct OmpRunConfig {
@@ -240,12 +322,13 @@ pub enum AdvisorConfigUpdate {
     SyncBacklog(OmpAdvisorSyncBacklog),
     ImmuneTurns(u32),
 }
-/// Whether another process currently owns an OMP session journal.
+/// Whether another process currently owns an OMP session journal for writing.
 ///
 /// OMP 17.2.9 has no persisted local attach endpoint or writer lock. Its
 /// session manager keeps an append descriptor open between writes for an active
-/// persisted session. We use an exact-path descriptor probe and fail closed
-/// when the platform cannot answer.
+/// persisted session. We probe the exact path and count only write-capable file
+/// descriptors; read-only tails, editors, and log viewers do not own the
+/// session. A failed or incomplete probe remains fail-closed as `Unknown`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionWriterState {
     Active,
@@ -253,51 +336,126 @@ pub enum SessionWriterState {
     Unknown,
 }
 
-fn session_writer_state_with(path: &Path, executable: &Path) -> Option<SessionWriterState> {
+fn parse_lsof_writer_pids(stdout: &[u8]) -> Option<Vec<u32>> {
+    let mut pid = None;
+    let mut writers = Vec::new();
+    let mut file_open = false;
+    let mut access_seen = false;
+
+    for line in stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        match line.first().copied()? {
+            b'p' => {
+                if file_open && !access_seen {
+                    return None;
+                }
+                let value = std::str::from_utf8(&line[1..]).ok()?.parse::<u32>().ok()?;
+                pid = Some(value);
+                file_open = false;
+                access_seen = false;
+            }
+            b'f' => {
+                if file_open && !access_seen {
+                    return None;
+                }
+                pid?;
+                file_open = true;
+                access_seen = false;
+            }
+            b'a' => {
+                if !file_open || access_seen {
+                    return None;
+                }
+                access_seen = true;
+                match line.get(1).copied()? {
+                    b'w' | b'u' => {
+                        let pid = pid?;
+                        if !writers.contains(&pid) {
+                            writers.push(pid);
+                        }
+                    }
+                    b'r' => {}
+                    _ => return None,
+                }
+            }
+            // `n` is requested for auditability but ownership is established by
+            // the exact path argument plus the access field above.
+            b'n' => {}
+            _ => return None,
+        }
+    }
+    if file_open && !access_seen {
+        return None;
+    }
+    Some(writers)
+}
+
+fn session_writer_pids_with(path: &Path, executable: &Path) -> Option<Vec<u32>> {
     let output = ProcessCommand::new(executable)
-        .args(["-F", "p", "--"])
+        .args(["-F", "pfan", "--"])
         .arg(path)
         .stdin(Stdio::null())
         .output()
         .ok()?;
-    if output.stdout.split(|byte| *byte == b'\n').any(|line| {
-        line.strip_prefix(b"p")
-            .is_some_and(|pid| !pid.is_empty() && pid.iter().all(u8::is_ascii_digit))
-    }) {
-        return Some(SessionWriterState::Active);
+    if output.status.success() {
+        return parse_lsof_writer_pids(&output.stdout);
     }
     if output.status.code() == Some(1) && output.stderr.is_empty() {
-        return Some(SessionWriterState::Inactive);
+        return Some(Vec::new());
     }
-    Some(SessionWriterState::Unknown)
+    None
+}
+
+fn session_writer_state_with(path: &Path, executable: &Path) -> Option<SessionWriterState> {
+    session_writer_pids_with(path, executable).map(|pids| {
+        if pids.is_empty() {
+            SessionWriterState::Inactive
+        } else {
+            SessionWriterState::Active
+        }
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn fdinfo_text_is_write_capable(text: &str) -> Option<bool> {
+    let flags = text.lines().find_map(|line| {
+        line.strip_prefix("flags:")
+            .map(str::trim)
+            .and_then(|value| u32::from_str_radix(value, 8).ok())
+    })?;
+    let access = flags as i32 & libc::O_ACCMODE;
+    Some(access == libc::O_WRONLY || access == libc::O_RDWR)
 }
 
 #[cfg(target_os = "linux")]
-fn linux_session_writer_state(path: &Path) -> SessionWriterState {
+fn fdinfo_is_write_capable(path: &Path) -> Option<bool> {
+    fdinfo_text_is_write_capable(&std::fs::read_to_string(path).ok()?)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_session_writer_pids(path: &Path) -> Option<Vec<u32>> {
     use std::os::unix::fs::MetadataExt as _;
 
-    let Ok(target) = std::fs::metadata(path) else {
-        return SessionWriterState::Unknown;
-    };
-    let Ok(processes) = std::fs::read_dir("/proc") else {
-        return SessionWriterState::Unknown;
-    };
+    let target = std::fs::metadata(path).ok()?;
+    let processes = std::fs::read_dir("/proc").ok()?;
     // SAFETY: geteuid has no preconditions and does not retain pointers.
     let effective_uid = unsafe { libc::geteuid() };
     let mut incomplete = false;
+    let mut writers = Vec::new();
     for process in processes {
         let Ok(process) = process else {
             incomplete = true;
             continue;
         };
-        if process
+        let Some(pid) = process
             .file_name()
             .to_str()
             .and_then(|name| name.parse::<u32>().ok())
-            .is_none()
-        {
+        else {
             continue;
-        }
+        };
         let Ok(process_metadata) = process.metadata() else {
             continue;
         };
@@ -317,11 +475,21 @@ fn linux_session_writer_state(path: &Path) -> SessionWriterState {
                 incomplete = true;
                 continue;
             };
-            match std::fs::metadata(descriptor.path()) {
+            let descriptor_path = descriptor.path();
+            match std::fs::metadata(&descriptor_path) {
                 Ok(metadata)
                     if metadata.dev() == target.dev() && metadata.ino() == target.ino() =>
                 {
-                    return SessionWriterState::Active;
+                    let fdinfo = process.path().join("fdinfo").join(descriptor.file_name());
+                    match fdinfo_is_write_capable(&fdinfo) {
+                        Some(true) => {
+                            writers.push(pid);
+                            break;
+                        }
+                        Some(false) => {}
+                        None if !descriptor_path.exists() => {}
+                        None => incomplete = true,
+                    }
                 }
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -329,25 +497,13 @@ fn linux_session_writer_state(path: &Path) -> SessionWriterState {
             }
         }
     }
-    if incomplete {
-        SessionWriterState::Unknown
-    } else {
-        SessionWriterState::Inactive
-    }
+    (!incomplete).then_some(writers)
 }
 
-/// Probe one exact OMP JSONL path for a live writer.
-///
-/// Linux uses `/proc/<pid>/fd`, so Scaffold images do not need an `lsof`
-/// package. macOS and other Unix hosts resolve the native absolute `lsof`
-/// locations before consulting `PATH`. A missing tool or failed/incomplete
-/// probe is `Unknown`, never `Inactive`.
-pub fn session_writer_state(path: &Path) -> SessionWriterState {
+fn session_writer_pids(path: &Path) -> Option<Vec<u32>> {
     #[cfg(target_os = "linux")]
-    match linux_session_writer_state(path) {
-        SessionWriterState::Active => return SessionWriterState::Active,
-        SessionWriterState::Inactive => return SessionWriterState::Inactive,
-        SessionWriterState::Unknown => {}
+    if let Some(pids) = linux_session_writer_pids(path) {
+        return Some(pids);
     }
 
     for executable in [
@@ -355,11 +511,321 @@ pub fn session_writer_state(path: &Path) -> SessionWriterState {
         Path::new("/usr/bin/lsof"),
         Path::new("lsof"),
     ] {
-        if let Some(state) = session_writer_state_with(path, executable) {
-            return state;
+        if let Some(pids) = session_writer_pids_with(path, executable) {
+            return Some(pids);
         }
     }
-    SessionWriterState::Unknown
+    None
+}
+
+/// Probe one exact OMP JSONL path for a live writer.
+///
+/// Linux uses `/proc/<pid>/fdinfo`, so Scaffold images do not need an `lsof`
+/// package. macOS and other Unix hosts resolve the native absolute `lsof`
+/// locations before consulting `PATH`. A missing tool or failed/incomplete
+/// probe is `Unknown`, never `Inactive`.
+pub fn session_writer_state(path: &Path) -> SessionWriterState {
+    match session_writer_pids(path) {
+        Some(pids) if pids.is_empty() => SessionWriterState::Inactive,
+        Some(_) => SessionWriterState::Active,
+        None => SessionWriterState::Unknown,
+    }
+}
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+struct ProcessIdentity {
+    pid: u32,
+    uid: u32,
+    ppid: u32,
+    pgid: i32,
+    executable: PathBuf,
+    command: String,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_parent_and_group(stat: &str) -> Option<(u32, i32)> {
+    let rest = stat.rsplit_once(')')?.1;
+    let mut fields = rest.split_whitespace();
+    let _state = fields.next()?;
+    let ppid = fields.next()?.parse::<u32>().ok()?;
+    let pgid = fields.next()?.parse::<i32>().ok()?;
+    Some((ppid, pgid))
+}
+
+#[cfg(target_os = "linux")]
+fn process_identity(pid: u32) -> Option<ProcessIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let root = PathBuf::from(format!("/proc/{pid}"));
+    let uid = std::fs::metadata(&root).ok()?.uid();
+    let stat = std::fs::read_to_string(root.join("stat")).ok()?;
+    let (ppid, pgid) = linux_parent_and_group(&stat)?;
+    let executable = std::fs::read_link(root.join("exe")).ok()?;
+    let command =
+        String::from_utf8_lossy(&std::fs::read(root.join("cmdline")).ok()?).replace('\0', " ");
+    Some(ProcessIdentity {
+        pid,
+        uid,
+        ppid,
+        pgid,
+        executable,
+        command,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn process_identity(pid: u32) -> Option<ProcessIdentity> {
+    let status = ProcessCommand::new("/bin/ps")
+        .args(["-o", "uid=,ppid=,pgid=", "-p", &pid.to_string()])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !status.status.success() {
+        return None;
+    }
+    let fields = String::from_utf8_lossy(&status.stdout)
+        .split_whitespace()
+        .filter_map(|value| value.parse::<i64>().ok())
+        .collect::<Vec<_>>();
+    let [uid, ppid, pgid] = fields.as_slice() else {
+        return None;
+    };
+    let executable = [Path::new("/usr/sbin/lsof"), Path::new("/usr/bin/lsof")]
+        .into_iter()
+        .find_map(|lsof| {
+            let output = ProcessCommand::new(lsof)
+                .args(["-a", "-p", &pid.to_string(), "-d", "txt", "-F", "n"])
+                .stdin(Stdio::null())
+                .output()
+                .ok()?;
+            output
+                .status
+                .success()
+                .then_some(output.stdout)?
+                .split(|byte| *byte == b'\n')
+                .find_map(|line| line.strip_prefix(b"n"))
+                .map(|path| PathBuf::from(String::from_utf8_lossy(path).into_owned()))
+        })?;
+    let command = ProcessCommand::new("/bin/ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_default();
+    Some(ProcessIdentity {
+        pid,
+        uid: *uid as u32,
+        ppid: *ppid as u32,
+        pgid: *pgid as i32,
+        executable,
+        command,
+    })
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn process_identity(_pid: u32) -> Option<ProcessIdentity> {
+    None
+}
+
+#[cfg(unix)]
+fn same_executable(left: &Path, right: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    match (std::fs::metadata(left), std::fs::metadata(right)) {
+        (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(unix)]
+fn omp_ancestor(mut identity: ProcessIdentity, omp_executable: &Path) -> Option<ProcessIdentity> {
+    for _ in 0..64 {
+        if same_executable(&identity.executable, omp_executable) {
+            return Some(identity);
+        }
+        if identity.ppid <= 1 || identity.ppid == identity.pid {
+            return None;
+        }
+        identity = process_identity(identity.ppid)?;
+    }
+    None
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopTarget {
+    Process(u32),
+    Group(i32),
+}
+
+#[cfg(unix)]
+fn stop_plan(files: &[PathBuf], omp_executable: &Path) -> Result<Vec<StopTarget>, HarnessError> {
+    let mut writer_pids = Vec::new();
+    for file in files {
+        let pids = session_writer_pids(file).ok_or_else(|| {
+            HarnessError::Protocol("Could not verify the process writing this OMP session".into())
+        })?;
+        for pid in pids {
+            if !writer_pids.contains(&pid) {
+                writer_pids.push(pid);
+            }
+        }
+    }
+    if writer_pids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // SAFETY: geteuid/getpgrp have no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    let current_group = unsafe { libc::getpgrp() };
+    let identities = writer_pids
+        .iter()
+        .map(|pid| process_identity(*pid))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            HarnessError::Protocol("An OMP writer exited while takeover was verified".into())
+        })?;
+    if identities.iter().any(|identity| identity.uid != uid) {
+        return Err(HarnessError::Protocol(
+            "The OMP session writer belongs to another user".into(),
+        ));
+    }
+
+    // A tool can inherit OMP's append descriptor while moving into another
+    // process group. Resolve the configured OMP executable through ancestry,
+    // not only among the processes that still hold the descriptor. If OMP has
+    // already died, accept only a same-user holder orphaned directly under PID
+    // 1: the exact write-capable journal descriptor is then the surviving
+    // ownership proof. A live unrelated process still fails closed.
+    let mut roots = Vec::<ProcessIdentity>::new();
+    let mut writer_roots = Vec::with_capacity(identities.len());
+    for identity in &identities {
+        match omp_ancestor(identity.clone(), omp_executable) {
+            Some(root) => {
+                if root.uid != uid {
+                    return Err(HarnessError::Protocol(
+                        "The OMP session writer belongs to another user".into(),
+                    ));
+                }
+                writer_roots.push(Some(root.pid));
+                if !roots.iter().any(|existing| existing.pid == root.pid) {
+                    roots.push(root);
+                }
+            }
+            None if identity.ppid == 1 => writer_roots.push(None),
+            None => {
+                return Err(HarnessError::Protocol(
+                    "The write-capable holder is not OMP or an orphaned OMP tool".into(),
+                ));
+            }
+        }
+    }
+
+    let mut targets = Vec::new();
+    for root in &roots {
+        let supervised_group = root.pgid > 1
+            && root.pgid != current_group
+            && (root.pgid == root.pid as i32
+                || (root.ppid == root.pgid as u32
+                    && process_identity(root.ppid).is_some_and(|supervisor| {
+                        supervisor.command.contains(OMP_SUPERVISOR_MARKER)
+                    })));
+        let target = if supervised_group {
+            StopTarget::Group(root.pgid)
+        } else {
+            StopTarget::Process(root.pid)
+        };
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    // Terminate inherited write holders before their OMP root. An orphaned
+    // group leader is itself the only safely attributable root left, so stop
+    // its isolated group; otherwise signal only the exact holder process.
+    for (identity, root_pid) in identities.iter().zip(writer_roots).rev() {
+        if root_pid == Some(identity.pid) {
+            continue;
+        }
+        let target = if root_pid.is_none()
+            && identity.pgid == identity.pid as i32
+            && identity.pgid > 1
+            && identity.pgid != current_group
+        {
+            StopTarget::Group(identity.pgid)
+        } else {
+            StopTarget::Process(identity.pid)
+        };
+        if !targets.contains(&target) {
+            targets.insert(0, target);
+        }
+    }
+    Ok(targets)
+}
+
+#[cfg(unix)]
+fn signal_stop_plan(targets: &[StopTarget], signal: i32) -> Result<(), HarnessError> {
+    for target in targets {
+        let pid = match *target {
+            StopTarget::Process(pid) => pid as i32,
+            StopTarget::Group(group) => -group,
+        };
+        // SAFETY: targets were re-resolved from exact journal writers and
+        // verified against uid, executable identity, ancestry, and group.
+        if unsafe { libc::kill(pid, signal) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(HarnessError::Io(error));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn session_has_writer(files: &[PathBuf]) -> Result<bool, HarnessError> {
+    let mut active = false;
+    for file in files {
+        match session_writer_state(file) {
+            SessionWriterState::Active => active = true,
+            SessionWriterState::Inactive => {}
+            SessionWriterState::Unknown => {
+                return Err(HarnessError::Protocol(
+                    "Could not verify that the OMP session writer stopped".into(),
+                ));
+            }
+        }
+    }
+    Ok(active)
+}
+
+#[cfg(unix)]
+fn stop_session_writer(files: Vec<PathBuf>, omp_executable: PathBuf) -> Result<(), HarnessError> {
+    let graceful = stop_plan(&files, &omp_executable)?;
+    signal_stop_plan(&graceful, libc::SIGTERM)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if !session_has_writer(&files)? {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Rebuild from the still-open exact descriptors before escalation. PID
+    // reuse or a newly introduced unrelated writer therefore fails closed.
+    let forced = stop_plan(&files, &omp_executable)?;
+    signal_stop_plan(&forced, libc::SIGKILL)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if !session_has_writer(&files)? {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err(HarnessError::Protocol(
+        "The OMP process did not release its session journal".into(),
+    ))
 }
 
 fn valid_profile_name(profile: &str) -> bool {
@@ -641,6 +1107,7 @@ fn propagate_auth_broker_environment(
 
 pub struct OmpHarness {
     executable: Option<PathBuf>,
+    supervisor_executable: Option<PathBuf>,
     scaffold_host: bool,
     interrupt_grace: Duration,
     session_dirs: Option<Vec<PathBuf>>,
@@ -652,6 +1119,7 @@ impl Default for OmpHarness {
     fn default() -> Self {
         Self {
             executable: None,
+            supervisor_executable: None,
             scaffold_host: false,
             interrupt_grace: Duration::from_secs(2),
             session_dirs: None,
@@ -675,6 +1143,12 @@ impl OmpHarness {
 
     pub fn with_executable(mut self, executable: impl Into<PathBuf>) -> Self {
         self.executable = Some(executable.into());
+        self
+    }
+
+    /// Wrap persistent OMP runs in this Comet executable's hidden supervisor.
+    pub fn with_supervisor_executable(mut self, executable: impl Into<PathBuf>) -> Self {
+        self.supervisor_executable = Some(executable.into());
         self
     }
 
@@ -735,10 +1209,9 @@ impl OmpHarness {
         for file in files {
             match self.writer_state(&file) {
                 SessionWriterState::Active => {
-                    return Err(HarnessError::Protocol(
-                        "This OMP session is already running. Close it before resuming here."
-                            .into(),
-                    ));
+                    return Err(HarnessError::SessionBusy {
+                        session_id: session_id.to_string(),
+                    });
                 }
                 SessionWriterState::Unknown => state = SessionWriterState::Unknown,
                 SessionWriterState::Inactive => {}
@@ -763,8 +1236,23 @@ impl OmpHarness {
         executable: &Path,
         cwd: &str,
         include_auth_broker_token: bool,
+        supervised: bool,
     ) -> Command {
-        let mut command = Command::new(executable);
+        let mut command = if supervised {
+            self.supervisor_executable.as_ref().map_or_else(
+                || Command::new(executable),
+                |supervisor| {
+                    let mut command = Command::new(supervisor);
+                    command
+                        .arg(OMP_SUPERVISOR_MARKER)
+                        .arg(std::process::id().to_string())
+                        .arg(executable);
+                    command
+                },
+            )
+        } else {
+            Command::new(executable)
+        };
         crate::compose_child_path(&mut command, executable);
         let auth_broker_environment = self
             .auth_broker_environment
@@ -796,10 +1284,15 @@ impl OmpHarness {
         cwd: &str,
         include_auth_broker_token: bool,
     ) -> Command {
-        let mut command = self.base_command(executable, cwd, include_auth_broker_token);
+        let mut command = self.base_command(executable, cwd, include_auth_broker_token, false);
         // OMP sets CI on tool children independently of its launch environment.
         // Repository-owned wrappers use this local-only marker to recover local
         // command semantics; Scaffold explicitly omits it and stays CI.
+        self.configure_rpc_mode(&mut command);
+        command
+    }
+
+    fn configure_rpc_mode(&self, command: &mut Command) {
         if self.scaffold_host {
             command.env("CI", "true");
             command.env_remove(LOCAL_RUNTIME_ENV);
@@ -817,14 +1310,14 @@ impl OmpHarness {
                 "--no-rules",
             ]);
         }
-        command
     }
 
     /// A run's child command: model, thinking level, and resume are pinned as
     /// CLI flags so the session opens fully configured — RPC mode needs no
     /// in-band configure stage.
     fn run_command(&self, executable: &Path, request: &RunRequest) -> Command {
-        let mut command = self.rpc_mode_command(executable, &request.cwd, true);
+        let mut command = self.base_command(executable, &request.cwd, true, true);
+        self.configure_rpc_mode(&mut command);
         if !self.scaffold_host
             && let Some(model) = request.model.as_deref().filter(|model| *model != "default")
         {
@@ -835,6 +1328,11 @@ impl OmpHarness {
         }
         if let Some(resume) = request.resume.as_deref() {
             command.args(["--resume", resume]);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.as_std_mut().process_group(0);
         }
         command
     }
@@ -1032,10 +1530,36 @@ impl Harness for OmpHarness {
         &[]
     }
 
+    async fn stop_session(&self, session_id: &str) -> Result<(), HarnessError> {
+        let session_dirs = self
+            .session_dirs
+            .clone()
+            .unwrap_or_else(|| omp_session_dirs(self.scaffold_host));
+        let (files, exhaustive) = matching_session_files(&session_dirs, session_id);
+        if files.is_empty() || !exhaustive {
+            return Err(HarnessError::Protocol(
+                "Could not resolve the exact OMP session journal for takeover".into(),
+            ));
+        }
+        let executable = self.resolve_executable()?;
+        #[cfg(unix)]
+        return tokio::task::spawn_blocking(move || stop_session_writer(files, executable))
+            .await
+            .map_err(|error| {
+                HarnessError::Protocol(format!("OMP takeover worker failed: {error}"))
+            })?;
+        #[cfg(not(unix))]
+        {
+            let _ = (files, executable);
+            Err(HarnessError::Protocol(
+                "Stopping an external OMP session requires a Unix host".into(),
+            ))
+        }
+    }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         let executable = self.resolve_executable()?;
         let output = self
-            .base_command(&executable, "", false)
+            .base_command(&executable, "", false, false)
             .args(["models", "--json"])
             .stdin(Stdio::null())
             .output()
@@ -1091,6 +1615,8 @@ impl Harness for OmpHarness {
                 client,
                 frames,
                 stderr_tail,
+                process_group: None,
+                process_group_guard: rpc_mode::ProcessGroupGuard::new(None),
                 run_config: None,
             },
             RPC_COMMAND_CATALOG_DEADLINE,
@@ -1129,6 +1655,11 @@ impl Harness for OmpHarness {
                 HarnessError::Io(error)
             }
         })?;
+        #[cfg(unix)]
+        let process_group = child.id().map(|pid| pid as i32);
+        #[cfg(not(unix))]
+        let process_group = None;
+        let process_group_guard = rpc_mode::ProcessGroupGuard::new(process_group);
         let stdin = child
             .stdin
             .take()
@@ -1158,6 +1689,8 @@ impl Harness for OmpHarness {
                     client,
                     frames,
                     stderr_tail,
+                    process_group,
+                    process_group_guard,
                     run_config: Some(run_config),
                 },
                 request,
@@ -2121,6 +2654,63 @@ fn normalize_update(params: &Value, harness: HarnessId) -> Option<AgentEvent> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn lsof_probe_ignores_readers_and_requires_access_fields() {
+        let output = b"p10\nf3\nar\nnsession.jsonl\np11\nf4\naw\nnsession.jsonl\np12\nf5\nau\nnsession.jsonl\n";
+        assert_eq!(parse_lsof_writer_pids(output), Some(vec![11, 12]));
+        assert_eq!(
+            parse_lsof_writer_pids(b"p10\nf3\nar\nnsession.jsonl\n"),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            parse_lsof_writer_pids(b"p10\nf3\na \nnsession.jsonl\n"),
+            None
+        );
+        assert_eq!(parse_lsof_writer_pids(b"p10\nf3\nnsession.jsonl\n"), None);
+    }
+
+    #[test]
+    fn linux_fdinfo_and_proc_stat_classify_ownership() {
+        assert_eq!(
+            fdinfo_text_is_write_capable("flags:\t0100000\n"),
+            Some(false)
+        );
+        assert_eq!(
+            fdinfo_text_is_write_capable("flags:\t0100001\n"),
+            Some(true)
+        );
+        assert_eq!(
+            fdinfo_text_is_write_capable("flags:\t0100002\n"),
+            Some(true)
+        );
+        assert_eq!(fdinfo_text_is_write_capable("pos:\t0\n"), None);
+        assert_eq!(
+            linux_parent_and_group("321 (worker name) S 42 77 77 0 -1 0"),
+            Some((42, 77))
+        );
+    }
+
+    #[test]
+    fn supervised_run_wraps_only_the_persistent_rpc_process() {
+        let command = OmpHarness::new()
+            .with_supervisor_executable("/opt/comet/bin/comet")
+            .run_command(Path::new("/opt/omp/bin/omp"), &run_request(None));
+        assert_eq!(command.as_std().get_program(), "/opt/comet/bin/comet");
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args[0], OMP_SUPERVISOR_MARKER);
+        assert_eq!(args[1], std::process::id().to_string());
+        assert_eq!(args[2], "/opt/omp/bin/omp");
+        assert_eq!(&args[3..7], ["--mode", "rpc", "--approval-mode", "yolo"]);
+
+        let catalog = OmpHarness::new()
+            .with_supervisor_executable("/opt/comet/bin/comet")
+            .command_catalog_command(Path::new("/opt/omp/bin/omp"), "/tmp");
+        assert_eq!(catalog.as_std().get_program(), "/opt/omp/bin/omp");
+    }
     fn configured_env(command: &Command, key: &str) -> Option<String> {
         command
             .as_std()

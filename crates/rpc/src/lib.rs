@@ -37,6 +37,9 @@ pub mod methods {
     pub const LIST_MODELS: &str = "ListModels";
     pub const LIST_HARNESS_COMMANDS: &str = "ListHarnessCommands";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
+    /// Stop a verified external OMP writer and retry the blocked prompt under
+    /// the target Comet engine.
+    pub const TAKE_OVER_OMP_SESSION: &str = "TakeOverOmpSession";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
     /// Read one older transcript page before an opaque raw-list cursor.
     pub const READ_DOC_MESSAGES: &str = "ReadDocMessages";
