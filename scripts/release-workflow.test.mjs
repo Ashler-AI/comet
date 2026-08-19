@@ -34,6 +34,8 @@ describe("Comet release surfaces", () => {
     assert.match(workflow, /promotion_target:[\s\S]*- staging-candidate[\s\S]*- staging[\s\S]*- production/);
     assert.match(workflow, /REQUESTED_PROMOTION_TARGET: \$\{\{ inputs\.promotion_target \}\}/);
     assert.match(workflow, /echo "promotion_target=\$promotion_target" >> "\$GITHUB_OUTPUT"/);
+    assert.match(workflow, /github\.repository_id == '1323358312'/);
+    assert.doesNotMatch(workflow, /github\.repository_owner ==/);
     assert.match(staging, /needs\.version\.outputs\.promotion_target == 'staging-candidate'/);
     assert.match(production, /needs\.version\.outputs\.promotion_target == 'production'/);
     const immutable = staging.indexOf('publish_immutable "$file" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$VERSION/$name"');
