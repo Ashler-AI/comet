@@ -10,7 +10,7 @@ import { scopedSessionRoomKey } from "./room-key";
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const GRANT_TTL_MS = 15 * 60 * 1000;
 const ACCESS_TTL_MS = 12 * 60 * 60 * 1000;
-const SCAFFOLD_COMET_RUNTIME_VERSION = "scaffold.comet-runtime.v2";
+const SCAFFOLD_COMET_RUNTIME_VERSION = "scaffold.comet-runtime.v1";
 
 interface GrantRecord {
   grantId: string;

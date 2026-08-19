@@ -193,7 +193,7 @@ describe("device grant issuance", () => {
       Response.json({
         ok: true,
         profile: {
-          version: "scaffold.comet-runtime.v2",
+          version: "scaffold.comet-runtime.v1",
           projectId: identity.projectScope,
           deploymentId: identity.projectScope,
           sandboxId: "sandbox-789",
@@ -251,7 +251,7 @@ describe("device grant issuance", () => {
       Response.json({
         ok: true,
         profile: {
-          version: "scaffold.comet-runtime.v2",
+          version: "scaffold.comet-runtime.v1",
           projectId: identity.projectScope,
           deploymentId: identity.projectScope,
           sandboxId: "sandbox-789",
@@ -283,7 +283,7 @@ describe("device grant issuance", () => {
       Response.json({
         ok: true,
         profile: {
-          version: "scaffold.comet-runtime.v2",
+          version: "scaffold.comet-runtime.v1",
           projectId: identity.projectScope,
           deploymentId: identity.projectScope,
           sandboxId: "sandbox-789",
@@ -313,7 +313,7 @@ describe("device grant issuance", () => {
       Response.json({
         ok: true,
         profile: {
-          version: "scaffold.comet-runtime.v2",
+          version: "scaffold.comet-runtime.v1",
           projectId: identity.projectScope,
           deploymentId: identity.projectScope,
           sandboxId: "sandbox-789",
@@ -347,7 +347,7 @@ describe("device grant issuance", () => {
       {
         ok: true,
         profile: {
-          version: "scaffold.comet-runtime.v2",
+          version: "scaffold.comet-runtime.v1",
           projectId: identity.projectScope,
           deploymentId: identity.projectScope,
           sandboxId: "sandbox-789",

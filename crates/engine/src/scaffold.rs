@@ -2318,7 +2318,7 @@ mod tests {
     fn comet_sandbox(status: &str) -> String {
         sandbox(status).replace(
             r#""runtimeProfile":"remote_code""#,
-            r#""runtimeProfile":"comet_remote","cometRuntimeProfile":{"version":"scaffold.comet-runtime.v2","projectId":"project-a","deploymentId":"deployment-a","sessionId":"011664b5-3660-4fe6-83a2-3647fa6a2f65","sandboxId":"sandbox-a"}"#,
+            r#""runtimeProfile":"comet_remote","cometRuntimeProfile":{"version":"scaffold.comet-runtime.v1","projectId":"project-a","deploymentId":"deployment-a","sessionId":"011664b5-3660-4fe6-83a2-3647fa6a2f65","sandboxId":"sandbox-a"}"#,
         )
     }
 
@@ -2670,7 +2670,7 @@ mod tests {
         assert!(requests[5].contains(
             r#""agentRoute":{"provider":"openai","model":"gpt-5.5","fallback":"disabled","routingMode":"automatic"}"#
         ));
-        assert!(requests[2].contains(r#""version":"scaffold.comet-runtime.v2""#));
+        assert!(requests[2].contains(r#""version":"scaffold.comet-runtime.v1""#));
         assert!(requests[2].contains(r#""projectId":"project-a""#));
         assert!(requests[2].contains(r#""deploymentId":"deployment-a""#));
         assert!(requests[2].contains(r#""sessionId":"011664b5-3660-4fe6-83a2-3647fa6a2f65""#));
@@ -2690,7 +2690,7 @@ mod tests {
             database_environment: ScaffoldDatabaseEnvironment::Local,
             agent_route: &route,
             comet_runtime_profile: CreateCometRuntimeProfile {
-                version: "scaffold.comet-runtime.v2",
+                version: "scaffold.comet-runtime.v1",
                 project_id: "project-a",
                 deployment_id: "deployment-a",
                 session_id: "session-a",

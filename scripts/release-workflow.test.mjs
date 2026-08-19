@@ -61,9 +61,9 @@ describe("Comet release surfaces", () => {
     const candidate = jobBlock(workflow, "candidate");
     const staging = jobBlock(workflow, "publish-staging");
 
-    assert.equal(runtimeVersion, "scaffold.comet-runtime.v2");
+    assert.equal(runtimeVersion, "scaffold.comet-runtime.v1");
     assert.match(engine, /SCAFFOLD_COMET_RUNTIME_VERSION[\s\S]*include_str!\("\.\.\/\.\.\/\.\.\/scaffold-runtime-version\.txt"\)/);
-    assert.match(edge, /SCAFFOLD_COMET_RUNTIME_VERSION = "scaffold\.comet-runtime\.v2"/);
+    assert.match(edge, /SCAFFOLD_COMET_RUNTIME_VERSION = "scaffold\.comet-runtime\.v1"/);
     assert.match(candidate, /scaffold_runtime_version="\$\(cat scaffold-runtime-version\.txt\)"/);
     assert.match(candidate, /--arg scaffoldRuntimeVersion "\$scaffold_runtime_version"/);
     assert.match(candidate, /scaffoldRuntimeVersion:\$scaffoldRuntimeVersion/);

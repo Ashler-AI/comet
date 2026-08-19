@@ -147,7 +147,7 @@ const startFakeScaffold = async (port) => {
         sendJson(response, 200, {
           ok: true,
           profile: {
-            version: "scaffold.comet-runtime.v2",
+            version: "scaffold.comet-runtime.v1",
             ...target,
             actor: { sub: OWNER_SUBJECT }
           }
