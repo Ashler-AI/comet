@@ -413,6 +413,14 @@ impl LocalSessionCapability {
     }
 }
 
+fn local_session_import_completed(
+    target_chat: Option<&str>,
+    selected_chat: Option<&str>,
+    target_still_available: bool,
+) -> bool {
+    target_chat.is_some_and(|target| selected_chat == Some(target) && !target_still_available)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct LocalSessionProviderSection {
     harness: comet_proto::HarnessId,
@@ -597,6 +605,15 @@ enum SplashPhase {
     Visible,
     FadingOut,
     Gone,
+}
+
+fn next_splash_phase(current: SplashPhase, connection: &ConnectionStatus) -> SplashPhase {
+    match connection {
+        ConnectionStatus::Ready if current == SplashPhase::Visible => SplashPhase::FadingOut,
+        // Reveal the gate card immediately; the splash never returns mid-session.
+        ConnectionStatus::Failed(_) => SplashPhase::Gone,
+        ConnectionStatus::Ready | ConnectionStatus::Connecting => current,
+    }
 }
 
 /// The chat-row Rename dialog.
@@ -1450,6 +1467,8 @@ impl Shell {
             _state_observation: observation,
             _composer_events: composer_events,
         };
+        let initial_connection = shell.state.read(cx).connection.clone();
+        shell.sync_splash(&initial_connection, cx);
         shell.refresh_account_usage(cx);
         shell
     }
@@ -1473,6 +1492,26 @@ impl Shell {
                 _ => ControlFeedbackState::Rejected,
             };
             feedback.detail = audit.reason.clone().map(SharedString::from);
+        }
+    }
+
+    fn sync_splash(&mut self, connection: &ConnectionStatus, cx: &mut Context<Self>) {
+        let next = next_splash_phase(self.splash, connection);
+        if next == self.splash {
+            return;
+        }
+        self.splash = next;
+        if next == SplashPhase::FadingOut {
+            self.splash_task = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(SPLASH_OUT.total() + Duration::from_millis(30))
+                    .await;
+                this.update(cx, |shell, cx| {
+                    shell.splash = SplashPhase::Gone;
+                    cx.notify();
+                })
+                .ok();
+            }));
         }
     }
 
@@ -1623,26 +1662,8 @@ impl Shell {
                 changes.update(cx, |changes, cx| changes.ensure_watch(cx));
             }
         }
-        match state.read(cx).connection {
-            ConnectionStatus::Ready => {
-                if self.splash == SplashPhase::Visible {
-                    self.splash = SplashPhase::FadingOut;
-                    self.splash_task = Some(cx.spawn(async move |this, cx| {
-                        cx.background_executor()
-                            .timer(SPLASH_OUT.total() + Duration::from_millis(30))
-                            .await;
-                        this.update(cx, |shell, cx| {
-                            shell.splash = SplashPhase::Gone;
-                            cx.notify();
-                        })
-                        .ok();
-                    }));
-                }
-            }
-            // Reveal the gate card immediately; the splash never returns mid-session.
-            ConnectionStatus::Failed(_) => self.splash = SplashPhase::Gone,
-            ConnectionStatus::Connecting => {}
-        }
+        let connection = state.read(cx).connection.clone();
+        self.sync_splash(&connection, cx);
     }
 
     // ---- layout state ----
@@ -7686,10 +7707,26 @@ fn header_icon_button(
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.session_import_open
-            && let Some(target_chat) = self.session_import_target_chat.as_deref()
-            && self.state.read(cx).selected_chat.as_deref() == Some(target_chat)
-        {
+        let close_completed_session_import = {
+            let target_chat = self.session_import_target_chat.as_deref();
+            if !self.session_import_open {
+                false
+            } else {
+                let state = self.state.read(cx);
+                let target_still_available = target_chat.is_some_and(|target| {
+                    state
+                        .local_session_candidates
+                        .iter()
+                        .any(|candidate| candidate.chat_id == target)
+                });
+                local_session_import_completed(
+                    target_chat,
+                    state.selected_chat.as_deref(),
+                    target_still_available,
+                )
+            }
+        };
+        if close_completed_session_import {
             self.session_import_open = false;
             self.session_import_target_chat = None;
         }
@@ -8040,6 +8077,33 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::rc::Rc;
+
+    #[test]
+    fn ready_before_shell_observation_cannot_leave_boot_splash_visible() {
+        assert_eq!(
+            next_splash_phase(SplashPhase::Visible, &ConnectionStatus::Ready),
+            SplashPhase::FadingOut
+        );
+    }
+
+    #[test]
+    fn selected_existing_chat_does_not_close_import_before_attach_finishes() {
+        assert!(!local_session_import_completed(
+            Some("chat-a"),
+            Some("chat-a"),
+            true,
+        ));
+        assert!(local_session_import_completed(
+            Some("chat-a"),
+            Some("chat-a"),
+            false,
+        ));
+        assert!(!local_session_import_completed(
+            Some("chat-a"),
+            Some("chat-b"),
+            false,
+        ));
+    }
 
     /// A press on the settle button hands its click to the button; the row
     /// underneath must not also select the session.

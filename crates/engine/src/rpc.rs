@@ -1984,6 +1984,8 @@ impl RpcService for EngineRpc {
                 let cancellation = comet_harness::CancellationToken::new();
                 let scaffold = self.scaffold()?;
                 let owner_room = self.prepare_scaffold_attach(&control)?;
+                self.await_scaffold_owner_room(owner_room.as_deref(), &cancellation)
+                    .await?;
                 let result = scaffold
                     .control(control, &cancellation)
                     .await
@@ -2012,8 +2014,6 @@ impl RpcService for EngineRpc {
                         "Scaffold attached without local control grant projection"
                     );
                 }
-                self.await_scaffold_owner_room(owner_room.as_deref(), &cancellation)
-                    .await?;
                 RpcReply::value(&result)
             }
             methods::WATCH_SESSIONS => {

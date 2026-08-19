@@ -11,7 +11,7 @@
 pub(crate) mod rpc;
 pub(crate) mod rpc_mode;
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::OsString;
 use std::future::Future;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
@@ -339,6 +339,42 @@ fn session_writer_state_with(path: &Path, executable: &Path) -> Option<SessionWr
     Some(SessionWriterState::Unknown)
 }
 
+fn session_writer_states_with(
+    paths: &[PathBuf],
+    executable: &Path,
+) -> Option<Vec<SessionWriterState>> {
+    if paths.is_empty() {
+        return Some(Vec::new());
+    }
+    let output = ProcessCommand::new(executable)
+        .args(["-F", "pn", "--"])
+        .args(paths)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    let active_paths: HashSet<Vec<u8>> = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| line.strip_prefix(b"n"))
+        .map(<[u8]>::to_vec)
+        .collect();
+    let complete = matches!(output.status.code(), Some(0 | 1)) && output.stderr.is_empty();
+    Some(
+        paths
+            .iter()
+            .map(|path| {
+                if active_paths.contains(path.as_os_str().as_encoded_bytes()) {
+                    SessionWriterState::Active
+                } else if complete {
+                    SessionWriterState::Inactive
+                } else {
+                    SessionWriterState::Unknown
+                }
+            })
+            .collect(),
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn linux_session_writer_state(path: &Path) -> SessionWriterState {
     use std::os::unix::fs::MetadataExt as _;
@@ -401,6 +437,43 @@ fn linux_session_writer_state(path: &Path) -> SessionWriterState {
     } else {
         SessionWriterState::Inactive
     }
+}
+
+/// Probe many exact OMP JSONL paths with one descriptor scan.
+///
+/// Results retain input order. Missing tools and incomplete probes fail closed
+/// as `Unknown`; a confirmed descriptor match remains `Active`.
+pub fn session_writer_states(paths: &[PathBuf]) -> Vec<SessionWriterState> {
+    let mut states = vec![SessionWriterState::Unknown; paths.len()];
+    #[cfg(target_os = "linux")]
+    {
+        states = paths
+            .iter()
+            .map(|path| linux_session_writer_state(path))
+            .collect();
+        if states
+            .iter()
+            .all(|state| *state != SessionWriterState::Unknown)
+        {
+            return states;
+        }
+    }
+
+    for executable in [
+        Path::new("/usr/sbin/lsof"),
+        Path::new("/usr/bin/lsof"),
+        Path::new("lsof"),
+    ] {
+        if let Some(fallback) = session_writer_states_with(paths, executable) {
+            for (state, fallback) in states.iter_mut().zip(fallback) {
+                if *state == SessionWriterState::Unknown {
+                    *state = fallback;
+                }
+            }
+            return states;
+        }
+    }
+    states
 }
 
 /// Probe one exact OMP JSONL path for a live writer.
@@ -2195,6 +2268,40 @@ mod tests {
             .find(|(name, _)| name.to_string_lossy() == key)
             .and_then(|(_, value)| value)
             .map(|value| value.to_string_lossy().into_owned())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn batched_writer_probe_classifies_paths_with_one_process() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("active.jsonl");
+        let inactive = temp.path().join("inactive.jsonl");
+        std::fs::write(&active, "{}\n").unwrap();
+        std::fs::write(&inactive, "{}\n").unwrap();
+        let probe = temp.path().join("probe.sh");
+        std::fs::write(
+            &probe,
+            "#!/bin/sh\nset -eu\nprintf x >> \"$0.count\"\n\
+             [ \"$#\" -eq 5 ]\n[ \"$1\" = \"-F\" ]\n[ \"$2\" = \"pn\" ]\n\
+             [ \"$3\" = \"--\" ]\nprintf 'n%s\\n' \"$4\"\nexit 1\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&probe).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&probe, permissions).unwrap();
+
+        let states =
+            session_writer_states_with(&[active, inactive], &probe).expect("probe should run");
+
+        assert_eq!(
+            states,
+            [SessionWriterState::Active, SessionWriterState::Inactive]
+        );
+        assert_eq!(
+            std::fs::read(format!("{}.count", probe.display())).unwrap(),
+            b"x"
+        );
     }
 
     #[test]

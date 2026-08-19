@@ -800,28 +800,34 @@ fn candidate_from_codex_rollout(path: &Path, known_id: Option<&str>) -> Option<D
 }
 
 fn discover_omp(root: &Path) -> Vec<DiscoveredSession> {
-    recent_omp_jsonl_files(&root.join("sessions"), MAX_CANDIDATES_PER_HARNESS)
-        .into_iter()
-        .filter_map(|path| {
-            // Parse the bounded header first. Most OMP journals are internal
-            // advisor/worker shells with no user turn; do not pay for an lsof
-            // process or expose an empty row for those files.
-            let mut session = candidate_from_omp_with_writer_state(
-                &path,
-                comet_harness::omp::SessionWriterState::Unknown,
-            )?;
-            session
-                .candidate
-                .preview
-                .as_deref()
-                .filter(|preview| !preview.trim().is_empty())?;
-            apply_omp_writer_state(
-                &mut session,
-                comet_harness::omp::session_writer_state(&path),
-            );
-            Some(session)
-        })
-        .collect()
+    // Parse bounded headers before probing ownership. Most OMP journals are
+    // internal advisor/worker shells with no user turn, so they never enter
+    // the single batched descriptor scan.
+    let mut sessions: Vec<_> =
+        recent_omp_jsonl_files(&root.join("sessions"), MAX_CANDIDATES_PER_HARNESS)
+            .into_iter()
+            .filter_map(|path| {
+                let session = candidate_from_omp_with_writer_state(
+                    &path,
+                    comet_harness::omp::SessionWriterState::Unknown,
+                )?;
+                session
+                    .candidate
+                    .preview
+                    .as_deref()
+                    .filter(|preview| !preview.trim().is_empty())?;
+                Some(session)
+            })
+            .collect();
+    let paths: Vec<_> = sessions
+        .iter()
+        .map(|session| session.path.clone())
+        .collect();
+    let writer_states = comet_harness::omp::session_writer_states(&paths);
+    for (session, writer_state) in sessions.iter_mut().zip(writer_states) {
+        apply_omp_writer_state(session, writer_state);
+    }
+    sessions
 }
 
 /// Latest native journal activity for a specific OMP session. A Comet-owned
