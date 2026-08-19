@@ -41,6 +41,8 @@ describe("Comet release surfaces", () => {
     assert.match(production, /google-github-actions\/auth@v2/);
     assert.match(staging, /needs\.version\.outputs\.promotion_target == 'staging-candidate'/);
     assert.match(production, /needs\.version\.outputs\.promotion_target == 'production'/);
+    assert.match(staging, /always\(\)[\s\S]*needs\.version\.result == 'success'[\s\S]*needs\.candidate\.result == 'success'/);
+    assert.match(production, /always\(\)[\s\S]*needs\['publish-staging'\]\.result == 'success'/);
     const immutable = staging.indexOf('publish_immutable "$file" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$VERSION/$name"');
     const candidateStop = staging.indexOf('if [[ "$PROMOTION_TARGET" == "staging-candidate" ]]');
     const guard = staging.indexOf("node scripts/guard-scaffold-runtime-release.mjs");

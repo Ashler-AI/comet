@@ -259,7 +259,10 @@ jobs:
 
   publish-staging:
     if: >-
-      needs.version.outputs.promotion_target == 'staging-candidate' || needs.version.outputs.promotion_target == 'staging' || needs.version.outputs.promotion_target == 'production'
+      always() &&
+      needs.version.result == 'success' &&
+      needs.candidate.result == 'success' &&
+      (needs.version.outputs.promotion_target == 'staging-candidate' || needs.version.outputs.promotion_target == 'staging' || needs.version.outputs.promotion_target == 'production')
     needs: [version, candidate]
     runs-on: ubuntu-24.04
     environment: comet-release-staging
@@ -393,7 +396,12 @@ jobs:
           fi
 
   publish-production:
-    if: needs.version.outputs.promotion_target == 'production'
+    if: >-
+      always() &&
+      needs.version.result == 'success' &&
+      needs.candidate.result == 'success' &&
+      needs['publish-staging'].result == 'success' &&
+      needs.version.outputs.promotion_target == 'production'
     needs: [version, candidate, publish-staging]
     runs-on: ubuntu-24.04
     environment: comet-release-production
