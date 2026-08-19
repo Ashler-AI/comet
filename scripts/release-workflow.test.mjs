@@ -30,8 +30,12 @@ describe("Comet release surfaces", () => {
   it("publishes a private immutable candidate without moving staging channels", async () => {
     const workflow = await read(".github/workflows/release.yml");
     const staging = jobBlock(workflow, "publish-staging");
+    const production = jobBlock(workflow, "publish-production");
     assert.match(workflow, /promotion_target:[\s\S]*- staging-candidate[\s\S]*- staging[\s\S]*- production/);
-    assert.match(staging, /inputs\.promotion_target == 'staging-candidate'/);
+    assert.match(workflow, /REQUESTED_PROMOTION_TARGET: \$\{\{ inputs\.promotion_target \}\}/);
+    assert.match(workflow, /echo "promotion_target=\$promotion_target" >> "\$GITHUB_OUTPUT"/);
+    assert.match(staging, /needs\.version\.outputs\.promotion_target == 'staging-candidate'/);
+    assert.match(production, /needs\.version\.outputs\.promotion_target == 'production'/);
     const immutable = staging.indexOf('publish_immutable "$file" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$VERSION/$name"');
     const candidateStop = staging.indexOf('if [[ "$PROMOTION_TARGET" == "staging-candidate" ]]');
     const guard = staging.indexOf("node scripts/guard-scaffold-runtime-release.mjs");
