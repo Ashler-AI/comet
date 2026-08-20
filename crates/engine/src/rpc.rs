@@ -400,6 +400,8 @@ enum MutateParams {
         /// The space the chat is created in — fixes host device + base cwd.
         space_id: String,
         #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
         config: Option<ChatConfig>,
         /// The picked ref, named on the row from the first frame (the footer
         /// read "Select ref" until the diff reconciler stamped it).
@@ -580,13 +582,12 @@ impl EngineRpc {
             .ok_or_else(|| RpcError::Failed("scaffold_control_plane_unavailable".into()))
     }
 
-    async fn prepare_scaffold_attach(
+    fn prepare_scaffold_attach(
         &self,
         control: &ScaffoldEnvironmentControl,
-        cancellation: &comet_harness::CancellationToken,
-    ) -> Result<(), RpcError> {
+    ) -> Result<Option<std::sync::Arc<crate::doc_host::ChatDocHandle>>, RpcError> {
         let ScaffoldEnvironmentControl::Attach { scope, .. } = control else {
-            return Ok(());
+            return Ok(None);
         };
         let auth_state = self.auth()?.state();
         let project_scope = auth_state
@@ -600,24 +601,34 @@ impl EngineRpc {
             .as_deref()
             .filter(|value| !value.trim().is_empty())
         else {
-            return Ok(());
+            return Ok(None);
         };
         let Some(session_id) = scope
             .session_id
             .as_deref()
             .filter(|value| !value.trim().is_empty())
         else {
-            return Ok(());
+            return Ok(None);
         };
         let projection = SessionRoomProjection {
             project_id: scope.project_id.clone(),
             deployment_id: deployment_id.to_string(),
             session_id: session_id.to_string(),
         };
-        let handle = self
-            .doc_host
+        self.doc_host
             .open_projection(session_id, Some(&projection))
-            .map_err(|error| RpcError::Failed(error.to_string()))?;
+            .map(Some)
+            .map_err(|error| RpcError::Failed(error.to_string()))
+    }
+
+    async fn await_scaffold_owner_room(
+        &self,
+        handle: Option<&crate::doc_host::ChatDocHandle>,
+        cancellation: &comet_harness::CancellationToken,
+    ) -> Result<(), RpcError> {
+        let Some(handle) = handle else {
+            return Ok(());
+        };
         tokio::time::timeout(SCAFFOLD_OWNER_ROOM_READY_TIMEOUT, async {
             while !handle.connected() {
                 tokio::select! {
@@ -993,6 +1004,7 @@ impl EngineRpc {
             MutateParams::CreateChat {
                 chat_id,
                 space_id,
+                title,
                 config,
                 branch,
                 cwd,
@@ -1000,6 +1012,11 @@ impl EngineRpc {
                 self.workspace
                     .create_chat(&chat_id, &space_id, config, cwd)
                     .map_err(failed)?;
+                if let Some(title) = title.as_deref().filter(|title| !title.is_empty()) {
+                    self.workspace
+                        .rename_chat(&chat_id, title)
+                        .map_err(failed)?;
+                }
                 if let Some(branch) = branch.as_deref().filter(|b| !b.is_empty()) {
                     self.workspace
                         .set_chat_branch(&chat_id, branch)
@@ -1624,11 +1641,28 @@ impl RpcService for EngineRpc {
             }
             methods::QUEUE_COMMAND => {
                 let p: QueueCommandParams = parse_params(params)?;
+                let activates_chat = match &p.command {
+                    SessionCommandPayload::Run { .. }
+                    | SessionCommandPayload::Steer { .. }
+                    | SessionCommandPayload::Queue { .. } => true,
+                    SessionCommandPayload::Control { action, .. } => matches!(
+                        action.as_ref(),
+                        comet_doc::SessionControlAction::Start { .. }
+                            | comet_doc::SessionControlAction::Steer { .. }
+                            | comet_doc::SessionControlAction::Queue { .. }
+                    ),
+                    _ => false,
+                };
                 self.install_local_owner_grant(&p.command)?;
                 let command_id = self
                     .doc_host
                     .queue_command(&p.chat_id, p.command)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                if activates_chat {
+                    self.workspace
+                        .set_chat_archived(&p.chat_id, false)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                }
                 RpcReply::value(&serde_json::json!({ "commandId": command_id }))
             }
             methods::TAKE_OVER_OMP_SESSION => {
@@ -1673,7 +1707,7 @@ impl RpcService for EngineRpc {
                 // Membership MUST precede DocHost::open inside queue_command_with_id;
                 // otherwise the missing-chat fallback could self-claim a foreign room.
                 self.workspace
-                    .upsert_session_ref(&target_chat_id)
+                    .upsert_session_ref(&target_chat_id, None)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 let existing = self
                     .doc_host
@@ -1763,7 +1797,7 @@ impl RpcService for EngineRpc {
                     None
                 };
                 self.workspace
-                    .upsert_session_ref(&target_chat_id)
+                    .upsert_session_ref(&target_chat_id, None)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 // One reply is correlated to one stored command. Deriving its id
                 // makes transport retries append/execute exactly once without
@@ -1928,7 +1962,7 @@ impl RpcService for EngineRpc {
                     .ok_or_else(|| RpcError::Failed("invalid_session_id".into()))?;
                 let session_ref = self
                     .workspace
-                    .upsert_session_ref(&chat_id)
+                    .upsert_session_ref(&chat_id, None)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&session_ref)
             }
@@ -1959,12 +1993,31 @@ impl RpcService for EngineRpc {
                 let control: ScaffoldEnvironmentControl = parse_params(params)?;
                 let cancellation = comet_harness::CancellationToken::new();
                 let scaffold = self.scaffold()?;
-                self.prepare_scaffold_attach(&control, &cancellation)
+                let owner_room = self.prepare_scaffold_attach(&control)?;
+                self.await_scaffold_owner_room(owner_room.as_deref(), &cancellation)
                     .await?;
                 let result = scaffold
                     .control(control, &cancellation)
                     .await
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
+                if let Some(projection) = result.room_projection.as_ref() {
+                    if result.environment.scope.project_id != projection.project_id
+                        || result.environment.scope.deployment_id.as_deref()
+                            != Some(projection.deployment_id.as_str())
+                        || result.environment.scope.session_id.as_deref()
+                            != Some(projection.session_id.as_str())
+                    {
+                        return Err(RpcError::Failed(
+                            "Scaffold attachment environment projection mismatch".into(),
+                        ));
+                    }
+                    self.workspace
+                        .upsert_session_ref(
+                            &projection.session_id,
+                            Some(result.environment.clone()),
+                        )
+                        .map_err(|error| RpcError::Failed(error.to_string()))?;
+                }
                 if let Err(error) = self.install_scaffold_control_grant(&result) {
                     tracing::warn!(
                         error = %error,
@@ -2682,6 +2735,39 @@ mod tests {
             Some(comet_proto::Utf8ByteRange { start: 7, end: 15 })
         );
         assert_eq!(projected.state, comet_proto::AnnotationState::Reanchored);
+    }
+
+    #[tokio::test]
+    async fn scaffold_attach_preparation_does_not_wait_for_the_remote_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = crate::EngineCore::assemble_with_identity(
+            dir.path(),
+            std::sync::Arc::new(crate::default_registry(RuntimeProfile::Mock)),
+            HarnessId::Mock,
+            None,
+            "project-a",
+            "accounts.google.com:subject-alice",
+            RuntimeProfile::Mock,
+        )
+        .unwrap();
+        let rpc = core.rpc_service();
+        let control = ScaffoldEnvironmentControl::Attach {
+            sandbox_id: "sandbox-a".into(),
+            scope: CollaborationScope {
+                project_id: "project-a".into(),
+                deployment_id: Some("deployment-a".into()),
+                session_id: Some("session-a".into()),
+                unknown: Default::default(),
+            },
+        };
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            rpc.prepare_scaffold_attach(&control)
+        })
+        .await
+        .expect("preparing an attach must not wait for the stopped remote owner")
+        .unwrap();
+        core.shutdown().await;
     }
 
     #[test]

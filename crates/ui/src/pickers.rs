@@ -372,17 +372,6 @@ fn draft_config_applies(selected_chat: Option<&str>, pending_scaffold_chat: Opti
     selected_chat.is_none() || is_pending_scaffold_selection(selected_chat, pending_scaffold_chat)
 }
 
-/// A Scaffold room's remote OMP broker is bound to the control-plane route
-/// chosen at first send. Later control actions carry prompts, not a new route,
-/// so only the pending first-send draft may change model or account.
-fn scaffold_route_picker_locked(
-    selected_chat_is_scaffold_room: bool,
-    selected_chat: Option<&str>,
-    pending_scaffold_chat: Option<&str>,
-) -> bool {
-    selected_chat_is_scaffold_room && !draft_config_applies(selected_chat, pending_scaffold_chat)
-}
-
 /// Command catalogs vary by harness, repository, and owning device: project
 /// commands and skills are discovered from `cwd`, while remote hosts can have a
 /// different OMP installation and plugin set.
@@ -631,16 +620,6 @@ impl Pickers {
         )
     }
 
-    fn scaffold_route_picker_locked(&self, cx: &App) -> bool {
-        let state = self.state.read(cx);
-        scaffold_route_picker_locked(
-            state.selected_chat_is_scaffold_room(),
-            state.selected_chat.as_deref(),
-            state
-                .scaffold_session_draft()
-                .map(|draft| draft.chat_id.as_str()),
-        )
-    }
     fn is_scaffold_selection(&self, cx: &App) -> bool {
         let state = self.state.read(cx);
         is_scaffold_selection(
@@ -841,11 +820,6 @@ impl Pickers {
         } else {
             kind
         };
-        if kind == PickerKind::HarnessModel && self.scaffold_route_picker_locked(cx) {
-            self.open = None;
-            cx.notify();
-            return;
-        }
         if self.open == Some(kind) {
             self.open = None;
             cx.notify();
@@ -1390,14 +1364,14 @@ impl Pickers {
     }
 
     fn pick_model(&mut self, model_id: String, cx: &mut Context<Self>) {
-        if self.scaffold_route_picker_locked(cx) {
-            return;
-        }
         self.open = None;
         if self.state.read(cx).selected_chat.is_some() {
             // Existing chat: persist to the chat row (Mutate setChatConfig) —
             // survives restarts and syncs; next runs in this chat use it.
-            self.update_chat_config(cx, move |config| config.model = Some(model_id));
+            self.update_chat_config(cx, move |config| {
+                config.model = Some(model_id);
+                config.agent_account_id = None;
+            });
         } else {
             // New chat: draft pick + sticky last-used memory for this harness.
             self.config.model = Some(model_id.clone());
@@ -1755,7 +1729,6 @@ impl Pickers {
         chip_icon: Option<(&'static str, Option<gpui::Hsla>)>,
         suffix: Option<SharedString>,
         theme: &Theme,
-        disabled: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         const ID: &str = "picker-model";
@@ -1777,22 +1750,14 @@ impl Pickers {
             .font_weight(gpui::FontWeight::MEDIUM)
             // comet composer/styles.tsx `pill`: `transition-colors` — the wash
             // and text brighten fade over 150ms.
-            .text_color(if disabled {
-                theme.text_muted.opacity(0.6)
-            } else {
-                motion::hover_blend(ID, theme.text.opacity(0.9), theme.text)
-            })
+            .text_color(motion::hover_blend(ID, theme.text.opacity(0.9), theme.text))
             .bg(if open {
                 theme.element_hover
-            } else if disabled {
-                gpui::transparent_black()
             } else {
                 motion::hover_blend(ID, gpui::transparent_black(), theme.element_hover)
             })
-            .when(!disabled, |el| {
-                el.on_hover(motion::hover_listener(ID)).cursor_pointer()
-            })
-            .when(disabled, |el| el.opacity(0.55))
+            .on_hover(motion::hover_listener(ID))
+            .cursor_pointer()
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.toggle(PickerKind::HarnessModel, window, cx);
             }))
@@ -2930,11 +2895,6 @@ fn attach_overlay_end(
 impl Render for Pickers {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
-        let scaffold_route_locked = self.scaffold_route_picker_locked(cx);
-        if scaffold_route_locked && self.open == Some(PickerKind::HarnessModel) {
-            self.open = None;
-            self.boot_focus_pending = false;
-        }
         // A COMET_OPEN_PICKER popover never went through `toggle`, so claim
         // its keyboard focus here (re-claim until it sticks — the shell's
         // first-paint fallback focuses the composer after our first render).
@@ -3061,7 +3021,6 @@ impl Render for Pickers {
             Some(harness_icon),
             Some(traits_label),
             &theme,
-            scaffold_route_locked,
             cx,
         );
         let _ = traits_set;
@@ -3158,21 +3117,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn scaffold_route_picker_locks_only_after_the_first_send() {
-        assert!(
-            scaffold_route_picker_locked(true, Some("scaffold-chat"), None),
-            "an existing Scaffold room must keep its original model and account"
-        );
-        assert!(
-            !scaffold_route_picker_locked(true, Some("scaffold-chat"), Some("scaffold-chat")),
-            "a pending first-send Scaffold draft must remain configurable"
-        );
-        assert!(
-            !scaffold_route_picker_locked(false, Some("local-chat"), None),
-            "local persisted chats retain their existing picker behavior"
-        );
-    }
     #[test]
     fn scaffold_selection_offers_only_omp() {
         let descriptor = |id: HarnessId, name: &str| HarnessDescriptor {

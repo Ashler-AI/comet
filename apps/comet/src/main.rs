@@ -31,7 +31,7 @@ enum Command {
     /// Live sync introspection from the running engine: per-room connection
     /// state, last pushed-frame/ack ages, rejoin/probe/resync counters.
     Sync,
-    /// Import, inspect, and message global Comet sessions.
+    /// Import, inspect, and message global Crew sessions.
     Session {
         #[command(subcommand)]
         command: session_cli::SessionCommand,

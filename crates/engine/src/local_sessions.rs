@@ -126,6 +126,19 @@ pub fn capture_omp_artifact(candidate_id: &str) -> Result<OmpSessionArtifact, En
     capture_omp_artifact_with_roots(candidate_id, &session_roots())
 }
 
+/// Capture the OMP session identified by the durable native id and cwd stored
+/// on a Crew chat row.
+///
+/// Re-discovery resolves that trusted pair to a concrete OMP candidate, then
+/// capture revalidates the same identity against the bytes under a stable
+/// no-follow file handle. Callers never provide a filesystem path.
+pub fn capture_omp_artifact_for_session(
+    native_session_id: &str,
+    cwd: &str,
+) -> Result<OmpSessionArtifact, EngineError> {
+    capture_omp_artifact_for_session_with_roots(native_session_id, cwd, &session_roots())
+}
+
 fn capture_omp_artifact_with_roots(
     candidate_id: &str,
     roots: &SessionRoots,
@@ -134,6 +147,29 @@ fn capture_omp_artifact_with_roots(
         .into_iter()
         .find(|session| session.candidate.id == candidate_id)
         .ok_or_else(|| EngineError::Other("local session is no longer available".into()))?;
+    capture_discovered_omp_artifact(&session, roots)
+}
+
+fn capture_omp_artifact_for_session_with_roots(
+    native_session_id: &str,
+    cwd: &str,
+    roots: &SessionRoots,
+) -> Result<OmpSessionArtifact, EngineError> {
+    let session = discover_with_roots(roots)
+        .into_iter()
+        .find(|session| {
+            session.candidate.harness == HarnessId::Omp
+                && session.candidate.session_id == native_session_id
+                && session.candidate.cwd == cwd
+        })
+        .ok_or_else(|| EngineError::Other("local OMP session is no longer available".into()))?;
+    capture_discovered_omp_artifact(&session, roots)
+}
+
+fn capture_discovered_omp_artifact(
+    session: &DiscoveredSession,
+    roots: &SessionRoots,
+) -> Result<OmpSessionArtifact, EngineError> {
     if session.candidate.harness != HarnessId::Omp {
         return Err(EngineError::Other(
             "only OMP native sessions support exact artifact capture".into(),
@@ -764,37 +800,57 @@ fn candidate_from_codex_rollout(path: &Path, known_id: Option<&str>) -> Option<D
 }
 
 fn discover_omp(root: &Path) -> Vec<DiscoveredSession> {
-    recent_omp_jsonl_files(&root.join("sessions"), MAX_CANDIDATES_PER_HARNESS)
-        .into_iter()
-        .filter_map(|path| {
-            // Parse the bounded header first. Most OMP journals are internal
-            // advisor/worker shells with no user turn; do not pay for an lsof
-            // process or expose an empty row for those files.
-            let mut session = candidate_from_omp_with_writer_state(
-                &path,
-                comet_harness::omp::SessionWriterState::Unknown,
-            )?;
-            session
-                .candidate
-                .preview
-                .as_deref()
-                .filter(|preview| !preview.trim().is_empty())?;
-            apply_omp_writer_state(
-                &mut session,
-                comet_harness::omp::session_writer_state(&path),
-            );
-            Some(session)
-        })
-        .collect()
+    // Parse bounded headers before probing ownership. Most OMP journals are
+    // internal advisor/worker shells with no user turn, so they never enter
+    // the single batched descriptor scan.
+    let mut sessions: Vec<_> =
+        recent_omp_jsonl_files(&root.join("sessions"), MAX_CANDIDATES_PER_HARNESS)
+            .into_iter()
+            .filter_map(|path| {
+                let session = candidate_from_omp_with_writer_state(
+                    &path,
+                    comet_harness::omp::SessionWriterState::Unknown,
+                )?;
+                session
+                    .candidate
+                    .preview
+                    .as_deref()
+                    .filter(|preview| !preview.trim().is_empty())?;
+                Some(session)
+            })
+            .collect();
+    let paths: Vec<_> = sessions
+        .iter()
+        .map(|session| session.path.clone())
+        .collect();
+    let writer_states = comet_harness::omp::session_writer_states(&paths);
+    for (session, writer_state) in sessions.iter_mut().zip(writer_states) {
+        apply_omp_writer_state(session, writer_state);
+    }
+    sessions
 }
 
 /// Latest native journal activity for a specific OMP session. A Comet-owned
 /// turn records this watermark at `Done`, after the ACP response is durable,
 /// so later history refreshes start strictly after records Comet already
 /// rendered through the live stream.
+///
+/// This completion path only needs persisted metadata. Writer ownership is
+/// intentionally excluded: probing it can launch `lsof`, which must never
+/// block the session engine after a turn finishes.
 pub(crate) fn omp_session_updated_at(session_id: &str, cwd: &str) -> Option<i64> {
-    discover_omp(&session_roots().omp)
+    omp_session_updated_at_with_root(&session_roots().omp, session_id, cwd)
+}
+
+fn omp_session_updated_at_with_root(root: &Path, session_id: &str, cwd: &str) -> Option<i64> {
+    recent_omp_jsonl_files(&root.join("sessions"), MAX_CANDIDATES_PER_HARNESS)
         .into_iter()
+        .filter_map(|path| {
+            candidate_from_omp_with_writer_state(
+                &path,
+                comet_harness::omp::SessionWriterState::Unknown,
+            )
+        })
         .find(|session| session.candidate.session_id == session_id && session.candidate.cwd == cwd)
         .map(|session| session.candidate.updated_at)
 }
@@ -2184,6 +2240,25 @@ mod tests {
 
         assert!(discover_omp(temp.path()).is_empty());
     }
+    #[test]
+    fn omp_watermark_lookup_uses_session_metadata_without_discovery_eligibility() {
+        let temp = TempDir::new().unwrap();
+        let path = fixture(
+            temp.path(),
+            "sessions/project/watermark.jsonl",
+            &[serde_json::json!({
+                "type": "session",
+                "id": "watermark-session",
+                "cwd": "/repo",
+                "timestamp": "2026-08-20T04:11:10Z"
+            })],
+        );
+
+        assert_eq!(
+            omp_session_updated_at_with_root(temp.path(), "watermark-session", "/repo"),
+            file_modified_ms(&path)
+        );
+    }
 
     #[test]
     fn omp_writer_state_controls_resumability_without_live_attachment() {
@@ -2307,6 +2382,15 @@ mod tests {
             artifact.sha256,
             format!("{:x}", Sha256::digest(&artifact.bytes))
         );
+        let by_native_session = capture_omp_artifact_for_session_with_roots(
+            &candidate.candidate.session_id,
+            &candidate.candidate.cwd,
+            &roots,
+        )
+        .unwrap();
+        assert_eq!(by_native_session, artifact);
+        assert!(capture_omp_artifact_for_session_with_roots("omp-other", "/repo", &roots).is_err());
+        assert!(capture_omp_artifact_for_session_with_roots("omp-1", "/other", &roots).is_err());
     }
 
     #[test]

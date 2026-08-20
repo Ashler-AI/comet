@@ -67,21 +67,21 @@ fn macos_key_bindings() -> Vec<KeyBinding> {
 
 fn application_menu(macos: bool) -> Menu {
     let mut items = vec![
-        MenuItem::action("About Ashler Comet", About).disabled(true),
+        MenuItem::action("About Crew", About).disabled(true),
         MenuItem::separator(),
     ];
     if macos {
         items.extend([
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),
-            MenuItem::action("Hide Ashler Comet", Hide),
+            MenuItem::action("Hide Crew", Hide),
             MenuItem::action("Hide Others", HideOthers),
             MenuItem::action("Show All", ShowAll),
             MenuItem::separator(),
         ]);
     }
-    items.push(MenuItem::action("Quit Ashler Comet", Quit));
-    Menu::new("Ashler Comet").items(items)
+    items.push(MenuItem::action("Quit Crew", Quit));
+    Menu::new("Crew").items(items)
 }
 
 fn file_menu() -> Menu {
@@ -144,13 +144,13 @@ mod tests {
     use gpui::Action as _;
 
     #[test]
-    fn product_menu_uses_ashler_comet_name_and_quit_action() {
+    fn product_menu_uses_crew_name_and_quit_action() {
         let menus = app_menus();
-        assert_eq!(menus[0].name.as_ref(), "Ashler Comet");
+        assert_eq!(menus[0].name.as_ref(), "Crew");
         let MenuItem::Action { name, action, .. } = menus[0].items.last().unwrap() else {
             panic!("last product menu item should quit");
         };
-        assert_eq!(name.as_ref(), "Quit Ashler Comet");
+        assert_eq!(name.as_ref(), "Quit Crew");
         assert_eq!(action.name(), Quit.name());
     }
 

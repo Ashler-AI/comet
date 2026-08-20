@@ -28,16 +28,16 @@ use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
 use comet_doc::{
-    MessagePart, MessageRole, SessionEntryWindow, SessionMessageEntry, TranscriptDesync,
-    TranscriptFrame,
+    MessagePart, MessageRole, MessageStatus, SessionEntryWindow, SessionMessageEntry,
+    TranscriptDesync, TranscriptFrame,
 };
 use comet_engine::{Engine, EngineConfig, EngineRuntime, rpc::AuthRpc};
 use comet_proto::{
     AgentRoute, AuthState, Chat, ChatIndicator, CollaborationScope, CollaborationSnapshot, Device,
     HarnessId, LocalSessionAttachResult, LocalSessionCandidate, MessageProvenance,
-    ParticipantPresence, RuntimeProfile, ScaffoldEnvironmentControl,
-    ScaffoldEnvironmentControlResult, ScaffoldLifecycle, ScaffoldRuntimeMode, Session,
-    SessionEnvironmentSource, SessionRef, SessionRoomProjection, Space,
+    ParticipantPresence, RuntimeProfile, ScaffoldDatabaseEnvironment, ScaffoldEnvironmentControl,
+    ScaffoldEnvironmentControlResult, ScaffoldEnvironmentSnapshot, ScaffoldLifecycle, Session,
+    SessionEnvironment, SessionEnvironmentSource, SessionRef, SessionRoomProjection, Space,
 };
 use comet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
 
@@ -367,8 +367,9 @@ impl EngineHandle {
 // this crate reads them as `state::…`.
 pub use comet_proto::view::{
     ChatGroup, ConnectionStatus, GatePhase, Indicator, SESSION_STALE_MS, attention_rank,
-    chat_location, display_status, effective_indicator, format_time_ago, gate_phase, group_chats,
-    parse_auth_state, project_label, sort_active, sort_chats, sort_spaces, sort_tabs,
+    chat_location, display_status, effective_agent_indicator, effective_indicator, format_time_ago,
+    gate_phase, group_chats, parse_auth_state, project_label, sort_active, sort_chats, sort_spaces,
+    sort_tabs,
 };
 
 /// A compact transcript-derived label for an imported session. The first user
@@ -401,6 +402,32 @@ fn shared_session_preview(entries: &[SessionMessageEntry]) -> Option<String> {
     })
 }
 
+fn agent_indicator_with_transcript(
+    session: Option<&comet_proto::AgentSessionRecord>,
+    transcript: &[SessionMessageEntry],
+    now: DateTime<Utc>,
+) -> Indicator {
+    let indicator = effective_agent_indicator(session, now);
+    let Some(session) = session else {
+        return indicator;
+    };
+    let run_started_at = session.updated_at.unwrap_or(session.created_at);
+    let latest_run_entry = transcript.iter().rev().find(|entry| {
+        entry.role == MessageRole::Assistant
+            && entry.device_id == session.owner_device_id
+            && entry.created_at >= run_started_at
+    });
+    match latest_run_entry.and_then(|entry| entry.status) {
+        Some(MessageStatus::Streaming) => Indicator::Working,
+        Some(MessageStatus::Complete | MessageStatus::Aborted)
+            if indicator == Indicator::Working =>
+        {
+            Indicator::None
+        }
+        _ => indicator,
+    }
+}
+
 fn session_ref_fallback(chat_id: &str) -> String {
     format!("Session {}", chat_id.chars().take(8).collect::<String>())
 }
@@ -410,6 +437,13 @@ fn session_ref_fallback(chat_id: &str) -> String {
 // AppState entity
 // ---------------------------------------------------------------------------
 
+/// Durable OMP identity copied into Scaffold before the first remote run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScaffoldOmpHandoffDraft {
+    pub native_session_id: String,
+    pub cwd: String,
+}
+
 /// A local Comet session selected for Scaffold. The sandbox does not exist
 /// until this session's first prompt is submitted.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -418,6 +452,10 @@ pub(crate) struct ScaffoldSessionDraft {
     pub deployment_id: String,
     pub space_id: String,
     pub chat_id: String,
+    pub database_environment: ScaffoldDatabaseEnvironment,
+    /// Existing local OMP session to materialize in Scaffold. `None` creates a
+    /// blank session.
+    pub omp_handoff: Option<ScaffoldOmpHandoffDraft>,
 }
 impl ScaffoldSessionDraft {
     pub fn collaboration_scope(&self) -> CollaborationScope {
@@ -437,6 +475,7 @@ pub(crate) struct ScaffoldControlTarget {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ScaffoldSessionAttachment {
+    pub environment: SessionEnvironment,
     pub projection: SessionRoomProjection,
     pub grant_id: String,
     pub owner_device_id: String,
@@ -450,15 +489,17 @@ pub(crate) struct ScaffoldSessionAttachment {
 pub(crate) async fn create_scaffold_session(
     handle: &EngineHandle,
     scope: &CollaborationScope,
+    name: Option<&str>,
     source_ref: Option<&str>,
+    database_environment: ScaffoldDatabaseEnvironment,
     agent_route: &AgentRoute,
 ) -> Result<(String, CollaborationScope), RpcError> {
     let create = ScaffoldEnvironmentControl::Create {
         scope: scope.clone(),
-        name: Some("Comet Scaffold session".into()),
+        name: name.map(str::to_string),
         source_ref: source_ref.map(str::to_string),
         region: None,
-        runtime_mode: Some(ScaffoldRuntimeMode::Compose),
+        database_environment,
         agent_route: agent_route.clone(),
     };
     let value = handle
@@ -541,6 +582,7 @@ pub(crate) async fn attach_scaffold_session(
         .await?;
     let attached: ScaffoldEnvironmentControlResult =
         serde_json::from_value(value).map_err(|err| RpcError::Failed(err.to_string()))?;
+    let environment = attached.environment.clone();
     let source_ref = attached.environment.source_ref.clone();
     let SessionEnvironmentSource::Scaffold {
         sandbox_id: attached_sandbox_id,
@@ -598,6 +640,7 @@ pub(crate) async fn attach_scaffold_session(
         ));
     }
     Ok(ScaffoldSessionAttachment {
+        environment,
         projection,
         grant_id: grant.id,
         owner_device_id,
@@ -609,61 +652,134 @@ pub(crate) async fn attach_scaffold_session(
         },
     })
 }
-const SCAFFOLD_ATTACH_MAX_ATTEMPTS: usize = 60;
-#[cfg(not(test))]
-const SCAFFOLD_ATTACH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
-#[cfg(test)]
-const SCAFFOLD_ATTACH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
 
-fn is_retryable_scaffold_attach_error(error: &RpcError) -> bool {
+/// Materialize an authenticated OMP session in an already ready Scaffold host,
+/// rebind it to the remote workspace, and return the native id plus remote cwd
+/// for the first run.
+pub(crate) async fn handoff_omp_session(
+    handle: &EngineHandle,
+    sandbox_id: &str,
+    scope: &CollaborationScope,
+    native_session_id: &str,
+    cwd: &str,
+) -> Result<(String, String), RpcError> {
+    let value = handle
+        .client()
+        .call(
+            methods::CONTROL_SCAFFOLD_ENVIRONMENT,
+            serde_json::to_value(ScaffoldEnvironmentControl::HandoffOmpSession {
+                sandbox_id: sandbox_id.to_string(),
+                scope: scope.clone(),
+                native_session_id: native_session_id.to_string(),
+                cwd: cwd.to_string(),
+            })
+            .unwrap_or_default(),
+        )
+        .await?;
+    let handed_off: ScaffoldEnvironmentControlResult =
+        serde_json::from_value(value).map_err(|err| RpcError::Failed(err.to_string()))?;
+    let SessionEnvironmentSource::Scaffold {
+        sandbox_id: handed_off_sandbox_id,
+        ..
+    } = &handed_off.environment.source
+    else {
+        return Err(RpcError::Failed(
+            "OMP handoff returned a local environment".into(),
+        ));
+    };
+    if handed_off_sandbox_id != sandbox_id || handed_off.environment.scope != *scope {
+        return Err(RpcError::Failed(
+            "OMP handoff returned a different sandbox scope".into(),
+        ));
+    }
+    let projection = handed_off
+        .room_projection
+        .ok_or_else(|| RpcError::Failed("OMP handoff returned no session room".into()))?;
+    if projection.project_id != scope.project_id
+        || Some(projection.deployment_id.as_str()) != scope.deployment_id.as_deref()
+        || Some(projection.session_id.as_str()) != scope.session_id.as_deref()
+    {
+        return Err(RpcError::Failed(
+            "OMP handoff returned a different session room".into(),
+        ));
+    }
+    let native_session_id = handed_off
+        .handoff_native_session_id
+        .filter(|session_id| !session_id.trim().is_empty())
+        .ok_or_else(|| RpcError::Failed("OMP handoff returned no native session id".into()))?;
+    let remote_cwd = handed_off
+        .handoff_cwd
+        .filter(|cwd| !cwd.trim().is_empty())
+        .ok_or_else(|| RpcError::Failed("OMP handoff returned no remote cwd".into()))?;
+    Ok((native_session_id, remote_cwd))
+}
+// Half-second retries match the composer's ten-minute Scaffold readiness budget.
+const SCAFFOLD_CONTROL_MAX_ATTEMPTS: usize = 1_200;
+#[cfg(not(test))]
+const SCAFFOLD_CONTROL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+#[cfg(test)]
+const SCAFFOLD_CONTROL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
+
+fn is_retryable_scaffold_control_error(error: &RpcError) -> bool {
     matches!(
         error,
         RpcError::Failed(message)
-            if message.contains("scaffold_api_error:502:scaffold_request_rejected")
+            if message.contains("scaffold_api_error:500:scaffold_request_rejected")
+                || message.contains("scaffold_api_error:502:scaffold_request_rejected")
+                || message.contains("scaffold_api_error:503:scaffold_request_rejected")
+                || message.contains("scaffold_api_error:504:scaffold_request_rejected")
+                || message.contains(
+                    "scaffold_api_error:404:not_found:Sandbox agent route projection failed",
+                )
                 || message.contains(
                     "scaffold_api_error:409:sandbox_provider_error:Sandbox lifecycle changed while the operation was in flight",
+                )
+                || message.contains("scaffold_session_owner_room_unavailable")
+                || message.contains(
+                    "scaffold_api_error:404:sandbox_provider_error:E2B sandbox control channel is unavailable",
+                )
+                || (message.contains("scaffold_response_invalid: sandbox ")
+                    && message.contains(" is not ready"))
+                || message.contains(
+                    "Scaffold agent route update returned unavailable lifecycle",
                 )
     )
 }
 
-async fn attach_scaffold_session_with_retry<Wait, WaitFuture>(
-    handle: &EngineHandle,
-    sandbox_id: &str,
-    scope: CollaborationScope,
+async fn retry_scaffold_control_operation<T, Operation, OperationFuture, Wait, WaitFuture>(
+    mut operation: Operation,
     wait: &Wait,
-) -> Result<ScaffoldSessionAttachment, RpcError>
+) -> Result<T, RpcError>
 where
+    Operation: FnMut() -> OperationFuture,
+    OperationFuture: Future<Output = Result<T, RpcError>>,
     Wait: Fn(std::time::Duration) -> WaitFuture,
     WaitFuture: Future<Output = ()>,
 {
     let mut attempt = 1;
     loop {
-        match attach_scaffold_session(handle, sandbox_id, scope.clone()).await {
-            Ok(attachment) => return Ok(attachment),
+        match operation().await {
+            Ok(value) => return Ok(value),
             Err(error)
-                if attempt < SCAFFOLD_ATTACH_MAX_ATTEMPTS
-                    && is_retryable_scaffold_attach_error(&error) =>
+                if attempt < SCAFFOLD_CONTROL_MAX_ATTEMPTS
+                    && is_retryable_scaffold_control_error(&error) =>
             {
                 attempt += 1;
-                wait(SCAFFOLD_ATTACH_RETRY_DELAY).await;
+                wait(SCAFFOLD_CONTROL_RETRY_DELAY).await;
             }
             Err(error) => return Err(error),
         }
     }
 }
 
-/// Reconnect an existing Scaffold room. Paused sandboxes resume before a fresh,
-/// lifecycle-bound device grant is installed; active sandboxes only reattach.
-pub(crate) async fn ensure_scaffold_session_attached<Wait, WaitFuture>(
+/// Reconnect an existing Scaffold room once. Paused sandboxes resume before a
+/// fresh, lifecycle-bound device grant is installed; active sandboxes only
+/// reattach.
+async fn ensure_scaffold_session_attached_once(
     handle: &EngineHandle,
     sandbox_id: &str,
     scope: &CollaborationScope,
-    wait: &Wait,
-) -> Result<ScaffoldSessionAttachment, RpcError>
-where
-    Wait: Fn(std::time::Duration) -> WaitFuture,
-    WaitFuture: Future<Output = ()>,
-{
+) -> Result<ScaffoldSessionAttachment, RpcError> {
     match inspect_scaffold_session(handle, sandbox_id, scope).await? {
         ScaffoldLifecycle::Paused => {
             let value = handle
@@ -720,7 +836,94 @@ where
         | ScaffoldLifecycle::AgentRunning
         | ScaffoldLifecycle::Resuming => {}
     }
-    attach_scaffold_session_with_retry(handle, sandbox_id, scope.clone(), wait).await
+    attach_scaffold_session(handle, sandbox_id, scope.clone()).await
+}
+
+/// Reconnect an existing Scaffold room with bounded automatic recovery for
+/// transient provider rollout, lifecycle, and room-readiness races.
+pub(crate) async fn ensure_scaffold_session_attached<Wait, WaitFuture>(
+    handle: &EngineHandle,
+    sandbox_id: &str,
+    scope: &CollaborationScope,
+    wait: &Wait,
+) -> Result<ScaffoldSessionAttachment, RpcError>
+where
+    Wait: Fn(std::time::Duration) -> WaitFuture,
+    WaitFuture: Future<Output = ()>,
+{
+    retry_scaffold_control_operation(
+        || ensure_scaffold_session_attached_once(handle, sandbox_id, scope),
+        wait,
+    )
+    .await
+}
+async fn update_scaffold_session_agent_route_once(
+    handle: &EngineHandle,
+    sandbox_id: &str,
+    scope: &CollaborationScope,
+    agent_route: &comet_proto::AgentRoute,
+) -> Result<(), RpcError> {
+    let value = handle
+        .client()
+        .call(
+            methods::CONTROL_SCAFFOLD_ENVIRONMENT,
+            serde_json::to_value(ScaffoldEnvironmentControl::UpdateAgentRoute {
+                sandbox_id: sandbox_id.to_string(),
+                scope: scope.clone(),
+                agent_route: agent_route.clone(),
+            })
+            .unwrap_or_default(),
+        )
+        .await?;
+    let updated: ScaffoldEnvironmentControlResult =
+        serde_json::from_value(value).map_err(|err| RpcError::Failed(err.to_string()))?;
+    if updated.environment.scope != *scope {
+        return Err(RpcError::Failed(
+            "Scaffold agent route update returned a different sandbox scope".into(),
+        ));
+    }
+    let SessionEnvironmentSource::Scaffold {
+        sandbox_id: updated_id,
+        lifecycle,
+        ..
+    } = updated.environment.source
+    else {
+        return Err(RpcError::Failed(
+            "Scaffold agent route update returned a local environment".into(),
+        ));
+    };
+    if updated_id != sandbox_id {
+        return Err(RpcError::Failed(
+            "Scaffold agent route update returned a different sandbox".into(),
+        ));
+    }
+    if !matches!(
+        lifecycle,
+        ScaffoldLifecycle::Ready | ScaffoldLifecycle::AgentRunning
+    ) {
+        return Err(RpcError::Failed(format!(
+            "Scaffold agent route update returned unavailable lifecycle {lifecycle:?}"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) async fn update_scaffold_session_agent_route<Wait, WaitFuture>(
+    handle: &EngineHandle,
+    sandbox_id: &str,
+    scope: &CollaborationScope,
+    agent_route: &comet_proto::AgentRoute,
+    wait: &Wait,
+) -> Result<(), RpcError>
+where
+    Wait: Fn(std::time::Duration) -> WaitFuture,
+    WaitFuture: Future<Output = ()>,
+{
+    retry_scaffold_control_operation(
+        || update_scaffold_session_agent_route_once(handle, sandbox_id, scope, agent_route),
+        wait,
+    )
+    .await
 }
 
 /// Create the sandbox and immediately dispatch its supervised Comet bootstrap.
@@ -729,7 +932,9 @@ where
 pub(crate) async fn create_and_attach_scaffold_session<Wait, WaitFuture>(
     handle: &EngineHandle,
     scope: &CollaborationScope,
+    name: Option<&str>,
     source_ref: Option<&str>,
+    database_environment: ScaffoldDatabaseEnvironment,
     agent_route: &AgentRoute,
     wait: &Wait,
 ) -> Result<(String, ScaffoldSessionAttachment), RpcError>
@@ -737,10 +942,20 @@ where
     Wait: Fn(std::time::Duration) -> WaitFuture,
     WaitFuture: Future<Output = ()>,
 {
-    let (sandbox_id, authoritative_scope) =
-        create_scaffold_session(handle, scope, source_ref, agent_route).await?;
-    let attachment =
-        attach_scaffold_session_with_retry(handle, &sandbox_id, authoritative_scope, wait).await?;
+    let (sandbox_id, authoritative_scope) = create_scaffold_session(
+        handle,
+        scope,
+        name,
+        source_ref,
+        database_environment,
+        agent_route,
+    )
+    .await?;
+    let attachment = retry_scaffold_control_operation(
+        || attach_scaffold_session(handle, &sandbox_id, authoritative_scope.clone()),
+        wait,
+    )
+    .await?;
     Ok((sandbox_id, attachment))
 }
 /// Pause exactly the sandbox attached to a chat. The response must preserve
@@ -907,6 +1122,8 @@ pub struct AppState {
     /// Non-secret physical targets for attached Scaffold chats. Retained after
     /// settlement so archive can pause the exact sandbox idempotently.
     scaffold_control_targets: HashMap<String, ScaffoldControlTarget>,
+    /// Latest control-plane metadata keyed by the Crew chat/session id.
+    scaffold_environments: HashMap<String, SessionEnvironment>,
     /// Exact local Comet session awaiting its first-prompt Scaffold attach.
     pending_scaffold_session: Option<ScaffoldSessionDraft>,
     /// A Comet chat row is being persisted for a user-selected Scaffold session.
@@ -1001,6 +1218,7 @@ impl AppState {
             room_projections: HashMap::new(),
             scaffold_control_grants: HashMap::new(),
             scaffold_control_targets: HashMap::new(),
+            scaffold_environments: HashMap::new(),
             pending_scaffold_session: None,
             scaffold_session_creating: false,
             scaffold_session_error: None,
@@ -1092,6 +1310,17 @@ impl AppState {
 
     pub fn apply_sessions(&mut self, sessions: Vec<Session>) {
         self.sessions = sessions;
+    }
+
+    pub fn apply_scaffold_environments(&mut self, snapshot: ScaffoldEnvironmentSnapshot) {
+        self.scaffold_environments = snapshot
+            .environments
+            .into_iter()
+            .filter_map(|environment| {
+                let chat_id = environment.scope.session_id.clone()?;
+                Some((chat_id, environment))
+            })
+            .collect();
     }
 
     pub fn apply_session_refs(&mut self, mut refs: Vec<SessionRef>) {
@@ -1284,6 +1513,12 @@ impl AppState {
     }
 
     pub fn apply_collaboration(&mut self, snapshot: CollaborationSnapshot) {
+        for session in &snapshot.sessions {
+            if let Some(environment) = &session.environment {
+                self.scaffold_environments
+                    .insert(session.chat_id.clone(), environment.clone());
+            }
+        }
         if self.apply_pending_invitation(&snapshot) {
             self.collaboration = Some(snapshot);
             return;
@@ -1552,6 +1787,31 @@ impl AppState {
             .sessions
             .iter()
             .find(|session| session.session_id == selected)
+    }
+
+    pub fn agent_indicator_for(&self, session_id: &str, now: DateTime<Utc>) -> Indicator {
+        let selected_chat = self.selected_chat.as_deref();
+        agent_indicator_with_transcript(
+            self.collaboration
+                .as_ref()
+                .and_then(|snapshot| {
+                    snapshot
+                        .sessions
+                        .iter()
+                        .find(|session| session.session_id == session_id)
+                })
+                .filter(|session| Some(session.chat_id.as_str()) == selected_chat),
+            &self.transcript,
+            now,
+        )
+    }
+
+    pub fn selected_agent_indicator(&self, now: DateTime<Utc>) -> Indicator {
+        self.selected_agent_session
+            .as_deref()
+            .map_or(Indicator::None, |session_id| {
+                self.agent_indicator_for(session_id, now)
+            })
     }
 
     pub fn select_agent_session(&mut self, session_id: Option<String>) {
@@ -1868,6 +2128,13 @@ impl AppState {
                 methods::WATCH_SPACES,
                 AppState::apply_spaces,
             ),
+            spawn_watch(
+                cx,
+                handle.clone(),
+                methods::WATCH_SCAFFOLD_ENVIRONMENTS,
+                AppState::apply_scaffold_environments,
+            ),
+            spawn_scaffold_environment_refresh(cx, handle.clone(), self.scaffold_scope.clone()),
             // Auth frames parse tolerantly — engine and proto tags differ today.
             spawn_watch(
                 cx,
@@ -1956,17 +2223,21 @@ impl AppState {
     pub(crate) fn scaffold_control_target(&self, chat_id: &str) -> Option<&ScaffoldControlTarget> {
         self.scaffold_control_targets.get(chat_id)
     }
+    pub(crate) fn scaffold_environment(&self, chat_id: &str) -> Option<&SessionEnvironment> {
+        self.scaffold_environments.get(chat_id)
+    }
 
     pub fn selected_chat_is_scaffold_room(&self) -> bool {
         self.selected_chat
             .as_ref()
-            .is_some_and(|chat_id| self.room_projections.contains_key(chat_id))
+            .is_some_and(|chat_id| self.chat_is_scaffold(chat_id))
     }
     pub fn chat_is_scaffold(&self, chat_id: &str) -> bool {
         self.pending_scaffold_session
             .as_ref()
             .is_some_and(|draft| draft.chat_id == chat_id)
             || self.room_projections.contains_key(chat_id)
+            || self.scaffold_environments.contains_key(chat_id)
     }
 
     pub fn can_start_scaffold_session(&self) -> bool {
@@ -1994,7 +2265,11 @@ impl AppState {
 
     /// Create one local Comet session under the selected folder. No Scaffold
     /// environment RPC is made until this exact session sends its first prompt.
-    pub fn start_scaffold_session(&mut self, cx: &mut Context<Self>) {
+    pub fn start_scaffold_session(
+        &mut self,
+        database_environment: ScaffoldDatabaseEnvironment,
+        cx: &mut Context<Self>,
+    ) {
         if self.scaffold_session_creating {
             return;
         }
@@ -2003,11 +2278,62 @@ impl AppState {
             cx.notify();
             return;
         };
-        let Some(space_id) = self.selected_space.clone() else {
+        let handoff_source = self.selected_chat.as_deref().and_then(|selected| {
+            self.chats
+                .iter()
+                .find(|chat| chat.id == selected)
+                .filter(|chat| {
+                    self.local_device_id.as_deref() == Some(chat.device_id.as_str())
+                        && chat
+                            .config
+                            .as_ref()
+                            .is_some_and(|config| config.harness == HarnessId::Omp)
+                        && !self.room_projections.contains_key(selected)
+                })
+                .and_then(|chat| {
+                    let native_session_id = chat
+                        .harness_session_id
+                        .as_deref()
+                        .filter(|session_id| !session_id.is_empty())?;
+                    let cwd = chat
+                        .harness_session_cwd
+                        .as_deref()
+                        .filter(|cwd| !cwd.is_empty())?;
+                    Some((
+                        chat.id.clone(),
+                        ScaffoldOmpHandoffDraft {
+                            native_session_id: native_session_id.to_string(),
+                            cwd: cwd.to_string(),
+                        },
+                    ))
+                })
+        });
+        let source_space_id = handoff_source.as_ref().and_then(|(chat_id, _)| {
+            self.chats
+                .iter()
+                .find(|chat| chat.id == *chat_id)
+                .and_then(|chat| chat.space_id.clone())
+        });
+        let Some(space_id) = source_space_id.or_else(|| self.selected_space.clone()) else {
             self.scaffold_session_error = Some("Select a folder first".into());
             cx.notify();
             return;
         };
+        if let Some((local_chat_id, omp_handoff)) = handoff_source {
+            self.scaffold_session_error = None;
+            self.select_pending_scaffold_chat(
+                ScaffoldSessionDraft {
+                    project_id,
+                    deployment_id,
+                    space_id,
+                    chat_id: local_chat_id,
+                    database_environment,
+                    omp_handoff: Some(omp_handoff),
+                },
+                cx,
+            );
+            return;
+        }
         let Some(handle) = self.engine.clone() else {
             self.scaffold_session_error = Some("Engine not connected".into());
             cx.notify();
@@ -2038,11 +2364,13 @@ impl AppState {
                             deployment_id,
                             space_id,
                             chat_id,
+                            database_environment,
+                            omp_handoff: None,
                         },
                         cx,
                     ),
                     Err(err) => {
-                        tracing::warn!(error = %err, "Scaffold Comet session creation failed");
+                        tracing::warn!(error = %err, "Scaffold Crew session creation failed");
                         state.scaffold_session_error =
                             Some("Could not create Scaffold session".into());
                         cx.notify();
@@ -2069,6 +2397,8 @@ impl AppState {
             .insert(chat_id.clone(), attachment.grant_id.clone());
         self.scaffold_control_targets
             .insert(chat_id.clone(), attachment.control_target.clone());
+        self.scaffold_environments
+            .insert(chat_id.clone(), attachment.environment.clone());
         self.pending_scaffold_session = None;
         self.scaffold_session_error = None;
         if self.selected_chat.as_deref() != Some(chat_id.as_str()) {
@@ -2706,6 +3036,35 @@ fn spawn_local_device_probe(cx: &mut Context<AppState>, handle: EngineHandle) ->
     })
 }
 
+/// Load existing control-plane metadata once after engine attach. The watch
+/// above carries all later lifecycle changes; this call is not a poll loop.
+fn spawn_scaffold_environment_refresh(
+    cx: &mut Context<AppState>,
+    handle: EngineHandle,
+    scope: Option<(String, String)>,
+) -> Task<()> {
+    cx.spawn(async move |_, _| {
+        let Some((project_id, deployment_id)) = scope else {
+            return;
+        };
+        if let Err(error) = handle
+            .client()
+            .call(
+                methods::REFRESH_SCAFFOLD_ENVIRONMENTS,
+                serde_json::json!({
+                    "scope": {
+                        "projectId": project_id,
+                        "deploymentId": deployment_id,
+                    }
+                }),
+            )
+            .await
+        {
+            tracing::debug!(%error, "Scaffold environment refresh unavailable");
+        }
+    })
+}
+
 fn spawn_transcript_watch(
     cx: &mut Context<AppState>,
     handle: EngineHandle,
@@ -2860,9 +3219,10 @@ mod tests {
     use chrono::TimeDelta;
     use comet_engine::{EngineCore, default_registry};
     use gpui::AppContext;
-    // `SessionStatus` is only needed to build the fixtures below — the module
-    // itself derives everything through `comet_proto::view`.
-    use comet_proto::{SessionStatus, UserProfile};
+    // Session records are only needed to build fixtures below; production
+    // state derives indicators through `comet_proto::view`.
+    use comet_proto::{AgentSessionRecord, AgentSessionSource, SessionStatus, UserProfile};
+    use std::collections::BTreeMap;
     use std::sync::{
         Mutex as StdMutex,
         atomic::{AtomicU16, Ordering},
@@ -2871,6 +3231,7 @@ mod tests {
     struct ReadyScaffoldRpc {
         operations: Arc<StdMutex<Vec<String>>>,
         attach_failures_remaining: AtomicU16,
+        update_route_failures_remaining: AtomicU16,
         inspect_lifecycle: &'static str,
         archive_fails: bool,
     }
@@ -2907,6 +3268,10 @@ mod tests {
                 .expect("typed Scaffold operation");
             if operation == "create" {
                 assert_eq!(
+                    params.get("name").and_then(serde_json::Value::as_str),
+                    Some("Investigate staging resume delivery")
+                );
+                assert_eq!(
                     params.get("source_ref").and_then(serde_json::Value::as_str),
                     Some("feat/comet-identity-integration")
                 );
@@ -2919,6 +3284,13 @@ mod tests {
                         "routingMode": "automatic",
                     }))
                 );
+                assert!(matches!(
+                    params
+                        .get("database_environment")
+                        .and_then(serde_json::Value::as_str),
+                    Some("local" | "staging_snapshot" | "production_snapshot")
+                ));
+                assert!(params.get("runtime_mode").is_none());
             }
             self.operations
                 .lock()
@@ -2936,14 +3308,27 @@ mod tests {
                     "scaffold_api_error:502:scaffold_request_rejected".into(),
                 ));
             }
+            if operation == "updateAgentRoute"
+                && self
+                    .update_route_failures_remaining
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+            {
+                return Err(RpcError::Failed(
+                    "scaffold_api_error:500:scaffold_request_rejected".into(),
+                ));
+            }
             let scope = params.get("scope").expect("Scaffold scope");
             let session_id = scope
                 .get("sessionId")
                 .and_then(serde_json::Value::as_str)
                 .expect("session id");
             let lifecycle = match operation {
-                "inspect" => self.inspect_lifecycle,
+                "inspect" | "handoffOmpSession" => self.inspect_lifecycle,
                 "pause" => "paused",
+                "updateAgentRoute" => "ready",
                 _ => "starting",
             };
             let environment = serde_json::json!({
@@ -2953,8 +3338,12 @@ mod tests {
                     "region": "default",
                     "lifecycle": lifecycle,
                     "lifecycle_epoch": 1,
-                    "links": {}
+                    "links": {
+                        "session": "https://scaffold.example/?q=sandbox-ready",
+                        "web": "https://scaffold.example/sessions/sandbox-ready/web"
+                    }
                 },
+                "name": "Investigate staging resume delivery",
                 "ownerPrincipal": "accounts.google.com:ready@example.com",
                 "sourceRef": "387d6652abd642f0b85e8bd14f9131a9f23b7e70",
                 "scope": {
@@ -2980,10 +3369,31 @@ mod tests {
                         "capabilities": [comet_proto::CAPABILITY_SESSION_CHAT]
                     }
                 })
+            } else if operation == "handoffOmpSession" {
+                assert_eq!(
+                    params
+                        .get("nativeSessionId")
+                        .and_then(serde_json::Value::as_str),
+                    Some("omp-session-a")
+                );
+                assert_eq!(
+                    params.get("cwd").and_then(serde_json::Value::as_str),
+                    Some("/workspace/ashler-platform")
+                );
+                serde_json::json!({
+                    "environment": environment,
+                    "roomProjection": {
+                        "projectId": "ashler-staging",
+                        "deploymentId": "ashler-staging",
+                        "sessionId": session_id
+                    },
+                    "handoffNativeSessionId": "omp-session-a",
+                    "handoffCwd": "/workspace/ashler-platform"
+                })
             } else {
                 assert!(matches!(
                     operation,
-                    "create" | "inspect" | "pause" | "resume"
+                    "create" | "inspect" | "pause" | "resume" | "updateAgentRoute"
                 ));
                 serde_json::json!({ "environment": environment })
             };
@@ -3045,6 +3455,7 @@ mod tests {
             attach_failures_remaining: AtomicU16::new(0),
             inspect_lifecycle: "ready",
             archive_fails: false,
+            update_route_failures_remaining: AtomicU16::new(0),
         });
         let handle = EngineHandle {
             inner: Arc::new(RemoteEngine {
@@ -3063,7 +3474,9 @@ mod tests {
         let (sandbox_id, attachment) = create_and_attach_scaffold_session(
             &handle,
             &scope,
+            Some("Investigate staging resume delivery"),
             Some("feat/comet-identity-integration"),
+            ScaffoldDatabaseEnvironment::StagingSnapshot,
             &AgentRoute::automatic(comet_proto::AgentProvider::OpenAi, "gpt-5.6-sol"),
             &no_wait,
         )
@@ -3092,6 +3505,22 @@ mod tests {
         );
         assert_eq!(attachment.projection.session_id, "session-ready");
         assert_eq!(
+            attachment.environment.name.as_deref(),
+            Some("Investigate staging resume delivery")
+        );
+        let SessionEnvironmentSource::Scaffold { links, .. } = &attachment.environment.source
+        else {
+            panic!("expected Scaffold environment")
+        };
+        assert_eq!(
+            links.web.as_deref(),
+            Some("https://scaffold.example/sessions/sandbox-ready/web")
+        );
+        assert_eq!(
+            links.session.as_deref(),
+            Some("https://scaffold.example/?q=sandbox-ready")
+        );
+        assert_eq!(
             attachment.owner_device_id,
             "comet-scaffold-sandbox-ready-e1"
         );
@@ -3111,6 +3540,18 @@ mod tests {
                 scope: scope.clone(),
             }
         );
+        assert_eq!(
+            handoff_omp_session(
+                &handle,
+                "sandbox-ready",
+                &scope,
+                "omp-session-a",
+                "/workspace/ashler-platform",
+            )
+            .await
+            .unwrap(),
+            ("omp-session-a".into(), "/workspace/ashler-platform".into())
+        );
         archive_and_pause_scaffold_session(&handle, "session-ready", &attachment.control_target)
             .await
             .unwrap();
@@ -3119,16 +3560,42 @@ mod tests {
                 .lock()
                 .expect("Scaffold operation log")
                 .as_slice(),
-            ["create", "attach", "inspect", "archive", "pause"]
+            [
+                "create",
+                "attach",
+                "inspect",
+                "handoffOmpSession",
+                "archive",
+                "pause"
+            ]
         );
     }
 
     #[test]
-    fn scaffold_attach_retries_transient_provider_claim_conflicts() {
-        assert!(is_retryable_scaffold_attach_error(&RpcError::Failed(
+    fn scaffold_control_retries_transient_provider_and_readiness_failures() {
+        assert!(is_retryable_scaffold_control_error(&RpcError::Failed(
+            "scaffold_api_error:500:scaffold_request_rejected".into()
+        )));
+        assert!(is_retryable_scaffold_control_error(&RpcError::Failed(
             "scaffold_api_error:502:scaffold_request_rejected".into()
         )));
-        assert!(!is_retryable_scaffold_attach_error(&RpcError::Failed(
+        assert!(is_retryable_scaffold_control_error(&RpcError::Failed(
+            "scaffold_api_error:404:not_found:Sandbox agent route projection failed".into()
+        )));
+        assert!(is_retryable_scaffold_control_error(&RpcError::Failed(
+            "scaffold_api_error:404:sandbox_provider_error:E2B sandbox control channel is unavailable"
+                .into()
+        )));
+        assert!(is_retryable_scaffold_control_error(&RpcError::Failed(
+            "scaffold_response_invalid: sandbox rcs_1 is not ready".into()
+        )));
+        assert!(is_retryable_scaffold_control_error(&RpcError::Failed(
+            "scaffold_session_owner_room_unavailable".into()
+        )));
+        assert!(!is_retryable_scaffold_control_error(&RpcError::Failed(
+            "scaffold_api_error:404:scaffold_request_rejected".into()
+        )));
+        assert!(!is_retryable_scaffold_control_error(&RpcError::Failed(
             "scaffold_response_invalid: sandbox failed".into()
         )));
 
@@ -3141,6 +3608,7 @@ mod tests {
                 attach_failures_remaining: AtomicU16::new(2),
                 inspect_lifecycle: "ready",
                 archive_fails: false,
+                update_route_failures_remaining: AtomicU16::new(0),
             });
             let handle = EngineHandle {
                 inner: Arc::new(RemoteEngine {
@@ -3162,7 +3630,9 @@ mod tests {
             let (sandbox_id, attachment) = create_and_attach_scaffold_session(
                 &handle,
                 &scope,
+                Some("Investigate staging resume delivery"),
                 Some("feat/comet-identity-integration"),
+                ScaffoldDatabaseEnvironment::ProductionSnapshot,
                 &AgentRoute::automatic(comet_proto::AgentProvider::OpenAi, "gpt-5.6-sol"),
                 &no_wait,
             )
@@ -3182,6 +3652,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scaffold_send_route_update_retries_transient_provider_rejection() {
+        let operations = Arc::new(StdMutex::new(Vec::new()));
+        let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
+            operations: Arc::clone(&operations),
+            attach_failures_remaining: AtomicU16::new(0),
+            update_route_failures_remaining: AtomicU16::new(1),
+            inspect_lifecycle: "ready",
+            archive_fails: false,
+        });
+        let handle = EngineHandle {
+            inner: Arc::new(RemoteEngine {
+                client: memory_client(service),
+                url: "memory://transient-route-update".into(),
+            }),
+        };
+        let scope = CollaborationScope {
+            project_id: "ashler-staging".into(),
+            deployment_id: Some("ashler-staging".into()),
+            session_id: Some("session-transient-route".into()),
+            unknown: Default::default(),
+        };
+        let route = AgentRoute::automatic(comet_proto::AgentProvider::OpenAi, "gpt-5.6-sol");
+        let no_wait = |_| futures::future::ready(());
+
+        update_scaffold_session_agent_route(&handle, "sandbox-ready", &scope, &route, &no_wait)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            operations
+                .lock()
+                .expect("Scaffold operation log")
+                .as_slice(),
+            ["updateAgentRoute", "updateAgentRoute"]
+        );
+    }
+
+    #[tokio::test]
     async fn failed_archive_does_not_pause_scaffold() {
         let operations = Arc::new(StdMutex::new(Vec::new()));
         let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
@@ -3189,6 +3697,7 @@ mod tests {
             attach_failures_remaining: AtomicU16::new(0),
             inspect_lifecycle: "ready",
             archive_fails: true,
+            update_route_failures_remaining: AtomicU16::new(0),
         });
         let handle = EngineHandle {
             inner: Arc::new(RemoteEngine {
@@ -3228,6 +3737,7 @@ mod tests {
             attach_failures_remaining: AtomicU16::new(0),
             inspect_lifecycle: "paused",
             archive_fails: false,
+            update_route_failures_remaining: AtomicU16::new(0),
         });
         let handle = EngineHandle {
             inner: Arc::new(RemoteEngine {
@@ -3440,6 +3950,11 @@ mod tests {
             deployment_id: "deployment-a".into(),
             space_id: "space-a".into(),
             chat_id: "chat-a".into(),
+            database_environment: ScaffoldDatabaseEnvironment::StagingSnapshot,
+            omp_handoff: Some(ScaffoldOmpHandoffDraft {
+                native_session_id: "omp-native-a".into(),
+                cwd: "/repo".into(),
+            }),
         };
 
         let scope = draft.collaboration_scope();
@@ -3447,6 +3962,51 @@ mod tests {
         assert_eq!(scope.project_id, "project-a");
         assert_eq!(scope.deployment_id.as_deref(), Some("deployment-a"));
         assert_eq!(scope.session_id.as_deref(), Some("chat-a"));
+        assert_eq!(
+            draft.omp_handoff,
+            Some(ScaffoldOmpHandoffDraft {
+                native_session_id: "omp-native-a".into(),
+                cwd: "/repo".into(),
+            })
+        );
+    }
+
+    #[gpui::test]
+    fn new_local_omp_session_becomes_a_scaffold_handoff_draft(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            let mut local = chat("a6c3c748-7fb2-4fa0-bf5c-ccb26b471599", 0, Some(1));
+            local.device_id = "device-a".into();
+            local.space_id = Some("space-a".into());
+            local.harness_session_id = Some("omp-session-a".into());
+            local.harness_session_cwd = Some("/repo".into());
+            local.config = Some(comet_proto::ChatConfig {
+                harness: HarnessId::Omp,
+                model: Some("gpt-5.6-sol".into()),
+                reasoning: None,
+                agent_account_id: None,
+                model_options: Default::default(),
+                sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
+            });
+            state.local_device_id = Some("device-a".into());
+            state.scaffold_scope = Some(("project-a".into(), "deployment-a".into()));
+            state.selected_space = Some("space-a".into());
+            state.selected_chat = Some(local.id.clone());
+            state.chats = vec![local];
+
+            state.start_scaffold_session(ScaffoldDatabaseEnvironment::Local, cx);
+
+            let draft = state.scaffold_session_draft().expect("OMP handoff draft");
+            assert_eq!(draft.chat_id, "a6c3c748-7fb2-4fa0-bf5c-ccb26b471599");
+            assert_eq!(
+                draft.omp_handoff,
+                Some(ScaffoldOmpHandoffDraft {
+                    native_session_id: "omp-session-a".into(),
+                    cwd: "/repo".into(),
+                })
+            );
+            assert!(!state.scaffold_session_creating());
+        });
     }
 
     #[gpui::test]
@@ -3458,6 +4018,8 @@ mod tests {
                 deployment_id: "deployment-a".into(),
                 space_id: "space-a".into(),
                 chat_id: "chat-a".into(),
+                database_environment: ScaffoldDatabaseEnvironment::Local,
+                omp_handoff: None,
             });
 
             state.select_chat(Some("chat-a".into()), cx);
@@ -3477,6 +4039,7 @@ mod tests {
             attach_failures_remaining: AtomicU16::new(0),
             inspect_lifecycle: "ready",
             archive_fails: false,
+            update_route_failures_remaining: AtomicU16::new(0),
         });
         let handle = EngineHandle {
             inner: Arc::new(RemoteEngine {
@@ -3494,6 +4057,8 @@ mod tests {
                     deployment_id: "deployment-a".into(),
                     space_id: "space-a".into(),
                     chat_id: "chat-a".into(),
+                    database_environment: ScaffoldDatabaseEnvironment::ProductionSnapshot,
+                    omp_handoff: None,
                 },
                 cx,
             );
@@ -3632,6 +4197,29 @@ mod tests {
         }
     }
 
+    fn agent_session(
+        chat_id: &str,
+        status: SessionStatus,
+        updated_secs_ago: i64,
+        now: DateTime<Utc>,
+    ) -> AgentSessionRecord {
+        AgentSessionRecord {
+            session_id: "remote-session".into(),
+            chat_id: chat_id.into(),
+            owner_subject: "owner".into(),
+            owner_device_id: "remote-device".into(),
+            source: AgentSessionSource::Scaffold,
+            environment: None,
+            harness: Some(HarnessId::Omp),
+            model: Some("openai-codex/gpt-5.6-sol".into()),
+            harness_session_id: None,
+            status: Some(status),
+            updated_at: Some((now - TimeDelta::seconds(updated_secs_ago)).timestamp_millis()),
+            created_at: (now - TimeDelta::minutes(1)).timestamp_millis(),
+            unknown: BTreeMap::new(),
+        }
+    }
+
     #[test]
     fn chats_sort_by_last_message_desc_with_created_fallback() {
         let mut chats = vec![
@@ -3667,6 +4255,61 @@ mod tests {
         // Future timestamps (clock skew) count as fresh.
         let skewed = session("c", SessionStatus::Working, -30, now);
         assert_eq!(effective_indicator(Some(&skewed), now), Indicator::Working);
+    }
+
+    #[test]
+    fn scaffold_agent_indicator_matches_local_session_status() {
+        let now = Utc::now();
+        let fresh = agent_session("c", SessionStatus::Working, 10, now);
+        assert_eq!(
+            effective_agent_indicator(Some(&fresh), now),
+            Indicator::Working
+        );
+        let stale = agent_session("c", SessionStatus::Working, 46, now);
+        assert_eq!(
+            effective_agent_indicator(Some(&stale), now),
+            Indicator::None
+        );
+        let awaiting = agent_session("c", SessionStatus::AwaitingInput, 5, now);
+        assert_eq!(
+            effective_agent_indicator(Some(&awaiting), now),
+            Indicator::AwaitingInput
+        );
+        let mut streaming = transcript_entry("streaming");
+        streaming.status = Some(MessageStatus::Streaming);
+        streaming.device_id = stale.owner_device_id.clone();
+        streaming.created_at = now.timestamp_millis();
+        assert_eq!(
+            agent_indicator_with_transcript(Some(&stale), &[streaming], now),
+            Indicator::Working,
+            "live transcript activity must keep a long-running remote turn visible"
+        );
+        let idle = agent_session("c", SessionStatus::Idle, 0, now);
+        assert_eq!(
+            agent_indicator_with_transcript(Some(&idle), &[], now),
+            Indicator::None,
+            "the owner's terminal publication must clear the remote working state"
+        );
+        let fresh_working = agent_session("c", SessionStatus::Working, 5, now);
+        let mut completed = transcript_entry("completed");
+        completed.status = Some(MessageStatus::Complete);
+        completed.device_id = fresh_working.owner_device_id.clone();
+        completed.created_at = now.timestamp_millis();
+        assert_eq!(
+            agent_indicator_with_transcript(
+                Some(&fresh_working),
+                std::slice::from_ref(&completed),
+                now,
+            ),
+            Indicator::None,
+            "a completed owner transcript must bridge older owners that lack terminal publications"
+        );
+        completed.created_at = fresh_working.updated_at.unwrap() - 1;
+        assert_eq!(
+            agent_indicator_with_transcript(Some(&fresh_working), &[completed], now),
+            Indicator::Working,
+            "a completed prior turn must not hide the next turn before its first frame"
+        );
     }
 
     #[test]
@@ -4326,6 +4969,23 @@ mod tests {
                     "ownerSubject": "iap:owner@example.com",
                     "ownerDeviceId": "device-owner",
                     "source": "local",
+                    "environment": {
+                        "source": {
+                            "kind": "scaffold",
+                            "sandbox_id": "sandbox-invited",
+                            "lifecycle": "ready",
+                            "links": {
+                                "web": "https://scaffold.example/sessions/sandbox-invited/web"
+                            }
+                        },
+                        "name": "Investigate staging resume delivery",
+                        "ownerPrincipal": "iap:owner@example.com",
+                        "scope": {
+                            "projectId": "project-a",
+                            "deploymentId": "deployment-a",
+                            "sessionId": "chat-a"
+                        }
+                    },
                     "createdAt": now
                 }
             ],
@@ -4371,6 +5031,13 @@ mod tests {
         // No chat row for the invited session: verified membership arms the
         // sidebar pin that replaces the manual exact-id import dialog.
         assert_eq!(state.pending_session_pin.as_deref(), Some("chat-a"));
+        assert_eq!(
+            state
+                .scaffold_environment("chat-a")
+                .and_then(|environment| environment.name.as_deref()),
+            Some("Investigate staging resume delivery")
+        );
+        assert!(state.chat_is_scaffold("chat-a"));
     }
     #[test]
     fn imported_membership_keeps_selection_without_a_chat_row() {
@@ -4380,6 +5047,7 @@ mod tests {
         state.apply_session_refs(vec![SessionRef {
             chat_id: chat_id.into(),
             added_at: Utc::now(),
+            environment: None,
         }]);
 
         state.apply_chats(Vec::new());
@@ -4399,6 +5067,7 @@ mod tests {
         state.apply_session_refs(vec![SessionRef {
             chat_id: chat_id.into(),
             added_at: Utc::now(),
+            environment: None,
         }]);
         assert_eq!(state.shared_session_title(chat_id), "Session aaaaaaaa");
 
@@ -4427,6 +5096,7 @@ mod tests {
         state.apply_session_refs(vec![SessionRef {
             chat_id: chat_id.into(),
             added_at: Utc::now(),
+            environment: None,
         }]);
         state.apply_chats(vec![chat(chat_id, 1, None)]);
 

@@ -178,9 +178,7 @@ fn resolve_session_id(
         .or(environment)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            anyhow!("no source session: pass --from or run inside a Comet agent session")
-        })
+        .ok_or_else(|| anyhow!("no source session: pass --from or run inside a Crew agent session"))
 }
 
 fn print_json(value: &serde_json::Value) -> anyhow::Result<()> {

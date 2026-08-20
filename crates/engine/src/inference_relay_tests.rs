@@ -229,6 +229,76 @@ mod tests {
         });
         origin
     }
+    async fn counting_control_plane(captured: mpsc::UnboundedSender<u64>) -> String {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let captured = captured.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |request: Request<Incoming>| {
+                        let captured = captured.clone();
+                        async move {
+                            let path = request.uri().path().to_string();
+                            let expires_at =
+                                (Utc::now() + TimeDelta::minutes(5)).to_rfc3339();
+                            let (status, response) = match path.as_str() {
+                                "/api/agent-auth/grants" => {
+                                    let _ = request.into_body().collect().await.unwrap();
+                                    (
+                                        StatusCode::CREATED,
+                                        json!({
+                                            "token": "remote-large-body-account",
+                                            "expiresAt": expires_at,
+                                            "binding": {
+                                                "ownerSubject": "owner-1",
+                                                "logicalSessionId": "session-large-body",
+                                                "provider": "openai",
+                                                "model": "gpt-5.6-sol",
+                                                "harness": "codex",
+                                                "routingMode": "automatic",
+                                                "requestedAccountId": null,
+                                                "source": "comet-local",
+                                                "lifecycleEpoch": 1,
+                                                "environment": "local",
+                                                "backend": "oauth",
+                                                "accountId": "account-1",
+                                                "accountGeneration": 1,
+                                            }
+                                        }),
+                                    )
+                                }
+                                "/api/agent-auth/v1/responses" => {
+                                    let mut body = request.into_body().into_data_stream();
+                                    let mut observed = 0_u64;
+                                    while let Some(chunk) = body.next().await {
+                                        observed += chunk.unwrap().len() as u64;
+                                    }
+                                    captured.send(observed).unwrap();
+                                    (StatusCode::OK, json!({ "ok": true }))
+                                }
+                                other => panic!("unexpected counting control-plane path {other}"),
+                            };
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(status)
+                                    .header(CONTENT_TYPE, "application/json")
+                                    .body(Full::new(Bytes::from(response.to_string())))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+        origin
+    }
+
     async fn rebind_control_plane(captured: mpsc::UnboundedSender<Value>) -> String {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -242,7 +312,9 @@ mod tests {
                         async move {
                             assert_eq!(request.uri().path(), "/api/agent-auth/grants/rebind");
                             let bytes = request.into_body().collect().await.unwrap().to_bytes();
-                            captured.send(serde_json::from_slice(&bytes).unwrap()).unwrap();
+                            captured
+                                .send(serde_json::from_slice(&bytes).unwrap())
+                                .unwrap();
                             Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"{}"))))
                         }
                     });
@@ -740,6 +812,43 @@ mod tests {
             }
         );
     }
+    #[tokio::test]
+    async fn streams_requests_larger_than_the_former_relay_ceiling() {
+        const CHUNK_BYTES: usize = 256 * 1024;
+        const CHUNK_COUNT: usize = 132;
+        const BODY_BYTES: usize = CHUNK_BYTES * CHUNK_COUNT;
+
+        let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
+        let origin = counting_control_plane(captured_tx).await;
+        let client = ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap();
+        let relay = InferenceRelay::start(client).unwrap();
+        let route = relay
+            .prepare(
+                "session-large-body",
+                HarnessId::Codex,
+                Some("gpt-5.6-sol"),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let chunk = Bytes::from(vec![b'x'; CHUNK_BYTES]);
+        let body = reqwest::Body::wrap_stream(stream::iter(
+            (0..CHUNK_COUNT).map(move |_| Ok::<_, io::Error>(chunk.clone())),
+        ));
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/responses", route.base_url))
+            .bearer_auth(&route.token)
+            .header(CONTENT_LENGTH, BODY_BYTES)
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(captured_rx.recv().await.unwrap(), BODY_BYTES as u64);
+    }
+
 
     #[test]
     fn projects_only_local_import_ids_to_stable_agent_auth_uuids() {

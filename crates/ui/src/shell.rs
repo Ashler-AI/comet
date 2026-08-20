@@ -413,6 +413,14 @@ impl LocalSessionCapability {
     }
 }
 
+fn local_session_import_completed(
+    target_chat: Option<&str>,
+    selected_chat: Option<&str>,
+    target_still_available: bool,
+) -> bool {
+    target_chat.is_some_and(|target| selected_chat == Some(target) && !target_still_available)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct LocalSessionProviderSection {
     harness: comet_proto::HarnessId,
@@ -536,6 +544,8 @@ fn local_session_age(updated_at: i64, now: chrono::DateTime<Utc>) -> String {
 struct SidebarSessionMeta {
     source: comet_proto::AgentSessionSource,
     runtime_model: SharedString,
+    scaffold_web: Option<SharedString>,
+    scaffold_session: Option<SharedString>,
 }
 /// Flex gap between sidebar list items.
 const SIDEBAR_LIST_GAP: f32 = 2.0;
@@ -595,6 +605,15 @@ enum SplashPhase {
     Visible,
     FadingOut,
     Gone,
+}
+
+fn next_splash_phase(current: SplashPhase, connection: &ConnectionStatus) -> SplashPhase {
+    match connection {
+        ConnectionStatus::Ready if current == SplashPhase::Visible => SplashPhase::FadingOut,
+        // Reveal the gate card immediately; the splash never returns mid-session.
+        ConnectionStatus::Failed(_) => SplashPhase::Gone,
+        ConnectionStatus::Ready | ConnectionStatus::Connecting => current,
+    }
 }
 
 /// The chat-row Rename dialog.
@@ -1173,6 +1192,8 @@ pub struct Shell {
     account_usage_loading: bool,
     account_usage_loaded_at: Option<Instant>,
     account_usage_task: Option<Task<()>>,
+    scaffold_create_open: bool,
+    scaffold_database_environment: comet_proto::ScaffoldDatabaseEnvironment,
     /// On-demand native session picker. Discovery starts only when this opens.
     session_import_open: bool,
     /// Candidate chat selected from the picker; success closes the picker once
@@ -1340,9 +1361,7 @@ impl Shell {
         let debug_dialog = std::env::var("COMET_OPEN_DIALOG").ok();
         let debug_gate = match std::env::var("COMET_FORCE_GATE").ok().as_deref() {
             Some("signin") => Some(GatePhase::SignIn),
-            Some("failed") => Some(GatePhase::Failed(
-                "Could not reach the Ashler Comet engine".into(),
-            )),
+            Some("failed") => Some(GatePhase::Failed("Could not reach the Crew engine".into())),
             _ => None,
         };
         let nav = NavHistory::new(match route {
@@ -1390,6 +1409,8 @@ impl Shell {
             activity_open: false,
             invite_open: false,
             workspace_goals_scroll: gpui::ScrollHandle::new(),
+            scaffold_create_open: false,
+            scaffold_database_environment: comet_proto::ScaffoldDatabaseEnvironment::Local,
             account_usage: None,
             account_usage_error: None,
             account_usage_loading: false,
@@ -1446,6 +1467,8 @@ impl Shell {
             _state_observation: observation,
             _composer_events: composer_events,
         };
+        let initial_connection = shell.state.read(cx).connection.clone();
+        shell.sync_splash(&initial_connection, cx);
         shell.refresh_account_usage(cx);
         shell
     }
@@ -1469,6 +1492,26 @@ impl Shell {
                 _ => ControlFeedbackState::Rejected,
             };
             feedback.detail = audit.reason.clone().map(SharedString::from);
+        }
+    }
+
+    fn sync_splash(&mut self, connection: &ConnectionStatus, cx: &mut Context<Self>) {
+        let next = next_splash_phase(self.splash, connection);
+        if next == self.splash {
+            return;
+        }
+        self.splash = next;
+        if next == SplashPhase::FadingOut {
+            self.splash_task = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(SPLASH_OUT.total() + Duration::from_millis(30))
+                    .await;
+                this.update(cx, |shell, cx| {
+                    shell.splash = SplashPhase::Gone;
+                    cx.notify();
+                })
+                .ok();
+            }));
         }
     }
 
@@ -1619,26 +1662,8 @@ impl Shell {
                 changes.update(cx, |changes, cx| changes.ensure_watch(cx));
             }
         }
-        match state.read(cx).connection {
-            ConnectionStatus::Ready => {
-                if self.splash == SplashPhase::Visible {
-                    self.splash = SplashPhase::FadingOut;
-                    self.splash_task = Some(cx.spawn(async move |this, cx| {
-                        cx.background_executor()
-                            .timer(SPLASH_OUT.total() + Duration::from_millis(30))
-                            .await;
-                        this.update(cx, |shell, cx| {
-                            shell.splash = SplashPhase::Gone;
-                            cx.notify();
-                        })
-                        .ok();
-                    }));
-                }
-            }
-            // Reveal the gate card immediately; the splash never returns mid-session.
-            ConnectionStatus::Failed(_) => self.splash = SplashPhase::Gone,
-            ConnectionStatus::Connecting => {}
-        }
+        let connection = state.read(cx).connection.clone();
+        self.sync_splash(&connection, cx);
     }
 
     // ---- layout state ----
@@ -1892,12 +1917,51 @@ impl Shell {
             ));
     }
 
+    fn scaffold_database_row(
+        &self,
+        environment: comet_proto::ScaffoldDatabaseEnvironment,
+        label: &'static str,
+        detail: &'static str,
+        id: &'static str,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let selected = self.scaffold_database_environment == environment;
+        popover::menu_row(theme, selected, id)
+            .id(id)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.scaffold_database_environment = environment;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_color(theme.text)
+                            .child(SharedString::from(label)),
+                    )
+                    .child(
+                        div()
+                            .mt(px(2.0))
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(detail)),
+                    ),
+            )
+            .when(selected, |row| row.child(popover::menu_check(theme)))
+    }
+
     fn open_session_import(&mut self, cx: &mut Context<Self>) {
         self.session_import_open = true;
         self.session_import_target_chat = None;
         self.activity_open = false;
         self.invite_open = false;
         self.command_palette_open = false;
+        self.scaffold_create_open = false;
         self.session_import_groups_scroll
             .set_offset(Point::default());
         self.sync_session_import_sections(cx);
@@ -1914,6 +1978,8 @@ impl Shell {
             self.activity_open = false;
         } else if self.invite_open {
             self.invite_open = false;
+        } else if self.scaffold_create_open {
+            self.scaffold_create_open = false;
         } else if self.session_import_open {
             self.session_import_open = false;
             self.session_import_target_chat = None;
@@ -3393,6 +3459,69 @@ impl Shell {
                 }))
                 .into_any_element()
         });
+        let link_actions = (reveal > 0.0
+            && (meta.scaffold_web.is_some() || meta.scaffold_session.is_some()))
+        .then(|| {
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(2.0))
+                .opacity(reveal)
+                .when_some(meta.scaffold_web.clone(), |actions, link| {
+                    actions.child(
+                        div()
+                            .id(SharedString::from(format!("scaffold-web-{id}")))
+                            .size(px(18.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .hover(|el| el.bg(crate::theme::ink(0.10)))
+                            .tooltip(popover::text_tooltip("Open web"))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.open_url(&link);
+                            }))
+                            .child(
+                                icon(icons::GLOBAL)
+                                    .size(px(11.0))
+                                    .text_color(theme.text_muted),
+                            ),
+                    )
+                })
+                .when_some(meta.scaffold_session.clone(), |actions, link| {
+                    actions.child(
+                        div()
+                            .id(SharedString::from(format!("scaffold-session-{id}")))
+                            .size(px(18.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .hover(|el| el.bg(crate::theme::ink(0.10)))
+                            .tooltip(popover::text_tooltip("Open session"))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.open_url(&link);
+                            }))
+                            .child(
+                                icon(icons::MONITOR)
+                                    .size(px(11.0))
+                                    .text_color(theme.text_muted),
+                            ),
+                    )
+                })
+                .into_any_element()
+        });
         div()
             .id(SharedString::from(format!("chat-{id}")))
             .flex()
@@ -3525,7 +3654,8 @@ impl Shell {
                                     .text_color(subline)
                                     .child(branch),
                             )
-                    }),
+                    })
+                    .when_some(link_actions, |el, actions| el.child(actions)),
             )
             .into_any_element()
     }
@@ -4327,9 +4457,12 @@ impl Shell {
                             button
                                 .cursor_pointer()
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.state.update(cx, |state, cx| {
-                                        state.start_scaffold_session(cx);
-                                    });
+                                    this.scaffold_create_open = true;
+                                    this.session_import_open = false;
+                                    this.activity_open = false;
+                                    this.invite_open = false;
+                                    this.command_palette_open = false;
+                                    cx.notify();
                                 }))
                         })
                         .child(
@@ -4639,8 +4772,8 @@ impl Shell {
             return;
         };
         match comet_update::apply_mac_app(&staged, &bundle) {
-            Ok(()) => {
-                comet_update::relaunch_app_after_exit(&bundle);
+            Ok(installed) => {
+                comet_update::relaunch_app_after_exit(&installed);
                 cx.quit();
             }
             Err(err) => {
@@ -5936,6 +6069,76 @@ impl Shell {
             overlays.push(popover::menu_at("chat-context-menu", position, menu));
         }
 
+        if self.scaffold_create_open {
+            let card = popover::dialog_card(&theme)
+                .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
+                    if ev.keystroke.key == "escape" {
+                        this.scaffold_create_open = false;
+                        cx.notify();
+                    }
+                }))
+                .child(popover::dialog_title(&theme, "Create Scaffold session"))
+                .child(
+                    div()
+                        .mt(px(10.0))
+                        .child(popover::menu_heading(&theme, "Database"))
+                        .child(self.scaffold_database_row(
+                            comet_proto::ScaffoldDatabaseEnvironment::Local,
+                            "Local",
+                            "Empty local database",
+                            "scaffold-database-local",
+                            &theme,
+                            cx,
+                        ))
+                        .child(self.scaffold_database_row(
+                            comet_proto::ScaffoldDatabaseEnvironment::StagingSnapshot,
+                            "Staging snapshot",
+                            "Managed staging snapshot",
+                            "scaffold-database-staging",
+                            &theme,
+                            cx,
+                        ))
+                        .child(self.scaffold_database_row(
+                            comet_proto::ScaffoldDatabaseEnvironment::ProductionSnapshot,
+                            "Production snapshot",
+                            "Managed production snapshot",
+                            "scaffold-database-production",
+                            &theme,
+                            cx,
+                        )),
+                )
+                .child(
+                    div()
+                        .mt(px(16.0))
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap(px(8.0))
+                        .child(
+                            popover::btn_ghost(&theme, "Cancel", "scaffold-create-cancel")
+                                .id("scaffold-create-cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.scaffold_create_open = false;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            popover::btn_primary(&theme, "Create")
+                                .id("scaffold-create-submit")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let environment = this.scaffold_database_environment;
+                                    this.scaffold_create_open = false;
+                                    this.state.update(cx, |state, cx| {
+                                        state.start_scaffold_session(environment, cx);
+                                    });
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .into_any_element();
+            overlays.push(popover::modal("scaffold-create-dialog", viewport, card));
+        }
+
         if let Some(dialog) = &mut self.rename_dialog {
             if std::mem::take(&mut dialog.focus_pending) {
                 window.focus(&dialog.input.focus_handle(cx), cx);
@@ -7000,11 +7203,27 @@ impl Shell {
                 )
                 .into_any_element();
         }
-        let indicator = state.indicator_for(&chat_id, now);
+        let local_indicator = state.indicator_for(&chat_id, now);
+        let indicator = if local_indicator == Indicator::None {
+            state.selected_agent_indicator(now)
+        } else {
+            local_indicator
+        };
         let elapsed_secs = state
             .session_for(&chat_id)
             .and_then(|s| s.started_at)
             .map(|t| now.signed_duration_since(t).num_seconds())
+            .or_else(|| {
+                state
+                    .selected_agent_session()
+                    .filter(|session| session.chat_id == chat_id)
+                    .map(|session| {
+                        now.timestamp_millis()
+                            .saturating_sub(session.created_at)
+                            .max(0)
+                            / 1_000
+                    })
+            })
             .unwrap_or(0);
         let sending = self.composer.read(cx).is_sending();
 
@@ -7144,7 +7363,7 @@ impl Shell {
                         .child(SharedString::from("Retry")),
                 )
                 .into_any_element(),
-            // Login card: centered on the grid with the Ashler Comet mark and
+            // Login card: centered on the grid with the Crew mark and
             // one full-width sign-in action.
             _ => div()
                 .w(px(360.0))
@@ -7170,7 +7389,7 @@ impl Shell {
                         .text_size(px(18.0))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(theme.text)
-                        .child(SharedString::from("Log in to Ashler Comet")),
+                        .child(SharedString::from("Log in to Crew")),
                 )
                 .child(
                     div()
@@ -7488,10 +7707,26 @@ fn header_icon_button(
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.session_import_open
-            && let Some(target_chat) = self.session_import_target_chat.as_deref()
-            && self.state.read(cx).selected_chat.as_deref() == Some(target_chat)
-        {
+        let close_completed_session_import = {
+            let target_chat = self.session_import_target_chat.as_deref();
+            if !self.session_import_open {
+                false
+            } else {
+                let state = self.state.read(cx);
+                let target_still_available = target_chat.is_some_and(|target| {
+                    state
+                        .local_session_candidates
+                        .iter()
+                        .any(|candidate| candidate.chat_id == target)
+                });
+                local_session_import_completed(
+                    target_chat,
+                    state.selected_chat.as_deref(),
+                    target_still_available,
+                )
+            }
+        };
+        if close_completed_session_import {
             self.session_import_open = false;
             self.session_import_target_chat = None;
         }
@@ -7842,6 +8077,33 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::rc::Rc;
+
+    #[test]
+    fn ready_before_shell_observation_cannot_leave_boot_splash_visible() {
+        assert_eq!(
+            next_splash_phase(SplashPhase::Visible, &ConnectionStatus::Ready),
+            SplashPhase::FadingOut
+        );
+    }
+
+    #[test]
+    fn selected_existing_chat_does_not_close_import_before_attach_finishes() {
+        assert!(!local_session_import_completed(
+            Some("chat-a"),
+            Some("chat-a"),
+            true,
+        ));
+        assert!(local_session_import_completed(
+            Some("chat-a"),
+            Some("chat-a"),
+            false,
+        ));
+        assert!(!local_session_import_completed(
+            Some("chat-a"),
+            Some("chat-b"),
+            false,
+        ));
+    }
 
     /// A press on the settle button hands its click to the button; the row
     /// underneath must not also select the session.

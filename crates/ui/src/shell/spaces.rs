@@ -39,6 +39,12 @@ fn folder_device_name(name: Option<&str>) -> &str {
         .unwrap_or("Remote device")
 }
 
+fn scaffold_sidebar_surfaces(
+    links: &comet_proto::ScaffoldEnvironmentLinks,
+) -> (Option<String>, Option<String>) {
+    (links.web.clone(), links.session.clone())
+}
+
 /// One logical source in the sidebar. `space` is presentation-only: every
 /// persisted member row remains in `member_ids`, and none of their chats move.
 #[derive(Clone, Debug)]
@@ -911,6 +917,7 @@ impl Shell {
             comet_proto::Chat,
             String,
             Option<String>,
+            String,
             super::SidebarSessionMeta,
         )> = {
             let state = self.state.read(cx);
@@ -932,6 +939,20 @@ impl Shell {
                         folder = format!("{folder} · {device}");
                     }
                     let branch = sidebar_branch_label(&chat);
+                    let scaffold_environment = state.scaffold_environment(&chat.id);
+                    let scaffold_title =
+                        scaffold_environment.and_then(|environment| environment.name.clone());
+                    let (scaffold_web, scaffold_session) = scaffold_environment
+                        .and_then(|environment| match &environment.source {
+                            comet_proto::SessionEnvironmentSource::Scaffold { links, .. } => {
+                                Some(scaffold_sidebar_surfaces(links))
+                            }
+                            comet_proto::SessionEnvironmentSource::Local => None,
+                        })
+                        .unwrap_or_default();
+                    let title = scaffold_title
+                        .or_else(|| chat.title.clone())
+                        .unwrap_or_else(|| "New session".into());
                     let agent_session = state.collaboration_sessions(&chat.id).next();
                     let source = sidebar_session_source(
                         state.local_device_id.as_deref(),
@@ -956,9 +977,12 @@ impl Shell {
                         chat,
                         folder,
                         branch,
+                        title,
                         super::SidebarSessionMeta {
                             source,
                             runtime_model,
+                            scaffold_web: scaffold_web.map(SharedString::from),
+                            scaffold_session: scaffold_session.map(SharedString::from),
                         },
                     )
                 })
@@ -966,17 +990,14 @@ impl Shell {
         };
         let selected = self.state.read(cx).selected_chat.clone();
         rows.into_iter()
-            .map(|(status, chat, folder, branch, meta)| {
+            .map(|(status, chat, folder, branch, title, meta)| {
                 let time_ago: SharedString =
                     format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
                 let is_selected = selected.as_deref() == Some(chat.id.as_str());
                 let height = super::chat_row_height(self.settings.density);
                 let element = self.render_chat_row(
                     chat.id.clone(),
-                    transcript::single_line(
-                        &chat.title.clone().unwrap_or_else(|| "New session".into()),
-                    )
-                    .into(),
+                    transcript::single_line(&title).into(),
                     time_ago,
                     folder.into(),
                     branch.map(SharedString::from),
@@ -2131,10 +2152,11 @@ impl Shell {
 mod tests {
     use super::{
         collapse_sidebar_sources, detached_worktree_label, folder_device_name,
-        sidebar_session_source, source_picker_spaces, spaces_with_visible_sessions,
+        scaffold_sidebar_surfaces, sidebar_session_source, source_picker_spaces,
+        spaces_with_visible_sessions,
     };
     use chrono::{DateTime, Utc};
-    use comet_proto::{AgentSessionSource, Space};
+    use comet_proto::{AgentSessionSource, ScaffoldEnvironmentLinks, Space};
     use std::path::PathBuf;
 
     fn space(id: &str, device_id: &str, path: &str, created_at: i64) -> Space {
@@ -2180,6 +2202,24 @@ mod tests {
         assert_eq!(
             sidebar_session_source(Some("device-current"), "device-current", false, None),
             AgentSessionSource::Local
+        );
+    }
+
+    #[test]
+    fn scaffold_sidebar_opens_web_and_session_surfaces() {
+        let links = ScaffoldEnvironmentLinks {
+            session: Some("https://scaffold.example/?q=sandbox-ready".into()),
+            web: Some("https://scaffold.example/sessions/sandbox-ready/web".into()),
+            opencode: Some("https://scaffold.example/sessions/sandbox-ready/opencode".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            scaffold_sidebar_surfaces(&links),
+            (
+                links.web.clone(),
+                Some("https://scaffold.example/?q=sandbox-ready".into())
+            )
         );
     }
 

@@ -33,7 +33,6 @@ use comet_proto::{AgentRoutingMode, HarnessId};
 use crate::scaffold::{AgentInferenceGrant, AgentInferenceGrantRequest, ScaffoldClient};
 use crate::{EngineError, new_id};
 
-const MAX_REQUEST_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CONNECTIONS: usize = 64;
 const REFRESH_SKEW_SECONDS: i64 = 60;
 const MAX_ACCOUNT_FAILOVERS: usize = 1;
@@ -633,13 +632,7 @@ impl InferenceRelay {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok())
         {
-            Some(length) if length <= MAX_REQUEST_BYTES => length,
-            Some(_) => {
-                return json_response(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    json!({ "error": "inference_request_too_large" }),
-                );
-            }
+            Some(length) => length,
             None => {
                 return json_response(
                     StatusCode::LENGTH_REQUIRED,
@@ -830,7 +823,7 @@ async fn spool_request_body(body: Incoming, content_length: u64) -> io::Result<R
                 "inference request length overflow",
             )
         })?;
-        if observed > content_length || observed > MAX_REQUEST_BYTES {
+        if observed > content_length {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "inference request exceeded declared length",

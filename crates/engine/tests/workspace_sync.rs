@@ -244,7 +244,10 @@ async fn two_engines_share_a_workspace() {
         .call(
             methods::MUTATE,
             serde_json::json!({
-                "op": "createChat", "chatId": "chat-1", "spaceId": "space-1"
+                "op": "createChat",
+                "chatId": "chat-1",
+                "spaceId": "space-1",
+                "title": "Investigate staging resume delivery"
             }),
         )
         .await
@@ -262,8 +265,17 @@ async fn two_engines_share_a_workspace() {
     )
     .await;
     wait_for(
-        || b.workspace.doc().chat("chat-1").ok().flatten().is_some(),
-        "chat row on B",
+        || {
+            b.workspace
+                .doc()
+                .chat("chat-1")
+                .ok()
+                .flatten()
+                .is_some_and(|chat| {
+                    chat.title.as_deref() == Some("Investigate staging resume delivery")
+                })
+        },
+        "named chat row on B",
     )
     .await;
 

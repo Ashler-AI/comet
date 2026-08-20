@@ -1,6 +1,6 @@
-# Ashler Comet
+# Crew
 
-Ashler Comet is Ashler's internal, multi-device controller for Claude Code and Codex sessions. Each device runs a small engine; shared threads merge agent output while each owning device remains responsible for its own session commands.
+Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
 ## Install the Linux daemon
 
@@ -120,6 +120,23 @@ Manual releases choose an explicit surface:
 
 Version tags remain complete `desktop-and-scaffold` releases for backward compatibility. CI verifies the tag or dispatch version against both `[workspace.package].version` and Cargo metadata. Every `releases/<version>/…` object and version-named root artifact is create-only; a byte-identical re-publish is a no-op and differing bytes fail. Moving desktop and Scaffold channel aliases are independent. All objects remain private.
 
+`scaffold-runtime-version.txt` is the compatibility boundary between Comet and
+the Scaffold control plane. A breaking runtime change is platform-first:
+
+1. Increment that file and update both repositories to accept the new contract.
+2. Deploy and verify the compatible ashler-platform change in Scaffold staging.
+3. Publish Comet with `release_surface=desktop-and-scaffold` and
+   `scaffold_runtime_deployment=staging-deployed`.
+4. Deploy and verify the compatible Scaffold change in production before a
+   production Comet publication with
+   `scaffold_runtime_deployment=production-deployed`.
+
+The release workflow compares the candidate runtime version with the currently
+published Scaffold manifest before writing any release objects. A changed
+contract cannot ship as a desktop-only release. An unacknowledged bump,
+including one introduced by a tag push, fails with the required deployment
+sequence.
+
 ```bash
 version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
 
@@ -147,7 +164,7 @@ The required local/Scaffold cutover and multi-client acceptance contract is in [
 
 ## Provenance and licensing
 
-Ashler Comet is derived from `zeronsh/comet` at commit `82ce44193a32b5ae5610f8a4542e5e30b992e6a9`. The inherited [MIT LICENSE](LICENSE) is preserved verbatim.
+Crew is derived from `zeronsh/comet` at commit `82ce44193a32b5ae5610f8a4542e5e30b992e6a9`. The inherited [MIT LICENSE](LICENSE) is preserved verbatim.
 
 The native UI depends only on the Apache-2.0 GPUI packages and uses permitted GPUI examples as API references. GPL-licensed Zed application crates, UI code, and editor code are not copied, linked, or redistributed.
 

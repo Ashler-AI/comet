@@ -24,11 +24,27 @@ on:
         type: choice
         options:
           - none
+          - staging-candidate
           - staging
           - production
+      scaffold_runtime_deployment:
+        description: "When scaffold-runtime-version.txt changes, confirm compatible Scaffold is already deployed"
+        required: true
+        default: unchanged
+        type: choice
+        options:
+          - unchanged
+          - staging-deployed
+          - production-deployed
+      candidate_run_id:
+        description: "Successful release run whose exact candidate should be reused for production promotion; empty rebuilds"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
+  actions: read
   id-token: write
 
 concurrency:
@@ -42,6 +58,8 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       source_epoch: ${{ steps.version.outputs.source_epoch }}
       release_surface: ${{ steps.version.outputs.release_surface }}
+      promotion_target: ${{ steps.version.outputs.promotion_target }}
+      candidate_run_id: ${{ steps.version.outputs.candidate_run_id }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -52,6 +70,8 @@ jobs:
         env:
           REQUESTED_VERSION: ${{ inputs.version }}
           REQUESTED_RELEASE_SURFACE: ${{ inputs.release_surface }}
+          REQUESTED_PROMOTION_TARGET: ${{ inputs.promotion_target }}
+          REQUESTED_CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
         run: |
           set -euo pipefail
           workspace_version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
@@ -59,9 +79,11 @@ jobs:
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             requested="${GITHUB_REF_NAME#v}"
             release_surface="desktop-and-scaffold"
+            promotion_target="production"
           else
             requested="$REQUESTED_VERSION"
             release_surface="$REQUESTED_RELEASE_SURFACE"
+            promotion_target="$REQUESTED_PROMOTION_TARGET"
           fi
           case "$release_surface" in
             desktop|desktop-and-scaffold) ;;
@@ -70,6 +92,24 @@ jobs:
               exit 1
               ;;
           esac
+          case "$promotion_target" in
+            none|staging-candidate|staging|production) ;;
+            *)
+              echo "::error::unsupported promotion target: $promotion_target"
+              exit 1
+              ;;
+          esac
+          candidate_run_id="$REQUESTED_CANDIDATE_RUN_ID"
+          if [[ -n "$candidate_run_id" ]]; then
+            if [[ ! "$candidate_run_id" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error::candidate_run_id must be a positive GitHub Actions run id"
+              exit 1
+            fi
+            if [[ "$promotion_target" != "production" ]]; then
+              echo "::error::candidate_run_id is only supported for production promotion"
+              exit 1
+            fi
+          fi
           if [[ "$requested" != "$workspace_version" ]]; then
             echo "::error::release version $requested does not match workspace version $workspace_version"
             exit 1
@@ -81,10 +121,12 @@ jobs:
           fi
           echo "version=$workspace_version" >> "$GITHUB_OUTPUT"
           echo "release_surface=$release_surface" >> "$GITHUB_OUTPUT"
+          echo "promotion_target=$promotion_target" >> "$GITHUB_OUTPUT"
+          echo "candidate_run_id=$candidate_run_id" >> "$GITHUB_OUTPUT"
           echo "source_epoch=$(git show -s --format=%ct "$GITHUB_SHA")" >> "$GITHUB_OUTPUT"
 
   linux:
-    if: ${{ needs.version.outputs.release_surface == 'desktop-and-scaffold' }}
+    if: ${{ inputs.candidate_run_id == '' && needs.version.outputs.release_surface == 'desktop-and-scaffold' }}
     needs: version
     strategy:
       fail-fast: false
@@ -127,6 +169,7 @@ jobs:
           if-no-files-found: error
 
   macos:
+    if: ${{ inputs.candidate_run_id == '' }}
     needs: version
     runs-on: macos-14
     env:
@@ -156,24 +199,59 @@ jobs:
           if-no-files-found: error
 
   candidate:
-    if: ${{ always() && needs.version.result == 'success' && needs.macos.result == 'success' && (needs.linux.result == 'success' || needs.linux.result == 'skipped') }}
+    if: >-
+      always() &&
+      needs.version.result == 'success' &&
+      (
+        (
+          inputs.candidate_run_id != '' &&
+          needs.macos.result == 'skipped' &&
+          needs.linux.result == 'skipped'
+        ) ||
+        (
+          inputs.candidate_run_id == '' &&
+          needs.macos.result == 'success' &&
+          (needs.linux.result == 'success' || needs.linux.result == 'skipped')
+        )
+      )
     needs: [version, linux, macos]
     runs-on: ubuntu-24.04
     outputs:
-      digest: ${{ steps.candidate.outputs.digest }}
+      digest: ${{ steps.candidate.outputs.digest || steps.reuse.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
+      - id: reuse-source
+        name: Read reused candidate source run
+        if: ${{ inputs.candidate_run_id != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" > candidate-source-run.json
       - uses: actions/download-artifact@v4
+        if: ${{ inputs.candidate_run_id == '' }}
         with:
           path: incoming
+      - name: Download exact prior release candidate
+        if: ${{ inputs.candidate_run_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: release-candidate-${{ needs.version.outputs.version }}
+          path: reused
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.candidate_run_id }}
       - id: candidate
         name: Assemble immutable release candidate
+        if: ${{ inputs.candidate_run_id == '' }}
         env:
           VERSION: ${{ needs.version.outputs.version }}
           SOURCE_EPOCH: ${{ needs.version.outputs.source_epoch }}
           RELEASE_SURFACE: ${{ needs.version.outputs.release_surface }}
         run: |
           set -euo pipefail
+          scaffold_runtime_version="$(cat scaffold-runtime-version.txt)"
           mkdir -p candidate
           find incoming -type f -name 'comet-*' -exec cp '{}' candidate/ \;
 
@@ -188,8 +266,9 @@ jobs:
             --arg commit "$GITHUB_SHA" \
             --arg repository "$GITHUB_REPOSITORY" \
             --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg scaffoldRuntimeVersion "$scaffold_runtime_version" \
             --rawfile sums candidate/desktop-SHA256SUMS \
-            '{schemaVersion:2,releaseSurface:"desktop",version:$version,source:{repository:$repository,commit:$commit,workflowRun:$run},files:($sums|split("\n")|map(select(length>0)|capture("^(?<sha256>[0-9a-f]{64})  (?<name>.+)$"))|map({key:.name,value:{sha256:.sha256}})|from_entries)}' \
+            '{schemaVersion:2,releaseSurface:"desktop",scaffoldRuntimeVersion:$scaffoldRuntimeVersion,version:$version,source:{repository:$repository,commit:$commit,workflowRun:$run},files:($sums|split("\n")|map(select(length>0)|capture("^(?<sha256>[0-9a-f]{64})  (?<name>.+)$"))|map({key:.name,value:{sha256:.sha256}})|from_entries)}' \
             > candidate/desktop-manifest.json
 
           if [[ "$RELEASE_SURFACE" == "desktop-and-scaffold" ]]; then
@@ -205,8 +284,9 @@ jobs:
               --arg commit "$GITHUB_SHA" \
               --arg repository "$GITHUB_REPOSITORY" \
               --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              --arg scaffoldRuntimeVersion "$scaffold_runtime_version" \
               --rawfile sums candidate/scaffold-SHA256SUMS \
-              '{schemaVersion:2,releaseSurface:"scaffold",scaffoldRuntimeVersion:"scaffold.comet-runtime.v1",version:$version,source:{repository:$repository,commit:$commit,workflowRun:$run},files:($sums|split("\n")|map(select(length>0)|capture("^(?<sha256>[0-9a-f]{64})  (?<name>.+)$"))|map({key:.name,value:{sha256:.sha256}})|from_entries)}' \
+              '{schemaVersion:2,releaseSurface:"scaffold",scaffoldRuntimeVersion:$scaffoldRuntimeVersion,version:$version,source:{repository:$repository,commit:$commit,workflowRun:$run},files:($sums|split("\n")|map(select(length>0)|capture("^(?<sha256>[0-9a-f]{64})  (?<name>.+)$"))|map({key:.name,value:{sha256:.sha256}})|from_entries)}' \
               > candidate/scaffold-manifest.json
             cat candidate/desktop-SHA256SUMS candidate/scaffold-SHA256SUMS > candidate/SHA256SUMS
             jq -n \
@@ -224,6 +304,33 @@ jobs:
           digest="$(sha256sum release-candidate.tar.gz | cut -d' ' -f1)"
           printf '%s  %s\n' "$digest" release-candidate.tar.gz > release-candidate.tar.gz.sha256
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - id: reuse
+        name: Validate exact prior release candidate
+        if: ${{ inputs.candidate_run_id != '' }}
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          RELEASE_SURFACE: ${{ needs.version.outputs.release_surface }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+        run: |
+          set -euo pipefail
+          cp reused/release-candidate.tar.gz reused/release-candidate.tar.gz.sha256 .
+          sha256sum --check release-candidate.tar.gz.sha256
+          mkdir candidate
+          tar -xzf release-candidate.tar.gz -C candidate
+          node scripts/validate-release-candidate-reuse.mjs \
+            candidate-source-run.json \
+            candidate \
+            "$VERSION" \
+            "$RELEASE_SURFACE" \
+            "$GITHUB_REPOSITORY" \
+            "$CANDIDATE_RUN_ID"
+          (cd candidate && sha256sum --check desktop-SHA256SUMS)
+          if [[ "$RELEASE_SURFACE" == "desktop-and-scaffold" ]]; then
+            (cd candidate && sha256sum --check scaffold-SHA256SUMS)
+            (cd candidate && sha256sum --check SHA256SUMS)
+          fi
+          digest="$(sha256sum release-candidate.tar.gz | cut -d' ' -f1)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
           name: release-candidate-${{ needs.version.outputs.version }}
@@ -234,8 +341,10 @@ jobs:
 
   publish-staging:
     if: >-
-      github.repository_owner == 'Ashler-AI' &&
-      (startsWith(github.ref, 'refs/tags/v') || inputs.promotion_target == 'staging' || inputs.promotion_target == 'production')
+      always() &&
+      needs.version.result == 'success' &&
+      needs.candidate.result == 'success' &&
+      (needs.version.outputs.promotion_target == 'staging-candidate' || needs.version.outputs.promotion_target == 'staging' || needs.version.outputs.promotion_target == 'production')
     needs: [version, candidate]
     runs-on: ubuntu-24.04
     environment: comet-release-staging
@@ -245,6 +354,7 @@ jobs:
       GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
       COMET_RELEASES_GCS_BUCKET: ${{ secrets.COMET_RELEASES_GCS_BUCKET }}
       RELEASE_SURFACE: ${{ needs.version.outputs.release_surface }}
+      PROMOTION_TARGET: ${{ needs.version.outputs.promotion_target }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -289,6 +399,7 @@ jobs:
       - name: Publish immutable staging release and selected moving channels
         env:
           VERSION: ${{ needs.version.outputs.version }}
+          SCAFFOLD_RUNTIME_DEPLOYMENT: ${{ inputs.scaffold_runtime_deployment || 'unchanged' }}
         run: |
           set -euo pipefail
           publish_immutable() {
@@ -322,6 +433,25 @@ jobs:
           for file in candidate/*; do
             name="$(basename "$file")"
             publish_immutable "$file" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$VERSION/$name"
+          done
+          if [[ "$PROMOTION_TARGET" == "staging-candidate" ]]; then
+            echo "Published immutable private staging candidate $VERSION without moving release channels."
+            exit 0
+          fi
+          current_scaffold_manifest="$RUNNER_TEMP/current-scaffold-manifest.json"
+          if ! gcloud storage cp \
+            "gs://$COMET_RELEASES_GCS_BUCKET/releases/scaffold-manifest.json" \
+            "$current_scaffold_manifest" >/dev/null 2>&1; then
+            rm -f "$current_scaffold_manifest"
+          fi
+          node scripts/guard-scaffold-runtime-release.mjs \
+            candidate/desktop-manifest.json \
+            "$current_scaffold_manifest" \
+            staging \
+            "$SCAFFOLD_RUNTIME_DEPLOYMENT" \
+            "$RELEASE_SURFACE"
+          for file in candidate/*; do
+            name="$(basename "$file")"
             case "$name" in
               *manifest.json|*SHA256SUMS|install.sh) ;;
               *) publish_immutable "$file" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$name" ;;
@@ -349,8 +479,11 @@ jobs:
 
   publish-production:
     if: >-
-      github.repository_owner == 'Ashler-AI' &&
-      (startsWith(github.ref, 'refs/tags/v') || inputs.promotion_target == 'production')
+      always() &&
+      needs.version.result == 'success' &&
+      needs.candidate.result == 'success' &&
+      needs['publish-staging'].result == 'success' &&
+      needs.version.outputs.promotion_target == 'production'
     needs: [version, candidate, publish-staging]
     runs-on: ubuntu-24.04
     environment: comet-release-production
@@ -402,6 +535,7 @@ jobs:
       - name: Promote immutable production release and selected moving channels
         env:
           VERSION: ${{ needs.version.outputs.version }}
+          SCAFFOLD_RUNTIME_DEPLOYMENT: ${{ inputs.scaffold_runtime_deployment || 'unchanged' }}
         run: |
           set -euo pipefail
           publish_immutable() {
@@ -432,6 +566,18 @@ jobs:
               return 1
             fi
           }
+          current_scaffold_manifest="$RUNNER_TEMP/current-scaffold-manifest.json"
+          if ! gcloud storage cp \
+            "gs://$COMET_RELEASES_GCS_BUCKET/releases/scaffold-manifest.json" \
+            "$current_scaffold_manifest" >/dev/null 2>&1; then
+            rm -f "$current_scaffold_manifest"
+          fi
+          node scripts/guard-scaffold-runtime-release.mjs \
+            candidate/desktop-manifest.json \
+            "$current_scaffold_manifest" \
+            production \
+            "$SCAFFOLD_RUNTIME_DEPLOYMENT" \
+            "$RELEASE_SURFACE"
           for file in candidate/*; do
             name="$(basename "$file")"
             publish_immutable "$file" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$VERSION/$name"

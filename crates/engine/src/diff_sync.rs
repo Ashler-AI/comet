@@ -770,7 +770,7 @@ pub async fn capture_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, En
     if tracked.truncated {
         let boundary = patch.rfind('\n').unwrap_or(0);
         patch.truncate(boundary);
-        patch.push_str("\n# Comet diff truncated\n");
+        patch.push_str("\n# Crew diff truncated\n");
     }
 
     // `?? path` records; rename records (`R  new\0old`) consume their extra field.

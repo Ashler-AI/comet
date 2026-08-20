@@ -430,7 +430,7 @@ async fn diff_capture_truncates_at_patch_cap() {
     let snapshot = capture_diff(&repos, &repo_dir).await.expect("capture");
     assert!(snapshot.truncated, "patch cap hit");
     assert!(snapshot.patch.len() <= 3 * 1024 * 1024 + 64);
-    assert!(snapshot.patch.contains("# Comet diff truncated"));
+    assert!(snapshot.patch.contains("# Crew diff truncated"));
 }
 
 // ---------------------------------------------------------------------------

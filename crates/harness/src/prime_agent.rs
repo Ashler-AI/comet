@@ -521,6 +521,7 @@ mod tests {
         );
 
         assert_eq!(first, same);
+        assert_ne!(first, second);
         assert_eq!(
             first
                 .parent()

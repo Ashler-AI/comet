@@ -549,7 +549,7 @@ impl AccountsPage {
         cx.notify();
     }
 
-    /// Persist the "update agents after Comet updates" toggle. Optimistic:
+    /// Persist the "update agents after Crew updates" toggle. Optimistic:
     /// the local frame flips now, the next `UpdateStatus` frame confirms (or
     /// corrects, if the engine-side write failed).
     fn set_harness_auto_update(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -770,7 +770,15 @@ impl AccountsPage {
                                     .truncate()
                                     .text_size(px(11.5))
                                     .text_color(theme.text_muted.opacity(0.6))
-                                    .child(SharedString::from(account_status_label(account))),
+                                    .child(SharedString::from(
+                                        if account.status == AgentAccountStatus::Connected
+                                            && !account.migration_available
+                                        {
+                                            "Remaining usage unavailable"
+                                        } else {
+                                            account_status_label(account)
+                                        },
+                                    )),
                             )
                         } else {
                             el.child(
@@ -1234,7 +1242,7 @@ impl AccountsPage {
             .into_any_element()
     }
 
-    /// The "Update agents after Comet updates" row: title + description left,
+    /// The "Update agents after Crew updates" row: title + description left,
     /// a 36×20 pill toggle right (the advisor settings toggle idiom).
     fn render_auto_update_row(
         &self,
@@ -1260,7 +1268,7 @@ impl AccountsPage {
                             .text_size(px(13.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text)
-                            .child(SharedString::from("Update agents after Comet updates")),
+                            .child(SharedString::from("Update agents after Crew updates")),
                     )
                     .child(
                         div()

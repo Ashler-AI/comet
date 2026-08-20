@@ -252,7 +252,7 @@ impl Harness for CodexHarness {
                 .expect("loopback inference URL serializes");
             for override_value in [
                 "model_provider=\"comet\"".to_string(),
-                "model_providers.comet.name=\"Comet Agent Auth\"".to_string(),
+                "model_providers.comet.name=\"Crew Agent Auth\"".to_string(),
                 format!("model_providers.comet.base_url={base_url}"),
                 "model_providers.comet.env_key=\"COMET_INFERENCE_TOKEN\"".to_string(),
                 "model_providers.comet.wire_api=\"responses\"".to_string(),
@@ -479,7 +479,7 @@ async fn run_session(session: Session) {
                 json!({
                     "clientInfo": {
                         "name": "comet-native",
-                        "title": "Comet",
+                        "title": "Crew",
                         "version": env!("CARGO_PKG_VERSION"),
                     },
                     "capabilities": { "experimentalApi": true },
@@ -1152,7 +1152,7 @@ fn tool_input_questions(params: &Value) -> Vec<UserInputQuestion> {
                     .unwrap_or("Provider request")
                     .into(),
                 question: if secret {
-                    "This request needs secret input, which Comet can’t collect safely.".into()
+                    "This request needs secret input, which Crew can’t collect safely.".into()
                 } else {
                     question
                         .get("question")

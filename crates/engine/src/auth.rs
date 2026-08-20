@@ -1156,14 +1156,14 @@ async fn handle_loopback_conn(
                     auth.finish_sign_in(result);
                     (
                         "200 OK",
-                        page("Signed in to Ashler Comet. You can close this window."),
+                        page("Signed in to Crew. You can close this window."),
                     )
                 }
                 Err(error) => {
                     tracing::warn!(%error, "auth: loopback token exchange failed");
                     (
                         "502 Bad Gateway",
-                        page("Sign-in failed. Return to Ashler Comet and try again."),
+                        page("Sign-in failed. Return to Crew and try again."),
                     )
                 }
             },
@@ -1187,7 +1187,7 @@ async fn handle_loopback_conn(
 
 fn page(message: &str) -> String {
     format!(
-        "<!doctype html><html><head><meta charset='utf-8'><title>Ashler Comet sign in</title></head><body style='font-family:sans-serif;padding:2rem'>{message}</body></html>"
+        "<!doctype html><html><head><meta charset='utf-8'><title>Crew sign in</title></head><body style='font-family:sans-serif;padding:2rem'>{message}</body></html>"
     )
 }
 

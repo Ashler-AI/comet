@@ -74,17 +74,14 @@ pub async fn update(config: EngineConfig, check_only: bool) -> anyhow::Result<()
                 &data_dir,
             )
             .await?;
-            comet_update::apply_mac_app(&staged, &bundle)?;
-            println!(
-                "updated {}. Relaunch Ashler Comet to finish.",
-                bundle.display()
-            );
+            let installed = comet_update::apply_mac_app(&staged, &bundle)?;
+            println!("updated {}. Relaunch Crew to finish.", installed.display());
             Ok(())
         }
         InstallKind::Unmanaged => {
             bail!(
                 "this binary is not update-managed (source build or hand-copied).\n\
-                 Install the current Ashler Comet release from the internal release channel."
+                 Install the current Crew release from the internal release channel."
             )
         }
     }

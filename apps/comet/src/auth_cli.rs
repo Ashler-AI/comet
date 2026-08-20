@@ -8,7 +8,7 @@ pub async fn login(config: EngineConfig) -> anyhow::Result<()> {
     std::fs::create_dir_all(&config.data_dir)?;
     let auth = Engine::build_auth(&config).await;
     if !auth.oauth_enabled() {
-        println!("Ashler Comet is using explicit local development identity.");
+        println!("Crew is using explicit local development identity.");
         return Ok(());
     }
     if let AuthState::SignedIn {
@@ -110,7 +110,7 @@ pub async fn status(config: EngineConfig) -> anyhow::Result<()> {
 fn engine_lock(config: &EngineConfig, verb: &str) -> anyhow::Result<InstanceLock> {
     InstanceLock::acquire(&config.data_dir).map_err(|err| {
         anyhow::anyhow!(
-            "{err}\nCannot {verb} while an engine is running; stop it first (`comet daemon stop`, or quit Ashler Comet)."
+            "{err}\nCannot {verb} while an engine is running; stop it first (`comet daemon stop`, or quit Crew)."
         )
     })
 }

@@ -53,7 +53,7 @@ pub use scaffold::{
 pub use sessions::{JournaledEvent, SessionsEngine, SteerOutcome};
 pub use spaces::SpacesSync;
 pub use terminals::Terminals;
-pub use titles::TitleGenerator;
+pub use titles::{TitleGenerator, title_from_prompt};
 pub use uploads::{AttachmentChunk, Uploads};
 pub use workspace_host::{
     DEFAULT_PROJECT_SCOPE, DEFAULT_USER_ID, WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig,
@@ -822,7 +822,7 @@ pub async fn terminal_sign_in(auth: &Auth) -> Result<(), EngineError> {
                 }
                 if stdin_reader.is_none() {
                     let url = auth.start_headless_sign_in().await?;
-                    println!("Sign in to Ashler Comet:\n\n  {url}\n");
+                    println!("Sign in to Crew:\n\n  {url}\n");
                     println!(
                         "If the browser cannot reach this machine, paste its final localhost URL here."
                     );

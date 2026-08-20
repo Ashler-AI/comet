@@ -16,9 +16,10 @@ use comet_proto::{
     AgentAccountStatus, AgentRoute, AgentRouteReceipt, AgentRoutingMode,
     CAPABILITY_SESSION_ANNOTATE, CAPABILITY_SESSION_CHAT, CAPABILITY_SESSION_CONTROL,
     CAPABILITY_SESSION_ENVIRONMENT, CAPABILITY_SESSION_FILES, CAPABILITY_SESSION_READ,
-    CollaborationScope, OmpSessionArtifact, ScaffoldControlGrant, ScaffoldEnvironmentControl,
-    ScaffoldEnvironmentControlResult, ScaffoldEnvironmentLinks, ScaffoldEnvironmentSnapshot,
-    ScaffoldRuntimeMode, SessionEnvironment, SessionEnvironmentSource, SessionRoomProjection,
+    CollaborationScope, OmpSessionArtifact, ScaffoldControlGrant, ScaffoldDatabaseEnvironment,
+    ScaffoldEnvironmentControl, ScaffoldEnvironmentControlResult, ScaffoldEnvironmentLinks,
+    ScaffoldEnvironmentSnapshot, SessionEnvironment, SessionEnvironmentSource,
+    SessionRoomProjection,
 };
 use comet_rpc::TokenSource;
 use reqwest::{Method, StatusCode, Url};
@@ -31,6 +32,10 @@ use crate::now_ms;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const JOIN_GRANT_TTL_SECONDS: u32 = 15 * 60;
 const DEVICE_ACCESS_TTL_MS: i64 = 12 * 60 * 60 * 1000;
+const SCAFFOLD_WORKSPACE_CWD: &str = "/workspace/ashler-platform";
+
+pub(crate) const SCAFFOLD_COMET_RUNTIME_VERSION: &str =
+    include_str!("../../../scaffold-runtime-version.txt");
 const JOIN_GRANT_PATH: [&str; 2] = ["auth", "device-grants"];
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -145,6 +150,14 @@ pub(crate) struct AgentAccountOAuthCredential {
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct RemoteAgentUsageWindow {
+    pub label: String,
+    pub used_fraction: f32,
+    pub reset_at: Option<String>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct RemoteAgentAccount {
     pub id: String,
     pub provider: String,
@@ -154,8 +167,8 @@ pub(crate) struct RemoteAgentAccount {
     pub organization: Option<String>,
     pub plan: Option<String>,
     pub status: AgentAccountStatus,
-    pub usage_fraction: Option<f32>,
-    pub reset_at: Option<String>,
+    #[serde(default)]
+    pub usage_windows: Vec<RemoteAgentUsageWindow>,
 }
 
 #[derive(Deserialize)]
@@ -576,7 +589,7 @@ impl ScaffoldClient {
             name,
             source_ref,
             region,
-            runtime_mode,
+            database_environment,
         } = options;
         self.validate_scope(scope)?;
         agent_route
@@ -590,10 +603,10 @@ impl ScaffoldClient {
             name,
             source: source_ref.map(|reference| CreateSandboxSource { reference }),
             region,
-            runtime_mode,
+            database_environment,
             agent_route,
             comet_runtime_profile: CreateCometRuntimeProfile {
-                version: "scaffold.comet-runtime.v1",
+                version: SCAFFOLD_COMET_RUNTIME_VERSION,
                 project_id: &scope.project_id,
                 deployment_id,
                 session_id: scope.session_id.as_deref().expect("validated sessionId"),
@@ -639,6 +652,24 @@ impl ScaffoldClient {
         self.lifecycle(sandbox_id, "stop", scope, cancellation)
             .await
     }
+    pub async fn update_agent_route(
+        &self,
+        sandbox_id: &str,
+        scope: &CollaborationScope,
+        agent_route: &AgentRoute,
+        cancellation: &CancellationToken,
+    ) -> Result<SessionEnvironment, ScaffoldError> {
+        self.validate_scope(scope)?;
+        let response: SandboxEnvelope = self
+            .request(
+                Method::POST,
+                self.sandbox_url(sandbox_id, Some("agent-route"))?,
+                Some(&AgentRouteBody { agent_route }),
+                cancellation,
+            )
+            .await?;
+        response.sandbox.into_environment(scope.clone())
+    }
 
     async fn lifecycle(
         &self,
@@ -664,7 +695,7 @@ impl ScaffoldClient {
         sandbox_id: &str,
         artifact: &OmpSessionArtifact,
         cancellation: &CancellationToken,
-    ) -> Result<(), ScaffoldError> {
+    ) -> Result<String, ScaffoldError> {
         validate_handoff_artifact(artifact)?;
         // Scaffold owns the absolute destination selection and must constrain it
         // below PI_CODING_AGENT_DIR. The archive itself contains only the
@@ -688,9 +719,9 @@ impl ScaffoldClient {
         self.upload_granted_archive(&grant, archive, cancellation)
             .await?;
 
-        // Do not start OMP ACP here: that would create a second writer. The
-        // ordinary first remote RunRequest uses the returned native id and
-        // reaches ACP session/load in the harness adapter.
+        // Do not start OMP here: that would create a second writer. The
+        // ordinary first remote RunRequest resumes the returned native id after
+        // the verified transcript has been materialized in the active profile.
         let verify_argv = vec![
             "python3".to_string(),
             "-c".to_string(),
@@ -699,6 +730,8 @@ impl ScaffoldClient {
             artifact.storage_relative_path.clone(),
             artifact.sha256.clone(),
             artifact.byte_count.to_string(),
+            artifact.native_session_id.clone(),
+            artifact.cwd.clone(),
         ];
         let verified = self
             .exec(
@@ -717,7 +750,7 @@ impl ScaffoldClient {
         {
             return Err(ScaffoldError::OmpSessionHandoffFailed);
         }
-        Ok(())
+        Ok(SCAFFOLD_WORKSPACE_CWD.to_string())
     }
 
     async fn upload_granted_archive(
@@ -1099,6 +1132,7 @@ struct SandboxEnvelope {
 #[serde(rename_all = "camelCase")]
 struct ScaffoldSandbox {
     id: String,
+    name: Option<String>,
     lifecycle_epoch: Option<u64>,
     status: comet_proto::ScaffoldLifecycle,
     kind: Option<String>,
@@ -1106,6 +1140,8 @@ struct ScaffoldSandbox {
     region: Option<String>,
     selected_region: Option<String>,
     source_ref: Option<String>,
+    #[serde(default)]
+    database_environment: ScaffoldDatabaseEnvironment,
     owner_email: Option<String>,
     created_at: String,
     updated_at: String,
@@ -1143,7 +1179,7 @@ impl ScaffoldSandbox {
                 .is_some_and(|profile| !matches!(profile, "remote_code" | "comet_remote"))
         {
             return Err(ScaffoldError::InvalidResponse(format!(
-                "{} is not a Comet-compatible remote sandbox",
+                "{} is not a Crew-compatible remote sandbox",
                 self.id
             )));
         }
@@ -1166,18 +1202,18 @@ impl ScaffoldSandbox {
         let scope = if self.runtime_profile.as_deref() == Some("comet_remote") {
             let profile = self.comet_runtime_profile.as_ref().ok_or_else(|| {
                 ScaffoldError::InvalidResponse(format!(
-                    "sandbox {} has no authoritative Comet runtime profile",
+                    "sandbox {} has no authoritative Crew runtime profile",
                     self.id
                 ))
             })?;
-            if profile.version != "scaffold.comet-runtime.v1"
+            if profile.version != SCAFFOLD_COMET_RUNTIME_VERSION
                 || profile.project_id != scope.project_id
                 || Some(profile.deployment_id.as_str()) != scope.deployment_id.as_deref()
                 || Some(profile.session_id.as_str()) != scope.session_id.as_deref()
                 || profile.sandbox_id != self.id
             {
                 return Err(ScaffoldError::InvalidResponse(format!(
-                    "sandbox {} returned a mismatched Comet runtime profile",
+                    "sandbox {} returned a mismatched Crew runtime profile",
                     self.id
                 )));
             }
@@ -1199,10 +1235,12 @@ impl ScaffoldSandbox {
                 lifecycle_epoch,
                 links: Box::new(self.links),
             },
+            name: self.name,
             owner_principal,
             scope,
             source_ref: self.source_ref,
             last_activity_at,
+            database_environment: Some(self.database_environment),
             unknown: Default::default(),
         })
     }
@@ -1219,7 +1257,7 @@ pub(crate) struct CreateSandboxOptions<'a> {
     pub name: Option<&'a str>,
     pub source_ref: Option<&'a str>,
     pub region: Option<&'a str>,
-    pub runtime_mode: Option<ScaffoldRuntimeMode>,
+    pub database_environment: ScaffoldDatabaseEnvironment,
 }
 
 #[derive(Debug, Serialize)]
@@ -1231,8 +1269,7 @@ struct CreateSandboxBody<'a> {
     source: Option<CreateSandboxSource<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     region: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    runtime_mode: Option<ScaffoldRuntimeMode>,
+    database_environment: ScaffoldDatabaseEnvironment,
     agent_route: &'a AgentRoute,
     comet_runtime_profile: CreateCometRuntimeProfile<'a>,
 }
@@ -1254,6 +1291,11 @@ struct CreateCometRuntimeProfile<'a> {
 
 #[derive(Debug, Serialize)]
 struct EmptyBody {}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentRouteBody<'a> {
+    agent_route: &'a AgentRoute,
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1336,7 +1378,7 @@ struct UploadGrant {
     _command: String,
 }
 
-const VERIFY_HANDOFF_PYTHON: &str = r#"import hashlib, os, pathlib, stat, sys, uuid
+const VERIFY_HANDOFF_PYTHON: &str = r#"import hashlib, json, os, pathlib, shutil, stat, sys, tempfile, uuid
 staging_root = pathlib.Path(sys.argv[1]).resolve(strict=True)
 workspace = pathlib.Path("/workspace/ashler-platform").resolve(strict=True)
 if workspace not in staging_root.parents or staging_root.relative_to(workspace).as_posix() != ".scaffold/omp-handoff-staging":
@@ -1345,23 +1387,103 @@ rel = pathlib.PurePosixPath(sys.argv[2])
 if rel.is_absolute() or not rel.parts or any(p in ("", ".", "..") for p in rel.parts):
     raise SystemExit(21)
 staged = staging_root.joinpath(*rel.parts)
-expected_sha, expected_count = sys.argv[3], int(sys.argv[4])
+expected_digest = (sys.argv[3], int(sys.argv[4]))
+expected_native_id, expected_local_cwd = sys.argv[5], sys.argv[6]
+if not expected_native_id or len(expected_native_id) > 128 or any(ord(c) < 32 for c in expected_native_id):
+    raise SystemExit(29)
+if not expected_local_cwd or len(expected_local_cwd) > 4096 or any(ord(c) < 32 for c in expected_local_cwd):
+    raise SystemExit(29)
 
-def exact_file(path, require_mode):
+def file_digest(path, require_mode):
     try:
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except (FileNotFoundError, OSError):
-        return False
+        return None
     with os.fdopen(fd, "rb") as f:
         st = os.fstat(f.fileno())
         if not stat.S_ISREG(st.st_mode) or stat.S_IMODE(st.st_mode) != require_mode:
-            return False
+            return None
         h, count = hashlib.sha256(), 0
         while True:
             block = f.read(1024 * 1024)
             if not block: break
             count += len(block); h.update(block)
-    return count == expected_count and h.hexdigest() == expected_sha
+    return h.hexdigest(), count
+
+def exact_file(path, require_mode, digest):
+    return file_digest(path, require_mode) == digest
+
+def bounded_regular(path, allowed_modes, limit):
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except (FileNotFoundError, OSError):
+        return None
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode) or stat.S_IMODE(st.st_mode) not in allowed_modes or st.st_size <= 0 or st.st_size > limit:
+            return None
+        contents = f.read(limit + 1)
+    return contents if len(contents) == st.st_size else None
+
+def exact_dir(path):
+    try:
+        st = path.lstat()
+    except (FileNotFoundError, OSError):
+        return False
+    return stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode)
+
+def write_rebased_session(source, out):
+    scanned = 0
+    while scanned <= 65536:
+        line = source.readline(65537)
+        if not line:
+            break
+        scanned += len(line)
+        if scanned > 65536:
+            raise SystemExit(29)
+        body = line[:-1] if line.endswith(b"\n") else line
+        try:
+            record = json.loads(body)
+        except (UnicodeDecodeError, ValueError):
+            out.write(line)
+            continue
+        if not isinstance(record, dict) or record.get("type") != "session":
+            out.write(line)
+            continue
+        if record.get("id") != expected_native_id or record.get("cwd") != expected_local_cwd:
+            raise SystemExit(29)
+        record["cwd"] = str(workspace)
+        encoded = json.dumps(record, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+        out.write(encoded + (b"\n" if line.endswith(b"\n") else b""))
+        shutil.copyfileobj(source, out, length=1024 * 1024)
+        return
+    raise SystemExit(29)
+
+def relative_under(root, path):
+    if path == root:
+        return ""
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return None
+
+def encode_relative_session_dir(prefix, relative):
+    encoded = relative.replace("/", "-").replace("\\", "-").replace(":", "-")
+    if not encoded:
+        return prefix
+    return prefix + encoded if prefix.endswith("-") else prefix + "-" + encoded
+
+def omp_session_dir_name(cwd):
+    home_relative = relative_under(pathlib.Path.home().resolve(strict=True), cwd)
+    if home_relative is not None:
+        return encode_relative_session_dir("-", home_relative)
+    temp_relative = relative_under(pathlib.Path(tempfile.gettempdir()).resolve(strict=True), cwd)
+    if temp_relative is not None:
+        return encode_relative_session_dir("-tmp", temp_relative)
+    absolute = str(cwd)
+    if absolute.startswith(("/", "\\")):
+        absolute = absolute[1:]
+    return "--" + absolute.replace("/", "-").replace("\\", "-").replace(":", "-") + "--"
 
 def secure_dirs(root, parts):
     current = root
@@ -1384,40 +1506,68 @@ try:
         raise SystemExit(22)
     if staging_root not in staged_resolved.parents or staged_resolved != staged:
         raise SystemExit(22)
-    if not exact_file(staged, 0o600):
+    if not exact_file(staged, 0o600, expected_digest):
         raise SystemExit(22)
-    sessions = pathlib.Path("/workspace/.omp/profiles/scaffold-host/agent/sessions")
-    parent = secure_dirs(pathlib.Path("/workspace"), sessions.relative_to("/workspace").parts + rel.parts[:-1])
-    target = parent / rel.name
+
+    runtime_value = os.environ.get("SCAFFOLD_RUNTIME_DIR", "")
+    runtime_input = pathlib.Path(runtime_value)
+    if not runtime_value or not runtime_input.is_absolute():
+        raise SystemExit(28)
     try:
+        runtime_dir = runtime_input.resolve(strict=True)
+        profile_path = (runtime_dir / "omp-inference/profile.json").resolve(strict=True)
+    except (FileNotFoundError, OSError):
+        raise SystemExit(28)
+    profile_bytes = bounded_regular(profile_path, (0o600, 0o644), 4096)
+    if profile_bytes is None:
+        raise SystemExit(28)
+    try:
+        profile = json.loads(profile_bytes)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raise SystemExit(28)
+    models_value = profile.get("modelsPath") if isinstance(profile, dict) else None
+    if not isinstance(models_value, str) or not models_value or len(models_value) > 4096:
+        raise SystemExit(28)
+    models_input = pathlib.Path(models_value)
+    if not models_input.is_absolute() or models_input.name != "models.yml":
+        raise SystemExit(28)
+    try:
+        models_path = models_input.resolve(strict=True)
+    except (FileNotFoundError, OSError):
+        raise SystemExit(28)
+    if models_path.name != "models.yml" or bounded_regular(models_path, (0o600,), 1024 * 1024) is None:
+        raise SystemExit(28)
+    agent_dir = models_path.parent
+    if tuple(agent_dir.parts[-4:]) != (".omp", "profiles", "scaffold-host", "agent") or not exact_dir(agent_dir):
+        raise SystemExit(28)
+    os.chmod(agent_dir, 0o700, follow_symlinks=False)
+
+    parent = secure_dirs(agent_dir, ("sessions", omp_session_dir_name(workspace)))
+    target = parent / rel.name
+    temporary = parent / (".comet-handoff-" + uuid.uuid4().hex)
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        with os.fdopen(fd, "wb") as out, staged.open("rb") as source:
+            write_rebased_session(source, out)
+            out.flush(); os.fsync(out.fileno())
+        os.chmod(temporary, 0o600, follow_symlinks=False)
+        transformed_digest = file_digest(temporary, 0o600)
+        if transformed_digest is None:
+            raise SystemExit(27)
         if target.exists() or target.is_symlink():
-            if target.is_symlink() or not exact_file(target, 0o600):
+            if target.is_symlink() or not exact_file(target, 0o600, transformed_digest):
                 raise SystemExit(26)
         else:
-            temporary = parent / (".comet-handoff-" + uuid.uuid4().hex)
-            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
             try:
-                with os.fdopen(fd, "wb") as out, staged.open("rb") as source:
-                    while True:
-                        block = source.read(1024 * 1024)
-                        if not block: break
-                        out.write(block)
-                    out.flush(); os.fsync(out.fileno())
-                os.chmod(temporary, 0o600, follow_symlinks=False)
-                try:
-                    os.link(temporary, target, follow_symlinks=False)
-                    temporary.unlink()
-                except FileExistsError:
-                    if target.is_symlink() or not exact_file(target, 0o600):
-                        raise SystemExit(26)
-                    temporary.unlink()
-            finally:
-                try: temporary.unlink()
-                except FileNotFoundError: pass
-        if not exact_file(target, 0o600):
+                os.link(temporary, target, follow_symlinks=False)
+            except FileExistsError:
+                if target.is_symlink() or not exact_file(target, 0o600, transformed_digest):
+                    raise SystemExit(26)
+        if not exact_file(target, 0o600, transformed_digest):
             raise SystemExit(27)
     finally:
-        pass
+        try: temporary.unlink()
+        except FileNotFoundError: pass
     print("verified")
 finally:
     try: staged.unlink()
@@ -1703,7 +1853,7 @@ impl ScaffoldRuntime {
                 name,
                 source_ref,
                 region,
-                runtime_mode,
+                database_environment,
                 agent_route,
             } => (
                 self.inner
@@ -1714,7 +1864,7 @@ impl ScaffoldRuntime {
                             name: name.as_deref(),
                             source_ref: source_ref.as_deref(),
                             region: region.as_deref(),
-                            runtime_mode,
+                            database_environment,
                         },
                         &agent_route,
                         cancellation,
@@ -1751,6 +1901,19 @@ impl ScaffoldRuntime {
                 None,
                 None,
             ),
+            ScaffoldEnvironmentControl::UpdateAgentRoute {
+                sandbox_id,
+                scope,
+                agent_route,
+            } => (
+                self.inner
+                    .client
+                    .update_agent_route(&sandbox_id, &scope, &agent_route, cancellation)
+                    .await?,
+                None,
+                None,
+                None,
+            ),
             ScaffoldEnvironmentControl::Attach { sandbox_id, scope } => {
                 let environment = self
                     .inner
@@ -1766,7 +1929,8 @@ impl ScaffoldRuntime {
             ScaffoldEnvironmentControl::HandoffOmpSession {
                 sandbox_id,
                 scope,
-                local_candidate_id,
+                native_session_id,
+                cwd,
             } => {
                 let environment = self
                     .inner
@@ -1781,13 +1945,17 @@ impl ScaffoldRuntime {
                 ) {
                     return Err(ScaffoldError::OmpSessionHandoffFailed);
                 }
-                let artifact = crate::local_sessions::capture_omp_artifact(&local_candidate_id)
-                    .map_err(|_| ScaffoldError::OmpSessionHandoffFailed)?;
-                self.inner
+                let artifact = crate::local_sessions::capture_omp_artifact_for_session(
+                    &native_session_id,
+                    &cwd,
+                )
+                .map_err(|_| ScaffoldError::OmpSessionHandoffFailed)?;
+                let remote_cwd = self
+                    .inner
                     .client
                     .handoff_omp_session(&sandbox_id, &artifact, cancellation)
                     .await?;
-                let handoff = Some((artifact.native_session_id, artifact.cwd));
+                let handoff = Some((artifact.native_session_id, remote_cwd));
                 (environment, None, None, handoff)
             }
         };
@@ -2410,6 +2578,7 @@ mod tests {
             comet_sandbox("creating"),
             sandbox("paused"),
             sandbox("resuming"),
+            sandbox("ready"),
             sandbox("stopped"),
         ];
         let (origin, captured) = mock_server(responses).await;
@@ -2429,10 +2598,10 @@ mod tests {
             .create(
                 &scope(),
                 CreateSandboxOptions {
-                    name: Some("Comet"),
+                    name: Some("Crew"),
                     source_ref: Some("main"),
                     region: Some("us-central1"),
-                    runtime_mode: Some(ScaffoldRuntimeMode::Tilt),
+                    database_environment: ScaffoldDatabaseEnvironment::StagingSnapshot,
                 },
                 &AgentRoute::automatic(comet_proto::AgentProvider::OpenAi, "gpt-5.6-sol"),
                 &cancellation,
@@ -2449,6 +2618,15 @@ mod tests {
             .unwrap();
         client
             .resume("sandbox-a", &scope(), &cancellation)
+            .await
+            .unwrap();
+        client
+            .update_agent_route(
+                "sandbox-a",
+                &scope(),
+                &AgentRoute::automatic(comet_proto::AgentProvider::OpenAi, "gpt-5.5"),
+                &cancellation,
+            )
             .await
             .unwrap();
         let stopped = client
@@ -2476,6 +2654,7 @@ mod tests {
                 "POST /api/code-sandboxes HTTP/1.1",
                 "POST /api/code-sandboxes/sandbox-a/pause HTTP/1.1",
                 "POST /api/code-sandboxes/sandbox-a/resume HTTP/1.1",
+                "POST /api/code-sandboxes/sandbox-a/agent-route HTTP/1.1",
                 "POST /api/code-sandboxes/sandbox-a/stop HTTP/1.1",
             ]
         );
@@ -2484,9 +2663,12 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("authorization: bearer sc_rc_control_secret")
         }));
-        assert!(requests[2].contains(r#""runtimeMode":"tilt""#));
+        assert!(requests[2].contains(r#""databaseEnvironment":"staging_snapshot""#));
         assert!(requests[2].contains(
             r#""agentRoute":{"provider":"openai","model":"gpt-5.6-sol","fallback":"disabled","routingMode":"automatic"}"#
+        ));
+        assert!(requests[5].contains(
+            r#""agentRoute":{"provider":"openai","model":"gpt-5.5","fallback":"disabled","routingMode":"automatic"}"#
         ));
         assert!(requests[2].contains(r#""version":"scaffold.comet-runtime.v1""#));
         assert!(requests[2].contains(r#""projectId":"project-a""#));
@@ -2505,7 +2687,7 @@ mod tests {
             name: None,
             source: None,
             region: None,
-            runtime_mode: Some(ScaffoldRuntimeMode::Compose),
+            database_environment: ScaffoldDatabaseEnvironment::Local,
             agent_route: &route,
             comet_runtime_profile: CreateCometRuntimeProfile {
                 version: "scaffold.comet-runtime.v1",
@@ -2694,7 +2876,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn omp_handoff_uses_one_use_raw_tar_and_verifies_without_starting_acp() {
+    async fn omp_handoff_uses_one_use_raw_tar_and_verifies_without_starting_omp() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let upload_url = format!("{origin}/one-use-upload");
@@ -2766,10 +2948,11 @@ mod tests {
             Arc::new(StaticToken("scaffold_control_secret".into())),
         )
         .unwrap();
-        client
+        let remote_cwd = client
             .handoff_omp_session("sandbox-a", &artifact, &CancellationToken::new())
             .await
             .unwrap();
+        assert_eq!(remote_cwd, SCAFFOLD_WORKSPACE_CWD);
 
         let requests = captured.await.unwrap();
         assert_eq!(requests.len(), 3);
@@ -2801,7 +2984,11 @@ mod tests {
         let verify = String::from_utf8_lossy(&requests[2]);
         assert!(verify.starts_with("POST /api/code-sandboxes/sandbox-a/exec HTTP/1.1"));
         let verify_body = verify.split_once("\r\n\r\n").unwrap().1;
-        assert!(verify_body.contains("/workspace/.omp/profiles/scaffold-host/agent/sessions"));
+        assert!(verify_body.contains("omp-inference/profile.json"));
+        assert!(verify_body.contains("modelsPath"));
+        assert!(verify_body.contains("secure_dirs(agent_dir"));
+        assert!(verify_body.contains("omp_session_dir_name(workspace)"));
+        assert!(!verify_body.contains("/workspace/.omp"));
         assert!(verify_body.contains("/workspace/ashler-platform/.scaffold/omp-handoff-staging"));
         assert!(verify_body.contains("staged.unlink()"));
         assert!(verify_body.contains("by-cwd/native-1.jsonl"));
@@ -2837,11 +3024,34 @@ mod tests {
         let staging = workspace.join(".scaffold/omp-handoff-staging/by-cwd");
         std::fs::create_dir_all(&staging).unwrap();
         let staged = staging.join("native-1.jsonl");
-        let bytes = b"native omp bytes\n";
+        let bytes = b"{\"type\":\"session\",\"version\":3,\"id\":\"native-1\",\"timestamp\":\"2026-08-16T00:00:00.000Z\",\"cwd\":\"/repo\"}\n{\"type\":\"message\",\"id\":\"message-1\"}\n";
         let sha = format!("{:x}", sha2::Sha256::digest(bytes));
+        let runtime = root.join(".scaffold");
+        let profile_dir = runtime.join("omp-inference");
+        let profile_agent_dir = root.join("runtime-home/.omp/profiles/scaffold-host/agent");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::create_dir_all(&profile_agent_dir).unwrap();
+        std::fs::set_permissions(&profile_agent_dir, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let models_path = profile_agent_dir.join("models.yml");
+        std::fs::write(&models_path, "providers: {}\n").unwrap();
+        std::fs::set_permissions(&models_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let profile_path = profile_dir.join("profile.json");
+        std::fs::write(
+            &profile_path,
+            serde_json::to_vec(&serde_json::json!({
+                "profile": "scaffold-host",
+                "model": "scaffold-openai/gpt-5.6-sol",
+                "modelsPath": models_path,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&profile_path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let script = VERIFY_HANDOFF_PYTHON.replace("/workspace", root.to_str().unwrap());
         let run = |script: &str| {
             Command::new("python3")
+                .env("SCAFFOLD_RUNTIME_DIR", &runtime)
                 .args([
                     "-c",
                     script,
@@ -2852,6 +3062,8 @@ mod tests {
                     "by-cwd/native-1.jsonl",
                     &sha,
                     &bytes.len().to_string(),
+                    "native-1",
+                    "/repo",
                 ])
                 .output()
                 .unwrap()
@@ -2865,8 +3077,33 @@ mod tests {
             String::from_utf8_lossy(&first.stderr)
         );
         assert!(!staged.exists(), "staged file must be consumed");
-        let target = root.join(".omp/profiles/scaffold-host/agent/sessions/by-cwd/native-1.jsonl");
-        assert_eq!(std::fs::read(&target).unwrap(), bytes);
+        let sessions = profile_agent_dir.join("sessions");
+        let target = std::fs::read_dir(&sessions)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("native-1.jsonl"))
+            .find(|path| path.is_file())
+            .expect("materializer must use OMP's cwd-scoped session directory");
+        assert!(
+            target
+                .parent()
+                .and_then(std::path::Path::file_name)
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|name| name.starts_with("-tmp"))
+        );
+        let transformed = std::fs::read(&target).unwrap();
+        let mut transformed_lines = transformed.split(|byte| *byte == b'\n');
+        let header: serde_json::Value =
+            serde_json::from_slice(transformed_lines.next().unwrap()).unwrap();
+        assert_eq!(header["id"], "native-1");
+        assert_eq!(
+            header["cwd"],
+            workspace.canonicalize().unwrap().to_str().unwrap()
+        );
+        assert_eq!(
+            transformed_lines.next().unwrap(),
+            b"{\"type\":\"message\",\"id\":\"message-1\"}"
+        );
         assert_eq!(
             std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
             0o600
@@ -2884,7 +3121,7 @@ mod tests {
         std::fs::write(&staged, bytes).unwrap();
         std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(run(&script).status.success());
-        assert_eq!(std::fs::read(&target).unwrap(), bytes);
+        assert_eq!(std::fs::read(&target).unwrap(), transformed);
 
         // An existing mismatched destination fails closed and still cleans staging.
         std::fs::write(&target, b"different").unwrap();

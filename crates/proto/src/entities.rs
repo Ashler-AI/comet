@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{HarnessId, ReasoningLevel, SandboxLevel};
+use crate::{HarnessId, ReasoningLevel, SandboxLevel, SessionEnvironment};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -124,19 +124,20 @@ pub struct LocalSessionCandidate {
     pub busy_elsewhere: Option<bool>,
 }
 
-/// Exact, content-addressed capture of an OMP native session file.
+/// Exact, content-addressed source capture of an OMP native session file.
 ///
-/// This is a local-controller handoff payload: the platform uploads `bytes`
-/// under `sha256`, preserves `native_session_id` and `cwd` as trusted metadata,
-/// and materializes the bytes in the destination OMP session store before ACP
-/// continuation. The source filesystem path is deliberately not exposed.
+/// This is a local-controller handoff payload: the platform authenticates
+/// `bytes` under `sha256` and preserves `native_session_id` plus `cwd` as trusted
+/// metadata. Scaffold rebinds the authenticated header to its remote workspace
+/// and installs it in the active profile's cwd-scoped session store. The source
+/// filesystem path is deliberately not exposed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OmpSessionArtifact {
     pub native_session_id: String,
     pub cwd: String,
-    /// Slash-separated path below the configured OMP `sessions` directory.
-    /// The receiver materializes `bytes` at this exact relative path.
+    /// Slash-separated source path below the configured OMP `sessions` directory.
+    /// Scaffold uses it only for isolated upload staging, never as the final store path.
     pub storage_relative_path: String,
     /// Lowercase SHA-256 of `bytes`.
     pub sha256: String,
@@ -241,13 +242,17 @@ pub fn chat_indicator(chat: &Chat, live: Option<&Session>) -> ChatIndicator {
 }
 /// A workspace-local pointer to an existing global session room.
 ///
-/// Unlike [`Chat`], a session ref carries no host placement or cached session
-/// metadata. Knowing the exact chat id is sufficient to open the existing room.
+/// Unlike [`Chat`], a session ref carries no host placement. Scaffold imports
+/// retain only the verified environment route required to reconnect the room.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRef {
     pub chat_id: String,
     pub added_at: DateTime<Utc>,
+    /// Verified Scaffold route metadata for reconnecting this imported room
+    /// after Crew restarts. Capability grant ids are intentionally not stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<SessionEnvironment>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

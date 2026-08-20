@@ -444,16 +444,30 @@ pub enum ScaffoldLifecycle {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ScaffoldRuntimeMode {
-    Tilt,
-    Compose,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScaffoldDatabaseEnvironment {
+    #[default]
+    Local,
+    StagingSnapshot,
+    ProductionSnapshot,
+}
+
+impl ScaffoldDatabaseEnvironment {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::StagingSnapshot => "staging_snapshot",
+            Self::ProductionSnapshot => "production_snapshot",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ScaffoldEnvironmentLinks {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -490,6 +504,8 @@ pub enum SessionEnvironmentSource {
 #[serde(rename_all = "camelCase")]
 pub struct SessionEnvironment {
     pub source: SessionEnvironmentSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Control-plane-verified owner subject. Display email is not an authority key.
     pub owner_principal: String,
     pub scope: CollaborationScope,
@@ -497,6 +513,8 @@ pub struct SessionEnvironment {
     pub source_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_environment: Option<ScaffoldDatabaseEnvironment>,
     #[serde(flatten, default)]
     pub unknown: UnknownFields,
 }
@@ -525,8 +543,8 @@ pub enum ScaffoldEnvironmentControl {
         source_ref: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         region: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        runtime_mode: Option<ScaffoldRuntimeMode>,
+        #[serde(default)]
+        database_environment: ScaffoldDatabaseEnvironment,
         #[serde(rename = "agentRoute")]
         agent_route: AgentRoute,
     },
@@ -546,15 +564,24 @@ pub enum ScaffoldEnvironmentControl {
         sandbox_id: String,
         scope: CollaborationScope,
     },
-    /// Copy an exact local OMP session into a Scaffold host. This only
-    /// materializes and verifies the native store; the first remote run performs
-    /// ACP `session/load` through its ordinary `RunRequest.resume` path.
+    UpdateAgentRoute {
+        #[serde(rename = "sandboxId")]
+        sandbox_id: String,
+        scope: CollaborationScope,
+        #[serde(rename = "agentRoute")]
+        agent_route: AgentRoute,
+    },
+    /// Transfer an authenticated native OMP session into a Scaffold host. The
+    /// controller resolves the durable native id/cwd pair to a discovered file;
+    /// callers cannot provide a path. Scaffold rebinds the header to its remote
+    /// workspace before the first ordinary `RunRequest.resume`.
     HandoffOmpSession {
         #[serde(rename = "sandboxId")]
         sandbox_id: String,
         scope: CollaborationScope,
-        #[serde(rename = "localCandidateId")]
-        local_candidate_id: String,
+        #[serde(rename = "nativeSessionId")]
+        native_session_id: String,
+        cwd: String,
     },
 }
 
@@ -910,13 +937,46 @@ mod tests {
                 session_id: Some("session-a".into()),
                 unknown: Default::default(),
             },
-            local_candidate_id: "opaque-local-id".into(),
+            native_session_id: "omp-native-a".into(),
+            cwd: "/repo".into(),
         };
         let value = serde_json::to_value(control).unwrap();
         assert_eq!(value["operation"], "handoffOmpSession");
         assert_eq!(value["sandboxId"], "sandbox-a");
-        assert_eq!(value["localCandidateId"], "opaque-local-id");
+        assert_eq!(value["nativeSessionId"], "omp-native-a");
+        assert_eq!(value["cwd"], "/repo");
         assert_eq!(value["scope"]["sessionId"], "session-a");
+    }
+    #[test]
+    fn agent_route_update_control_uses_camel_case_wire_shape() {
+        let control = ScaffoldEnvironmentControl::UpdateAgentRoute {
+            sandbox_id: "sandbox-a".into(),
+            scope: CollaborationScope {
+                project_id: "project-a".into(),
+                deployment_id: Some("deployment-a".into()),
+                session_id: Some("session-a".into()),
+                unknown: Default::default(),
+            },
+            agent_route: AgentRoute::automatic(AgentProvider::OpenAi, "gpt-5.5"),
+        };
+        assert_eq!(
+            serde_json::to_value(control).unwrap(),
+            serde_json::json!({
+                "operation": "updateAgentRoute",
+                "sandboxId": "sandbox-a",
+                "scope": {
+                    "projectId": "project-a",
+                    "deploymentId": "deployment-a",
+                    "sessionId": "session-a",
+                },
+                "agentRoute": {
+                    "provider": "openai",
+                    "model": "gpt-5.5",
+                    "fallback": "disabled",
+                    "routingMode": "automatic",
+                },
+            })
+        );
     }
 
     #[test]

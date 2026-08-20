@@ -54,7 +54,7 @@ pub(crate) fn elicitation_questions(params: &Value) -> Vec<UserInputQuestion> {
                 return UserInputQuestion {
                     id: format!("{SECRET_PREFIX}{key}"),
                     header: title.into(),
-                    question: "This request needs secret input, which Comet can’t collect safely."
+                    question: "This request needs secret input, which Crew can’t collect safely."
                         .into(),
                     options: vec!["Cancel".into()],
                     multi_select: false,

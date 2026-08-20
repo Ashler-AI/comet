@@ -451,10 +451,13 @@ fn agent_tasks(args: &Value) -> Option<Vec<AgentActivity>> {
     })
 }
 
-/// Subagent progress from a task tool result (`result.details.progress`),
+/// Subagent progress from a task tool result or in-flight partial result,
 /// mirroring the ACP `rawOutput.details.progress` shape.
 fn agent_progress(frame: &Value) -> Option<Vec<AgentActivity>> {
-    let progress = frame.pointer("/result/details/progress")?.as_array()?;
+    let progress = frame
+        .pointer("/result/details/progress")
+        .or_else(|| frame.pointer("/partialResult/details/progress"))?
+        .as_array()?;
     (!progress.is_empty()).then(|| {
         progress
             .iter()
@@ -502,6 +505,42 @@ fn result_text(result: &Value) -> Option<String> {
     }
     (!result.is_null())
         .then(|| serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string()))
+}
+
+fn assistant_message_event(frame: &Value) -> Option<AgentEvent> {
+    let event = frame.get("assistantMessageEvent")?;
+    let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
+    let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
+    match kind {
+        "text_delta" if !delta.is_empty() => Some(AgentEvent::TextDelta { text: delta.into() }),
+        "thinking_start" => Some(AgentEvent::ReasoningStarted),
+        "thinking_delta" if !delta.is_empty() => {
+            Some(AgentEvent::ReasoningDelta { text: delta.into() })
+        }
+        "thinking_end" => Some(AgentEvent::ReasoningCompleted),
+        _ => None,
+    }
+}
+
+fn tool_progress_from_update(frame: &Value) -> Option<AgentEvent> {
+    let id = frame
+        .get("toolCallId")
+        .and_then(Value::as_str)
+        .unwrap_or("omp-tool")
+        .to_string();
+    if let Some(agents) = agent_progress(frame) {
+        return Some(AgentEvent::ToolCall {
+            id,
+            call: ToolCall::Agent { agents },
+        });
+    }
+    Some(AgentEvent::ToolProgress {
+        id,
+        output: frame
+            .get("partialResult")
+            .and_then(result_text)
+            .map(comet_proto::truncate_tool_output),
+    })
 }
 
 fn tool_result_from_end(frame: &Value) -> Option<AgentEvent> {
@@ -975,21 +1014,9 @@ pub(crate) async fn run_rpc(
                         }
                     }
                     "message_update" => {
-                        let event = frame.get("assistantMessageEvent");
-                        let kind = event
-                            .and_then(|event| event.get("type"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        let delta = event
-                            .and_then(|event| event.get("delta"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        let mapped = match kind {
-                            "text_delta" if !delta.is_empty() => Some(AgentEvent::TextDelta { text: delta.into() }),
-                            "thinking_delta" if !delta.is_empty() => Some(AgentEvent::ReasoningDelta { text: delta.into() }),
-                            _ => None,
-                        };
-                        if let Some(event) = mapped && events.send(Ok(event)).await.is_err() {
+                        if let Some(event) = assistant_message_event(&frame)
+                            && events.send(Ok(event)).await.is_err()
+                        {
                             kill_rpc_process(&mut child, process_group, interrupt_grace).await;
                             return Ok(());
                         }
@@ -1012,6 +1039,14 @@ pub(crate) async fn run_rpc(
                             && events.send(Ok(event)).await.is_err()
                         {
                             kill_rpc_process(&mut child, process_group, interrupt_grace).await;
+                            return Ok(());
+                        }
+                    }
+                    "tool_execution_update" => {
+                        if let Some(event) = tool_progress_from_update(&frame)
+                            && events.send(Ok(event)).await.is_err()
+                        {
+                            let _ = child.kill().await;
                             return Ok(());
                         }
                     }
@@ -1179,7 +1214,7 @@ pub(crate) async fn run_rpc(
                                 "type": "host_tool_result",
                                 "id": id,
                                 "isError": true,
-                                "result": { "content": [{ "type": "text", "text": "Comet registers no host tools" }] },
+                                "result": { "content": [{ "type": "text", "text": "Crew registers no host tools" }] },
                             }));
                         }
                     }
@@ -1189,7 +1224,7 @@ pub(crate) async fn run_rpc(
                                 "type": "host_uri_result",
                                 "id": id,
                                 "isError": true,
-                                "error": "Comet registers no host URI schemes",
+                                "error": "Crew registers no host URI schemes",
                             }));
                         }
                     }
@@ -1536,6 +1571,45 @@ mod tests {
         };
         assert_eq!(agents[0].status, AgentActivityStatus::Completed);
         assert_eq!(agents[0].model.as_deref(), Some("m-1"));
+    }
+
+    #[test]
+    fn maps_reasoning_lifecycle_without_exposing_private_text() {
+        for (kind, expected) in [
+            ("thinking_start", AgentEvent::ReasoningStarted),
+            ("thinking_end", AgentEvent::ReasoningCompleted),
+        ] {
+            let frame = json!({
+                "assistantMessageEvent": { "type": kind }
+            });
+            assert_eq!(assistant_message_event(&frame), Some(expected));
+        }
+
+        let delta = json!({
+            "assistantMessageEvent": { "type": "thinking_delta", "delta": "private" }
+        });
+        assert_eq!(
+            assistant_message_event(&delta),
+            Some(AgentEvent::ReasoningDelta {
+                text: "private".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn maps_bounded_tool_progress_without_resolving_the_call() {
+        let update = json!({
+            "type": "tool_execution_update",
+            "toolCallId": "t1",
+            "partialResult": { "content": [{ "type": "text", "text": "working" }] },
+        });
+        assert_eq!(
+            tool_progress_from_update(&update),
+            Some(AgentEvent::ToolProgress {
+                id: "t1".into(),
+                output: Some("working".into()),
+            })
+        );
     }
 
     #[test]
