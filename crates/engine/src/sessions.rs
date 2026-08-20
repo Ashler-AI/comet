@@ -87,6 +87,16 @@ pub enum QueueOutcome {
 
 type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>;
 
+const OMP_PROCESS_RESUME_NOTICE: &str = "<system-reminder>\nCrew resumed this durable OMP session in a new local harness process. Process-local tool state from earlier turns did not survive this boundary. Recreate and verify any Eval/REPL bindings, browser handles, or sandbox helpers before reuse. Run one bounded probe successfully before starting any polling loop.\n</system-reminder>";
+
+fn harness_run_request(request: &RunRequest, harness_id: HarnessId) -> RunRequest {
+    let mut prepared = request.clone();
+    if harness_id == HarnessId::Omp && prepared.resume.is_some() {
+        prepared.prompt = format!("{OMP_PROCESS_RESUME_NOTICE}\n\n{}", request.prompt);
+    }
+    prepared
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerReply {
     pub command_id: String,
@@ -987,7 +997,10 @@ impl SessionsEngine {
         // consumption. A spawn/transport error must return to the durable
         // command executor so it can write Rejected + an audit reason instead
         // of first reporting Applied and failing moments later.
-        let stream = match harness.run(request.clone(), controls).await {
+        let stream = match harness
+            .run(harness_run_request(&request, harness_id), controls)
+            .await
+        {
             Ok(stream) => stream,
             Err(err) => {
                 if let HarnessError::SessionBusy { session_id } = &err {
@@ -2490,6 +2503,46 @@ mod tests {
         )
     }
 
+    fn test_request(prompt: &str, resume: Option<&str>) -> RunRequest {
+        RunRequest {
+            prompt: prompt.into(),
+            model: Some("gpt-5.6-sol".into()),
+            agent_account_id: None,
+            reasoning: None,
+            model_options: Default::default(),
+            cwd: "/tmp".into(),
+            sandbox: SandboxLevel::WorkspaceWrite,
+            auto_approve: true,
+            resume: resume.map(str::to_owned),
+            attachments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resumed_omp_process_warns_that_process_local_tool_state_was_reset() {
+        let request = test_request("continue the run", Some("native-session"));
+        let prepared = harness_run_request(&request, HarnessId::Omp);
+
+        assert_eq!(request.prompt, "continue the run");
+        assert_eq!(request.resume.as_deref(), Some("native-session"));
+        assert!(prepared.prompt.starts_with(OMP_PROCESS_RESUME_NOTICE));
+        assert!(prepared.prompt.ends_with("\n\ncontinue the run"));
+        assert!(
+            prepared
+                .prompt
+                .contains("Run one bounded probe successfully")
+        );
+
+        assert_eq!(
+            harness_run_request(&test_request("fresh", None), HarnessId::Omp).prompt,
+            "fresh"
+        );
+        assert_eq!(
+            harness_run_request(&request, HarnessId::Codex).prompt,
+            "continue the run"
+        );
+    }
+
     fn test_route(harness: HarnessId) -> RunRoute {
         RunRoute::new(
             harness,
@@ -2818,11 +2871,19 @@ mod tests {
             .expect("takeover resumes the blocked request");
         assert_eq!(stops.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
-        let requests = lock(&requests);
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].prompt, request.prompt);
-        assert_eq!(requests[1].prompt, request.prompt);
-        assert_eq!(requests[1].resume, request.resume);
+        {
+            let requests = lock(&requests);
+            assert_eq!(requests.len(), 2);
+            for harness_request in requests.iter() {
+                assert!(
+                    harness_request
+                        .prompt
+                        .starts_with(OMP_PROCESS_RESUME_NOTICE)
+                );
+                assert!(harness_request.prompt.ends_with(&request.prompt));
+            }
+            assert_eq!(requests[1].resume, request.resume);
+        }
         assert!(!lock(&sessions.inner.blocked_omp_takeovers).contains_key("takeover-chat"));
         let entries = sessions
             .doc_handle("takeover-chat")
@@ -2838,8 +2899,15 @@ mod tests {
             1,
             "retry must reuse the original user message id"
         );
+        let user_entry = entries
+            .iter()
+            .find(|entry| entry.id == "takeover-user-message")
+            .expect("takeover user entry");
+        assert!(matches!(
+            user_entry.parts.as_slice(),
+            [MessagePart::Text { text, .. }] if text == &request.prompt
+        ));
 
-        drop(requests);
         fail_cleanup.store(true, std::sync::atomic::Ordering::SeqCst);
         let interrupted = sessions.interrupt("takeover-chat").await;
         assert!(
