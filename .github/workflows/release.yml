@@ -605,3 +605,47 @@ jobs:
             gcloud storage cp candidate/SHA256SUMS "gs://$COMET_RELEASES_GCS_BUCKET/releases/SHA256SUMS"
             gcloud storage cp scaffold-latest.txt "gs://$COMET_RELEASES_GCS_BUCKET/releases/latest.txt"
           fi
+      - name: Verify published production channels
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          readback="$(mktemp -d)"
+          trap 'rm -rf "$readback"' EXIT
+
+          verify_object() {
+            source="$1"
+            name="$2"
+            gcloud storage cp \
+              "gs://$COMET_RELEASES_GCS_BUCKET/releases/$name" \
+              "$readback/$name" >/dev/null
+            if ! cmp -s "$source" "$readback/$name"; then
+              echo "::error::published production release object $name differs from the promoted candidate"
+              return 1
+            fi
+          }
+
+          verify_pointer() {
+            name="$1"
+            actual="$(gcloud storage cat "gs://$COMET_RELEASES_GCS_BUCKET/releases/$name")"
+            if [[ "$actual" != "$VERSION" ]]; then
+              echo "::error::published production release pointer $name is $actual, expected $VERSION"
+              return 1
+            fi
+          }
+
+          verify_object candidate/desktop-manifest.json desktop-manifest.json
+          verify_object candidate/desktop-SHA256SUMS desktop-SHA256SUMS
+          verify_pointer desktop-latest.txt
+
+          if [[ "$RELEASE_SURFACE" == "desktop-and-scaffold" ]]; then
+            verify_object candidate/scaffold-manifest.json scaffold-manifest.json
+            verify_object candidate/scaffold-SHA256SUMS scaffold-SHA256SUMS
+            verify_object candidate/manifest.json manifest.json
+            verify_object candidate/SHA256SUMS SHA256SUMS
+            verify_object candidate/install.sh install.sh
+            verify_pointer scaffold-latest.txt
+            verify_pointer latest.txt
+          fi
+
+          echo "Verified production release channels at $VERSION."
