@@ -561,6 +561,10 @@ fn session_writer_states_with(
     if paths.is_empty() {
         return Some(Vec::new());
     }
+    let canonical_paths: Vec<_> = paths
+        .iter()
+        .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
+        .collect();
     let output = ProcessCommand::new(executable)
         .args(["-F", "pfan", "--"])
         .args(paths)
@@ -572,8 +576,11 @@ fn session_writer_states_with(
     Some(
         paths
             .iter()
-            .map(|path| {
-                if active_paths.contains(path.as_os_str().as_encoded_bytes()) {
+            .zip(canonical_paths)
+            .map(|(path, canonical_path)| {
+                if active_paths.contains(path.as_os_str().as_encoded_bytes())
+                    || active_paths.contains(canonical_path.as_os_str().as_encoded_bytes())
+                {
                     SessionWriterState::Active
                 } else if complete {
                     SessionWriterState::Inactive
@@ -2918,19 +2925,28 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn batched_writer_probe_ignores_readers_with_one_process() {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
 
         let temp = tempfile::tempdir().unwrap();
-        let active = temp.path().join("active.jsonl");
+        let real = temp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let active_real = real.join("active.jsonl");
+        let alias = temp.path().join("alias");
+        symlink(&real, &alias).unwrap();
+        let active = alias.join("active.jsonl");
         let inactive = temp.path().join("inactive.jsonl");
-        std::fs::write(&active, "{}\n").unwrap();
+        std::fs::write(&active_real, "{}\n").unwrap();
         std::fs::write(&inactive, "{}\n").unwrap();
+        let active_identity = std::fs::canonicalize(&active_real).unwrap();
         let probe = temp.path().join("probe.sh");
         std::fs::write(
             &probe,
-            "#!/bin/sh\nset -eu\nprintf x >> \"$0.count\"\n\
-             [ \"$#\" -eq 5 ]\n[ \"$1\" = \"-F\" ]\n[ \"$2\" = \"pfan\" ]\n\
-             [ \"$3\" = \"--\" ]\nprintf 'p10\\nf3\\naw\\nn%s\\np11\\nf4\\nar\\nn%s\\n' \"$4\" \"$5\"\nexit 1\n",
+            format!(
+                "#!/bin/sh\nset -eu\nprintf x >> \"$0.count\"\n\
+                 [ \"$#\" -eq 5 ]\n[ \"$1\" = \"-F\" ]\n[ \"$2\" = \"pfan\" ]\n\
+                 [ \"$3\" = \"--\" ]\nprintf 'p10\\nf3\\naw\\nn{}\\np11\\nf4\\nar\\nn%s\\n' \"$5\"\nexit 1\n",
+                active_identity.display()
+            ),
         )
         .unwrap();
         let mut permissions = std::fs::metadata(&probe).unwrap().permissions();
