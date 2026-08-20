@@ -36,9 +36,15 @@ on:
           - unchanged
           - staging-deployed
           - production-deployed
+      candidate_run_id:
+        description: "Successful release run whose exact candidate should be reused for production promotion; empty rebuilds"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
+  actions: read
   id-token: write
 
 concurrency:
@@ -53,6 +59,7 @@ jobs:
       source_epoch: ${{ steps.version.outputs.source_epoch }}
       release_surface: ${{ steps.version.outputs.release_surface }}
       promotion_target: ${{ steps.version.outputs.promotion_target }}
+      candidate_run_id: ${{ steps.version.outputs.candidate_run_id }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -64,6 +71,7 @@ jobs:
           REQUESTED_VERSION: ${{ inputs.version }}
           REQUESTED_RELEASE_SURFACE: ${{ inputs.release_surface }}
           REQUESTED_PROMOTION_TARGET: ${{ inputs.promotion_target }}
+          REQUESTED_CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
         run: |
           set -euo pipefail
           workspace_version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
@@ -91,6 +99,17 @@ jobs:
               exit 1
               ;;
           esac
+          candidate_run_id="$REQUESTED_CANDIDATE_RUN_ID"
+          if [[ -n "$candidate_run_id" ]]; then
+            if [[ ! "$candidate_run_id" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error::candidate_run_id must be a positive GitHub Actions run id"
+              exit 1
+            fi
+            if [[ "$promotion_target" != "production" ]]; then
+              echo "::error::candidate_run_id is only supported for production promotion"
+              exit 1
+            fi
+          fi
           if [[ "$requested" != "$workspace_version" ]]; then
             echo "::error::release version $requested does not match workspace version $workspace_version"
             exit 1
@@ -103,10 +122,11 @@ jobs:
           echo "version=$workspace_version" >> "$GITHUB_OUTPUT"
           echo "release_surface=$release_surface" >> "$GITHUB_OUTPUT"
           echo "promotion_target=$promotion_target" >> "$GITHUB_OUTPUT"
+          echo "candidate_run_id=$candidate_run_id" >> "$GITHUB_OUTPUT"
           echo "source_epoch=$(git show -s --format=%ct "$GITHUB_SHA")" >> "$GITHUB_OUTPUT"
 
   linux:
-    if: ${{ needs.version.outputs.release_surface == 'desktop-and-scaffold' }}
+    if: ${{ inputs.candidate_run_id == '' && needs.version.outputs.release_surface == 'desktop-and-scaffold' }}
     needs: version
     strategy:
       fail-fast: false
@@ -149,6 +169,7 @@ jobs:
           if-no-files-found: error
 
   macos:
+    if: ${{ inputs.candidate_run_id == '' }}
     needs: version
     runs-on: macos-14
     env:
@@ -178,18 +199,52 @@ jobs:
           if-no-files-found: error
 
   candidate:
-    if: ${{ always() && needs.version.result == 'success' && needs.macos.result == 'success' && (needs.linux.result == 'success' || needs.linux.result == 'skipped') }}
+    if: >-
+      always() &&
+      needs.version.result == 'success' &&
+      (
+        (
+          inputs.candidate_run_id != '' &&
+          needs.macos.result == 'skipped' &&
+          needs.linux.result == 'skipped'
+        ) ||
+        (
+          inputs.candidate_run_id == '' &&
+          needs.macos.result == 'success' &&
+          (needs.linux.result == 'success' || needs.linux.result == 'skipped')
+        )
+      )
     needs: [version, linux, macos]
     runs-on: ubuntu-24.04
     outputs:
-      digest: ${{ steps.candidate.outputs.digest }}
+      digest: ${{ steps.candidate.outputs.digest || steps.reuse.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
+      - id: reuse-source
+        name: Read reused candidate source run
+        if: ${{ inputs.candidate_run_id != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" > candidate-source-run.json
       - uses: actions/download-artifact@v4
+        if: ${{ inputs.candidate_run_id == '' }}
         with:
           path: incoming
+      - name: Download exact prior release candidate
+        if: ${{ inputs.candidate_run_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: release-candidate-${{ needs.version.outputs.version }}
+          path: reused
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.candidate_run_id }}
       - id: candidate
         name: Assemble immutable release candidate
+        if: ${{ inputs.candidate_run_id == '' }}
         env:
           VERSION: ${{ needs.version.outputs.version }}
           SOURCE_EPOCH: ${{ needs.version.outputs.source_epoch }}
@@ -248,6 +303,33 @@ jobs:
             -czf release-candidate.tar.gz -C candidate .
           digest="$(sha256sum release-candidate.tar.gz | cut -d' ' -f1)"
           printf '%s  %s\n' "$digest" release-candidate.tar.gz > release-candidate.tar.gz.sha256
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - id: reuse
+        name: Validate exact prior release candidate
+        if: ${{ inputs.candidate_run_id != '' }}
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          RELEASE_SURFACE: ${{ needs.version.outputs.release_surface }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+        run: |
+          set -euo pipefail
+          cp reused/release-candidate.tar.gz reused/release-candidate.tar.gz.sha256 .
+          sha256sum --check release-candidate.tar.gz.sha256
+          mkdir candidate
+          tar -xzf release-candidate.tar.gz -C candidate
+          node scripts/validate-release-candidate-reuse.mjs \
+            candidate-source-run.json \
+            candidate \
+            "$VERSION" \
+            "$RELEASE_SURFACE" \
+            "$GITHUB_REPOSITORY" \
+            "$CANDIDATE_RUN_ID"
+          (cd candidate && sha256sum --check desktop-SHA256SUMS)
+          if [[ "$RELEASE_SURFACE" == "desktop-and-scaffold" ]]; then
+            (cd candidate && sha256sum --check scaffold-SHA256SUMS)
+            (cd candidate && sha256sum --check SHA256SUMS)
+          fi
+          digest="$(sha256sum release-candidate.tar.gz | cut -d' ' -f1)"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
