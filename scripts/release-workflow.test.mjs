@@ -3,9 +3,68 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
+import { validateReleaseCandidateReuse } from "./validate-release-candidate-reuse.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const read = (relative) => readFile(path.join(root, relative), "utf8");
+
+const SHA256 = "a".repeat(64);
+const RUN_SHA = "b".repeat(40);
+const RUN_ID = "32313877342";
+const REPOSITORY = "Ashler-AI/comet";
+const VERSION = "0.1.57";
+const RUN_URL = `https://github.com/${REPOSITORY}/actions/runs/${RUN_ID}`;
+
+function releaseManifest(releaseSurface, files, schemaVersion = 2) {
+  return {
+    schemaVersion,
+    ...(releaseSurface ? { releaseSurface } : {}),
+    ...(schemaVersion === 2 ? { scaffoldRuntimeVersion: "scaffold.comet-runtime.v1" } : {}),
+    version: VERSION,
+    source: {
+      repository: REPOSITORY,
+      commit: RUN_SHA,
+      workflowRun: RUN_URL,
+    },
+    files: Object.fromEntries(files.map((name) => [name, { sha256: SHA256 }])),
+  };
+}
+
+function reusableCandidate(overrides = {}) {
+  return {
+    run: {
+      id: Number(RUN_ID),
+      repository: { full_name: REPOSITORY },
+      head_repository: { full_name: REPOSITORY },
+      path: ".github/workflows/release.yml",
+      event: "workflow_dispatch",
+      status: "completed",
+      conclusion: "success",
+      head_branch: "main",
+      head_sha: RUN_SHA,
+      html_url: RUN_URL,
+    },
+    desktopManifest: releaseManifest("desktop", [
+      `comet-${VERSION}-macos-arm64.dmg`,
+      `comet-${VERSION}-macos-arm64-app.tar.gz`,
+    ]),
+    scaffoldManifest: releaseManifest("scaffold", [
+      `comet-${VERSION}-linux-aarch64.tar.gz`,
+      `comet-${VERSION}-linux-x86_64.tar.gz`,
+    ]),
+    unifiedManifest: releaseManifest(undefined, [
+      `comet-${VERSION}-linux-aarch64.tar.gz`,
+      `comet-${VERSION}-linux-x86_64.tar.gz`,
+      `comet-${VERSION}-macos-arm64.dmg`,
+      `comet-${VERSION}-macos-arm64-app.tar.gz`,
+    ], 1),
+    requestedVersion: VERSION,
+    releaseSurface: "desktop-and-scaffold",
+    repository: REPOSITORY,
+    runId: RUN_ID,
+    ...overrides,
+  };
+}
 
 function jobBlock(workflow, name) {
   const marker = `  ${name}:\n`;
@@ -22,9 +81,9 @@ describe("Comet release surfaces", () => {
     assert.match(workflow, /GITHUB_REF.*refs\/tags\/v[\s\S]*release_surface="desktop-and-scaffold"/);
     assert.match(
       jobBlock(workflow, "linux"),
-      /if: \$\{\{ needs\.version\.outputs\.release_surface == 'desktop-and-scaffold' \}\}/,
+      /if: \$\{\{ inputs\.candidate_run_id == '' && needs\.version\.outputs\.release_surface == 'desktop-and-scaffold' \}\}/,
     );
-    assert.doesNotMatch(jobBlock(workflow, "macos"), /release_surface == 'desktop-and-scaffold'/);
+    assert.match(jobBlock(workflow, "macos"), /if: \$\{\{ inputs\.candidate_run_id == '' \}\}/);
   });
 
   it("publishes a private immutable candidate without moving staging channels", async () => {
@@ -49,6 +108,21 @@ describe("Comet release surfaces", () => {
     const channels = staging.indexOf("require_forward_version desktop");
     assert.ok(immutable >= 0 && immutable < candidateStop);
     assert.ok(candidateStop < guard && guard < channels);
+  });
+
+  it("reuses only a successful main release candidate for production promotion", async () => {
+    const workflow = await read(".github/workflows/release.yml");
+    const candidate = jobBlock(workflow, "candidate");
+
+    assert.match(workflow, /candidate_run_id:[\s\S]*required: false[\s\S]*default: ""/);
+    assert.match(workflow, /permissions:[\s\S]*actions: read/);
+    assert.match(workflow, /candidate_run_id is only supported for production promotion/);
+    assert.match(candidate, /gh api "repos\/\$GITHUB_REPOSITORY\/actions\/runs\/\$CANDIDATE_RUN_ID"/);
+    assert.match(candidate, /actions\/download-artifact@v4[\s\S]*run-id: \$\{\{ inputs\.candidate_run_id \}\}/);
+    assert.match(candidate, /node scripts\/validate-release-candidate-reuse\.mjs/);
+    assert.match(candidate, /sha256sum --check desktop-SHA256SUMS/);
+    assert.match(candidate, /sha256sum --check scaffold-SHA256SUMS/);
+    assert.match(candidate, /sha256sum --check SHA256SUMS/);
   });
 
   it("advances desktop and Scaffold moving channels independently", async () => {
@@ -111,5 +185,37 @@ describe("Comet release surfaces", () => {
     assert.match(installer, /scaffold-SHA256SUMS/);
     assert.match(feed, /\(\?:desktop\|scaffold\)/);
     assert.match(feed, /manifest\\\.json\|SHA256SUMS\|latest\\\.txt/);
+  });
+});
+
+describe("release candidate reuse validation", () => {
+  it("accepts an exact successful candidate from main", () => {
+    assert.deepEqual(validateReleaseCandidateReuse(reusableCandidate()), {
+      commit: RUN_SHA,
+      workflowRun: RUN_URL,
+    });
+  });
+
+  it("rejects candidates from another repository, commit, or file set", () => {
+    const wrongRepository = reusableCandidate();
+    wrongRepository.run.repository.full_name = "attacker/comet";
+    assert.throws(
+      () => validateReleaseCandidateReuse(wrongRepository),
+      /source run repository/,
+    );
+
+    const wrongCommit = reusableCandidate();
+    wrongCommit.desktopManifest.source.commit = "c".repeat(40);
+    assert.throws(
+      () => validateReleaseCandidateReuse(wrongCommit),
+      /desktop manifest\.source\.commit/,
+    );
+
+    const wrongFiles = reusableCandidate();
+    delete wrongFiles.unifiedManifest.files[`comet-${VERSION}-linux-aarch64.tar.gz`];
+    assert.throws(
+      () => validateReleaseCandidateReuse(wrongFiles),
+      /unified manifest\.files/,
+    );
   });
 });
