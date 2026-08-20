@@ -134,6 +134,7 @@ describe("Comet release surfaces", () => {
     ]);
     const candidate = jobBlock(workflow, "candidate");
     const staging = jobBlock(workflow, "publish-staging");
+    const production = jobBlock(workflow, "publish-production");
 
     assert.equal(runtimeVersion, "scaffold.comet-runtime.v1");
     assert.match(engine, /SCAFFOLD_COMET_RUNTIME_VERSION[\s\S]*include_str!\("\.\.\/\.\.\/\.\.\/scaffold-runtime-version\.txt"\)/);
@@ -149,6 +150,13 @@ describe("Comet release surfaces", () => {
       staging,
       /if \[\[ "\$RELEASE_SURFACE" == "desktop-and-scaffold" \]\]; then[\s\S]*gcloud storage cp candidate\/scaffold-manifest\.json .*scaffold-manifest\.json/,
     );
+    assert.match(production, /name: Verify published production channels/);
+    assert.match(production, /verify_object candidate\/desktop-manifest\.json desktop-manifest\.json/);
+    assert.match(
+      production,
+      /if \[\[ "\$RELEASE_SURFACE" == "desktop-and-scaffold" \]\]; then[\s\S]*verify_object candidate\/scaffold-manifest\.json scaffold-manifest\.json/,
+    );
+    assert.match(production, /verify_pointer desktop-latest\.txt[\s\S]*verify_pointer scaffold-latest\.txt[\s\S]*verify_pointer latest\.txt/);
   });
 
   it("blocks runtime version channel promotions until Scaffold is deployed first", async () => {
