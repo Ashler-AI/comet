@@ -8,9 +8,12 @@
 //!   panel drives the timers; the buffer logic here is pure);
 //! - [`TerminalElement`] — a custom gpui element that measures cell metrics
 //!   from the real mono font (the "font probe"), reports the resulting
-//!   cols×rows back to the panel, and paints the grid: background quads for
-//!   non-default cells, one `ShapedLine` per row (same font whatever the
-//!   colors — paint never changes layout), and the cursor block.
+//!   cols×rows back to the panel, and paints the grid while caching each row's
+//!   `ShapedLine` and background quads by emulator generation and paint inputs.
+
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::{
     App, Bounds, Entity, GlobalElementId, Hsla, LayoutId, Modifiers, PaintQuad, Pixels, ShapedLine,
@@ -19,7 +22,7 @@ use gpui::{
 
 use crate::theme::{Theme, rgb_to_hsl};
 
-use super::emulator::{CellColor, CellSnapshot};
+use super::emulator::{CellColor, CellSnapshot, VisibleRowSnapshot};
 use super::panel::TerminalPanel;
 
 /// Terminal font metrics (mono).
@@ -266,6 +269,120 @@ impl InputCoalescer {
 // Grid element
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, PartialEq)]
+struct RowStyleKey {
+    font_family: SharedString,
+    font_size: Pixels,
+    foreground: Hsla,
+    background: Hsla,
+}
+
+impl RowStyleKey {
+    fn new(theme: &Theme, font_size: Pixels) -> Self {
+        Self {
+            font_family: theme.font_mono.clone(),
+            font_size,
+            foreground: theme.text,
+            background: terminal_bg(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct RowBackgroundKey {
+    origin_x: Pixels,
+    origin_y: Pixels,
+    cell_width: Pixels,
+    line_height: Pixels,
+    foreground: Hsla,
+    background: Hsla,
+}
+
+struct CachedShape {
+    generation: u64,
+    key: RowStyleKey,
+    line: Arc<ShapedLine>,
+}
+
+struct CachedBackground {
+    generation: u64,
+    key: RowBackgroundKey,
+    quads: Arc<[PaintQuad]>,
+}
+
+/// Per-tab row artifacts. The panel owns this behind an `Rc<RefCell<_>>` so
+/// custom elements recreated by GPUI renders still reuse shaped rows.
+#[derive(Default)]
+pub(super) struct TerminalRenderCache {
+    shapes: Vec<Option<CachedShape>>,
+    backgrounds: Vec<Option<CachedBackground>>,
+}
+
+impl TerminalRenderCache {
+    pub(super) fn shared() -> Rc<RefCell<Self>> {
+        Rc::new(RefCell::new(Self::default()))
+    }
+
+    fn ensure_rows(&mut self, rows: usize) {
+        self.shapes.resize_with(rows, || None);
+        self.backgrounds.resize_with(rows, || None);
+    }
+
+    fn cached_shape(
+        &self,
+        row: usize,
+        generation: u64,
+        key: &RowStyleKey,
+    ) -> Option<Arc<ShapedLine>> {
+        self.shapes
+            .get(row)
+            .and_then(Option::as_ref)
+            .filter(|cached| cached.generation == generation && cached.key == *key)
+            .map(|cached| cached.line.clone())
+    }
+
+    fn store_shape(
+        &mut self,
+        row: usize,
+        generation: u64,
+        key: RowStyleKey,
+        line: Arc<ShapedLine>,
+    ) {
+        self.shapes[row] = Some(CachedShape {
+            generation,
+            key,
+            line,
+        });
+    }
+
+    fn cached_background(
+        &self,
+        row: usize,
+        generation: u64,
+        key: RowBackgroundKey,
+    ) -> Option<Arc<[PaintQuad]>> {
+        self.backgrounds
+            .get(row)
+            .and_then(Option::as_ref)
+            .filter(|cached| cached.generation == generation && cached.key == key)
+            .map(|cached| cached.quads.clone())
+    }
+
+    fn store_background(
+        &mut self,
+        row: usize,
+        generation: u64,
+        key: RowBackgroundKey,
+        quads: Arc<[PaintQuad]>,
+    ) {
+        self.backgrounds[row] = Some(CachedBackground {
+            generation,
+            key,
+            quads,
+        });
+    }
+}
+
 /// Paints the active tab's grid. Cell metrics come from the resolved mono font
 /// each frame (font probe): `em_advance` for the cell width, the fixed line
 /// height for rows. The measured cols×rows feed back into the panel, which
@@ -282,8 +399,8 @@ impl TerminalElement {
 }
 
 pub struct TerminalPrepaint {
-    bg_quads: Vec<PaintQuad>,
-    lines: Vec<ShapedLine>,
+    bg_quads: Vec<Arc<[PaintQuad]>>,
+    lines: Vec<Arc<ShapedLine>>,
     cursor: Option<PaintQuad>,
 }
 
@@ -363,39 +480,48 @@ impl gpui::Element for TerminalElement {
             bounds.left() + px(TERM_PADDING),
             bounds.top() + px(TERM_PADDING),
         );
-        let mut bg_quads = Vec::new();
-        let mut lines = Vec::with_capacity(snapshot.lines.len());
+        let style_key = RowStyleKey::new(&theme, font_size);
+        let background_key = RowBackgroundKey {
+            origin_x: origin.x,
+            origin_y: origin.y,
+            cell_width: cell_w,
+            line_height: line_h,
+            foreground: theme.text,
+            background: terminal_bg(),
+        };
+        let mut bg_quads = Vec::with_capacity(snapshot.rows.len());
+        let mut lines = Vec::with_capacity(snapshot.rows.len());
+        let mut cache = snapshot.cache.borrow_mut();
+        cache.ensure_rows(snapshot.rows.len());
 
-        for (row_ix, row) in snapshot.lines.iter().enumerate() {
-            let y = origin.y + line_h * row_ix as f32;
-            // Merge consecutive non-default background cells into quads.
-            let mut run_start: Option<(usize, Hsla)> = None;
-            for (col, color) in row
-                .iter()
-                .map(|cell| cell.display_colors().1)
-                .chain(std::iter::once(CellColor::Background))
-                .enumerate()
-            {
-                let paint = match color {
-                    CellColor::Background => None,
-                    other => Some(resolve_color(other, &theme)),
-                };
-                match (&run_start, paint) {
-                    (None, Some(color)) => run_start = Some((col, color)),
-                    (Some((start, current)), next) if next != Some(*current) => {
-                        bg_quads.push(fill(
-                            Bounds::new(
-                                point(origin.x + cell_w * *start as f32, y),
-                                size(cell_w * (col - *start) as f32, line_h),
-                            ),
-                            *current,
-                        ));
-                        run_start = next.map(|color| (col, color));
-                    }
-                    _ => {}
+        for (row_ix, row) in snapshot.rows.iter().enumerate() {
+            let line = match cache.cached_shape(row_ix, row.generation, &style_key) {
+                Some(line) => line,
+                None => {
+                    let line = Arc::new(shape_row(
+                        row.cells.as_ref(),
+                        &theme,
+                        &mono,
+                        font_size,
+                        window,
+                    ));
+                    cache.store_shape(row_ix, row.generation, style_key.clone(), line.clone());
+                    line
                 }
-            }
-            lines.push(shape_row(row, &theme, &mono, font_size, window));
+            };
+            lines.push(line);
+
+            let quads = match cache.cached_background(row_ix, row.generation, background_key) {
+                Some(quads) => quads,
+                None => {
+                    let quads = build_background_quads(
+                        row, row_ix, origin.x, origin.y, cell_w, line_h, &theme,
+                    );
+                    cache.store_background(row_ix, row.generation, background_key, quads.clone());
+                    quads
+                }
+            };
+            bg_quads.push(quads);
         }
 
         let cursor = snapshot.cursor.map(|c| {
@@ -437,8 +563,10 @@ impl gpui::Element for TerminalElement {
             bounds.top() + px(TERM_PADDING),
         );
         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
-            for quad in prepaint.bg_quads.drain(..) {
-                window.paint_quad(quad);
+            for row_quads in prepaint.bg_quads.drain(..) {
+                for quad in row_quads.iter() {
+                    window.paint_quad(quad.clone());
+                }
             }
             for (ix, line) in prepaint.lines.iter().enumerate() {
                 let _ = line.paint(
@@ -455,6 +583,47 @@ impl gpui::Element for TerminalElement {
             }
         });
     }
+}
+
+fn build_background_quads(
+    row: &VisibleRowSnapshot,
+    row_ix: usize,
+    origin_x: Pixels,
+    origin_y: Pixels,
+    cell_w: Pixels,
+    line_h: Pixels,
+    theme: &Theme,
+) -> Arc<[PaintQuad]> {
+    let y = origin_y + line_h * row_ix as f32;
+    let mut quads = Vec::new();
+    let mut run_start: Option<(usize, Hsla)> = None;
+    for (col, color) in row
+        .cells
+        .iter()
+        .map(|cell| cell.display_colors().1)
+        .chain(std::iter::once(CellColor::Background))
+        .enumerate()
+    {
+        let paint = match color {
+            CellColor::Background => None,
+            other => Some(resolve_color(other, theme)),
+        };
+        match (&run_start, paint) {
+            (None, Some(color)) => run_start = Some((col, color)),
+            (Some((start, current)), next) if next != Some(*current) => {
+                quads.push(fill(
+                    Bounds::new(
+                        point(origin_x + cell_w * *start as f32, y),
+                        size(cell_w * (col - *start) as f32, line_h),
+                    ),
+                    *current,
+                ));
+                run_start = next.map(|color| (col, color));
+            }
+            _ => {}
+        }
+    }
+    quads.into()
 }
 
 /// Shape one grid row: wide-char spacers are skipped (the wide glyph covers
@@ -727,5 +896,46 @@ mod tests {
     fn timing_constants_match_spec() {
         assert_eq!(COALESCE_MS, 12);
         assert_eq!(RESIZE_DEBOUNCE_MS, 80);
+    }
+    #[test]
+    fn row_cache_keys_generation_style_and_background_geometry_independently() {
+        let mut cache = TerminalRenderCache::default();
+        cache.ensure_rows(1);
+        let style = RowStyleKey {
+            font_family: "Mono A".into(),
+            font_size: px(13.0),
+            foreground: rgb8(0xee, 0xee, 0xee),
+            background: terminal_bg(),
+        };
+        let shaped = Arc::new(ShapedLine::default());
+        cache.store_shape(0, 7, style.clone(), shaped.clone());
+
+        let hit = cache.cached_shape(0, 7, &style).unwrap();
+        assert!(Arc::ptr_eq(&hit, &shaped));
+        assert!(cache.cached_shape(0, 8, &style).is_none());
+        let mut other_font = style.clone();
+        other_font.font_family = "Mono B".into();
+        assert!(cache.cached_shape(0, 7, &other_font).is_none());
+
+        let geometry = RowBackgroundKey {
+            origin_x: px(10.0),
+            origin_y: px(20.0),
+            cell_width: px(8.0),
+            line_height: px(18.0),
+            foreground: style.foreground,
+            background: style.background,
+        };
+        let quads: Arc<[PaintQuad]> = Arc::from([]);
+        cache.store_background(0, 7, geometry, quads.clone());
+        let hit = cache.cached_background(0, 7, geometry).unwrap();
+        assert!(Arc::ptr_eq(&hit, &quads));
+        assert!(cache.cached_background(0, 8, geometry).is_none());
+        let moved = RowBackgroundKey {
+            origin_x: px(11.0),
+            ..geometry
+        };
+        assert!(cache.cached_background(0, 7, moved).is_none());
+        // Font family alone does not affect already-positioned background quads.
+        assert!(cache.cached_background(0, 7, geometry).is_some());
     }
 }

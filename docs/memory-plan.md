@@ -97,10 +97,10 @@ viewer-laptop steady state ≈ gpui baseline + selected chat ≈ 150–250MB, fl
 - **Terminals**: purge `terminal/panel.rs:239` chats map on chat delete;
   scrollback 10k → configurable ~2k lines (24B/cell ⇒ 30–50MB per
   fully-scrolled terminal today); count replay bytes raw, not base64.
-- **Diff pane**: watch carries every checkout's ≤3MiB patch, resident engine +
-  UI (`diff_sync.rs:106`, `changes.rs:480`); send summaries, fetch patch on
-  demand; stop the 120s repair tick re-capturing unchanged checkouts
-  (`diff_sync.rs:486`).
+- **Diff pane**: summary-only watches plus exact-checksum on-demand fetch for the
+  selected checkout have landed; the UI retains one patch instead of every
+  checkout's ≤3MiB patch. Remaining: stop the 120s repair tick re-capturing
+  unchanged checkouts (`diff_sync.rs`).
 - **Transcript render caches**: byte-budget `tree_cache`/`RenderCache`/
   `HighlightStore` to viewport±K rows (today they grow with every row ever
   scrolled past, freed only on chat switch).

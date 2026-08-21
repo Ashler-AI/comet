@@ -23,7 +23,8 @@
 //! - Repos (§3.5): `ListRepos`, `AddRepo {path}`, `CloneRepo {url}`,
 //!   `CreateRepo {name}`, `ListBranches {repoPath}` (default branch first),
 //!   `ListFolders {path?}`, `CreateWorktree {repoPath, branch}`, `DeleteWorktree
-//!   {repoPath, worktreePath}`; `WatchCheckoutDiffs` → stream of `CheckoutDiff[]`
+//!   {repoPath, worktreePath}`, `ReadCheckoutDiff {checkoutId, checksum}` → exact
+//!   bounded patch; `WatchCheckoutDiffs` → summary-only `CheckoutDiffSummary[]`
 //! - Terminals (§3.4): `OpenTerminal {chatId, cols, rows}` → `TerminalSession`,
 //!   `SubscribeTerminal {terminalId, afterSeq?}` → stream of `TerminalEvent`
 //!   (replay then live tail), `WriteTerminal {terminalId, data}`, `ResizeTerminal`,
@@ -67,8 +68,9 @@ use comet_proto::{
 };
 use comet_rpc::{
     GetAgentRouteReceiptParams, LinkCache, PeerMessageResult, PeerReplyResult, PeerWaitResult,
-    RemoveSessionRefResult, ReplyPeerMessageParams, RpcError, RpcReply, RpcService,
-    SendPeerMessageParams, SessionRefParams, WaitPeerReplyParams, methods, parse_params,
+    ReadCheckoutDiffParams, ReadCheckoutDiffResult, RemoveSessionRefResult, ReplyPeerMessageParams,
+    RpcError, RpcReply, RpcService, SendPeerMessageParams, SessionRefParams, WaitPeerReplyParams,
+    methods, parse_params,
 };
 
 use crate::agent_accounts::AgentAccounts;
@@ -1176,6 +1178,7 @@ fn forwardable(method: &str) -> bool {
             | methods::DELETE_WORKTREE
             // Checkout diffs are produced on the device holding the checkout.
             | methods::WATCH_CHECKOUT_DIFFS
+            | methods::READ_CHECKOUT_DIFF
             // Terminals live on the chat's host device.
             | methods::OPEN_TERMINAL
             | methods::SUBSCRIBE_TERMINAL
@@ -2086,6 +2089,12 @@ impl RpcService for EngineRpc {
             methods::WATCH_CHECKOUT_DIFFS => {
                 Ok(RpcReply::Stream(watch_stream(self.diff_sync.watch_diffs())))
             }
+            methods::READ_CHECKOUT_DIFF => {
+                let p: ReadCheckoutDiffParams = parse_params(params)?;
+                RpcReply::value(&ReadCheckoutDiffResult {
+                    diff: self.diff_sync.read_diff(&p.checkout_id, &p.checksum),
+                })
+            }
             methods::LIST_REPOS => RpcReply::value(&self.repos.list().await),
             methods::ADD_REPO => {
                 #[derive(Deserialize)]
@@ -2453,6 +2462,7 @@ mod tests {
         assert!(!forwardable(methods::LOCAL_DEVICE));
         assert!(!forwardable(methods::QUEUE_COMMAND));
         assert!(forwardable(methods::SEARCH_FILES));
+        assert!(forwardable(methods::READ_CHECKOUT_DIFF));
         assert!(forwardable(methods::UPDATE_HARNESS));
         assert!(forwardable(methods::SET_HARNESS_AUTO_UPDATE));
         assert!(!forwardable(methods::SEND_PEER_MESSAGE));

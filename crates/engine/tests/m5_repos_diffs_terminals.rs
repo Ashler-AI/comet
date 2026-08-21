@@ -575,9 +575,26 @@ async fn diff_sync_publishes_and_updates_chat_branch() {
             .expect("watch alive");
     };
     assert_eq!(diff.device_id, core.device_id);
-    assert!(diff.patch.contains("+edited"));
     assert!(!diff.checkout_id.is_empty());
     assert!(!diff.checksum.is_empty());
+    assert!(
+        serde_json::to_value(&diff)
+            .expect("summary serialization")
+            .get("patch")
+            .is_none(),
+        "watch summaries must not serialize patch bytes"
+    );
+    let fetched = core
+        .diff_sync
+        .read_diff(&diff.checkout_id, &diff.checksum)
+        .expect("current patch available on demand");
+    assert!(fetched.patch.contains("+edited"));
+    assert!(
+        core.diff_sync
+            .read_diff(&diff.checkout_id, "stale-checksum")
+            .is_none(),
+        "a stale checksum must never receive the current patch"
+    );
 
     // Row upkeep: branch + checkoutId stamped on the workspace chat row.
     let chat = core
@@ -599,7 +616,11 @@ async fn diff_sync_publishes_and_updates_chat_branch() {
             if let Some(diff) = diffs.first()
                 && diff.checksum != before
             {
-                assert!(diff.patch.contains("watched.txt"));
+                let fetched = core
+                    .diff_sync
+                    .read_diff(&diff.checkout_id, &diff.checksum)
+                    .expect("updated patch available on demand");
+                assert!(fetched.patch.contains("watched.txt"));
                 break;
             }
         }
@@ -919,16 +940,56 @@ async fn rpc_dispatch_for_m5_methods() {
     assert_eq!(deleted["ok"], true);
     assert!(!PathBuf::from(&worktree_path).exists());
 
-    // WatchCheckoutDiffs: streams the current (empty) diff set immediately.
+    // WatchCheckoutDiffs streams only summary bytes. The exact full patch is a
+    // separate typed read keyed by checkout id + checksum.
+    std::fs::write(repo_dir.join("file.txt"), "hello\nchanged\n").expect("dirty repo");
+    core.diff_sync.reconcile_now().await;
     let mut diffs_stream = client
         .subscribe(methods::WATCH_CHECKOUT_DIFFS, serde_json::Value::Null)
         .await
         .expect("WatchCheckoutDiffs");
-    let first = tokio::time::timeout(Duration::from_secs(5), diffs_stream.recv())
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let summary = loop {
+        let frame = tokio::time::timeout_at(deadline, diffs_stream.recv())
+            .await
+            .expect("diff summary before timeout")
+            .expect("stream alive");
+        if let Some(summary) = frame
+            .as_array()
+            .and_then(|summaries| summaries.first())
+            .filter(|summary| !summary["files"].as_array().unwrap().is_empty())
+        {
+            break summary.clone();
+        }
+    };
+    assert!(summary.get("patch").is_none());
+    let patch = client
+        .call(
+            methods::READ_CHECKOUT_DIFF,
+            serde_json::json!({
+                "checkoutId": summary["checkoutId"],
+                "checksum": summary["checksum"],
+            }),
+        )
         .await
-        .expect("first diffs item")
-        .expect("stream alive");
-    assert!(first.is_array());
+        .expect("ReadCheckoutDiff");
+    assert!(
+        patch["diff"]["patch"]
+            .as_str()
+            .unwrap()
+            .contains("+changed")
+    );
+    let stale = client
+        .call(
+            methods::READ_CHECKOUT_DIFF,
+            serde_json::json!({
+                "checkoutId": summary["checkoutId"],
+                "checksum": "stale-checksum",
+            }),
+        )
+        .await
+        .expect("stale ReadCheckoutDiff");
+    assert!(stale["diff"].is_null());
 
     // Terminals: the chat's cwd (via its space) becomes the PTY cwd.
     client

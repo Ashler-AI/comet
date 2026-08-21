@@ -139,11 +139,13 @@ display EXCLUDED. File paths refer to the reference repo.
 - UploadChunk/UploadCommit; ReadAttachment(stream)/ReadAttachmentChunk
 - OpenTerminal{chatId,cols,rows}->TerminalSession; SubscribeTerminal{id,afterSeq?}->stream
   (Data{seq,data}|Exit{seq,code,signal?}); WriteTerminal; ResizeTerminal; CloseTerminal
+- ReadCheckoutDiff{checkoutId,checksum,targetDeviceId?}->{diff?} fetches one
+  exact current bounded patch; stale checksums return no diff.
 - ListAgentAccounts{forceUsage?}; ActivateAgentAccount; ForgetAgentAccount; StartAgentLogin ->
   {loginId,url,mode:paste-code|browser}; CompleteAgentLogin{code}; PollAgentLogin; CancelAgentLogin
 ### DataRpc (IPC-only)
 - WatchDevices/WatchChats{deviceId?}/WatchSessions{deviceId?}/WatchDocMessages{chatId}(KEEP)/
-  WatchCheckoutDiffs -> streams. (WatchMessages, WatchUsage DROPPED.)
+  WatchCheckoutDiffs(summary-only) -> streams. (WatchMessages, WatchUsage DROPPED.)
 - QueueCommand{chatId,kind,payload}->{commandId}
 - Mutate: CreateChat, SetChatConfig, SetChatArchived, RenameChat, RenameDevice, DeleteChat,
   MarkChatSeen

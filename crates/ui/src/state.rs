@@ -18,6 +18,7 @@
 //! unit tests; rendering reads them.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -1040,6 +1041,29 @@ impl CachedTranscriptWindow {
             .sum()
     }
 }
+/// Entry-level work represented by one selected-transcript notification.
+///
+/// `Splice` names indices before and after the reducer mutation. Delta frames
+/// conservatively use a suffix; history paging uses a true head insertion so
+/// the transcript view can preserve every existing row and its list anchor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TranscriptEntriesChange {
+    None,
+    Reset,
+    Splice {
+        old: Range<usize>,
+        new: Range<usize>,
+    },
+}
+
+/// Metadata for the most recent selected-transcript revision. Consumers must
+/// fall back to a full reconciliation if they miss a revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TranscriptChange {
+    pub revision: u64,
+    pub entries: TranscriptEntriesChange,
+    pub echoes_changed: bool,
+}
 
 /// Root application state. Reducer methods (`apply_*`, [`Self::session_for`], …)
 /// are plain `&mut self` functions so tests construct the struct directly; gpui
@@ -1087,6 +1111,8 @@ pub struct AppState {
     pub transcript: Vec<SessionMessageEntry>,
     /// Changes only when selected transcript rows or optimistic echoes change.
     transcript_revision: u64,
+    /// Exact entry/echo work represented by `transcript_revision`.
+    transcript_change: TranscriptChange,
     /// First entry owned by the live bounded tail. Earlier entries were loaded
     /// explicitly by upward paging and are not part of delta `count` checks.
     transcript_tail_start: usize,
@@ -1205,6 +1231,11 @@ impl AppState {
             selected_chat: None,
             transcript: Vec::new(),
             transcript_revision: 0,
+            transcript_change: TranscriptChange {
+                revision: 0,
+                entries: TranscriptEntriesChange::Reset,
+                echoes_changed: true,
+            },
             transcript_tail_start: 0,
             transcript_tail_before: None,
             transcript_history_before: None,
@@ -1433,22 +1464,35 @@ impl AppState {
         self.transcript_revision
     }
 
-    fn bump_transcript_revision(&mut self) {
+    pub(crate) fn transcript_change(&self) -> &TranscriptChange {
+        &self.transcript_change
+    }
+
+    fn record_transcript_change(&mut self, entries: TranscriptEntriesChange, echoes_changed: bool) {
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        self.transcript_change = TranscriptChange {
+            revision: self.transcript_revision,
+            entries,
+            echoes_changed,
+        };
     }
 
     pub fn apply_transcript(&mut self, entries: Vec<SessionMessageEntry>) {
         // Doc frames supersede optimistic echoes carrying the same id.
-        if let Some(chat_id) = self.selected_chat.as_deref()
+        let echoes_changed = if let Some(chat_id) = self.selected_chat.as_deref()
             && let Some(echoes) = self.echoes.get_mut(chat_id)
         {
+            let old_len = echoes.len();
             echoes.retain(|echo| !entries.iter().any(|e| e.id == echo.id));
-        }
+            echoes.len() != old_len
+        } else {
+            false
+        };
         self.transcript = entries;
         self.transcript_tail_start = 0;
         self.transcript_tail_before = None;
         self.transcript_history_before = None;
-        self.bump_transcript_revision();
+        self.record_transcript_change(TranscriptEntriesChange::Reset, echoes_changed);
         self.update_selected_shared_preview();
     }
 
@@ -1493,11 +1537,12 @@ impl AppState {
         self.transcript_tail_before = None;
         self.transcript_history_before = None;
         self.transcript_restored_from_cache = false;
-        self.bump_transcript_revision();
         let Some(chat_id) = chat_id else {
+            self.record_transcript_change(TranscriptEntriesChange::Reset, true);
             return;
         };
         let Some(cached) = self.transcript_cache.remove(chat_id) else {
+            self.record_transcript_change(TranscriptEntriesChange::Reset, true);
             return;
         };
         self.transcript_cache_lru.retain(|id| id != chat_id);
@@ -1506,6 +1551,7 @@ impl AppState {
         self.transcript_tail_before = cached.tail_before;
         self.transcript_history_before = cached.history_before;
         self.transcript_restored_from_cache = true;
+        self.record_transcript_change(TranscriptEntriesChange::Reset, true);
     }
 
     fn apply_transcript_page(&mut self, page: SessionEntryWindow) {
@@ -1521,7 +1567,13 @@ impl AppState {
             entries.append(&mut self.transcript);
             self.transcript = entries;
             self.transcript_tail_start += added;
-            self.bump_transcript_revision();
+            self.record_transcript_change(
+                TranscriptEntriesChange::Splice {
+                    old: 0..0,
+                    new: 0..added,
+                },
+                false,
+            );
         }
         self.transcript_history_before = page.before;
     }
@@ -1610,6 +1662,54 @@ impl AppState {
         true
     }
 
+    /// Earliest selected-transcript entry a delta may disturb. Delta rows are
+    /// reconciled as a suffix from here; reset frames deliberately use the
+    /// conservative full-rebuild path.
+    fn transcript_delta_start(&self, frame: &TranscriptFrame) -> Option<usize> {
+        let TranscriptFrame::Delta {
+            upsert,
+            append,
+            remove,
+            ..
+        } = frame
+        else {
+            return None;
+        };
+        if upsert.is_empty() && append.is_empty() && remove.is_empty() {
+            return None;
+        }
+        let tail_start = self.transcript_tail_start.min(self.transcript.len());
+        let tail = &self.transcript[tail_start..];
+        let mut earliest = tail.len();
+        for id in remove {
+            if let Some(index) = tail.iter().rposition(|entry| entry.id == *id) {
+                earliest = earliest.min(index);
+            }
+        }
+        for text_append in append {
+            if let Some(index) = tail.iter().rposition(|entry| entry.id == text_append.entry) {
+                earliest = earliest.min(index);
+            }
+        }
+        for operation in upsert {
+            if let Some(index) = tail
+                .iter()
+                .rposition(|entry| entry.id == operation.entry.id)
+            {
+                earliest = earliest.min(index);
+            }
+            match operation.after.as_deref() {
+                None => earliest = 0,
+                Some(anchor) => {
+                    if let Some(index) = tail.iter().rposition(|entry| entry.id == anchor) {
+                        earliest = earliest.min(index + 1);
+                    }
+                }
+            }
+        }
+        Some(tail_start + earliest)
+    }
+
     /// Apply a `WatchDocMessages` delta to the live bounded tail. Explicitly
     /// paged history remains a stable prefix and does not enter frame counts.
     pub fn apply_transcript_frame(
@@ -1617,6 +1717,9 @@ impl AppState {
         frame: TranscriptFrame,
     ) -> Result<(), TranscriptDesync> {
         let before = frame.before();
+        let reset = frame.reset_entries().is_some();
+        let old_len = self.transcript.len();
+        let changed_start = self.transcript_delta_start(&frame);
         if let Some(reset) = frame.reset_entries()
             && self.transcript_restored_from_cache
         {
@@ -1655,22 +1758,45 @@ impl AppState {
             if retired > 0 {
                 self.transcript_tail_start += retired;
             }
-            let mut tail = self.transcript.split_off(self.transcript_tail_start);
-            comet_doc::apply_transcript_frame(&mut tail, frame)?;
-            self.transcript.append(&mut tail);
+            if self.transcript_tail_start == 0 {
+                comet_doc::apply_transcript_frame(&mut self.transcript, frame)?;
+            } else {
+                // Isolate the bounded live tail only when paged history exists;
+                // the ordinary no-history hot path must not move every entry
+                // through a temporary vector on every streaming commit.
+                let mut tail = self.transcript.split_off(self.transcript_tail_start);
+                comet_doc::apply_transcript_frame(&mut tail, frame)?;
+                self.transcript.append(&mut tail);
+            }
         }
         self.transcript_tail_before = before;
         if self.transcript_tail_start == 0 {
             self.transcript_history_before = before;
         }
         self.transcript_restored_from_cache = false;
-        if let Some(chat_id) = self.selected_chat.as_deref()
+        let echoes_changed = if let Some(chat_id) = self.selected_chat.as_deref()
             && let Some(echoes) = self.echoes.get_mut(chat_id)
         {
+            let old_len = echoes.len();
             let transcript = &self.transcript;
             echoes.retain(|echo| !transcript.iter().any(|e| e.id == echo.id));
+            echoes.len() != old_len
+        } else {
+            false
+        };
+        let entries = if reset {
+            TranscriptEntriesChange::Reset
+        } else if let Some(start) = changed_start {
+            TranscriptEntriesChange::Splice {
+                old: start.min(old_len)..old_len,
+                new: start.min(self.transcript.len())..self.transcript.len(),
+            }
+        } else {
+            TranscriptEntriesChange::None
+        };
+        if entries != TranscriptEntriesChange::None || echoes_changed {
+            self.record_transcript_change(entries, echoes_changed);
         }
-        self.bump_transcript_revision();
         self.update_selected_shared_preview();
         Ok(())
     }
@@ -1680,7 +1806,9 @@ impl AppState {
         let echoes = self.echoes.entry(chat_id.to_string()).or_default();
         if !echoes.iter().any(|e| e.id == entry.id) {
             echoes.push(entry);
-            self.bump_transcript_revision();
+            if self.selected_chat.as_deref() == Some(chat_id) {
+                self.record_transcript_change(TranscriptEntriesChange::None, true);
+            }
         }
     }
 
@@ -1724,8 +1852,8 @@ impl AppState {
             echoes.retain(|e| e.id != message_id);
             echoes.len() != before
         });
-        if removed {
-            self.bump_transcript_revision();
+        if removed && self.selected_chat.as_deref() == Some(chat_id) {
+            self.record_transcript_change(TranscriptEntriesChange::None, true);
         }
     }
 
@@ -1936,6 +2064,13 @@ impl AppState {
 
     fn has_chat_row(&self, chat_id: &str) -> bool {
         self.chats.iter().any(|chat| chat.id == chat_id)
+    }
+
+    /// Cached transcript-derived title without allocating the id fallback.
+    pub(crate) fn shared_session_preview(&self, chat_id: &str) -> Option<&str> {
+        self.shared_session_previews
+            .get(chat_id)
+            .map(String::as_str)
     }
 
     pub fn shared_session_title(&self, chat_id: &str) -> String {
@@ -4747,6 +4882,44 @@ mod tests {
             status: None,
             continuation_of: None,
         }
+    }
+
+    #[test]
+    fn transcript_change_metadata_tracks_tail_updates_and_history_inserts() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("chat".into());
+        let initial = vec![transcript_entry("m0"), transcript_entry("m1")];
+        state
+            .apply_transcript_frame(TranscriptFrame::reset(&initial, None))
+            .unwrap();
+
+        let mut changed_tail = transcript_entry("m1");
+        changed_tail.parts = vec![MessagePart::Text {
+            id: "t0".into(),
+            text: "changed".into(),
+        }];
+        let next = vec![transcript_entry("m0"), changed_tail];
+        let frame = comet_doc::diff_transcript(&initial, &next, None);
+        state.apply_transcript_frame(frame).unwrap();
+        assert_eq!(
+            state.transcript_change().entries,
+            TranscriptEntriesChange::Splice {
+                old: 1..2,
+                new: 1..2,
+            }
+        );
+
+        state.apply_transcript_page(SessionEntryWindow {
+            entries: vec![transcript_entry("history")],
+            before: None,
+        });
+        assert_eq!(
+            state.transcript_change().entries,
+            TranscriptEntriesChange::Splice {
+                old: 0..0,
+                new: 0..1,
+            }
+        );
     }
 
     #[test]

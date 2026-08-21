@@ -45,7 +45,7 @@ use crate::markdown::parser::{Block, BlockTree, IncrementalParser, parse_full};
 use crate::markdown::render::{self, RenderCache, RenderOptions};
 use crate::markdown::veil::RowVeil;
 use crate::motion::{self, AnimationExt as _, RESIZE};
-use crate::state::AppState;
+use crate::state::{AppState, TranscriptEntriesChange};
 use crate::theme::Theme;
 
 // ---------------------------------------------------------------------------
@@ -955,12 +955,49 @@ struct CachedRows {
     fingerprint: u64,
     rows: Vec<Row>,
 }
+/// Map an entry-index boundary to its row boundary. Walking from the nearer
+/// end keeps a tail update proportional to the changed suffix.
+fn entry_row_offset(counts: &[usize], index: usize, total_rows: usize) -> usize {
+    debug_assert!(index <= counts.len());
+    if index <= counts.len() - index {
+        counts[..index].iter().sum()
+    } else {
+        total_rows - counts[index..].iter().sum::<usize>()
+    }
+}
+
+fn entry_row_range(counts: &[usize], entries: Range<usize>, total_rows: usize) -> Range<usize> {
+    entry_row_offset(counts, entries.start, total_rows)
+        ..entry_row_offset(counts, entries.end, total_rows)
+}
+
+/// Replace rows for an entry range by moving both old and new rows. `T` is
+/// intentionally not `Clone`: unchanged prefix/suffix rows cannot accidentally
+/// regress to the old clone-everything reconciliation.
+fn splice_entry_rows<T>(
+    rows: &mut Vec<T>,
+    entry_counts: &mut Vec<usize>,
+    row_base: usize,
+    old_entries: Range<usize>,
+    old_rows: Range<usize>,
+    replacement: Vec<T>,
+    replacement_counts: Vec<usize>,
+) {
+    entry_counts.splice(old_entries, replacement_counts);
+    rows.splice(
+        row_base + old_rows.start..row_base + old_rows.end,
+        replacement,
+    );
+}
 
 const RENDER_WINDOW_CHAT_LIMIT: usize = 8;
 const RENDER_WINDOW_ROW_LIMIT: usize = 4096;
 
 struct CachedTranscriptRender {
     rows: Vec<Row>,
+    entry_row_counts: Vec<usize>,
+    entry_row_count: usize,
+    echo_row_counts: Vec<usize>,
     row_cache: HashMap<String, CachedRows>,
     tree_cache: HashMap<String, (usize, Arc<BlockTree>)>,
 }
@@ -1013,6 +1050,12 @@ pub struct Transcript {
     state: Entity<AppState>,
     list: ListState,
     rows: Vec<Row>,
+    /// Row counts parallel to AppState's real transcript entries.
+    entry_row_counts: Vec<usize>,
+    /// Total rows occupied by real entries; optimistic echoes follow them.
+    entry_row_count: usize,
+    /// Row counts parallel to the selected chat's optimistic echoes.
+    echo_row_counts: Vec<usize>,
     chat_id: Option<String>,
     /// Last app-state transcript revision reconciled into `rows`.
     state_revision: u64,
@@ -1114,6 +1157,9 @@ impl Transcript {
             state,
             list,
             rows: Vec::new(),
+            entry_row_counts: Vec::new(),
+            entry_row_count: 0,
+            echo_row_counts: Vec::new(),
             chat_id: None,
             state_revision: u64::MAX,
             row_cache: HashMap::new(),
@@ -1426,8 +1472,101 @@ impl Transcript {
         }
         cx.notify();
     }
+    fn build_entry_rows(
+        &mut self,
+        entries: &[SessionMessageEntry],
+        pending: bool,
+    ) -> Vec<Vec<Row>> {
+        entries
+            .iter()
+            .map(|entry| self.rows_for(entry, pending))
+            .collect()
+    }
 
-    /// Rebuild rows from app state; splice minimal ranges into the list.
+    /// Move-replace one real-entry or echo range and update only the matching
+    /// virtual-list range. Rows outside the range remain in `self.rows` without
+    /// cloning or reconstruction.
+    fn reconcile_entry_range(
+        &mut self,
+        old_entries: Range<usize>,
+        replacement_by_entry: Vec<Vec<Row>>,
+        real_entries: bool,
+    ) -> bool {
+        let (row_base, total_rows, counts) = if real_entries {
+            (0, self.entry_row_count, &self.entry_row_counts)
+        } else {
+            (
+                self.entry_row_count,
+                self.rows.len() - self.entry_row_count,
+                &self.echo_row_counts,
+            )
+        };
+        let old_rows = entry_row_range(counts, old_entries.clone(), total_rows);
+        let replacement_counts: Vec<usize> = replacement_by_entry.iter().map(Vec::len).collect();
+        let replacement: Vec<Row> = replacement_by_entry.into_iter().flatten().collect();
+        let old_global = row_base + old_rows.start..row_base + old_rows.end;
+
+        let old_live: std::collections::HashSet<SharedString> = self.rows[old_global.clone()]
+            .iter()
+            .filter(|row| matches!(row.kind, RowKind::LiveMarkdown { .. }))
+            .map(|row| row.id.clone())
+            .collect();
+        let new_live: std::collections::HashSet<SharedString> = replacement
+            .iter()
+            .filter(|row| matches!(row.kind, RowKind::LiveMarkdown { .. }))
+            .map(|row| row.id.clone())
+            .collect();
+        for id in old_live.difference(&new_live) {
+            self.veils.remove(id);
+            self.veil_baseline.remove(id);
+        }
+
+        let row_diff = diff_rows(&self.rows[old_global.clone()], &replacement);
+        if let Some((local_old, new_count)) = row_diff.clone() {
+            let changed = row_base + old_rows.start + local_old.start
+                ..row_base + old_rows.start + local_old.end;
+            for row in &self.rows[changed.clone()] {
+                self.render_cache.borrow_mut().invalidate_row(&row.id);
+            }
+            if preserves_row_identities(
+                &self.rows[old_global.clone()],
+                &replacement,
+                &local_old,
+                new_count,
+            ) {
+                self.list.remeasure_items(changed);
+            } else {
+                self.list.splice(changed, new_count);
+            }
+        }
+
+        let new_total: usize = replacement_counts.iter().sum();
+        if real_entries {
+            splice_entry_rows(
+                &mut self.rows,
+                &mut self.entry_row_counts,
+                row_base,
+                old_entries,
+                old_rows.clone(),
+                replacement,
+                replacement_counts,
+            );
+            self.entry_row_count = self.entry_row_count - old_rows.len() + new_total;
+        } else {
+            splice_entry_rows(
+                &mut self.rows,
+                &mut self.echo_row_counts,
+                row_base,
+                old_entries,
+                old_rows,
+                replacement,
+                replacement_counts,
+            );
+        }
+        row_diff.is_some()
+    }
+
+    /// Reconcile the latest state notification into row/list ranges.
     fn sync(&mut self, cx: &mut Context<Self>) {
         let state = self.state.clone();
         let state = state.read(cx);
@@ -1437,6 +1576,9 @@ impl Transcript {
         if !attached && revision == self.state_revision {
             return;
         }
+        let change = state.transcript_change().clone();
+        let missed_revision = !attached
+            && (change.revision != revision || revision != self.state_revision.wrapping_add(1));
         self.state_revision = revision;
         let echoes = state.pending_echoes().to_vec();
         let entries = &state.transcript;
@@ -1448,6 +1590,9 @@ impl Transcript {
                     previous.clone(),
                     CachedTranscriptRender {
                         rows: std::mem::take(&mut self.rows),
+                        entry_row_counts: std::mem::take(&mut self.entry_row_counts),
+                        entry_row_count: std::mem::take(&mut self.entry_row_count),
+                        echo_row_counts: std::mem::take(&mut self.echo_row_counts),
                         row_cache: std::mem::take(&mut self.row_cache),
                         tree_cache: std::mem::take(&mut self.tree_cache),
                     },
@@ -1475,10 +1620,16 @@ impl Transcript {
             {
                 self.render_window_lru.retain(|id| id != chat_id);
                 self.rows = cached.rows;
+                self.entry_row_counts = cached.entry_row_counts;
+                self.entry_row_count = cached.entry_row_count;
+                self.echo_row_counts = cached.echo_row_counts;
                 self.row_cache = cached.row_cache;
                 self.tree_cache = cached.tree_cache;
             } else {
                 self.rows.clear();
+                self.entry_row_counts.clear();
+                self.entry_row_count = 0;
+                self.echo_row_counts.clear();
                 self.row_cache.clear();
                 self.tree_cache.clear();
             }
@@ -1497,81 +1648,101 @@ impl Transcript {
             self.spring_settled_at = None;
             self.spring_kick = false;
             self.show_jump_button = false;
-        }
-
-        let mut new_rows: Vec<Row> = Vec::new();
-        for entry in entries {
-            new_rows.extend(self.rows_for(entry, false));
-        }
-        for echo in &echoes {
-            new_rows.extend(self.rows_for(echo, true));
-        }
-
-        // Text already streamed before this (re)attach is the veil BASELINE:
-        // its rows' veils seed instead of fading (render creates them from
-        // this set), so only post-switch appends animate. Captured from the
-        // first NON-EMPTY transcript after attach — the replay frame — never
-        // the attach-time sync, whose transcript is still empty (selection
-        // clears it; the doc watch refills it async).
-        if attached {
             self.veil_baseline.clear();
             self.veil_attach_pending = true;
         }
-        if self.veil_attach_pending && !entries.is_empty() {
-            self.veil_attach_pending = false;
-            self.veil_baseline = new_rows
-                .iter()
-                .filter(|r| matches!(r.kind, RowKind::LiveMarkdown { .. }))
-                .map(|r| r.id.clone())
-                .collect();
-        }
 
-        // Veils live exactly as long as their live row — drop them on the
-        // live→complete flip (any mid-fade chunk snaps to full, matching the
-        // row's version splice).
-        self.veils.retain(|id, _| {
-            new_rows
-                .iter()
-                .any(|r| &r.id == id && matches!(r.kind, RowKind::LiveMarkdown { .. }))
-        });
-        self.veil_baseline.retain(|id| {
-            new_rows
-                .iter()
-                .any(|r| &r.id == id && matches!(r.kind, RowKind::LiveMarkdown { .. }))
-        });
-
-        let was_empty = self.rows.is_empty();
-        match diff_rows(&self.rows, &new_rows) {
-            None => {
-                self.rows = new_rows;
-                return;
+        let splice_valid = match &change.entries {
+            TranscriptEntriesChange::None => self.entry_row_counts.len() == entries.len(),
+            TranscriptEntriesChange::Reset => false,
+            TranscriptEntriesChange::Splice { old, new } => {
+                old.start <= old.end
+                    && old.end <= self.entry_row_counts.len()
+                    && new.start <= new.end
+                    && new.end <= entries.len()
+                    && self.entry_row_counts.len() - old.len() + new.len() == entries.len()
             }
-            Some((old_range, count)) => {
-                // Any changed row's cached flatten results are stale — and
-                // because live replies refresh only the rows whose content hash
-                // changed (the tail), this is O(changed rows) per commit, never
-                // O(reply).
+        };
+        let echo_shape_valid = change.echoes_changed || self.echo_row_counts.len() == echoes.len();
+        let full_rebuild = attached
+            || missed_revision
+            || matches!(&change.entries, TranscriptEntriesChange::Reset)
+            || !splice_valid
+            || !echo_shape_valid;
+        let was_empty = self.rows.is_empty();
+        let changed = if full_rebuild {
+            let real_rows_by_entry = self.build_entry_rows(entries, false);
+            let new_entry_counts: Vec<usize> = real_rows_by_entry.iter().map(Vec::len).collect();
+            let new_entry_row_count: usize = new_entry_counts.iter().sum();
+            let echo_rows_by_entry = self.build_entry_rows(&echoes, true);
+            let new_echo_counts: Vec<usize> = echo_rows_by_entry.iter().map(Vec::len).collect();
+            let mut new_rows: Vec<Row> = real_rows_by_entry.into_iter().flatten().collect();
+            new_rows.extend(echo_rows_by_entry.into_iter().flatten());
+
+            if self.veil_attach_pending && !entries.is_empty() {
+                self.veil_attach_pending = false;
+                self.veil_baseline = new_rows
+                    .iter()
+                    .filter(|row| matches!(row.kind, RowKind::LiveMarkdown { .. }))
+                    .map(|row| row.id.clone())
+                    .collect();
+            }
+            self.veils.retain(|id, _| {
+                new_rows
+                    .iter()
+                    .any(|row| &row.id == id && matches!(row.kind, RowKind::LiveMarkdown { .. }))
+            });
+            self.veil_baseline.retain(|id| {
+                new_rows
+                    .iter()
+                    .any(|row| &row.id == id && matches!(row.kind, RowKind::LiveMarkdown { .. }))
+            });
+
+            let row_diff = diff_rows(&self.rows, &new_rows);
+            if let Some((old_range, new_count)) = row_diff.clone() {
                 for row in &self.rows[old_range.clone()] {
                     self.render_cache.borrow_mut().invalidate_row(&row.id);
                 }
-                if preserves_row_identities(&self.rows, &new_rows, &old_range, count) {
+                if preserves_row_identities(&self.rows, &new_rows, &old_range, new_count) {
                     self.list.remeasure_items(old_range);
                 } else {
-                    self.list.splice(old_range, count);
+                    self.list.splice(old_range, new_count);
                 }
             }
+            self.rows = new_rows;
+            self.entry_row_counts = new_entry_counts;
+            self.entry_row_count = new_entry_row_count;
+            self.echo_row_counts = new_echo_counts;
+            row_diff.is_some()
+        } else {
+            let mut changed = false;
+            if let TranscriptEntriesChange::Splice { old, new } = change.entries {
+                let replacement = self.build_entry_rows(&entries[new], false);
+                changed |= self.reconcile_entry_range(old, replacement, true);
+            }
+            if change.echoes_changed {
+                let old_echoes = 0..self.echo_row_counts.len();
+                let replacement = self.build_entry_rows(&echoes, true);
+                changed |= self.reconcile_entry_range(old_echoes, replacement, false);
+            }
+            if self.veil_attach_pending && !entries.is_empty() {
+                self.veil_attach_pending = false;
+                self.veil_baseline = self.rows[..self.entry_row_count]
+                    .iter()
+                    .filter(|row| matches!(row.kind, RowKind::LiveMarkdown { .. }))
+                    .map(|row| row.id.clone())
+                    .collect();
+            }
+            changed
+        };
+
+        if !changed {
+            return;
         }
-        self.rows = new_rows;
         if self.pinned {
             if motion::reduced_motion(cx) || was_empty {
-                // First fill (chat open) lands at the bottom instantly
-                // (mugen initialScroll:'bottom'); reduced motion always snaps.
                 self.list.scroll_to_end();
             } else if self.is_glued() {
-                // A glued offset (`None` / anchored past the end) makes the
-                // upcoming layout hard-snap to the new end — the per-commit
-                // stutter. Materialize a pixel anchor a hair above the bottom
-                // so layout holds position and the spring glides the growth.
                 self.list.scroll_by(px(-0.75));
             }
             self.spring_kick = true;
@@ -3186,6 +3357,7 @@ fn tool_detail_pane(
                     .child(SharedString::from("Couldn't load this call's detail.")),
             );
         }
+
         Some(ToolDetailState::Loaded(d)) => {
             let input = d.input.clone().or_else(|| {
                 comet_proto::view::tool_call_input_text(&tool.call)
@@ -3363,6 +3535,80 @@ impl Render for Transcript {
 mod tests {
     use super::*;
     use comet_doc::MessagePart;
+    struct NoCloneRow {
+        name: &'static str,
+        identity: Box<u8>,
+    }
+
+    impl NoCloneRow {
+        fn new(name: &'static str) -> Self {
+            Self {
+                name,
+                identity: Box::new(0),
+            }
+        }
+
+        fn identity(&self) -> *const u8 {
+            self.identity.as_ref()
+        }
+    }
+
+    #[test]
+    fn final_entry_splice_moves_no_unaffected_rows() {
+        let mut rows = vec![
+            NoCloneRow::new("first"),
+            NoCloneRow::new("middle"),
+            NoCloneRow::new("old-tail"),
+        ];
+        let first_identity = rows[0].identity();
+        let middle_identity = rows[1].identity();
+        let mut counts = vec![1, 1, 1];
+        let old_rows = entry_row_range(&counts, 2..3, rows.len());
+
+        splice_entry_rows(
+            &mut rows,
+            &mut counts,
+            0,
+            2..3,
+            old_rows,
+            vec![NoCloneRow::new("new-tail")],
+            vec![1],
+        );
+
+        assert_eq!(
+            rows.iter().map(|row| row.name).collect::<Vec<_>>(),
+            ["first", "middle", "new-tail"]
+        );
+        assert_eq!(rows[0].identity(), first_identity);
+        assert_eq!(rows[1].identity(), middle_identity);
+    }
+
+    #[test]
+    fn history_prepend_is_an_insertion_and_preserves_existing_row_identities() {
+        let mut rows = vec![NoCloneRow::new("first-live"), NoCloneRow::new("tail")];
+        let first_identity = rows[0].identity();
+        let tail_identity = rows[1].identity();
+        let mut counts = vec![1, 1];
+        let old_rows = entry_row_range(&counts, 0..0, rows.len());
+        assert_eq!(old_rows, 0..0, "list reconciliation must insert, not reset");
+
+        splice_entry_rows(
+            &mut rows,
+            &mut counts,
+            0,
+            0..0,
+            old_rows,
+            vec![NoCloneRow::new("history")],
+            vec![1],
+        );
+
+        assert_eq!(
+            rows.iter().map(|row| row.name).collect::<Vec<_>>(),
+            ["history", "first-live", "tail"]
+        );
+        assert_eq!(rows[1].identity(), first_identity);
+        assert_eq!(rows[2].identity(), tail_identity);
+    }
 
     #[test]
     fn only_omp_busy_errors_offer_takeover() {

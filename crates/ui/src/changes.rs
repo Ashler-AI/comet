@@ -1,12 +1,13 @@
 //! The right-pane "Changes" content (feature-inventory §1.11): a unified-diff
-//! viewer over `WatchCheckoutDiffs`.
+//! viewer driven by summary-only `WatchCheckoutDiffs` frames and an on-demand
+//! `ReadCheckoutDiff` for the selected checkout.
 //!
 //! - pure patch parser: `diff --git` sections → file/hunk/line/notice rows,
 //!   with add/delete/rename/binary detection and per-file counts;
 //! - resolution: the shown diff matches the selected chat by `checkout_id`
 //!   first, then by device+cwd, then cwd alone;
-//! - states: *preparing* (no diff yet), *clean* (empty patch), *list*; a watch
-//!   error shows a banner while the last content stays;
+//! - states: *preparing* (no summary/fetched patch yet), *clean*, *list*; RPC
+//!   errors show a banner while current content stays;
 //! - virtualized with gpui `list()` — one row per file section; each section
 //!   collapses with a 180 ms height tween (analytic heights, no measurement)
 //!   and a 200 ms chevron transition;
@@ -24,8 +25,8 @@ use gpui::{
     Subscription, Task, Window, div, font, list, prelude::*, px,
 };
 
-use comet_proto::{Chat, CheckoutDiff};
-use comet_rpc::methods;
+use comet_proto::{Chat, CheckoutDiffPatch, CheckoutDiffSummary};
+use comet_rpc::{ReadCheckoutDiffParams, ReadCheckoutDiffResult, methods};
 
 use crate::markdown::highlight::{Lang, LineCarry, Token, lang_for_tag, tokenize_line};
 use crate::markdown::render;
@@ -334,9 +335,12 @@ pub fn body_height(file: &FileDiff) -> f32 {
 // Resolution + states (pure)
 // ---------------------------------------------------------------------------
 
-/// The diff shown for a chat: `checkout_id` match first, then device+cwd,
+/// The diff summary shown for a chat: `checkout_id` match first, then device+cwd,
 /// then cwd alone (§1.11).
-pub fn resolve_diff<'a>(diffs: &'a [CheckoutDiff], chat: &Chat) -> Option<&'a CheckoutDiff> {
+pub fn resolve_diff<'a>(
+    diffs: &'a [CheckoutDiffSummary],
+    chat: &Chat,
+) -> Option<&'a CheckoutDiffSummary> {
     if let Some(checkout_id) = chat.checkout_id.as_deref()
         && let Some(diff) = diffs.iter().find(|d| d.checkout_id == checkout_id)
     {
@@ -367,10 +371,10 @@ pub struct ChangesSummary {
     pub truncated: bool,
 }
 
-pub fn diff_phase(resolved: Option<&CheckoutDiff>) -> DiffPhase {
+pub fn diff_phase(resolved: Option<&CheckoutDiffSummary>) -> DiffPhase {
     match resolved {
         None => DiffPhase::Preparing,
-        Some(diff) if diff.patch.trim().is_empty() && diff.files.is_empty() => DiffPhase::Clean,
+        Some(diff) if diff.files.is_empty() => DiffPhase::Clean,
         Some(_) => DiffPhase::List,
     }
 }
@@ -384,38 +388,17 @@ pub fn uncommitted_label(count: usize) -> String {
     }
 }
 
-/// Fold a `WatchCheckoutDiffs` frame into the diff set. Accepts either a full
-/// list (replace) or a single `CheckoutDiff` (upsert by checkout id) — the
-/// contract streams `CheckoutDiff` items, but list frames cost nothing to
-/// support. Returns whether anything changed.
-pub fn apply_diff_frame(diffs: &mut Vec<CheckoutDiff>, value: serde_json::Value) -> bool {
-    if value.is_array() {
-        return match serde_json::from_value::<Vec<CheckoutDiff>>(value) {
-            Ok(all) if *diffs != all => {
-                *diffs = all;
-                true
-            }
-            Ok(_) => false,
-            Err(err) => {
-                tracing::warn!(error = %err, "changes: dropping malformed diff frame");
-                false
-            }
-        };
-    }
-    match serde_json::from_value::<CheckoutDiff>(value) {
-        Ok(one) => {
-            if let Some(existing) = diffs.iter_mut().find(|d| d.checkout_id == one.checkout_id) {
-                if *existing == one {
-                    return false;
-                }
-                *existing = one;
-            } else {
-                diffs.push(one);
-            }
+/// Fold a summary-only `WatchCheckoutDiffs` frame into the current set. The
+/// engine sends the complete latest list, so every frame replaces wholesale.
+pub fn apply_diff_frame(diffs: &mut Vec<CheckoutDiffSummary>, value: serde_json::Value) -> bool {
+    match serde_json::from_value::<Vec<CheckoutDiffSummary>>(value) {
+        Ok(all) if *diffs != all => {
+            *diffs = all;
             true
         }
+        Ok(_) => false,
         Err(err) => {
-            tracing::warn!(error = %err, "changes: dropping malformed diff frame");
+            tracing::warn!(error = %err, "changes: dropping malformed diff summary frame");
             false
         }
     }
@@ -438,6 +421,37 @@ fn hash64(parts: &[&str]) -> u64 {
 // ---------------------------------------------------------------------------
 // Entity
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectedPatch {
+    checkout_id: String,
+    checksum: String,
+    patch: String,
+}
+
+impl SelectedPatch {
+    fn matches(&self, diff: &CheckoutDiffSummary) -> bool {
+        self.checkout_id == diff.checkout_id && self.checksum == diff.checksum
+    }
+}
+
+/// Install a reply only if it still belongs to the selected summary. This is
+/// deliberately pure so stale-response behavior is directly testable.
+fn cache_fetched_patch(
+    cached: &mut Option<SelectedPatch>,
+    selected: &CheckoutDiffSummary,
+    fetched: CheckoutDiffPatch,
+) -> bool {
+    if fetched.checkout_id != selected.checkout_id || fetched.checksum != selected.checksum {
+        return false;
+    }
+    *cached = Some(SelectedPatch {
+        checkout_id: fetched.checkout_id,
+        checksum: fetched.checksum,
+        patch: fetched.patch,
+    });
+    true
+}
 
 struct ParsedDiff {
     /// `checkout_id:checksum` — identity of the parsed content.
@@ -499,7 +513,12 @@ async fn yield_now() {
 /// (the shell calls it when the pane first opens).
 pub struct Changes {
     state: Entity<AppState>,
-    diffs: Vec<CheckoutDiff>,
+    /// Summary-only latest state for every checkout on the watched device.
+    diffs: Vec<CheckoutDiffSummary>,
+    /// The sole retained patch: exactly the selected checkout/checksum.
+    selected_patch: Option<SelectedPatch>,
+    fetching_key: Option<String>,
+    fetch_task: Option<Task<()>>,
     started: bool,
     error: Option<SharedString>,
     /// Device the running watch targets: `None` = the connected engine itself,
@@ -509,6 +528,7 @@ pub struct Changes {
     watch_target: Option<String>,
     watch_task: Option<Task<()>>,
     parsed: Option<ParsedDiff>,
+    parsing_key: Option<String>,
     parse_task: Option<Task<()>>,
     folds: HashMap<String, FileFold>,
     highlights: HashMap<String, HighlightSlot>,
@@ -522,11 +542,15 @@ impl Changes {
         Self {
             state,
             diffs: Vec::new(),
+            selected_patch: None,
+            fetching_key: None,
+            fetch_task: None,
             started: false,
             error: None,
             watch_target: None,
             watch_task: None,
             parsed: None,
+            parsing_key: None,
             parse_task: None,
             folds: HashMap::new(),
             highlights: HashMap::new(),
@@ -558,10 +582,11 @@ impl Changes {
             // Engine still booting — retry on the next state change via sync().
             return;
         };
-        // Retarget: the old task (and its stream) drop; rows from the previous
-        // device would resolve against the wrong checkouts, so clear them.
+        // Retarget: the old tasks and stream drop; rows or a cached patch from
+        // the previous device must never resolve against the new target.
         if self.started {
             self.diffs.clear();
+            self.clear_selected_content();
             self.error = None;
         }
         self.started = true;
@@ -594,9 +619,12 @@ impl Changes {
                     Ok(mut rx) => {
                         while let Some(value) = rx.recv().await {
                             let alive = this.update(cx, |changes, cx| {
-                                changes.error = None;
-                                if apply_diff_frame(&mut changes.diffs, value) {
+                                let cleared_error = changes.error.take().is_some();
+                                let changed = apply_diff_frame(&mut changes.diffs, value);
+                                if changed {
                                     changes.sync(cx);
+                                }
+                                if changed || cleared_error {
                                     cx.notify();
                                 }
                             });
@@ -633,7 +661,7 @@ impl Changes {
         })
     }
 
-    fn resolved(&self, cx: &App) -> Option<&CheckoutDiff> {
+    fn resolved(&self, cx: &App) -> Option<&CheckoutDiffSummary> {
         let state = self.state.read(cx);
         let chat = state.selected_chat_row()?;
         resolve_diff(&self.diffs, chat)
@@ -649,48 +677,96 @@ impl Changes {
         })
     }
 
-    /// Reconcile parsed content with the currently-resolved diff.
+    fn clear_selected_content(&mut self) {
+        self.selected_patch = None;
+        self.fetching_key = None;
+        self.fetch_task = None;
+        self.parsed = None;
+        self.parsing_key = None;
+        self.parse_task = None;
+        self.list.reset(0);
+        self.folds.clear();
+        self.highlights.clear();
+    }
+
+    /// Reconcile the selected summary, its one-entry patch cache, and parsed
+    /// content. Selection/checksum changes drop the old patch before fetching.
     fn sync(&mut self, cx: &mut Context<Self>) {
-        // The watch follows the selected chat's host device (idempotent when
-        // the target is unchanged); a boot-deferred attempt retries here too.
         self.ensure_watch(cx);
-        let Some(diff) = self.resolved(cx) else {
-            if self.parsed.take().is_some() {
-                self.list.reset(0);
-                self.folds.clear();
-                self.highlights.clear();
+        let Some(diff) = self.resolved(cx).cloned() else {
+            if self.selected_patch.is_some()
+                || self.parsed.is_some()
+                || self.fetching_key.is_some()
+                || self.parsing_key.is_some()
+            {
+                self.clear_selected_content();
                 cx.notify();
             }
             return;
         };
         let key = format!("{}:{}", diff.checkout_id, diff.checksum);
-        if self.parsed.as_ref().is_some_and(|p| p.key == key) {
+
+        if !self
+            .selected_patch
+            .as_ref()
+            .is_some_and(|patch| patch.matches(&diff))
+        {
+            self.selected_patch = None;
+            if self.fetching_key.as_deref() != Some(key.as_str()) {
+                self.fetch_task = None;
+                self.fetching_key = None;
+            }
+        }
+        if self.parsed.as_ref().is_some_and(|parsed| parsed.key != key) {
+            self.parsed = None;
+            self.parsing_key = None;
+            self.parse_task = None;
+            self.list.reset(0);
+            self.folds.clear();
+            self.highlights.clear();
+            cx.notify();
+        }
+
+        if self.selected_patch.is_none() {
+            if self.fetching_key.as_deref() != Some(key.as_str()) {
+                self.fetch_selected(diff, key, cx);
+            }
             return;
         }
-        // Parse off the render path — patches run to megabytes.
-        let patch = diff.patch.clone();
+        if self.parsed.as_ref().is_some_and(|parsed| parsed.key == key)
+            || self.parsing_key.as_deref() == Some(key.as_str())
+        {
+            return;
+        }
+
+        let patch = self
+            .selected_patch
+            .as_ref()
+            .expect("selected patch checked above")
+            .patch
+            .clone();
         let truncated = diff.truncated;
         let additions = diff.additions;
         let deletions = diff.deletions;
         let file_count = diff.files.len();
+        self.parsing_key = Some(key.clone());
         self.parse_task = Some(cx.spawn(async move |this, cx| {
             let files = cx
                 .background_executor()
                 .spawn(async move { parse_patch(&patch) })
                 .await;
             this.update(cx, |changes, cx| {
-                // Late results for a superseded diff are re-checked by key.
                 let current = changes
                     .resolved(cx)
-                    .map(|d| format!("{}:{}", d.checkout_id, d.checksum));
-                if current.as_deref() != Some(key.as_str()) {
+                    .map(|current| format!("{}:{}", current.checkout_id, current.checksum));
+                if current.as_deref() != Some(key.as_str())
+                    || !changes.selected_patch.as_ref().is_some_and(|patch| {
+                        patch.checkout_id == diff.checkout_id && patch.checksum == diff.checksum
+                    })
+                {
                     return;
                 }
-                let file_count = if file_count > 0 {
-                    file_count
-                } else {
-                    files.len()
-                };
+                changes.parsing_key = None;
                 changes.list.reset(files.len());
                 changes.folds.clear();
                 changes.highlights.clear();
@@ -699,12 +775,95 @@ impl Changes {
                     truncated,
                     additions,
                     deletions,
-                    file_count,
+                    file_count: if file_count > 0 {
+                        file_count
+                    } else {
+                        files.len()
+                    },
                     files: Arc::new(files),
                 });
                 cx.notify();
             })
             .ok();
+        }));
+    }
+
+    fn fetch_selected(&mut self, diff: CheckoutDiffSummary, key: String, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let params = serde_json::to_value(ReadCheckoutDiffParams {
+            checkout_id: diff.checkout_id.clone(),
+            checksum: diff.checksum.clone(),
+            target_device_id: self.watch_target.clone(),
+        })
+        .expect("diff read params serialize");
+        self.fetching_key = Some(key.clone());
+        self.fetch_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                match engine
+                    .client()
+                    .call_as::<ReadCheckoutDiffResult>(methods::READ_CHECKOUT_DIFF, params.clone())
+                    .await
+                {
+                    Ok(ReadCheckoutDiffResult {
+                        diff: Some(fetched),
+                    }) => {
+                        this.update(cx, |changes, cx| {
+                            if changes.fetching_key.as_deref() != Some(key.as_str()) {
+                                return;
+                            }
+                            changes.fetching_key = None;
+                            let Some(current) = changes.resolved(cx).cloned() else {
+                                return;
+                            };
+                            if cache_fetched_patch(&mut changes.selected_patch, &current, fetched) {
+                                changes.error = None;
+                                changes.sync(cx);
+                                cx.notify();
+                            } else {
+                                // A mismatched reply never enters the cache. Retry
+                                // the still-current exact key rather than leaving
+                                // the selected pane stuck on its loading state.
+                                changes.sync(cx);
+                            }
+                        })
+                        .ok();
+                        return;
+                    }
+                    Ok(ReadCheckoutDiffResult { diff: None }) => {
+                        let active = this
+                            .update(cx, |changes, _| {
+                                changes.fetching_key.as_deref() == Some(key.as_str())
+                            })
+                            .unwrap_or(false);
+                        if !active {
+                            return;
+                        }
+                        // The checksum raced a newer engine snapshot. Let its
+                        // summary arrive, but retry in case the checkout returns
+                        // to this exact checksum without producing a new UI frame.
+                        cx.background_executor().timer(Duration::from_secs(2)).await;
+                    }
+                    Err(err) => {
+                        let active = this
+                            .update(cx, |changes, cx| {
+                                let active = changes.fetching_key.as_deref() == Some(key.as_str());
+                                if active {
+                                    changes.error =
+                                        Some(format!("Diff unavailable: {err} — retrying").into());
+                                    cx.notify();
+                                }
+                                active
+                            })
+                            .unwrap_or(false);
+                        if !active {
+                            return;
+                        }
+                        cx.background_executor().timer(Duration::from_secs(2)).await;
+                    }
+                }
+            }
         }));
     }
 
@@ -1573,17 +1732,16 @@ rename to new_name.rs
         );
     }
 
-    fn diff(checkout: &str, device: &str, cwd: &str, patch: &str) -> CheckoutDiff {
-        CheckoutDiff {
+    fn diff(checkout: &str, device: &str, cwd: &str, checksum: &str) -> CheckoutDiffSummary {
+        CheckoutDiffSummary {
             checkout_id: checkout.into(),
             device_id: device.into(),
             cwd: cwd.into(),
-            patch: patch.into(),
             files: Vec::new(),
             additions: 0,
             deletions: 0,
             truncated: false,
-            checksum: format!("sum-{}", patch.len()),
+            checksum: checksum.into(),
             updated_at: Utc::now(),
         }
     }
@@ -1631,15 +1789,12 @@ rename to new_name.rs
     }
 
     #[test]
-    fn phases() {
+    fn phases_come_from_summary_without_patch_bytes() {
         assert_eq!(diff_phase(None), DiffPhase::Preparing);
-        let clean = diff("co", "d", "/w", "  \n");
+        let clean = diff("co", "d", "/w", "clean-sum");
         assert_eq!(diff_phase(Some(&clean)), DiffPhase::Clean);
-        let full = diff("co", "d", "/w", "diff --git a/x b/x\n");
-        assert_eq!(diff_phase(Some(&full)), DiffPhase::List);
-        // Engine may report files without patch text (truncation edge).
-        let mut summarized = diff("co", "d", "/w", "");
-        summarized.files.push(comet_proto::DiffFileSummary {
+        let mut changed = diff("co", "d", "/w", "changed-sum");
+        changed.files.push(comet_proto::DiffFileSummary {
             path: "x".into(),
             old_path: None,
             status: "modified".into(),
@@ -1647,7 +1802,7 @@ rename to new_name.rs
             deletions: 0,
             binary: false,
         });
-        assert_eq!(diff_phase(Some(&summarized)), DiffPhase::List);
+        assert_eq!(diff_phase(Some(&changed)), DiffPhase::List);
     }
 
     #[test]
@@ -1658,43 +1813,56 @@ rename to new_name.rs
     }
 
     #[test]
-    fn diff_frames_replace_lists_and_upsert_singles() {
+    fn summary_frames_replace_wholesale_and_contain_no_patch() {
         let mut diffs = Vec::new();
-        let one = diff("co-1", "d", "/w", "p1");
-        // Single frame inserts.
-        assert!(apply_diff_frame(
-            &mut diffs,
-            serde_json::to_value(&one).unwrap()
-        ));
-        assert_eq!(diffs.len(), 1);
-        // Identical frame is a no-op.
+        let one = diff("co-1", "d", "/w", "sum-1");
+        let frame = serde_json::to_value(vec![one.clone()]).unwrap();
+        assert!(frame[0].get("patch").is_none());
+        assert!(apply_diff_frame(&mut diffs, frame));
+        assert_eq!(diffs, vec![one.clone()]);
+
         assert!(!apply_diff_frame(
             &mut diffs,
-            serde_json::to_value(&one).unwrap()
+            serde_json::to_value(vec![one]).unwrap()
         ));
-        // Same checkout upserts in place.
-        let mut updated = one.clone();
-        updated.patch = "p2".into();
-        assert!(apply_diff_frame(
-            &mut diffs,
-            serde_json::to_value(&updated).unwrap()
-        ));
-        assert_eq!(diffs.len(), 1);
-        assert_eq!(diffs[0].patch, "p2");
-        // List frame replaces wholesale.
-        let two = diff("co-2", "d", "/x", "q");
+        let two = diff("co-2", "d", "/x", "sum-2");
         assert!(apply_diff_frame(
             &mut diffs,
             serde_json::to_value(vec![two.clone()]).unwrap()
         ));
-        assert_eq!(diffs.len(), 1);
-        assert_eq!(diffs[0].checkout_id, "co-2");
-        // Malformed frames change nothing.
+        assert_eq!(diffs, vec![two]);
+
+        // A legacy single/full-patch-shaped payload is malformed, not retained.
         assert!(!apply_diff_frame(
             &mut diffs,
-            serde_json::json!({"nope": true})
+            serde_json::json!({"checkoutId": "co-3", "patch": "large bytes"})
         ));
         assert_eq!(diffs[0].checkout_id, "co-2");
+    }
+
+    #[test]
+    fn selected_patch_cache_ignores_stale_replies() {
+        let current = diff("co-1", "d", "/w", "sum-new");
+        let mut cached = Some(SelectedPatch {
+            checkout_id: "co-1".into(),
+            checksum: "sum-new".into(),
+            patch: "new patch".into(),
+        });
+        let stale = CheckoutDiffPatch {
+            checkout_id: "co-1".into(),
+            checksum: "sum-old".into(),
+            patch: "old patch".into(),
+        };
+        assert!(!cache_fetched_patch(&mut cached, &current, stale));
+        assert_eq!(cached.as_ref().unwrap().patch, "new patch");
+
+        let fetched = CheckoutDiffPatch {
+            checkout_id: "co-1".into(),
+            checksum: "sum-new".into(),
+            patch: "exact patch".into(),
+        };
+        assert!(cache_fetched_patch(&mut cached, &current, fetched));
+        assert_eq!(cached.as_ref().unwrap().patch, "exact patch");
     }
 
     #[test]

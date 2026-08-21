@@ -13,7 +13,10 @@
 //! before `WriteTerminal`; viewport-driven resizes debounce 80 ms before
 //! `ResizeTerminal` (the emulator resizes immediately).
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -30,10 +33,10 @@ use crate::settings::{TERMINAL_MAX_VH, TERMINAL_MIN_HEIGHT};
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
 
-use super::emulator::{CellSnapshot, CursorSnapshot, Emulator};
+use super::emulator::{CursorSnapshot, Emulator, VisibleRowSnapshot};
 use super::view::{
-    COALESCE_MS, InputCoalescer, RESIZE_DEBOUNCE_MS, TerminalElement, keystroke_bytes, paste_bytes,
-    terminal_bg,
+    COALESCE_MS, InputCoalescer, RESIZE_DEBOUNCE_MS, TerminalElement, TerminalRenderCache,
+    keystroke_bytes, paste_bytes, terminal_bg,
 };
 
 /// Fixed tab width — drag-reorder math stays analytic.
@@ -170,10 +173,11 @@ fn encode_base64(bytes: &[u8]) -> String {
 // Entity
 // ---------------------------------------------------------------------------
 
-/// A grid snapshot handed to the paint element.
-pub struct GridSnapshot {
-    pub lines: Vec<Vec<CellSnapshot>>,
+/// Arc-backed grid snapshot handed to the paint element.
+pub(super) struct GridSnapshot {
+    pub rows: Arc<[VisibleRowSnapshot]>,
     pub cursor: Option<CursorSnapshot>,
+    pub cache: Rc<RefCell<TerminalRenderCache>>,
 }
 
 struct TerminalTab {
@@ -188,6 +192,7 @@ struct TerminalTab {
     resize_task: Option<Task<()>>,
     /// Open + subscribe/reconnect lifecycle; dropping it cancels the stream.
     _run: Option<Task<()>>,
+    render_cache: Rc<RefCell<TerminalRenderCache>>,
 }
 
 #[derive(Default)]
@@ -376,6 +381,7 @@ impl TerminalPanel {
             flush_task: None,
             resize_task: None,
             _run: None,
+            render_cache: TerminalRenderCache::shared(),
         });
         entry.active = entry.tabs.len() - 1;
 
@@ -745,12 +751,14 @@ impl TerminalPanel {
         // current frame, which already paints the resized grid.
     }
 
-    /// Snapshot for the paint element.
-    pub fn active_grid_snapshot(&self, cx: &App) -> Option<GridSnapshot> {
+    /// Snapshot for the paint element. Row cells and cache ownership are
+    /// Arc/Rc-backed, so a repaint does not clone the visible cell grid.
+    pub(super) fn active_grid_snapshot(&self, cx: &App) -> Option<GridSnapshot> {
         let tab = self.active_tab(cx)?;
         Some(GridSnapshot {
-            lines: tab.emulator.lines(),
+            rows: tab.emulator.visible_rows(),
             cursor: tab.emulator.cursor(),
+            cache: tab.render_cache.clone(),
         })
     }
 

@@ -115,6 +115,8 @@ pub mod methods {
     /// Checkout-diff stream for the target device's chats (DataRpc,
     /// relay-forwardable — diffs are produced where the checkout lives).
     pub const WATCH_CHECKOUT_DIFFS: &str = "WatchCheckoutDiffs";
+    /// Read the bounded full patch for one exact checkout checksum on demand.
+    pub const READ_CHECKOUT_DIFF: &str = "ReadCheckoutDiff";
     // Shared Agent Auth account pool (ControlRpc, never device-targeted).
     pub const LIST_AGENT_ACCOUNTS: &str = "ListAgentAccounts";
     pub const MIGRATE_AGENT_ACCOUNT: &str = "MigrateAgentAccount";
@@ -150,6 +152,26 @@ pub mod methods {
     /// Persist whether agent CLIs auto-refresh after a Comet update lands on
     /// the target device.
     pub const SET_HARNESS_AUTO_UPDATE: &str = "SetHarnessAutoUpdate";
+}
+
+/// Parameters for `ReadCheckoutDiff`. A checksum mismatch returns no patch,
+/// preventing a response for an older watch frame from masquerading as current.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadCheckoutDiffParams {
+    pub checkout_id: String,
+    pub checksum: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_device_id: Option<String>,
+}
+/// Non-null unary envelope for `ReadCheckoutDiff`. The RPC frame itself uses an
+/// optional `ok` field, so a bare JSON `null` would be indistinguishable from a
+/// missing reply and leave the caller pending forever.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadCheckoutDiffResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<comet_proto::CheckoutDiffPatch>,
 }
 
 /// Shared parameters for `AddSessionRef` and `RemoveSessionRef`.

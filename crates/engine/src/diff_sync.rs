@@ -7,7 +7,7 @@
 //! and publishes it three ways:
 //!
 //! - the local `WatchCheckoutDiffs` stream (a watch channel of every checkout's
-//!   latest [`CheckoutDiff`]);
+//!   latest [`CheckoutDiffSummary`], without patch bytes);
 //! - a [`DiffSidecar`] JSON `POST {edge}/diff/{chatId}` for every syncing chat of
 //!   the checkout (bearer = engine edge token), so "review pending changes while
 //!   the host sleeps" works;
@@ -29,7 +29,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, watch};
 
-use comet_proto::{Chat, CheckoutDiff, DiffFileSummary};
+use comet_proto::{Chat, CheckoutDiffPatch, CheckoutDiffSummary, DiffFileSummary};
 
 use crate::EngineError;
 use crate::doc_host::EdgeConfig;
@@ -88,9 +88,9 @@ pub struct DiffSnapshot {
 struct CheckoutEntry {
     identity: CheckoutIdentity,
     chats: Mutex<Vec<Chat>>,
-    /// Last published checksum — unchanged snapshots publish nothing.
-    checksum: Mutex<Option<String>>,
-    /// Kick channel into the entry's debounce/sync task.
+    /// Latest bounded snapshot. Kept engine-side so the patch can be read for
+    /// one exact checksum without placing patch bytes in the watch channel.
+    latest: Mutex<Option<Arc<DiffSnapshot>>>,
     kick_tx: mpsc::UnboundedSender<()>,
     /// Keeps the recursive fs watchers alive; dropped on entry close.
     _watchers: Vec<notify::RecommendedWatcher>,
@@ -103,7 +103,7 @@ struct DiffSyncInner {
     edge: Option<EdgeConfig>,
     http: reqwest::Client,
     entries: Mutex<HashMap<String, Arc<CheckoutEntry>>>,
-    diffs_tx: watch::Sender<Vec<CheckoutDiff>>,
+    diffs_tx: watch::Sender<Vec<CheckoutDiffSummary>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -143,9 +143,25 @@ impl CheckoutDiffSync {
         sync
     }
 
-    /// `WatchCheckoutDiffs` source: every tracked checkout's latest diff.
-    pub fn watch_diffs(&self) -> watch::Receiver<Vec<CheckoutDiff>> {
+    /// `WatchCheckoutDiffs` source: every tracked checkout's latest summary.
+    pub fn watch_diffs(&self) -> watch::Receiver<Vec<CheckoutDiffSummary>> {
         self.inner.diffs_tx.subscribe()
+    }
+
+    /// Return the bounded patch only when `checksum` still names the latest
+    /// snapshot for `checkout_id`. A raced/stale request returns `None`.
+    pub fn read_diff(&self, checkout_id: &str, checksum: &str) -> Option<CheckoutDiffPatch> {
+        let entries = lock(&self.inner.entries);
+        let entry = entries.get(checkout_id)?;
+        let latest = lock(&entry.latest);
+        let snapshot = latest
+            .as_ref()
+            .filter(|snapshot| snapshot.checksum == checksum)?;
+        Some(CheckoutDiffPatch {
+            checkout_id: checkout_id.to_string(),
+            checksum: checksum.to_string(),
+            patch: snapshot.patch.clone(),
+        })
     }
 
     /// Regroup this device's chats by checkout identity, then (re)build watchers.
@@ -297,7 +313,7 @@ async fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats
     let entry = Arc::new(CheckoutEntry {
         identity,
         chats: Mutex::new(chats),
-        checksum: Mutex::new(None),
+        latest: Mutex::new(None),
         kick_tx: kick_tx.clone(),
         _watchers: watchers,
     });
@@ -390,7 +406,7 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
     // branch rename may complete while capture is in flight.
     let chats = lock(&entry.chats).clone();
     let snapshot = match capture_diff(&inner.repos, &entry.identity.root).await {
-        Ok(snapshot) => snapshot,
+        Ok(snapshot) => Arc::new(snapshot),
         Err(err) => {
             tracing::debug!(checkout = %entry.identity.root.display(), error = %err,
                 "diff-sync: capture failed");
@@ -414,16 +430,24 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
         }
     }
 
-    if lock(&entry.checksum).as_deref() == Some(snapshot.checksum.as_str()) {
+    {
+        let entries = lock(&inner.entries);
+        if !entries.contains_key(&entry.identity.id) {
+            return; // closed while computing
+        }
+    }
+    if lock(&entry.latest)
+        .as_ref()
+        .is_some_and(|latest| latest.checksum == snapshot.checksum)
+    {
         return; // unchanged — publish nothing
     }
-    *lock(&entry.checksum) = Some(snapshot.checksum.clone());
+    *lock(&entry.latest) = Some(snapshot.clone());
 
-    let diff = CheckoutDiff {
+    let diff = CheckoutDiffSummary {
         checkout_id: entry.identity.id.clone(),
         device_id: inner.device_id.clone(),
         cwd: entry.identity.root.to_string_lossy().to_string(),
-        patch: snapshot.patch.clone(),
         files: snapshot.files.clone(),
         additions: snapshot.additions,
         deletions: snapshot.deletions,
@@ -431,12 +455,6 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
         checksum: snapshot.checksum.clone(),
         updated_at: chrono::Utc::now(),
     };
-    {
-        let entries = lock(&inner.entries);
-        if !entries.contains_key(&entry.identity.id) {
-            return; // closed while computing
-        }
-    }
     publish_watch_with(inner, Some(diff));
 
     // Latest-only sidecar to every syncing chat's session DO slot.
@@ -482,13 +500,15 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
     }
 }
 
-/// Re-emit the watch channel from the current entries' cached diffs, replacing (or
-/// inserting) `updated`.
-fn publish_watch_with(inner: &Arc<DiffSyncInner>, updated: Option<CheckoutDiff>) {
+/// Re-emit the watch channel from the current entries' cached summaries,
+/// replacing (or inserting) `updated`.
+fn publish_watch_with(inner: &Arc<DiffSyncInner>, updated: Option<CheckoutDiffSummary>) {
     let live: HashSet<String> = lock(&inner.entries).keys().cloned().collect();
     inner.diffs_tx.send_modify(|diffs| {
         diffs.retain(|d| live.contains(&d.checkout_id));
-        if let Some(updated) = updated {
+        if let Some(updated) = updated
+            && live.contains(&updated.checkout_id)
+        {
             match diffs
                 .iter_mut()
                 .find(|d| d.checkout_id == updated.checkout_id)

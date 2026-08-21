@@ -2,8 +2,9 @@
 //! `Processor` wrapped as a pure state machine.
 //!
 //! Bytes in ([`Emulator::feed`] — the decoded `SubscribeTerminal` Data frames),
-//! grid snapshots out ([`Emulator::line`], [`Emulator::cursor`]). No I/O, no
-//! timers, no gpui: the panel owns RPC and scheduling, the view owns paint.
+//! Arc-backed dirty-row snapshots out ([`Emulator::visible_rows`],
+//! [`Emulator::cursor`]). No I/O, no timers, no gpui: the panel owns RPC and
+//! scheduling, the view owns paint.
 //! That split makes the whole escape-sequence surface unit-testable with
 //! scripted byte strings.
 //!
@@ -17,12 +18,13 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{
     Color as AnsiColor, CursorShape, NamedColor, Processor, Rgb as AnsiRgb,
 };
@@ -139,6 +141,15 @@ pub struct CursorSnapshot {
     pub col: usize,
 }
 
+/// Immutable cell data for one visible row. The generation changes only when
+/// the row's paintable contents change (or the terminal reports full damage,
+/// such as a scroll, resize, palette update, or screen-mode swap).
+#[derive(Debug, Clone)]
+pub struct VisibleRowSnapshot {
+    pub generation: u64,
+    pub cells: Arc<[CellSnapshot]>,
+}
+
 /// Captures `Term` callbacks. Interior-mutable because `EventListener::send_event`
 /// takes `&self`; single-threaded (the emulator lives inside a gpui entity).
 #[derive(Default, Clone)]
@@ -159,6 +170,8 @@ pub struct Emulator {
     capture: EventCapture,
     title: Option<String>,
     bell: bool,
+    visible_rows: Arc<[VisibleRowSnapshot]>,
+    next_row_generation: u64,
 }
 
 impl Emulator {
@@ -169,13 +182,17 @@ impl Emulator {
             ..Config::default()
         };
         let term = Term::new(config, &GridSize::new(cols, rows), capture.clone());
-        Self {
+        let mut emulator = Self {
             term,
             parser: Processor::new(),
             capture,
             title: None,
             bell: false,
-        }
+            visible_rows: Arc::from([]),
+            next_row_generation: 0,
+        };
+        emulator.refresh_visible_rows();
+        emulator
     }
 
     /// Advance the state machine over decoded PTY output. Returns bytes the
@@ -192,11 +209,17 @@ impl Emulator {
                 _ => {}
             }
         }
+        self.refresh_visible_rows();
         responses
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
-        self.term.resize(GridSize::new(cols, rows));
+        let size = GridSize::new(cols, rows);
+        if self.cols() == size.cols as usize && self.rows() == size.rows as usize {
+            return;
+        }
+        self.term.resize(size);
+        self.refresh_visible_rows();
     }
 
     pub fn cols(&self) -> usize {
@@ -237,24 +260,34 @@ impl Emulator {
         self.term.grid().history_size()
     }
 
-    /// Scroll the view: positive = up into history, negative = toward live.
     pub fn scroll(&mut self, delta: i32) {
         self.term.scroll_display(Scroll::Delta(delta));
+        self.refresh_visible_rows();
     }
 
     pub fn scroll_to_bottom(&mut self) {
         self.term.scroll_display(Scroll::Bottom);
+        self.refresh_visible_rows();
+    }
+
+    /// Arc-backed visible rows, top to bottom. Cloning the returned Arc is
+    /// constant-time and does not clone the visible cell grid.
+    pub fn visible_rows(&self) -> Arc<[VisibleRowSnapshot]> {
+        self.visible_rows.clone()
     }
 
     /// Snapshot one viewport row (0 = top) honoring the scrollback offset.
     pub fn line(&self, viewport_row: usize) -> Vec<CellSnapshot> {
-        let offset = self.display_offset() as i32;
+        self.visible_rows[viewport_row].cells.to_vec()
+    }
+
+    fn snapshot_line(term: &Term<EventCapture>, viewport_row: usize) -> Arc<[CellSnapshot]> {
+        let offset = term.grid().display_offset() as i32;
         let line = Line(viewport_row as i32 - offset);
-        let grid = self.term.grid();
-        let row = &grid[line];
-        (0..self.cols())
+        let grid = term.grid();
+        (0..term.columns())
             .map(|col| {
-                let cell = &row[Column(col)];
+                let cell = &grid[line][Column(col)];
                 CellSnapshot {
                     ch: cell.c,
                     fg: map_color(cell.fg),
@@ -274,9 +307,55 @@ impl Emulator {
             .collect()
     }
 
-    /// All viewport rows, top to bottom.
-    pub fn lines(&self) -> Vec<Vec<CellSnapshot>> {
-        (0..self.rows()).map(|r| self.line(r)).collect()
+    fn next_generation(&mut self) -> u64 {
+        self.next_row_generation = self.next_row_generation.wrapping_add(1).max(1);
+        self.next_row_generation
+    }
+
+    /// Materialize only terminal-damaged rows. Partial damage caused solely by
+    /// moving or blinking the cursor compares equal and leaves row identity
+    /// untouched; full terminal damage intentionally re-identifies every row.
+    fn refresh_visible_rows(&mut self) {
+        let damaged_rows = match self.term.damage() {
+            TermDamage::Full => None,
+            TermDamage::Partial(lines) => Some(lines.map(|line| line.line).collect::<Vec<_>>()),
+        };
+        self.term.reset_damage();
+
+        let row_count = self.rows();
+        if damaged_rows.is_none() || self.visible_rows.len() != row_count {
+            let mut rows = Vec::with_capacity(row_count);
+            for row in 0..row_count {
+                let cells = Self::snapshot_line(&self.term, row);
+                let generation = self.next_generation();
+                rows.push(VisibleRowSnapshot { generation, cells });
+            }
+            self.visible_rows = rows.into();
+            return;
+        }
+
+        let mut replacements = Vec::new();
+        for row in damaged_rows.unwrap() {
+            if row >= row_count {
+                continue;
+            }
+            let cells = Self::snapshot_line(&self.term, row);
+            if self.visible_rows[row].cells.as_ref() != cells.as_ref() {
+                replacements.push((
+                    row,
+                    VisibleRowSnapshot {
+                        generation: self.next_generation(),
+                        cells,
+                    },
+                ));
+            }
+        }
+        if !replacements.is_empty() {
+            let rows = Arc::make_mut(&mut self.visible_rows);
+            for (row, replacement) in replacements {
+                rows[row] = replacement;
+            }
+        }
     }
 
     /// Cursor in viewport coordinates; `None` when hidden or scrolled out.
@@ -540,5 +619,66 @@ mod tests {
         e.feed(&bytes[..1]);
         e.feed(&bytes[1..]);
         assert_eq!(e.row_text(0), "é");
+    }
+    #[test]
+    fn single_row_update_reidentifies_only_that_row() {
+        let mut e = emu(12, 4);
+        let before = e.visible_rows();
+
+        e.feed(b"x");
+
+        let after = e.visible_rows();
+        assert_ne!(before[0].generation, after[0].generation);
+        assert!(!Arc::ptr_eq(&before[0].cells, &after[0].cells));
+        for row in 1..4 {
+            assert_eq!(before[row].generation, after[row].generation);
+            assert!(Arc::ptr_eq(&before[row].cells, &after[row].cells));
+        }
+    }
+
+    #[test]
+    fn cursor_only_updates_preserve_visible_row_snapshot() {
+        let mut e = emu(12, 4);
+        e.feed(b"text");
+        let before = e.visible_rows();
+
+        e.feed(b"\x1b[3;2H");
+
+        let after = e.visible_rows();
+        assert!(Arc::ptr_eq(&before, &after));
+        assert_eq!(e.cursor(), Some(CursorSnapshot { row: 2, col: 1 }));
+    }
+
+    #[test]
+    fn scroll_resize_and_palette_updates_invalidate_visible_rows() {
+        let mut e = emu(12, 3);
+        for line in 0..5 {
+            e.feed(format!("line{line}\r\n").as_bytes());
+        }
+
+        let live = e.visible_rows();
+        e.scroll(1);
+        let scrolled = e.visible_rows();
+        assert!(!Arc::ptr_eq(&live, &scrolled));
+        assert!(
+            live.iter()
+                .zip(scrolled.iter())
+                .all(|(old, new)| old.generation != new.generation)
+        );
+
+        e.resize(16, 4);
+        let resized = e.visible_rows();
+        assert_eq!(resized.len(), 4);
+        assert!(!Arc::ptr_eq(&scrolled, &resized));
+
+        let before_palette = e.visible_rows();
+        e.feed(b"\x1b]4;1;rgb:ff/00/00\x07");
+        let after_palette = e.visible_rows();
+        assert!(
+            before_palette
+                .iter()
+                .zip(after_palette.iter())
+                .all(|(old, new)| old.generation != new.generation)
+        );
     }
 }

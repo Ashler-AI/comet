@@ -43,11 +43,9 @@ use crate::settings::{
     Density, KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
     SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
 };
-#[cfg(test)]
-use crate::state::ActiveHarnessGoal;
 use crate::state::{
-    AppState, ConnectionStatus, EngineBootConfig, GatePhase, Indicator, format_time_ago,
-    latest_active_omp_goal,
+    ActiveHarnessGoal, AppState, ConnectionStatus, EngineBootConfig, GatePhase, Indicator,
+    TranscriptEntriesChange, format_time_ago, latest_active_omp_goal,
 };
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
@@ -908,6 +906,324 @@ fn goal_group_rows(groups: Vec<GoalGroupData>) -> Vec<GoalGroupRows> {
         .collect()
 }
 
+/// Transcript-derived values painted by the shell rather than by the independently
+/// reactive transcript entity. Equality is the transcript lane's invalidation key:
+/// text deltas are deliberately absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TranscriptChromeProjection {
+    goal_groups: Vec<GoalGroupRows>,
+    active_goal: Option<ActiveHarnessGoal>,
+    shared_session_previews: Vec<(String, Option<String>)>,
+    selected_agent_indicator: Indicator,
+}
+
+impl Default for TranscriptChromeProjection {
+    fn default() -> Self {
+        Self {
+            goal_groups: Vec::new(),
+            active_goal: None,
+            shared_session_previews: Vec::new(),
+            selected_agent_indicator: Indicator::None,
+        }
+    }
+}
+
+/// Goal calls are the only transcript payload that can change the shell's goal
+/// projection. One compact entry-aligned lane lets exact transcript splices
+/// prove that a plain-text delta cannot affect goals without replaying history.
+type GoalEntryProjection = Vec<(String, comet_proto::ToolCall)>;
+
+struct TranscriptChromeCache {
+    revision: u64,
+    goal_entries: Vec<GoalEntryProjection>,
+    projection: TranscriptChromeProjection,
+}
+
+impl TranscriptChromeCache {
+    fn new(state: &AppState, now: chrono::DateTime<Utc>) -> Self {
+        Self {
+            revision: state.transcript_revision(),
+            goal_entries: state.transcript.iter().map(goal_entry_projection).collect(),
+            projection: TranscriptChromeProjection {
+                goal_groups: goal_group_rows(latest_goal_groups(&state.transcript)),
+                active_goal: latest_active_omp_goal(&state.transcript),
+                shared_session_previews: shared_session_previews(state),
+                selected_agent_indicator: state.selected_agent_indicator(now),
+            },
+        }
+    }
+
+    fn refresh(&mut self, state: &AppState, now: chrono::DateTime<Utc>) -> bool {
+        let mut changed = false;
+        if self.revision != state.transcript_revision() {
+            if self.reconcile_goal_entries(state) {
+                let goal_groups = goal_group_rows(latest_goal_groups(&state.transcript));
+                let active_goal = latest_active_omp_goal(&state.transcript);
+                changed |= self.projection.goal_groups != goal_groups
+                    || self.projection.active_goal != active_goal;
+                self.projection.goal_groups = goal_groups;
+                self.projection.active_goal = active_goal;
+            }
+            self.revision = state.transcript_revision();
+        }
+        if !shared_session_previews_match(&self.projection.shared_session_previews, state) {
+            self.projection.shared_session_previews = shared_session_previews(state);
+            changed = true;
+        }
+        let selected_agent_indicator = state.selected_agent_indicator(now);
+        if self.projection.selected_agent_indicator != selected_agent_indicator {
+            self.projection.selected_agent_indicator = selected_agent_indicator;
+            changed = true;
+        }
+        changed
+    }
+
+    /// Applies one exact AppState transcript delta to the compact goal lane.
+    /// `true` means goal calls changed and the structured replay is required.
+    fn reconcile_goal_entries(&mut self, state: &AppState) -> bool {
+        let change = state.transcript_change();
+        if self.revision.wrapping_add(1) != change.revision {
+            self.goal_entries = state.transcript.iter().map(goal_entry_projection).collect();
+            return true;
+        }
+        match &change.entries {
+            TranscriptEntriesChange::None => false,
+            TranscriptEntriesChange::Reset => {
+                self.goal_entries = state.transcript.iter().map(goal_entry_projection).collect();
+                true
+            }
+            TranscriptEntriesChange::Splice { old, new } => {
+                if old.end > self.goal_entries.len() || new.end > state.transcript.len() {
+                    self.goal_entries =
+                        state.transcript.iter().map(goal_entry_projection).collect();
+                    return true;
+                }
+                let new_entries = &state.transcript[new.clone()];
+                let unchanged = old.len() == new.len()
+                    && self.goal_entries[old.clone()]
+                        .iter()
+                        .zip(new_entries)
+                        .all(|(cached, entry)| goal_entry_projection_matches(cached, entry));
+                if unchanged {
+                    return false;
+                }
+                let replacement = new_entries
+                    .iter()
+                    .map(goal_entry_projection)
+                    .collect::<Vec<_>>();
+                let goals_changed =
+                    goal_entry_ranges_differ(&self.goal_entries[old.clone()], &replacement);
+                drop(self.goal_entries.splice(old.clone(), replacement));
+                goals_changed
+            }
+        }
+    }
+}
+
+fn goal_entry_projection(entry: &comet_doc::SessionMessageEntry) -> GoalEntryProjection {
+    entry
+        .parts
+        .iter()
+        .filter_map(|part| {
+            let comet_doc::MessagePart::Tool { id, call, .. } = part else {
+                return None;
+            };
+            goal_call_is_relevant(id, call).then(|| (id.clone(), call.clone()))
+        })
+        .collect()
+}
+
+fn goal_entry_projection_matches(
+    cached: &GoalEntryProjection,
+    entry: &comet_doc::SessionMessageEntry,
+) -> bool {
+    cached
+        .iter()
+        .map(|(id, call)| (id.as_str(), call))
+        .eq(entry.parts.iter().filter_map(|part| {
+            let comet_doc::MessagePart::Tool { id, call, .. } = part else {
+                return None;
+            };
+            goal_call_is_relevant(id, call).then_some((id.as_str(), call))
+        }))
+}
+
+fn goal_entry_ranges_differ(old: &[GoalEntryProjection], new: &[GoalEntryProjection]) -> bool {
+    old.iter().flatten().ne(new.iter().flatten())
+}
+
+fn goal_call_is_relevant(id: &str, call: &comet_proto::ToolCall) -> bool {
+    match call {
+        comet_proto::ToolCall::Todo { .. } => true,
+        comet_proto::ToolCall::Unknown { name, input } => {
+            (id == comet_proto::OMP_GOAL_STATE_CALL_ID
+                || name == comet_proto::OMP_GOAL_STATE_CALL_NAME)
+                || input
+                    .as_ref()
+                    .and_then(|input| input.get("op"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|op| matches!(op, "init" | "append" | "done" | "drop" | "rm"))
+        }
+        _ => false,
+    }
+}
+
+fn shared_session_previews(state: &AppState) -> Vec<(String, Option<String>)> {
+    state
+        .shared_session_refs()
+        .map(|session_ref| {
+            (
+                session_ref.chat_id.clone(),
+                state
+                    .shared_session_preview(&session_ref.chat_id)
+                    .map(str::to_owned),
+            )
+        })
+        .collect()
+}
+
+#[derive(Clone, PartialEq)]
+struct ShellChatProjection {
+    id: String,
+    status: comet_proto::ChatIndicator,
+    scaffold_starting: bool,
+    scaffold_environment: Option<comet_proto::SessionEnvironment>,
+}
+
+fn shared_session_previews_match(cached: &[(String, Option<String>)], state: &AppState) -> bool {
+    cached.len() == state.shared_session_refs().count()
+        && cached.iter().zip(state.shared_session_refs()).all(
+            |((cached_id, cached_preview), session_ref)| {
+                cached_id == &session_ref.chat_id
+                    && cached_preview.as_deref()
+                        == state.shared_session_preview(&session_ref.chat_id)
+            },
+        )
+}
+
+/// Non-transcript AppState inputs painted or acted on by the shell. The cached
+/// snapshot is only cloned after equality fails, so text-token notifications
+/// do not rebuild the larger state vectors.
+#[derive(Clone, PartialEq)]
+struct ShellStateProjection {
+    connection: ConnectionStatus,
+    auth: Option<comet_proto::AuthState>,
+    devices: Vec<comet_proto::Device>,
+    spaces: Vec<comet_proto::Space>,
+    chats: Vec<comet_proto::Chat>,
+    local_session_candidates: Vec<comet_proto::LocalSessionCandidate>,
+    local_sessions_loading: bool,
+    local_sessions_error: Option<String>,
+    local_session_attaching: std::collections::HashSet<String>,
+    local_session_attach_errors: std::collections::HashMap<String, String>,
+    sessions: Vec<comet_proto::Session>,
+    session_refs: Vec<comet_proto::SessionRef>,
+    selected_space: Option<String>,
+    selected_chat: Option<String>,
+    collaboration: Option<comet_proto::CollaborationSnapshot>,
+    selected_agent_session: Option<String>,
+    selected_invitation_grant: Option<String>,
+    local_device_id: Option<String>,
+    update: Option<comet_update::UpdateStatus>,
+    scaffold_session_creating: bool,
+    scaffold_session_error: Option<String>,
+    chat_projections: Vec<ShellChatProjection>,
+}
+
+impl ShellStateProjection {
+    fn capture(state: &AppState, now: chrono::DateTime<Utc>) -> Self {
+        Self {
+            connection: state.connection.clone(),
+            auth: state.auth.clone(),
+            devices: state.devices.clone(),
+            spaces: state.spaces.clone(),
+            chats: state.chats.clone(),
+            local_session_candidates: state.local_session_candidates.clone(),
+            local_sessions_loading: state.local_sessions_loading,
+            local_sessions_error: state.local_sessions_error.clone(),
+            local_session_attaching: state.local_session_attaching.clone(),
+            local_session_attach_errors: state.local_session_attach_errors.clone(),
+            sessions: state.sessions.clone(),
+            session_refs: state.session_refs.clone(),
+            selected_space: state.selected_space.clone(),
+            selected_chat: state.selected_chat.clone(),
+            collaboration: state.collaboration.clone(),
+            selected_agent_session: state.selected_agent_session.clone(),
+            selected_invitation_grant: state.selected_invitation_grant.clone(),
+            local_device_id: state.local_device_id.clone(),
+            update: state.update.clone(),
+            scaffold_session_creating: state.scaffold_session_creating(),
+            scaffold_session_error: state.scaffold_session_error.clone(),
+            chat_projections: shell_chat_projections(state, now),
+        }
+    }
+
+    fn matches(&self, state: &AppState, now: chrono::DateTime<Utc>) -> bool {
+        self.connection == state.connection
+            && self.auth == state.auth
+            && self.devices == state.devices
+            && self.spaces == state.spaces
+            && self.chats == state.chats
+            && self.local_session_candidates == state.local_session_candidates
+            && self.local_sessions_loading == state.local_sessions_loading
+            && self.local_sessions_error == state.local_sessions_error
+            && self.local_session_attaching == state.local_session_attaching
+            && self.local_session_attach_errors == state.local_session_attach_errors
+            && self.sessions == state.sessions
+            && self.session_refs == state.session_refs
+            && self.selected_space == state.selected_space
+            && self.selected_chat == state.selected_chat
+            && self.collaboration == state.collaboration
+            && self.selected_agent_session == state.selected_agent_session
+            && self.selected_invitation_grant == state.selected_invitation_grant
+            && self.local_device_id == state.local_device_id
+            && self.update == state.update
+            && self.scaffold_session_creating == state.scaffold_session_creating()
+            && self.scaffold_session_error == state.scaffold_session_error
+            && shell_chat_projections_match(&self.chat_projections, state, now)
+    }
+}
+
+fn shell_chat_projections(
+    state: &AppState,
+    now: chrono::DateTime<Utc>,
+) -> Vec<ShellChatProjection> {
+    state
+        .chats
+        .iter()
+        .map(|chat| ShellChatProjection {
+            id: chat.id.clone(),
+            status: state.display_status_for(chat, now),
+            scaffold_starting: state.scaffold_chat_starting(&chat.id),
+            scaffold_environment: state.scaffold_environment(&chat.id).cloned(),
+        })
+        .collect()
+}
+
+fn shell_chat_projections_match(
+    cached: &[ShellChatProjection],
+    state: &AppState,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    cached.len() == state.chats.len()
+        && cached.iter().zip(&state.chats).all(|(cached, chat)| {
+            cached.id == chat.id
+                && cached.status == state.display_status_for(chat, now)
+                && cached.scaffold_starting == state.scaffold_chat_starting(&chat.id)
+                && cached.scaffold_environment.as_ref() == state.scaffold_environment(&chat.id)
+        })
+}
+
+#[cfg(test)]
+fn shell_invalidation_changed(
+    previous_state: &ShellStateProjection,
+    next_state: &ShellStateProjection,
+    previous_transcript: &TranscriptChromeProjection,
+    next_transcript: &TranscriptChromeProjection,
+) -> bool {
+    previous_state != next_state || previous_transcript != next_transcript
+}
+
 /// Split one goal line into indentation, optional checkbox state, list-marker
 /// presence, and display text. This accepts markdown-style bullets, numbered
 /// lists, and checkboxes without requiring goal producers to share a schema.
@@ -1121,6 +1437,10 @@ pub struct Shell {
     state: Entity<AppState>,
     transcript: Entity<Transcript>,
     composer: Entity<Composer>,
+    /// Last non-transcript AppState inputs observed by shell chrome.
+    state_projection: ShellStateProjection,
+    /// Transcript projections painted outside the independently reactive Transcript.
+    transcript_chrome: TranscriptChromeCache,
     /// External file drag hovering the conversation column — shows the
     /// "Drop images to attach" veil over the whole chat area; a drop stages
     /// the files in the composer.
@@ -1298,9 +1618,17 @@ pub struct Shell {
 
 impl Shell {
     pub fn new(state: Entity<AppState>, boot: EngineBootConfig, cx: &mut Context<Self>) -> Self {
+        let now = Utc::now();
+        let state_projection = ShellStateProjection::capture(state.read(cx), now);
+        let transcript_chrome = TranscriptChromeCache::new(state.read(cx), now);
+        let sound_prev = state
+            .read(cx)
+            .sessions
+            .iter()
+            .map(|session| (session.chat_id.clone(), session.status))
+            .collect();
         let observation = cx.observe(&state, |this: &mut Shell, state, cx| {
-            this.on_state_changed(&state, cx);
-            cx.notify();
+            this.on_app_state_notification(&state, cx);
         });
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
@@ -1372,6 +1700,8 @@ impl Shell {
             state,
             transcript,
             composer,
+            state_projection,
+            transcript_chrome,
             file_drag_active: false,
             terminal: None,
             changes: None,
@@ -1403,7 +1733,7 @@ impl Shell {
             sidebar_scroll: gpui::ScrollHandle::new(),
             space_boot_applied: false,
             room_boot_applied: false,
-            sound_prev: std::collections::HashMap::new(),
+            sound_prev,
             user_menu_open: false,
             command_palette_open: false,
             activity_open: false,
@@ -1512,6 +1842,24 @@ impl Shell {
                 })
                 .ok();
             }));
+        }
+    }
+
+    fn on_app_state_notification(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
+        let now = Utc::now();
+        let state_changed = {
+            let current = state.read(cx);
+            !self.state_projection.matches(current, now)
+        };
+        if state_changed {
+            self.state_projection = ShellStateProjection::capture(state.read(cx), now);
+            // Chimes, optimistic audit reconciliation, navigation/panel switching,
+            // and splash transitions only depend on non-transcript state.
+            self.on_state_changed(state, cx);
+        }
+        let transcript_changed = self.transcript_chrome.refresh(state.read(cx), now);
+        if state_changed || transcript_changed {
+            cx.notify();
         }
     }
 
@@ -4940,17 +5288,14 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        let (mut items, goals) = {
-            let state = self.state.read(cx);
-            (
-                state
-                    .collaboration
-                    .as_ref()
-                    .map(crate::multiplayer::activity_items)
-                    .unwrap_or_default(),
-                latest_goal_groups(&state.transcript),
-            )
-        };
+        let mut items = self
+            .state
+            .read(cx)
+            .collaboration
+            .as_ref()
+            .map(crate::multiplayer::activity_items)
+            .unwrap_or_default();
+        let goal_groups = self.transcript_chrome.projection.goal_groups.clone();
         for feedback in &self.control_feedback {
             if items.iter().any(|item| item.id == feedback.command_id) {
                 continue;
@@ -4979,7 +5324,6 @@ impl Shell {
         items.sort_by_key(|item| std::cmp::Reverse(item.occurred_at));
         let now = Utc::now();
         let has_activity = !items.is_empty();
-        let goal_groups = goal_group_rows(goals);
         let goal_total = goal_groups
             .iter()
             .map(|group| group.rows.len())
@@ -6386,13 +6730,8 @@ impl Shell {
             .filter(|branch| !branch.is_empty())
             .unwrap_or_else(|| "Worktree".to_string())
             .into();
-        let (goal_groups, active_goal) = {
-            let state = self.state.read(cx);
-            (
-                goal_group_rows(latest_goal_groups(&state.transcript)),
-                latest_active_omp_goal(&state.transcript),
-            )
-        };
+        let goal_groups = self.transcript_chrome.projection.goal_groups.clone();
+        let active_goal = self.transcript_chrome.projection.active_goal.clone();
         let goal_total = goal_groups
             .iter()
             .map(|group| group.rows.len())
@@ -8286,6 +8625,122 @@ mod tests {
             annotation_prompt_context(&annotation),
             "Selected text:\nunsafe fallback\n\nComment:\nUse the typed helper here."
         );
+    }
+
+    fn transcript_entry(
+        id: &str,
+        parts: Vec<comet_doc::MessagePart>,
+    ) -> comet_doc::SessionMessageEntry {
+        comet_doc::SessionMessageEntry {
+            id: id.into(),
+            role: comet_doc::MessageRole::Assistant,
+            parts,
+            created_at: 0,
+            device_id: "device".into(),
+            status: Some(comet_doc::MessageStatus::Streaming),
+            continuation_of: None,
+        }
+    }
+
+    #[test]
+    fn shell_invalidation_ignores_plain_transcript_text_but_not_goal_projection() {
+        let now = Utc::now();
+        let mut state = AppState::default();
+        let state_key = ShellStateProjection::capture(&state, now);
+        let transcript_key = TranscriptChromeProjection::default();
+
+        state.transcript.push(transcript_entry(
+            "assistant",
+            vec![comet_doc::MessagePart::Text {
+                id: "text".into(),
+                text: "streaming".into(),
+            }],
+        ));
+        let text_state_key = ShellStateProjection::capture(&state, now);
+        assert!(!shell_invalidation_changed(
+            &state_key,
+            &text_state_key,
+            &transcript_key,
+            &transcript_key,
+        ));
+
+        let mut goal_key = transcript_key.clone();
+        goal_key.goal_groups = vec![GoalGroupRows {
+            label: None,
+            rows: vec![GoalRowData {
+                text: "Ship it".into(),
+                done: false,
+                depth: 0,
+            }],
+        }];
+        assert!(shell_invalidation_changed(
+            &state_key,
+            &text_state_key,
+            &transcript_key,
+            &goal_key,
+        ));
+    }
+
+    #[test]
+    fn shell_state_projection_invalidates_navigation_changes() {
+        let now = Utc::now();
+        let mut state = AppState::default();
+        let before = ShellStateProjection::capture(&state, now);
+        state.selected_chat = Some("chat-b".into());
+        let after = ShellStateProjection::capture(&state, now);
+        assert!(shell_invalidation_changed(
+            &before,
+            &after,
+            &TranscriptChromeProjection::default(),
+            &TranscriptChromeProjection::default(),
+        ));
+    }
+
+    #[test]
+    fn structured_goal_projection_ignores_text_deltas_and_detects_todo_updates() {
+        let mut entry = transcript_entry(
+            "assistant",
+            vec![comet_doc::MessagePart::Text {
+                id: "text".into(),
+                text: "a".into(),
+            }],
+        );
+        let cached = goal_entry_projection(&entry);
+        let comet_doc::MessagePart::Text { text, .. } = &mut entry.parts[0] else {
+            unreachable!();
+        };
+        text.push('b');
+        assert!(goal_entry_projection_matches(&cached, &entry));
+
+        let plain_append = transcript_entry(
+            "assistant-2",
+            vec![comet_doc::MessagePart::Text {
+                id: "text-2".into(),
+                text: "more".into(),
+            }],
+        );
+        let plain_projection = goal_entry_projection(&plain_append);
+        assert!(plain_projection.is_empty());
+        assert!(!goal_entry_ranges_differ(&[], &[plain_projection]));
+
+        let todo = transcript_entry(
+            "todo",
+            vec![comet_doc::MessagePart::Tool {
+                id: "todo-call".into(),
+                call: comet_proto::ToolCall::Todo {
+                    items: vec![comet_proto::TodoItem {
+                        text: "Ship it".into(),
+                        done: false,
+                    }],
+                },
+                is_error: false,
+                resolved: true,
+            }],
+        );
+        let todo_projection = goal_entry_projection(&todo);
+        assert!(!todo_projection.is_empty());
+        assert!(!goal_entry_projection_matches(&cached, &todo));
+        assert!(goal_entry_ranges_differ(&[cached], &[todo_projection]));
     }
 
     #[test]

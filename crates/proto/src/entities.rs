@@ -357,21 +357,30 @@ pub struct DiffFileSummary {
     pub binary: bool,
 }
 
-/// Working-tree diff for a checkout — latest-only sidecar, 3MiB patch cap.
+/// Latest working-tree summary for a checkout. This is the watch-stream payload:
+/// it deliberately excludes the potentially 3 MiB patch.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CheckoutDiff {
+pub struct CheckoutDiffSummary {
     pub checkout_id: String,
     pub device_id: String,
     pub cwd: String,
-    pub patch: String,
     pub files: Vec<DiffFileSummary>,
     pub additions: u32,
     pub deletions: u32,
-    /// True when the patch was truncated at the byte cap ("Partial snapshot").
+    /// True when the corresponding patch hit the byte cap ("Partial snapshot").
     pub truncated: bool,
     pub checksum: String,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Full patch returned on demand for one exact checkout snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckoutDiffPatch {
+    pub checkout_id: String,
+    pub checksum: String,
+    pub patch: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -588,5 +597,40 @@ mod tests {
         }))
         .expect("unknown status remains readable");
         assert_eq!(unknown.status, AgentAccountStatus::Unknown);
+    }
+
+    #[test]
+    fn checkout_diff_watch_summary_never_serializes_patch_bytes() {
+        let summary = CheckoutDiffSummary {
+            checkout_id: "checkout-1".into(),
+            device_id: "device-1".into(),
+            cwd: "/repo".into(),
+            files: vec![DiffFileSummary {
+                path: "src/main.rs".into(),
+                old_path: None,
+                status: "modified".into(),
+                additions: 1,
+                deletions: 1,
+                binary: false,
+            }],
+            additions: 1,
+            deletions: 1,
+            truncated: false,
+            checksum: "sum-1".into(),
+            updated_at: Utc::now(),
+        };
+        let value = serde_json::to_value(&summary).expect("summary serialization");
+        assert!(value.get("patch").is_none());
+        assert_eq!(value["checksum"], "sum-1");
+
+        let patch = CheckoutDiffPatch {
+            checkout_id: summary.checkout_id,
+            checksum: summary.checksum,
+            patch: "diff --git a/x b/x\n".into(),
+        };
+        let round_trip: CheckoutDiffPatch =
+            serde_json::from_value(serde_json::to_value(&patch).expect("patch serialization"))
+                .expect("patch deserialization");
+        assert_eq!(round_trip, patch);
     }
 }
