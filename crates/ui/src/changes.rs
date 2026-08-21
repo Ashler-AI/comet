@@ -389,12 +389,18 @@ pub fn uncommitted_label(count: usize) -> String {
 /// contract streams `CheckoutDiff` items, but list frames cost nothing to
 /// support. Returns whether anything changed.
 pub fn apply_diff_frame(diffs: &mut Vec<CheckoutDiff>, value: serde_json::Value) -> bool {
-    if let Ok(all) = serde_json::from_value::<Vec<CheckoutDiff>>(value.clone()) {
-        if *diffs != all {
-            *diffs = all;
-            return true;
-        }
-        return false;
+    if value.is_array() {
+        return match serde_json::from_value::<Vec<CheckoutDiff>>(value) {
+            Ok(all) if *diffs != all => {
+                *diffs = all;
+                true
+            }
+            Ok(_) => false,
+            Err(err) => {
+                tracing::warn!(error = %err, "changes: dropping malformed diff frame");
+                false
+            }
+        };
     }
     match serde_json::from_value::<CheckoutDiff>(value) {
         Ok(one) => {
@@ -627,10 +633,10 @@ impl Changes {
         })
     }
 
-    fn resolved(&self, cx: &App) -> Option<CheckoutDiff> {
+    fn resolved(&self, cx: &App) -> Option<&CheckoutDiff> {
         let state = self.state.read(cx);
         let chat = state.selected_chat_row()?;
-        resolve_diff(&self.diffs, chat).cloned()
+        resolve_diff(&self.diffs, chat)
     }
 
     /// Current selected checkout summary without exposing or reparsing the patch.
@@ -1328,7 +1334,7 @@ impl Render for Changes {
         let phase = if self.state.read(cx).selected_chat_row().is_none() {
             DiffPhase::Clean
         } else {
-            diff_phase(resolved.as_ref())
+            diff_phase(resolved)
         };
         let error = self.error.clone();
 

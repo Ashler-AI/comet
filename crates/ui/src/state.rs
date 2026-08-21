@@ -1085,6 +1085,8 @@ pub struct AppState {
     pub auto_selected: bool,
     /// Joined transcript of the selected chat (continuations folded engine-side).
     pub transcript: Vec<SessionMessageEntry>,
+    /// Changes only when selected transcript rows or optimistic echoes change.
+    transcript_revision: u64,
     /// First entry owned by the live bounded tail. Earlier entries were loaded
     /// explicitly by upward paging and are not part of delta `count` checks.
     transcript_tail_start: usize,
@@ -1202,6 +1204,7 @@ impl AppState {
             selected_space_members: Vec::new(),
             selected_chat: None,
             transcript: Vec::new(),
+            transcript_revision: 0,
             transcript_tail_start: 0,
             transcript_tail_before: None,
             transcript_history_before: None,
@@ -1426,6 +1429,14 @@ impl AppState {
         }
     }
 
+    pub(crate) fn transcript_revision(&self) -> u64 {
+        self.transcript_revision
+    }
+
+    fn bump_transcript_revision(&mut self) {
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+    }
+
     pub fn apply_transcript(&mut self, entries: Vec<SessionMessageEntry>) {
         // Doc frames supersede optimistic echoes carrying the same id.
         if let Some(chat_id) = self.selected_chat.as_deref()
@@ -1437,6 +1448,7 @@ impl AppState {
         self.transcript_tail_start = 0;
         self.transcript_tail_before = None;
         self.transcript_history_before = None;
+        self.bump_transcript_revision();
         self.update_selected_shared_preview();
     }
 
@@ -1481,6 +1493,7 @@ impl AppState {
         self.transcript_tail_before = None;
         self.transcript_history_before = None;
         self.transcript_restored_from_cache = false;
+        self.bump_transcript_revision();
         let Some(chat_id) = chat_id else {
             return;
         };
@@ -1508,6 +1521,7 @@ impl AppState {
             entries.append(&mut self.transcript);
             self.transcript = entries;
             self.transcript_tail_start += added;
+            self.bump_transcript_revision();
         }
         self.transcript_history_before = page.before;
     }
@@ -1656,6 +1670,7 @@ impl AppState {
             let transcript = &self.transcript;
             echoes.retain(|echo| !transcript.iter().any(|e| e.id == echo.id));
         }
+        self.bump_transcript_revision();
         self.update_selected_shared_preview();
         Ok(())
     }
@@ -1665,6 +1680,7 @@ impl AppState {
         let echoes = self.echoes.entry(chat_id.to_string()).or_default();
         if !echoes.iter().any(|e| e.id == entry.id) {
             echoes.push(entry);
+            self.bump_transcript_revision();
         }
     }
 
@@ -1703,8 +1719,13 @@ impl AppState {
 
     /// Drop an echo (send failed — the prompt returns to the draft).
     pub fn remove_echo(&mut self, chat_id: &str, message_id: &str) {
-        if let Some(echoes) = self.echoes.get_mut(chat_id) {
+        let removed = self.echoes.get_mut(chat_id).is_some_and(|echoes| {
+            let before = echoes.len();
             echoes.retain(|e| e.id != message_id);
+            echoes.len() != before
+        });
+        if removed {
+            self.bump_transcript_revision();
         }
     }
 

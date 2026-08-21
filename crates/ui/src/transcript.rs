@@ -1014,6 +1014,8 @@ pub struct Transcript {
     list: ListState,
     rows: Vec<Row>,
     chat_id: Option<String>,
+    /// Last app-state transcript revision reconciled into `rows`.
+    state_revision: u64,
     row_cache: HashMap<String, CachedRows>,
     live_parsers: HashMap<String, IncrementalParser>,
     tree_cache: HashMap<String, (usize, Arc<BlockTree>)>,
@@ -1113,6 +1115,7 @@ impl Transcript {
             list,
             rows: Vec::new(),
             chat_id: None,
+            state_revision: u64::MAX,
             row_cache: HashMap::new(),
             live_parsers: HashMap::new(),
             tree_cache: HashMap::new(),
@@ -1429,9 +1432,14 @@ impl Transcript {
         let state = self.state.clone();
         let state = state.read(cx);
         let selected = state.selected_chat.clone();
+        let attached = selected != self.chat_id;
+        let revision = state.transcript_revision();
+        if !attached && revision == self.state_revision {
+            return;
+        }
+        self.state_revision = revision;
         let echoes = state.pending_echoes().to_vec();
         let entries = &state.transcript;
-        let attached = selected != self.chat_id;
         if attached {
             if let Some(previous) = self.chat_id.take()
                 && !self.rows.is_empty()

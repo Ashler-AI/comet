@@ -39,6 +39,8 @@ use super::view::{
 /// Fixed tab width — drag-reorder math stays analytic.
 pub const TAB_WIDTH: f32 = 118.0;
 pub const TAB_BAR_HEIGHT: f32 = 40.0;
+/// Coalesce PTY stream bursts to at most one visible repaint per display frame.
+const REPAINT_COALESCE_MS: u64 = 16;
 
 actions!(terminal, [ToggleTerminal]);
 
@@ -242,6 +244,8 @@ pub struct TerminalPanel {
     tab_seq: u64,
     drag: Option<DragState>,
     last_selected: Option<String>,
+    /// One frame-rate repaint timer shared by every terminal stream.
+    repaint_task: Option<Task<()>>,
     _observe: Subscription,
 }
 
@@ -256,6 +260,7 @@ impl TerminalPanel {
             tab_seq: 0,
             drag: None,
             last_selected: None,
+            repaint_task: None,
             _observe: observe,
         }
     }
@@ -290,6 +295,21 @@ impl TerminalPanel {
         if switched {
             cx.notify();
         }
+    }
+    fn schedule_repaint(&mut self, cx: &mut Context<Self>) {
+        if self.repaint_task.is_some() {
+            return;
+        }
+        self.repaint_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(REPAINT_COALESCE_MS))
+                .await;
+            this.update(cx, |panel, cx| {
+                panel.repaint_task = None;
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     fn engine(&self, cx: &App) -> Option<EngineHandle> {
@@ -514,6 +534,14 @@ impl TerminalPanel {
         event: TerminalEvent,
         cx: &mut Context<Self>,
     ) -> StreamDisposition {
+        let selected_chat_visible =
+            self.open && self.state.read(cx).selected_chat.as_deref() == Some(chat);
+        let active_tab_visible = selected_chat_visible
+            && self
+                .chats
+                .get(chat)
+                .and_then(|tabs| tabs.tabs.get(tabs.active))
+                .is_some_and(|tab| tab.key == key);
         let target = self.chat_target(chat, cx);
         let Some(tab) = self.tab_mut(chat, key) else {
             return StreamDisposition::Stop;
@@ -542,14 +570,18 @@ impl TerminalPanel {
                     })
                     .detach();
                 }
-                cx.notify();
+                if active_tab_visible {
+                    self.schedule_repaint(cx);
+                }
                 StreamDisposition::Continue
             }
             TerminalEvent::Exit { seq, exit_code, .. } => {
                 tab.last_seq = seq;
                 tab.exited = Some(exit_code);
                 tab.emulator.feed(&exit_message(exit_code));
-                cx.notify();
+                if selected_chat_visible {
+                    self.schedule_repaint(cx);
+                }
                 StreamDisposition::Stop
             }
         }
