@@ -415,7 +415,8 @@ impl ScaffoldClient {
                     .origin
                     .join("/api/agent-auth/v2/authority")
                     .expect("static v2 authority path");
-                self.request(Method::POST, url, Option::<&()>::None, cancellation)
+                let body = serde_json::json!({});
+                self.request(Method::POST, url, Some(&body), cancellation)
                     .await
                     .map(AgentInferenceAccess::V2)
             }
@@ -2636,7 +2637,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let requests = captured.await.unwrap();
-        assert!(requests[0].starts_with("POST /api/agent-auth/v2/authority HTTP/1.1"));
+        let authority_request = requests[0].to_ascii_lowercase();
+        assert!(authority_request.starts_with("post /api/agent-auth/v2/authority http/1.1"));
+        assert!(authority_request.contains("content-length: 2"));
+        assert!(authority_request.ends_with("\r\n\r\n{}"));
         let inference = requests[1].to_ascii_lowercase();
         assert!(inference.starts_with("post /api/agent-auth/v2/messages?beta=true http/1.1"));
         assert!(inference.contains("authorization: bearer v2-authority-token"));
