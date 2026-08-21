@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scaffold::AgentInferenceGrantBinding;
+    use crate::scaffold::{AgentInferenceAuthorityV2, AgentInferenceGrantBinding};
     use async_trait::async_trait;
     use http_body_util::{BodyExt, Full, StreamBody};
     use hyper::{body::Frame, body::Incoming, service::service_fn};
@@ -117,6 +117,7 @@ mod tests {
 
     #[derive(Debug)]
     struct CapturedRequest {
+        path: String,
         authorization: String,
         api_key: Option<String>,
         owner_subject: String,
@@ -144,6 +145,11 @@ mod tests {
                         let revoked = revoked.clone();
                         async move {
                             let path = request.uri().path().to_string();
+                            let path_and_query = request
+                                .uri()
+                                .path_and_query()
+                                .map(|value| value.as_str().to_string())
+                                .unwrap_or_else(|| path.clone());
                             let headers = request.headers().clone();
                             let bytes = request.into_body().collect().await.unwrap().to_bytes();
                             let response = match path.as_str() {
@@ -175,6 +181,7 @@ mod tests {
                                 | "/api/agent-auth/v1/messages" => {
                                     captured
                                         .send(CapturedRequest {
+                                            path: path_and_query,
                                             authorization: headers[AUTHORIZATION]
                                                 .to_str()
                                                 .unwrap()
@@ -675,6 +682,7 @@ mod tests {
                             if path == "/api/agent-auth/v1/responses" {
                                 captured
                                     .send(CapturedRequest {
+                                        path: path.clone(),
                                         authorization: headers[AUTHORIZATION].to_str().unwrap().to_string(),
                                         api_key: None,
                                         owner_subject: headers["x-agent-auth-owner-subject"].to_str().unwrap().to_string(),
@@ -1449,8 +1457,9 @@ mod tests {
             .unwrap()
             .unwrap();
 
+        assert!(route.token.starts_with("sk-ant-oat01-"));
         let response = reqwest::Client::new()
-            .post(format!("{}/v1/messages", route.base_url))
+            .post(format!("{}/v1/messages?beta=true", route.base_url))
             .header("x-api-key", &route.token)
             .json(&json!({ "model": "claude-opus-5", "messages": [] }))
             .send()
@@ -1463,6 +1472,7 @@ mod tests {
         );
 
         let captured = captured_rx.recv().await.unwrap();
+        assert_eq!(captured.path, "/api/agent-auth/v1/messages?beta=true");
         assert_eq!(captured.authorization, "Bearer remote-agent-auth-grant-1");
         assert_eq!(captured.api_key, None);
         assert_eq!(captured.session_id, "session-anthropic");
@@ -1519,6 +1529,33 @@ mod tests {
     }
 
     #[test]
+    fn accepts_only_well_formed_v2_principal_authorities() {
+        let request = AgentInferenceGrantRequest {
+            logical_session_id: "conversation-1".into(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            harness: "omp".into(),
+            routing_mode: AgentRoutingMode::Automatic,
+            requested_account_id: None,
+            lifecycle_epoch: 1,
+        };
+        let authority = AgentInferenceAuthorityV2 {
+            contract_version: 2,
+            token: "v2-authority-token".into(),
+            token_type: "Bearer".into(),
+            authority_id: "authority-1".into(),
+            principal_id: "identity:owner-1".into(),
+            expires_at: "2099-01-01T00:00:00Z".into(),
+        };
+        let access = AgentInferenceAccess::V2(authority.clone());
+        assert!(validate_access(&access, &request).is_ok());
+
+        let mut invalid = authority;
+        invalid.contract_version = 1;
+        assert!(validate_access(&AgentInferenceAccess::V2(invalid), &request).is_err());
+    }
+
+    #[test]
     fn accepts_exactly_one_matching_loopback_credential() {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, "Bearer local-token".parse().unwrap());
@@ -1530,6 +1567,14 @@ mod tests {
 
         headers.insert(AUTHORIZATION, "Bearer other-token".parse().unwrap());
         assert_eq!(relay_token(&headers), None);
+    }
+
+    #[test]
+    fn local_relay_token_uses_oauth_shape_only_for_anthropic() {
+        let anthropic = local_relay_token("anthropic");
+        assert!(anthropic.starts_with("sk-ant-oat01-"));
+        assert!(!anthropic.chars().any(char::is_whitespace));
+        assert!(!local_relay_token("openai").starts_with("sk-ant-oat01-"));
     }
 
     #[test]
