@@ -30,7 +30,9 @@ use tokio_util::io::ReaderStream;
 use comet_harness::InferenceRoute;
 use comet_proto::{AgentRoutingMode, HarnessId};
 
-use crate::scaffold::{AgentInferenceGrant, AgentInferenceGrantRequest, ScaffoldClient};
+use crate::scaffold::{
+    AgentInferenceAccess, AgentInferenceGrant, AgentInferenceGrantRequest, ScaffoldClient,
+};
 use crate::{EngineError, new_id};
 
 const MAX_CONNECTIONS: usize = 64;
@@ -95,7 +97,7 @@ impl Route {
 }
 
 struct GrantState {
-    grant: AgentInferenceGrant,
+    access: AgentInferenceAccess,
     expires_at: DateTime<Utc>,
 }
 
@@ -333,6 +335,15 @@ fn inference_grant_request(
     }))
 }
 
+fn local_relay_token(provider: &str) -> String {
+    let value = format!("{}{}", new_id().replace('-', ""), new_id().replace('-', ""));
+    if provider == "anthropic" {
+        format!("sk-ant-oat01-{value}")
+    } else {
+        value
+    }
+}
+
 impl InferenceRelay {
     pub(crate) fn start(client: ScaffoldClient) -> Result<Self, EngineError> {
         let listener = StdTcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
@@ -392,7 +403,7 @@ impl InferenceRelay {
             tracing::debug!(?harness, "inference relay skipped for unsupported harness");
             return Ok(None);
         };
-        let grant = self
+        let access = self
             .inner
             .client
             .issue_agent_inference_grant(&request, &comet_harness::CancellationToken::new())
@@ -400,25 +411,23 @@ impl InferenceRelay {
             .map_err(|error| {
                 EngineError::Other(format!("Agent Auth grant issuance failed: {error}"))
             })?;
-        let expires_at = validate_grant(&grant, &request)?;
+        let expires_at = validate_access(&access, &request)?;
         let provider = request.provider.clone();
         let model = request.model.clone();
-        let owner_subject = grant.binding.owner_subject.clone();
+        let owner_subject = access.route_identity().to_string();
         let route = Arc::new(Route {
             request,
             local_session_id,
             owner_subject: owner_subject.clone(),
             cancellation: comet_harness::CancellationToken::new(),
-            grant: AsyncMutex::new(GrantState { grant, expires_at }),
+            grant: AsyncMutex::new(GrantState { access, expires_at }),
         });
         let local_token = {
             let mut state = lock(&self.inner.route_state);
             state.prune_retired();
             let token = state
                 .take_retired_token(session_id, &owner_subject, &provider)
-                .unwrap_or_else(|| {
-                    format!("{}{}", new_id().replace('-', ""), new_id().replace('-', ""))
-                });
+                .unwrap_or_else(|| local_relay_token(&provider));
             state.active.insert(token.clone(), route);
             token
         };
@@ -615,6 +624,16 @@ impl InferenceRelay {
             "/v1/messages" => "messages",
             _ => return json_response(StatusCode::NOT_FOUND, json!({ "error": "not_found" })),
         };
+        let query = match request.uri().query() {
+            None => None,
+            Some("beta=true") if endpoint == "messages" => Some("beta=true"),
+            Some(_) => {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "inference_query_invalid" }),
+                );
+            }
+        };
         let expected_provider = if endpoint == "messages" {
             "anthropic"
         } else {
@@ -661,8 +680,8 @@ impl InferenceRelay {
                 );
             }
         };
-        let mut grant = match self.current_grant(&route).await {
-            Ok(grant) => grant,
+        let mut access = match self.current_grant(&route).await {
+            Ok(access) => access,
             Err(error) => {
                 tracing::warn!(err = %error, "inference relay grant refresh failed");
                 return json_response(
@@ -691,7 +710,10 @@ impl InferenceRelay {
                 .client
                 .proxy_agent_inference(crate::scaffold::AgentInferenceProxyRequest {
                     endpoint,
-                    grant: &grant,
+                    query,
+                    access: &access,
+                    conversation_id: &route.request.logical_session_id,
+                    requested_account_id: route.request.requested_account_id.as_deref(),
                     request_id: &request_id,
                     headers: sanitized_headers.clone(),
                     content_length,
@@ -701,7 +723,7 @@ impl InferenceRelay {
                 .await
             {
                 Ok(response) => response,
-                Err(error) if transport_replays < MAX_TRANSPORT_REPLAYS => {
+                Err(error) if !access.is_v2() && transport_replays < MAX_TRANSPORT_REPLAYS => {
                     transport_replays += 1;
                     tracing::warn!(
                         err = %error,
@@ -718,12 +740,18 @@ impl InferenceRelay {
                     );
                 }
             };
+            if access.is_v2() {
+                return stream_response(upstream, cancellation, stream_context.clone());
+            }
+            let AgentInferenceAccess::V1(grant) = &access else {
+                unreachable!("v2 responses return before v1 failover handling");
+            };
             if account_failovers >= MAX_ACCOUNT_FAILOVERS {
                 return stream_response(upstream, cancellation, stream_context.clone());
             }
             let (upstream, failure_class) = retryable_response(
                 &route.request,
-                &grant,
+                grant,
                 upstream,
                 cancellation.clone(),
                 stream_context.clone(),
@@ -741,7 +769,7 @@ impl InferenceRelay {
                 .inner
                 .client
                 .report_agent_inference_failure(
-                    &grant,
+                    grant,
                     failure_class,
                     false,
                     retry_after_seconds,
@@ -768,11 +796,11 @@ impl InferenceRelay {
             }
             drop(upstream);
             account_failovers += 1;
-            grant = replacement;
+            access = AgentInferenceAccess::V1(replacement);
         }
     }
 
-    async fn current_grant(&self, route: &Route) -> Result<AgentInferenceGrant, EngineError> {
+    async fn current_grant(&self, route: &Route) -> Result<AgentInferenceAccess, EngineError> {
         let mut current = route.grant.lock().await;
         if current.expires_at <= Utc::now() + TimeDelta::seconds(REFRESH_SKEW_SECONDS) {
             let refreshed = self
@@ -786,13 +814,13 @@ impl InferenceRelay {
                 .map_err(|error| {
                     EngineError::Other(format!("Agent Auth grant renewal failed: {error}"))
                 })?;
-            let expires_at = validate_grant(&refreshed, &route.request)?;
+            let expires_at = validate_access(&refreshed, &route.request)?;
             *current = GrantState {
-                grant: refreshed,
+                access: refreshed,
                 expires_at,
             };
         }
-        Ok(current.grant.clone())
+        Ok(current.access.clone())
     }
 
     async fn replace_current_grant(
@@ -801,7 +829,10 @@ impl InferenceRelay {
         grant: AgentInferenceGrant,
     ) -> Result<(), EngineError> {
         let expires_at = validate_grant(&grant, &route.request)?;
-        *route.grant.lock().await = GrantState { grant, expires_at };
+        *route.grant.lock().await = GrantState {
+            access: AgentInferenceAccess::V1(grant),
+            expires_at,
+        };
         Ok(())
     }
 }
@@ -996,6 +1027,37 @@ fn confirmed_account_exhaustion_payload(body: &[u8]) -> bool {
     })
 }
 
+fn validate_access(
+    access: &AgentInferenceAccess,
+    request: &AgentInferenceGrantRequest,
+) -> Result<DateTime<Utc>, EngineError> {
+    if let AgentInferenceAccess::V1(grant) = access {
+        return validate_grant(grant, request);
+    }
+    let AgentInferenceAccess::V2(authority) = access else {
+        unreachable!("AgentInferenceAccess has exactly two variants");
+    };
+    if authority.contract_version != 2
+        || authority.token_type != "Bearer"
+        || authority.authority_id.is_empty()
+        || authority.principal_id.is_empty()
+        || access.token().is_empty()
+    {
+        return Err(EngineError::Other(
+            "Agent Auth returned an invalid v2 authority".into(),
+        ));
+    }
+    let expires_at = DateTime::parse_from_rfc3339(access.expires_at())
+        .map_err(|_| EngineError::Other("Agent Auth returned an invalid authority expiry".into()))?
+        .with_timezone(&Utc);
+    if expires_at <= Utc::now() {
+        return Err(EngineError::Other(
+            "Agent Auth returned an expired authority".into(),
+        ));
+    }
+    Ok(expires_at)
+}
+
 fn validate_grant(
     grant: &AgentInferenceGrant,
     request: &AgentInferenceGrantRequest,
@@ -1075,6 +1137,11 @@ fn sanitize_request_headers(mut headers: HeaderMap) -> HeaderMap {
         "x-agent-auth-harness",
         "x-agent-auth-source",
         "x-agent-auth-lifecycle-epoch",
+        "x-agent-auth-environment",
+        "x-agent-auth-routing-mode",
+        "x-agent-auth-requested-account-id",
+        "x-agent-auth-account-id",
+        "x-agent-auth-conversation-id",
         "x-agent-auth-request-id",
         "x-agent-auth-internal-secret",
     ] {
