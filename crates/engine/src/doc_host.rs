@@ -1860,7 +1860,10 @@ impl DocHost {
                     } else {
                         match self.execute(sessions, handle, &entry).await {
                             Ok(outcome) => outcome,
-                            Err(err) => (SessionCommandStatus::Rejected, Some(err.to_string())),
+                            Err(err) => {
+                                tracing::warn!(chat = %handle.chat_id, command = %entry.id, error = %err, "command execution rejected");
+                                (SessionCommandStatus::Rejected, Some(err.to_string()))
+                            }
                         }
                     };
                     self.resolve_command(handle, &entry, status, resolution.as_deref());
