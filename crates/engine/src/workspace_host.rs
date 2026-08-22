@@ -150,6 +150,17 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+fn send_if_changed<T: PartialEq>(sender: &watch::Sender<T>, value: T) {
+    sender.send_if_modified(|current| {
+        if *current == value {
+            false
+        } else {
+            *current = value;
+            true
+        }
+    });
+}
+
 #[derive(Clone)]
 pub struct WorkspaceHost {
     inner: Arc<WorkspaceHostInner>,
@@ -289,7 +300,7 @@ impl WorkspaceHost {
                             match events.recv().await {
                                 Ok(comet_sync::RoomEvent::EphemeralUpdate) => {
                                     let Some(inner) = weak.upgrade() else { return };
-                                    inner.publish();
+                                    inner.publish_presence();
                                 }
                                 Ok(_) => {}
                                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
@@ -889,20 +900,31 @@ impl WorkspaceHostInner {
         }) {
             Ok(mut state) => {
                 self.overlay_presence(&mut state.devices);
-                // send_replace, NOT send: `watch::Sender::send` drops the value when
-                // no receiver exists yet, so a stream subscribed later would start
-                // from a stale snapshot (found the hard way by the e2e smoke).
-                self.chats_tx.send_replace(state.chats);
-                self.devices_tx.send_replace(state.devices);
-                self.sessions_tx.send_replace(state.sessions);
-                self.spaces_tx.send_replace(state.spaces);
-                self.session_refs_tx.send_replace(state.session_refs);
-                self.worktree_deletions_tx
-                    .send_replace(state.worktree_deletions);
+                // Update the retained watch value even before the first receiver,
+                // but wake subscribers only when that entity collection changed.
+                send_if_changed(&self.chats_tx, state.chats);
+                send_if_changed(&self.devices_tx, state.devices);
+                send_if_changed(&self.sessions_tx, state.sessions);
+                send_if_changed(&self.spaces_tx, state.spaces);
+                send_if_changed(&self.session_refs_tx, state.session_refs);
+                send_if_changed(&self.worktree_deletions_tx, state.worktree_deletions);
             }
             Err(err) => {
                 tracing::warn!(error = %err, "workspace read failed");
             }
+        }
+    }
+
+    /// Presence events never alter chats, sessions, spaces, or memberships.
+    /// Read and publish only devices so a 15-second heartbeat cannot wake every
+    /// workspace consumer (notably checkout reconciliation).
+    fn publish_presence(&self) {
+        match self.doc.read_devices() {
+            Ok(mut devices) => {
+                self.overlay_presence(&mut devices);
+                send_if_changed(&self.devices_tx, devices);
+            }
+            Err(err) => tracing::warn!(error = %err, "workspace devices read failed"),
         }
     }
 
@@ -1123,7 +1145,7 @@ async fn relay_probe_task(weak: Weak<WorkspaceHostInner>) {
             }
         }
         if refreshed && let Some(inner) = weak.upgrade() {
-            inner.publish();
+            inner.publish_presence();
         }
     }
 }
@@ -1165,8 +1187,24 @@ async fn workspace_task(weak: Weak<WorkspaceHostInner>, mut changed_rx: watch::R
                 // Re-publish on the same cadence: remote heartbeats decay when a
                 // device goes silent, and watchers (the UI online dot, "host
                 // offline" hints) need a tick to observe that staleness.
-                inner.publish();
+                inner.publish_presence();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::send_if_changed;
+
+    #[test]
+    fn unchanged_watch_values_do_not_wake_receivers() {
+        let (sender, receiver) = tokio::sync::watch::channel(vec!["chat"]);
+        send_if_changed(&sender, vec!["chat"]);
+        assert!(!receiver.has_changed().unwrap());
+
+        send_if_changed(&sender, vec!["other"]);
+        assert!(receiver.has_changed().unwrap());
+        assert_eq!(&*receiver.borrow(), &["other"]);
     }
 }

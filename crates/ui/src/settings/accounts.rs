@@ -21,7 +21,7 @@ use comet_rpc::methods;
 use comet_update::HarnessStatus;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
-use crate::motion::{AnimationExt as _, COMET_PULSE};
+use crate::motion::COMET_PULSE;
 use crate::popover::{self, Loadable};
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -973,14 +973,17 @@ impl AccountsPage {
                                 .text_color(theme.text_muted)
                                 .child(
                                     div()
+                                        .opacity(
+                                            0.55 + 0.35
+                                                * crate::motion::pulse_delta(
+                                                    &COMET_PULSE,
+                                                    cx.entity_id(),
+                                                    cx,
+                                                ),
+                                        )
                                         .child(message.clone().unwrap_or_else(|| {
                                             SharedString::from("Waiting for the browser…")
-                                        }))
-                                        .with_animation(
-                                            "login-waiting",
-                                            COMET_PULSE.animation().repeat(),
-                                            |label, delta| label.opacity(0.55 + 0.35 * delta),
-                                        ),
+                                        })),
                                 ),
                         )
                     })

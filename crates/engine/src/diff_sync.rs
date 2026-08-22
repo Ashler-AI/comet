@@ -40,7 +40,7 @@ use crate::workspace_host::WorkspaceHost;
 pub const MAX_PATCH_BYTES: usize = 3 * 1024 * 1024;
 /// Trailing debounce after a filesystem event burst.
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(500);
-/// Slow repair pass: re-reconcile + re-sync every checkout.
+/// Slow repair pass: re-sync every checkout in one bounded global queue.
 const REPAIR_INTERVAL: Duration = Duration::from_secs(120);
 /// Max subdirectories a checkout may have before we skip its live recursive
 /// watch (one OS watch per dir; past this the watcher thread's own bookkeeping
@@ -48,6 +48,9 @@ const REPAIR_INTERVAL: Duration = Duration::from_secs(120);
 /// under this; a node_modules/vendored tree blows past it. The repair tick
 /// still covers skipped checkouts.
 const MAX_WATCH_DIRS: usize = 8_000;
+/// Git snapshots are I/O-heavy and each starts several subprocesses. A single
+/// global permit prevents many active worktrees from launching them in parallel.
+const MAX_CONCURRENT_CAPTURES: usize = 1;
 /// `git hash-object -t tree /dev/null` — diff base for repos with no commits yet.
 const EMPTY_TREE_SHA: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
@@ -103,6 +106,10 @@ struct DiffSyncInner {
     edge: Option<EdgeConfig>,
     http: reqwest::Client,
     entries: Mutex<HashMap<String, Arc<CheckoutEntry>>>,
+    /// Exact cwd → canonical checkout identity. Workspace publications often
+    /// touch chat metadata without moving the checkout; do not rerun rev-parse.
+    identity_cache: Mutex<HashMap<PathBuf, CheckoutIdentity>>,
+    capture_permits: tokio::sync::Semaphore,
     diffs_tx: watch::Sender<Vec<CheckoutDiffSummary>>,
 }
 
@@ -133,6 +140,8 @@ impl CheckoutDiffSync {
                 edge,
                 http: reqwest::Client::new(),
                 entries: Mutex::new(HashMap::new()),
+                identity_cache: Mutex::new(HashMap::new()),
+                capture_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_CAPTURES),
                 diffs_tx,
             }),
         };
@@ -204,12 +213,23 @@ async fn reconcile(inner: &Arc<DiffSyncInner>, chats: Vec<Chat>) {
 
     let mut groups: HashMap<String, (CheckoutIdentity, Vec<Chat>)> = HashMap::new();
     for (cwd, chats) in chats_by_cwd {
-        let identity = match inner.repos.checkout_identity(&cwd).await {
-            Ok(identity) => identity,
-            Err(err) => {
-                tracing::debug!(cwd = %cwd.display(), error = %err, "diff-sync: not a checkout");
-                continue;
-            }
+        // Cache exact cwd resolutions only. Prefix reuse would misclassify a
+        // nested repository or submodule as its parent checkout.
+        let cached = lock(&inner.identity_cache).get(&cwd).cloned();
+        let identity = match cached {
+            Some(identity) => identity,
+            None => match inner.repos.checkout_identity(&cwd).await {
+                Ok(identity) => {
+                    let mut cache = lock(&inner.identity_cache);
+                    cache.insert(cwd.clone(), identity.clone());
+                    cache.insert(identity.root.clone(), identity.clone());
+                    identity
+                }
+                Err(err) => {
+                    tracing::debug!(cwd = %cwd.display(), error = %err, "diff-sync: not a checkout");
+                    continue;
+                }
+            },
         };
         for chat in &chats {
             // Stamp the row's checkoutId so every device groups this chat correctly.
@@ -239,6 +259,9 @@ async fn reconcile(inner: &Arc<DiffSyncInner>, chats: Vec<Chat>) {
         }
         removed
     };
+    if !removed.is_empty() {
+        lock(&inner.identity_cache).retain(|_, identity| !removed.contains(&identity.id));
+    }
     if !removed.is_empty() {
         publish_watch(inner);
     }
@@ -326,6 +349,54 @@ async fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats
     let _ = kick_tx.send(()); // initial snapshot
 }
 
+fn build_ignore_matcher(root: &Path) -> ignore::gitignore::Gitignore {
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+    let gitignore = root.join(".gitignore");
+    if gitignore.is_file() {
+        builder.add(gitignore);
+    }
+    builder.build().unwrap_or_else(|err| {
+        tracing::debug!(error = %err, "diff-sync: ignore matcher build failed");
+        ignore::gitignore::GitignoreBuilder::new(root)
+            .build()
+            .expect("empty ignore matcher")
+    })
+}
+
+fn is_diff_signal(
+    identity: &CheckoutIdentity,
+    ignored: &ignore::gitignore::Gitignore,
+    path: &Path,
+) -> bool {
+    if let Ok(relative) = path.strip_prefix(&identity.git_dir) {
+        return relative.as_os_str().is_empty()
+            || relative.components().next().is_some_and(|component| {
+                matches!(
+                    component.as_os_str().to_str(),
+                    Some("HEAD" | "index" | "refs" | "packed-refs")
+                )
+            });
+    }
+    let Ok(relative) = path.strip_prefix(&identity.root) else {
+        return true;
+    };
+    !ignored
+        .matched_path_or_any_parents(relative, path.is_dir())
+        .is_ignore()
+}
+
+fn event_needs_capture(
+    identity: &CheckoutIdentity,
+    ignored: &ignore::gitignore::Gitignore,
+    event: &notify::Event,
+) -> bool {
+    event.paths.is_empty()
+        || event
+            .paths
+            .iter()
+            .any(|path| is_diff_signal(identity, ignored, path))
+}
+
 /// Build native filesystem watchers away from the async runtime. Both the
 /// bounded directory walk and notify's recursive registration perform blocking
 /// filesystem I/O; doing either on a Tokio worker delayed auth, IPC, and UI
@@ -339,6 +410,7 @@ fn build_watchers(
     if !identity.git_dir.starts_with(&identity.root) {
         targets.push(&identity.git_dir);
     }
+    let ignored = Arc::new(build_ignore_matcher(&identity.root));
     for target in targets {
         // A recursive `notify` watch installs one OS watch per subdirectory and
         // has no way to prune subtrees. On a checkout carrying big dependency
@@ -352,9 +424,14 @@ fn build_watchers(
             continue;
         }
         let tx = kick_tx.clone();
+        let filter_identity = identity.clone();
+        let ignored = ignored.clone();
         let watcher =
             notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
-                if event.is_ok() {
+                if event
+                    .as_ref()
+                    .is_ok_and(|event| event_needs_capture(&filter_identity, &ignored, event))
+                {
                     let _ = tx.send(());
                 }
             });
@@ -405,12 +482,17 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
     // Capture the expected metadata before the async git read. A title-driven
     // branch rename may complete while capture is in flight.
     let chats = lock(&entry.chats).clone();
-    let snapshot = match capture_diff(&inner.repos, &entry.identity.root).await {
-        Ok(snapshot) => Arc::new(snapshot),
-        Err(err) => {
-            tracing::debug!(checkout = %entry.identity.root.display(), error = %err,
-                "diff-sync: capture failed");
+    let snapshot = {
+        let Ok(_permit) = inner.capture_permits.acquire().await else {
             return;
+        };
+        match capture_diff(&inner.repos, &entry.identity.root).await {
+            Ok(snapshot) => Arc::new(snapshot),
+            Err(err) => {
+                tracing::debug!(checkout = %entry.identity.root.display(), error = %err,
+                    "diff-sync: capture failed");
+                return;
+            }
         }
     };
 
@@ -624,44 +706,87 @@ fn split_z(value: &[u8]) -> Vec<String> {
         .collect()
 }
 
-fn parse_name_status(value: &[u8]) -> Vec<DiffFileSummary> {
-    let fields = split_z(value);
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    while i < fields.len() {
-        let raw = fields[i].clone();
-        i += 1;
-        let code = raw.chars().next().unwrap_or('M');
-        let Some(first) = fields.get(i).cloned() else {
-            break;
-        };
-        i += 1;
-        let renamed = code == 'R' || code == 'C';
-        let second = if renamed {
-            let s = fields.get(i).cloned();
-            i += 1;
-            s
-        } else {
-            None
-        };
-        let status = match code {
-            'A' => "added",
-            'D' => "deleted",
-            'R' => "renamed",
-            'C' => "copied",
-            'U' => "unmerged",
-            _ => "modified",
-        };
-        out.push(DiffFileSummary {
-            path: second.clone().unwrap_or_else(|| first.clone()),
-            old_path: second.is_some().then_some(first),
-            status: status.to_string(),
-            additions: 0,
-            deletions: 0,
-            binary: false,
-        });
+fn status_code(xy: &str) -> char {
+    xy.chars().find(|code| *code != '.').unwrap_or('M')
+}
+
+fn file_summary(path: String, old_path: Option<String>, code: char) -> DiffFileSummary {
+    let status = match code {
+        'A' | '?' => "added",
+        'D' => "deleted",
+        'R' => "renamed",
+        'C' => "copied",
+        'U' => "unmerged",
+        _ => "modified",
+    };
+    DiffFileSummary {
+        path,
+        old_path,
+        status: status.to_string(),
+        additions: 0,
+        deletions: 0,
+        binary: false,
     }
-    out
+}
+
+fn parse_status_v2(value: &[u8]) -> (String, String, Vec<DiffFileSummary>, Vec<String>) {
+    let records = split_z(value);
+    let mut branch = "HEAD".to_string();
+    let mut head = String::new();
+    let mut files = Vec::new();
+    let mut untracked = Vec::new();
+    let mut i = 0usize;
+    while i < records.len() {
+        let record = &records[i];
+        i += 1;
+        if let Some(value) = record.strip_prefix("# branch.oid ") {
+            if value != "(initial)" {
+                head = value.to_string();
+            }
+            continue;
+        }
+        if let Some(value) = record.strip_prefix("# branch.head ") {
+            if value != "(detached)" {
+                branch = value.to_string();
+            }
+            continue;
+        }
+        if record.starts_with("1 ") {
+            let fields: Vec<&str> = record.splitn(9, ' ').collect();
+            if let (Some(xy), Some(path)) = (fields.get(1), fields.get(8)) {
+                files.push(file_summary((*path).to_string(), None, status_code(xy)));
+            }
+            continue;
+        }
+        if record.starts_with("2 ") {
+            let fields: Vec<&str> = record.splitn(10, ' ').collect();
+            let old_path = records.get(i).cloned();
+            i += usize::from(old_path.is_some());
+            if let (Some(xy), Some(path)) = (fields.get(1), fields.get(9)) {
+                files.push(file_summary((*path).to_string(), old_path, status_code(xy)));
+            }
+            continue;
+        }
+        if record.starts_with("u ") {
+            let fields: Vec<&str> = record.splitn(11, ' ').collect();
+            if let Some(path) = fields.get(10) {
+                files.push(file_summary((*path).to_string(), None, 'U'));
+            }
+            continue;
+        }
+        if let Some(path) = record.strip_prefix("? ") {
+            untracked.push(path.to_string());
+        }
+    }
+    (branch, head, files, untracked)
+}
+
+fn split_numstat_patch(value: &[u8]) -> (&[u8], &[u8]) {
+    const MARKER: &[u8] = b"\0\0diff --git ";
+    value
+        .windows(MARKER.len())
+        .position(|window| window == MARKER)
+        .map_or((value, &[]), |at| (&value[..at], &value[at + 2..]))
 }
 
 fn apply_numstat(files: &mut [DiffFileSummary], value: &[u8]) {
@@ -728,41 +853,37 @@ fn untracked_patch(path: &str, content: &str) -> String {
     )
 }
 
-/// One bounded atomic snapshot: tracked diff vs HEAD (or the empty tree) with
-/// renames, plus untracked files (via `git status --porcelain`, index untouched)
-/// as synthesized new-file hunks. 3MiB patch cap with a `truncated` flag; sha256
-/// checksum over branch ‖ head ‖ patch ‖ files ‖ truncated.
-pub async fn capture_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, EngineError> {
-    let head = capture_git(root, &["rev-parse", "--verify", "HEAD"], 256)
-        .await
-        .map(|c| String::from_utf8_lossy(&c.stdout).trim().to_string())
-        .unwrap_or_default();
+/// One bounded atomic snapshot: one porcelain-v2 status supplies HEAD, branch,
+/// tracked state, and untracked paths; one combined numstat+patch diff supplies
+/// line counts and patch bytes. The previous six-command sequence amplified
+/// every filesystem burst across every checkout.
+pub async fn capture_diff(_repos: &Repos, root: &Path) -> Result<DiffSnapshot, EngineError> {
+    let status = capture_git(
+        root,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "--untracked-files=all",
+            "-z",
+        ],
+        2 * 1024 * 1024,
+    )
+    .await?;
+    let (branch, head, mut files, mut untracked) = parse_status_v2(&status.stdout);
     let base: &str = if head.is_empty() {
         EMPTY_TREE_SHA
     } else {
         &head
     };
-    let branch = repos
-        .current_branch(root)
-        .await
-        .unwrap_or_else(|_| "HEAD".into());
-
-    let names = capture_git(
-        root,
-        &["diff", "--name-status", "-z", "--find-renames", base, "--"],
-        2 * 1024 * 1024,
-    )
-    .await?;
-    let nums = capture_git(
-        root,
-        &["diff", "--numstat", "-z", "--find-renames", base, "--"],
-        2 * 1024 * 1024,
-    )
-    .await?;
     let tracked = capture_git(
         root,
         &[
             "diff",
+            "--numstat",
+            "--patch",
+            "-z",
             "--no-ext-diff",
             "--no-color",
             "--find-renames",
@@ -770,49 +891,23 @@ pub async fn capture_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, En
             base,
             "--",
         ],
-        MAX_PATCH_BYTES,
+        MAX_PATCH_BYTES + 2 * 1024 * 1024,
     )
     .await?;
-    // Untracked listing via porcelain status; `--no-optional-locks` keeps this
-    // read-only (a status-triggered index refresh would re-kick our own watcher).
-    let status = capture_git(
-        root,
-        &["--no-optional-locks", "status", "--porcelain", "-z"],
-        2 * 1024 * 1024,
-    )
-    .await?;
+    let (numstat, patch_bytes) = split_numstat_patch(&tracked.stdout);
+    apply_numstat(&mut files, numstat);
 
-    let mut files = parse_name_status(&names.stdout);
-    apply_numstat(&mut files, &nums.stdout);
-    let mut patch = String::from_utf8_lossy(&tracked.stdout).to_string();
-    let mut truncated = tracked.truncated || names.truncated || nums.truncated || status.truncated;
-
-    if tracked.truncated {
+    let patch_truncated = patch_bytes.len() > MAX_PATCH_BYTES;
+    let mut patch =
+        String::from_utf8_lossy(&patch_bytes[..patch_bytes.len().min(MAX_PATCH_BYTES)]).to_string();
+    let mut truncated = tracked.truncated || patch_truncated || status.truncated;
+    if tracked.truncated || patch_truncated {
         let boundary = patch.rfind('\n').unwrap_or(0);
         patch.truncate(boundary);
         patch.push_str("\n# Crew diff truncated\n");
     }
 
-    // `?? path` records; rename records (`R  new\0old`) consume their extra field.
-    let mut untracked: Vec<String> = Vec::new();
-    let records = split_z(&status.stdout);
-    let mut i = 0usize;
-    while i < records.len() {
-        let record = &records[i];
-        i += 1;
-        if record.len() < 3 {
-            continue;
-        }
-        let (code, path) = record.split_at(2);
-        if code.starts_with('R') || code.starts_with('C') {
-            i += 1; // skip the origin-path field
-        }
-        if code == "??" {
-            untracked.push(path.trim_start().to_string());
-        }
-    }
     untracked.sort();
-
     for path in untracked {
         let full = root.join(&path);
         let binary;
@@ -846,7 +941,7 @@ pub async fn capture_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, En
                         }
                     }
                 }
-                Err(_) => continue, // vanished between status and read
+                Err(_) => continue,
             }
         }
         files.push(DiffFileSummary {
@@ -888,7 +983,12 @@ pub async fn capture_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, En
 
 #[cfg(test)]
 mod watch_budget_tests {
-    use super::{MAX_WATCH_DIRS, exceeds_watch_budget};
+
+    use super::{
+        MAX_WATCH_DIRS, build_ignore_matcher, event_needs_capture, exceeds_watch_budget,
+        parse_status_v2, split_numstat_patch,
+    };
+    use crate::repos::CheckoutIdentity;
 
     #[test]
     fn small_tree_is_watchable() {
@@ -921,5 +1021,57 @@ mod watch_budget_tests {
         // A self-referential symlink cycle must not send the walk into a spin.
         std::os::unix::fs::symlink(root.join("real"), root.join("real/inner/loop")).unwrap();
         assert!(!exceeds_watch_budget(root)); // terminates, under budget
+    }
+
+    #[test]
+    fn ignored_output_events_do_not_kick_capture() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), "dist/\ntarget/\n").unwrap();
+        let identity = CheckoutIdentity {
+            id: "checkout".into(),
+            root: tmp.path().into(),
+            git_dir: tmp.path().join(".git"),
+        };
+        let ignored = build_ignore_matcher(tmp.path());
+        let generated = notify::Event::new(notify::EventKind::Any)
+            .add_path(tmp.path().join("dist/artifact.js"));
+        let source =
+            notify::Event::new(notify::EventKind::Any).add_path(tmp.path().join("src/lib.rs"));
+        let outside = notify::Event::new(notify::EventKind::Any)
+            .add_path(tmp.path().parent().unwrap().join("outside"));
+        assert!(!event_needs_capture(&identity, &ignored, &generated));
+        assert!(event_needs_capture(&identity, &ignored, &source));
+        assert!(event_needs_capture(&identity, &ignored, &outside));
+
+        let tracked_root = tempfile::tempdir().unwrap();
+        let tracked_identity = CheckoutIdentity {
+            id: "tracked-checkout".into(),
+            root: tracked_root.path().into(),
+            git_dir: tracked_root.path().join(".git"),
+        };
+        let tracked_matcher = build_ignore_matcher(tracked_root.path());
+        let tracked_dist = notify::Event::new(notify::EventKind::Any)
+            .add_path(tracked_root.path().join("dist/tracked.js"));
+        assert!(event_needs_capture(
+            &tracked_identity,
+            &tracked_matcher,
+            &tracked_dist,
+        ));
+    }
+
+    #[test]
+    fn porcelain_v2_and_combined_diff_split_without_extra_git_calls() {
+        let status = b"# branch.oid abc123\0# branch.head main\0\
+1 .M N... 100644 100644 100644 a b src/lib.rs\0? new file.txt\0";
+        let (branch, head, files, untracked) = parse_status_v2(status);
+        assert_eq!(branch, "main");
+        assert_eq!(head, "abc123");
+        assert_eq!(files[0].path, "src/lib.rs");
+        assert_eq!(untracked, ["new file.txt"]);
+
+        let combined = b"1\t0\tsrc/lib.rs\0\0diff --git a/src/lib.rs b/src/lib.rs\n";
+        let (numstat, patch) = split_numstat_patch(combined);
+        assert_eq!(numstat, b"1\t0\tsrc/lib.rs");
+        assert!(patch.starts_with(b"diff --git "));
     }
 }

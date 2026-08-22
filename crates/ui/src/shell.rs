@@ -4151,13 +4151,8 @@ impl Shell {
                 capability.action_label(busy_elsewhere)
             }));
         let action_text = if attaching {
-            action_text
-                .with_animation(
-                    SharedString::from(format!("local-session-attach-{}", candidate.id)),
-                    motion::COMET_PULSE.animation().repeat(),
-                    |el, t| el.opacity(0.56 + 0.44 * t),
-                )
-                .into_any_element()
+            let delta = motion::pulse_delta(&motion::COMET_PULSE, cx.entity_id(), cx);
+            action_text.opacity(0.56 + 0.44 * delta).into_any_element()
         } else {
             action_text.into_any_element()
         };
@@ -7528,17 +7523,14 @@ impl Shell {
             return strip.into_any_element();
         };
         if state.scaffold_chat_starting(&chat_id) {
+            let delta = motion::pulse_delta(&COMET_PULSE, cx.entity_id(), cx);
             return strip
                 .child(
                     div()
                         .text_size(px(12.0))
                         .text_color(theme.text_muted)
-                        .child(SharedString::from("Starting Scaffold sandbox…"))
-                        .with_animation(
-                            SharedString::from(format!("scaffold-starting-{chat_id}")),
-                            COMET_PULSE.animation().repeat(),
-                            |label, delta| label.opacity(0.6 + 0.35 * delta),
-                        ),
+                        .opacity(0.6 + 0.35 * delta)
+                        .child(SharedString::from("Starting Scaffold sandbox…")),
                 )
                 .into_any_element();
         }
@@ -7570,17 +7562,14 @@ impl Shell {
             Indicator::Working => {
                 let word =
                     transcript::flavour_word(transcript::flavour_seed(&chat_id), elapsed_secs);
+                let delta = motion::pulse_delta(&COMET_PULSE, cx.entity_id(), cx);
                 strip
                     .child(
                         div()
                             .text_size(px(12.0))
                             .text_color(theme.text_muted)
-                            .child(SharedString::from(format!("{word}…")))
-                            .with_animation(
-                                SharedString::from(format!("working-text-{chat_id}")),
-                                COMET_PULSE.animation().repeat(),
-                                |label, delta| label.opacity(0.6 + 0.35 * delta),
-                            ),
+                            .opacity(0.6 + 0.35 * delta)
+                            .child(SharedString::from(format!("{word}…"))),
                     )
                     .child(
                         div()
@@ -7596,19 +7585,18 @@ impl Shell {
                 .text_color(theme.danger)
                 .child(SharedString::from("Run failed"))
                 .into_any_element(),
-            Indicator::None if sending => strip
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .text_color(theme.text_muted)
-                        .child(SharedString::from("Sending…"))
-                        .with_animation(
-                            "sending-text",
-                            COMET_PULSE.animation().repeat(),
-                            |label, delta| label.opacity(0.6 + 0.35 * delta),
-                        ),
-                )
-                .into_any_element(),
+            Indicator::None if sending => {
+                let delta = motion::pulse_delta(&COMET_PULSE, cx.entity_id(), cx);
+                strip
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme.text_muted)
+                            .opacity(0.6 + 0.35 * delta)
+                            .child(SharedString::from("Sending…")),
+                    )
+                    .into_any_element()
+            }
             Indicator::None => strip.into_any_element(),
         }
     }
