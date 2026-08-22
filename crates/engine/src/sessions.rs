@@ -311,16 +311,12 @@ struct Inner {
     route_restarts: Mutex<HashMap<String, RouteRestartState>>,
     /// Per-chat dispatch serialization. The weak values disappear when the
     /// final waiter leaves, while the map preserves one lock for all dispatches
-    /// that overlap grant preparation or harness startup.
+    /// that overlap authority preparation or harness startup.
     dispatch_locks: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     /// A route reservation exists from the first potentially-async replacement
     /// step through harness startup. Auth changes cancel stale preparations
     /// even before a live run handle exists.
     preparations: Mutex<HashMap<String, DispatchPreparation>>,
-    /// Last successfully prepared route per chat. Deliberately retained after
-    /// run removal so a changed no-live dispatch still clears the authenticated
-    /// upstream binding before asking for another grant.
-    last_routes: Mutex<HashMap<String, RunRoute>>,
     /// chat_id → broadcast hub (retained across runs so subscribers survive turns).
     hubs: Mutex<HashMap<String, broadcast::Sender<JournaledEvent>>>,
     statuses: Mutex<HashMap<String, Session>>,
@@ -376,7 +372,6 @@ impl SessionsEngine {
                 route_restarts: Mutex::new(HashMap::new()),
                 dispatch_locks: Mutex::new(HashMap::new()),
                 preparations: Mutex::new(HashMap::new()),
-                last_routes: Mutex::new(HashMap::new()),
                 hubs: Mutex::new(HashMap::new()),
                 statuses: Mutex::new(HashMap::new()),
                 sessions_tx,
@@ -505,13 +500,6 @@ impl SessionsEngine {
         route: &RunRoute,
     ) -> bool {
         !preparation.cancel.is_cancelled() && self.auth_identity() == route.auth_identity
-    }
-
-    fn no_live_route_requires_rebind(&self, chat_id: &str, requested: &RunRoute) -> bool {
-        // With no in-memory identity the engine may have restarted after the
-        // remote route became sticky but before any local run survived. Treat
-        // that state as unknown and rebind conservatively before first prepare.
-        lock(&self.inner.last_routes).get(chat_id) != Some(requested)
     }
 
     fn doc_handle(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
@@ -766,7 +754,6 @@ impl SessionsEngine {
             },
             Replace {
                 run_id: String,
-                route_changed: bool,
             },
         }
 
@@ -778,7 +765,6 @@ impl SessionsEngine {
                 None => ExistingRunDecision::None,
                 Some(handle) if handle.route != requested_route => ExistingRunDecision::Replace {
                     run_id: handle.run_id.clone(),
-                    route_changed: true,
                 },
                 Some(handle) => {
                     let was_turn_active = handle.turn_active;
@@ -786,7 +772,6 @@ impl SessionsEngine {
                     if !handle.steerable {
                         ExistingRunDecision::Replace {
                             run_id: handle.run_id.clone(),
-                            route_changed: false,
                         }
                     } else {
                         let message = SteerMessage {
@@ -796,7 +781,6 @@ impl SessionsEngine {
                         if handle.steer_tx.try_send(message.clone()).is_err() {
                             ExistingRunDecision::Replace {
                                 run_id: handle.run_id.clone(),
-                                route_changed: false,
                             }
                         } else {
                             let status = handle.mailbox_message_status(was_turn_active, message);
@@ -827,52 +811,26 @@ impl SessionsEngine {
             return Ok(run_id.clone());
         }
 
-        // Reserve before the first async teardown/rebind/prepare step. A second
+        // Reserve before the first potentially-async replacement or prepare step. A second
         // dispatch for this chat cannot pass the lock above, and an auth change
         // can cancel this route even though no replacement RunHandle exists yet.
         let preparation = self.reserve_preparation(chat_id, requested_route.clone());
-        let mut rebound = false;
         match existing {
-            ExistingRunDecision::Replace {
-                run_id,
-                route_changed,
-            } => {
+            ExistingRunDecision::Replace { run_id } => {
                 // Mailbox closed, non-steering harness, or route mismatch:
                 // settle the old run before issuing any replacement.
                 self.interrupt(chat_id).await?;
                 // `interrupt` is intentionally bounded for ordinary callers;
-                // route replacement must also await relay removal and upstream
-                // grant revocation, which happen before the handle disappears.
+                // route replacement must also await local relay removal, which
+                // happens before the handle disappears.
                 while self.is_live(chat_id, &run_id) {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-                if route_changed && let Some(relay) = self.inner.inference_relay.get() {
-                    if !self.preparation_auth_is_current(&preparation, &requested_route) {
-                        return Err(EngineError::Other(
-                            "authenticated route changed during dispatch preparation".into(),
-                        ));
-                    }
-                    relay.rebind(chat_id).await?;
-                    rebound = true;
                 }
             }
             ExistingRunDecision::None => {}
             ExistingRunDecision::Routed { .. } => unreachable!("routed dispatch returned above"),
         }
 
-        if !self.preparation_auth_is_current(&preparation, &requested_route) {
-            return Err(EngineError::Other(
-                "authenticated route changed during dispatch preparation".into(),
-            ));
-        }
-        if !rebound
-            && self.no_live_route_requires_rebind(chat_id, &requested_route)
-            && let Some(relay) = self.inner.inference_relay.get()
-        {
-            // This includes restart state where the exact prior identity is
-            // unavailable. Rebind is deliberately before prepare/grant issuance.
-            relay.rebind(chat_id).await?;
-        }
         if !self.preparation_auth_is_current(&preparation, &requested_route) {
             return Err(EngineError::Other(
                 "authenticated route changed during dispatch preparation".into(),
@@ -896,14 +854,12 @@ impl SessionsEngine {
             if let (Some(relay), Some(route)) =
                 (self.inner.inference_relay.get(), inference.as_ref())
             {
-                relay.remove(&route.token).await;
-                relay.rebind(chat_id).await?;
+                relay.remove(&route.token);
             }
             return Err(EngineError::Other(
                 "authenticated route changed during dispatch preparation".into(),
             ));
         }
-        lock(&self.inner.last_routes).insert(chat_id.to_string(), requested_route.clone());
         let inference_token = inference.as_ref().map(|route| route.token.clone());
         let handle = self.doc_handle(chat_id)?;
         handle.write_user_message(&user_id, &request.prompt, now_ms())?;
@@ -957,8 +913,7 @@ impl SessionsEngine {
             if let (Some(relay), Some(token)) =
                 (self.inner.inference_relay.get(), inference_token.as_deref())
             {
-                relay.remove(token).await;
-                relay.rebind(chat_id).await?;
+                relay.remove(token);
             }
             return Err(EngineError::Other(
                 "authenticated route changed during dispatch preparation".into(),
@@ -1017,7 +972,7 @@ impl SessionsEngine {
                 if let (Some(relay), Some(token)) =
                     (self.inner.inference_relay.get(), inference_token.as_deref())
                 {
-                    relay.remove(token).await;
+                    relay.remove(token);
                 }
                 let message = err.to_string();
                 let error_event = AgentEvent::Error {
@@ -1248,8 +1203,8 @@ impl SessionsEngine {
     }
 
     async fn interrupt_runs_with_stale_auth_identity(&self, current: &RunAuthIdentity) {
-        // Preparations precede live handles. Cancel them first so a grant that
-        // returns under a different owner/project is revoked instead of launched.
+        // Preparations precede live handles. Cancel them first so an authority
+        // that returns under a different owner/project is removed instead of launched.
         for preparation in lock(&self.inner.preparations).values() {
             if &preparation.route.auth_identity != current {
                 preparation.cancel.cancel();
@@ -2099,7 +2054,7 @@ async fn drive_run(
             if let (Some(relay), Some(token)) =
                 (inner.inference_relay.get(), inference_token.as_deref())
             {
-                relay.remove(token).await;
+                relay.remove(token);
             }
             inner.remove_run(&chat_id, &run_id);
             let engine = SessionsEngine {
@@ -2354,7 +2309,7 @@ async fn drive_run(
             .unwrap_or_default()
     };
     if let (Some(relay), Some(token)) = (inner.inference_relay.get(), inference_token.as_deref()) {
-        relay.remove(token).await;
+        relay.remove(token);
     }
     inner.remove_run(&chat_id, &run_id);
     inner.set_status(&chat_id, final_status, false);
@@ -2689,29 +2644,6 @@ mod tests {
         assert!(preparation.cancel.is_cancelled());
     }
 
-    #[test]
-    fn no_live_changed_or_restart_unknown_route_requires_rebind() {
-        let dir = tempfile::tempdir().unwrap();
-        let sessions = bare_sessions(&dir.path().join("journal"));
-        let route = test_route(HarnessId::Codex);
-
-        assert!(
-            sessions.no_live_route_requires_rebind("chat-a", &route),
-            "restart-unknown route state must fail closed"
-        );
-        lock(&sessions.inner.last_routes).insert("chat-a".into(), route.clone());
-        assert!(!sessions.no_live_route_requires_rebind("chat-a", &route));
-        assert!(
-            sessions.no_live_route_requires_rebind("chat-a", &test_route(HarnessId::ClaudeCode))
-        );
-        let mut changed_model = route.clone();
-        changed_model.model = Some("gpt-5.6-terra".into());
-        assert!(sessions.no_live_route_requires_rebind("chat-a", &changed_model));
-
-        let mut changed_account = route.clone();
-        changed_account.agent_account_id = Some("account-b".into());
-        assert!(sessions.no_live_route_requires_rebind("chat-a", &changed_account));
-    }
     struct TakeoverHarness {
         runs: Arc<std::sync::atomic::AtomicUsize>,
         stops: Arc<std::sync::atomic::AtomicUsize>,

@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use chrono::{DateTime, TimeDelta, Utc};
-use futures::{Stream, StreamExt, stream};
+use futures::{Stream, StreamExt};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
@@ -14,46 +14,33 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::error::Error;
-use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener as StdTcpListener};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tempfile::TempPath;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore, broadcast};
-use tokio_util::io::ReaderStream;
 
 use comet_harness::InferenceRoute;
-use comet_proto::{AgentRoutingMode, HarnessId};
+use comet_proto::HarnessId;
 
-use crate::scaffold::{
-    AgentInferenceAccess, AgentInferenceGrant, AgentInferenceGrantRequest, ScaffoldClient,
-};
+use crate::scaffold::{AgentInferenceAuthority, AgentInferenceProxyRequest, ScaffoldClient};
 use crate::{EngineError, new_id};
+
+#[derive(Clone)]
+struct InferenceRouteRequest {
+    logical_session_id: String,
+    provider: String,
+    model: String,
+    requested_account_id: Option<String>,
+    lifecycle_epoch: u64,
+}
 
 const MAX_CONNECTIONS: usize = 64;
 const REFRESH_SKEW_SECONDS: i64 = 60;
-const MAX_ACCOUNT_FAILOVERS: usize = 1;
-const MAX_TRANSPORT_REPLAYS: usize = 1;
 const RETIRED_ROUTE_TTL: Duration = Duration::from_secs(30 * 60);
-
-struct RequestSpool {
-    path: TempPath,
-    content_length: u64,
-}
-
-impl RequestSpool {
-    async fn body(&self) -> io::Result<reqwest::Body> {
-        let file = tokio::fs::File::open(&self.path).await?;
-        Ok(reqwest::Body::wrap_stream(ReaderStream::new(
-            file.take(self.content_length),
-        )))
-    }
-}
 
 type BoxError = Box<dyn Error + Send + Sync>;
 type RelayBody = UnsyncBoxBody<Bytes, BoxError>;
@@ -80,11 +67,11 @@ struct Inner {
 }
 
 struct Route {
-    request: AgentInferenceGrantRequest,
+    request: InferenceRouteRequest,
     /// Original local chat id when Agent Auth needs a UUID projection.
     local_session_id: Option<String>,
     owner_subject: String,
-    grant: AsyncMutex<GrantState>,
+    authority: AsyncMutex<AuthorityState>,
     cancellation: comet_harness::CancellationToken,
 }
 
@@ -96,8 +83,8 @@ impl Route {
     }
 }
 
-struct GrantState {
-    access: AgentInferenceAccess,
+struct AuthorityState {
+    authority: AgentInferenceAuthority,
     expires_at: DateTime<Utc>,
 }
 
@@ -296,22 +283,15 @@ fn agent_auth_logical_session_id(session_id: &str) -> Cow<'_, str> {
     Cow::Owned(uuid::Uuid::from_bytes(bytes).to_string())
 }
 
-fn inference_grant_request(
+fn inference_route_request(
     logical_session_id: &str,
     harness: HarnessId,
     selected_model: Option<&str>,
     requested_account_id: Option<&str>,
     lifecycle_epoch: u64,
-) -> Result<Option<AgentInferenceGrantRequest>, EngineError> {
+) -> Result<Option<InferenceRouteRequest>, EngineError> {
     let Some((provider, model)) = inference_binding(harness, selected_model) else {
         return Ok(None);
-    };
-    let harness = match harness {
-        HarnessId::Codex => "codex",
-        HarnessId::ClaudeCode => "claude-code",
-        HarnessId::Omp => "omp",
-        HarnessId::PrimeAgent => "prime-agent",
-        _ => return Ok(None),
     };
     let requested_account_id = requested_account_id.map(str::trim).map(str::to_string);
     if requested_account_id.as_deref() == Some("") {
@@ -319,17 +299,10 @@ fn inference_grant_request(
             "Agent Auth account selection cannot be empty".into(),
         ));
     }
-    let routing_mode = if requested_account_id.is_some() {
-        AgentRoutingMode::Pinned
-    } else {
-        AgentRoutingMode::Automatic
-    };
-    Ok(Some(AgentInferenceGrantRequest {
+    Ok(Some(InferenceRouteRequest {
         logical_session_id: logical_session_id.to_string(),
         provider: provider.to_string(),
         model,
-        harness: harness.to_string(),
-        routing_mode,
         requested_account_id,
         lifecycle_epoch,
     }))
@@ -392,7 +365,7 @@ impl InferenceRelay {
         let agent_auth_session_id = agent_auth_logical_session_id(session_id);
         let local_session_id =
             matches!(&agent_auth_session_id, Cow::Owned(_)).then(|| session_id.to_string());
-        let Some(request) = inference_grant_request(
+        let Some(request) = inference_route_request(
             agent_auth_session_id.as_ref(),
             harness,
             model,
@@ -403,24 +376,27 @@ impl InferenceRelay {
             tracing::debug!(?harness, "inference relay skipped for unsupported harness");
             return Ok(None);
         };
-        let access = self
+        let authority = self
             .inner
             .client
-            .issue_agent_inference_grant(&request, &comet_harness::CancellationToken::new())
+            .issue_agent_inference_authority(&comet_harness::CancellationToken::new())
             .await
             .map_err(|error| {
-                EngineError::Other(format!("Agent Auth grant issuance failed: {error}"))
+                EngineError::Other(format!("Agent Auth authority issuance failed: {error}"))
             })?;
-        let expires_at = validate_access(&access, &request)?;
+        let expires_at = validate_authority(&authority)?;
         let provider = request.provider.clone();
         let model = request.model.clone();
-        let owner_subject = access.route_identity().to_string();
+        let owner_subject = authority.principal_id.clone();
         let route = Arc::new(Route {
             request,
             local_session_id,
             owner_subject: owner_subject.clone(),
             cancellation: comet_harness::CancellationToken::new(),
-            grant: AsyncMutex::new(GrantState { access, expires_at }),
+            authority: AsyncMutex::new(AuthorityState {
+                authority,
+                expires_at,
+            }),
         });
         let local_token = {
             let mut state = lock(&self.inner.route_state);
@@ -439,19 +415,7 @@ impl InferenceRelay {
         }))
     }
 
-    pub(crate) async fn rebind(&self, session_id: &str) -> Result<(), EngineError> {
-        let agent_auth_session_id = agent_auth_logical_session_id(session_id);
-        self.inner
-            .client
-            .rebind_agent_inference_route(
-                agent_auth_session_id.as_ref(),
-                &comet_harness::CancellationToken::new(),
-            )
-            .await
-            .map_err(|error| EngineError::Other(format!("Agent Auth route rebind failed: {error}")))
-    }
-
-    pub(crate) async fn remove(&self, local_token: &str) {
+    pub(crate) fn remove(&self, local_token: &str) {
         let route = {
             let mut state = lock(&self.inner.route_state);
             state.prune_retired();
@@ -481,24 +445,8 @@ impl InferenceRelay {
             }
             route
         };
-        let Some(route) = route else {
-            return;
-        };
-        route.cancellation.cancel();
-        if let Err(error) = self
-            .inner
-            .client
-            .revoke_agent_inference_grants(
-                &route.request.logical_session_id,
-                &comet_harness::CancellationToken::new(),
-            )
-            .await
-        {
-            tracing::warn!(
-                session_id = %route.request.logical_session_id,
-                err = %error,
-                "inference grant revocation failed"
-            );
+        if let Some(route) = route {
+            route.cancellation.cancel();
         }
     }
 
@@ -670,20 +618,10 @@ impl InferenceRelay {
             session_id: route.request.logical_session_id.clone(),
             request_id: request_id.clone(),
         };
-        let spool = match spool_request_body(request.into_body(), content_length).await {
-            Ok(spool) => spool,
+        let authority = match self.current_authority(&route).await {
+            Ok(authority) => authority,
             Err(error) => {
-                tracing::warn!(err = %error, "inference relay rejected request body");
-                return json_response(
-                    StatusCode::BAD_REQUEST,
-                    json!({ "error": "inference_body_invalid" }),
-                );
-            }
-        };
-        let mut access = match self.current_grant(&route).await {
-            Ok(access) => access,
-            Err(error) => {
-                tracing::warn!(err = %error, "inference relay grant refresh failed");
+                tracing::warn!(err = %error, "inference relay authority refresh failed");
                 return json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     json!({ "error": "agent_auth_unavailable" }),
@@ -691,410 +629,76 @@ impl InferenceRelay {
             }
         };
         let cancellation = route.cancellation.clone();
-        let sanitized_headers = sanitize_request_headers(headers);
-        let mut account_failovers = 0_usize;
-        let mut transport_replays = 0_usize;
-        loop {
-            let body = match spool.body().await {
-                Ok(body) => body,
-                Err(error) => {
-                    tracing::warn!(err = %error, "inference relay could not replay request body");
-                    return json_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        json!({ "error": "inference_body_unavailable" }),
-                    );
-                }
-            };
-            let upstream = match self
-                .inner
-                .client
-                .proxy_agent_inference(crate::scaffold::AgentInferenceProxyRequest {
-                    endpoint,
-                    query,
-                    access: &access,
-                    conversation_id: &route.request.logical_session_id,
-                    requested_account_id: route.request.requested_account_id.as_deref(),
-                    request_id: &request_id,
-                    headers: sanitized_headers.clone(),
-                    content_length,
-                    body,
-                    cancellation: &cancellation,
-                })
-                .await
-            {
-                Ok(response) => response,
-                Err(error) if !access.is_v2() && transport_replays < MAX_TRANSPORT_REPLAYS => {
-                    transport_replays += 1;
-                    tracing::warn!(
-                        err = %error,
-                        attempt = transport_replays,
-                        "inference relay upstream failed before response headers; replaying request"
-                    );
-                    continue;
-                }
-                Err(error) => {
-                    tracing::warn!(err = %error, "inference relay upstream failed");
-                    return json_response(
-                        StatusCode::BAD_GATEWAY,
-                        json!({ "error": "inference_upstream_unavailable" }),
-                    );
-                }
-            };
-            if access.is_v2() {
-                return stream_response(upstream, cancellation, stream_context.clone());
-            }
-            let AgentInferenceAccess::V1(grant) = &access else {
-                unreachable!("v2 responses return before v1 failover handling");
-            };
-            if account_failovers >= MAX_ACCOUNT_FAILOVERS {
-                return stream_response(upstream, cancellation, stream_context.clone());
-            }
-            let (upstream, failure_class) = retryable_response(
-                &route.request,
-                grant,
-                upstream,
-                cancellation.clone(),
-                stream_context.clone(),
-            )
+        let body = reqwest::Body::wrap_stream(request.into_body().into_data_stream());
+        let upstream = self
+            .inner
+            .client
+            .proxy_agent_inference(AgentInferenceProxyRequest {
+                endpoint,
+                query,
+                authority: &authority,
+                conversation_id: &route.request.logical_session_id,
+                requested_account_id: route.request.requested_account_id.as_deref(),
+                request_id: &request_id,
+                headers: sanitize_request_headers(headers),
+                content_length,
+                body,
+                cancellation: &cancellation,
+            })
             .await;
-            let Some(failure_class) = failure_class else {
-                return upstream;
-            };
-            let retry_after_seconds = upstream
-                .headers()
-                .get(hyper::header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u64>().ok());
-            let replacement = self
-                .inner
-                .client
-                .report_agent_inference_failure(
-                    grant,
-                    failure_class,
-                    false,
-                    retry_after_seconds,
-                    &cancellation,
+        match upstream {
+            Ok(response) => stream_response(response, cancellation, stream_context),
+            Err(error) => {
+                tracing::warn!(err = %error, "inference relay upstream failed");
+                json_response(
+                    StatusCode::BAD_GATEWAY,
+                    json!({ "error": "inference_upstream_unavailable" }),
                 )
-                .await;
-            let replacement = match replacement {
-                Ok(Some(replacement)) => replacement,
-                Ok(None) => return upstream,
-                Err(error) => {
-                    tracing::warn!(err = %error, "inference relay failure report was rejected");
-                    return upstream;
-                }
-            };
-            if let Err(error) = self
-                .replace_current_grant(&route, replacement.clone())
-                .await
-            {
-                tracing::warn!(err = %error, "inference relay replacement grant was invalid");
-                return json_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    json!({ "error": "agent_auth_unavailable" }),
-                );
             }
-            drop(upstream);
-            account_failovers += 1;
-            access = AgentInferenceAccess::V1(replacement);
         }
     }
 
-    async fn current_grant(&self, route: &Route) -> Result<AgentInferenceAccess, EngineError> {
-        let mut current = route.grant.lock().await;
+    async fn current_authority(
+        &self,
+        route: &Route,
+    ) -> Result<AgentInferenceAuthority, EngineError> {
+        let mut current = route.authority.lock().await;
         if current.expires_at <= Utc::now() + TimeDelta::seconds(REFRESH_SKEW_SECONDS) {
-            let refreshed = self
+            let authority = self
                 .inner
                 .client
-                .issue_agent_inference_grant(
-                    &route.request,
-                    &comet_harness::CancellationToken::new(),
-                )
+                .issue_agent_inference_authority(&comet_harness::CancellationToken::new())
                 .await
                 .map_err(|error| {
-                    EngineError::Other(format!("Agent Auth grant renewal failed: {error}"))
+                    EngineError::Other(format!("Agent Auth authority renewal failed: {error}"))
                 })?;
-            let expires_at = validate_access(&refreshed, &route.request)?;
-            *current = GrantState {
-                access: refreshed,
+            let expires_at = validate_authority(&authority)?;
+            *current = AuthorityState {
+                authority,
                 expires_at,
             };
         }
-        Ok(current.access.clone())
-    }
-
-    async fn replace_current_grant(
-        &self,
-        route: &Route,
-        grant: AgentInferenceGrant,
-    ) -> Result<(), EngineError> {
-        let expires_at = validate_grant(&grant, &route.request)?;
-        *route.grant.lock().await = GrantState {
-            access: AgentInferenceAccess::V1(grant),
-            expires_at,
-        };
-        Ok(())
+        Ok(current.authority.clone())
     }
 }
 
-async fn spool_request_body(body: Incoming, content_length: u64) -> io::Result<RequestSpool> {
-    let (file, path) = tokio::task::spawn_blocking(|| -> io::Result<_> {
-        Ok(tempfile::NamedTempFile::new()?.into_parts())
-    })
-    .await
-    .map_err(io::Error::other)??;
-    let mut file = tokio::fs::File::from_std(file);
-    let mut stream = body.into_data_stream();
-    let mut observed = 0_u64;
-    while let Some(chunk) = stream.next().await {
-        let bytes = chunk.map_err(io::Error::other)?;
-        observed = observed.checked_add(bytes.len() as u64).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "inference request length overflow",
-            )
-        })?;
-        if observed > content_length {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "inference request exceeded declared length",
-            ));
-        }
-        file.write_all(&bytes).await?;
-    }
-    if observed != content_length {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "inference request did not match declared length",
-        ));
-    }
-    file.flush().await?;
-    drop(file);
-    Ok(RequestSpool {
-        path,
-        content_length,
-    })
-}
-
-async fn retryable_response(
-    request: &AgentInferenceGrantRequest,
-    grant: &AgentInferenceGrant,
-    upstream: reqwest::Response,
-    cancellation: comet_harness::CancellationToken,
-    stream_context: RelayStreamContext,
-) -> (Response<RelayBody>, Option<&'static str>) {
-    if request.routing_mode == AgentRoutingMode::Pinned || grant.binding.backend != "oauth" {
-        return (
-            stream_response(upstream, cancellation, stream_context),
-            None,
-        );
-    }
-    if upstream.status() == StatusCode::UNAUTHORIZED {
-        return (
-            stream_response(upstream, cancellation, stream_context),
-            Some("authentication_required"),
-        );
-    }
-    if upstream.status() != StatusCode::TOO_MANY_REQUESTS
-        || upstream
-            .headers()
-            .get(CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<usize>().ok())
-            .is_some_and(|length| length > MAX_FAILURE_RESPONSE_BYTES)
-    {
-        return (
-            stream_response(upstream, cancellation, stream_context),
-            None,
-        );
-    }
-
-    let status = upstream.status();
-    let headers = upstream.headers().clone();
-    let mut remaining = Box::pin(upstream.bytes_stream());
-    let mut chunks = Vec::new();
-    let mut observed = 0_usize;
-    while let Some(chunk) = remaining.next().await {
-        let chunk = match chunk {
-            Ok(chunk) => chunk,
-            Err(error) => {
-                let prefix = stream::iter(chunks.into_iter().map(Ok::<Bytes, BoxError>));
-                let failure = stream::once(async move { Err::<Bytes, BoxError>(Box::new(error)) });
-                return (
-                    instrumented_streamed_response(
-                        status,
-                        headers,
-                        Box::pin(prefix.chain(failure)),
-                        cancellation,
-                        stream_context,
-                    ),
-                    None,
-                );
-            }
-        };
-        observed = match observed.checked_add(chunk.len()) {
-            Some(observed) => observed,
-            None => {
-                chunks.push(chunk);
-                let prefix = stream::iter(chunks.into_iter().map(Ok::<Bytes, BoxError>));
-                let rest =
-                    remaining.map(|chunk| chunk.map_err(|error| -> BoxError { Box::new(error) }));
-                return (
-                    instrumented_streamed_response(
-                        status,
-                        headers,
-                        Box::pin(prefix.chain(rest)),
-                        cancellation,
-                        stream_context,
-                    ),
-                    None,
-                );
-            }
-        };
-        chunks.push(chunk);
-        if observed > MAX_FAILURE_RESPONSE_BYTES {
-            let prefix = stream::iter(chunks.into_iter().map(Ok::<Bytes, BoxError>));
-            let rest =
-                remaining.map(|chunk| chunk.map_err(|error| -> BoxError { Box::new(error) }));
-            return (
-                instrumented_streamed_response(
-                    status,
-                    headers,
-                    Box::pin(prefix.chain(rest)),
-                    cancellation,
-                    stream_context,
-                ),
-                None,
-            );
-        }
-    }
-
-    let mut body = Vec::with_capacity(observed);
-    for chunk in chunks {
-        body.extend_from_slice(&chunk);
-    }
-    let exhausted = confirmed_account_exhaustion(&body);
-    (
-        buffered_response(status, headers, Bytes::from(body)),
-        exhausted.then_some("account_exhausted"),
-    )
-}
-
-const MAX_FAILURE_RESPONSE_BYTES: usize = 64 * 1024;
-const ACCOUNT_EXHAUSTION_CODES: [&str; 3] = [
-    "insufficient_quota",
-    "subscription_limit_reached",
-    "usage_limit_reached",
-];
-const ACCOUNT_EXHAUSTION_TYPES: [&str; 3] = [
-    "rate_limit_error",
-    "usage_limit_error",
-    "usage_limit_reached",
-];
-
-fn confirmed_account_exhaustion(body: &[u8]) -> bool {
-    confirmed_account_exhaustion_payload(body)
-        || body
-            .split(|byte| *byte == b'\n')
-            .filter_map(|line| line.strip_prefix(b"data:"))
-            .any(confirmed_account_exhaustion_payload)
-}
-
-fn confirmed_account_exhaustion_payload(body: &[u8]) -> bool {
-    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return false;
-    };
-    let Some(payload) = payload.as_object() else {
-        return false;
-    };
-    let nested = payload.get("error").and_then(serde_json::Value::as_object);
-    let code = nested
-        .and_then(|error| error.get("code"))
-        .or_else(|| payload.get("code"))
-        .and_then(serde_json::Value::as_str);
-    let failure_type = nested
-        .and_then(|error| error.get("type"))
-        .or_else(|| payload.get("type"))
-        .and_then(serde_json::Value::as_str);
-    code.is_some_and(|code| {
-        ACCOUNT_EXHAUSTION_CODES
-            .iter()
-            .any(|expected| code.trim().eq_ignore_ascii_case(expected))
-    }) || failure_type.is_some_and(|failure_type| {
-        ACCOUNT_EXHAUSTION_TYPES
-            .iter()
-            .any(|expected| failure_type.trim().eq_ignore_ascii_case(expected))
-    })
-}
-
-fn validate_access(
-    access: &AgentInferenceAccess,
-    request: &AgentInferenceGrantRequest,
-) -> Result<DateTime<Utc>, EngineError> {
-    if let AgentInferenceAccess::V1(grant) = access {
-        return validate_grant(grant, request);
-    }
-    let AgentInferenceAccess::V2(authority) = access else {
-        unreachable!("AgentInferenceAccess has exactly two variants");
-    };
+fn validate_authority(authority: &AgentInferenceAuthority) -> Result<DateTime<Utc>, EngineError> {
     if authority.contract_version != 2
         || authority.token_type != "Bearer"
         || authority.authority_id.is_empty()
         || authority.principal_id.is_empty()
-        || access.token().is_empty()
+        || authority.token.is_empty()
     {
         return Err(EngineError::Other(
             "Agent Auth returned an invalid v2 authority".into(),
         ));
     }
-    let expires_at = DateTime::parse_from_rfc3339(access.expires_at())
+    let expires_at = DateTime::parse_from_rfc3339(&authority.expires_at)
         .map_err(|_| EngineError::Other("Agent Auth returned an invalid authority expiry".into()))?
         .with_timezone(&Utc);
     if expires_at <= Utc::now() {
         return Err(EngineError::Other(
             "Agent Auth returned an expired authority".into(),
-        ));
-    }
-    Ok(expires_at)
-}
-
-fn validate_grant(
-    grant: &AgentInferenceGrant,
-    request: &AgentInferenceGrantRequest,
-) -> Result<DateTime<Utc>, EngineError> {
-    let binding = &grant.binding;
-    let pinned_binding_invalid = request.routing_mode == AgentRoutingMode::Pinned
-        && (binding.backend != "oauth"
-            || binding.account_id.as_deref() != request.requested_account_id.as_deref()
-            || binding.account_generation.is_none());
-    let automatic_oauth_binding_invalid = request.routing_mode == AgentRoutingMode::Automatic
-        && binding.backend == "oauth"
-        && (binding.account_id.is_none() || binding.account_generation.is_none());
-    if grant.token.is_empty()
-        || binding.owner_subject.is_empty()
-        || binding.logical_session_id != request.logical_session_id
-        || binding.provider != request.provider
-        || binding.model != request.model
-        || binding.harness != request.harness
-        || binding.routing_mode != request.routing_mode
-        || binding.requested_account_id != request.requested_account_id
-        || binding.source != "comet-local"
-        || binding.lifecycle_epoch != request.lifecycle_epoch
-        || binding.environment != "local"
-        || !matches!(binding.backend.as_str(), "oauth" | "bifrost")
-        || pinned_binding_invalid
-        || automatic_oauth_binding_invalid
-    {
-        return Err(EngineError::Other(
-            "Agent Auth returned a mismatched inference grant".into(),
-        ));
-    }
-    let expires_at = DateTime::parse_from_rfc3339(&grant.expires_at)
-        .map_err(|_| EngineError::Other("Agent Auth returned an invalid grant expiry".into()))?
-        .with_timezone(&Utc);
-    if expires_at <= Utc::now() {
-        return Err(EngineError::Other(
-            "Agent Auth returned an expired inference grant".into(),
         ));
     }
     Ok(expires_at)
@@ -1150,7 +754,7 @@ fn sanitize_request_headers(mut headers: HeaderMap) -> HeaderMap {
     headers
 }
 
-fn model_catalog(request: &AgentInferenceGrantRequest) -> Response<RelayBody> {
+fn model_catalog(request: &InferenceRouteRequest) -> Response<RelayBody> {
     let (owned_by, api) = if request.provider == "anthropic" {
         ("anthropic", "anthropic-messages")
     } else {
@@ -1213,13 +817,6 @@ fn streamed_response(
 ) -> Response<RelayBody> {
     let stream = stream.map(|chunk| chunk.map(Frame::data));
     response_with_headers(status, headers, StreamBody::new(stream).boxed_unsync())
-}
-
-fn buffered_response(status: StatusCode, headers: HeaderMap, body: Bytes) -> Response<RelayBody> {
-    let body = Full::new(body)
-        .map_err(|never| match never {})
-        .boxed_unsync();
-    response_with_headers(status, headers, body)
 }
 
 fn response_with_headers(

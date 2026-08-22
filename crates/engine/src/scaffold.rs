@@ -13,13 +13,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use comet_harness::CancellationToken;
 use comet_proto::{
-    AgentAccountStatus, AgentRoute, AgentRouteReceipt, AgentRoutingMode,
-    CAPABILITY_SESSION_ANNOTATE, CAPABILITY_SESSION_CHAT, CAPABILITY_SESSION_CONTROL,
-    CAPABILITY_SESSION_ENVIRONMENT, CAPABILITY_SESSION_FILES, CAPABILITY_SESSION_READ,
-    CollaborationScope, OmpSessionArtifact, ScaffoldControlGrant, ScaffoldDatabaseEnvironment,
-    ScaffoldEnvironmentControl, ScaffoldEnvironmentControlResult, ScaffoldEnvironmentLinks,
-    ScaffoldEnvironmentSnapshot, SessionEnvironment, SessionEnvironmentSource,
-    SessionRoomProjection,
+    AgentAccountStatus, AgentRoute, AgentRouteReceipt, CAPABILITY_SESSION_ANNOTATE,
+    CAPABILITY_SESSION_CHAT, CAPABILITY_SESSION_CONTROL, CAPABILITY_SESSION_ENVIRONMENT,
+    CAPABILITY_SESSION_FILES, CAPABILITY_SESSION_READ, CollaborationScope, OmpSessionArtifact,
+    ScaffoldControlGrant, ScaffoldDatabaseEnvironment, ScaffoldEnvironmentControl,
+    ScaffoldEnvironmentControlResult, ScaffoldEnvironmentLinks, ScaffoldEnvironmentSnapshot,
+    SessionEnvironment, SessionEnvironmentSource, SessionRoomProjection,
 };
 use comet_rpc::TokenSource;
 use reqwest::{Method, StatusCode, Url};
@@ -42,13 +41,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn routing_mode_value(mode: AgentRoutingMode) -> &'static str {
-    match mode {
-        AgentRoutingMode::Automatic => "automatic",
-        AgentRoutingMode::Pinned => "pinned",
-    }
 }
 
 fn scaffold_http_client(
@@ -124,13 +116,6 @@ pub struct ScaffoldClient {
     origin: Url,
     project_scope: String,
     bearer: Arc<dyn TokenSource>,
-    agent_auth_contract: AgentAuthContract,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AgentAuthContract {
-    V1,
-    V2,
 }
 
 #[derive(Clone, Serialize)]
@@ -188,41 +173,9 @@ struct RemoteAgentAccountEnvelope {
     account: RemoteAgentAccount,
 }
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct AgentInferenceGrantRequest {
-    pub logical_session_id: String,
-    pub provider: String,
-    pub model: String,
-    pub harness: String,
-    pub routing_mode: AgentRoutingMode,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub requested_account_id: Option<String>,
-    pub lifecycle_epoch: u64,
-}
-
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct AgentInferenceGrantBinding {
-    pub owner_subject: String,
-    pub logical_session_id: String,
-    pub provider: String,
-    pub model: String,
-    pub harness: String,
-    pub routing_mode: AgentRoutingMode,
-    #[serde(default)]
-    pub requested_account_id: Option<String>,
-    pub source: String,
-    pub lifecycle_epoch: u64,
-    pub environment: String,
-    pub backend: String,
-    pub account_id: Option<String>,
-    pub account_generation: Option<u64>,
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct AgentInferenceAuthorityV2 {
+pub(crate) struct AgentInferenceAuthority {
     pub contract_version: u8,
     pub token: String,
     pub token_type: String,
@@ -231,51 +184,10 @@ pub(crate) struct AgentInferenceAuthorityV2 {
     pub expires_at: String,
 }
 
-#[derive(Clone)]
-pub(crate) enum AgentInferenceAccess {
-    V1(AgentInferenceGrant),
-    V2(AgentInferenceAuthorityV2),
-}
-
-impl AgentInferenceAccess {
-    pub(crate) fn token(&self) -> &str {
-        match self {
-            Self::V1(grant) => &grant.token,
-            Self::V2(authority) => &authority.token,
-        }
-    }
-
-    pub(crate) fn expires_at(&self) -> &str {
-        match self {
-            Self::V1(grant) => &grant.expires_at,
-            Self::V2(authority) => &authority.expires_at,
-        }
-    }
-
-    pub(crate) fn route_identity(&self) -> &str {
-        match self {
-            Self::V1(grant) => &grant.binding.owner_subject,
-            Self::V2(authority) => &authority.principal_id,
-        }
-    }
-
-    pub(crate) fn is_v2(&self) -> bool {
-        matches!(self, Self::V2(_))
-    }
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct AgentInferenceGrant {
-    pub token: String,
-    pub expires_at: String,
-    pub binding: AgentInferenceGrantBinding,
-}
-
 pub(crate) struct AgentInferenceProxyRequest<'a> {
     pub endpoint: &'a str,
     pub query: Option<&'a str>,
-    pub access: &'a AgentInferenceAccess,
+    pub authority: &'a AgentInferenceAuthority,
     pub conversation_id: &'a str,
     pub requested_account_id: Option<&'a str>,
     pub request_id: &'a str,
@@ -285,27 +197,11 @@ pub(crate) struct AgentInferenceProxyRequest<'a> {
     pub cancellation: &'a CancellationToken,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AgentInferenceFailureReport<'a> {
-    failure_class: &'a str,
-    response_started: bool,
-    retry_after_seconds: Option<u64>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AgentInferenceFailureResponse {
-    retry: bool,
-    grant: Option<AgentInferenceGrant>,
-}
-
 impl fmt::Debug for ScaffoldClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ScaffoldClient")
             .field("origin", &self.origin)
             .field("project_scope", &self.project_scope)
-            .field("agent_auth_contract", &self.agent_auth_contract)
             .field("bearer", &"<provider>")
             .finish()
     }
@@ -329,14 +225,8 @@ impl ScaffoldClient {
             inference_http,
             origin,
             project_scope,
-            agent_auth_contract: AgentAuthContract::V1,
             bearer,
         })
-    }
-
-    pub(crate) fn with_agent_auth_v2(mut self) -> Self {
-        self.agent_auth_contract = AgentAuthContract::V2;
-        self
     }
 
     pub fn project_scope(&self) -> &str {
@@ -395,32 +285,17 @@ impl ScaffoldClient {
         Ok(())
     }
 
-    pub(crate) async fn issue_agent_inference_grant(
+    pub(crate) async fn issue_agent_inference_authority(
         &self,
-        request: &AgentInferenceGrantRequest,
         cancellation: &CancellationToken,
-    ) -> Result<AgentInferenceAccess, ScaffoldError> {
-        match self.agent_auth_contract {
-            AgentAuthContract::V1 => {
-                let url = self
-                    .origin
-                    .join("/api/agent-auth/grants")
-                    .expect("static inference grant path");
-                self.request(Method::POST, url, Some(request), cancellation)
-                    .await
-                    .map(AgentInferenceAccess::V1)
-            }
-            AgentAuthContract::V2 => {
-                let url = self
-                    .origin
-                    .join("/api/agent-auth/v2/authority")
-                    .expect("static v2 authority path");
-                let body = serde_json::json!({});
-                self.request(Method::POST, url, Some(&body), cancellation)
-                    .await
-                    .map(AgentInferenceAccess::V2)
-            }
-        }
+    ) -> Result<AgentInferenceAuthority, ScaffoldError> {
+        let url = self
+            .origin
+            .join("/api/agent-auth/v2/authority")
+            .expect("static Agent Auth authority path");
+        let body = serde_json::json!({});
+        self.request(Method::POST, url, Some(&body), cancellation)
+            .await
     }
 
     pub(crate) async fn proxy_agent_inference(
@@ -430,7 +305,7 @@ impl ScaffoldClient {
         let AgentInferenceProxyRequest {
             endpoint,
             query,
-            access,
+            authority,
             conversation_id,
             requested_account_id,
             request_id,
@@ -439,11 +314,9 @@ impl ScaffoldClient {
             body,
             cancellation,
         } = proxy;
-        let path = match (access, endpoint) {
-            (AgentInferenceAccess::V1(_), "responses") => "/api/agent-auth/v1/responses",
-            (AgentInferenceAccess::V1(_), "messages") => "/api/agent-auth/v1/messages",
-            (AgentInferenceAccess::V2(_), "responses") => "/api/agent-auth/v2/responses",
-            (AgentInferenceAccess::V2(_), "messages") => "/api/agent-auth/v2/messages",
+        let path = match endpoint {
+            "responses" => "/api/agent-auth/v2/responses",
+            "messages" => "/api/agent-auth/v2/messages",
             _ => {
                 return Err(ScaffoldError::InvalidResponse(
                     "unsupported inference endpoint".into(),
@@ -479,141 +352,22 @@ impl ScaffoldClient {
         }
         let mut url = self.origin.join(path).expect("static inference proxy path");
         url.set_query(query);
-        let request = self
+        let mut request = self
             .inference_http
             .post(url)
             .headers(headers)
-            .bearer_auth(access.token())
+            .bearer_auth(&authority.token)
             .header(reqwest::header::CONTENT_LENGTH, content_length)
-            .header("x-agent-auth-request-id", request_id);
-        let mut request = match access {
-            AgentInferenceAccess::V1(grant) => request
-                .header("x-agent-auth-owner-subject", &grant.binding.owner_subject)
-                .header("x-agent-auth-session-id", &grant.binding.logical_session_id)
-                .header("x-agent-auth-provider", &grant.binding.provider)
-                .header("x-agent-auth-model", &grant.binding.model)
-                .header("x-agent-auth-harness", &grant.binding.harness)
-                .header("x-agent-auth-environment", &grant.binding.environment)
-                .header("x-agent-auth-source", &grant.binding.source)
-                .header(
-                    "x-agent-auth-routing-mode",
-                    routing_mode_value(grant.binding.routing_mode),
-                )
-                .header(
-                    "x-agent-auth-lifecycle-epoch",
-                    grant.binding.lifecycle_epoch.to_string(),
-                ),
-            AgentInferenceAccess::V2(_) => {
-                request.header("x-agent-auth-conversation-id", conversation_id)
-            }
-        };
-        if let Some(account_id) = match access {
-            AgentInferenceAccess::V1(grant) => grant.binding.requested_account_id.as_deref(),
-            AgentInferenceAccess::V2(_) => requested_account_id,
-        } {
-            let name = if access.is_v2() {
-                "x-agent-auth-account-id"
-            } else {
-                "x-agent-auth-requested-account-id"
-            };
-            request = request.header(name, account_id);
+            .header("x-agent-auth-request-id", request_id)
+            .header("x-agent-auth-conversation-id", conversation_id);
+        if let Some(account_id) = requested_account_id {
+            request = request.header("x-agent-auth-account-id", account_id);
         }
         let request = request.body(body);
         tokio::select! {
             response = request.send() => response.map_err(ScaffoldError::Transport),
             () = cancellation.cancelled() => Err(ScaffoldError::Cancelled),
         }
-    }
-
-    pub(crate) async fn report_agent_inference_failure(
-        &self,
-        grant: &AgentInferenceGrant,
-        failure_class: &str,
-        response_started: bool,
-        retry_after_seconds: Option<u64>,
-        cancellation: &CancellationToken,
-    ) -> Result<Option<AgentInferenceGrant>, ScaffoldError> {
-        let url = self
-            .origin
-            .join("/api/agent-auth/grants/failure")
-            .expect("static inference failure path");
-        let mut request = self
-            .http
-            .post(url)
-            .bearer_auth(&grant.token)
-            .header("x-agent-auth-owner-subject", &grant.binding.owner_subject)
-            .header("x-agent-auth-session-id", &grant.binding.logical_session_id)
-            .header("x-agent-auth-provider", &grant.binding.provider)
-            .header("x-agent-auth-model", &grant.binding.model)
-            .header("x-agent-auth-harness", &grant.binding.harness)
-            .header("x-agent-auth-source", &grant.binding.source)
-            .header("x-agent-auth-environment", &grant.binding.environment)
-            .header(
-                "x-agent-auth-routing-mode",
-                routing_mode_value(grant.binding.routing_mode),
-            )
-            .header(
-                "x-agent-auth-lifecycle-epoch",
-                grant.binding.lifecycle_epoch.to_string(),
-            );
-        if let Some(account_id) = &grant.binding.requested_account_id {
-            request = request.header("x-agent-auth-requested-account-id", account_id);
-        }
-        let request = request.json(&AgentInferenceFailureReport {
-            failure_class,
-            response_started,
-            retry_after_seconds,
-        });
-        let response = tokio::select! {
-            response = request.send() => response?,
-            () = cancellation.cancelled() => return Err(ScaffoldError::Cancelled),
-        };
-        let status = response.status();
-        let bytes = response.bytes().await?;
-        if !status.is_success() {
-            return Err(api_error(status, &bytes));
-        }
-        let reported: AgentInferenceFailureResponse = serde_json::from_slice(&bytes)
-            .map_err(|error| ScaffoldError::InvalidResponse(error.to_string()))?;
-        Ok(reported.retry.then_some(reported.grant).flatten())
-    }
-
-    pub(crate) async fn revoke_agent_inference_grants(
-        &self,
-        logical_session_id: &str,
-        cancellation: &CancellationToken,
-    ) -> Result<(), ScaffoldError> {
-        if self.agent_auth_contract == AgentAuthContract::V2 {
-            return Ok(());
-        }
-        let url = self
-            .origin
-            .join("api/agent-auth/grants/revoke")
-            .expect("static Agent Auth grant revocation path");
-        let body = serde_json::json!({ "logicalSessionId": logical_session_id });
-        let _: serde_json::Value = self
-            .request(Method::POST, url, Some(&body), cancellation)
-            .await?;
-        Ok(())
-    }
-
-    pub(crate) async fn rebind_agent_inference_route(
-        &self,
-        logical_session_id: &str,
-        cancellation: &CancellationToken,
-    ) -> Result<(), ScaffoldError> {
-        if self.agent_auth_contract == AgentAuthContract::V2 {
-            return Ok(());
-        }
-        let url = self
-            .origin
-            .join("/api/agent-auth/grants/rebind")
-            .expect("static Agent Auth route rebind path");
-        let body = serde_json::json!({ "logicalSessionId": logical_session_id });
-        let _: serde_json::Value = self
-            .request(Method::POST, url, Some(&body), cancellation)
-            .await?;
-        Ok(())
     }
 
     pub(crate) async fn get_agent_route_receipt(
@@ -2484,25 +2238,14 @@ mod tests {
         (origin, task)
     }
 
-    fn test_inference_grant() -> AgentInferenceGrant {
-        AgentInferenceGrant {
-            token: "remote-grant".into(),
-            expires_at: "2026-08-12T23:00:00Z".into(),
-            binding: AgentInferenceGrantBinding {
-                owner_subject: "owner-1".into(),
-                logical_session_id: "session-1".into(),
-                provider: "openai".into(),
-                model: "gpt-5.6-sol".into(),
-                harness: "omp".into(),
-                routing_mode: AgentRoutingMode::Automatic,
-                requested_account_id: None,
-                source: "comet-local".into(),
-                lifecycle_epoch: 1,
-                environment: "local".into(),
-                backend: "oauth".into(),
-                account_id: Some("account-1".into()),
-                account_generation: Some(1),
-            },
+    fn test_inference_authority() -> AgentInferenceAuthority {
+        AgentInferenceAuthority {
+            contract_version: 2,
+            token: "remote-authority".into(),
+            token_type: "Bearer".into(),
+            authority_id: "authority-1".into(),
+            principal_id: "identity:owner-1".into(),
+            expires_at: "2099-01-01T00:00:00Z".into(),
         }
     }
 
@@ -2557,13 +2300,12 @@ mod tests {
         )
         .unwrap();
         let cancellation = CancellationToken::new();
-        let grant = test_inference_grant();
-        let access = AgentInferenceAccess::V1(grant);
+        let authority = test_inference_authority();
         let response = client
             .proxy_agent_inference(AgentInferenceProxyRequest {
                 endpoint: "responses",
                 query: None,
-                access: &access,
+                authority: &authority,
                 conversation_id: "session-1",
                 requested_account_id: None,
                 request_id: "request-1",
@@ -2579,7 +2321,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_authority_and_messages_use_the_explicit_parallel_contract() {
+    async fn agent_auth_uses_the_canonical_v2_contract_by_default() {
         let authority = serde_json::json!({
             "contractVersion": 2,
             "token": "v2-authority-token",
@@ -2595,23 +2337,12 @@ mod tests {
             "project-a",
             Arc::new(StaticToken("owner-scoped-bearer".into())),
         )
-        .unwrap()
-        .with_agent_auth_v2();
+        .unwrap();
         let cancellation = CancellationToken::new();
-        let grant_request = AgentInferenceGrantRequest {
-            logical_session_id: "conversation-1".into(),
-            provider: "anthropic".into(),
-            model: "claude-sonnet-4-6".into(),
-            harness: "omp".into(),
-            routing_mode: AgentRoutingMode::Pinned,
-            requested_account_id: Some("account-1".into()),
-            lifecycle_epoch: 1,
-        };
-        let access = client
-            .issue_agent_inference_grant(&grant_request, &cancellation)
+        let authority = client
+            .issue_agent_inference_authority(&cancellation)
             .await
             .unwrap();
-        assert!(access.is_v2());
 
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("x-api-key", "local-loopback-token".parse().unwrap());
@@ -2623,7 +2354,7 @@ mod tests {
             .proxy_agent_inference(AgentInferenceProxyRequest {
                 endpoint: "messages",
                 query: Some("beta=true"),
-                access: &access,
+                authority: &authority,
                 conversation_id: "conversation-1",
                 requested_account_id: Some("account-1"),
                 request_id: "request-1",
@@ -2713,35 +2444,6 @@ mod tests {
             requests[0]
                 .to_ascii_lowercase()
                 .contains("authorization: bearer owner-scoped-bearer")
-        );
-    }
-
-    #[tokio::test]
-    async fn route_rebind_uses_the_authenticated_exact_contract() {
-        let (origin, captured) = mock_server(vec!["{}".into()]).await;
-        let client = ScaffoldClient::new(
-            origin,
-            "project-a",
-            Arc::new(StaticToken("owner-scoped-bearer".into())),
-        )
-        .unwrap();
-
-        client
-            .rebind_agent_inference_route("session-a", &CancellationToken::new())
-            .await
-            .unwrap();
-
-        let requests = captured.await.unwrap();
-        assert!(requests[0].starts_with("POST /api/agent-auth/grants/rebind HTTP/1.1"));
-        assert!(
-            requests[0]
-                .to_ascii_lowercase()
-                .contains("authorization: bearer owner-scoped-bearer")
-        );
-        let body = requests[0].split("\r\n\r\n").nth(1).unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(body).unwrap(),
-            serde_json::json!({ "logicalSessionId": "session-a" })
         );
     }
 

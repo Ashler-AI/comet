@@ -616,11 +616,6 @@ impl Engine {
         {
             let bearer: Arc<dyn comet_rpc::TokenSource> = Arc::new(auth.clone());
             let client = ScaffoldClient::new(scaffold_url, project_scope.clone(), bearer.clone())?;
-            let client = if agent_auth_v2_enabled()? {
-                client.with_agent_auth_v2()
-            } else {
-                client
-            };
             core.sessions
                 .set_inference_relay(inference_relay::InferenceRelay::start(client.clone())?);
             let grants = Arc::new(EdgeDeviceJoinGrantClient::new(&config.edge_url, bearer)?);
@@ -892,16 +887,6 @@ fn env_or(key: &str, default: &str) -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| default.to_string())
-}
-
-fn agent_auth_v2_enabled() -> Result<bool, EngineError> {
-    match env_or("COMET_AGENT_AUTH_VERSION", "1").as_str() {
-        "1" => Ok(false),
-        "2" => Ok(true),
-        value => Err(EngineError::Other(format!(
-            "unsupported COMET_AGENT_AUTH_VERSION: {value}"
-        ))),
-    }
 }
 
 fn ipc_port_from_env() -> u16 {
