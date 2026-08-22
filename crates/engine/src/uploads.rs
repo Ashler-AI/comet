@@ -1,12 +1,11 @@
 //! Uploads — attachment staging + the content-addressed edge mirror
 //! (feature-inventory §3.7 "Uploads"; port of comet's `uploads.ts`).
 //!
-//! The UI streams a file as base64 chunks (~60KB, sized for the relay when the
-//! target device is remote); chunks stage on disk under `{data_dir}/uploads/tmp/
-//! {uploadId}/{seq}.b64` (surviving an engine restart mid-upload, unlike comet's
-//! in-memory buffers), and `commit` assembles them into
-//! `{data_dir}/uploads/{id8}-{name}` and returns the absolute path, which the
-//! composer appends to the prompt so the agent can read the file from disk.
+//! The UI streams a file as independent base64 chunks (~60KB, sized for the
+//! relay when the target device is remote); chunks stage on disk under
+//! `{data_dir}/uploads/tmp/{uploadId}/{seq}.b64` (surviving an engine restart
+//! mid-upload), and `commit` decodes each chunk directly into
+//! `{data_dir}/uploads/{id8}-{name}` without buffering the whole attachment.
 //!
 //! On commit the assembled bytes are also mirrored to the edge, best-effort:
 //! `PUT {edge}/attachments/{sha256}` (bearer auth, content-addressed R2 —
@@ -20,6 +19,7 @@
 //! (the RPC layer supplies the cwd roots) — and only supported image types, as
 //! in comet.
 
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,9 +35,10 @@ use crate::repos::hex;
 
 /// A pending upload must finish within this window (covers slow mesh links).
 const STAGING_TTL: Duration = Duration::from_secs(10 * 60);
-/// Hard cap on an assembled file (matches the edge's 32MB attachment cap).
-const MAX_BYTES: u64 = 32 * 1024 * 1024;
-/// Multiple of 3 so independent base64 chunks concatenate losslessly.
+/// Individual RPC payload bound; aggregate upload size is intentionally unbounded.
+const MAX_CHUNK_B64_BYTES: usize = 60_000;
+/// The edge attachment API remains capped; larger files stay on the owning device.
+const MAX_EDGE_MIRROR_BYTES: u64 = 32 * 1024 * 1024;
 const READ_CHUNK_BYTES: u64 = 45_000;
 
 /// `ReadAttachmentChunk` reply.
@@ -98,25 +99,15 @@ impl Uploads {
             Some(seq) => seq,
             None => next_free_seq(&dir)?,
         };
-        if at > 1_000_000 {
-            return Err(EngineError::Other("Invalid chunk index".into()));
+        if data.len() > MAX_CHUNK_B64_BYTES {
+            return Err(EngineError::Other("Upload chunk is too large".into()));
         }
-        // Base64 inflates by ~4/3; bound the staged payload against the file cap.
-        let staged: u64 = chunk_files(&dir)?
-            .iter()
-            .filter(|(seq, _)| *seq != at)
-            .map(|(_, path)| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
-            .sum();
-        if (staged + data.len() as u64) * 3 / 4 > MAX_BYTES {
-            let _ = std::fs::remove_dir_all(&dir);
-            return Err(EngineError::Other("Upload too large".into()));
-        }
-        std::fs::write(dir.join(format!("{at:06}.b64")), data)?;
+        std::fs::write(dir.join(format!("{at:020}.b64")), data)?;
         Ok(())
     }
 
-    /// Assemble the staged chunks into a durable file and return its absolute
-    /// path. Also mirrors the bytes to the edge (content-addressed), best-effort.
+    /// Decode staged chunks into a durable file and return its absolute path.
+    /// Decoding and hashing stay chunk-bounded regardless of total file size.
     pub fn commit(&self, upload_id: &str, file_name: &str) -> Result<String, EngineError> {
         let dir = self.staging_dir(upload_id)?;
         let mut parts = chunk_files(&dir)?;
@@ -124,29 +115,42 @@ impl Uploads {
             return Err(EngineError::Other("Unknown or expired upload".into()));
         }
         parts.sort_by_key(|(seq, _)| *seq);
-        // Positional appends may leave holes if a chunk never arrived — joining
-        // around them would silently corrupt the file.
-        let mut joined = String::new();
-        for (i, (seq, path)) in parts.iter().enumerate() {
-            if *seq != i as u64 {
-                return Err(EngineError::Other("Upload is missing a chunk".into()));
-            }
-            joined.push_str(std::fs::read_to_string(path)?.trim());
-        }
-        let bytes = BASE64
-            .decode(joined.as_bytes())
-            .map_err(|e| EngineError::Other(format!("upload is not valid base64: {e}")))?;
-        if bytes.len() as u64 > MAX_BYTES {
-            let _ = std::fs::remove_dir_all(&dir);
-            return Err(EngineError::Other("Upload too large".into()));
-        }
         std::fs::create_dir_all(&self.inner.dir)?;
         let name = sanitize(file_name);
         let id8: String = upload_id.chars().take(8).collect();
         let path = self.inner.dir.join(format!("{id8}-{name}"));
-        std::fs::write(&path, &bytes)?;
+        let pending_path = self.inner.dir.join(format!(".{id8}-{name}.uploading"));
+        let assembled = (|| -> Result<(String, u64), EngineError> {
+            let mut output = BufWriter::new(std::fs::File::create(&pending_path)?);
+            let mut hash = Sha256::new();
+            let mut size = 0u64;
+            for (index, (seq, chunk_path)) in parts.iter().enumerate() {
+                if *seq != index as u64 {
+                    return Err(EngineError::Other("Upload is missing a chunk".into()));
+                }
+                let encoded = std::fs::read(chunk_path)?;
+                let bytes = BASE64.decode(encoded).map_err(|error| {
+                    EngineError::Other(format!("upload is not valid base64: {error}"))
+                })?;
+                output.write_all(&bytes)?;
+                hash.update(&bytes);
+                size = size
+                    .checked_add(bytes.len() as u64)
+                    .ok_or_else(|| EngineError::Other("Upload size overflow".into()))?;
+            }
+            output.flush()?;
+            Ok((hex(&hash.finalize()), size))
+        })();
+        let (sha, size) = match assembled {
+            Ok(assembled) => assembled,
+            Err(error) => {
+                let _ = std::fs::remove_file(&pending_path);
+                return Err(error);
+            }
+        };
+        std::fs::rename(&pending_path, &path)?;
         let _ = std::fs::remove_dir_all(&dir);
-        self.mirror_to_edge(&path, bytes);
+        self.mirror_to_edge(&path, sha, size);
         Ok(path.to_string_lossy().to_string())
     }
 
@@ -200,8 +204,8 @@ impl Uploads {
         Ok(self.inner.tmp.join(upload_id))
     }
 
-    /// Reclaim staging dirs whose newest chunk is older than the TTL (an upload
-    /// abandoned mid-stream must not hold up to 32MB forever).
+    /// Reclaim staging dirs whose newest chunk is older than the TTL so an
+    /// abandoned upload cannot retain disk indefinitely.
     fn sweep(&self) {
         let Ok(entries) = std::fs::read_dir(&self.inner.tmp) else {
             return;
@@ -239,9 +243,6 @@ impl Uploads {
         if !meta.is_file() {
             return Err(EngineError::Other("Attachment is not a file".into()));
         }
-        if meta.len() > MAX_BYTES {
-            return Err(EngineError::Other("Attachment is too large".into()));
-        }
         let mime_type = mime_by_ext(&resolved)
             .ok_or_else(|| EngineError::Other("Attachment is not a supported image".into()))?;
         Ok(InspectedFile {
@@ -256,19 +257,25 @@ impl Uploads {
     }
 
     /// Best-effort content-addressed mirror (`PUT /attachments/{sha256}`, bearer
-    /// auth). Failures only log — local commit already succeeded.
-    fn mirror_to_edge(&self, path: &Path, bytes: Vec<u8>) {
+    /// auth). The edge API has its own 32MB limit; larger local uploads skip it.
+    fn mirror_to_edge(&self, path: &Path, sha: String, size: u64) {
         let Some(edge) = self.inner.edge.clone() else {
             return;
         };
-        let sha = hex(&Sha256::digest(&bytes));
+        if size > MAX_EDGE_MIRROR_BYTES {
+            tracing::debug!(sha = %sha, size, "attachment mirror skipped: exceeds edge limit");
+            return;
+        }
+        let Ok(bytes) = std::fs::read(path) else {
+            tracing::warn!(sha = %sha, "attachment mirror skipped: committed file unreadable");
+            return;
+        };
         let mime = mime_by_ext(path)
             .unwrap_or("application/octet-stream")
             .to_string();
         let url = format!("{}/attachments/{sha}", edge.url.trim_end_matches('/'));
         let http = self.inner.http.clone();
         tokio::spawn(async move {
-            // Fresh bearer per request — never the boot-time snapshot.
             let Some(bearer) = edge.bearer().await else {
                 tracing::warn!(sha = %sha, "attachment mirror skipped: signed out");
                 return;

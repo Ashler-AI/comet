@@ -193,9 +193,19 @@ mod tests {
                                 }
                                 other => panic!("unexpected control-plane path {other}"),
                             };
-                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(
-                                response.to_string(),
-                            ))))
+                            let mut response_builder = Response::builder();
+                            if matches!(
+                                path.as_str(),
+                                "/api/agent-auth/v2/responses" | "/api/agent-auth/v2/messages"
+                            ) {
+                                response_builder = response_builder
+                                    .header("x-agent-auth-selected-account-id", "account-actual");
+                            }
+                            Ok::<_, Infallible>(
+                                response_builder
+                                    .body(Full::new(Bytes::from(response.to_string())))
+                                    .unwrap(),
+                            )
                         }
                     });
                     hyper::server::conn::http1::Builder::new()
@@ -381,6 +391,10 @@ mod tests {
         assert_eq!(
             response.json::<Value>().await.unwrap(),
             json!({ "ok": true })
+        );
+        assert_eq!(
+            relay.selected_account_id("session-1").as_deref(),
+            Some("account-actual")
         );
 
         let captured = captured_rx.recv().await.unwrap();

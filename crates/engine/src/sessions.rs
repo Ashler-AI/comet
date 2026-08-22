@@ -428,6 +428,13 @@ impl SessionsEngine {
         });
     }
 
+    pub(crate) fn selected_agent_account_id(&self, chat_id: &str) -> Option<String> {
+        self.inner
+            .inference_relay
+            .get()
+            .and_then(|relay| relay.selected_account_id(chat_id))
+    }
+
     pub(crate) fn set_auth(&self, auth: crate::Auth) {
         let mut state_rx = auth.watch_state();
         if self.inner.auth.set(auth).is_err() {

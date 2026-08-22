@@ -101,13 +101,12 @@ async fn uploads_chunk_commit_readback_and_jail() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let uploads = Uploads::new(tmp.path(), None);
 
-    // 100KB of pseudo-random bytes, staged as three positional base64 chunks
-    // (out of order, with one retried) — chunk boundaries are multiples of 3
-    // bytes so independent base64 strings concatenate losslessly.
+    // Independently encoded chunks may contain padding before the final chunk;
+    // commit must decode each slot separately rather than concatenate base64.
     let payload: Vec<u8> = (0..100_002u32)
         .map(|i| (i.wrapping_mul(31) % 251) as u8)
         .collect();
-    let chunks: Vec<String> = payload.chunks(45_000).map(|c| BASE64.encode(c)).collect();
+    let chunks: Vec<String> = payload.chunks(40_001).map(|c| BASE64.encode(c)).collect();
     assert_eq!(chunks.len(), 3);
     uploads
         .append("up-1", &chunks[2], Some(2))
@@ -150,6 +149,25 @@ async fn uploads_chunk_commit_readback_and_jail() {
     assert!(
         uploads.commit("up-2", "holey.png").is_err(),
         "hole detected"
+    );
+
+    // Aggregate uploads are not limited by the edge mirror's 32MB cap.
+    let large_chunk = vec![0x5a; 45_000];
+    let large_chunk_b64 = BASE64.encode(&large_chunk);
+    let chunk_count = (32 * 1024 * 1024) / large_chunk.len() + 1;
+    for seq in 0..chunk_count {
+        uploads
+            .append("up-large", &large_chunk_b64, Some(seq as u64))
+            .expect("large upload chunk");
+    }
+    let large_path = uploads
+        .commit("up-large", "large.bin")
+        .expect("large upload commit");
+    assert_eq!(
+        std::fs::metadata(large_path)
+            .expect("large file metadata")
+            .len(),
+        (chunk_count * large_chunk.len()) as u64
     );
 
     // Path jail: files outside the uploads dir (and outside any allowed cwd

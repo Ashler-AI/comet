@@ -92,6 +92,8 @@ struct AuthorityState {
 struct RouteState {
     active: HashMap<String, Arc<Route>>,
     retired: HashMap<String, RetiredRoute>,
+    /// Last account confirmed by Agent Auth response headers for each local chat.
+    selected_accounts: HashMap<String, String>,
 }
 
 struct RetiredRoute {
@@ -348,6 +350,23 @@ impl InferenceRelay {
             logical_session_id: logical_session_id.to_string(),
             lifecycle_epoch,
         });
+    }
+
+    pub(crate) fn selected_account_id(&self, session_id: &str) -> Option<String> {
+        lock(&self.inner.route_state)
+            .selected_accounts
+            .get(session_id)
+            .cloned()
+    }
+
+    fn record_selected_account(&self, session_id: &str, account_id: &str) {
+        let account_id = account_id.trim();
+        if account_id.is_empty() {
+            return;
+        }
+        lock(&self.inner.route_state)
+            .selected_accounts
+            .insert(session_id.to_string(), account_id.to_string());
     }
 
     pub(crate) async fn prepare(
@@ -647,7 +666,16 @@ impl InferenceRelay {
             })
             .await;
         match upstream {
-            Ok(response) => stream_response(response, cancellation, stream_context),
+            Ok(response) => {
+                if let Some(account_id) = response
+                    .headers()
+                    .get("x-agent-auth-selected-account-id")
+                    .and_then(|value| value.to_str().ok())
+                {
+                    self.record_selected_account(route.session_id(), account_id);
+                }
+                stream_response(response, cancellation, stream_context)
+            }
             Err(error) => {
                 tracing::warn!(err = %error, "inference relay upstream failed");
                 json_response(

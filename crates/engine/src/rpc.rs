@@ -67,10 +67,11 @@ use comet_proto::{
     WorktreeDeletionStage,
 };
 use comet_rpc::{
-    GetAgentRouteReceiptParams, LinkCache, PeerMessageResult, PeerReplyResult, PeerWaitResult,
-    ReadCheckoutDiffParams, ReadCheckoutDiffResult, RemoveSessionRefResult, ReplyPeerMessageParams,
-    RpcError, RpcReply, RpcService, SendPeerMessageParams, SessionRefParams, WaitPeerReplyParams,
-    methods, parse_params,
+    GetAgentRouteAccountParams, GetAgentRouteAccountResult, GetAgentRouteReceiptParams, LinkCache,
+    PeerMessageResult, PeerReplyResult, PeerWaitResult, ReadCheckoutDiffParams,
+    ReadCheckoutDiffResult, RemoveSessionRefResult, ReplyPeerMessageParams, RpcError, RpcReply,
+    RpcService, SendPeerMessageParams, SessionRefParams, WaitPeerReplyParams, methods,
+    parse_params,
 };
 
 use crate::agent_accounts::AgentAccounts;
@@ -1190,6 +1191,8 @@ fn forwardable(method: &str) -> bool {
             | methods::UPLOAD_CHUNK
             | methods::UPLOAD_COMMIT
             | methods::READ_ATTACHMENT_CHUNK
+            // The serving account is observed by the inference relay on the host device.
+            | methods::GET_AGENT_ROUTE_ACCOUNT
             // Tool details come from the run journal on the device that ran
             // the turn.
             | methods::TOOL_CALL_DETAIL
@@ -2278,6 +2281,14 @@ impl RpcService for EngineRpc {
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
                 RpcReply::value(&receipt)
             }
+            methods::GET_AGENT_ROUTE_ACCOUNT => {
+                let p: GetAgentRouteAccountParams = parse_params(params)?;
+                RpcReply::value(&GetAgentRouteAccountResult {
+                    account_id: self
+                        .sessions
+                        .selected_agent_account_id(&p.logical_session_id),
+                })
+            }
             methods::LIST_AGENT_ACCOUNTS => {
                 self.require_agent_accounts()?;
                 let snapshot = self
@@ -2352,10 +2363,14 @@ impl RpcService for EngineRpc {
             }
             methods::UPLOAD_COMMIT => {
                 let p: UploadCommitParams = parse_params(params)?;
-                let path = self
-                    .uploads
-                    .commit(&p.upload_id, &p.file_name)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let uploads = self.uploads.clone();
+                let path =
+                    tokio::task::spawn_blocking(move || uploads.commit(&p.upload_id, &p.file_name))
+                        .await
+                        .map_err(|error| {
+                            RpcError::Failed(format!("upload commit task failed: {error}"))
+                        })?
+                        .map_err(|error| RpcError::Failed(error.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "path": path }))
             }
             methods::READ_ATTACHMENT_CHUNK => {
@@ -2431,6 +2446,24 @@ mod tests {
         assert_eq!(receipt.logical_session_id, "session-1");
         assert!(
             parse_params::<GetAgentRouteReceiptParams>(serde_json::json!({
+                "logicalSessionId": "session-1",
+                "ownerSubject": "caller-supplied-owner",
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn route_account_params_allow_only_device_targeting() {
+        let params: GetAgentRouteAccountParams = parse_params(serde_json::json!({
+            "logicalSessionId": "session-1",
+            "targetDeviceId": "device-1",
+        }))
+        .expect("route account params");
+        assert_eq!(params.logical_session_id, "session-1");
+        assert_eq!(params.target_device_id.as_deref(), Some("device-1"));
+        assert!(
+            parse_params::<GetAgentRouteAccountParams>(serde_json::json!({
                 "logicalSessionId": "session-1",
                 "ownerSubject": "caller-supplied-owner",
             }))

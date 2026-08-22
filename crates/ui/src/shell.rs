@@ -23,7 +23,7 @@ use gpui::{
 };
 
 use comet_doc::{SessionCommandPayload, SessionControlAction};
-use comet_rpc::methods;
+use comet_rpc::{GetAgentRouteAccountResult, methods};
 use gpui_tokio::Tokio;
 
 use crate::changes::{Changes, ChangesEvent};
@@ -1442,7 +1442,7 @@ pub struct Shell {
     /// Transcript projections painted outside the independently reactive Transcript.
     transcript_chrome: TranscriptChromeCache,
     /// External file drag hovering the conversation column — shows the
-    /// "Drop images to attach" veil over the whole chat area; a drop stages
+    /// "Drop files to attach" veil over the whole chat area; a drop stages
     /// the files in the composer.
     changes_sub: Option<Subscription>,
     file_drag_active: bool,
@@ -1512,6 +1512,13 @@ pub struct Shell {
     account_usage_loading: bool,
     account_usage_loaded_at: Option<Instant>,
     account_usage_task: Option<Task<()>>,
+    active_account_chat_id: Option<String>,
+    active_account_id: Option<String>,
+    active_account_loading: bool,
+    active_account_loaded_at: Option<Instant>,
+    active_account_task: Option<Task<()>>,
+    copied_worktree: Option<String>,
+    copied_worktree_task: Option<Task<()>>,
     scaffold_create_open: bool,
     scaffold_database_environment: comet_proto::ScaffoldDatabaseEnvironment,
     /// On-demand native session picker. Discovery starts only when this opens.
@@ -1746,6 +1753,13 @@ impl Shell {
             account_usage_loading: false,
             account_usage_loaded_at: None,
             account_usage_task: None,
+            active_account_chat_id: None,
+            active_account_id: None,
+            active_account_loading: false,
+            active_account_loaded_at: None,
+            active_account_task: None,
+            copied_worktree: None,
+            copied_worktree_task: None,
             session_import_open: false,
             session_import_target_chat: None,
             session_import_sections: Vec::new(),
@@ -1800,6 +1814,7 @@ impl Shell {
         let initial_connection = shell.state.read(cx).connection.clone();
         shell.sync_splash(&initial_connection, cx);
         shell.refresh_account_usage(cx);
+        shell.refresh_active_agent_account(cx);
         shell
     }
 
@@ -1858,6 +1873,9 @@ impl Shell {
             self.on_state_changed(state, cx);
         }
         let transcript_changed = self.transcript_chrome.refresh(state.read(cx), now);
+        if transcript_changed {
+            self.refresh_active_agent_account(cx);
+        }
         if state_changed || transcript_changed {
             cx.notify();
         }
@@ -1867,6 +1885,7 @@ impl Shell {
         if self.account_usage_loaded_at.is_none() && !self.account_usage_loading {
             self.refresh_account_usage(cx);
         }
+        self.refresh_active_agent_account(cx);
         if self.session_import_open {
             self.sync_session_import_sections(cx);
         }
@@ -2148,6 +2167,95 @@ impl Shell {
                             Some(format!("Account usage unavailable: {error}").into());
                     }
                 }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn refresh_active_agent_account(&mut self, cx: &mut Context<Self>) {
+        let (chat_id, target_device_id, configured_account_id) = {
+            let state = self.state.read(cx);
+            let Some(chat) = state.selected_chat_row() else {
+                self.active_account_chat_id = None;
+                self.active_account_id = None;
+                return;
+            };
+            (
+                chat.id.clone(),
+                Some(chat.device_id.clone()),
+                chat.config
+                    .as_ref()
+                    .and_then(|config| config.agent_account_id.clone()),
+            )
+        };
+        if self.active_account_chat_id.as_deref() != Some(chat_id.as_str()) {
+            self.active_account_task = None;
+            self.active_account_loading = false;
+            self.active_account_loaded_at = None;
+            self.active_account_chat_id = Some(chat_id.clone());
+            self.active_account_id = configured_account_id;
+        }
+        if self.active_account_loading
+            || self
+                .active_account_loaded_at
+                .is_some_and(|loaded_at| loaded_at.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.active_account_loading = true;
+        self.active_account_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::GET_AGENT_ROUTE_ACCOUNT,
+                    serde_json::json!({
+                        "logicalSessionId": chat_id,
+                        "targetDeviceId": target_device_id,
+                    }),
+                )
+                .await;
+            this.update(cx, |shell, cx| {
+                shell.active_account_loading = false;
+                shell.active_account_loaded_at = Some(Instant::now());
+                if shell.active_account_chat_id.as_deref() != Some(chat_id.as_str()) {
+                    return;
+                }
+                if let Ok(value) = result
+                    && let Ok(account) = serde_json::from_value::<GetAgentRouteAccountResult>(value)
+                    && account.account_id.is_some()
+                {
+                    shell.active_account_id = account.account_id;
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn copy_current_worktree(&mut self, cx: &mut Context<Self>) {
+        let path = {
+            let state = self.state.read(cx);
+            state
+                .selected_chat_row()
+                .and_then(|chat| chat.cwd.clone())
+                .or_else(|| state.selected_space_row().map(|space| space.path.clone()))
+        };
+        let Some(path) = path else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+        self.copied_worktree = Some(path);
+        self.copied_worktree_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1500))
+                .await;
+            this.update(cx, |shell, cx| {
+                shell.copied_worktree = None;
                 cx.notify();
             })
             .ok();
@@ -6641,49 +6749,45 @@ impl Shell {
         if remote.is_empty() {
             return None;
         }
-        let avatars = remote
-            .into_iter()
-            .take(5)
-            .enumerate()
-            .map(|(ix, participant)| {
-                let name: SharedString = participant
-                    .display_name
-                    .clone()
-                    .unwrap_or_else(|| participant.principal_subject.clone())
-                    .into();
-                let initials = crate::multiplayer::initials(name.as_ref());
-                let presence = match participant.state {
-                    comet_proto::ParticipantState::Active => theme.success,
-                    comet_proto::ParticipantState::Idle => theme.warning,
-                    comet_proto::ParticipantState::Disconnected => theme.text_faint,
-                };
-                div()
-                    .relative()
-                    .when(ix > 0, |el| el.ml(px(-6.0)))
-                    .size(px(24.0))
-                    .rounded_full()
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.surface_raised)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(9.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.text_muted)
-                    .child(SharedString::from(initials))
-                    .child(
-                        div()
-                            .absolute()
-                            .right(px(-1.0))
-                            .bottom(px(-1.0))
-                            .size(px(6.0))
-                            .rounded_full()
-                            .border_1()
-                            .border_color(theme.bg)
-                            .bg(presence),
-                    )
-            });
+        let avatars = remote.iter().enumerate().map(|(ix, participant)| {
+            let name: SharedString = participant
+                .display_name
+                .clone()
+                .unwrap_or_else(|| participant.principal_subject.clone())
+                .into();
+            let initials = crate::multiplayer::initials(name.as_ref());
+            let presence = match participant.state {
+                comet_proto::ParticipantState::Active => theme.success,
+                comet_proto::ParticipantState::Idle => theme.warning,
+                comet_proto::ParticipantState::Disconnected => theme.text_faint,
+            };
+            div()
+                .relative()
+                .when(ix > 0, |el| el.ml(px(-6.0)))
+                .size(px(24.0))
+                .rounded_full()
+                .border_1()
+                .border_color(theme.bg)
+                .bg(theme.surface_raised)
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(9.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.text_muted)
+                .child(SharedString::from(initials))
+                .child(
+                    div()
+                        .absolute()
+                        .right(px(-1.0))
+                        .bottom(px(-1.0))
+                        .size(px(6.0))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(theme.bg)
+                        .bg(presence),
+                )
+        });
         Some(
             div()
                 .absolute()
@@ -6717,14 +6821,22 @@ impl Shell {
         changes.update(cx, |changes, cx| changes.ensure_watch(cx));
         let changes_summary = changes.read(cx).summary(cx);
         let git_detected = self.space_git_detected(cx);
-        let branch: SharedString = self
-            .state
-            .read(cx)
-            .selected_chat_row()
-            .and_then(|chat| chat.branch.clone())
-            .filter(|branch| !branch.is_empty())
-            .unwrap_or_else(|| "Worktree".to_string())
-            .into();
+        let (branch, worktree_path) = {
+            let state = self.state.read(cx);
+            let chat = state.selected_chat_row();
+            let branch: SharedString = chat
+                .and_then(|chat| chat.branch.clone())
+                .filter(|branch| !branch.is_empty())
+                .unwrap_or_else(|| "Worktree".to_string())
+                .into();
+            let path = chat
+                .and_then(|chat| chat.cwd.clone())
+                .or_else(|| state.selected_space_row().map(|space| space.path.clone()));
+            (branch, path)
+        };
+        let worktree_copied = worktree_path
+            .as_deref()
+            .is_some_and(|path| self.copied_worktree.as_deref() == Some(path));
         let goal_groups = self.transcript_chrome.projection.goal_groups.clone();
         let active_goal = self.transcript_chrome.projection.active_goal.clone();
         let goal_total = goal_groups
@@ -6742,45 +6854,40 @@ impl Shell {
             .map(|(index, group)| render_goal_group(group, index, "workspace-goal", &theme))
             .collect::<Vec<_>>();
 
-        let account = self.account_usage.as_ref().and_then(|snapshot| {
-            snapshot
-                .accounts
-                .iter()
-                .find(|account| {
-                    !account.migration_available && Some(account.harness) == preferred_harness
-                })
-                .or_else(|| {
-                    snapshot.accounts.iter().find(|account| {
-                        !account.migration_available
-                            && account.harness == comet_proto::HarnessId::Codex
-                    })
-                })
-                .or_else(|| {
+        let account = self
+            .active_account_id
+            .as_ref()
+            .and_then(|active_account_id| {
+                self.account_usage.as_ref().and_then(|snapshot| {
                     snapshot
                         .accounts
                         .iter()
-                        .find(|account| !account.migration_available)
+                        .find(|account| {
+                            !account.migration_available && account.id == *active_account_id
+                        })
+                        .map(|account| {
+                            let provider = crate::multiplayer::harness_label(account.harness);
+                            let identity = account
+                                .display_name
+                                .as_deref()
+                                .or(account.email.as_deref())
+                                .unwrap_or(provider);
+                            let identity = account
+                                .plan_label
+                                .as_deref()
+                                .map(|plan| format!("{identity} · {plan}"))
+                                .unwrap_or_else(|| identity.to_string());
+                            (account.harness, identity, account.usage_windows.clone())
+                        })
                 })
-                .map(|account| {
-                    let provider = crate::multiplayer::harness_label(account.harness);
-                    let identity = account
-                        .display_name
-                        .as_deref()
-                        .or(account.email.as_deref())
-                        .unwrap_or(provider);
-                    let identity = account
-                        .plan_label
-                        .as_deref()
-                        .map(|plan| format!("{identity} · {plan}"))
-                        .unwrap_or_else(|| identity.to_string());
-                    (account.harness, identity, account.usage_windows.clone())
-                })
+            });
+        let (account_harness, account_identity, usage_windows) = account.unwrap_or_else(|| {
+            (
+                preferred_harness.unwrap_or(comet_proto::HarnessId::Codex),
+                self.active_account_id.clone().unwrap_or_default(),
+                Vec::new(),
+            )
         });
-        let (account_harness, account_identity, usage_windows) = account.unwrap_or((
-            preferred_harness.unwrap_or(comet_proto::HarnessId::Codex),
-            String::new(),
-            Vec::new(),
-        ));
         let account_icon = match account_harness {
             comet_proto::HarnessId::Codex => icons::OPENAI_MARK,
             comet_proto::HarnessId::ClaudeCode => icons::CLAUDE_MARK,
@@ -6866,16 +6973,15 @@ impl Shell {
                     )
             })
             .collect::<Vec<_>>();
-        let account_detail: SharedString =
-            if self.account_usage_loading && account_identity.is_empty() {
-                "Loading current account…".into()
-            } else if !account_identity.is_empty() {
-                account_identity.into()
-            } else if self.account_usage_error.is_some() {
-                "Usage unavailable".into()
-            } else {
-                "No active agent account".into()
-            };
+        let account_detail: SharedString = if !account_identity.is_empty() {
+            account_identity.into()
+        } else if self.active_account_loading || self.account_usage_loading {
+            "Resolving current account…".into()
+        } else if self.account_usage_error.is_some() {
+            "Usage unavailable".into()
+        } else {
+            "No routed agent account yet".into()
+        };
 
         let changes_row = div()
             .id("workspace-status-changes")
@@ -7085,11 +7191,20 @@ impl Shell {
             .overflow_hidden()
             .child(
                 div()
+                    .id("workspace-copy-worktree")
                     .px(px(14.0))
                     .pt(px(12.0))
                     .pb(px(10.0))
                     .flex()
                     .items_center()
+                    .when(worktree_path.is_some(), |el| {
+                        el.cursor_pointer()
+                            .hover(|style| style.bg(theme.element_hover))
+                            .tooltip(popover::text_tooltip("Copy worktree path"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.copy_current_worktree(cx);
+                            }))
+                    })
                     .child(
                         div()
                             .min_w_0()
@@ -7101,7 +7216,11 @@ impl Shell {
                                 div()
                                     .text_size(px(10.5))
                                     .text_color(theme.text_faint)
-                                    .child("Current worktree"),
+                                    .child(if worktree_copied {
+                                        "Worktree path copied"
+                                    } else {
+                                        "Current worktree"
+                                    }),
                             )
                             .child(
                                 div()
@@ -7258,7 +7377,7 @@ impl Shell {
         let status = self.render_status_strip(cx);
         // File dropzone over the ENTIRE conversation column (transcript +
         // composer, not just the pill): dragging OS files anywhere across the
-        // chat area shows the "Drop images to attach" veil; a drop stages the
+        // chat area shows the "Drop files to attach" veil; a drop stages the
         // files in the composer. `has_active_drag` gates the veil so a drag
         // that left the window (FileDrop Exited) can't strand it.
         let file_drag_active = self.file_drag_active && cx.has_active_drag();
@@ -7331,7 +7450,7 @@ impl Shell {
                         .justify_center()
                         .text_size(px(13.0))
                         .text_color(theme.text)
-                        .child("Drop images to attach"),
+                        .child("Drop files to attach"),
                 )
             });
         let workspace_status = has_selection.then(|| self.render_workspace_status(cx));

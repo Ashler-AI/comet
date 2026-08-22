@@ -127,6 +127,8 @@ pub mod methods {
     pub const CANCEL_AGENT_LOGIN: &str = "CancelAgentLogin";
     /// Owner-scoped attribution for the account that handled a logical session.
     pub const GET_AGENT_ROUTE_RECEIPT: &str = "GetAgentRouteReceipt";
+    /// Device-local account most recently observed serving a logical session.
+    pub const GET_AGENT_ROUTE_ACCOUNT: &str = "GetAgentRouteAccount";
     /// Read and update OMP's device-local advisor settings.
     pub const GET_OMP_ADVISOR_CONFIG: &str = "GetOmpAdvisorConfig";
     pub const SET_OMP_ADVISOR_CONFIG: &str = "SetOmpAdvisorConfig";
@@ -191,6 +193,21 @@ pub struct RemoveSessionRefResult {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct GetAgentRouteReceiptParams {
     pub logical_session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct GetAgentRouteAccountParams {
+    pub logical_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetAgentRouteAccountResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

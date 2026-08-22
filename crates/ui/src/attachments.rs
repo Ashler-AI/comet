@@ -13,7 +13,8 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::path::Path;
+use std::io::{Cursor, Read};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -28,17 +29,18 @@ use crate::state::EngineHandle;
 use crate::theme::ink;
 use comet_rpc::methods;
 
-/// use-attachments.ts `MAX_ATTACHMENT_BYTES`.
-pub const MAX_ATTACHMENT_BYTES: u64 = 24 * 1024 * 1024;
-/// Folder selections are expanded in-memory before upload. Keep that expansion
-/// bounded so choosing a repository cannot accidentally consume unbounded RAM.
+/// Disk images up to this size retain an in-memory thumbnail. Larger images
+/// still upload from their path without a preview or a size ceiling.
+const MAX_ATTACHMENT_PREVIEW_BYTES: u64 = 24 * 1024 * 1024;
+/// Folder selections remain file-count bounded, but individual and aggregate
+/// byte sizes are not capped.
 pub const MAX_FOLDER_ATTACHMENT_FILES: usize = 200;
-pub const MAX_FOLDER_ATTACHMENT_BYTES: u64 = 128 * 1024 * 1024;
 const FOLDER_NAME_PREFIX: &str = "cf1-";
 const MAX_FOLDER_UPLOAD_NAME_BYTES: usize = 240;
 /// Base64 chars per `UploadChunk` (comet state.ts `UPLOAD_CHUNK` — sized for
 /// the relay when the target device is remote).
 pub const UPLOAD_CHUNK_B64_CHARS: usize = 60_000;
+const UPLOAD_CHUNK_BYTES: usize = UPLOAD_CHUNK_B64_CHARS / 4 * 3;
 /// state.ts `MAX_ATTACHMENT_READ_CHUNKS` — bounds the read-back loop.
 const MAX_READ_CHUNKS: usize = 1_000;
 
@@ -313,13 +315,13 @@ pub fn user_message_rail_text(content: &str) -> String {
 // Staging (use-attachments.ts intake)
 // ---------------------------------------------------------------------------
 
-/// Content staged in the composer before upload. Bytes remain shared through
-/// the thumbnail/preview/upload path instead of being copied between layers.
+/// Content staged in the composer before upload. Disk files retain only their
+/// path so attachment size does not translate into resident memory.
 #[derive(Clone)]
 pub enum StagedAttachmentContent {
     Image(Arc<Image>),
     Text(Arc<str>),
-    File(Arc<[u8]>),
+    File(Arc<PathBuf>),
 }
 
 #[derive(Clone)]
@@ -338,11 +340,32 @@ pub fn display_basename(name: &str) -> &str {
 }
 
 impl StagedAttachment {
-    pub fn bytes(&self) -> &[u8] {
+    fn reader(&self) -> Result<Box<dyn Read + '_>, String> {
         match &self.content {
-            StagedAttachmentContent::Image(image) => &image.bytes,
-            StagedAttachmentContent::Text(text) => text.as_bytes(),
-            StagedAttachmentContent::File(bytes) => bytes,
+            StagedAttachmentContent::Image(image) => {
+                Ok(Box::new(Cursor::new(image.bytes.as_slice())))
+            }
+            StagedAttachmentContent::Text(text) => Ok(Box::new(Cursor::new(text.as_bytes()))),
+            StagedAttachmentContent::File(path) => std::fs::File::open(path.as_ref())
+                .map(|file| Box::new(file) as Box<dyn Read>)
+                .map_err(|_| format!("{} could not be read.", self.display_basename())),
+        }
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        match &self.content {
+            StagedAttachmentContent::Image(image) => u64::try_from(image.bytes.len()).ok(),
+            StagedAttachmentContent::Text(text) => u64::try_from(text.len()).ok(),
+            StagedAttachmentContent::File(path) => {
+                std::fs::metadata(path.as_ref()).ok().map(|meta| meta.len())
+            }
+        }
+    }
+
+    pub fn source_path(&self) -> Option<&Path> {
+        match &self.content {
+            StagedAttachmentContent::File(path) => Some(path.as_ref()),
+            StagedAttachmentContent::Image(_) | StagedAttachmentContent::Text(_) => None,
         }
     }
 
@@ -391,8 +414,8 @@ pub fn ensure_extension(name: &str, format: ImageFormat) -> String {
     }
 }
 
-/// Stage a file from disk (picker / drop / pasted path). Images retain decoded
-/// thumbnail content; every other regular file retains its raw bytes for upload.
+/// Stage a file from disk (picker / drop / pasted path). Small images retain a
+/// decoded thumbnail; every other file uploads lazily from its source path.
 /// `Err` carries the user-facing failure message.
 pub fn stage_file(path: &Path) -> Result<StagedAttachment, String> {
     let source_name = path
@@ -403,18 +426,18 @@ pub fn stage_file(path: &Path) -> Result<StagedAttachment, String> {
     if !meta.is_file() {
         return Err(format!("{source_name} is not a file."));
     }
-    if meta.len() > MAX_ATTACHMENT_BYTES {
-        return Err(format!("{source_name} is too large (24 MB max)."));
-    }
-    let bytes = std::fs::read(path).map_err(|_| format!("{source_name} could not be read."))?;
     let (name, content) = match format_by_extension(path) {
-        Some(format) => (
-            ensure_extension(&source_name, format),
-            StagedAttachmentContent::Image(Arc::new(Image::from_bytes(format, bytes))),
-        ),
-        None => (
+        Some(format) if meta.len() <= MAX_ATTACHMENT_PREVIEW_BYTES => {
+            let bytes =
+                std::fs::read(path).map_err(|_| format!("{source_name} could not be read."))?;
+            (
+                ensure_extension(&source_name, format),
+                StagedAttachmentContent::Image(Arc::new(Image::from_bytes(format, bytes))),
+            )
+        }
+        _ => (
             source_name,
-            StagedAttachmentContent::File(Arc::<[u8]>::from(bytes)),
+            StagedAttachmentContent::File(Arc::new(path.to_path_buf())),
         ),
     };
     Ok(StagedAttachment {
@@ -441,7 +464,6 @@ pub fn stage_selected_path(path: &Path) -> Result<Vec<StagedAttachment>, String>
 
     let mut directories = vec![path.to_path_buf()];
     let mut files = Vec::new();
-    let mut total_bytes = 0u64;
     while let Some(directory) = directories.pop() {
         let entries = std::fs::read_dir(&directory)
             .map_err(|_| format!("{source_name} could not be read."))?;
@@ -469,16 +491,6 @@ pub fn stage_selected_path(path: &Path) -> Result<Vec<StagedAttachment>, String>
                 return Err(format!(
                     "{source_name} contains more than {MAX_FOLDER_ATTACHMENT_FILES} files."
                 ));
-            }
-            let file_bytes = entry
-                .metadata()
-                .map_err(|_| format!("{} could not be read.", entry_path.display()))?
-                .len();
-            total_bytes = total_bytes
-                .checked_add(file_bytes)
-                .ok_or_else(|| format!("{source_name} is too large."))?;
-            if total_bytes > MAX_FOLDER_ATTACHMENT_BYTES {
-                return Err(format!("{source_name} is too large (128 MB total max)."));
             }
             files.push(entry_path);
         }
@@ -539,13 +551,12 @@ pub(crate) fn with_target(
     params
 }
 
-/// Per-call deadlines (desktop state.ts): a stalled-but-open relay link never
-/// fails an RPC on its own, so every attachment call races a timer. The first
-/// chunk gets 90s (a cold dial to a remote device), later chunks 30s; commit
-/// 150s (it must outlast the engine's cross-device assemble); reads 20s.
+/// Per-call deadlines: chunk deadlines remain fixed because every chunk is
+/// bounded; commit scales with source size so large files have no size-derived
+/// timeout while a stalled relay still terminates.
 const FIRST_CHUNK_TIMEOUT: Duration = Duration::from_secs(90);
 const CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
-const COMMIT_TIMEOUT: Duration = Duration::from_secs(150);
+const COMMIT_BASE_TIMEOUT: Duration = Duration::from_secs(150);
 const READ_CHUNK_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Race an RPC against `timeout` on the gpui background executor (these
@@ -566,24 +577,35 @@ pub(crate) async fn call_with_timeout(
     }
 }
 
-/// Chunked upload: base64 the bytes, `UploadChunk{uploadId,seq,data}` per 60KB
-/// slice (positional `seq` makes the cheap retry idempotent), then
-/// `UploadCommit{uploadId,fileName}` → the durable absolute path on the target
-/// device. Errors return the raw cause (the composer shows friendly copy).
+/// Chunked upload: read at most 45KB at a time, base64 each aligned chunk, then
+/// `UploadCommit{uploadId,fileName}`. Positional `seq` keeps retries idempotent.
 pub async fn upload_attachment(
     engine: &EngineHandle,
     executor: &BackgroundExecutor,
     target_device_id: Option<&str>,
     attachment: &StagedAttachment,
 ) -> Result<String, String> {
-    let b64 = BASE64.encode(attachment.bytes());
+    let mut reader = attachment.reader()?;
     let upload_id = uuid::Uuid::new_v4().to_string();
-    let mut start = 0usize;
+    let mut raw = vec![0_u8; UPLOAD_CHUNK_BYTES];
     let mut seq = 0u64;
     loop {
-        let end = (start + UPLOAD_CHUNK_B64_CHARS).min(b64.len());
+        let mut read = 0usize;
+        while read < raw.len() {
+            let count = reader
+                .read(&mut raw[read..])
+                .map_err(|_| format!("{} could not be read.", attachment.display_basename()))?;
+            if count == 0 {
+                break;
+            }
+            read += count;
+        }
+        if read == 0 && seq > 0 {
+            break;
+        }
+        let data = BASE64.encode(&raw[..read]);
         let params = with_target(
-            serde_json::json!({ "uploadId": upload_id, "seq": seq, "data": &b64[start..end] }),
+            serde_json::json!({ "uploadId": upload_id, "seq": seq, "data": data }),
             target_device_id,
         );
         let timeout = if seq == 0 {
@@ -591,9 +613,6 @@ pub async fn upload_attachment(
         } else {
             CHUNK_TIMEOUT
         };
-        // One transient blip must not abort a ~400-chunk upload; `seq` slots
-        // are idempotent engine-side, so a blind re-send is safe (timeouts
-        // retry too, like the original's per-chunk `withTimeout` + retry ×2).
         let mut attempt = 0u32;
         loop {
             match call_with_timeout(
@@ -613,9 +632,8 @@ pub async fn upload_attachment(
                 Err(err) => return Err(err),
             }
         }
-        start = end;
-        seq += 1;
-        if start >= b64.len() {
+        seq = seq.saturating_add(1);
+        if read == 0 {
             break;
         }
     }
@@ -623,12 +641,16 @@ pub async fn upload_attachment(
         serde_json::json!({ "uploadId": upload_id, "fileName": attachment.name }),
         target_device_id,
     );
+    let commit_seconds = attachment
+        .byte_len()
+        .map(|bytes| bytes / (1024 * 1024))
+        .unwrap_or_default();
     let reply = call_with_timeout(
         engine,
         executor,
         methods::UPLOAD_COMMIT,
         params,
-        COMMIT_TIMEOUT,
+        COMMIT_BASE_TIMEOUT.saturating_add(Duration::from_secs(commit_seconds)),
     )
     .await?;
     reply
@@ -1112,7 +1134,7 @@ mod tests {
         let attachment = stage_file(&path).expect("PDF should stage as a file attachment");
         assert_eq!(attachment.name, "George Resume.pdf");
         assert_eq!(attachment.display_name, "George Resume.pdf");
-        assert_eq!(attachment.bytes(), b"%PDF-1.7 resume");
+        assert_eq!(attachment.source_path(), Some(path.as_path()));
         assert!(attachment.image().is_none());
     }
 
@@ -1140,8 +1162,14 @@ mod tests {
         assert_eq!(attachments[0].display_basename(), "George Resume.pdf");
         assert!(attachments[1].name.starts_with(FOLDER_NAME_PREFIX));
         assert!(attachments[1].name.ends_with(".docx"));
-        assert_eq!(attachments[0].bytes(), b"george");
-        assert_eq!(attachments[1].bytes(), b"tina");
+        assert_eq!(
+            attachments[0].source_path(),
+            Some(root.join("George Resume.pdf").as_path())
+        );
+        assert_eq!(
+            attachments[1].source_path(),
+            Some(nested.join("Borello Tina.docx").as_path())
+        );
     }
 
     #[test]

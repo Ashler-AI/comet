@@ -2285,16 +2285,18 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
     );
     let client = comet_rpc::memory_client(core.rpc_service());
 
-    // Chunked upload exactly as the composer sends it: base64 split across
-    // positional UploadChunk slots, then UploadCommit → the durable path.
-    let payload: Vec<u8> = (0..=255u8).cycle().take(9_001).collect();
-    let encoded = b64.encode(&payload);
-    let (first, second) = encoded.split_at(encoded.len() / 2);
-    for (seq, data) in [(0, first), (1, second)] {
+    // Chunked upload exactly as the composer sends it: independently encode
+    // 45KB raw slices into positional UploadChunk slots, then commit.
+    let payload: Vec<u8> = (0..=255u8).cycle().take(90_001).collect();
+    for (seq, bytes) in payload.chunks(45_000).enumerate() {
         client
             .call(
                 comet_rpc::methods::UPLOAD_CHUNK,
-                serde_json::json!({ "uploadId": "e2e-att", "seq": seq, "data": data }),
+                serde_json::json!({
+                    "uploadId": "e2e-att",
+                    "seq": seq,
+                    "data": b64.encode(bytes),
+                }),
             )
             .await
             .expect("UploadChunk");
