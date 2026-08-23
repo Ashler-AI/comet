@@ -203,6 +203,7 @@ pub(crate) struct AgentInferenceAuthority {
     pub token_type: String,
     pub authority_id: String,
     pub principal_id: String,
+    pub authority_scope: String,
     pub expires_at: String,
 }
 
@@ -364,6 +365,7 @@ impl ScaffoldClient {
             "x-agent-auth-environment",
             "x-agent-auth-lifecycle-epoch",
             "x-agent-auth-request-id",
+            "x-agent-auth-authority-scope",
             "x-agent-auth-routing-mode",
             "x-agent-auth-requested-account-id",
             "x-agent-auth-account-id",
@@ -380,6 +382,7 @@ impl ScaffoldClient {
             .headers(headers)
             .bearer_auth(&authority.token)
             .header(reqwest::header::CONTENT_LENGTH, content_length)
+            .header("x-agent-auth-authority-scope", &authority.authority_scope)
             .header("x-agent-auth-request-id", request_id)
             .header("x-agent-auth-conversation-id", conversation_id);
         if let Some(account_id) = requested_account_id {
@@ -2702,6 +2705,7 @@ mod tests {
             token_type: "Bearer".into(),
             authority_id: "authority-1".into(),
             principal_id: "identity:owner-1".into(),
+            authority_scope: "user:identity:owner-1".into(),
             expires_at: "2099-01-01T00:00:00Z".into(),
         }
     }
@@ -2785,6 +2789,7 @@ mod tests {
             "tokenType": "Bearer",
             "authorityId": "authority-1",
             "principalId": "identity:owner-1",
+            "authorityScope": "user:identity:owner-1",
             "expiresAt": "2099-01-01T00:00:00Z"
         })
         .to_string();
@@ -2832,6 +2837,7 @@ mod tests {
         let inference = requests[1].to_ascii_lowercase();
         assert!(inference.starts_with("post /api/agent-auth/v2/messages?beta=true http/1.1"));
         assert!(inference.contains("authorization: bearer v2-authority-token"));
+        assert!(inference.contains("x-agent-auth-authority-scope: user:identity:owner-1"));
         assert!(inference.contains("x-agent-auth-conversation-id: conversation-1"));
         assert!(inference.contains("x-agent-auth-account-id: account-1"));
         assert!(inference.contains("x-agent-auth-request-id: request-1"));

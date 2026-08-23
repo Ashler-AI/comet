@@ -159,6 +159,7 @@ mod tests {
                                         "tokenType": "Bearer",
                                         "authorityId": format!("authority-{authority_id}"),
                                         "principalId": "identity:owner-1",
+                                        "authorityScope": "user:identity:owner-1",
                                         "expiresAt": (Utc::now() + TimeDelta::minutes(5)).to_rfc3339(),
                                     })
                                 }
@@ -239,6 +240,7 @@ mod tests {
                                         "tokenType": "Bearer",
                                         "authorityId": "large-body-authority",
                                         "principalId": "identity:owner-1",
+                                        "authorityScope": "user:identity:owner-1",
                                         "expiresAt": (Utc::now() + TimeDelta::minutes(5)).to_rfc3339(),
                                     })
                                 }
@@ -322,6 +324,7 @@ mod tests {
                                 "tokenType": "Bearer",
                                 "authorityId": "authority-1",
                                 "principalId": "identity:owner-1",
+                                "authorityScope": "user:identity:owner-1",
                                 "expiresAt": (Utc::now() + TimeDelta::minutes(5)).to_rfc3339(),
                             });
                             let body = futures::stream::once(async move {
@@ -775,13 +778,18 @@ mod tests {
             token_type: "Bearer".into(),
             authority_id: "authority-1".into(),
             principal_id: "identity:owner-1".into(),
+            authority_scope: "user:identity:owner-1".into(),
             expires_at: "2099-01-01T00:00:00Z".into(),
         };
         assert!(validate_authority(&authority).is_ok());
 
-        let mut invalid = authority;
+        let mut invalid = authority.clone();
         invalid.contract_version = 1;
         assert!(validate_authority(&invalid).is_err());
+
+        let mut missing_scope = authority;
+        missing_scope.authority_scope.clear();
+        assert!(validate_authority(&missing_scope).is_err());
     }
 
     #[test]
