@@ -32,6 +32,7 @@ pub mod titles;
 pub mod uploads;
 pub mod workspace_host;
 pub mod worktree_cleanup;
+mod worktree_handoff;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
 pub use auth::{Auth, AuthConfig, AuthState, AuthUser};

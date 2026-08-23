@@ -30,8 +30,8 @@ use comet_doc::{
 };
 use comet_proto::{
     AgentProvider, AgentRoute, AgentSessionSource, Chat, ChatConfig, FileSearchMatch,
-    HarnessCommand, HarnessId, RunRequest, SandboxLevel, ScaffoldLifecycle, SteeringMode,
-    UserInputAnswer, UserInputQuestion,
+    HarnessCommand, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, ScaffoldLifecycle,
+    SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 use comet_rpc::{RpcError, methods};
 
@@ -130,13 +130,17 @@ fn scaffold_send_requires_binding(
     scaffold_draft || control_source == Some(AgentSessionSource::Scaffold)
 }
 
-fn scaffold_attached_chat_config(binding: &ScaffoldAgentBinding) -> ChatConfig {
+fn scaffold_attached_chat_config(
+    binding: &ScaffoldAgentBinding,
+    reasoning: Option<ReasoningLevel>,
+    model_options: serde_json::Map<String, serde_json::Value>,
+) -> ChatConfig {
     ChatConfig {
         harness: HarnessId::Omp,
         model: Some(binding.model_id.clone()),
-        reasoning: None,
+        reasoning,
         agent_account_id: None,
-        model_options: Default::default(),
+        model_options,
         sandbox: SandboxLevel::WorkspaceWrite,
     }
 }
@@ -150,6 +154,14 @@ fn scaffold_run_model(
         binding.map(|binding| binding.model_id.clone())
     } else {
         resolved_model.map(str::to_string)
+    }
+}
+
+fn run_agent_account_id(attached: bool, chat_config: Option<&ChatConfig>) -> Option<String> {
+    if attached {
+        None
+    } else {
+        chat_config.and_then(|config| config.agent_account_id.clone())
     }
 }
 
@@ -3427,11 +3439,11 @@ fn scaffold_reconnect_target(
         })
         .max_by_key(|grant| grant.granted_at)
         .and_then(|grant| {
-            Some(ScaffoldControlTarget {
+            let target = ScaffoldControlTarget {
                 sandbox_id: grant.sandbox_id.clone()?,
                 scope: grant.scope.clone(),
-            })
-            .filter(|_| grant.scope.deployment_id.is_some())
+            };
+            grant.scope.deployment_id.is_some().then_some(target)
         })
 }
 fn scaffold_start_control_route(
@@ -4115,7 +4127,7 @@ impl Composer {
             params.insert("query".into(), token.query.clone().into());
             let target = if let Some(chat) = state.selected_chat_row() {
                 params.insert("chatId".into(), chat.id.clone().into());
-                Some(chat.device_id.clone())
+                state.chat_host_device_id(&chat.id).map(str::to_string)
             } else if let Some(space) = state.selected_space_row() {
                 params.insert("spaceId".into(), space.id.clone().into());
                 if let Some(path) = selected_worktree {
@@ -4837,7 +4849,7 @@ impl Composer {
         let is_shared = !is_new && self.state.read(cx).is_shared_session(&chat_id);
         if is_shared && !self.staged().is_empty() {
             self.failure =
-                Some("Attachments aren't available in shared sessions; send text only.".into());
+                Some("Attachments aren’t available in remote sessions. Send text only.".into());
             cx.notify();
             return;
         }
@@ -4848,6 +4860,11 @@ impl Composer {
         // Fully-resolved model/reasoning/options — concrete values (chat config
         // or defaults), so the engine never has to guess a "default".
         let resolved = self.pickers.read(cx).resolved(cx);
+        let selected_chat_config = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .and_then(|chat| chat.config.clone());
         let existing_cwd = self
             .state
             .read(cx)
@@ -5412,6 +5429,8 @@ impl Composer {
                                 scaffold_agent_binding
                                     .as_ref()
                                     .expect("attached Scaffold session has a resolved route"),
+                                resolved.reasoning,
+                                resolved.model_options.clone(),
                             ))
                         } else {
                             resolved.chat_config()
@@ -5518,7 +5537,10 @@ impl Composer {
                         scaffold_agent_binding.as_ref(),
                         resolved.model.as_deref(),
                     ),
-                    agent_account_id: None,
+                    agent_account_id: run_agent_account_id(
+                        scaffold_attached,
+                        selected_chat_config.as_ref(),
+                    ),
                     reasoning: resolved.reasoning,
                     model_options: resolved.model_options.clone(),
                     cwd: scaffold_run_cwd(&cwd, scaffold_resume_cwd.as_deref()).to_string(),
@@ -6683,14 +6705,35 @@ mod tests {
         assert_eq!(binding.route.account_id, None);
         assert_eq!(binding.model_id, "openai-codex/gpt-5.6-sol");
 
-        let persisted = scaffold_attached_chat_config(&binding);
+        let persisted = scaffold_attached_chat_config(
+            &binding,
+            Some(ReasoningLevel::High),
+            serde_json::Map::new(),
+        );
         assert_eq!(persisted.harness, HarnessId::Omp);
         assert_eq!(persisted.model.as_deref(), Some("openai-codex/gpt-5.6-sol"));
         assert_eq!(persisted.agent_account_id, None);
+        assert_eq!(persisted.reasoning, Some(ReasoningLevel::High));
         assert_eq!(
             scaffold_run_model(true, Some(&binding), Some("wrong-model")).as_deref(),
             persisted.model.as_deref()
         );
+    }
+
+    #[test]
+    fn local_run_preserves_pinned_account_while_scaffold_run_uses_its_binding() {
+        let mut config = scaffold_attached_chat_config(
+            &scaffold_agent_binding(Some(HarnessId::Omp), Some("openai/gpt-5.6-sol")).unwrap(),
+            Some(ReasoningLevel::High),
+            serde_json::Map::new(),
+        );
+        config.agent_account_id = Some("account-yahoo".into());
+
+        assert_eq!(
+            run_agent_account_id(false, Some(&config)).as_deref(),
+            Some("account-yahoo")
+        );
+        assert_eq!(run_agent_account_id(true, Some(&config)), None);
     }
 
     #[test]
@@ -6702,7 +6745,7 @@ mod tests {
         assert_eq!(binding.route.account_id, None);
         assert_eq!(binding.model_id, "anthropic/claude-opus-5");
 
-        let persisted = scaffold_attached_chat_config(&binding);
+        let persisted = scaffold_attached_chat_config(&binding, None, serde_json::Map::new());
         assert_eq!(persisted.harness, HarnessId::Omp);
         assert_eq!(persisted.model.as_deref(), Some("anthropic/claude-opus-5"));
         assert_eq!(persisted.agent_account_id, None);

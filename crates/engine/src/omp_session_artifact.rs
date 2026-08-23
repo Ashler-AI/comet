@@ -6,17 +6,116 @@
 //! read so bytes cannot silently change underneath the capture.
 
 use std::fs::{File, Metadata};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::Path;
 
 use comet_proto::OmpSessionArtifact;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tempfile::NamedTempFile;
+use tokio_util::sync::CancellationToken;
 
 use crate::EngineError;
 
 /// Maximum native OMP session accepted for handoff (64 MiB).
 pub const MAX_OMP_SESSION_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+
+const MAX_OMP_SESSION_HEADER_BYTES: usize = 64 * 1024;
+
+#[derive(Debug)]
+pub(crate) struct CapturedOmpSessionFile {
+    file: NamedTempFile,
+    pub native_session_id: String,
+    pub cwd: String,
+    pub storage_relative_path: String,
+    pub sha256: String,
+    pub byte_count: u64,
+}
+
+impl CapturedOmpSessionFile {
+    pub fn reopen(&self) -> io::Result<File> {
+        self.file.reopen()
+    }
+}
+
+pub(crate) fn capture_omp_session_file(
+    path: &Path,
+    storage_relative_path: &Path,
+    expected_native_session_id: &str,
+    expected_cwd: &str,
+    cancellation: &CancellationToken,
+) -> Result<CapturedOmpSessionFile, EngineError> {
+    if expected_native_session_id.trim().is_empty() || expected_cwd.trim().is_empty() {
+        return Err(invalid("OMP native session id and cwd are required"));
+    }
+    let storage_relative_path = validate_storage_relative_path(storage_relative_path)?;
+    check_cancelled(cancellation)?;
+
+    let mut input = open_regular_nofollow(path)?;
+    let before = input.metadata()?;
+    validate_metadata(&before, MAX_OMP_SESSION_ARTIFACT_BYTES)?;
+    let mut output = NamedTempFile::new()?;
+    let mut digest = Sha256::new();
+    let mut byte_count = 0_u64;
+    let mut header = Vec::with_capacity(MAX_OMP_SESSION_HEADER_BYTES.min(before.len() as usize));
+    let mut buffer = [0_u8; 64 * 1024];
+
+    loop {
+        check_cancelled(cancellation)?;
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        byte_count = byte_count.saturating_add(read as u64);
+        if byte_count > MAX_OMP_SESSION_ARTIFACT_BYTES || byte_count > before.len() {
+            return Err(invalid("OMP session file changed during capture"));
+        }
+        if header.len() < MAX_OMP_SESSION_HEADER_BYTES {
+            let retained = read.min(MAX_OMP_SESSION_HEADER_BYTES - header.len());
+            header.extend_from_slice(&buffer[..retained]);
+        }
+        digest.update(&buffer[..read]);
+        output.write_all(&buffer[..read])?;
+    }
+
+    if byte_count != before.len() {
+        return Err(invalid("OMP session file changed during capture"));
+    }
+    let after = input.metadata()?;
+    validate_metadata(&after, MAX_OMP_SESSION_ARTIFACT_BYTES)?;
+    if !same_file_state(&before, &after) {
+        return Err(invalid("OMP session file changed during capture"));
+    }
+    let complete_header_len = header
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|index| index + 1)
+        .ok_or_else(|| invalid("OMP session header exceeds the capture identity window"))?;
+    let (native_session_id, cwd) = parse_session_header(&header[..complete_header_len])?;
+    if native_session_id != expected_native_session_id || cwd != expected_cwd {
+        return Err(invalid(
+            "OMP session header does not match the discovered native id and cwd",
+        ));
+    }
+    output.as_file_mut().flush()?;
+    check_cancelled(cancellation)?;
+
+    Ok(CapturedOmpSessionFile {
+        file: output,
+        native_session_id,
+        cwd,
+        storage_relative_path,
+        sha256: format!("{:x}", digest.finalize()),
+        byte_count,
+    })
+}
+
+fn check_cancelled(cancellation: &CancellationToken) -> Result<(), EngineError> {
+    if cancellation.is_cancelled() {
+        return Err(invalid("OMP session capture was cancelled"));
+    }
+    Ok(())
+}
 
 /// Capture one exact OMP JSONL session file.
 ///
@@ -57,7 +156,7 @@ fn capture_with_limit(
     let capacity = usize::try_from(before.len())
         .map_err(|_| invalid("OMP session file size is not addressable"))?;
     let mut bytes = Vec::with_capacity(capacity);
-    file.by_ref()
+    std::io::Read::by_ref(&mut file)
         .take(limit.saturating_add(1))
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > limit {
@@ -245,6 +344,115 @@ mod tests {
         assert_eq!(artifact.cwd, "/workspace");
         assert_eq!(artifact.storage_relative_path, "repo/session.jsonl");
         assert_eq!(artifact.sha256, hex_sha256(&artifact.bytes));
+    }
+
+    #[test]
+    fn file_backed_capture_accepts_exact_limit_rejects_limit_plus_one_and_cancels() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let mut source = File::create(&path).unwrap();
+        source
+            .write_all(&session_bytes("omp-1", "/workspace"))
+            .unwrap();
+        source.set_len(MAX_OMP_SESSION_ARTIFACT_BYTES).unwrap();
+        drop(source);
+
+        let captured = capture_omp_session_file(
+            &path,
+            Path::new("repo/session.jsonl"),
+            "omp-1",
+            "/workspace",
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(captured.byte_count, MAX_OMP_SESSION_ARTIFACT_BYTES);
+        assert_eq!(
+            captured.reopen().unwrap().metadata().unwrap().len(),
+            MAX_OMP_SESSION_ARTIFACT_BYTES
+        );
+        drop(captured);
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(
+            capture_omp_session_file(
+                &path,
+                Path::new("repo/session.jsonl"),
+                "omp-1",
+                "/workspace",
+                &cancelled,
+            )
+            .is_err()
+        );
+
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(MAX_OMP_SESSION_ARTIFACT_BYTES + 1)
+            .unwrap();
+        assert!(
+            capture_omp_session_file(
+                &path,
+                Path::new("repo/session.jsonl"),
+                "omp-1",
+                "/workspace",
+                &CancellationToken::new(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn file_backed_capture_ignores_a_truncated_record_after_the_session_header() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let mut source = File::create(&path).unwrap();
+        source
+            .write_all(b"{\"type\":\"title\",\"title\":\"before\"}\n")
+            .unwrap();
+        source
+            .write_all(b"{\"type\":\"session\",\"id\":\"omp-1\",\"cwd\":\"/workspace\"}\n")
+            .unwrap();
+        source
+            .write_all(&vec![b'x'; MAX_OMP_SESSION_HEADER_BYTES])
+            .unwrap();
+        drop(source);
+
+        let artifact = capture_omp_session_file(
+            &path,
+            Path::new("repo/session.jsonl"),
+            "omp-1",
+            "/workspace",
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(artifact.byte_count > MAX_OMP_SESSION_HEADER_BYTES as u64);
+    }
+
+    #[test]
+    fn file_backed_capture_rejects_session_headers_beyond_the_identity_window() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let mut source = File::create(&path).unwrap();
+        source
+            .write_all(&vec![b'x'; MAX_OMP_SESSION_HEADER_BYTES])
+            .unwrap();
+        source.write_all(b"\n").unwrap();
+        source
+            .write_all(b"{\"type\":\"session\",\"id\":\"omp-1\",\"cwd\":\"/workspace\"}\n")
+            .unwrap();
+        drop(source);
+        assert!(
+            capture_omp_session_file(
+                &path,
+                Path::new("repo/session.jsonl"),
+                "omp-1",
+                "/workspace",
+                &CancellationToken::new(),
+            )
+            .is_err()
+        );
     }
 
     #[cfg(unix)]

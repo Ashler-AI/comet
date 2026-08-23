@@ -1897,8 +1897,10 @@ impl Transcript {
     fn attachment_device_ids(&self, cx: &Context<Self>) -> Vec<String> {
         let state = self.state.read(cx);
         let mut ids = Vec::new();
-        if let Some(chat) = state.selected_chat_row() {
-            ids.push(chat.device_id.clone());
+        if let Some(chat_id) = state.selected_chat.as_deref()
+            && let Some(device) = state.chat_host_device_id(chat_id)
+        {
+            ids.push(device.to_string());
         }
         if let Some(local) = state.local_device_id.clone()
             && !ids.contains(&local)

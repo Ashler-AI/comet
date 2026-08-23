@@ -23,7 +23,7 @@ use gpui::{
 use comet_engine::registry::HarnessDescriptor;
 use comet_proto::{
     ChatConfig, FolderListing, HarnessCommand, HarnessId, Model, ReasoningLevel, RepoRef,
-    SandboxLevel, SteeringMode,
+    SandboxLevel, ScaffoldDatabaseEnvironment, SteeringMode,
 };
 use comet_rpc::methods;
 
@@ -347,8 +347,8 @@ pub fn browser_rows(listing: &FolderListing) -> Vec<&comet_proto::FolderEntry> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerKind {
     Branch,
-    /// The checkout-kind dropdown in the composer footer (Current
-    /// checkout/worktree | New worktree).
+    /// Local sessions choose checkout/worktree placement. Pending Scaffold
+    /// sessions use this same footer position for their database environment.
     Checkout,
     HarnessModel,
     Traits,
@@ -366,6 +366,31 @@ fn is_scaffold_selection(
 ) -> bool {
     selected_chat_is_scaffold_room
         || is_pending_scaffold_selection(selected_chat, pending_scaffold_chat)
+}
+
+const SCAFFOLD_DATABASES: [ScaffoldDatabaseEnvironment; 3] = [
+    ScaffoldDatabaseEnvironment::Local,
+    ScaffoldDatabaseEnvironment::StagingSnapshot,
+    ScaffoldDatabaseEnvironment::ProductionSnapshot,
+];
+
+fn scaffold_database_index(environment: ScaffoldDatabaseEnvironment) -> usize {
+    SCAFFOLD_DATABASES
+        .iter()
+        .position(|candidate| *candidate == environment)
+        .unwrap_or(0)
+}
+
+fn scaffold_database_at(index: usize) -> ScaffoldDatabaseEnvironment {
+    SCAFFOLD_DATABASES.get(index).copied().unwrap_or_default()
+}
+
+fn scaffold_database_label(environment: ScaffoldDatabaseEnvironment) -> &'static str {
+    match environment {
+        ScaffoldDatabaseEnvironment::Local => "Local database",
+        ScaffoldDatabaseEnvironment::StagingSnapshot => "Staging database",
+        ScaffoldDatabaseEnvironment::ProductionSnapshot => "Production database",
+    }
 }
 
 fn draft_config_applies(selected_chat: Option<&str>, pending_scaffold_chat: Option<&str>) -> bool {
@@ -503,11 +528,17 @@ impl Pickers {
                 }
                 this.switch_error = None;
             }
-            if pending_scaffold && this.config.harness != Some(HarnessId::Omp) {
-                this.config.harness = Some(HarnessId::Omp);
-                this.config.model = None;
-                this.config.reasoning = None;
-                this.config.model_options.clear();
+            if pending_scaffold {
+                if this.config.harness != Some(HarnessId::Omp) {
+                    this.config.harness = Some(HarnessId::Omp);
+                    this.config.model = None;
+                    this.config.reasoning = None;
+                    this.config.model_options.clear();
+                }
+                if let Some(draft) = state.scaffold_session_draft() {
+                    this.config.branch = Some(draft.source_ref.clone());
+                    this.config.checkout = CheckoutKind::Local;
+                }
             }
             // A space switch invalidates the branch draft + cache — the folder
             // (and possibly the device) changed under them.
@@ -841,6 +872,12 @@ impl Pickers {
         // The keyboard-nav highlight starts ON the selected row — row 0
         // otherwise reads as a second active row (user report).
         self.active = match kind {
+            PickerKind::Checkout if self.is_scaffold_selection(cx) => self
+                .state
+                .read(cx)
+                .scaffold_session_draft()
+                .map(|draft| scaffold_database_index(draft.database_environment))
+                .unwrap_or(0),
             PickerKind::Checkout => match self.config.checkout {
                 CheckoutKind::Local => 0,
                 CheckoutKind::NewWorktree => 1,
@@ -876,7 +913,9 @@ impl Pickers {
             // Force: the checkout state moves under us (a send mints a
             // worktree+branch, terminals switch refs) — every open
             // revalidates, keeping stale rows visible until fresh ones land.
-            PickerKind::Branch | PickerKind::Checkout => self.ensure_refs(true, cx),
+            PickerKind::Branch => self.ensure_refs(true, cx),
+            PickerKind::Checkout if !self.is_scaffold_selection(cx) => self.ensure_refs(true, cx),
+            PickerKind::Checkout => {}
             PickerKind::HarnessModel | PickerKind::Traits => {
                 self.ensure_harnesses(cx);
                 if let Some(harness) = self.effective_harness(cx) {
@@ -1139,6 +1178,15 @@ impl Pickers {
     // ---- selections ----
 
     fn pick_ref(&mut self, row: RepoRef, cx: &mut Context<Self>) {
+        if self.is_scaffold_selection(cx) {
+            self.config.branch = Some(row.name.clone());
+            self.state.update(cx, |state, cx| {
+                state.set_scaffold_source_ref(row.name, cx);
+            });
+            self.open = None;
+            cx.notify();
+            return;
+        }
         // Persisted-session ref picks switch its checkout. A pending Scaffold
         // chat is still a first-send draft and must only update that draft.
         if self.state.read(cx).selected_chat_row().is_some() && !self.draft_config_applies(cx) {
@@ -1247,7 +1295,13 @@ impl Pickers {
             cx.notify();
             return;
         }
-        let local = self.state.read(cx).local_device_id.clone();
+        let (local, host_device) = {
+            let state = self.state.read(cx);
+            (
+                state.local_device_id.clone(),
+                state.chat_host_device_id(&chat.id).map(str::to_string),
+            )
+        };
         self.switch_error = None;
         self.switching = Some(row.name.clone());
         let ref_name = row.name.clone();
@@ -1279,10 +1333,12 @@ impl Pickers {
                         "refName".into(),
                         serde_json::Value::String(ref_name.clone()),
                     );
-                    if local.as_deref() != Some(chat.device_id.as_str()) {
+                    if let Some(host_device) = host_device
+                        && local.as_deref() != Some(host_device.as_str())
+                    {
                         params.insert(
                             "targetDeviceId".into(),
-                            serde_json::Value::String(chat.device_id.clone()),
+                            serde_json::Value::String(host_device),
                         );
                     }
                     engine
@@ -1320,6 +1376,19 @@ impl Pickers {
             self.config.branch = None;
         }
         self.set_draft_checkout(kind);
+        self.open = None;
+        cx.notify();
+    }
+
+    fn pick_scaffold_database(
+        &mut self,
+        environment: ScaffoldDatabaseEnvironment,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.update(cx, |state, cx| {
+            state.set_scaffold_database_environment(environment, cx);
+        });
+        self.active = scaffold_database_index(environment);
         self.open = None;
         cx.notify();
     }
@@ -1683,6 +1752,7 @@ impl Pickers {
                 let delta = if key == MenuKey::Up { -1 } else { 1 };
                 let count = match self.open {
                     Some(PickerKind::Branch) => self.filtered_ref_rows(cx).len().min(MAX_REF_ROWS),
+                    Some(PickerKind::Checkout) if self.is_scaffold_selection(cx) => 3,
                     Some(PickerKind::Checkout) => 2,
                     // Keyboard nav walks the MODEL list only; the traits
                     // chips below (reasoning ladder, model options) are
@@ -1707,12 +1777,16 @@ impl Pickers {
                 if self.open == Some(PickerKind::HarnessModel) {
                     self.activate_model_row(cx);
                 } else if self.open == Some(PickerKind::Checkout) {
-                    let kind = if self.active == 0 {
-                        CheckoutKind::Local
+                    if self.is_scaffold_selection(cx) {
+                        self.pick_scaffold_database(scaffold_database_at(self.active), cx);
                     } else {
-                        CheckoutKind::NewWorktree
-                    };
-                    self.pick_checkout(kind, cx);
+                        let kind = if self.active == 0 {
+                            CheckoutKind::Local
+                        } else {
+                            CheckoutKind::NewWorktree
+                        };
+                        self.pick_checkout(kind, cx);
+                    }
                 } else {
                     self.on_search_submit(cx);
                 }
@@ -1864,19 +1938,18 @@ impl Pickers {
         // right after send mints it) still renders the DRAFT footer — the
         // values are identical, so the toolbar never blinks through a
         // half-empty locked state.
-        let (space, session) = {
+        let (space, session, scaffold_draft) = {
             let state = self.state.read(cx);
             let space = state.selected_space_row().cloned()?;
             let selected_chat = state.selected_chat.as_deref();
-            let pending_scaffold_chat = state
-                .scaffold_session_draft()
-                .map(|draft| draft.chat_id.as_str());
+            let scaffold_draft = state.scaffold_session_draft().cloned();
+            let pending_scaffold_chat = scaffold_draft.as_ref().map(|draft| draft.chat_id.as_str());
             let session = if draft_config_applies(selected_chat, pending_scaffold_chat) {
                 None
             } else {
                 selected_chat.and_then(|_| state.selected_chat_row().cloned())
             };
-            (space, session)
+            (space, session, scaffold_draft)
         };
         if !space.git_detected {
             return None;
@@ -1915,7 +1988,11 @@ impl Pickers {
                 Some((PickerKind::Branch, self.popover_frame(320.0, content, cx)))
             }
             Some(PickerKind::Checkout) if new_chat => {
-                let content = self.render_checkout_popover(cx);
+                let content = if scaffold_draft.is_some() {
+                    self.render_scaffold_database_popover(cx)
+                } else {
+                    self.render_checkout_popover(cx)
+                };
                 Some((PickerKind::Checkout, self.popover_frame(224.0, content, cx)))
             }
             _ => None,
@@ -1944,15 +2021,23 @@ impl Pickers {
             return Some(row.child(left).child(ref_side).into_any_element());
         }
 
-        let kind_icon = match (self.config.checkout, self.selected_ref_worktree().is_some()) {
-            (CheckoutKind::Local, false) => crate::icons::FOLDER,
-            _ => crate::icons::FOLDER_WITH_FILES,
+        let (kind_icon, kind_label) = if let Some(draft) = scaffold_draft.as_ref() {
+            (
+                crate::icons::GLOBAL,
+                scaffold_database_label(draft.database_environment),
+            )
+        } else {
+            let icon = match (self.config.checkout, self.selected_ref_worktree().is_some()) {
+                (CheckoutKind::Local, false) => crate::icons::FOLDER,
+                _ => crate::icons::FOLDER_WITH_FILES,
+            };
+            (icon, self.checkout_label())
         };
         let kind_chip = self.footer_chip(
             PickerKind::Checkout,
             "picker-checkout",
             kind_icon,
-            SharedString::from(self.checkout_label()),
+            SharedString::from(kind_label),
             &theme,
             cx,
         );
@@ -2239,6 +2324,53 @@ impl Pickers {
                                 .child(SharedString::from(label)),
                         )
                         .when(is_selected, |el| el.child(popover::menu_check(&theme)))
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_scaffold_database_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let current = self
+            .state
+            .read(cx)
+            .scaffold_session_draft()
+            .map(|draft| draft.database_environment)
+            .unwrap_or_default();
+        let active = self.active;
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .children(
+                SCAFFOLD_DATABASES
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ix, environment)| {
+                        let selected = current == environment;
+                        popover::menu_row_nav(
+                            &theme,
+                            selected,
+                            ix == active,
+                            format!("scaffold-database-row-{ix}"),
+                        )
+                        .id(("scaffold-database-row", ix))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.pick_scaffold_database(environment, cx);
+                        }))
+                        .child(
+                            crate::icons::icon(crate::icons::GLOBAL)
+                                .size(px(14.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(SharedString::from(scaffold_database_label(environment))),
+                        )
+                        .when(selected, |row| row.child(popover::menu_check(&theme)))
                     }),
             )
             .into_any_element()

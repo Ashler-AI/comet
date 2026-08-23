@@ -571,10 +571,11 @@ pub enum ScaffoldEnvironmentControl {
         #[serde(rename = "agentRoute")]
         agent_route: AgentRoute,
     },
-    /// Transfer an authenticated native OMP session into a Scaffold host. The
-    /// controller resolves the durable native id/cwd pair to a discovered file;
-    /// callers cannot provide a path. Scaffold rebinds the header to its remote
-    /// workspace before the first ordinary `RunRequest.resume`.
+    /// Transfer an authenticated native OMP session and its Git-visible
+    /// worktree delta into a ready Scaffold host. The controller resolves the
+    /// durable native id/cwd pair to a discovered file; callers cannot provide
+    /// paths. Scaffold resolves its own immutable checkout commit before the
+    /// bounded delta is captured and applied.
     HandoffOmpSession {
         #[serde(rename = "sandboxId")]
         sandbox_id: String,

@@ -4,7 +4,8 @@
 //! metadata only; transcripts and workspace rows are materialized by an explicit
 //! attach.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -137,6 +138,95 @@ pub fn capture_omp_artifact_for_session(
     cwd: &str,
 ) -> Result<OmpSessionArtifact, EngineError> {
     capture_omp_artifact_for_session_with_roots(native_session_id, cwd, &session_roots())
+}
+
+pub(crate) fn capture_omp_file_for_session(
+    native_session_id: &str,
+    cwd: &str,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<crate::omp_session_artifact::CapturedOmpSessionFile, EngineError> {
+    let roots = session_roots();
+    if cancellation.is_cancelled() {
+        return Err(EngineError::Other(
+            "OMP session capture was cancelled".into(),
+        ));
+    }
+    let session = find_omp_session_for_capture(&roots.omp, native_session_id, cwd, cancellation)?;
+    let sessions_root = roots.omp.join("sessions");
+    let storage_relative_path = session.path.strip_prefix(&sessions_root).map_err(|_| {
+        EngineError::Other("OMP session path escaped the configured sessions root".into())
+    })?;
+    crate::omp_session_artifact::capture_omp_session_file(
+        &session.path,
+        storage_relative_path,
+        &session.candidate.session_id,
+        &session.candidate.cwd,
+        cancellation,
+    )
+}
+
+fn find_omp_session_for_capture(
+    root: &Path,
+    native_session_id: &str,
+    cwd: &str,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<DiscoveredSession, EngineError> {
+    fn matching_session(
+        directory: &Path,
+        native_session_id: &str,
+        cwd: &str,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<Option<DiscoveredSession>, EngineError> {
+        let Ok(entries) = fs::read_dir(directory) else {
+            return Ok(None);
+        };
+        for entry in entries.flatten() {
+            if cancellation.is_cancelled() {
+                return Err(EngineError::Other(
+                    "OMP session capture was cancelled".into(),
+                ));
+            }
+            let path = entry.path();
+            if !entry.file_type().is_ok_and(|file_type| file_type.is_file())
+                || path.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
+            {
+                continue;
+            }
+            let Some(session) = candidate_from_omp_with_writer_state(
+                &path,
+                comet_harness::omp::SessionWriterState::Unknown,
+            ) else {
+                continue;
+            };
+            if session.candidate.session_id == native_session_id && session.candidate.cwd == cwd {
+                return Ok(Some(session));
+            }
+        }
+        Ok(None)
+    }
+
+    let sessions_root = root.join("sessions");
+    if let Some(session) = matching_session(&sessions_root, native_session_id, cwd, cancellation)? {
+        return Ok(session);
+    }
+    let entries = fs::read_dir(&sessions_root)
+        .map_err(|_| EngineError::Other("local OMP session is no longer available".into()))?;
+    for entry in entries.flatten() {
+        if cancellation.is_cancelled() {
+            return Err(EngineError::Other(
+                "OMP session capture was cancelled".into(),
+            ));
+        }
+        if entry.file_type().is_ok_and(|file_type| file_type.is_dir())
+            && let Some(session) =
+                matching_session(&entry.path(), native_session_id, cwd, cancellation)?
+        {
+            return Ok(session);
+        }
+    }
+    Err(EngineError::Other(
+        "local OMP session is no longer available".into(),
+    ))
 }
 
 fn capture_omp_artifact_with_roots(
@@ -860,6 +950,24 @@ fn candidate_from_omp(path: &Path) -> Option<DiscoveredSession> {
     candidate_from_omp_with_writer_state(path, comet_harness::omp::session_writer_state(path))
 }
 
+fn canonical_omp_model_selector(model: &str) -> Option<String> {
+    let model = model.trim();
+    if model.is_empty() {
+        return None;
+    }
+    for (internal, public) in [
+        ("comet-openai/", "openai-codex/"),
+        ("scaffold-openai/", "openai-codex/"),
+        ("comet-anthropic/", "anthropic/"),
+        ("scaffold-anthropic/", "anthropic/"),
+    ] {
+        if let Some(id) = model.strip_prefix(internal).filter(|id| !id.is_empty()) {
+            return Some(format!("{public}{id}"));
+        }
+    }
+    Some(model.to_string())
+}
+
 fn candidate_from_omp_with_writer_state(
     path: &Path,
     writer_state: comet_harness::omp::SessionWriterState,
@@ -908,7 +1016,9 @@ fn candidate_from_omp_with_writer_state(
                 }
             }
             Some("model_change") => {
-                model = string_at(&value, &["model"]).map(str::to_string).or(model);
+                model = string_at(&value, &["model"])
+                    .and_then(canonical_omp_model_selector)
+                    .or(model);
             }
             Some("thinking_level_change") => {
                 reasoning = string_at(&value, &["thinkingLevel"])
@@ -923,7 +1033,7 @@ fn candidate_from_omp_with_writer_state(
                 model = model.or_else(|| {
                     string_at_opt(message, &["model"])
                         .or_else(|| string_at(&value, &["model"]))
-                        .map(str::to_string)
+                        .and_then(canonical_omp_model_selector)
                 });
             }
             _ => {}
@@ -1597,7 +1707,11 @@ fn read_prime_live_metadata(path: &Path) -> Option<PrimeLiveMetadata> {
 }
 
 fn recent_omp_jsonl_files(root: &Path, limit: usize) -> Vec<PathBuf> {
-    fn collect_jsonl_files(path: &Path, files: &mut Vec<(i64, PathBuf)>) {
+    fn retain_recent_jsonl_files(
+        path: &Path,
+        limit: usize,
+        files: &mut BinaryHeap<Reverse<(i64, PathBuf)>>,
+    ) {
         let Ok(entries) = fs::read_dir(path) else {
             return;
         };
@@ -1608,23 +1722,32 @@ fn recent_omp_jsonl_files(root: &Path, limit: usize) -> Vec<PathBuf> {
             let path = entry.path();
             if file_type.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
             {
-                files.push((file_modified_ms(&path).unwrap_or_default(), path));
+                files.push(Reverse((file_modified_ms(&path).unwrap_or_default(), path)));
+                if files.len() > limit {
+                    files.pop();
+                }
             }
         }
     }
 
-    let mut files = Vec::new();
-    collect_jsonl_files(root, &mut files);
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut files = BinaryHeap::with_capacity(limit.saturating_add(1));
+    retain_recent_jsonl_files(root, limit, &mut files);
     let Ok(entries) = fs::read_dir(root) else {
         return Vec::new();
     };
     for entry in entries.flatten() {
         if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
-            collect_jsonl_files(&entry.path(), &mut files);
+            retain_recent_jsonl_files(&entry.path(), limit, &mut files);
         }
     }
-    files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
-    files.truncate(limit);
+    let mut files: Vec<_> = files
+        .into_iter()
+        .map(|Reverse((modified, path))| (modified, path))
+        .collect();
+    files.sort_by_key(|(modified, path)| (Reverse(*modified), path.clone()));
     files.into_iter().map(|(_, path)| path).collect()
 }
 
@@ -2129,6 +2252,10 @@ mod tests {
                     "timestamp": "2026-08-05T12:00:00Z"
                 }),
                 serde_json::json!({
+                    "type": "model_change",
+                    "model": "comet-openai/gpt-5.6-sol"
+                }),
+                serde_json::json!({
                     "type": "message",
                     "id": "m1",
                     "message": {"role": "user", "content": "Plan the staging restart"}
@@ -2138,7 +2265,7 @@ mod tests {
                     "id": "m2",
                     "message": {
                         "role": "assistant",
-                        "model": "openai-codex/gpt-5.6-sol",
+                        "model": "comet-openai/gpt-5.6-sol",
                         "content": "Here is the plan"
                     }
                 }),
@@ -2391,6 +2518,25 @@ mod tests {
         assert_eq!(by_native_session, artifact);
         assert!(capture_omp_artifact_for_session_with_roots("omp-other", "/repo", &roots).is_err());
         assert!(capture_omp_artifact_for_session_with_roots("omp-1", "/other", &roots).is_err());
+    }
+
+    #[test]
+    fn finds_one_omp_session_for_file_backed_capture_and_honors_cancellation() {
+        let temp = TempDir::new().unwrap();
+        let omp = temp.path().join("omp");
+        fixture(
+            &omp,
+            "sessions/by-cwd/omp-1.jsonl",
+            &[
+                serde_json::json!({"type":"session","id":"omp-1","cwd":"/repo","timestamp":"2026-08-05T12:00:00Z"}),
+                serde_json::json!({"type":"message","id":"m1","message":{"role":"user","content":"hello"}}),
+            ],
+        );
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let session = find_omp_session_for_capture(&omp, "omp-1", "/repo", &cancellation).unwrap();
+        assert_eq!(session.candidate.session_id, "omp-1");
+        cancellation.cancel();
+        assert!(find_omp_session_for_capture(&omp, "omp-1", "/repo", &cancellation).is_err());
     }
 
     #[test]

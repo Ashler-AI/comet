@@ -566,7 +566,8 @@ impl Changes {
     /// and the pane sits on "Preparing diff…" forever (user report).
     fn desired_target(&self, cx: &App) -> Option<String> {
         let state = self.state.read(cx);
-        let device = state.selected_chat_row()?.device_id.clone();
+        let chat_id = state.selected_chat.as_deref()?;
+        let device = state.chat_host_device_id(chat_id)?.to_string();
         (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device)
     }
 
