@@ -97,13 +97,25 @@ interface JoinState {
   capabilities: string[];
   rooms: string[];
   deviceId?: string;
+  workspace?: boolean;
 }
 
 interface SessionRoomInternals {
+  eph?: unknown;
   handleJoin(ws: WebSocket, state: JoinState, message: JoinRequest): Promise<void>;
+  applyUpdates(
+    ws: WebSocket,
+    state: JoinState,
+    crdt: CrdtType,
+    roomId: string,
+    batchId: `0x${string}`,
+    updates: Uint8Array[]
+  ): Promise<void>;
 }
 
-const makeRoom = (sql = new MemorySql()): { room: SessionRoom; sql: MemorySql } => {
+const makeRoom = (
+  sql = new MemorySql()
+): { room: SessionRoom; sql: MemorySql; sockets: WebSocket[] } => {
   const sockets: WebSocket[] = [];
   const storage = {
     sql: sql as unknown as SqlStorage,
@@ -120,7 +132,7 @@ const makeRoom = (sql = new MemorySql()): { room: SessionRoom; sql: MemorySql } 
       throw new Error(reason ?? "aborted");
     }
   } as unknown as DurableObjectState;
-  return { room: new SessionRoom(ctx, {} as Env), sql };
+  return { room: new SessionRoom(ctx, {} as Env), sql, sockets };
 };
 
 const authedRequest = (path: string, userId: string, init: RequestInit = {}): Request => {
@@ -182,6 +194,58 @@ describe("SessionRoom chat authorization", () => {
     await join(room, "user-a", "shared-chat");
     await join(room, "user-b", "shared-chat");
     expect(sql.meta.get("owner")).toBe(PROJECT_SCOPE);
+  });
+
+  it("relays workspace presence without allocating another WASM store", async () => {
+    const { room, sockets } = makeRoom();
+    const internals = room as unknown as SessionRoomInternals;
+    const roomId = "ws4/project-a";
+    const source = new CapturingSocket();
+    const target = new CapturingSocket();
+    const state = (deviceId: string): JoinState => ({
+      userId: "user-a",
+      projectScope: PROJECT_SCOPE,
+      capabilities: CAPABILITIES,
+      rooms: [CrdtType.Loro],
+      workspace: true,
+      deviceId
+    });
+    const sourceState = state("device-a");
+    const targetState = state("device-b");
+    source.serializeAttachment(sourceState);
+    target.serializeAttachment(targetState);
+    sockets.push(source as unknown as WebSocket, target as unknown as WebSocket);
+    const join = { ...joinRequest(roomId), crdt: CrdtType.LoroEphemeralStore };
+
+    await internals.handleJoin(source as unknown as WebSocket, sourceState, join);
+    await internals.handleJoin(target as unknown as WebSocket, targetState, join);
+    expect(internals.eph).toBeUndefined();
+
+    const heartbeat = new Uint8Array([1, 2, 3]);
+    await internals.applyUpdates(
+      source as unknown as WebSocket,
+      sourceState,
+      CrdtType.LoroEphemeralStore,
+      roomId,
+      "0x0000000000000001",
+      [heartbeat]
+    );
+
+    expect(internals.eph).toBeUndefined();
+    const sourceMessages = source.sent.map((bytes) => decode(bytes));
+    expect(
+      sourceMessages.some(
+        (message) => message.type === MessageType.Ack && message.status === 0
+      )
+    ).toBe(true);
+    const relayed = target.sent
+      .map((bytes) => decode(bytes))
+      .find((message) => message.type === MessageType.DocUpdate);
+    expect(relayed?.type).toBe(MessageType.DocUpdate);
+    if (relayed?.type === MessageType.DocUpdate) {
+      expect(relayed.crdt).toBe(CrdtType.LoroEphemeralStore);
+      expect(relayed.updates).toEqual([heartbeat]);
+    }
   });
 
   it("lets different authenticated users mutate and read every authorized chat surface", async () => {

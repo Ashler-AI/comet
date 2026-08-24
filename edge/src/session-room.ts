@@ -769,7 +769,12 @@ export class SessionRoom implements DurableObject {
     }
 
     if (message.crdt === CrdtType.LoroEphemeralStore) {
-      const eph = this.ensureEph();
+      // Workspace presence is a 15-second heartbeat, not durable room state.
+      // Keeping an EphemeralStore beside a large workspace LoroDoc allocated
+      // from the same WASM heap and repeatedly tipped the DO isolate over its
+      // memory limit. Relay workspace presence statelessly; a newly joined
+      // client sees every active device again on its next heartbeat.
+      const eph = state.workspace ? undefined : this.ensureEph();
       if (!state.rooms.includes(message.crdt)) state.rooms.push(message.crdt);
       ws.serializeAttachment(state);
       this.send(ws, {
@@ -779,8 +784,10 @@ export class SessionRoom implements DurableObject {
         permission: "write",
         version: new Uint8Array()
       });
-      const all = eph.encodeAll();
-      if (all.length > 0) this.sendUpdates(ws, message.crdt, message.roomId, [all]);
+      if (eph) {
+        const all = eph.encodeAll();
+        if (all.length > 0) this.sendUpdates(ws, message.crdt, message.roomId, [all]);
+      }
       return;
     }
 
@@ -851,12 +858,14 @@ export class SessionRoom implements DurableObject {
         this.ack(ws, { crdt, roomId }, UpdateStatusCode.PayloadTooLarge, batchId);
         return;
       }
-      const eph = this.ensureEph();
-      try {
-        for (const update of updates) if (update.length > 0) eph.apply(update);
-      } catch {
-        this.ack(ws, { crdt, roomId }, UpdateStatusCode.InvalidUpdate, batchId);
-        return;
+      if (!state.workspace) {
+        const eph = this.ensureEph();
+        try {
+          for (const update of updates) if (update.length > 0) eph.apply(update);
+        } catch {
+          this.ack(ws, { crdt, roomId }, UpdateStatusCode.InvalidUpdate, batchId);
+          return;
+        }
       }
       this.ack(ws, { crdt, roomId }, UpdateStatusCode.Ok, batchId);
       await this.relay(ws, crdt, roomId, updates);

@@ -715,7 +715,10 @@ fn validate_authority(authority: &AgentInferenceAuthority) -> Result<DateTime<Ut
         || authority.token_type != "Bearer"
         || authority.authority_id.is_empty()
         || authority.principal_id.is_empty()
-        || authority.authority_scope.is_empty()
+        || authority
+            .authority_scope
+            .as_deref()
+            .is_some_and(str::is_empty)
         || authority.token.is_empty()
     {
         return Err(EngineError::Other(

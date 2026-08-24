@@ -771,14 +771,14 @@ mod tests {
 
 
     #[test]
-    fn accepts_only_well_formed_v2_principal_authorities() {
+    fn accepts_scoped_and_legacy_unscoped_v2_principal_authorities() {
         let authority = AgentInferenceAuthority {
             contract_version: 2,
             token: "v2-authority-token".into(),
             token_type: "Bearer".into(),
             authority_id: "authority-1".into(),
             principal_id: "identity:owner-1".into(),
-            authority_scope: "user:identity:owner-1".into(),
+            authority_scope: Some("user:identity:owner-1".into()),
             expires_at: "2099-01-01T00:00:00Z".into(),
         };
         assert!(validate_authority(&authority).is_ok());
@@ -787,9 +787,13 @@ mod tests {
         invalid.contract_version = 1;
         assert!(validate_authority(&invalid).is_err());
 
-        let mut missing_scope = authority;
-        missing_scope.authority_scope.clear();
-        assert!(validate_authority(&missing_scope).is_err());
+        let mut unscoped = authority.clone();
+        unscoped.authority_scope = None;
+        assert!(validate_authority(&unscoped).is_ok());
+
+        let mut empty_scope = authority;
+        empty_scope.authority_scope = Some(String::new());
+        assert!(validate_authority(&empty_scope).is_err());
     }
 
     #[test]

@@ -203,7 +203,7 @@ pub(crate) struct AgentInferenceAuthority {
     pub token_type: String,
     pub authority_id: String,
     pub principal_id: String,
-    pub authority_scope: String,
+    pub authority_scope: Option<String>,
     pub expires_at: String,
 }
 
@@ -382,9 +382,11 @@ impl ScaffoldClient {
             .headers(headers)
             .bearer_auth(&authority.token)
             .header(reqwest::header::CONTENT_LENGTH, content_length)
-            .header("x-agent-auth-authority-scope", &authority.authority_scope)
             .header("x-agent-auth-request-id", request_id)
             .header("x-agent-auth-conversation-id", conversation_id);
+        if let Some(authority_scope) = authority.authority_scope.as_deref() {
+            request = request.header("x-agent-auth-authority-scope", authority_scope);
+        }
         if let Some(account_id) = requested_account_id {
             request = request.header("x-agent-auth-account-id", account_id);
         }
@@ -2705,7 +2707,7 @@ mod tests {
             token_type: "Bearer".into(),
             authority_id: "authority-1".into(),
             principal_id: "identity:owner-1".into(),
-            authority_scope: "user:identity:owner-1".into(),
+            authority_scope: Some("user:identity:owner-1".into()),
             expires_at: "2099-01-01T00:00:00Z".into(),
         }
     }
@@ -2843,6 +2845,52 @@ mod tests {
         assert!(inference.contains("x-agent-auth-request-id: request-1"));
         assert!(!inference.contains("local-loopback-token"));
         assert!(!inference.contains("x-agent-auth-owner-subject"));
+    }
+
+    #[tokio::test]
+    async fn agent_auth_accepts_unscoped_v2_authority_during_rollout() {
+        let authority = serde_json::json!({
+            "contractVersion": 2,
+            "token": "legacy-v2-authority-token",
+            "tokenType": "Bearer",
+            "authorityId": "authority-1",
+            "principalId": "identity:owner-1",
+            "expiresAt": "2099-01-01T00:00:00Z"
+        })
+        .to_string();
+        let (origin, captured) = mock_server(vec![authority, r#"{"ok":true}"#.into()]).await;
+        let client = ScaffoldClient::new(
+            origin,
+            "project-a",
+            Arc::new(StaticToken("owner-scoped-bearer".into())),
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        let authority = client
+            .issue_agent_inference_authority(&cancellation)
+            .await
+            .unwrap();
+
+        let response = client
+            .proxy_agent_inference(AgentInferenceProxyRequest {
+                endpoint: "messages",
+                query: None,
+                authority: &authority,
+                conversation_id: "conversation-1",
+                requested_account_id: None,
+                request_id: "request-1",
+                headers: reqwest::header::HeaderMap::new(),
+                content_length: 2,
+                body: reqwest::Body::from("{}"),
+                cancellation: &cancellation,
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let requests = captured.await.unwrap();
+        let inference = requests[1].to_ascii_lowercase();
+        assert!(!inference.contains("x-agent-auth-authority-scope:"));
     }
 
     #[tokio::test]
