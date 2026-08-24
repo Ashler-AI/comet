@@ -196,7 +196,7 @@ describe("SessionRoom chat authorization", () => {
     expect(sql.meta.get("owner")).toBe(PROJECT_SCOPE);
   });
 
-  it("relays workspace presence without allocating another WASM store", async () => {
+  it("replays bounded workspace presence without allocating another WASM store", async () => {
     const { room, sockets } = makeRoom();
     const internals = room as unknown as SessionRoomInternals;
     const roomId = "ws4/project-a";
@@ -218,7 +218,6 @@ describe("SessionRoom chat authorization", () => {
     const join = { ...joinRequest(roomId), crdt: CrdtType.LoroEphemeralStore };
 
     await internals.handleJoin(source as unknown as WebSocket, sourceState, join);
-    await internals.handleJoin(target as unknown as WebSocket, targetState, join);
     expect(internals.eph).toBeUndefined();
 
     const heartbeat = new Uint8Array([1, 2, 3]);
@@ -238,6 +237,8 @@ describe("SessionRoom chat authorization", () => {
         (message) => message.type === MessageType.Ack && message.status === 0
       )
     ).toBe(true);
+
+    await internals.handleJoin(target as unknown as WebSocket, targetState, join);
     const relayed = target.sent
       .map((bytes) => decode(bytes))
       .find((message) => message.type === MessageType.DocUpdate);
@@ -246,6 +247,16 @@ describe("SessionRoom chat authorization", () => {
       expect(relayed.crdt).toBe(CrdtType.LoroEphemeralStore);
       expect(relayed.updates).toEqual([heartbeat]);
     }
+
+    vi.advanceTimersByTime(30_001);
+    const expired = new CapturingSocket();
+    const expiredState = state("device-c");
+    expired.serializeAttachment(expiredState);
+    sockets.push(expired as unknown as WebSocket);
+    await internals.handleJoin(expired as unknown as WebSocket, expiredState, join);
+    expect(
+      expired.sent.some((bytes) => decode(bytes).type === MessageType.DocUpdate)
+    ).toBe(false);
   });
 
   it("lets different authenticated users mutate and read every authorized chat surface", async () => {

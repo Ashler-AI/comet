@@ -98,6 +98,8 @@ const REPLAY_CRASH_LIMIT = 3;
 /** Payload bytes per outbound fragment (leaves room for the envelope). */
 const FRAGMENT_BYTES = 200_000;
 const MAX_PRESENCE_UPDATE_BYTES = 16 * 1024;
+const WORKSPACE_PRESENCE_TTL_MS = 30_000;
+const MAX_WORKSPACE_PRESENCE_PEERS = 128;
 
 /** Validates the typed JSON carried inside a Loro ephemeral participant value. */
 export const isValidParticipantCursor = (cursor: unknown, text?: string): boolean => {
@@ -236,6 +238,10 @@ interface FragmentBatch {
   totalSize: number;
   header: DocUpdateFragmentHeader;
 }
+interface WorkspacePresenceEntry {
+  expiresAt: number;
+  updates: Uint8Array[];
+}
 
 interface FrontierCheckpoint {
   at: number;
@@ -249,6 +255,10 @@ export class SessionRoom implements DurableObject {
   /** Lazily materialized doc — the log is authoritative; this is a cache. */
   private doc: LoroDoc | undefined;
   private eph: EphemeralStore | undefined;
+  /** Bounded byte snapshots for workspace presence. Avoids another Loro WASM
+   * allocation while letting fresh joiners observe peers before the next
+   * 15-second heartbeat. Lost on hibernation by design. */
+  private readonly workspacePresence = new Map<string, WorkspacePresenceEntry>();
   private pending: Uint8Array[] = [];
   private pendingBytes = 0;
   private flushTimer: ReturnType<typeof setTimeout> | undefined;
@@ -769,11 +779,10 @@ export class SessionRoom implements DurableObject {
     }
 
     if (message.crdt === CrdtType.LoroEphemeralStore) {
-      // Workspace presence is a 15-second heartbeat, not durable room state.
-      // Keeping an EphemeralStore beside a large workspace LoroDoc allocated
-      // from the same WASM heap and repeatedly tipped the DO isolate over its
-      // memory limit. Relay workspace presence statelessly; a newly joined
-      // client sees every active device again on its next heartbeat.
+      // Workspace presence uses bounded encoded snapshots instead of another
+      // Loro WASM store beside the large workspace document. Each device
+      // republishes every 15 seconds; entries expire at the client's 30-second
+      // ephemeral timeout.
       const eph = state.workspace ? undefined : this.ensureEph();
       if (!state.rooms.includes(message.crdt)) state.rooms.push(message.crdt);
       ws.serializeAttachment(state);
@@ -784,7 +793,10 @@ export class SessionRoom implements DurableObject {
         permission: "write",
         version: new Uint8Array()
       });
-      if (eph) {
+      if (state.workspace) {
+        const cached = this.workspacePresenceSnapshot(state.deviceId, Date.now());
+        if (cached.length > 0) this.sendUpdates(ws, message.crdt, message.roomId, cached);
+      } else if (eph) {
         const all = eph.encodeAll();
         if (all.length > 0) this.sendUpdates(ws, message.crdt, message.roomId, [all]);
       }
@@ -857,6 +869,9 @@ export class SessionRoom implements DurableObject {
       if (updates.some((update) => update.length > MAX_PRESENCE_UPDATE_BYTES)) {
         this.ack(ws, { crdt, roomId }, UpdateStatusCode.PayloadTooLarge, batchId);
         return;
+      }
+      if (state.workspace) {
+        this.cacheWorkspacePresence(state.deviceId, updates, Date.now());
       }
       if (!state.workspace) {
         const eph = this.ensureEph();
@@ -1104,6 +1119,42 @@ export class SessionRoom implements DurableObject {
   private ensureEph(): EphemeralStore {
     if (!this.eph) this.eph = new EphemeralStore(30_000);
     return this.eph;
+  }
+
+  private pruneWorkspacePresence(now: number) {
+    for (const [deviceId, entry] of this.workspacePresence) {
+      if (entry.expiresAt <= now) this.workspacePresence.delete(deviceId);
+    }
+  }
+
+  private workspacePresenceSnapshot(deviceId: string | undefined, now: number) {
+    this.pruneWorkspacePresence(now);
+    const updates: Uint8Array[] = [];
+    for (const [peerDeviceId, entry] of this.workspacePresence) {
+      if (peerDeviceId !== deviceId) updates.push(...entry.updates);
+    }
+    return updates;
+  }
+
+  private cacheWorkspacePresence(
+    deviceId: string | undefined,
+    updates: Uint8Array[],
+    now: number
+  ) {
+    if (!deviceId) return;
+    const totalBytes = updates.reduce((total, update) => total + update.byteLength, 0);
+    if (totalBytes === 0 || totalBytes > MAX_PRESENCE_UPDATE_BYTES) return;
+    this.pruneWorkspacePresence(now);
+    this.workspacePresence.delete(deviceId);
+    while (this.workspacePresence.size >= MAX_WORKSPACE_PRESENCE_PEERS) {
+      const oldest = this.workspacePresence.keys().next().value;
+      if (oldest === undefined) break;
+      this.workspacePresence.delete(oldest);
+    }
+    this.workspacePresence.set(deviceId, {
+      expiresAt: now + WORKSPACE_PRESENCE_TTL_MS,
+      updates: updates.map((update) => update.slice())
+    });
   }
 
   // ── durability: flush, compaction, backups ───────────────────────────────

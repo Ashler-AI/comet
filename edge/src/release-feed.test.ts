@@ -12,7 +12,7 @@ afterEach(() => vi.unstubAllGlobals());
 describe("authenticated release feed", () => {
   it("obtains a fresh server credential for every manifest and artifact request", async () => {
     const authorizations: string[] = [];
-    const redirects: Array<RequestRedirect | undefined> = [];
+    const redirects: Array<RequestInit["redirect"]> = [];
     vi.stubGlobal(
       "fetch",
       vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
