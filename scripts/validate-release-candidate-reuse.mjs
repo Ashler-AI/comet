@@ -48,6 +48,7 @@ export function validateReleaseCandidateReuse({
   releaseSurface,
   repository,
   runId,
+  sourceCommitReachable = false,
 }) {
   const sourceRun = requireObject(run, "source run");
   if (!/^[1-9][0-9]*$/.test(String(runId))) throw new Error("candidate run id is invalid");
@@ -58,7 +59,11 @@ export function validateReleaseCandidateReuse({
   requireEqual(sourceRun.event, "workflow_dispatch", "source run event");
   requireEqual(sourceRun.status, "completed", "source run status");
   requireEqual(sourceRun.conclusion, "success", "source run conclusion");
-  requireEqual(sourceRun.head_branch, "main", "source run branch");
+  if (sourceRun.head_branch !== "main" && sourceCommitReachable !== true) {
+    throw new Error(
+      `source run branch is ${JSON.stringify(sourceRun.head_branch)} and its commit is not reachable from main`,
+    );
+  }
   if (!/^[0-9a-f]{40}$/.test(sourceRun.head_sha ?? "")) {
     throw new Error("source run head SHA is invalid");
   }
@@ -127,10 +132,18 @@ async function readJson(file) {
 }
 
 async function main() {
-  const [runPath, candidateDir, requestedVersion, releaseSurface, repository, runId] = process.argv.slice(2);
+  const [
+    runPath,
+    candidateDir,
+    requestedVersion,
+    releaseSurface,
+    repository,
+    runId,
+    sourceCommitReachable,
+  ] = process.argv.slice(2);
   if (!runPath || !candidateDir || !requestedVersion || !releaseSurface || !repository || !runId) {
     throw new Error(
-      "usage: validate-release-candidate-reuse.mjs <run-json> <candidate-dir> <version> <release-surface> <repository> <run-id>",
+      "usage: validate-release-candidate-reuse.mjs <run-json> <candidate-dir> <version> <release-surface> <repository> <run-id> [source-commit-reachable]",
     );
   }
   const hasScaffold = releaseSurface === "desktop-and-scaffold";
@@ -147,6 +160,7 @@ async function main() {
     releaseSurface,
     repository,
     runId,
+    sourceCommitReachable: sourceCommitReachable === "true",
   });
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }

@@ -110,7 +110,7 @@ describe("Comet release surfaces", () => {
     assert.ok(candidateStop < guard && guard < channels);
   });
 
-  it("reuses only a successful main release candidate for production promotion", async () => {
+  it("reuses only a successful main or merged release candidate for production promotion", async () => {
     const workflow = await read(".github/workflows/release.yml");
     const candidate = jobBlock(workflow, "candidate");
 
@@ -119,6 +119,9 @@ describe("Comet release surfaces", () => {
     assert.match(workflow, /candidate_run_id is only supported for production promotion/);
     assert.match(candidate, /gh api "repos\/\$GITHUB_REPOSITORY\/actions\/runs\/\$CANDIDATE_RUN_ID"/);
     assert.match(candidate, /actions\/download-artifact@v4[\s\S]*run-id: \$\{\{ inputs\.candidate_run_id \}\}/);
+    assert.match(candidate, /gh api "repos\/\$GITHUB_REPOSITORY\/compare\/\$source_sha\.\.\.\$GITHUB_SHA"/);
+    assert.match(candidate, /source_sha" =~ \^\[0-9a-f\]\{40\}\$/);
+    assert.match(candidate, /compare_status.*ahead.*identical/s);
     assert.match(candidate, /node scripts\/validate-release-candidate-reuse\.mjs/);
     assert.match(candidate, /sha256sum --check desktop-SHA256SUMS/);
     assert.match(candidate, /sha256sum --check scaffold-SHA256SUMS/);
@@ -202,6 +205,22 @@ describe("release candidate reuse validation", () => {
       commit: RUN_SHA,
       workflowRun: RUN_URL,
     });
+  });
+
+  it("accepts a candidate branch commit only after main contains it", () => {
+    const merged = reusableCandidate({ sourceCommitReachable: true });
+    merged.run.head_branch = "fix/crew-installed-stability";
+    assert.deepEqual(validateReleaseCandidateReuse(merged), {
+      commit: RUN_SHA,
+      workflowRun: RUN_URL,
+    });
+
+    const unmerged = reusableCandidate();
+    unmerged.run.head_branch = "fix/crew-installed-stability";
+    assert.throws(
+      () => validateReleaseCandidateReuse(unmerged),
+      /commit is not reachable from main/,
+    );
   });
 
   it("rejects candidates from another repository, commit, or file set", () => {

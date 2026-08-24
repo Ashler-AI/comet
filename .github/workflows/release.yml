@@ -311,19 +311,41 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
           RELEASE_SURFACE: ${{ needs.version.outputs.release_surface }}
           CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           cp reused/release-candidate.tar.gz reused/release-candidate.tar.gz.sha256 .
           sha256sum --check release-candidate.tar.gz.sha256
           mkdir candidate
           tar -xzf release-candidate.tar.gz -C candidate
+          source_branch="$(jq -r '.head_branch // empty' candidate-source-run.json)"
+          source_sha="$(jq -r '.head_sha // empty' candidate-source-run.json)"
+          if [[ ! "$source_sha" =~ ^[0-9a-f]{40}$ || -z "$source_branch" ]]; then
+            echo "::error::candidate source run returned an invalid branch or commit"
+            exit 1
+          fi
+          source_commit_reachable=false
+          if [[ "$source_branch" == "main" ]]; then
+            source_commit_reachable=true
+          else
+            compare_status="$(
+              gh api "repos/$GITHUB_REPOSITORY/compare/$source_sha...$GITHUB_SHA" --jq '.status'
+            )"
+            if [[ "$compare_status" == "ahead" || "$compare_status" == "identical" ]]; then
+              source_commit_reachable=true
+            else
+              echo "::error::candidate commit $source_sha from $source_branch is not an ancestor of main $GITHUB_SHA"
+              exit 1
+            fi
+          fi
           node scripts/validate-release-candidate-reuse.mjs \
             candidate-source-run.json \
             candidate \
             "$VERSION" \
             "$RELEASE_SURFACE" \
             "$GITHUB_REPOSITORY" \
-            "$CANDIDATE_RUN_ID"
+            "$CANDIDATE_RUN_ID" \
+            "$source_commit_reachable"
           (cd candidate && sha256sum --check desktop-SHA256SUMS)
           if [[ "$RELEASE_SURFACE" == "desktop-and-scaffold" ]]; then
             (cd candidate && sha256sum --check scaffold-SHA256SUMS)
