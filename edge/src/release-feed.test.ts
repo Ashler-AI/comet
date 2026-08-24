@@ -12,10 +12,12 @@ afterEach(() => vi.unstubAllGlobals());
 describe("authenticated release feed", () => {
   it("obtains a fresh server credential for every manifest and artifact request", async () => {
     const authorizations: string[] = [];
+    const redirects: Array<RequestRedirect | undefined> = [];
     vi.stubGlobal(
       "fetch",
       vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
         authorizations.push(new Headers(init?.headers).get("authorization") ?? "");
+        redirects.push(init?.redirect);
         return new Response("release bytes", {
           headers: { "content-type": "application/octet-stream", etag: '"digest"' }
         });
@@ -33,6 +35,7 @@ describe("authenticated release feed", () => {
     );
 
     expect(authorizations).toEqual(["Bearer server-token-1", "Bearer server-token-2"]);
+    expect(redirects).toEqual(["manual", "manual"]);
     expect(manifest.headers.get("cache-control")).toBe("private, no-store");
     expect(artifact.headers.get("cache-control")).toBe(
       "private, max-age=31536000, immutable"

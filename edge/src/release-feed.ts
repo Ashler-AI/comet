@@ -95,7 +95,7 @@ export const fetchReleaseObject = async (
   const object = encodeURIComponent(`releases/${file}`);
   const response = await fetch(
     `https://storage.googleapis.com/download/storage/v1/b/${encodeURIComponent(bucket)}/o/${object}?alt=media`,
-    { method, headers: { authorization: `Bearer ${token}` }, redirect: "error" }
+    { method, headers: { authorization: `Bearer ${token}` }, redirect: "manual" }
   );
   if (response.status === 404) return errorResponse("not_found", 404);
   if (!response.ok) return errorResponse("release_fetch_failed", 502);
