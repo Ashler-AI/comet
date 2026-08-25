@@ -216,6 +216,25 @@ impl Repos {
         })
     }
 
+    /// The repository's configured default branch: `origin/HEAD` when present,
+    /// otherwise the branch checked out in the main folder.
+    async fn default_branch(&self, repo_path: &Path) -> Option<String> {
+        match self
+            .git(
+                &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+                Some(repo_path),
+            )
+            .await
+        {
+            Ok(short) => short.split_once('/').map(|(_, branch)| branch.to_string()),
+            Err(_) => self
+                .current_branch(repo_path)
+                .await
+                .ok()
+                .filter(|branch| branch != "HEAD"),
+        }
+    }
+
     /// The absolute Git `HEAD` file for event-driven external branch reconciliation.
     pub async fn git_head_path(&self, path: &Path) -> Result<PathBuf, EngineError> {
         let git_dir = self
@@ -252,14 +271,14 @@ impl Repos {
     }
 
     async fn to_repo(&self, path: &Path) -> Result<Repo, EngineError> {
-        let branch = self.current_branch(path).await.ok();
+        let default_branch = self.default_branch(path).await;
         Ok(Repo {
             path: path.to_string_lossy().to_string(),
             name: path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| path.to_string_lossy().to_string()),
-            default_branch: branch,
+            default_branch,
         })
     }
 
@@ -386,25 +405,9 @@ impl Repos {
                 push(name);
             }
         }
-        // Default branch first: origin/HEAD's target, else the checked-out branch.
-        let default = match self
-            .git(
-                &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-                Some(repo_path),
-            )
-            .await
-        {
-            Ok(short) => short.split_once('/').map(|(_, b)| b.to_string()),
-            Err(_) => None,
-        };
-        let default = match default {
-            Some(branch) => Some(branch),
-            None => self
-                .current_branch(repo_path)
-                .await
-                .ok()
-                .filter(|b| b != "HEAD"),
-        };
+        // Default branch first; the picker treats the first row as the base for
+        // a fresh worktree when the user has not made an explicit ref choice.
+        let default = self.default_branch(repo_path).await;
         if let Some(default) = default
             && let Some(pos) = names.iter().position(|n| *n == default)
         {

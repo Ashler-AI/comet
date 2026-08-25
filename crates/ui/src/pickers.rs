@@ -52,8 +52,8 @@ pub struct DraftConfig {
     pub reasoning: Option<ReasoningLevel>,
     /// option id → choice id (only non-defaults are meaningful).
     pub model_options: serde_json::Map<String, serde_json::Value>,
-    /// The picked ref (base branch in NewWorktree mode; a worktree's branch
-    /// when reusing one). `None` = the repo's current branch.
+    /// The explicit ref pick. When absent, a new worktree uses the repository
+    /// default ref while local checkout mode uses the currently checked-out ref.
     pub branch: Option<String>,
     /// Where the new session runs.
     pub checkout: CheckoutKind,
@@ -78,6 +78,23 @@ impl CheckoutKind {
         } else {
             Self::Local
         }
+    }
+}
+
+/// Resolve an implicit draft ref from `ListRefs`. The engine keeps the
+/// repository default ref first; local mode deliberately follows the mutable
+/// main checkout instead.
+fn resolve_draft_ref<'a>(
+    refs: &'a [RepoRef],
+    picked: Option<&str>,
+    checkout: CheckoutKind,
+) -> Option<&'a RepoRef> {
+    match picked {
+        Some(name) => refs.iter().find(|row| row.name == name),
+        None => match checkout {
+            CheckoutKind::NewWorktree => refs.first(),
+            CheckoutKind::Local => refs.iter().find(|row| row.current),
+        },
     }
 }
 
@@ -1643,8 +1660,8 @@ impl Pickers {
     // ---- checkout resolution ----
 
     /// Index of the highlighted-by-default row in the (filtered) ref list:
-    /// the session's branch on an existing chat, the draft pick on a new one,
-    /// else the current branch. Capped to the displayed window.
+    /// the session's branch on an existing chat, otherwise the draft's resolved
+    /// ref. Capped to the displayed window.
     fn selected_ref_index(&self, cx: &App) -> usize {
         let rows = self.filtered_ref_rows(cx);
         let selected = self
@@ -1652,21 +1669,17 @@ impl Pickers {
             .read(cx)
             .selected_chat_row()
             .and_then(|c| c.branch.clone())
-            .or_else(|| self.config.branch.clone());
-        let index = match selected {
-            Some(name) => rows.iter().position(|r| r.name == name).unwrap_or(0),
-            None => rows.iter().position(|r| r.current).unwrap_or(0),
-        };
-        index.min(MAX_REF_ROWS.saturating_sub(1))
+            .or_else(|| self.effective_ref_name());
+        rows.iter()
+            .position(|row| selected.as_deref() == Some(row.name.as_str()))
+            .unwrap_or(0)
+            .min(MAX_REF_ROWS.saturating_sub(1))
     }
 
-    /// The picked ref's row, else the repo's current branch's row.
+    /// The explicit ref, or the checkout mode's implicit default.
     fn selected_ref(&self) -> Option<&RepoRef> {
         let refs = self.refs.ready()?;
-        match self.config.branch.as_deref() {
-            Some(name) => refs.iter().find(|r| r.name == name),
-            None => refs.iter().find(|r| r.current),
-        }
+        resolve_draft_ref(refs, self.config.branch.as_deref(), self.config.checkout)
     }
 
     /// The picked (or current) ref's name.
@@ -2173,7 +2186,7 @@ impl Pickers {
                     .into_any_element(),
                 Loadable::Ready(_) => {
                     let active = self.active;
-                    let selected = session_branch.or_else(|| self.config.branch.clone());
+                    let selected = session_branch.or_else(|| self.effective_ref_name());
                     div()
                         .id("branch-list")
                         .flex()
@@ -3187,6 +3200,40 @@ impl Render for Pickers {
 mod tests {
     use super::*;
     use comet_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+
+    #[test]
+    fn new_worktrees_default_to_repository_default_ref() {
+        let refs = vec![
+            RepoRef {
+                name: "master".into(),
+                current: false,
+                worktree_path: None,
+            },
+            RepoRef {
+                name: "feature/memory-bounds".into(),
+                current: true,
+                worktree_path: None,
+            },
+        ];
+
+        assert_eq!(
+            resolve_draft_ref(&refs, None, CheckoutKind::NewWorktree).map(|row| row.name.as_str()),
+            Some("master")
+        );
+        assert_eq!(
+            resolve_draft_ref(&refs, None, CheckoutKind::Local).map(|row| row.name.as_str()),
+            Some("feature/memory-bounds")
+        );
+        assert_eq!(
+            resolve_draft_ref(
+                &refs,
+                Some("feature/memory-bounds"),
+                CheckoutKind::NewWorktree,
+            )
+            .map(|row| row.name.as_str()),
+            Some("feature/memory-bounds")
+        );
+    }
 
     #[test]
     fn model_projection_filters_providers_search_and_favorites() {

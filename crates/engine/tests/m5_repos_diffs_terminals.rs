@@ -160,6 +160,40 @@ async fn worktree_creation_survives_tight_file_descriptor_budget() {
 }
 
 #[tokio::test]
+async fn repository_default_branch_beats_mutable_checkout() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("myrepo");
+    init_repo(&repo_dir).await;
+    git(
+        &repo_dir,
+        &["update-ref", "refs/remotes/origin/master", "HEAD"],
+    )
+    .await;
+    git(
+        &repo_dir,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/master",
+        ],
+    )
+    .await;
+    git(&repo_dir, &["checkout", "-b", "feature/memory-bounds"]).await;
+
+    let repos = test_repos(&tmp.path().join("data"));
+    let repo = repos
+        .add(&repo_dir.to_string_lossy())
+        .await
+        .expect("add repo");
+
+    assert_eq!(repo.default_branch.as_deref(), Some("master"));
+    assert_eq!(
+        repos.branches(&repo_dir).await.expect("branches")[0],
+        "master"
+    );
+}
+
+#[tokio::test]
 async fn repos_round_trip_add_branches_worktrees() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo_dir = tmp.path().join("myrepo");
