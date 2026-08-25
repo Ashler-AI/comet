@@ -419,6 +419,19 @@ fn local_session_import_completed(
     target_chat.is_some_and(|target| selected_chat == Some(target) && !target_still_available)
 }
 
+fn session_can_fork(
+    device_id: &str,
+    local_device_id: Option<&str>,
+    has_config: bool,
+    harness_session_id: Option<&str>,
+    is_scaffold: bool,
+) -> bool {
+    Some(device_id) == local_device_id
+        && has_config
+        && harness_session_id.is_some_and(|id| !id.is_empty())
+        && !is_scaffold
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct LocalSessionProviderSection {
     harness: comet_proto::HarnessId,
@@ -2729,6 +2742,45 @@ impl Shell {
     fn copy_chat_session_id(&mut self, chat_id: &str, cx: &mut Context<Self>) {
         self.chat_menu = None;
         cx.write_to_clipboard(ClipboardItem::new_string(chat_id.to_owned()));
+        cx.notify();
+    }
+    fn fork_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        self.chat_menu = None;
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.sidebar_notice = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        let state = self.state.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::FORK_SESSION,
+                    serde_json::json!({ "sourceChatId": chat_id }),
+                )
+                .await
+                .and_then(|value| {
+                    serde_json::from_value::<comet_rpc::ForkSessionResult>(value)
+                        .map_err(|error| comet_rpc::RpcError::Failed(error.to_string()))
+                });
+            match result {
+                Ok(fork) => {
+                    state.update(cx, |state, cx| {
+                        state.mark_chat_pending(&fork.chat_id);
+                        state.select_chat(Some(fork.chat_id), cx);
+                    });
+                }
+                Err(error) => {
+                    this.update(cx, |shell, cx| {
+                        shell.sidebar_notice = Some(format!("Fork failed: {error}").into());
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            }
+        });
+        self.control_tasks.push(task);
         cx.notify();
     }
 
@@ -6331,8 +6383,9 @@ impl Shell {
             let link_id = chat_id.clone();
             let invite_id = chat_id.clone();
             let handoff_id = chat_id.clone();
+            let fork_id = chat_id.clone();
             let has_invite_link = self.session_link_for(&chat_id, cx).is_some();
-            let (is_settled, unread_toggle, can_handoff) = {
+            let (is_settled, unread_toggle, can_handoff, can_fork) = {
                 let state = self.state.read(cx);
                 let chat = state.chats.iter().find(|chat| chat.id == chat_id);
                 (
@@ -6342,6 +6395,15 @@ impl Shell {
                     chat.filter(|chat| chat.last_message_at.is_some())
                         .map(|chat| chat.unseen()),
                     state.chat_can_handoff_to_scaffold(&chat_id),
+                    chat.is_some_and(|chat| {
+                        session_can_fork(
+                            &chat.device_id,
+                            state.local_device_id.as_deref(),
+                            chat.config.is_some(),
+                            chat.harness_session_id.as_deref(),
+                            state.chat_is_scaffold(&chat_id),
+                        )
+                    }),
                 )
             };
             let menu = popover::popover_card(&theme)
@@ -6361,6 +6423,21 @@ impl Shell {
                         .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
                         .child(SharedString::from("Rename…")),
                 )
+                .when(can_fork, |menu| {
+                    menu.child(
+                        popover::menu_row(&theme, false, format!("chat-menu-fork-{chat_id}"))
+                            .id("chat-menu-fork")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.fork_chat(fork_id.clone(), cx)
+                            }))
+                            .child(
+                                icon(icons::DOCUMENT_ADD)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Fork session")),
+                    )
+                })
                 .when(!is_settled, |menu| {
                     menu.child(
                         popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))
@@ -8463,6 +8540,45 @@ mod tests {
             Some("chat-a"),
             Some("chat-b"),
             false,
+        ));
+    }
+
+    #[test]
+    fn fork_menu_requires_local_configured_native_non_scaffold_session() {
+        assert!(session_can_fork(
+            "device-a",
+            Some("device-a"),
+            true,
+            Some("native-session"),
+            false,
+        ));
+        assert!(!session_can_fork(
+            "device-b",
+            Some("device-a"),
+            true,
+            Some("native-session"),
+            false,
+        ));
+        assert!(!session_can_fork(
+            "device-a",
+            Some("device-a"),
+            false,
+            Some("native-session"),
+            false,
+        ));
+        assert!(!session_can_fork(
+            "device-a",
+            Some("device-a"),
+            true,
+            None,
+            false,
+        ));
+        assert!(!session_can_fork(
+            "device-a",
+            Some("device-a"),
+            true,
+            Some("native-session"),
+            true,
         ));
     }
 

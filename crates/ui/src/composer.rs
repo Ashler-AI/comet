@@ -4997,6 +4997,7 @@ impl Composer {
                 .expect("current timestamp is representable"),
             harness_session_id: None,
             harness_session_cwd: None,
+            fork_from: None,
             space_id: space_id.clone(),
             last_seen_at: None,
         });

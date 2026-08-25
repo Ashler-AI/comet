@@ -258,6 +258,18 @@ impl Harness for ClaudeHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
         let mut cmd = self.build_command(&exe, &request);
+        if let Some(fork_from) = controls
+            .context
+            .as_ref()
+            .and_then(|context| context.fork_from.as_deref())
+        {
+            if request.resume.as_deref() != Some(fork_from) {
+                return Err(HarnessError::Protocol(
+                    "Crew fork source did not match Claude resume context".into(),
+                ));
+            }
+            cmd.arg("--fork-session");
+        }
         crate::apply_run_context(&mut cmd, controls.context.as_ref());
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {

@@ -425,6 +425,10 @@ async fn run_session(session: Session) {
         kill_grace,
         stderr_tail,
     } = session;
+    let fork_from = controls
+        .context
+        .as_ref()
+        .and_then(|context| context.fork_from.clone());
     let RunControls {
         request_input,
         mut steering,
@@ -491,17 +495,33 @@ async fn run_session(session: Session) {
         let thread = if let Some(resume) = &request.resume {
             let mut p = start_params.clone();
             p.insert("threadId".into(), Value::String(resume.clone()));
-            match client.request("thread/resume", Value::Object(p)).await {
-                Ok(thread) => thread,
-                // A missing/foreign rollout falls back to a fresh thread.
-                Err(e) => {
-                    tracing::debug!(
-                        target: "comet_harness::codex",
-                        "thread/resume failed (starting fresh): {e}"
-                    );
-                    client
-                        .request("thread/start", Value::Object(start_params.clone()))
-                        .await?
+            if let Some(source) = fork_from.as_deref() {
+                if source != resume {
+                    return Err(HarnessError::Protocol(
+                        "Crew fork source did not match Codex resume context".into(),
+                    ));
+                }
+                p.insert("deferGoalContinuation".into(), Value::Bool(true));
+                let thread = client.request("thread/fork", Value::Object(p)).await?;
+                if thread["thread"]["id"].as_str() == Some(source) {
+                    return Err(HarnessError::Protocol(
+                        "Codex fork reused the source thread identity".into(),
+                    ));
+                }
+                thread
+            } else {
+                match client.request("thread/resume", Value::Object(p)).await {
+                    Ok(thread) => thread,
+                    // A missing/foreign rollout falls back to a fresh thread.
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "comet_harness::codex",
+                            "thread/resume failed (starting fresh): {e}"
+                        );
+                        client
+                            .request("thread/start", Value::Object(start_params.clone()))
+                            .await?
+                    }
                 }
             }
         } else {
