@@ -223,9 +223,19 @@ The TypeScript edge hosts SessionRoom and DeviceRoom Durable Objects plus the R2
 - `staging`: staging Worker, Durable Objects, blobs, releases, Scaffold control-plane URL, and project scope.
 - `production`: production Worker, Durable Objects, blobs, releases, Scaffold control-plane URL, and project scope.
 
-No Cloudflare account ID is checked in. `.github/workflows/deploy.yml` builds one candidate, records its SHA-256 and source provenance, deploys it to the `comet-staging` GitHub environment, then permits a manual production path only when the downloaded candidate, build output, and staged digest are equal. The `comet-production` environment supplies separate Cloudflare and GCP IAP credentials and required-reviewer approval. A staging job cannot read production environment secrets.
+No Cloudflare account ID is checked in. `.github/workflows/deploy.yml` builds one candidate, records its SHA-256 and source provenance, and deploys it through the `comet-staging` GitHub environment. The manual production path reuses those platform-scoped deployment credentials only after the downloaded candidate, build output, and staged digest are equal and the GCP project/provider assertions pass. Release-feed credentials have separate protected environment boundaries described below.
 
-The required deployment secrets are `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `GCP_WORKLOAD_IDENTITY_PROVIDER`, and `GCP_SERVICE_ACCOUNT`; required variables are `GCP_PROJECT_ID` and `GCP_IAP_AUDIENCE`. Each value is scoped separately in `comet-staging` and `comet-production`. Release promotion likewise uses `comet-release-staging` and `comet-release-production`, each with `GCP_WORKLOAD_IDENTITY_PROVIDER`, `GCP_SERVICE_ACCOUNT`, and `COMET_RELEASES_GCS_BUCKET`, plus the `GCP_PROJECT_ID` variable. Release buckets are private; trusted downloaders use environment-specific Workload Identity.
+The deployment boundary requires `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `GCP_WORKLOAD_IDENTITY_PROVIDER`, and `GCP_SERVICE_ACCOUNT`; required variables are `GCP_PROJECT_ID` and `GCP_IAP_AUDIENCE`. Release promotion uses `comet-release-staging` and `comet-release-production`, each with `GCP_WORKLOAD_IDENTITY_PROVIDER`, `GCP_SERVICE_ACCOUNT`, and `COMET_RELEASES_GCS_BUCKET`, plus the `GCP_PROJECT_ID` variable. Release buckets are private; publishers use environment-specific Workload Identity, while edge release readers are synchronized from protected GitHub environment secrets.
+
+Release-feed Worker secrets have a separate synchronization boundary inside the
+Deploy workflow. The staging and production sync jobs enter
+`comet-release-staging` and `comet-release-production`, respectively, and read
+the Cloudflare deployment credential plus the bucket and read-only GCS service
+account credentials from that environment. Both reader values absent means
+"preserve the current Worker secrets"; exactly one present, a malformed private
+key, or a missing Cloudflare/bucket value fails before mutation. A valid complete
+set is uploaded with one Wrangler bulk-secret operation. Local secret mutation
+is not a supported deployment path.
 
 Run staging or the staging-to-production path with:
 

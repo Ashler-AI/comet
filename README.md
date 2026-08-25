@@ -57,23 +57,22 @@ The staging contract uses `SCAFFOLD_CONTROL_PLANE_URL=https://scaffold-staging.i
 Create these GitHub environments:
 
 - `comet-staging`
-- `comet-production`, with required reviewers and deployment-branch protection for `main`
 - `comet-release-staging`
 - `comet-release-production`, with required reviewers and deployment-branch protection for release tags
 
-Add the following environment-scoped secrets to both `comet-staging` and `comet-production`, using different values in each environment:
+Add these environment-scoped deployment secrets to `comet-staging`:
 
-- `CLOUDFLARE_API_TOKEN`: token limited to that environment's Worker, Durable Objects, and R2 resources
+- `CLOUDFLARE_API_TOKEN`: token limited to the Crew staging and production Worker, Durable Object, and R2 resources
 - `CLOUDFLARE_ACCOUNT_ID`: Cloudflare account selected at runtime, never checked in
-- `GCP_WORKLOAD_IDENTITY_PROVIDER`: GitHub Actions Workload Identity Provider for that environment
-- `GCP_SERVICE_ACCOUNT`: environment-specific deploy service account email allowed to mint an IAP identity token
+- `GCP_WORKLOAD_IDENTITY_PROVIDER`: GitHub Actions Workload Identity Provider
+- `GCP_SERVICE_ACCOUNT`: deploy service account email allowed to mint an IAP identity token
 
-Add these environment-scoped variables to both deployment environments, again with environment-specific values:
-
-- `GCP_PROJECT_ID`
-- `GCP_IAP_AUDIENCE`
-
-The staging job only references values from `comet-staging`. The production job only starts after staging, verifies the downloaded candidate digest equals both the build digest and staging digest, then enters `comet-production` for approval. Production secrets are never present in the staging job.
+Add `GCP_PROJECT_ID` and `GCP_IAP_AUDIENCE` as variables. The staging job
+uses this environment directly. The current production deploy reuses the same
+platform-scoped credentials only after the staged candidate digest and GCP
+project/provider assertions pass. Release-feed synchronization does not reuse
+that boundary: it enters the matching protected `comet-release-*` environment
+before either edge deployment.
 
 Add these environment-scoped secrets to `comet-release-staging` and `comet-release-production`:
 
@@ -83,11 +82,18 @@ Add these environment-scoped secrets to `comet-release-staging` and `comet-relea
 
 Add `GCP_PROJECT_ID` as an environment-scoped variable to both. Use separate private buckets and identities. The publisher's bucket IAM must grant exactly the operations it preflights: `storage.buckets.get`, `storage.buckets.getIamPolicy`, `storage.objects.get`, `storage.objects.create`, and `storage.objects.delete`; scope object access to that environment's `releases/` prefix. Deployment and publication are disabled unless the repository owner is `Ashler-AI`. Production promotes the candidate accepted by staging and never creates a public GitHub Release or object.
 
-The deployed Comet edge also needs `COMET_RELEASES_GCS_BUCKET`,
-`GCP_RELEASE_SERVICE_ACCOUNT_EMAIL`, and `GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY`
-as environment-specific Wrangler secrets. The service account is read-only on
-that environment's release bucket. Installed CLI and desktop clients send their
-renewable Comet login to the edge; GCS credentials never reach the device.
+The deployed Crew edge release feed is synchronized by the **Deploy** workflow
+from the matching `comet-release-staging` or `comet-release-production`
+environment. Add `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`,
+`GCP_RELEASE_SERVICE_ACCOUNT_EMAIL`, and
+`GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY` there alongside
+`COMET_RELEASES_GCS_BUCKET`. The reader service account is read-only on that
+environment's release bucket. When both reader credentials are absent, the
+workflow preserves the existing Worker secrets; a partial or malformed reader
+configuration fails before Wrangler runs. A complete configuration is applied
+with one bulk secret update. Do not provision release-feed credentials with a
+local `wrangler secret put`. Installed CLI and desktop clients send their
+renewable Crew login to the edge; GCS credentials never reach the device.
 
 ## Deploy
 
@@ -98,8 +104,8 @@ gh workflow run deploy.yml -f target=staging
 gh workflow run deploy.yml -f target=production
 ```
 
-The production command still deploys staging first. The `comet-production` environment approval is the production gate.
 
+The production command still deploys staging first. The protected `comet-release-production` secret-synchronization job is the production approval gate and must succeed before the production edge deploy starts.
 For an authenticated local deployment, use the checked-in environment contract and environment-specific Cloudflare credentials:
 
 ```bash
