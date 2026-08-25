@@ -92,6 +92,7 @@ fn routed_controls(token: &str) -> RunControls {
             provider: "openai".into(),
             model: "gpt-5.6-sol".into(),
         }),
+        fork_from: None,
     });
     controls
 }
@@ -264,6 +265,39 @@ async fn prime_resume_uses_the_native_token_without_creating_a_parallel_store() 
     )));
     #[cfg(unix)]
     std::fs::remove_dir(socket_path.parent().unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn prime_fork_uses_native_fork_without_reusing_the_source_identity() {
+    let _env = env_lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let config_dir = temp.path().join("config");
+    let _argv_log = EnvGuard::set("PRIME_ARGV_LOG", temp.path().join("argv"));
+    let _coding_agent_dir = EnvGuard::set("PRIME_AGENT_CODING_AGENT_DIR", &config_dir);
+    let harness = PrimeAgentHarness::new().with_executable(fixture_path());
+    let mut fork_controls = controls();
+    fork_controls.context = Some(RunContext {
+        session_id: "crew-fork".into(),
+        ipc_port: 38117,
+        inference: None,
+        fork_from: Some("native-prime-session".into()),
+    });
+
+    let events = harness
+        .run(request(Some("native-prime-session")), fork_controls)
+        .await
+        .expect("fork starts")
+        .map(|event| event.expect("valid ACP event"))
+        .collect::<Vec<_>>()
+        .await;
+
+    let argv = std::fs::read_to_string(temp.path().join("argv")).unwrap();
+    assert_eq!(argument_after(&argv, "--fork"), "native-prime-session");
+    assert!(!argv.lines().any(|arg| arg == "--resume"));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::SessionStarted { session_id, .. } if session_id == "prime-acp-session"
+    )));
 }
 
 #[tokio::test]

@@ -9,7 +9,7 @@
 //!   gitDetected, gitCheckedAt?, checkoutId?, createdAt}
 //! - `chats`: LoroMap keyed by chatId → row map {id, deviceId, title?, archived, cwd?,
 //!   branch?, checkoutId?, config?(json), lastMessagePreview?, lastMessageAt?, createdAt,
-//!   harnessSessionId?, harnessSessionCwd?, spaceId?, lastSeenAt?}
+//!   harnessSessionId?, harnessSessionCwd?, forkFrom?(json), spaceId?, lastSeenAt?}
 //! - `sessions`: LoroMap keyed by chatId → row map {chatId, deviceId, status, startedAt?,
 //!   updatedAt}
 //! - `sessionRefs`: LoroMap keyed by chatId → row map {chatId, addedAt}
@@ -273,6 +273,10 @@ impl WorkspaceDoc {
             "harnessSessionCwd",
             chat.harness_session_cwd.as_deref(),
         )?;
+        match &chat.fork_from {
+            Some(fork) => row.insert("forkFrom", LoroValue::from(serde_json::to_value(fork)?))?,
+            None => row.delete("forkFrom")?,
+        }
         set_opt_str(&row, "spaceId", chat.space_id.as_deref())?;
         set_opt_ms(&row, "lastSeenAt", chat.last_seen_at)?;
         self.doc.commit();
@@ -492,6 +496,15 @@ impl WorkspaceDoc {
         };
         row.insert("harnessSessionId", session_id)?;
         row.insert("harnessSessionCwd", cwd)?;
+        self.doc.commit();
+        Ok(true)
+    }
+    /// Clear a consumed one-shot native fork source. `false` when no chat exists.
+    pub fn clear_chat_fork(&self, chat_id: &str) -> Result<bool, DocError> {
+        let Some(row) = self.existing_row("chats", chat_id) else {
+            return Ok(false);
+        };
+        row.delete("forkFrom")?;
         self.doc.commit();
         Ok(true)
     }
@@ -828,6 +841,8 @@ struct RawChat {
     #[serde(default)]
     harness_session_cwd: Option<String>,
     #[serde(default)]
+    fork_from: Option<comet_proto::HarnessSessionFork>,
+    #[serde(default)]
     space_id: Option<String>,
     #[serde(default)]
     last_seen_at: Option<i64>,
@@ -849,6 +864,7 @@ impl From<RawChat> for Chat {
             created_at: dt(raw.created_at),
             harness_session_id: raw.harness_session_id,
             harness_session_cwd: raw.harness_session_cwd,
+            fork_from: raw.fork_from,
             space_id: raw.space_id,
             last_seen_at: raw.last_seen_at.map(dt),
         }
@@ -963,6 +979,7 @@ mod tests {
             created_at: ts(2_000),
             harness_session_id: None,
             harness_session_cwd: None,
+            fork_from: None,
             space_id: None,
             last_seen_at: None,
         }

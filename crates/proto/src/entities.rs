@@ -72,6 +72,14 @@ impl Space {
     }
 }
 
+/// Harness-native source identity retained until a forked chat starts successfully.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessSessionFork {
+    pub session_id: String,
+    pub cwd: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatConfig {
@@ -193,6 +201,9 @@ pub struct Chat {
     /// is only injected when the next run launches from the same cwd.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_session_cwd: Option<String>,
+    /// One-shot native source consumed after the forked chat starts successfully.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_from: Option<HarnessSessionFork>,
     /// The space this chat belongs to. Invariant: `Some` for every UI-created
     /// chat; rows with a missing/dangling space id are not rendered (the host
     /// device's repair sweep deletes its own danglers).

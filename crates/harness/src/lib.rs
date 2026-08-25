@@ -62,6 +62,8 @@ pub struct RunContext {
     pub session_id: String,
     pub ipc_port: u16,
     pub inference: Option<InferenceRoute>,
+    /// Source native session for a one-shot fork; never exported to the child environment.
+    pub fork_from: Option<String>,
 }
 
 /// Host-side controls handed to a run: input-request bridge + steering mailbox.
@@ -349,6 +351,7 @@ mod run_context_tests {
                 session_id: "session-123".into(),
                 ipc_port: 38117,
                 inference: None,
+                fork_from: None,
             }),
         );
 
@@ -377,6 +380,7 @@ mod run_context_tests {
                 session_id: "session-123".into(),
                 ipc_port: 38117,
                 inference: Some(route.clone()),
+                fork_from: None,
             }),
         );
 

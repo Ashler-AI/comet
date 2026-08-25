@@ -76,6 +76,7 @@ computer:
   maxHeight: 896
 "#;
 pub const OMP_SUPERVISOR_MARKER: &str = "__comet-omp-supervisor";
+const OMP_SESSION_FORK_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Run the hidden OMP supervisor command when this process was invoked for it.
 ///
@@ -1184,6 +1185,202 @@ fn matching_session_files_with_limit(
     }
     (matches, true)
 }
+#[derive(Default)]
+struct ForkSnapshotState {
+    last_user_boundary: Option<u64>,
+    completed_after_last_user: bool,
+}
+
+impl ForkSnapshotState {
+    fn observe(&mut self, role: Option<&str>, stop_reason: Option<&str>, boundary: u64) {
+        match role {
+            Some("user") => {
+                self.last_user_boundary = Some(boundary);
+                self.completed_after_last_user = false;
+            }
+            Some("assistant") if stop_reason != Some("toolUse") => {
+                self.completed_after_last_user = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn snapshot_len(&self, active: bool, complete_len: u64) -> Result<u64, HarnessError> {
+        if !active || self.completed_after_last_user {
+            return Ok(complete_len);
+        }
+        self.last_user_boundary.ok_or_else(|| {
+            HarnessError::Protocol("Active OMP session has no complete user context to fork".into())
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct ForkRecord<'a> {
+    #[serde(rename = "type", default)]
+    kind: Option<&'a str>,
+    #[serde(rename = "stopReason", default)]
+    stop_reason: Option<&'a str>,
+    #[serde(default, borrow)]
+    message: Option<ForkMessage<'a>>,
+}
+
+#[derive(Deserialize)]
+struct ForkMessage<'a> {
+    #[serde(default)]
+    role: Option<&'a str>,
+}
+
+#[cfg(test)]
+fn fork_snapshot_len(bytes: &[u8], active: bool) -> Result<usize, HarnessError> {
+    let complete_len = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|index| index + 1)
+        .ok_or_else(|| {
+            HarnessError::Protocol("OMP session journal has no complete records".into())
+        })?;
+    let mut state = ForkSnapshotState::default();
+    let mut offset = 0;
+    for line in bytes[..complete_len].split_inclusive(|byte| *byte == b'\n') {
+        offset += line.len();
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        let record: ForkRecord<'_> = serde_json::from_slice(body).map_err(|_| {
+            HarnessError::Protocol("OMP session journal contains an invalid complete record".into())
+        })?;
+        if record.kind == Some("message") {
+            state.observe(
+                record.message.and_then(|message| message.role),
+                record.stop_reason,
+                offset as u64,
+            );
+        }
+    }
+    Ok(state.snapshot_len(active, complete_len as u64)? as usize)
+}
+
+fn fork_session_file(
+    session_dirs: &[PathBuf],
+    source_session_id: &str,
+) -> Result<String, HarnessError> {
+    const RECORD_MAX_BYTES: usize = OMP_SESSION_FORK_MAX_BYTES as usize;
+
+    let (matches, exhaustive) = matching_session_files(session_dirs, source_session_id);
+    if !exhaustive || matches.len() != 1 {
+        return Err(HarnessError::Protocol(
+            "Could not resolve exactly one OMP session journal to fork".into(),
+        ));
+    }
+    let source_path = &matches[0];
+    let source = std::fs::File::open(source_path)?;
+    let byte_count = source.metadata()?.len();
+    if byte_count == 0 || byte_count > OMP_SESSION_FORK_MAX_BYTES {
+        return Err(HarnessError::Protocol(
+            "OMP session journal is empty or exceeds the fork limit".into(),
+        ));
+    }
+    let active = match session_writer_state(source_path) {
+        SessionWriterState::Active => true,
+        SessionWriterState::Inactive => false,
+        SessionWriterState::Unknown => {
+            return Err(HarnessError::Protocol(
+                "Could not verify the OMP source journal while forking".into(),
+            ));
+        }
+    };
+
+    let fork_session_id = uuid::Uuid::new_v4().to_string();
+    let parent = source_path.parent().ok_or_else(|| {
+        HarnessError::Protocol("OMP session journal has no parent directory".into())
+    })?;
+    let target = parent.join(format!("crew-fork-{fork_session_id}.jsonl"));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut output = options.open(&target)?;
+    let result = (|| -> Result<(), HarnessError> {
+        let mut reader = BufReader::new(source.take(byte_count));
+        let mut line = Vec::new();
+        let mut source_bytes = 0_u64;
+        let mut output_bytes = 0_u64;
+        let mut header_rewritten = false;
+        let mut snapshot = ForkSnapshotState::default();
+
+        loop {
+            line.clear();
+            let read = reader.read_until(b'\n', &mut line)?;
+            if read == 0 {
+                break;
+            }
+            source_bytes += read as u64;
+            if line.len() > RECORD_MAX_BYTES {
+                return Err(HarnessError::Protocol(
+                    "OMP session journal record exceeds the fork limit".into(),
+                ));
+            }
+            if line.last() != Some(&b'\n') {
+                continue;
+            }
+            let body = &line[..line.len() - 1];
+            let record: ForkRecord<'_> = serde_json::from_slice(body).map_err(|_| {
+                HarnessError::Protocol(
+                    "OMP session journal contains an invalid complete record".into(),
+                )
+            })?;
+            if !header_rewritten && record.kind == Some("session") {
+                let mut value: Value = serde_json::from_slice(body).map_err(|_| {
+                    HarnessError::Protocol("Could not decode OMP session header".into())
+                })?;
+                if value.get("id").and_then(Value::as_str) != Some(source_session_id) {
+                    return Err(HarnessError::Protocol(
+                        "OMP session journal identity changed before fork".into(),
+                    ));
+                }
+                value["id"] = Value::String(fork_session_id.clone());
+                let encoded = serde_json::to_vec(&value).map_err(|error| {
+                    HarnessError::Protocol(format!("Could not encode OMP fork header: {error}"))
+                })?;
+                output.write_all(&encoded)?;
+                output.write_all(b"\n")?;
+                output_bytes += encoded.len() as u64 + 1;
+                header_rewritten = true;
+            } else {
+                output.write_all(&line)?;
+                output_bytes += line.len() as u64;
+            }
+            if record.kind == Some("message") {
+                snapshot.observe(
+                    record.message.and_then(|message| message.role),
+                    record.stop_reason,
+                    output_bytes,
+                );
+            }
+        }
+        if source_bytes != byte_count {
+            return Err(HarnessError::Protocol(
+                "OMP session journal changed while its fork snapshot was read".into(),
+            ));
+        }
+        if !header_rewritten {
+            return Err(HarnessError::Protocol(
+                "OMP session journal has no session header".into(),
+            ));
+        }
+        output.set_len(snapshot.snapshot_len(active, output_bytes)?)?;
+        output.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        drop(output);
+        let _ = std::fs::remove_file(&target);
+        return Err(error);
+    }
+    Ok(fork_session_id)
+}
 
 fn resolve_omp_executable() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("OMP_EXECUTABLE").filter(|value| !value.is_empty()) {
@@ -1829,10 +2026,26 @@ impl Harness for OmpHarness {
 
     async fn run(
         &self,
-        request: RunRequest,
+        mut request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let executable = self.resolve_executable()?;
+        if let Some(fork_from) = controls
+            .context
+            .as_ref()
+            .and_then(|context| context.fork_from.as_deref())
+        {
+            if request.resume.as_deref() != Some(fork_from) {
+                return Err(HarnessError::Protocol(
+                    "Crew fork source did not match OMP resume context".into(),
+                ));
+            }
+            let session_dirs = self
+                .session_dirs
+                .clone()
+                .unwrap_or_else(|| omp_session_dirs(self.scaffold_host));
+            request.resume = Some(fork_session_file(&session_dirs, fork_from)?);
+        }
         self.ensure_resume_has_no_writer(request.resume.as_deref())?;
         let mut command = self.run_command(&executable, &request);
         let run_config = OmpRunConfig::create()?;
@@ -2964,6 +3177,55 @@ mod tests {
             std::fs::read(format!("{}.count", probe.display())).unwrap(),
             b"x"
         );
+    }
+
+    #[test]
+    fn active_fork_snapshot_stops_after_the_current_user_message() {
+        let bytes = concat!(
+            "{\"type\":\"session\",\"id\":\"native-source\",\"cwd\":\"/repo\"}\n",
+            "{\"type\":\"message\",\"id\":\"u1\",\"message\":{\"role\":\"user\"}}\n",
+            "{\"type\":\"message\",\"id\":\"a1\",\"stopReason\":\"toolUse\",\"message\":{\"role\":\"assistant\"}}\n",
+            "{\"type\":\"message\",\"id\":\"u2\",\"message\":{\"role\":\"user\"}}\n",
+            "{\"type\":\"custom\",\"id\":\"running-tool\"}\n",
+        )
+        .as_bytes();
+        let prefix = &bytes[..fork_snapshot_len(bytes, true).unwrap()];
+        let prefix = std::str::from_utf8(prefix).unwrap();
+        assert!(prefix.contains("\"id\":\"u2\""));
+        assert!(!prefix.contains("running-tool"));
+
+        let completed = concat!(
+            "{\"type\":\"session\",\"id\":\"native-source\",\"cwd\":\"/repo\"}\n",
+            "{\"type\":\"message\",\"id\":\"u1\",\"message\":{\"role\":\"user\"}}\n",
+            "{\"type\":\"message\",\"id\":\"a1\",\"stopReason\":\"stop\",\"message\":{\"role\":\"assistant\"}}\n",
+            "{\"type\":\"custom\",\"id\":\"after-turn\"}\n",
+        )
+        .as_bytes();
+        assert_eq!(fork_snapshot_len(completed, true).unwrap(), completed.len());
+    }
+
+    #[test]
+    fn fork_session_file_rewrites_only_the_native_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let source = sessions.join("source.jsonl");
+        let bytes = concat!(
+            "{\"type\":\"title\",\"title\":\"Source\"}\n",
+            "{\"type\":\"session\",\"version\":3,\"id\":\"native-source\",\"cwd\":\"/repo\"}\n",
+            "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"keep me\"}}\n",
+        );
+        std::fs::write(&source, bytes).unwrap();
+
+        let fork_id = fork_session_file(std::slice::from_ref(&sessions), "native-source").unwrap();
+        assert_ne!(fork_id, "native-source");
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), bytes);
+        let fork_path = sessions.join(format!("crew-fork-{fork_id}.jsonl"));
+        let fork = std::fs::read_to_string(fork_path).unwrap();
+        assert!(fork.contains(&format!("\"id\":\"{fork_id}\"")));
+        assert!(!fork.contains("\"id\":\"native-source\""));
+        assert!(fork.contains("\"id\":\"m1\""));
+        assert!(fork.contains("\"content\":\"keep me\""));
     }
 
     #[test]

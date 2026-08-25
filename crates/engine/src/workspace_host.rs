@@ -517,6 +517,7 @@ impl WorkspaceHost {
             created_at: Utc::now(),
             harness_session_id: None,
             harness_session_cwd: None,
+            fork_from: None,
             space_id,
             last_seen_at: None,
         })?;
@@ -615,6 +616,16 @@ impl WorkspaceHost {
 
     /// Session-status row upsert (sessions engine transitions land here too, in
     /// addition to the local watch channel).
+    pub fn chat_fork(&self, chat_id: &str) -> Option<comet_proto::HarnessSessionFork> {
+        match self.inner.doc.chat(chat_id) {
+            Ok(chat) => chat.and_then(|chat| chat.fork_from),
+            Err(error) => {
+                tracing::warn!(chat = %chat_id, %error, "workspace chat fork read failed");
+                None
+            }
+        }
+    }
+
     pub fn record_session(&self, session: &Session) {
         if let Err(err) = self.inner.doc.upsert_session(session) {
             tracing::warn!(chat = %session.chat_id, error = %err, "workspace session write failed");
@@ -653,10 +664,59 @@ impl WorkspaceHost {
             created_at: Utc::now(),
             harness_session_id: None,
             harness_session_cwd: None,
+            fork_from: None,
             space_id: Some(space.id),
             last_seen_at: None,
         })?;
         Ok(())
+    }
+
+    pub fn fork_chat(&self, source_chat_id: &str) -> Result<Chat, EngineError> {
+        let Some(source) = self.inner.doc.chat(source_chat_id)? else {
+            return Err(EngineError::Other("source session not found".into()));
+        };
+        if source.device_id != self.inner.config.device_id {
+            return Err(EngineError::Other(
+                "source session is hosted on another device".into(),
+            ));
+        }
+        if source.config.is_none() {
+            return Err(EngineError::Other(
+                "source session has no stored harness/model configuration".into(),
+            ));
+        }
+        let native_session_id = source
+            .harness_session_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| EngineError::Other("source session has no native context yet".into()))?;
+        let native_cwd = source
+            .harness_session_cwd
+            .as_deref()
+            .filter(|cwd| !cwd.is_empty())
+            .or(source.cwd.as_deref())
+            .ok_or_else(|| EngineError::Other("source session has no workspace context".into()))?;
+        let mut fork = source.clone();
+        fork.id = crate::new_id();
+        fork.device_id = self.inner.config.device_id.clone();
+        fork.title = source
+            .title
+            .as_deref()
+            .filter(|title| !title.is_empty())
+            .map(|title| format!("Fork of {title}"));
+        fork.archived = false;
+        fork.last_message_preview = None;
+        fork.last_message_at = None;
+        fork.last_seen_at = None;
+        fork.created_at = Utc::now();
+        fork.harness_session_id = None;
+        fork.harness_session_cwd = None;
+        fork.fork_from = Some(comet_proto::HarnessSessionFork {
+            session_id: native_session_id.to_string(),
+            cwd: native_cwd.to_string(),
+        });
+        self.inner.doc.upsert_chat(&fork)?;
+        Ok(fork)
     }
 
     // ── spaces (Mutate surface + owner stamps) ──────────────────────────────
@@ -825,6 +885,9 @@ impl WorkspaceHost {
     /// when the chat doesn't exist.
     pub fn set_chat_config(&self, chat_id: &str, config: &ChatConfig) -> Result<bool, EngineError> {
         Ok(self.inner.doc.set_chat_config(chat_id, config)?)
+    }
+    pub fn clear_chat_fork(&self, chat_id: &str) -> Result<bool, EngineError> {
+        Ok(self.inner.doc.clear_chat_fork(chat_id)?)
     }
 
     /// Tombstone: removes the chats (and session-status) row; the per-chat session

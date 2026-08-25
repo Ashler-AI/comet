@@ -67,11 +67,11 @@ use comet_proto::{
     WorktreeDeletionStage,
 };
 use comet_rpc::{
-    GetAgentRouteAccountParams, GetAgentRouteAccountResult, GetAgentRouteReceiptParams, LinkCache,
-    PeerMessageResult, PeerReplyResult, PeerWaitResult, ReadCheckoutDiffParams,
-    ReadCheckoutDiffResult, RemoveSessionRefResult, ReplyPeerMessageParams, RpcError, RpcReply,
-    RpcService, SendPeerMessageParams, SessionRefParams, WaitPeerReplyParams, methods,
-    parse_params,
+    ForkSessionParams, ForkSessionResult, GetAgentRouteAccountParams, GetAgentRouteAccountResult,
+    GetAgentRouteReceiptParams, LinkCache, PeerMessageResult, PeerReplyResult, PeerWaitResult,
+    ReadCheckoutDiffParams, ReadCheckoutDiffResult, RemoveSessionRefResult, ReplyPeerMessageParams,
+    RpcError, RpcReply, RpcService, SendPeerMessageParams, SessionRefParams, WaitPeerReplyParams,
+    methods, parse_params,
 };
 
 use crate::agent_accounts::AgentAccounts;
@@ -1645,6 +1645,62 @@ impl RpcService for EngineRpc {
                 .map_err(|err| RpcError::Failed(err.to_string()))?;
                 RpcReply::value(&result)
             }
+            methods::FORK_SESSION => {
+                let p: ForkSessionParams = parse_params(params)?;
+                let source_chat_id = p.source_chat_id.trim().to_string();
+                if source_chat_id.is_empty() {
+                    return Err(RpcError::Failed("invalid_source_chat_id".into()));
+                }
+                if !self.doc_host.is_locally_hosted(&source_chat_id) {
+                    return Err(RpcError::Failed("source_session_not_hosted_here".into()));
+                }
+                if !matches!(
+                    self.doc_host.harness_for(&source_chat_id),
+                    HarnessId::ClaudeCode
+                        | HarnessId::Codex
+                        | HarnessId::Omp
+                        | HarnessId::PrimeAgent
+                ) {
+                    return Err(RpcError::Failed(
+                        "source_session_harness_cannot_fork".into(),
+                    ));
+                }
+                let source = self
+                    .doc_host
+                    .open(&source_chat_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let mut entries = source
+                    .doc()
+                    .read_entries()
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                if let Some(streaming) = entries.iter().rposition(|entry| {
+                    entry.role == comet_doc::MessageRole::Assistant
+                        && entry.status == Some(comet_doc::MessageStatus::Streaming)
+                }) {
+                    entries.truncate(streaming);
+                }
+                for entry in &mut entries {
+                    entry.status = entry.status.map(|status| match status {
+                        comet_doc::MessageStatus::Queued | comet_doc::MessageStatus::Steered => {
+                            comet_doc::MessageStatus::Complete
+                        }
+                        status => status,
+                    });
+                }
+                let fork = self
+                    .workspace
+                    .fork_chat(&source_chat_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let target = self.doc_host.open(&fork.id).map_err(|error| {
+                    let _ = self.workspace.delete_chat(&fork.id);
+                    RpcError::Failed(error.to_string())
+                })?;
+                if let Err(error) = target.doc().push_messages(&entries) {
+                    let _ = self.workspace.delete_chat(&fork.id);
+                    return Err(RpcError::Failed(error.to_string()));
+                }
+                RpcReply::value(&ForkSessionResult { chat_id: fork.id })
+            }
             methods::QUEUE_COMMAND => {
                 let p: QueueCommandParams = parse_params(params)?;
                 let activates_chat = match &p.command {
@@ -2529,6 +2585,7 @@ mod tests {
             created_at: chrono::DateTime::UNIX_EPOCH,
             harness_session_id: None,
             harness_session_cwd: None,
+            fork_from: None,
             space_id: None,
             last_seen_at: None,
         };

@@ -871,13 +871,25 @@ impl SessionsEngine {
         let handle = self.doc_handle(chat_id)?;
         handle.write_user_message(&user_id, &request.prompt, now_ms())?;
 
-        // Engine-owned resume (comet sessions.ts:736 — every dispatch read the
-        // chat's stored harness session): callers always send `resume: None`;
-        // the engine threads the chat's prior harness session back in so a new
-        // process (app restart) continues the same harness conversation.
+        // Engine-owned continuation/fork lookup. A pending fork is distinct
+        // from resume: adapters must create a new native identity, and failure
+        // must never degrade to a context-free fresh session.
+        let mut fork_from = None;
         let mut resume_injected = false;
         if request.resume.is_none() && inject_resume {
-            request.resume = self.inner.resume_for(chat_id, &request.cwd);
+            fork_from = self.inner.fork_for(chat_id);
+            if fork_from
+                .as_ref()
+                .is_some_and(|fork| fork.cwd != request.cwd)
+            {
+                return Err(EngineError::Other(
+                    "fork source belongs to a different workspace context".into(),
+                ));
+            }
+            request.resume = fork_from
+                .as_ref()
+                .map(|fork| fork.session_id.clone())
+                .or_else(|| self.inner.resume_for(chat_id, &request.cwd));
             resume_injected = request.resume.is_some();
         }
         lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
@@ -913,6 +925,7 @@ impl SessionsEngine {
                 session_id: chat_id.to_string(),
                 ipc_port: self.inner.ipc_port,
                 inference,
+                fork_from: fork_from.as_ref().map(|fork| fork.session_id.clone()),
             }),
         };
 
@@ -1038,6 +1051,7 @@ impl SessionsEngine {
             RunResumeState {
                 user_message_id: user_id,
                 resume_injected,
+                fork_requested: fork_from.is_some(),
             },
             inference_token,
         ));
@@ -1655,6 +1669,9 @@ impl Inner {
         );
         if let Some(ws) = self.workspace() {
             ws.set_chat_harness_session(chat_id, session_id, cwd);
+            if let Err(err) = ws.clear_chat_fork(chat_id) {
+                tracing::warn!(chat = %chat_id, error = %err, "consumed session fork cleanup failed");
+            }
         }
         if let Some(host) = self.doc_host.get() {
             host.ensure_room_for_chat(chat_id);
@@ -1701,6 +1718,10 @@ impl Inner {
         // Cache the journal hit (memory + row) so later dispatches skip the scan.
         self.remember_harness_session(chat_id, &session_id, &session_cwd);
         cwd_ok(&session_cwd).then_some(session_id)
+    }
+    /// Pending one-shot fork source, gated against the run cwd before launch.
+    fn fork_for(&self, chat_id: &str) -> Option<comet_proto::HarnessSessionFork> {
+        self.workspace()?.chat_fork(chat_id)
     }
 
     fn note_route_restart_progress(&self, chat_id: &str, run_id: &str) {
@@ -1851,6 +1872,7 @@ fn finish_segment<'a>(
 struct RunResumeState {
     user_message_id: String,
     resume_injected: bool,
+    fork_requested: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2040,6 +2062,7 @@ async fn drive_run(
         // ONCE as a fresh session against the same user entry — tombstone the
         // dead id first so no lookup source (journal included) re-injects it.
         if resume_state.resume_injected
+            && !resume_state.fork_requested
             && !saw_session_started
             && folded.is_empty()
             && !interrupted
