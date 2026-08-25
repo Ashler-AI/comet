@@ -95,6 +95,7 @@ describe("Crew edge deployment", () => {
     assert.match(staging, /needs: candidate/);
     assert.match(staging, /environment: comet-release-staging/);
     assert.match(production, /environment: comet-release-production/);
+    assert.match(production, /name: Approve production edge and synchronize release-feed secrets/);
     assert.match(staging, /node scripts\/sync-edge-release-feed-secrets\.mjs staging/);
     assert.match(production, /node scripts\/sync-edge-release-feed-secrets\.mjs production/);
     assert.doesNotMatch(workflow, /wrangler secret put/);

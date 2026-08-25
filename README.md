@@ -104,8 +104,12 @@ gh workflow run deploy.yml -f target=staging
 gh workflow run deploy.yml -f target=production
 ```
 
-
-The production command still deploys staging first. The protected `comet-release-production` secret-synchronization job is the production approval gate and must succeed before the production edge deploy starts.
+The production command still deploys staging first. Every production edge
+deploy then requires one approval through the protected
+`comet-release-production` synchronization job. That approval authorizes the
+production deployment, so the gate intentionally remains when the reader pair
+is absent and secret synchronization is a no-op. Production starts only after
+the gate succeeds.
 For an authenticated local deployment, use the checked-in environment contract and environment-specific Cloudflare credentials:
 
 ```bash
