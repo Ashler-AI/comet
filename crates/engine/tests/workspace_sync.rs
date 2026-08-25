@@ -633,6 +633,139 @@ async fn chat_config_selects_the_run_harness() {
     a.shutdown().await;
 }
 
+#[tokio::test]
+async fn fork_session_clones_context_and_preserves_native_lineage() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), "dev-a");
+    let source_id = "local-chat-source";
+    let config = ChatConfig {
+        harness: HarnessId::Codex,
+        model: Some("gpt-5.6-sol".into()),
+        reasoning: Some(ReasoningLevel::High),
+        agent_account_id: None,
+        model_options: Default::default(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+    };
+    core.workspace
+        .create_space("space-fork", "dev-a", "/tmp/fork", None, true)
+        .unwrap();
+    core.workspace
+        .create_chat(
+            source_id,
+            "space-fork",
+            Some(config.clone()),
+            Some("/tmp/fork".into()),
+        )
+        .unwrap();
+    core.workspace
+        .rename_chat(source_id, "Investigate")
+        .unwrap();
+    core.workspace.set_chat_branch(source_id, "main").unwrap();
+    core.workspace
+        .set_chat_checkout(source_id, "checkout-a")
+        .unwrap();
+    core.workspace
+        .set_chat_harness_session(source_id, "native-source", "/tmp/fork");
+    core.doc_host
+        .open(source_id)
+        .unwrap()
+        .write_user_message("message-a", "retain this context", 123)
+        .unwrap();
+
+    let value = comet_rpc::memory_client(core.rpc_service())
+        .call(
+            methods::FORK_SESSION,
+            serde_json::json!({ "sourceChatId": source_id }),
+        )
+        .await
+        .unwrap();
+    let result: comet_rpc::ForkSessionResult = serde_json::from_value(value).unwrap();
+    assert_ne!(result.chat_id, source_id);
+
+    let fork = core.workspace.doc().chat(&result.chat_id).unwrap().unwrap();
+    assert_eq!(fork.title.as_deref(), Some("Fork of Investigate"));
+    assert_eq!(fork.cwd.as_deref(), Some("/tmp/fork"));
+    assert_eq!(fork.branch.as_deref(), Some("main"));
+    assert_eq!(fork.checkout_id.as_deref(), Some("checkout-a"));
+    assert_eq!(fork.config.as_ref(), Some(&config));
+    assert_eq!(
+        fork.fork_from,
+        Some(comet_proto::HarnessSessionFork {
+            session_id: "native-source".into(),
+            cwd: "/tmp/fork".into(),
+        })
+    );
+    assert_eq!(fork.harness_session_id, None);
+    assert_eq!(
+        core.doc_host
+            .open(&result.chat_id)
+            .unwrap()
+            .doc()
+            .read_entries()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>(),
+        ["message-a"]
+    );
+
+    let mut fork_request = run_request("continue in the fork");
+    fork_request.cwd = "/tmp/fork".into();
+    core.sessions
+        .dispatch(&result.chat_id, HarnessId::Codex, fork_request, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        core.sessions
+            .last_request(&result.chat_id)
+            .and_then(|request| request.resume),
+        Some("native-source".into())
+    );
+    wait_for(
+        || core.workspace.chat_fork(&result.chat_id).is_none(),
+        "fork lineage consumption",
+    )
+    .await;
+    assert_eq!(
+        core.workspace
+            .chat_harness_session(&result.chat_id)
+            .map(|(session_id, _)| session_id),
+        Some("hs-1".into())
+    );
+
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn fork_session_rejects_missing_stored_harness_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), "dev-a");
+    let source_id = "local-chat-unconfigured";
+    core.workspace
+        .create_space("space-fork-gate", "dev-a", "/tmp/fork", None, true)
+        .unwrap();
+    core.workspace
+        .create_chat(source_id, "space-fork-gate", None, Some("/tmp/fork".into()))
+        .unwrap();
+    core.workspace
+        .set_chat_harness_session(source_id, "native-source", "/tmp/fork");
+
+    let error = comet_rpc::memory_client(core.rpc_service())
+        .call(
+            methods::FORK_SESSION,
+            serde_json::json!({ "sourceChatId": source_id }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "source session has no stored harness/model configuration"
+    );
+    assert_eq!(core.workspace.doc().read_chats().unwrap().len(), 1);
+
+    core.shutdown().await;
+}
+
 /// Live-edge variant: the same convergence through a real workspace room. Requires
 /// the TS edge (`wrangler dev` in `edge/` with AUTH_MODE=dev):
 ///

@@ -11,6 +11,8 @@ pub enum SessionCommand {
     Remove { chat_id: String },
     /// Read the current transcript snapshot for a session.
     Read { chat_id: String },
+    /// Fork a Crew session, preserving its context and harness/model configuration.
+    Fork { chat_id: Option<String> },
     /// Send a message to another session.
     Send {
         chat_id: String,
@@ -80,6 +82,17 @@ pub async fn run(command: SessionCommand, ipc_port: u16) -> anyhow::Result<()> {
                 )
                 .await
                 .context("RemoveSessionRef failed")?;
+            print_json(&value)?;
+        }
+        SessionCommand::Fork { chat_id } => {
+            let source_chat_id = current_session_id(chat_id)?;
+            let value = client
+                .call(
+                    comet_rpc::methods::FORK_SESSION,
+                    serde_json::to_value(comet_rpc::ForkSessionParams { source_chat_id })?,
+                )
+                .await
+                .context("ForkSession failed")?;
             print_json(&value)?;
         }
         SessionCommand::Read { chat_id } => {
@@ -178,7 +191,9 @@ fn resolve_session_id(
         .or(environment)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("no source session: pass --from or run inside a Crew agent session"))
+        .ok_or_else(|| {
+            anyhow!("no source session: pass a session id or run inside a Crew agent session")
+        })
 }
 
 fn print_json(value: &serde_json::Value) -> anyhow::Result<()> {

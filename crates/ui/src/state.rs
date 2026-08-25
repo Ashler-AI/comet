@@ -2577,6 +2577,7 @@ impl AppState {
             created_at: chrono::Utc::now(),
             harness_session_id: None,
             harness_session_cwd: None,
+            fork_from: None,
             space_id: Some(space_id.clone()),
             last_seen_at: None,
         });
@@ -4175,6 +4176,7 @@ mod tests {
             created_at: base + TimeDelta::minutes(created_min),
             harness_session_id: None,
             harness_session_cwd: None,
+            fork_from: None,
             space_id: None,
             last_seen_at: None,
         }

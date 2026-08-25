@@ -46,6 +46,8 @@ pub mod methods {
     pub const SEND_PEER_MESSAGE: &str = "SendPeerMessage";
     pub const REPLY_PEER_MESSAGE: &str = "ReplyPeerMessage";
     pub const WAIT_PEER_REPLY: &str = "WaitPeerReply";
+    /// Create a distinct Crew chat from an existing session's native context.
+    pub const FORK_SESSION: &str = "ForkSession";
     /// Metadata-only harness-native session candidates stored on this device.
     pub const LIST_LOCAL_SESSIONS: &str = "ListLocalSessions";
     /// Re-resolve and import one local candidate into a Comet chat.
@@ -180,6 +182,17 @@ pub struct ReadCheckoutDiffResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRefParams {
+    pub chat_id: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkSessionParams {
+    pub source_chat_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkSessionResult {
     pub chat_id: String,
 }
 

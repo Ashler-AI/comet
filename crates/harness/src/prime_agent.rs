@@ -386,14 +386,14 @@ impl Harness for PrimeAgentHarness {
 
     async fn run(
         &self,
-        request: RunRequest,
+        mut request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let executable = self.resolve_executable()?;
         let agent_dir = prime_config_dir()?;
         crate::auth_gateway::prepare_runtime_dir(&agent_dir)?;
         let daemon_endpoint = prepare_comet_daemon_endpoint(&agent_dir, cfg!(windows))?;
-        let preloaded_session_id = request.resume.clone();
+        let mut preloaded_session_id = request.resume.clone();
         let mut command = self.command(&executable, &request.cwd);
         if let Some(provider) = controls
             .context
@@ -407,8 +407,26 @@ impl Harness for PrimeAgentHarness {
             command.args(["--provider", provider]);
         }
         crate::apply_run_context(&mut command, controls.context.as_ref());
-        let reported_session_dir = if let Some(resume) = request.resume.as_deref() {
-            command.args(["--resume", resume]);
+        let fork_from = controls
+            .context
+            .as_ref()
+            .and_then(|context| context.fork_from.as_deref());
+        let reported_session_dir = if let Some(resume) = request.resume.clone() {
+            if fork_from.is_some_and(|source| source != resume) {
+                return Err(HarnessError::Protocol(
+                    "Crew fork source did not match Prime Agent resume context".into(),
+                ));
+            }
+            command.arg(if fork_from.is_some() {
+                "--fork"
+            } else {
+                "--resume"
+            });
+            command.arg(&resume);
+            if fork_from.is_some() {
+                preloaded_session_id = None;
+                request.resume = None;
+            }
             None
         } else {
             let session_dir = Self::new_session_dir(&agent_dir)?;

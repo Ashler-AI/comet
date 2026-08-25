@@ -31,7 +31,7 @@ enum Command {
     /// Live sync introspection from the running engine: per-room connection
     /// state, last pushed-frame/ack ages, rejoin/probe/resync counters.
     Sync,
-    /// Import, inspect, and message global Crew sessions.
+    /// Import, inspect, message, and fork Crew sessions.
     Session {
         #[command(subcommand)]
         command: session_cli::SessionCommand,
@@ -859,6 +859,26 @@ mod session_parser_tests {
         assert_eq!(from.as_deref(), Some("source-chat"));
         assert!(wait);
         assert_eq!(timeout, Some(4500));
+    }
+    #[test]
+    fn parses_session_fork_with_optional_source() {
+        let current = Cli::try_parse_from(["comet", "session", "fork"]).unwrap();
+        let Some(Command::Session {
+            command: super::session_cli::SessionCommand::Fork { chat_id },
+        }) = current.command
+        else {
+            panic!("expected session fork");
+        };
+        assert_eq!(chat_id, None);
+
+        let explicit = Cli::try_parse_from(["comet", "session", "fork", "source-chat"]).unwrap();
+        let Some(Command::Session {
+            command: super::session_cli::SessionCommand::Fork { chat_id },
+        }) = explicit.command
+        else {
+            panic!("expected explicit session fork");
+        };
+        assert_eq!(chat_id.as_deref(), Some("source-chat"));
     }
 
     #[test]
