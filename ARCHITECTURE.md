@@ -237,6 +237,12 @@ key, or a missing Cloudflare/bucket value fails before mutation. A valid complet
 set is uploaded with one Wrangler bulk-secret operation. Local secret mutation
 is not a supported deployment path.
 
+`sync-production-release-feed-secrets` is also the sole manual approval gate for
+each production edge deployment. `production` depends on it even when the
+reader pair is absent and synchronization preserves the existing secrets. The
+approval therefore authorizes the production deployment boundary, not just a
+secret mutation.
+
 Run staging or the staging-to-production path with:
 
 ```bash
