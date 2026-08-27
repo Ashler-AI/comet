@@ -824,6 +824,119 @@ async fn terminal_guards_input_size_and_cwd() {
     terminals.close(&session.id).expect("close");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_startup_removes_its_chat_and_managed_worktree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data_dir = tmp.path().join("data");
+    let mut core = assemble(&data_dir);
+    core.repos = test_repos(&data_dir);
+    let client = comet_rpc::memory_client(core.rpc_service());
+    let created = client
+        .call(methods::CREATE_REPO, serde_json::json!({ "name": "demo" }))
+        .await
+        .expect("CreateRepo");
+    let repo_path = created["path"].as_str().expect("repo path").to_string();
+    let repo_dir = PathBuf::from(&repo_path);
+    std::fs::write(repo_dir.join("file.txt"), "hello\n").expect("seed file");
+    git(&repo_dir, &["add", "."]).await;
+    git(&repo_dir, &["commit", "-m", "seed"]).await;
+    core.workspace
+        .create_space("space", &core.device_id, &repo_path, None, true)
+        .expect("startup space");
+    core.workspace
+        .create_chat("startup-chat", "space", None, None)
+        .expect("startup chat");
+
+    let worktree = client
+        .call(
+            methods::CREATE_WORKTREE,
+            serde_json::json!({
+                "repoPath": repo_path,
+                "branch": "main",
+                "chatId": "startup-chat"
+            }),
+        )
+        .await
+        .expect("startup worktree");
+    let worktree_path = worktree["path"]
+        .as_str()
+        .expect("startup worktree path")
+        .to_string();
+    let chat = core
+        .workspace
+        .doc()
+        .chat("startup-chat")
+        .expect("startup chat read")
+        .expect("startup chat row");
+    assert_eq!(chat.cwd.as_deref(), Some(worktree_path.as_str()));
+    assert_eq!(chat.branch.as_deref(), worktree["branch"].as_str());
+    assert_eq!(chat.checkout_id.as_deref(), worktree["checkoutId"].as_str());
+
+    client
+        .notify(
+            methods::CANCEL_CHAT_STARTUP,
+            serde_json::json!({
+                "chatId": "startup-chat",
+                "createdWorktree": true,
+                "worktreePath": worktree_path
+            }),
+        )
+        .expect("enqueue startup rollback");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let chat_removed = core
+                .workspace
+                .doc()
+                .chat("startup-chat")
+                .expect("startup chat read")
+                .is_none();
+            if chat_removed && !PathBuf::from(&worktree_path).exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("startup rollback completes");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queue_command_retry_reuses_the_client_command_id() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data_dir = tmp.path().join("data");
+    let core = assemble(&data_dir);
+    core.workspace
+        .create_space(
+            "space",
+            &core.device_id,
+            tmp.path().to_str().unwrap(),
+            None,
+            false,
+        )
+        .expect("command space");
+    core.workspace
+        .create_chat("chat", "space", None, None)
+        .expect("command chat");
+    let client = comet_rpc::memory_client(core.rpc_service());
+    let params = serde_json::json!({
+        "chatId": "chat",
+        "commandId": "client-command-id",
+        "command": { "kind": "interrupt" }
+    });
+
+    let first = client
+        .call(methods::QUEUE_COMMAND, params.clone())
+        .await
+        .expect("first command admission");
+    let retry = client
+        .call(methods::QUEUE_COMMAND, params)
+        .await
+        .expect("idempotent command retry");
+
+    assert_eq!(first["commandId"], "client-command-id");
+    assert_eq!(retry["commandId"], first["commandId"]);
+}
+
 // ---------------------------------------------------------------------------
 // RPC dispatch over the in-memory transport
 // ---------------------------------------------------------------------------

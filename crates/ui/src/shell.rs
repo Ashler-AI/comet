@@ -44,8 +44,8 @@ use crate::settings::{
     SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
 };
 use crate::state::{
-    ActiveHarnessGoal, AppState, ConnectionStatus, EngineBootConfig, GatePhase, Indicator,
-    TranscriptEntriesChange, format_time_ago, latest_active_omp_goal,
+    ActiveHarnessGoal, AppState, ChatStartupPhase, ConnectionStatus, EngineBootConfig, GatePhase,
+    Indicator, TranscriptEntriesChange, format_time_ago, latest_active_omp_goal,
 };
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
@@ -1100,6 +1100,7 @@ struct ShellChatProjection {
     id: String,
     status: comet_proto::ChatIndicator,
     scaffold_starting: bool,
+    startup_phase: Option<ChatStartupPhase>,
     scaffold_environment: Option<comet_proto::SessionEnvironment>,
 }
 
@@ -1207,6 +1208,7 @@ fn shell_chat_projections(
         .map(|chat| ShellChatProjection {
             id: chat.id.clone(),
             status: state.display_status_for(chat, now),
+            startup_phase: state.chat_startup_phase(&chat.id),
             scaffold_starting: state.scaffold_chat_starting(&chat.id),
             scaffold_environment: state.scaffold_environment(&chat.id).cloned(),
         })
@@ -1222,6 +1224,7 @@ fn shell_chat_projections_match(
         && cached.iter().zip(&state.chats).all(|(cached, chat)| {
             cached.id == chat.id
                 && cached.status == state.display_status_for(chat, now)
+                && cached.startup_phase == state.chat_startup_phase(&chat.id)
                 && cached.scaffold_starting == state.scaffold_chat_starting(&chat.id)
                 && cached.scaffold_environment.as_ref() == state.scaffold_environment(&chat.id)
         })
@@ -7645,6 +7648,24 @@ impl Shell {
                 )
                 .into_any_element();
         }
+        if let Some(phase) = state.chat_startup_phase(&chat_id) {
+            let label = match phase {
+                ChatStartupPhase::Persisting => "Saving session…",
+                ChatStartupPhase::PreparingCheckout => "Creating worktree…",
+                ChatStartupPhase::UploadingAttachments => "Uploading attachments…",
+                ChatStartupPhase::Admitting => "Starting agent…",
+            };
+            let delta = motion::pulse_delta(&COMET_PULSE, cx.entity_id(), cx);
+            return strip
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .opacity(0.6 + 0.35 * delta)
+                        .child(SharedString::from(label)),
+                )
+                .into_any_element();
+        }
         let local_indicator = state.indicator_for(&chat_id, now);
         let indicator = if local_indicator == Indicator::None {
             state.selected_agent_indicator(now)
@@ -7667,7 +7688,7 @@ impl Shell {
                     })
             })
             .unwrap_or(0);
-        let sending = self.composer.read(cx).is_sending();
+        let sending = self.composer.read(cx).is_sending(&chat_id);
 
         match indicator {
             Indicator::Working => {

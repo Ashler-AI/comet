@@ -7,6 +7,7 @@
 //! pending-input detection) lives in free functions/structs with unit tests;
 //! the gpui element only feeds them measurements.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
@@ -38,7 +39,7 @@ use comet_rpc::{RpcError, methods};
 use crate::attachments::{self, StagedAttachment};
 use crate::motion;
 use crate::pickers::{CheckoutPlan, Pickers};
-use crate::state::{AppState, Indicator, latest_active_omp_goal};
+use crate::state::{AppState, ChatStartupPhase, EngineHandle, Indicator, latest_active_omp_goal};
 use crate::theme::Theme;
 
 // ---------------------------------------------------------------------------
@@ -80,6 +81,66 @@ pub const DRAG_SCROLL_FRAME_MS: u64 = 16;
 /// Maximum time the first prompt waits for its Scaffold sandbox and remote
 /// Comet host. Failure is surfaced; the prompt never falls back to local.
 const SCAFFOLD_DEMO_WAIT: Duration = Duration::from_secs(10 * 60);
+/// First sends must either reach the durable command ledger or roll back.
+const LOCAL_SESSION_ADMISSION_WAIT: Duration = Duration::from_secs(2 * 60);
+
+struct StartupRollback {
+    engine: EngineHandle,
+    chat_id: String,
+    worktree_path: Rc<RefCell<Option<String>>>,
+    owns_worktree: bool,
+    armed: bool,
+}
+
+impl StartupRollback {
+    fn new(
+        engine: EngineHandle,
+        chat_id: &str,
+        worktree_path: Rc<RefCell<Option<String>>>,
+        owns_worktree: bool,
+    ) -> Self {
+        Self {
+            engine,
+            chat_id: chat_id.to_string(),
+            worktree_path,
+            armed: true,
+            owns_worktree,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StartupRollback {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut params = serde_json::json!({ "chatId": self.chat_id });
+        if self.owns_worktree
+            && let Some(object) = params.as_object_mut()
+        {
+            object.insert("createdWorktree".into(), serde_json::Value::Bool(true));
+        }
+        if let (Some(worktree_path), Some(object)) =
+            (self.worktree_path.borrow().as_ref(), params.as_object_mut())
+        {
+            object.insert(
+                "worktreePath".into(),
+                serde_json::Value::String(worktree_path.clone()),
+            );
+        }
+        if let Err(error) = self
+            .engine
+            .client()
+            .notify(methods::CANCEL_CHAT_STARTUP, params)
+        {
+            tracing::warn!(%error, "could not enqueue chat startup rollback");
+        }
+    }
+}
 
 fn scaffold_source_ref(plan: &CheckoutPlan) -> Option<&str> {
     match plan {
@@ -3638,7 +3699,7 @@ pub struct Composer {
     /// composer in start mode even while a teammate's session is working.
     agent_target: Option<String>,
     start_agent: bool,
-    sending: bool,
+    sending_chats: HashSet<String>,
     failure: Option<SharedString>,
     wizard: Option<Wizard>,
     wizard_focus: FocusHandle,
@@ -3737,7 +3798,7 @@ impl Composer {
             current_key,
             agent_target: None,
             start_agent: false,
-            sending: false,
+            sending_chats: HashSet::new(),
             failure: None,
             wizard: None,
             wizard_focus: cx.focus_handle(),
@@ -3823,8 +3884,8 @@ impl Composer {
         self.on_submit(cx);
     }
 
-    pub fn is_sending(&self) -> bool {
-        self.sending
+    pub fn is_sending(&self, chat_id: &str) -> bool {
+        self.sending_chats.contains(chat_id)
     }
 
     // ---- attachment staging (use-attachments.ts) ----
@@ -4765,14 +4826,13 @@ impl Composer {
     }
 
     fn button_mode(&self, cx: &App) -> SendButtonMode {
-        let scaffold_starting = {
+        let startup_in_progress = {
             let state = self.state.read(cx);
-            state
-                .selected_chat
-                .as_deref()
-                .is_some_and(|chat_id| state.scaffold_chat_starting(chat_id))
+            state.selected_chat.as_deref().is_some_and(|chat_id| {
+                state.scaffold_chat_starting(chat_id) || state.chat_startup_phase(chat_id).is_some()
+            })
         };
-        if scaffold_starting {
+        if startup_in_progress {
             return SendButtonMode::Starting;
         }
         // A staged image counts as content: image-only sends are legal
@@ -4982,12 +5042,16 @@ impl Composer {
         };
         let steering_mode = self.pickers.read(cx).steering_mode(cx);
         let echo_status = optimistic_message_status(effective_delivery, steering_mode);
+        let initial_chat_cwd = match &plan {
+            CheckoutPlan::ReuseWorktree { path, .. } if !scaffold_demo => Some(path.clone()),
+            _ => space_path.clone(),
+        };
         let pending_chat = (is_new && !scaffold_demo).then(|| Chat {
             id: chat_id.clone(),
             device_id: device_id.clone(),
             title: None,
             archived: false,
-            cwd: space_path.clone(),
+            cwd: initial_chat_cwd.clone(),
             branch: scaffold_source_ref(&plan).map(str::to_string),
             checkout_id: space.as_ref().and_then(|space| space.checkout_id.clone()),
             config: resolved.chat_config(),
@@ -5016,9 +5080,13 @@ impl Composer {
             status: echo_status,
             continuation_of: None,
         };
+        let local_startup = is_new && !scaffold_demo && !space_remote;
         self.state.update(cx, |s, cx| {
             if let Some(pending_chat) = pending_chat {
                 s.stage_pending_chat(pending_chat);
+                if local_startup {
+                    s.set_chat_startup_phase(&chat_id, ChatStartupPhase::Persisting);
+                }
                 s.select_chat(Some(chat_id.clone()), cx);
             } else if is_new {
                 s.mark_chat_pending(&chat_id);
@@ -5033,7 +5101,7 @@ impl Composer {
         self.input.update(cx, |input, cx| input.set_text("", cx));
         self.drafts.remove(&self.current_key);
         self.failure = None;
-        self.sending = true;
+        self.sending_chats.insert(chat_id.clone());
         cx.emit(ComposerEvent::Sent {
             chat_id: chat_id.clone(),
         });
@@ -5061,16 +5129,75 @@ impl Composer {
                 )
             });
         }
-        self.send_task = Some(cx.spawn(async move |this, cx| {
+        let durable_startup = local_startup;
+        let send_task = cx.spawn(async move |this, cx| {
+        let creates_managed_worktree = local_startup
+            && matches!(&plan, CheckoutPlan::NewWorktree { base: Some(_) });
+            let command_admission_started = Rc::new(Cell::new(false));
+            let admission_started = command_admission_started.clone();
+            let startup_worktree_path = Rc::new(RefCell::new(None));
+            let mut startup_rollback = local_startup.then(|| {
+                StartupRollback::new(
+                    engine.clone(),
+                    &chat_id,
+                    startup_worktree_path.clone(),
+                    creates_managed_worktree,
+                )
+            });
+            let admission_deadline = local_startup
+                .then(|| cx.background_executor().timer(LOCAL_SESSION_ADMISSION_WAIT));
+            let admission_retry_params = Rc::new(RefCell::new(None));
+            let admission_retry = admission_retry_params.clone();
             let mut scaffold_attached = control_route
                 .as_ref()
                 .is_some_and(|route| route.source == AgentSessionSource::Scaffold);
-            let result: Result<(), String> = async {
+            let admission = async {
                 let mut control_route = control_route;
                 let mut host_device_id = host_device_id;
                 let mut attached_scaffold_source_ref = requested_scaffold_source_ref.clone();
                 let mut scaffold_resume_session_id = None;
                 let mut scaffold_resume_cwd = None;
+                if local_startup {
+                    let space_id = space_id
+                        .as_ref()
+                        .ok_or_else(|| "Could not persist this session".to_string())?;
+                    let mut mutate = serde_json::json!({
+                        "op": "createChat",
+                        "chatId": chat_id,
+                        "spaceId": space_id,
+                    });
+                    if let Some(object) = mutate.as_object_mut() {
+                        if let Some(cwd) = &initial_chat_cwd {
+                            object.insert("cwd".into(), serde_json::Value::String(cwd.clone()));
+                        }
+                        if let Some(branch) = scaffold_source_ref(&plan) {
+                            object.insert(
+                                "branch".into(),
+                                serde_json::Value::String(branch.to_string()),
+                            );
+                        }
+                        if let Some(config) = resolved.chat_config()
+                            && let Ok(config) = serde_json::to_value(config)
+                        {
+                            object.insert("config".into(), config);
+                        }
+                    }
+                    engine
+                        .client()
+                        .call(methods::MUTATE, mutate)
+                        .await
+                        .map_err(|error| format!("Could not persist this session: {error}"))?;
+                    this.update(cx, |composer, cx| {
+                        composer.state.update(cx, |state, cx| {
+                            state.set_chat_startup_phase(
+                                &chat_id,
+                                ChatStartupPhase::PreparingCheckout,
+                            );
+                            cx.notify();
+                        });
+                    })
+                    .ok();
+                }
                 if let Some(scope) = scaffold_scope {
                     let wait_started = Instant::now();
                     let mut sandbox_id = None;
@@ -5316,10 +5443,9 @@ impl Composer {
                     })
                     .ok();
                 }
-                // Resolve the execution checkout. Local sessions may reuse a
-                // local path. Scaffold sessions instead target the attached
-                // device and use only sandbox-relative paths; a fresh checkout
-                // is created from the control-plane-returned source ref.
+                // Resolve the execution checkout. A durable chat row precedes
+                // slow worktree materialization so navigation and sync watches
+                // never own the only copy of a first send.
                 let mut cwd = if scaffold_attached {
                     ".".to_string()
                 } else if is_new {
@@ -5327,14 +5453,9 @@ impl Composer {
                 } else {
                     existing_cwd.unwrap_or_else(|| ".".to_string())
                 };
-                let mut worktree_cwd: Option<String> = None;
-                if scaffold_demo {
-                    worktree_cwd = Some(cwd.clone());
-                }
-                // The picked ref rides createChat so the session footer names
-                // it from the first frame (it read "Select ref" until the
-                // host's diff reconciler got around to stamping the branch).
+                let mut worktree_cwd = scaffold_demo.then(|| cwd.clone());
                 let mut chat_branch: Option<String> = None;
+                let mut new_worktree: Option<(String, String, Option<String>)> = None;
                 if is_new || scaffold_demo {
                     match &plan {
                         CheckoutPlan::CurrentCheckout { branch } => {
@@ -5362,45 +5483,28 @@ impl Composer {
                                 } else {
                                     base.clone()
                                 };
+                                let target_device_id = if scaffold_attached {
+                                    host_device_id.clone()
+                                } else if space_remote {
+                                    Some(device_id.clone())
+                                } else {
+                                    None
+                                };
                                 if let Some(repo_path) = repo_path {
-                                    let mut params = serde_json::json!({
-                                        "repoPath": repo_path,
-                                        "branch": worktree_base,
-                                    });
-                                    let target_device_id = if scaffold_attached {
-                                        host_device_id.clone()
-                                    } else if space_remote {
-                                        Some(device_id.clone())
-                                    } else {
-                                        None
-                                    };
-                                    if let (Some(target_device_id), Some(object)) =
-                                        (target_device_id, params.as_object_mut())
-                                    {
-                                        object.insert(
-                                            "targetDeviceId".into(),
-                                            serde_json::Value::String(target_device_id),
-                                        );
-                                    }
-                                    let value = engine
-                                        .client()
-                                        .call(methods::CREATE_WORKTREE, params)
-                                        .await
-                                        .map_err(|e| format!("Worktree failed: {e}"))?;
-                                    let worktree: comet_proto::Worktree =
-                                        serde_json::from_value(value)
-                                            .map_err(|e| format!("Worktree reply malformed: {e}"))?;
-                                    cwd = worktree.path.clone();
-                                    worktree_cwd = Some(worktree.path);
+                                    new_worktree =
+                                        Some((repo_path, worktree_base, target_device_id));
                                 }
                             }
                         }
                     }
                 }
 
-                // Idempotently stamp config/cwd onto a new local chat or the
-                // already-created Comet session receiving its Scaffold attach.
-                if (is_new || scaffold_demo) && let Some(space_id) = &space_id {
+                // Scaffold and remote-device sessions keep their existing
+                // post-checkout persistence order. Same-device local sessions
+                // were persisted before checkout at the top of this task.
+                if ((is_new && !local_startup) || scaffold_demo)
+                    && let Some(space_id) = &space_id
+                {
                     let mut mutate = serde_json::json!({
                         "op": "createChat",
                         "chatId": chat_id,
@@ -5437,18 +5541,68 @@ impl Composer {
                             resolved.chat_config()
                         };
                         if let Some(config) = config
-                            && let Ok(config) = serde_json::to_value(&config)
+                            && let Ok(config) = serde_json::to_value(config)
                         {
                             object.insert("config".into(), config);
                         }
                     }
-                    if let Err(err) = engine.client().call(methods::MUTATE, mutate).await {
-                        if scaffold_demo {
-                            return Err(format!(
-                                "Could not group the Scaffold session in this folder: {err}"
-                            ));
-                        }
-                        tracing::debug!(error = %err, "CreateChat mutate unavailable; doc host will materialize the chat");
+                    engine
+                        .client()
+                        .call(methods::MUTATE, mutate)
+                        .await
+                        .map_err(|error| {
+                            format!("Could not persist this session: {error}")
+                        })?;
+                }
+
+                if let Some((repo_path, worktree_base, target_device_id)) = new_worktree {
+                    let mut params = serde_json::json!({
+                        "repoPath": repo_path,
+                        "branch": worktree_base,
+                    });
+                    if local_startup
+                        && target_device_id.is_none()
+                        && let Some(object) = params.as_object_mut()
+                    {
+                        object.insert(
+                            "chatId".into(),
+                            serde_json::Value::String(chat_id.clone()),
+                        );
+                    }
+                    if let (Some(target_device_id), Some(object)) =
+                        (target_device_id, params.as_object_mut())
+                    {
+                        object.insert(
+                            "targetDeviceId".into(),
+                            serde_json::Value::String(target_device_id),
+                        );
+                    }
+                    let value = engine
+                        .client()
+                        .call(methods::CREATE_WORKTREE, params)
+                        .await
+                        .map_err(|error| format!("Worktree failed: {error}"))?;
+                    let worktree: comet_proto::Worktree = serde_json::from_value(value)
+                        .map_err(|error| format!("Worktree reply malformed: {error}"))?;
+                    cwd = worktree.path.clone();
+                    if local_startup {
+                        *startup_worktree_path.borrow_mut() = Some(worktree.path.clone());
+                    }
+                    if is_new || scaffold_demo {
+                        engine
+                            .client()
+                            .call(
+                                methods::MUTATE,
+                                serde_json::json!({
+                                    "op": "setChatWorktree",
+                                    "chatId": chat_id,
+                                    "worktree": worktree,
+                                }),
+                            )
+                            .await
+                            .map_err(|error| {
+                                format!("Could not attach the new checkout: {error}")
+                            })?;
                     }
                 }
 
@@ -5461,6 +5615,18 @@ impl Composer {
                 let mut attachment_paths: Vec<String> = Vec::new();
                 let mut image_paths: Vec<String> = Vec::new();
                 let mut file_paths: Vec<String> = Vec::new();
+                if local_startup && !staged.is_empty() {
+                    this.update(cx, |composer, cx| {
+                        composer.state.update(cx, |state, cx| {
+                            state.set_chat_startup_phase(
+                                &chat_id,
+                                ChatStartupPhase::UploadingAttachments,
+                            );
+                            cx.notify();
+                        });
+                    })
+                    .ok();
+                }
                 if !staged.is_empty() {
                     for att in &staged {
                         match attachments::upload_attachment(
@@ -5531,6 +5697,15 @@ impl Composer {
                     .ok();
                 }
 
+                if local_startup {
+                    this.update(cx, |composer, cx| {
+                        composer.state.update(cx, |state, cx| {
+                            state.set_chat_startup_phase(&chat_id, ChatStartupPhase::Admitting);
+                            cx.notify();
+                        });
+                    })
+                    .ok();
+                }
                 let run_request = || RunRequest {
                     prompt: content.clone(),
                     model: scaffold_run_model(
@@ -5596,21 +5771,57 @@ impl Composer {
                         message_id: message_id.clone(),
                     }
                 };
-                let params = serde_json::json!({ "chatId": chat_id, "command": command });
+                let command_id = uuid::Uuid::new_v4().to_string();
+                let params = serde_json::json!({
+                    "chatId": chat_id,
+                    "commandId": command_id,
+                    "command": command,
+                });
+                admission_started.set(true);
+                *admission_retry.borrow_mut() = Some(params.clone());
                 engine
                     .client()
                     .call(methods::QUEUE_COMMAND, params)
                     .await
-                    .map_err(|e| format!("Send failed: {e}"))?;
+                    .map_err(|error| format!("Send failed: {error}"))?;
+                admission_retry.borrow_mut().take();
                 Ok(())
+            };
+            let result = if let Some(deadline) = admission_deadline {
+                futures::pin_mut!(admission);
+                futures::pin_mut!(deadline);
+                match futures::future::select(admission, deadline).await {
+                    futures::future::Either::Left((result, _)) => result,
+                    futures::future::Either::Right(((), _))
+                        if command_admission_started.get() =>
+                    {
+                        match admission_retry_params.borrow_mut().take() {
+                            Some(params) => engine
+                                .client()
+                                .notify(methods::QUEUE_COMMAND, params)
+                                .map_err(|error| {
+                                    format!("Could not retry session startup: {error}")
+                                }),
+                            None => Err("Could not retry session startup".into()),
+                        }
+                    }
+                    futures::future::Either::Right(((), _)) => {
+                        Err("Could not start this session in time".into())
+                    }
+                }
+            } else {
+                admission.await
+            };
+            let succeeded = result.is_ok();
+            if succeeded && let Some(rollback) = startup_rollback.as_mut() {
+                rollback.disarm();
             }
-            .await;
             this.update(cx, |composer, cx| {
-                composer.sending = false;
-                if let Err(message) = result {
+                composer.sending_chats.remove(&err_chat_id);
+                if let Err(message) = &result {
                     // Failure: red banner, echo removed, submitted prompt kept
                     // visible, and staged files returned to the chat's stash.
-                    composer.failure = Some(message.into());
+                    composer.failure = Some(message.clone().into());
                     composer.state.update(cx, |s, cx| {
                         s.remove_echo(&err_chat_id, &err_message_id);
                         s.clear_scaffold_chat_starting(&err_chat_id, cx);
@@ -5632,6 +5843,12 @@ impl Composer {
                         *slot = merged;
                     }
                 }
+                if local_startup && succeeded {
+                    composer.state.update(cx, |state, cx| {
+                        state.clear_chat_startup_phase(&err_chat_id);
+                        cx.notify();
+                    });
+                }
                 if scaffold_demo {
                     composer.state.update(cx, |state, cx| {
                         state.clear_scaffold_chat_starting(&err_chat_id, cx);
@@ -5640,7 +5857,12 @@ impl Composer {
                 cx.notify();
             })
             .ok();
-        }));
+        });
+        if durable_startup {
+            send_task.detach();
+        } else {
+            self.send_task = Some(send_task);
+        }
     }
 
     /// Stop the selected session when it is actively running.
@@ -6147,8 +6369,6 @@ impl Composer {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = Theme::of(cx);
-        // Comet composer-actions.tsx: a size-7 filled circle — up-arrow to
-        // send/steer, a dark rounded square on the same light circle to stop.
         match mode {
             SendButtonMode::Stop => div()
                 .id("composer-stop")
@@ -6160,7 +6380,7 @@ impl Composer {
                 .items_center()
                 .justify_center()
                 .cursor_pointer()
-                .hover(|s| s.opacity(0.85))
+                .hover(|style| style.opacity(0.85))
                 .on_click(cx.listener(|this, _, _, cx| this.interrupt(cx)))
                 .child(div().size(px(11.0)).rounded(px(3.0)).bg(theme.bg))
                 .into_any_element(),
@@ -6170,15 +6390,15 @@ impl Composer {
                 .flex_none()
                 .rounded_full()
                 .bg(theme.text)
+                .opacity(0.55)
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(crate::loaders::mini_gradient_spinner(
-                    "composer-scaffold-starting",
-                    2.5,
-                    cx.entity_id(),
-                    cx,
-                ))
+                .child(
+                    crate::icons::icon(crate::icons::ARROW_UP)
+                        .size(px(14.0))
+                        .text_color(theme.bg),
+                )
                 .into_any_element(),
             SendButtonMode::Send | SendButtonMode::Steer => div()
                 .id("composer-send")
@@ -6190,7 +6410,7 @@ impl Composer {
                 .items_center()
                 .justify_center()
                 .cursor_pointer()
-                .hover(|s| s.opacity(0.85))
+                .hover(|style| style.opacity(0.85))
                 .on_click(cx.listener(|this, _, _, cx| this.on_submit(cx)))
                 .child(
                     crate::icons::icon(crate::icons::ARROW_UP)

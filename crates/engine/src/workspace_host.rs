@@ -924,6 +924,24 @@ impl WorkspaceHost {
         Ok(self.inner.doc.set_chat_cwd(chat_id, cwd)?)
     }
 
+    /// Atomically bind a newly-created managed checkout to its durable chat.
+    /// A missing row means startup was cancelled; the creator must remove the
+    /// checkout instead of leaving an orphan.
+    pub fn bind_chat_worktree(
+        &self,
+        chat_id: &str,
+        worktree: &comet_proto::Worktree,
+    ) -> Result<bool, EngineError> {
+        let Some(mut chat) = self.inner.doc.chat(chat_id)? else {
+            return Ok(false);
+        };
+        chat.cwd = Some(worktree.path.clone());
+        chat.branch = Some(worktree.branch.clone());
+        chat.checkout_id = worktree.checkout_id.clone();
+        self.inner.doc.upsert_chat(&chat)?;
+        Ok(true)
+    }
+
     pub fn set_chat_space(&self, chat_id: &str, space_id: &str) -> Result<bool, EngineError> {
         Ok(self.inner.doc.set_chat_space(chat_id, space_id)?)
     }

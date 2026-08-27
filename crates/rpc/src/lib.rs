@@ -107,6 +107,8 @@ pub mod methods {
     /// Fuzzy relative-path search rooted in a known chat or space checkout.
     pub const SEARCH_FILES: &str = "SearchFiles";
     pub const CREATE_WORKTREE: &str = "CreateWorktree";
+    /// Roll back a first send that never reached command admission.
+    pub const CANCEL_CHAT_STARTUP: &str = "CancelChatStartup";
     pub const DELETE_WORKTREE: &str = "DeleteWorktree";
     // Terminals (ControlRpc, relay-forwardable; SubscribeTerminal streams).
     pub const OPEN_TERMINAL: &str = "OpenTerminal";

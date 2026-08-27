@@ -107,6 +107,24 @@ impl RpcClient {
         rx.await.map_err(|_| RpcError::Closed)?
     }
 
+    /// Enqueue a unary request without retaining its reply. Intended for
+    /// cancellation compensation from `Drop`, where awaiting is impossible
+    /// but ordering on the existing RPC channel still matters.
+    pub fn notify(&self, method: &str, params: serde_json::Value) -> Result<(), RpcError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let json = serde_json::to_string(&ClientFrame {
+            id,
+            method: Some(method.into()),
+            params,
+            cancel: false,
+        })
+        .map_err(|error| RpcError::Transport(format!("serialize frame: {error}")))?;
+        self.out.try_send(json).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => RpcError::Transport("RPC queue is full".into()),
+            mpsc::error::TrySendError::Closed(_) => RpcError::Closed,
+        })
+    }
+
     /// Typed unary request.
     pub async fn call_as<T: serde::de::DeserializeOwned>(
         &self,

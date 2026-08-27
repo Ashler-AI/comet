@@ -63,7 +63,7 @@ use comet_proto::{
     AgentSessionRecord, Chat, ChatConfig, CollaborationPrincipal, CollaborationScope,
     CollaborationSnapshot, HarnessId, OmpAdvisorSyncBacklog, ParticipantPresence, ParticipantState,
     RuntimeProfile, ScaffoldEnvironmentControl, ScaffoldEnvironmentControlResult,
-    SessionEnvironmentSource, SessionRoomProjection, SessionStatus, ToolCall,
+    SessionEnvironmentSource, SessionRoomProjection, SessionStatus, ToolCall, Worktree,
     WorktreeDeletionStage,
 };
 use comet_rpc::{
@@ -87,6 +87,7 @@ use crate::uploads::Uploads;
 use crate::workspace_host::WorkspaceHost;
 
 const FILE_SEARCH_RPC_TIMEOUT: Duration = Duration::from_secs(6);
+const WORKTREE_CREATE_RPC_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const SCAFFOLD_OWNER_ROOM_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const FILE_SEARCH_FEATURED_PATHS: usize = 32;
 const DEFAULT_PEER_WAIT_MS: u64 = 30_000;
@@ -123,6 +124,16 @@ struct ChatParams {
     chat_id: String,
     #[serde(default)]
     room_projection: Option<SessionRoomProjection>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelChatStartupParams {
+    chat_id: String,
+    #[serde(default)]
+    created_worktree: bool,
+    #[serde(default)]
+    worktree_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -199,6 +210,8 @@ fn generic_catalog_allowed(profile: RuntimeProfile, method: &str) -> bool {
 struct QueueCommandParams {
     chat_id: String,
     command: SessionCommandPayload,
+    #[serde(default)]
+    command_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -228,6 +241,11 @@ struct CreateWorktreeParams {
     #[serde(alias = "repo")]
     repo_path: String,
     branch: String,
+    /// Durable chat to retarget after checkout creation. When the initiating
+    /// UI future disappears, the server-owned operation still either binds
+    /// the checkout or removes it if startup was cancelled.
+    #[serde(default)]
+    chat_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -444,6 +462,10 @@ enum MutateParams {
     /// "project · branch" sub-line.
     #[serde(rename_all = "camelCase")]
     SetChatBranch { chat_id: String, branch: String },
+    /// Atomically replace the checkout path, branch, and identity after a
+    /// first-send worktree is ready.
+    #[serde(rename_all = "camelCase")]
+    SetChatWorktree { chat_id: String, worktree: Worktree },
     /// Retarget a chat onto another folder — mid-session switch to an
     /// EXISTING worktree (the picked ref's checkout). Next run starts a
     /// fresh harness conversation there (resume is cwd-scoped).
@@ -1068,6 +1090,11 @@ impl EngineRpc {
             MutateParams::SetChatBranch { chat_id, branch } => self
                 .workspace
                 .set_chat_branch(&chat_id, &branch)
+                .map_err(failed)
+                .map(drop),
+            MutateParams::SetChatWorktree { chat_id, worktree } => self
+                .workspace
+                .bind_chat_worktree(&chat_id, &worktree)
                 .map_err(failed)
                 .map(drop),
             MutateParams::SetChatCwd { chat_id, cwd } => self
@@ -1716,10 +1743,14 @@ impl RpcService for EngineRpc {
                     _ => false,
                 };
                 self.install_local_owner_grant(&p.command)?;
-                let command_id = self
-                    .doc_host
-                    .queue_command(&p.chat_id, p.command)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let command_id = if let Some(command_id) = p.command_id {
+                    self.doc_host
+                        .queue_command_with_id(&p.chat_id, &command_id, p.command)
+                        .map(|entry| entry.id)
+                } else {
+                    self.doc_host.queue_command(&p.chat_id, p.command)
+                }
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
                 if activates_chat {
                     self.workspace
                         .set_chat_archived(&p.chat_id, false)
@@ -2256,12 +2287,75 @@ impl RpcService for EngineRpc {
             }
             methods::CREATE_WORKTREE => {
                 let p: CreateWorktreeParams = parse_params(params)?;
-                let worktree = self
-                    .repos
-                    .create_worktree(std::path::Path::new(&p.repo_path), &p.branch)
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let repo_path = std::path::PathBuf::from(p.repo_path);
+                let branch = p.branch;
+                let worktree = if let Some(chat_id) = p.chat_id {
+                    let repos = self.repos.clone();
+                    let workspace = self.workspace.clone();
+                    let operation = tokio::spawn(async move {
+                        let worktree = repos.create_worktree(&repo_path, &branch).await?;
+                        if !workspace.bind_chat_worktree(&chat_id, &worktree)? {
+                            repos
+                                .delete_worktree(&repo_path, std::path::Path::new(&worktree.path))
+                                .await?;
+                            return Err(crate::EngineError::Other(
+                                "chat startup was cancelled".into(),
+                            ));
+                        }
+                        Ok::<_, crate::EngineError>(worktree)
+                    });
+                    tokio::time::timeout(WORKTREE_CREATE_RPC_TIMEOUT, operation)
+                        .await
+                        .map_err(|_| RpcError::Failed("worktree creation timed out".into()))?
+                        .map_err(|error| {
+                            RpcError::Failed(format!("worktree task failed: {error}"))
+                        })?
+                        .map_err(|error| RpcError::Failed(error.to_string()))?
+                } else {
+                    self.repos
+                        .create_worktree(&repo_path, &branch)
+                        .await
+                        .map_err(|error| RpcError::Failed(error.to_string()))?
+                };
                 RpcReply::value(&worktree)
+            }
+            methods::CANCEL_CHAT_STARTUP => {
+                let p: CancelChatStartupParams = parse_params(params)?;
+                let chat = self
+                    .workspace
+                    .doc()
+                    .chat(&p.chat_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                if chat
+                    .as_ref()
+                    .and_then(|chat| chat.harness_session_id.as_deref())
+                    .is_some()
+                {
+                    return Err(RpcError::Failed(
+                        "cannot cancel startup after agent admission".into(),
+                    ));
+                }
+                if self
+                    .doc_host
+                    .chat_has_commands(&p.chat_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?
+                {
+                    return Err(RpcError::Failed(
+                        "cannot cancel startup after command admission".into(),
+                    ));
+                }
+                let worktree_path = p.created_worktree.then_some(p.worktree_path).flatten();
+                if let Some(worktree_path) = worktree_path {
+                    self.repos
+                        .delete_managed_worktree(std::path::Path::new(&worktree_path))
+                        .await
+                        .map_err(|error| RpcError::Failed(error.to_string()))?;
+                }
+                self.workspace
+                    .delete_chat(&p.chat_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                self.doc_host.purge_chat(&p.chat_id);
+                RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::DELETE_WORKTREE => {
                 let p: DeleteWorktreeParams = parse_params(params)?;

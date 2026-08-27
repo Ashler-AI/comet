@@ -1545,6 +1545,12 @@ impl DocHost {
             .find(|entry| entry.id == command_id))
     }
 
+    pub fn chat_has_commands(&self, chat_id: &str) -> Result<bool, EngineError> {
+        let handle = self.open(chat_id)?;
+        let _guard = lock(&handle.command_lock);
+        Ok(!handle.doc.read_commands()?.is_empty())
+    }
+
     /// POST `{edge}/device/{host}/nudge {chatId}`. Versioned control commands
     /// carry the remote owner explicitly; legacy commands fall back to the
     /// workspace chat row. Offline and edge-less engines skip silently.
