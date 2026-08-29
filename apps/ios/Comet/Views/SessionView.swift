@@ -10,6 +10,8 @@ struct SessionView: View {
     @State private var showConfig = false
     @State private var refs: [RepoRef] = []
     @State private var catalogs: [String: [ModelInfo]] = [:]
+    @State private var forking = false
+    @State private var forkError: String?
 
     /// Width the nav bar's own controls need either side of the title — the
     /// back button leading, breathing room trailing.
@@ -121,6 +123,37 @@ struct SessionView: View {
                     .frame(maxWidth: max(140, viewWidth - Self.headerChromeInset))
                 }
             }
+            if let chat, canFork(chat) {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        fork(chat)
+                    } label: {
+                        if forking {
+                            ProgressView().controlSize(.mini)
+                        } else {
+                            Image(systemName: "rectangle.stack.badge.plus")
+                        }
+                    }
+                    .disabled(forking)
+                    .accessibilityLabel("Fork session")
+                }
+            }
+        }
+        .alert("Couldn’t fork session", isPresented: Binding(
+            get: { forkError != nil },
+            set: { if !$0 { forkError = nil } }
+        )) {
+            Button("OK", role: .cancel) { forkError = nil }
+        } message: {
+            Text(forkError ?? "Unknown error")
+        }
+        .alert("Couldn’t send", isPresented: Binding(
+            get: { store?.sendFailure != nil },
+            set: { if !$0 { store?.clearSendFailure() } }
+        )) {
+            Button("OK", role: .cancel) { store?.clearSendFailure() }
+        } message: {
+            Text(store?.sendFailure ?? "Unknown error")
         }
         .sheet(isPresented: $showConfig) {
             if let chat {
@@ -171,6 +204,24 @@ struct SessionView: View {
                 model.markSeen(chatId: chatId)
             }
             model.releaseSessionStore(chatId: chatId)
+        }
+    }
+
+    private func canFork(_ chat: Chat) -> Bool {
+        chat.config != nil && chat.harnessSessionId?.isEmpty == false
+    }
+
+    private func fork(_ chat: Chat) {
+        guard !forking else { return }
+        forking = true
+        Task { @MainActor in
+            defer { forking = false }
+            do {
+                let chatId = try await model.forkSession(chat)
+                model.launchRoute = .chat(chatId)
+            } catch {
+                forkError = error.localizedDescription
+            }
         }
     }
 

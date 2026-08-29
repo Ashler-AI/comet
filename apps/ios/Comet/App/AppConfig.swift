@@ -55,14 +55,12 @@ final class AppConfig: @unchecked Sendable {
         return url
     }
 
-    func sessionSocketURL(chatId: String) async -> URL? {
+    func sessionSocketURL(chatId: String, deploymentId: String? = nil) async -> URL? {
         guard let token = await currentToken() else { return nil }
         var url = wsBase.appending(path: "session/\(chatId)/ws")
         url.append(queryItems: [
             URLQueryItem(name: "token", value: token),
-            // Native Scaffold clients share the project's canonical deployment
-            // namespace with desktop engines and sandbox device credentials.
-            URLQueryItem(name: "deploymentId", value: projectScope),
+            URLQueryItem(name: "deploymentId", value: deploymentId ?? projectScope),
         ])
         return url
     }

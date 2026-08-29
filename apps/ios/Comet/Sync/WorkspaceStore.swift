@@ -180,6 +180,8 @@ final class WorkspaceStore {
                         lastMessagePreview: m["lastMessagePreview"]?.stringValue,
                         lastMessageAt: m["lastMessageAt"]?.i64Value,
                         createdAt: m["createdAt"]?.i64Value ?? 0,
+                        harnessSessionId: m["harnessSessionId"]?.stringValue,
+                        harnessSessionCwd: m["harnessSessionCwd"]?.stringValue,
                         spaceId: m["spaceId"]?.stringValue,
                         lastSeenAt: m["lastSeenAt"]?.i64Value)
         }
@@ -189,7 +191,14 @@ final class WorkspaceStore {
                   let rawChatId = row["chatId"]?.stringValue,
                   let uuid = UUID(uuidString: rawChatId),
                   let addedAt = row["addedAt"]?.i64Value else { return nil }
-            return SessionRef(chatId: uuid.uuidString.lowercased(), addedAt: addedAt)
+            let environment: SessionEnvironment? = row["environment"].flatMap { value in
+                guard let data = try? JSONSerialization.data(withJSONObject: value.jsonObject) else {
+                    return nil
+                }
+                return try? JSONDecoder().decode(SessionEnvironment.self, from: data)
+            }
+            return SessionRef(chatId: uuid.uuidString.lowercased(), addedAt: addedAt,
+                              environment: environment)
         }.sorted {
             ($0.addedAt, $0.chatId) > ($1.addedAt, $1.chatId)
         }
@@ -326,6 +335,219 @@ final class WorkspaceStore {
         return reply?.path
     }
 
+
+    func forkSession(source: Chat) async throws -> String {
+        struct Reply: Decodable { var chatId: String }
+        let reply: Reply = try await relay(for: source.deviceId).call(
+            method: "ForkSession", params: ["sourceChatId": source.id]
+        )
+        return reply.chatId
+    }
+
+    /// Create, attach, and start a Scaffold-hosted OMP session through the
+    /// selected desktop controller. The desktop remains the trusted control
+    /// plane client; iOS never receives sandbox bootstrap credentials.
+    func launchScaffoldSession(space: Space, prompt: String,
+                               launch: ScaffoldLaunchConfig) async throws -> (String, ScaffoldControlRoute) {
+        let chatId = UUID().uuidString.lowercased()
+        let requestedScope: [String: Any] = [
+            "projectId": config.projectScope,
+            "deploymentId": config.projectScope,
+            "sessionId": chatId,
+        ]
+        let agentRoute: [String: Any] = [
+            "provider": launch.provider,
+            "model": launch.providerModel,
+            "fallback": "disabled",
+            "routingMode": "automatic",
+        ]
+        let create: ScaffoldEnvironmentControlResult = try await relay(for: space.deviceId).call(
+            method: "ControlScaffoldEnvironment",
+            params: [
+                "operation": "create",
+                "scope": requestedScope,
+                "source_ref": launch.sourceRef,
+                "database_environment": launch.databaseEnvironment.rawValue,
+                "agentRoute": agentRoute,
+            ],
+            timeoutNanoseconds: 30_000_000_000
+        )
+        guard create.environment.source.kind == "scaffold",
+              let sandboxId = create.environment.source.sandboxId else {
+            throw MobileSessionError.unavailable("Scaffold returned an invalid environment")
+        }
+
+        let scope = encodableDictionary(create.environment.scope)
+        let attachment = try await attachScaffoldEnvironment(
+            controllerDeviceId: space.deviceId, sandboxId: sandboxId, scope: scope
+        )
+        guard let ownerDeviceId = attachment.attachedDeviceId,
+              let projection = attachment.roomProjection,
+              let grant = attachment.controlGrant,
+              grant.capabilities.contains("session.chat") else {
+            throw MobileSessionError.unavailable("Scaffold returned no chat authority")
+        }
+
+        try await waitForScaffoldReadiness(
+            controllerDeviceId: space.deviceId, sandboxId: sandboxId, scope: scope
+        )
+
+        let chatConfig = ChatConfig(harness: "omp", model: launch.persistedModel,
+                                    reasoning: launch.reasoning, sandbox: "workspace-write")
+        struct OkReply: Decodable { var ok: Bool? }
+        let _: OkReply = try await relay(for: space.deviceId).call(
+            method: "Mutate",
+            params: [
+                "op": "createChat",
+                "chatId": chatId,
+                "spaceId": space.id,
+                "cwd": ".",
+                "branch": launch.sourceRef,
+                "config": encodableDictionary(chatConfig),
+            ]
+        )
+        putChat(chatId: chatId, space: space, config: chatConfig,
+                branch: launch.sourceRef, cwd: ".")
+        _ = addSessionRef(chatId: chatId, environment: attachment.environment)
+
+        let route = ScaffoldControlRoute(
+            controllerDeviceId: space.deviceId,
+            ownerDeviceId: ownerDeviceId,
+            actorSubject: attachment.environment.ownerPrincipal,
+            grantId: grant.id,
+            projection: projection,
+            environment: attachment.environment
+        )
+        let request = RunRequest(prompt: prompt, model: chatConfig.model,
+                                 reasoning: chatConfig.reasoning, cwd: ".",
+                                 sandbox: "workspace-write")
+        try await queueScaffoldCommand(
+            route: route, payload: .run(request: request,
+                                       messageId: UUID().uuidString.lowercased())
+        )
+        return (chatId, route)
+    }
+
+    func sendScaffoldCommand(controllerDeviceId: String,
+                             environment: SessionEnvironment,
+                             payload: SessionCommandPayload) async throws {
+        guard environment.source.kind == "scaffold",
+              let sandboxId = environment.source.sandboxId else {
+            throw MobileSessionError.unavailable("This session has no Scaffold route")
+        }
+        let scope = encodableDictionary(environment.scope)
+        let attachment = try await attachScaffoldEnvironment(
+            controllerDeviceId: controllerDeviceId, sandboxId: sandboxId, scope: scope
+        )
+        guard let ownerDeviceId = attachment.attachedDeviceId,
+              let projection = attachment.roomProjection,
+              let grant = attachment.controlGrant,
+              grant.capabilities.contains("session.chat") else {
+            throw MobileSessionError.unavailable("Scaffold returned no chat authority")
+        }
+        let route = ScaffoldControlRoute(
+            controllerDeviceId: controllerDeviceId,
+            ownerDeviceId: ownerDeviceId,
+            actorSubject: attachment.environment.ownerPrincipal,
+            grantId: grant.id,
+            projection: projection,
+            environment: attachment.environment
+        )
+        _ = addSessionRef(chatId: projection.sessionId, environment: attachment.environment)
+        try await queueScaffoldCommand(route: route, payload: payload)
+    }
+
+    private func attachScaffoldEnvironment(controllerDeviceId: String, sandboxId: String,
+                                           scope: [String: Any]) async throws -> ScaffoldEnvironmentControlResult {
+        let deadline = Date().addingTimeInterval(90)
+        var lastError: Error?
+        repeat {
+            do {
+                return try await relay(for: controllerDeviceId).call(
+                    method: "ControlScaffoldEnvironment",
+                    params: ["operation": "attach", "sandbox_id": sandboxId, "scope": scope],
+                    timeoutNanoseconds: 30_000_000_000
+                )
+            } catch {
+                lastError = error
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        } while Date() < deadline
+        throw lastError ?? RelayError.timeout
+    }
+
+    private func waitForScaffoldReadiness(controllerDeviceId: String, sandboxId: String,
+                                          scope: [String: Any]) async throws {
+        let deadline = Date().addingTimeInterval(120)
+        var lastLifecycle = "unknown"
+        repeat {
+            let inspected: ScaffoldEnvironmentControlResult = try await relay(for: controllerDeviceId).call(
+                method: "ControlScaffoldEnvironment",
+                params: ["operation": "inspect", "sandbox_id": sandboxId, "scope": scope],
+                timeoutNanoseconds: 30_000_000_000
+            )
+            lastLifecycle = inspected.environment.source.lifecycle ?? "unknown"
+            if lastLifecycle == "ready" || lastLifecycle == "agent_running" { return }
+            if lastLifecycle == "failed" || lastLifecycle == "stopped" {
+                throw MobileSessionError.unavailable("Scaffold session became \(lastLifecycle)")
+            }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        } while Date() < deadline
+        throw MobileSessionError.unavailable("Scaffold session remained \(lastLifecycle)")
+    }
+
+    private func queueScaffoldCommand(route: ScaffoldControlRoute,
+                                      payload: SessionCommandPayload) async throws {
+        let actionPayload: [String: Any]
+        switch payload {
+        case .run(let request, let messageId):
+            actionPayload = [
+                "action": "start",
+                "request": encodableDictionary(request),
+                "message_id": messageId,
+            ]
+        case .steer(let prompt, let messageId):
+            var action: [String: Any] = ["action": "steer", "prompt": prompt]
+            if let messageId { action["message_id"] = messageId }
+            actionPayload = action
+        case .interrupt:
+            actionPayload = ["action": "stop"]
+        case .respondInput(let requestId, let answers):
+            actionPayload = [
+                "action": "respondInput",
+                "request_id": requestId,
+                "answers": answers.map(encodableDictionary),
+            ]
+        }
+        let command: [String: Any] = [
+            "kind": "control",
+            "sessionId": route.projection.sessionId,
+            "ownerDeviceId": route.ownerDeviceId,
+            "actorDeviceId": route.controllerDeviceId,
+            "actorSubject": route.actorSubject,
+            "grantId": route.grantId,
+            "source": "scaffold",
+            "action": actionPayload,
+        ]
+        struct Reply: Decodable { var commandId: String }
+        let _: Reply = try await relay(for: route.controllerDeviceId).call(
+            method: "QueueCommand",
+            params: [
+                "chatId": route.projection.sessionId,
+                "commandId": UUID().uuidString.lowercased(),
+                "command": command,
+            ],
+            timeoutNanoseconds: 30_000_000_000
+        )
+    }
+
+    private func encodableDictionary<T: Encodable>(_ value: T) -> [String: Any] {
+        guard let data = try? JSONEncoder().encode(value),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let dictionary = object as? [String: Any] else { return [:] }
+        return dictionary
+    }
+
     /// Retarget a session onto another checkout (the desktop's
     /// setChatCwd/setChatBranch mutates — LWW row writes here).
     func setChatCheckout(chatId: String, cwd: String, branch: String) {
@@ -340,9 +562,8 @@ final class WorkspaceStore {
         "\(config.userId.utf8.count):\(config.userId):\(chatId)"
     }
 
-    /// Upsert an exact global session id without creating a Chat host row.
     @discardableResult
-    func addSessionRef(chatId rawChatId: String) -> SessionRef? {
+    func addSessionRef(chatId rawChatId: String, environment: SessionEnvironment? = nil) -> SessionRef? {
         guard let uuid = UUID(uuidString: rawChatId.trimmingCharacters(in: .whitespacesAndNewlines))
         else { return nil }
         let chatId = uuid.uuidString.lowercased()
@@ -355,9 +576,12 @@ final class WorkspaceStore {
             try row.insert(key: "chatId", v: chatId)
             let addedAt = row.get(key: "addedAt")?.asValue()?.i64Value ?? nowMs()
             try row.insert(key: "addedAt", v: addedAt)
+            if let environment, let value = LoroValue.fromEncodable(environment) {
+                try row.insert(key: "environment", v: value)
+            }
             doc.commit()
             project()
-            return SessionRef(chatId: chatId, addedAt: addedAt)
+            return SessionRef(chatId: chatId, addedAt: addedAt, environment: environment)
         } catch {
             return nil
         }
@@ -380,25 +604,30 @@ final class WorkspaceStore {
     func createChat(space: Space, config chatConfig: ChatConfig,
                     branch: String? = nil, cwd: String? = nil) -> String {
         let chatId = UUID().uuidString.lowercased()
+        putChat(chatId: chatId, space: space, config: chatConfig,
+                branch: branch, cwd: cwd ?? space.path)
+        return chatId
+    }
+
+    private func putChat(chatId: String, space: Space, config chatConfig: ChatConfig,
+                         branch: String?, cwd: String) {
         let map = doc.getMap(id: "chats")
         do {
             let row = try map.getOrCreateContainer(key: chatId, child: LoroMap())
             try row.insert(key: "id", v: chatId)
             try row.insert(key: "deviceId", v: space.deviceId)
             try row.insert(key: "archived", v: false)
-            try row.insert(key: "cwd", v: cwd ?? space.path)
+            try row.insert(key: "cwd", v: cwd)
             try row.insert(key: "spaceId", v: space.id)
-            try row.insert(key: "createdAt", v: nowMs())
-            if let branch {
-                try row.insert(key: "branch", v: branch)
-            }
-            if let cfg = LoroValue.fromEncodable(chatConfig) {
-                try row.insert(key: "config", v: cfg)
+            let createdAt = row.get(key: "createdAt")?.asValue()?.i64Value ?? nowMs()
+            try row.insert(key: "createdAt", v: createdAt)
+            if let branch { try row.insert(key: "branch", v: branch) }
+            if let value = LoroValue.fromEncodable(chatConfig) {
+                try row.insert(key: "config", v: value)
             }
             doc.commit()
             project()
         } catch {}
-        return chatId
     }
 
     /// Create a space. Preferred path: `Mutate {op:createSpace}` straight to

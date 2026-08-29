@@ -33,6 +33,16 @@ enum HarnessCatalog {
 
     static func models(for harness: String) -> [ModelInfo] {
         switch harness {
+        case "omp":
+            let codex = models(for: "codex").map {
+                ModelInfo(id: "openai-codex/\($0.id)", label: $0.label,
+                          description: $0.description, reasoningLevels: $0.reasoningLevels)
+            }
+            let claude = models(for: "claude-code").map {
+                ModelInfo(id: "anthropic/\($0.id)", label: $0.label,
+                          description: $0.description, reasoningLevels: $0.reasoningLevels)
+            }
+            return codex + claude
         case "codex":
             return [
                 ModelInfo(id: "gpt-5.6-sol", label: "GPT-5.6-Sol",

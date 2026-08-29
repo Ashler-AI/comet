@@ -981,6 +981,46 @@ mod tests {
     }
 
     #[test]
+    fn mobile_scaffold_create_attach_and_inspect_wire_shapes_decode() {
+        let create: ScaffoldEnvironmentControl = serde_json::from_value(serde_json::json!({
+            "operation": "create",
+            "scope": {
+                "projectId": "ashler-staging",
+                "deploymentId": "ashler-staging",
+                "sessionId": "11111111-1111-1111-1111-111111111111",
+            },
+            "source_ref": "master",
+            "database_environment": "local",
+            "agentRoute": {
+                "provider": "openai",
+                "model": "gpt-5.6-sol",
+                "fallback": "disabled",
+                "routingMode": "automatic",
+            },
+        }))
+        .unwrap();
+        assert!(matches!(create, ScaffoldEnvironmentControl::Create { .. }));
+
+        for operation in ["attach", "inspect"] {
+            let control: ScaffoldEnvironmentControl = serde_json::from_value(serde_json::json!({
+                "operation": operation,
+                "sandbox_id": "sandbox-a",
+                "scope": {
+                    "projectId": "ashler-staging",
+                    "deploymentId": "ashler-staging",
+                    "sessionId": "11111111-1111-1111-1111-111111111111",
+                },
+            }))
+            .unwrap();
+            assert!(matches!(
+                (operation, control),
+                ("attach", ScaffoldEnvironmentControl::Attach { .. })
+                    | ("inspect", ScaffoldEnvironmentControl::Inspect { .. })
+            ));
+        }
+    }
+
+    #[test]
     fn agent_routes_use_the_shared_camel_case_wire_shape() {
         let automatic =
             serde_json::to_value(AgentRoute::automatic(AgentProvider::OpenAi, "gpt-5.6-sol"))

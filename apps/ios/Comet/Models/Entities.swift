@@ -14,14 +14,120 @@ struct DeviceRow: Identifiable, Hashable {
     var lastSeenAt: Int64?
     var createdAt: Int64?
 }
-/// Imported global-session membership. This is deliberately not a Chat: it
-/// carries no owner, host device, space, or cached public metadata.
+struct CollaborationScope: Codable, Hashable {
+    var projectId: String
+    var deploymentId: String?
+    var sessionId: String?
+}
+
+struct SessionEnvironmentLinks: Codable, Hashable {
+    var session: String?
+    var web: String?
+    var opencode: String?
+    var tilt: String?
+    var terminal: String?
+
+    var health: String?
+}
+enum SessionLaunchTarget: String, CaseIterable, Identifiable {
+    case local
+    case scaffold
+
+    var id: String { rawValue }
+    var label: String { self == .local ? "This device" : "Scaffold" }
+}
+
+struct SessionEnvironmentSource: Codable, Hashable {
+    var kind: String
+    var sandboxId: String?
+    var region: String?
+    var lifecycle: String?
+    var lifecycleEpoch: UInt64?
+    var links: SessionEnvironmentLinks?
+    enum CodingKeys: String, CodingKey {
+        case kind
+        case sandboxId = "sandbox_id"
+        case region
+        case lifecycle
+        case lifecycleEpoch = "lifecycle_epoch"
+        case links
+    }
+}
+
+enum ScaffoldDatabaseEnvironment: String, Codable, CaseIterable, Identifiable {
+    case local
+    case stagingSnapshot = "staging_snapshot"
+    case productionSnapshot = "production_snapshot"
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .local: return "Local database"
+        case .stagingSnapshot: return "Staging snapshot"
+        case .productionSnapshot: return "Production snapshot"
+        }
+    }
+}
+
+struct SessionEnvironment: Codable, Hashable {
+    var source: SessionEnvironmentSource
+    var name: String?
+    var ownerPrincipal: String
+    var scope: CollaborationScope
+    var sourceRef: String?
+    var lastActivityAt: Int64?
+    var databaseEnvironment: ScaffoldDatabaseEnvironment?
+}
+
+struct SessionRoomProjection: Codable, Hashable {
+    var projectId: String
+    var deploymentId: String
+    var sessionId: String
+}
+
+struct ScaffoldControlGrant: Codable, Hashable {
+    var id: String
+    var expiresAt: Int64
+    var capabilities: [String]
+}
+
+struct ScaffoldEnvironmentControlResult: Codable, Hashable {
+    var environment: SessionEnvironment
+    var attachedDeviceId: String?
+    var runId: String?
+    var roomProjection: SessionRoomProjection?
+    var controlGrant: ScaffoldControlGrant?
+}
+
+struct ScaffoldControlRoute: Hashable {
+    var controllerDeviceId: String
+    var ownerDeviceId: String
+    var actorSubject: String
+    var grantId: String
+    var projection: SessionRoomProjection
+    var environment: SessionEnvironment
+}
+
+struct ScaffoldLaunchConfig: Hashable {
+    var provider: String
+    var providerModel: String
+    var persistedModel: String
+    var reasoning: String?
+    var databaseEnvironment: ScaffoldDatabaseEnvironment
+    var sourceRef: String
+}
+
+/// Imported global-session membership. Scaffold refs retain their verified
+/// deployment route; capability grant ids remain short-lived and are never
+/// persisted in the workspace document.
 struct SessionRef: Identifiable, Hashable {
     var chatId: String
     var addedAt: Int64
+    var environment: SessionEnvironment?
 
     var id: String { chatId }
     var fallbackTitle: String { "Session \(chatId.prefix(8))" }
+    var deploymentId: String? { environment?.scope.deploymentId }
 }
 
 
@@ -61,6 +167,8 @@ struct Chat: Identifiable, Hashable {
     var lastMessagePreview: String?
     var lastMessageAt: Int64?
     var createdAt: Int64
+    var harnessSessionId: String?
+    var harnessSessionCwd: String?
     var spaceId: String?
     var lastSeenAt: Int64?
 
@@ -273,6 +381,14 @@ enum SessionCommandPayload {
         case .steer: return "steer"
         case .interrupt: return "interrupt"
         case .respondInput: return "respondInput"
+        }
+    }
+
+    var messageId: String? {
+        switch self {
+        case .run(_, let messageId): return messageId
+        case .steer(_, let messageId): return messageId
+        case .interrupt, .respondInput: return nil
         }
     }
 }

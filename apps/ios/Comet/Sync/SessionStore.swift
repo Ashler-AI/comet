@@ -14,6 +14,7 @@ final class SessionStore {
     let chatId: String
     /// The chat's host device — nudge target for cold-host command drains.
     var hostDeviceId: String?
+    private(set) var deploymentId: String?
     private(set) var entries: [MessageEntry] = []
     /// Bumped on every change to `entries` / `pendingSends`. The transcript's
     /// row builder memoizes on it, so a body re-eval that was triggered by
@@ -29,6 +30,7 @@ final class SessionStore {
     private(set) var connected = false
     /// Client-minted ids of sends the host hasn't materialized yet.
     private(set) var pendingSends: [(messageId: String, text: String, at: Int64)] = []
+    private(set) var sendFailure: String?
 
     let doc = LoroDoc()
     private var room: RoomClient?
@@ -39,10 +41,14 @@ final class SessionStore {
     private let offline: Bool
     /// Demo hook: invoked instead of the command plane when offline.
     @ObservationIgnored var demoResponder: ((String) -> Void)?
+    /// Scaffold commands must be admitted by a trusted desktop controller so
+    /// its fresh control grant, not the phone, signs the durable command.
+    @ObservationIgnored var scaffoldCommandSender: ((SessionCommandPayload) -> Void)?
 
-    init(chatId: String, config: AppConfig, offline: Bool = false) {
+    init(chatId: String, config: AppConfig, deploymentId: String? = nil, offline: Bool = false) {
         self.chatId = chatId
         self.config = config
+        self.deploymentId = deploymentId
         self.offline = offline
     }
 
@@ -62,8 +68,8 @@ final class SessionStore {
             project()
         }
         saver = DocSaver(docId: chatId, doc: doc)
-        let client = RoomClient(roomId: chatId, doc: doc) { [config, chatId] in
-            await config.sessionSocketURL(chatId: chatId)
+        let client = RoomClient(roomId: chatId, doc: doc) { [config, chatId, deploymentId] in
+            await config.sessionSocketURL(chatId: chatId, deploymentId: deploymentId)
         } events: { [weak self] event in
             Task { @MainActor [weak self] in self?.handle(event) }
         }
@@ -92,6 +98,14 @@ final class SessionStore {
         }
         room = nil
         connected = false
+    }
+
+    func updateDeploymentId(_ value: String?) {
+        guard deploymentId != value else { return }
+        deploymentId = value
+        guard !offline else { return }
+        stop()
+        start()
     }
 
     private func handle(_ event: RoomEvent) {
@@ -271,6 +285,12 @@ final class SessionStore {
                                  reasoning: chat?.config?.reasoning,
                                  cwd: chat?.cwd ?? "",
                                  sandbox: chat?.config?.sandbox ?? "workspace-write")
+        if let scaffoldCommandSender {
+            pendingSends.append((messageId, prompt, nowMs()))
+            revision &+= 1
+            scaffoldCommandSender(.run(request: request, messageId: messageId))
+            return
+        }
         queueCommand(kind: "run", payload: [
             "kind": "run",
             "request": encodableJSON(request),
@@ -286,6 +306,12 @@ final class SessionStore {
             return
         }
         let messageId = UUID().uuidString.lowercased()
+        if let scaffoldCommandSender {
+            pendingSends.append((messageId, prompt, nowMs()))
+            revision &+= 1
+            scaffoldCommandSender(.steer(prompt: prompt, messageId: messageId))
+            return
+        }
         queueCommand(kind: "steer", payload: [
             "kind": "steer",
             "prompt": prompt,
@@ -295,16 +321,46 @@ final class SessionStore {
         revision &+= 1
     }
 
+    @discardableResult
+    func stagePendingSend(prompt: String, messageId: String = UUID().uuidString.lowercased()) -> String {
+        pendingSends.append((messageId, prompt, nowMs()))
+        revision &+= 1
+        return messageId
+    }
+
+    func dropPendingSend(messageId: String) {
+        let count = pendingSends.count
+        pendingSends.removeAll { $0.messageId == messageId }
+        if pendingSends.count != count { revision &+= 1 }
+    }
+
+    func reportSendFailure(_ message: String, messageId: String?) {
+        if let messageId { dropPendingSend(messageId: messageId) }
+        sendFailure = message
+    }
+
+    func clearSendFailure() {
+        sendFailure = nil
+    }
+
     func sendInterrupt() {
-        queueCommand(kind: "interrupt", payload: ["kind": "interrupt"])
+        if let scaffoldCommandSender {
+            scaffoldCommandSender(.interrupt)
+        } else {
+            queueCommand(kind: "interrupt", payload: ["kind": "interrupt"])
+        }
     }
 
     func respondInput(requestId: String, answers: [UserInputAnswer]) {
-        queueCommand(kind: "respondInput", payload: [
-            "kind": "respondInput",
-            "requestId": requestId,
-            "answers": answers.map(encodableJSON),
-        ])
+        if let scaffoldCommandSender {
+            scaffoldCommandSender(.respondInput(requestId: requestId, answers: answers))
+        } else {
+            queueCommand(kind: "respondInput", payload: [
+                "kind": "respondInput",
+                "requestId": requestId,
+                "answers": answers.map(encodableJSON),
+            ])
+        }
     }
 
     /// schema.rs queue_command, field for field.

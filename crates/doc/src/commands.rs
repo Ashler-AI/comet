@@ -491,6 +491,73 @@ mod tests {
     }
 
     #[test]
+    fn mobile_scaffold_control_actions_use_snake_case_fields() {
+        let start: SessionControlAction = serde_json::from_value(serde_json::json!({
+            "action": "start",
+            "request": serde_json::to_value(run_request()).unwrap(),
+            "message_id": "message-a",
+        }))
+        .unwrap();
+        assert!(matches!(
+            start,
+            SessionControlAction::Start { message_id, .. } if message_id == "message-a"
+        ));
+
+        let control: SessionCommandPayload = serde_json::from_value(serde_json::json!({
+            "kind": "control",
+            "sessionId": "session-a",
+            "ownerDeviceId": "comet-scaffold-sandbox-a-e1",
+            "actorDeviceId": "controller-a",
+            "actorSubject": "accounts.google.com:subject-a",
+            "grantId": "grant-a",
+            "source": "scaffold",
+            "action": {
+                "action": "start",
+                "request": serde_json::to_value(run_request()).unwrap(),
+                "message_id": "message-a",
+            },
+        }))
+        .unwrap();
+        assert!(matches!(
+            control,
+            SessionCommandPayload::Control { session_id, action, .. }
+                if session_id == "session-a"
+                    && matches!(&*action, SessionControlAction::Start { message_id, .. }
+                        if message_id == "message-a")
+        ));
+
+        let steer: SessionControlAction = serde_json::from_value(serde_json::json!({
+            "action": "steer",
+            "prompt": "continue",
+            "message_id": "message-b",
+        }))
+        .unwrap();
+        assert!(matches!(
+            steer,
+            SessionControlAction::Steer { message_id: Some(message_id), .. }
+                if message_id == "message-b"
+        ));
+
+        let input: SessionControlAction = serde_json::from_value(serde_json::json!({
+            "action": "respondInput",
+            "request_id": "input-a",
+            "answers": [{ "questionId": "question-a", "labels": ["Yes"] }],
+        }))
+        .unwrap();
+        assert!(matches!(
+            input,
+            SessionControlAction::RespondInput { request_id, .. } if request_id == "input-a"
+        ));
+
+        assert!(serde_json::from_value::<SessionControlAction>(serde_json::json!({
+            "action": "start",
+            "request": serde_json::to_value(run_request()).unwrap(),
+            "messageId": "wrong-key",
+        }))
+        .is_err());
+    }
+
+    #[test]
     fn composer_cancel_rules() {
         let e = steer("c1", 1_000);
         assert!(can_composer_cancel(&e, "device-a"));

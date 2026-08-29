@@ -34,6 +34,21 @@ desktop's pulldown-cmark config).
   explore the UI with no infrastructure. Launch args for screenshot rigs:
   `-demo [-route chat:<id>|space:<id>] [-stream]`.
 
+
+### Session control coverage
+
+- The home screen merges every non-archived workspace chat with the signed-in
+  principal's imported session refs.
+- `comet://invite/{chatId}/{sessionId}/{grantId}` links pin missing membership
+  and open the session directly.
+- New-session launch supports the selected desktop device or a Scaffold OMP
+  environment, including source ref and database snapshot selection. Scaffold
+  creation, attachment, readiness, and command admission run through the
+  trusted desktop controller; the phone receives no sandbox credential.
+- Existing local and Scaffold sessions accept run/steer/stop/input commands.
+  Local OMP sessions with durable native context can be forked from the session
+  toolbar.
+
 ## Architecture
 
 ```

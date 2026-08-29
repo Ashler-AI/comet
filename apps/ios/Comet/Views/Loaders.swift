@@ -2,8 +2,7 @@
 //
 // gradient-spin-pulse: a 3×3 cell grid with per-row "sunrise" tints; each cell
 // pulses once per 750ms with phase = distance from bottom-center, so the wave
-// travels upward. The mini variant (2×3) snakes clockwise around the perimeter
-// and marks Working rows in lists.
+// travels upward. Session rows use the desktop's thin 9pt arc spinner.
 
 import SwiftUI
 
@@ -61,39 +60,26 @@ struct WorkingSpinner: View {
     }
 }
 
-/// 2×3 mini spinner — cells snake clockwise around the perimeter ring
-/// (loaders.rs mini_gradient_spinner). Used in session rows / tabs.
-struct MiniSpinner: View {
-    var cellSize: CGFloat = 2.0
+/// Thin session-row activity ring — a SwiftUI port of loaders.rs `arc_spinner`.
+/// Reduced motion keeps the partial ring static.
+struct ArcSpinner: View {
+    var color: Color = Theme.textMuted.opacity(0.8)
+    var diameter: CGFloat = 9
+    var lineWidth: CGFloat = 1.5
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    // Perimeter order for a 2-wide × 3-tall grid, clockwise.
-    private static let ring: [(row: Int, col: Int)] = [
-        (0, 0), (0, 1), (1, 1), (2, 1), (2, 0), (1, 0),
-    ]
 
     var body: some View {
         TimelineView(.animation(paused: reduceMotion)) { timeline in
-            let t = timeline.date.timeIntervalSinceReferenceDate / Motion.gradientSpinPeriod
-            grid(time: t)
+            let phase = reduceMotion
+                ? 0
+                : (timeline.date.timeIntervalSinceReferenceDate / Motion.arcSpinPeriod)
+                    .truncatingRemainder(dividingBy: 1)
+            Circle()
+                .trim(from: 0.08, to: 0.74)
+                .stroke(color, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
+                .rotationEffect(.degrees(phase * 360))
         }
-    }
-
-    private func grid(time: Double) -> some View {
-        VStack(spacing: cellSize * 0.8) {
-            ForEach(0..<3, id: \.self) { row in
-                HStack(spacing: cellSize * 0.8) {
-                    ForEach(0..<2, id: \.self) { col in
-                        let ix = Self.ring.firstIndex { $0 == (row, col) } ?? 0
-                        let phase = Double(ix) / Double(Self.ring.count)
-                        Rectangle()
-                            .fill(GradientSpin.rowTints[row])
-                            .frame(width: cellSize, height: cellSize)
-                            .opacity(GradientSpin.opacity(phase: time - phase))
-                    }
-                }
-            }
-        }
+        .frame(width: diameter, height: diameter)
     }
 }
 
@@ -137,28 +123,6 @@ extension ChatIndicator {
     }
 }
 
-/// The 6pt leading dot (leads so its position is stable); Working swaps in the
-/// mini spinner. Exactly 6 wide, like the desktop rail (shell.rs
-/// `render_chat_row`) — the session row's lower lines indent by rail + gap, so
-/// a wider rail here would push them out of line with the row's first line.
-struct StatusRail: View {
-    let indicator: ChatIndicator
-
-    var body: some View {
-        Group {
-            if indicator == .working {
-                MiniSpinner()
-            } else {
-                Circle()
-                    .fill(indicator.dotColor)
-                    .frame(width: 6, height: 6)
-            }
-        }
-        .frame(width: StatusRail.width, height: 10)
-    }
-
-    static let width: CGFloat = 6
-}
 
 /// Harness brand mark (pickers.rs harness_brand_icon) — the desktop's actual
 /// SVG marks, rendered via BrandMarkShape. Claude keeps its brand orange even

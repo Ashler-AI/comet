@@ -241,32 +241,27 @@ struct SpaceRow: View {
     }
 }
 
-/// The desktop session row (shell.rs `render_chat_row`), line for line: the
-/// status rail leads a muted context line carrying the space name and the
-/// relative time; the title sits on its own line below; harness mark and branch
-/// close it out. Lines 2 and 3 indent by rail + gap so they start exactly under
-/// the context line rather than beside the rail.
+/// Mobile port of the desktop rich session row (`shell.rs render_chat_row`):
+/// context and top-right status share the first line, followed by title and
+/// harness/branch metadata. Working replaces recency with a thin spinner;
+/// completed, awaiting-input, and errored rows replace it with one blue
+/// attention dot. Idle rows keep the recency label.
 ///
-/// The one addition the phone needs: the desktop row names only the space
-/// because its sidebar sits on the machine running the work. Here the Sessions
-/// list interleaves every device, and a session whose host has gone offline
-/// can't be driven at all — so the context line reads "space · device".
+/// The phone adds the owning device to the context because this list
+/// interleaves sessions hosted by every device.
 struct ChatRow: View {
     @Environment(AppModel.self) private var model
     let chat: Chat
     var showLocation: Bool
 
-    /// Rail (6) + gap (8) — see `render_chat_row`'s `pl(px(14.0))`.
-    private static let indent: CGFloat = StatusRail.width + 8
 
     private var subline: Color { Theme.textMuted.opacity(0.5) }
 
     var body: some View {
         let indicator = model.indicator(for: chat)
         VStack(alignment: .leading, spacing: 2) {
-            // Line 1: status rail, space · device, time-ago.
+            // Line 1: space · device, then spinner / attention dot / time-ago.
             HStack(spacing: 8) {
-                StatusRail(indicator: indicator)
                 if showLocation {
                     Text(location)
                         .font(Theme.sans(11))
@@ -277,10 +272,7 @@ struct ChatRow: View {
                 } else {
                     Spacer(minLength: 4)
                 }
-                Text(relativeTime(chat.lastMessageAt ?? chat.createdAt))
-                    .font(Theme.sans(11))
-                    .foregroundStyle(subline)
-                    .fixedSize()
+                statusSlot(indicator)
             }
 
             // Line 2: the session title.
@@ -289,7 +281,6 @@ struct ChatRow: View {
                 .foregroundStyle(Theme.text)
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.leading, Self.indent)
 
             // Line 3: harness brand mark, then the branch when the engine
             // stamped one.
@@ -307,11 +298,38 @@ struct ChatRow: View {
                 }
                 Spacer(minLength: 0)
             }
-            .padding(.leading, Self.indent)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
         .contentShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    @ViewBuilder
+    private func statusSlot(_ indicator: ChatIndicator) -> some View {
+        switch indicator {
+        case .working:
+            ArcSpinner()
+                .accessibilityLabel("Running")
+        case .awaitingInput, .completed, .errored:
+            Circle()
+                .fill(Theme.attention)
+                .frame(width: 7, height: 7)
+                .accessibilityLabel(attentionLabel(indicator))
+        case .idle:
+            Text(relativeTime(chat.lastMessageAt ?? chat.createdAt))
+                .font(Theme.sans(11))
+                .foregroundStyle(subline)
+                .fixedSize()
+        }
+    }
+
+    private func attentionLabel(_ indicator: ChatIndicator) -> String {
+        switch indicator {
+        case .awaitingInput: return "Awaiting input"
+        case .errored: return "Error"
+        case .completed: return "New activity"
+        case .working, .idle: return ""
+        }
     }
 
     /// "space · device", with offline marker. The space name (not the cwd

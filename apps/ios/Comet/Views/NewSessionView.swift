@@ -16,6 +16,8 @@ struct NewSessionView: View {
     @AppStorage("newSessionHarness") private var harness = "claude-code"
     @AppStorage("newSessionModel") private var storedModel = ""
     @AppStorage("newSessionReasoning") private var storedReasoning = ""
+    @AppStorage("newSessionTarget") private var launchTargetRaw = SessionLaunchTarget.scaffold.rawValue
+    @AppStorage("newSessionDatabase") private var databaseEnvironmentRaw = ScaffoldDatabaseEnvironment.local.rawValue
 
     @State private var draft = ""
     @State private var showPicker = false
@@ -27,6 +29,7 @@ struct NewSessionView: View {
     @State private var selectedRef: String?
     @State private var checkoutKind: CheckoutKind = .local
     @State private var busy = false
+    @State private var launchError: String?
     @FocusState private var focused: Bool
 
     private var space: Space? {
@@ -88,6 +91,14 @@ struct NewSessionView: View {
                     }
                 }
             }
+        }
+        .alert("Couldn’t start session", isPresented: Binding(
+            get: { launchError != nil },
+            set: { if !$0 { launchError = nil } }
+        )) {
+            Button("OK", role: .cancel) { launchError = nil }
+        } message: {
+            Text(launchError ?? "Unknown error")
         }
         .sheet(isPresented: $showRefPicker) {
             RefPickerSheet(refs: refs, selected: selectedRef) { ref in
@@ -175,6 +186,64 @@ struct NewSessionView: View {
             }
             .buttonStyle(ChipPressButtonStyle())
 
+
+            Menu {
+                ForEach(availableLaunchTargets) { target in
+                    Button {
+                        launchTargetRaw = target.rawValue
+                    } label: {
+                        if target == launchTarget {
+                            Label(target.label, systemImage: "checkmark")
+                        } else {
+                            Text(target.label)
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: launchTarget == .scaffold ? "cloud" : "desktopcomputer")
+                        .font(.system(size: 12, weight: .medium))
+                    Text(launchTarget.label)
+                        .font(Theme.sans(13, weight: .medium))
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(Theme.textFaint)
+                }
+                .foregroundStyle(Theme.text.opacity(0.9))
+                .padding(.horizontal, 12)
+                .frame(height: 36)
+                .background(whiteAlpha(0.10), in: Capsule())
+            }
+            .buttonStyle(ChipPressButtonStyle())
+
+            if launchTarget == .scaffold {
+                Menu {
+                    ForEach(ScaffoldDatabaseEnvironment.allCases) { environment in
+                        Button {
+                            databaseEnvironmentRaw = environment.rawValue
+                        } label: {
+                            if environment == databaseEnvironment {
+                                Label(environment.label, systemImage: "checkmark")
+                            } else {
+                                Text(environment.label)
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "cylinder")
+                            .font(.system(size: 12, weight: .medium))
+                        Text(databaseEnvironment.label)
+                            .font(Theme.sans(13, weight: .medium))
+                            .lineLimit(1)
+                    }
+                    .foregroundStyle(Theme.text.opacity(0.9))
+                    .padding(.horizontal, 12)
+                    .frame(height: 36)
+                    .background(whiteAlpha(0.10), in: Capsule())
+                }
+                .buttonStyle(ChipPressButtonStyle())
+            }
             // Checkout + ref chips — the desktop footer (git spaces only).
             if space?.gitDetected == true {
                 chip(icon: checkoutIcon, label: checkoutLabel) {
@@ -205,6 +274,19 @@ struct NewSessionView: View {
             .background(whiteAlpha(0.10), in: Capsule())
         }
         .buttonStyle(ChipPressButtonStyle())
+    }
+
+    private var launchTarget: SessionLaunchTarget {
+        guard model.launchesScaffoldSessions else { return .local }
+        return SessionLaunchTarget(rawValue: launchTargetRaw) ?? .scaffold
+    }
+
+    private var availableLaunchTargets: [SessionLaunchTarget] {
+        model.launchesScaffoldSessions ? SessionLaunchTarget.allCases : [.local]
+    }
+
+    private var databaseEnvironment: ScaffoldDatabaseEnvironment {
+        ScaffoldDatabaseEnvironment(rawValue: databaseEnvironmentRaw) ?? .local
     }
 
     // MARK: Checkout model (pickers.rs port)
@@ -289,9 +371,28 @@ struct NewSessionView: View {
         guard let space, canSend else { return }
         let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         busy = true
-        let config = ChatConfig(harness: harness, model: selectedModel.id,
-                                reasoning: reasoning, sandbox: "workspace-write")
         Task { @MainActor in
+            if launchTarget == .scaffold {
+                do {
+                    let chatId = try await model.launchScaffoldSession(
+                        space: space,
+                        prompt: prompt,
+                        harness: harness,
+                        model: selectedModel.id,
+                        reasoning: reasoning,
+                        databaseEnvironment: databaseEnvironment,
+                        sourceRef: selectedRef
+                    )
+                    finishLaunch(chatId: chatId)
+                } catch {
+                    busy = false
+                    launchError = error.localizedDescription
+                }
+                return
+            }
+
+            let config = ChatConfig(harness: harness, model: selectedModel.id,
+                                    reasoning: reasoning, sandbox: "workspace-write")
             var cwd: String?
             var branch = selectedRef
             switch checkoutKind {
@@ -305,9 +406,7 @@ struct NewSessionView: View {
                     branch = base
                 }
             case .local:
-                if let worktree = selectedRefRow?.worktreePath {
-                    cwd = worktree  // reuse the ref's existing checkout
-                }
+                if let worktree = selectedRefRow?.worktreePath { cwd = worktree }
             }
             guard let chatId = model.createChat(space: space, config: config,
                                                 branch: branch, cwd: cwd),
@@ -317,16 +416,16 @@ struct NewSessionView: View {
                 return
             }
             store.sendRun(prompt: prompt, chat: chat)
-            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            draft = ""
-            busy = false
-            // Replace the canvas with the live session (in-place swap, no
-            // back-through-canvas).
-            if path.last == .newSession(spaceId: spaceId) {
-                path.removeLast()
-            }
-            path.append(.chat(chatId))
+            finishLaunch(chatId: chatId)
         }
+    }
+
+    private func finishLaunch(chatId: String) {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        draft = ""
+        busy = false
+        if path.last == .newSession(spaceId: spaceId) { path.removeLast() }
+        path.append(.chat(chatId))
     }
 }
 
