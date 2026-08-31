@@ -443,6 +443,10 @@ fn materialize_discovered(
                     && chat.checkout_id.as_deref() == Some(metadata.checkout_id.as_str())
             })
     });
+    // This path is an explicit authenticated attach of an opaque candidate,
+    // not a shared-room import. Pin before the no-change fast path so a user
+    // who selects a pre-membership native session keeps it after the upgrade.
+    workspace.upsert_session_ref(&chat_id, None)?;
     if metadata_matches && transcript_import == TranscriptImport::None {
         return Ok((
             LocalSessionAttachResult { chat_id, space_id },
@@ -2330,10 +2334,29 @@ mod tests {
             2
         );
 
+        workspace
+            .doc()
+            .remove_session_ref("user-a", &attached.chat_id)
+            .unwrap();
+        assert!(
+            workspace
+                .doc()
+                .session_ref("user-a", &attached.chat_id)
+                .unwrap()
+                .is_none()
+        );
+
         let (reattached, transcript_import) =
             materialize_discovered(&session, &workspace, &doc_host).unwrap();
         assert_eq!(reattached.chat_id, attached.chat_id);
         assert_eq!(transcript_import, TranscriptImport::None);
+        assert!(
+            workspace
+                .doc()
+                .session_ref("user-a", &attached.chat_id)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

@@ -248,7 +248,7 @@ impl EngineCore {
         let journal = Arc::new(RunJournal::open(project_dir.join("journals"))?);
         let sessions = SessionsEngine::new(
             device_id.clone(),
-            journal,
+            journal.clone(),
             registry.clone(),
             context.ipc_port,
         );
@@ -260,7 +260,7 @@ impl EngineCore {
                 edge: edge.clone(),
             },
         );
-        let workspace = WorkspaceHost::open(
+        let workspace = WorkspaceHost::open_with_journal(
             store,
             WorkspaceHostConfig {
                 device_id: device_id.clone(),
@@ -274,6 +274,7 @@ impl EngineCore {
                     .then(|| edge.clone())
                     .flatten(),
             },
+            &journal,
         )?;
         doc_host.set_workspace(workspace.clone());
         doc_host.set_sessions(sessions.clone());

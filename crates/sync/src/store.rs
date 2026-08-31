@@ -35,6 +35,11 @@ const MIGRATIONS: &[&str] = &[
         command_id TEXT PRIMARY KEY,
         created_at INTEGER NOT NULL
      ) STRICT;",
+    // v3 — one-shot data migrations scoped by this store's project/principal path.
+    "CREATE TABLE local_migrations (
+        name TEXT PRIMARY KEY,
+        applied_at INTEGER NOT NULL
+     ) STRICT;",
 ];
 
 /// SQLite-backed store under a data directory (`{data_dir}/docs.sqlite3`).
@@ -146,6 +151,28 @@ impl DocsStore {
         Ok(())
     }
 
+    /// Whether an identity-local data migration has completed.
+    pub fn is_local_migration_applied(&self, name: &str) -> Result<bool, StoreError> {
+        let hit = self
+            .conn()
+            .query_row(
+                "SELECT 1 FROM local_migrations WHERE name = ?1",
+                params![name],
+                |_| Ok(()),
+            )
+            .optional()?;
+        Ok(hit.is_some())
+    }
+
+    /// Mark an identity-local data migration complete after its durable state is saved.
+    pub fn mark_local_migration_applied(&self, name: &str) -> Result<(), StoreError> {
+        self.conn().execute(
+            "INSERT OR IGNORE INTO local_migrations (name, applied_at) VALUES (?1, ?2)",
+            params![name, now_ms()],
+        )?;
+        Ok(())
+    }
+
     fn conn(&self) -> MutexGuard<'_, Connection> {
         // A poisoned lock only means another thread panicked mid-query; the
         // connection itself is still usable.
@@ -244,6 +271,19 @@ mod tests {
         assert!(store.is_trusted_local_command("cmd-local").unwrap());
         store.forget_local_command("cmd-local").unwrap();
         assert!(!store.is_trusted_local_command("cmd-local").unwrap());
+    }
+
+    #[test]
+    fn local_migration_markers_are_durable_and_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DocsStore::open(dir.path()).unwrap();
+        assert!(!store.is_local_migration_applied("membership-v1").unwrap());
+        store.mark_local_migration_applied("membership-v1").unwrap();
+        store.mark_local_migration_applied("membership-v1").unwrap();
+        drop(store);
+
+        let store = DocsStore::open(dir.path()).unwrap();
+        assert!(store.is_local_migration_applied("membership-v1").unwrap());
     }
 
     #[test]
