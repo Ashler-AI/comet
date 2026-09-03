@@ -577,11 +577,7 @@ impl Shell {
             .when(has_selection, |el| {
                 el.child(header_icon_button(
                     "toggle-workspace-status",
-                    if workspace_status_visible {
-                        icons::CLOSE
-                    } else {
-                        icons::WIDGET
-                    },
+                    icons::WIDGET,
                     if workspace_status_visible {
                         "Hide workspace details"
                     } else {
