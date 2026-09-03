@@ -6,11 +6,10 @@ import AuthenticationServices
 import Network
 import SwiftUI
 
-/// Production cloud endpoints — mirrors edge/wrangler.jsonc.
 enum Endpoints {
-    static let edgeURL = URL(string: "https://comet.internal.ashler.com")!
-    static let scaffoldURL = URL(string: "https://scaffold.internal.ashler.com")!
-    static let projectScope = "ashler-production"
+    static let edgeURL = ReleaseConfig.edgeURL
+    static let scaffoldURL = ReleaseConfig.scaffoldURL
+    static let projectScope = ReleaseConfig.projectScope
     static let loopbackHost = "127.0.0.1"
 }
 
@@ -31,7 +30,7 @@ struct SignInView: View {
                     CrewMark()
                         .frame(width: 72, height: 72)
                     VStack(spacing: 6) {
-                        Text("Crew")
+                        Text(ReleaseConfig.displayName)
                             .font(Theme.sans(28, weight: .semibold))
                             .kerning(-0.5)
                             .foregroundStyle(Theme.text)
@@ -132,8 +131,9 @@ final class AuthSessionCoordinator: NSObject, ASWebAuthenticationPresentationCon
     private var completion: ((Outcome) -> Void)?
     private var beginning = false
     private var finished = false
-    private let networkQueue = DispatchQueue(label: "dev.cometnative.Comet.oauth-loopback")
-
+    private let networkQueue = DispatchQueue(
+        label: "\(Bundle.main.bundleIdentifier ?? "ai.ashler.crew").oauth-loopback"
+    )
     func start(
         begin: @MainActor @escaping (String) async throws -> OAuthFlow,
         completion: @escaping (Outcome) -> Void

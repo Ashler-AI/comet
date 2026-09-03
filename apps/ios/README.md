@@ -22,6 +22,24 @@ automatically): [loro-swift 1.13.x](https://github.com/loro-dev/loro-swift)
 (cmark-gfm: tables/strikethrough/tasklists — the same feature set as the
 desktop's pulldown-cmark config).
 
+Production and staging use the same Swift target with separate checked-in schemes,
+bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
+
+```sh
+# Production: Crew, ai.ashler.crew, build 2
+xcodebuild -project Comet.xcodeproj -scheme Comet \
+  -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
+
+# Staging: Crew Staging, ai.ashler.crew.staging, build 1
+xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
+  -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
+```
+
+| Scheme | Edge | Scaffold | Project scope | Invite scheme |
+| --- | --- | --- | --- | --- |
+| `Comet` | `comet.internal.ashler.com` | `scaffold.internal.ashler.com` | `ashler-production` | `comet://` |
+| `Crew Staging` | `comet-staging.internal.ashler.com` | `scaffold-staging.internal.ashler.com` | `ashler-staging` | `comet-staging://` |
+
 ### Connecting
 
 - **Production**: Comet discovers Scaffold's OAuth metadata, dynamically

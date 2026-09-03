@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Crew</string>
+	<string>$(CREW_DISPLAY_NAME)</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -13,7 +13,7 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>$(PRODUCT_NAME)</string>
+	<string>$(CREW_DISPLAY_NAME)</string>
 	<key>CFBundlePackageType</key>
 	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
 	<key>CFBundleShortVersionString</key>
@@ -26,13 +26,21 @@
 	<array>
 		<dict>
 			<key>CFBundleURLName</key>
-			<string>com.ashler.comet.invite</string>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER).invite</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
-				<string>comet</string>
+				<string>$(CREW_INVITE_SCHEME)</string>
 			</array>
 		</dict>
 	</array>
+	<key>CrewEdgeURL</key>
+	<string>$(CREW_EDGE_URL)</string>
+	<key>CrewInviteScheme</key>
+	<string>$(CREW_INVITE_SCHEME)</string>
+	<key>CrewProjectScope</key>
+	<string>$(CREW_PROJECT_SCOPE)</string>
+	<key>CrewScaffoldURL</key>
+	<string>$(CREW_SCAFFOLD_URL)</string>
 	<key>UIAppFonts</key>
 	<array>
 		<string>Geist.ttf</string>

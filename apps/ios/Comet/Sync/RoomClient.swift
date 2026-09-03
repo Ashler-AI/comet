@@ -20,7 +20,7 @@ enum RoomEvent {
 /// Sync must never fail silently (2026-07-31: a send that never left the
 /// device was indistinguishable from a working one — `try?` all the way
 /// down). Visible in Console.app / `log stream` under this subsystem.
-let roomLog = Logger(subsystem: "dev.cometnative.Comet", category: "sync")
+let roomLog = Logger(subsystem: Bundle.main.bundleIdentifier ?? "ai.ashler.crew", category: "sync")
 
 actor RoomClient {
     // Constants mirrored from room.rs.

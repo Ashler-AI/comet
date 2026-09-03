@@ -31,7 +31,7 @@ final class AppModel {
     private var config: AppConfig?
 
     // Persisted connection settings.
-    @ObservationIgnored @AppStorage("edgeURL") var edgeURLString = "https://comet.internal.ashler.com"
+    @ObservationIgnored @AppStorage("edgeURL") var edgeURLString = ReleaseConfig.edgeURL.absoluteString
     @ObservationIgnored @AppStorage("authMode") var authModeRaw = AppConfig.Mode.scaffold.rawValue
     @ObservationIgnored @AppStorage("userId") var storedUserId = ""
     @ObservationIgnored @AppStorage("projectScope") var storedProjectScope = ""
@@ -269,10 +269,10 @@ final class AppModel {
 
     // MARK: One-click invitations
 
-    /// `comet://invite/{chatId}/{sessionId}/{grantId}` — the desktop's
-    /// one-click join link (`CometInvitation`). The session/grant ids route
-    /// engine command authority; a viewport needs only the chat id: pin
-    /// membership when the workspace has no chat row, then open the session.
+    /// Production uses `comet://invite/{chatId}/{sessionId}/{grantId}`;
+    /// staging uses the equivalent configured scheme. The session and grant
+    /// segments route engine authority; this viewport only needs the chat id
+    /// to pin membership and open the session.
     func openInvitation(url: URL) {
         guard let chatId = Self.invitationChatId(url) else { return }
         pendingInviteChatId = chatId
@@ -291,7 +291,7 @@ final class AppModel {
     /// Mirrors `comet_proto::CometInvitation::parse_deep_link`: exactly three
     /// non-empty `[A-Za-z0-9._-]{1,256}` segments, no query or fragment.
     static func invitationChatId(_ url: URL) -> String? {
-        let prefix = "comet://invite/"
+        let prefix = "\(ReleaseConfig.inviteScheme)://invite/"
         guard url.absoluteString.hasPrefix(prefix) else { return nil }
         let path = String(url.absoluteString.dropFirst(prefix.count))
         guard !path.contains("?"), !path.contains("#") else { return nil }

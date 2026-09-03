@@ -254,7 +254,7 @@ struct AuthClient {
 // MARK: - Keychain storage
 
 enum Keychain {
-    private static let service = "dev.cometnative.Comet"
+    private static let service = Bundle.main.bundleIdentifier ?? "ai.ashler.crew"
 
     static func save(_ value: String, key: String) {
         let data = Data(value.utf8)
