@@ -107,6 +107,8 @@ fn edit_menu() -> Menu {
 
 fn view_menu() -> Menu {
     Menu::new("View").items([
+        MenuItem::action("Toggle Workspace Details", shell::ToggleWorkspaceStatus),
+        MenuItem::separator(),
         MenuItem::action("Appearance: System", AppearanceSystem),
         MenuItem::action("Appearance: Light", AppearanceLight),
         MenuItem::action("Appearance: Dark", AppearanceDark),
@@ -169,6 +171,20 @@ mod tests {
         assert!(actions.contains(&composer::Copy.name()));
         assert!(actions.contains(&composer::Paste.name()));
         assert!(actions.contains(&composer::SelectAll.name()));
+    }
+
+    #[test]
+    fn view_menu_can_restore_workspace_details() {
+        let menu = view_menu();
+        let actions = menu
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                MenuItem::Action { action, .. } => Some(action.name()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(actions.contains(&shell::ToggleWorkspaceStatus.name()));
     }
 
     #[test]
