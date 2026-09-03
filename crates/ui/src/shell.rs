@@ -65,6 +65,7 @@ actions!(
         ToggleCommandPalette,
         ToggleActivity,
         ToggleFocusMode,
+        ToggleWorkspaceStatus,
         OpenInvite,
         NewSession,
         CloseSession
@@ -570,6 +571,27 @@ const SIDEBAR_GLASS_FADE_BAND: f32 = 32.0;
 /// paints, so this behaves like the Changes pane without reading as a panel.
 const WORKSPACE_STATUS_RAIL_WIDTH: f32 = 348.0;
 const WORKSPACE_GOALS_MAX_HEIGHT: f32 = 232.0;
+
+/// Space inside the inset main card not owned by its content lanes.
+const MAIN_HORIZONTAL_CHROME_WIDTH: f32 = 10.0;
+
+fn available_conversation_width(
+    viewport_width: f32,
+    sidebar_width: f32,
+    right_pane_width: f32,
+    workspace_status_visible: bool,
+) -> f32 {
+    (viewport_width
+        - sidebar_width
+        - right_pane_width
+        - MAIN_HORIZONTAL_CHROME_WIDTH
+        - if workspace_status_visible {
+            WORKSPACE_STATUS_RAIL_WIDTH
+        } else {
+            0.0
+        })
+    .max(0.0)
+}
 
 /// Drag marker for the sidebar resize handle.
 struct SidebarResize;
@@ -2298,6 +2320,19 @@ impl Shell {
         self.right_tween = Some(WidthTween::new(right_from, self.right_target(cx)));
         self.schedule_save(cx);
         cx.notify();
+    }
+
+    fn set_workspace_status_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.settings.workspace_status_visible == visible {
+            return;
+        }
+        self.settings.workspace_status_visible = visible;
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    fn toggle_workspace_status(&mut self, cx: &mut Context<Self>) {
+        self.set_workspace_status_visible(!self.settings.workspace_status_visible, cx);
     }
 
     fn toggle_activity(&mut self, cx: &mut Context<Self>) {
@@ -5838,6 +5873,23 @@ impl Shell {
                     },
                 )),
             )
+            .child(
+                popover::menu_row(&theme, false, "command-workspace-status")
+                    .id("command-workspace-status")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.command_palette_open = false;
+                        this.toggle_workspace_status(cx);
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(if self.settings.workspace_status_visible {
+                                "Hide workspace details"
+                            } else {
+                                "Show workspace details"
+                            }),
+                    ),
+            )
             .into_any_element();
         popover::modal("command-palette", viewport, card)
     }
@@ -7239,6 +7291,28 @@ impl Shell {
                                     .child("Partial"),
                             )
                         },
+                    )
+                    .child(
+                        div()
+                            .id("workspace-status-hide")
+                            .size(px(24.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme.glass_hover()))
+                            .tooltip(popover::text_tooltip("Hide workspace details"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.set_workspace_status_visible(false, cx);
+                            }))
+                            .child(
+                                icon(icons::CLOSE)
+                                    .size(px(11.0))
+                                    .text_color(theme.text_faint),
+                            ),
                     ),
             )
             .child(popover::menu_separator())
@@ -7250,7 +7324,7 @@ impl Shell {
             .into_any_element()
     }
 
-    fn render_main(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_main(&mut self, content_width: f32, cx: &mut Context<Self>) -> AnyElement {
         let theme_owned = Theme::of(cx).clone();
         let theme = &theme_owned;
         let theme_bg = theme.bg;
@@ -7369,7 +7443,7 @@ impl Shell {
                 .into_any_element()
         };
 
-        let status = self.render_status_strip(cx);
+        let status = self.render_status_strip(content_width, cx);
         // File dropzone over the ENTIRE conversation column (transcript +
         // composer, not just the pill): dragging OS files anywhere across the
         // chat area shows the "Drop files to attach" veil; a drop stages the
@@ -7448,7 +7522,8 @@ impl Shell {
                         .child("Drop files to attach"),
                 )
             });
-        let workspace_status = has_selection.then(|| self.render_workspace_status(cx));
+        let workspace_status = (has_selection && self.settings.workspace_status_visible)
+            .then(|| self.render_workspace_status(cx));
         div()
             .id("chat-layout")
             .flex_1()
@@ -7614,18 +7689,17 @@ impl Shell {
     /// Working indicator strip: animated activity text + elapsed time,
     /// staleness-gated via [`Indicator`]; falls back to a sending bridge and
     /// then the engine mode line.
-    fn render_status_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_status_strip(&mut self, content_width: f32, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let now = Utc::now();
         let state = self.state.read(cx);
 
-        // Aligned with the composer column: centered, same max width, small
-        // inner gutter (comet's `mx-auto h-6 max-w-3xl px-2`).
+        // Aligned with the responsive transcript/composer column.
         let strip = div()
             .h(px(Theme::STATUS_STRIP_HEIGHT))
             .flex_none()
             .w_full()
-            .max_w(px(768.0))
+            .max_w(px(transcript::aligned_chrome_width(content_width)))
             .mx_auto()
             .flex()
             .items_center()
@@ -8299,6 +8373,9 @@ impl Render for Shell {
             )
             .on_action(cx.listener(|this, _: &ToggleActivity, _, cx| this.toggle_activity(cx)))
             .on_action(cx.listener(|this, _: &ToggleFocusMode, _, cx| this.toggle_focus_mode(cx)))
+            .on_action(cx.listener(|this, _: &ToggleWorkspaceStatus, _, cx| {
+                this.toggle_workspace_status(cx)
+            }))
             .on_action(cx.listener(|this, _: &OpenInvite, _, cx| this.open_invite(cx)))
             .on_action(cx.listener(|this, _: &NewSession, _, cx| {
                 this.open_new_session(cx);
@@ -8351,11 +8428,25 @@ impl Render for Shell {
                     self.composer
                         .update(cx, |c, cx| c.debug_open_model_menu(window, cx));
                 }
-                // MessageRail width gate: hide below 48rem of main-panel width.
-                let viewport = f32::from(window.viewport_size().width);
-                let main_width = viewport - self.sidebar_target() - self.right_target(cx) - 10.0;
-                self.transcript.update(cx, |t, cx| {
-                    t.set_rail_enabled(rail::rail_visible(main_width), cx)
+                let on_chat = matches!(self.route, Route::Chat);
+                let viewport_width = f32::from(window.viewport_size().width);
+                let has_selection = on_chat && self.state.read(cx).selected_chat.is_some();
+                let workspace_status_visible =
+                    has_selection && self.settings.workspace_status_visible;
+                let right_width = if on_chat { self.right_target(cx) } else { 0.0 };
+                let conversation_width = available_conversation_width(
+                    viewport_width,
+                    self.sidebar_target(),
+                    right_width,
+                    workspace_status_visible,
+                );
+                let content_width = transcript::responsive_content_width(conversation_width);
+                self.transcript.update(cx, |transcript, cx| {
+                    transcript.set_content_width(content_width, cx);
+                    transcript.set_rail_enabled(rail::rail_visible(conversation_width), cx);
+                });
+                self.composer.update(cx, |composer, cx| {
+                    composer.set_content_width(content_width, cx)
                 });
 
                 let sidebar = self.render_sidebar(cx);
@@ -8365,12 +8456,7 @@ impl Render for Shell {
                     |shell, _| shell.settings.sidebar_width = SIDEBAR_DEFAULT,
                     cx,
                 );
-                let main = self.render_main(cx);
-                // The Changes pane is chat-scoped chrome: the Settings route
-                // never renders it (comet __root.tsx `!isSettings && activeChat`
-                // around the diff column) — the per-session open flags stay
-                // intact for the return trip.
-                let on_chat = matches!(self.route, Route::Chat);
+                let main = self.render_main(content_width, cx);
                 let right: AnyElement = if on_chat {
                     self.render_right_pane(cx)
                 } else {
@@ -8543,6 +8629,19 @@ mod tests {
             next_splash_phase(SplashPhase::Visible, &ConnectionStatus::Ready),
             SplashPhase::FadingOut
         );
+    }
+
+    #[test]
+    fn conversation_width_accounts_for_global_workspace_details() {
+        assert_eq!(
+            available_conversation_width(1_920.0, 256.0, 0.0, true),
+            1_306.0
+        );
+        assert_eq!(
+            available_conversation_width(1_920.0, 256.0, 0.0, false),
+            1_654.0
+        );
+        assert_eq!(available_conversation_width(300.0, 256.0, 100.0, true), 0.0);
     }
 
     #[test]

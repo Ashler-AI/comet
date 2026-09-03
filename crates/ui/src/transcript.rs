@@ -66,8 +66,23 @@ const TRANSCRIPT_DRAG_SCROLL_MAX_PX: f32 = 18.0;
 pub const GAP_TURN: f32 = 14.0;
 /// Vertical gap between blocks within a turn.
 pub const GAP_BLOCK: f32 = 8.0;
-/// Transcript column max width (comet 46rem).
-pub const MAX_CONTENT_WIDTH: f32 = 736.0;
+/// Maximum readable transcript width on a wide conversation lane.
+pub const MAX_CONTENT_WIDTH: f32 = 896.0;
+/// Minimum target before the flex parent takes over and naturally cramps it.
+pub const MIN_CONTENT_WIDTH: f32 = 240.0;
+/// Transcript rows reserve this gutter on each side before applying the cap.
+pub const CONTENT_GUTTER_X: f32 = 48.0;
+/// Composer and status chrome reserve the standard large gutter per side.
+pub const CHROME_GUTTER_X: f32 = Theme::SPACE_LG;
+
+/// One responsive content width shared by transcript, composer, and status.
+pub fn responsive_content_width(conversation_width: f32) -> f32 {
+    (conversation_width - CONTENT_GUTTER_X * 2.0).clamp(MIN_CONTENT_WIDTH, MAX_CONTENT_WIDTH)
+}
+
+pub fn aligned_chrome_width(content_width: f32) -> f32 {
+    content_width + CHROME_GUTTER_X * 2.0
+}
 /// Tool chip row height / gap — analytic, so fold heights need no measurement.
 /// A row is the guide rail + a 30px chip card centered in it (comet
 /// tool-chip.tsx: `TOOL_CHIP_HEIGHT = 38`, card `h-[30px]`); rows stack with no
@@ -1050,6 +1065,8 @@ pub struct Transcript {
     state: Entity<AppState>,
     list: ListState,
     rows: Vec<Row>,
+    /// Shell-computed width after panes, workspace details, and row gutters.
+    content_width: f32,
     /// Row counts parallel to AppState's real transcript entries.
     entry_row_counts: Vec<usize>,
     /// Total rows occupied by real entries; optimistic echoes follow them.
@@ -1157,6 +1174,7 @@ impl Transcript {
             state,
             list,
             rows: Vec::new(),
+            content_width: MAX_CONTENT_WIDTH,
             entry_row_counts: Vec::new(),
             entry_row_count: 0,
             echo_row_counts: Vec::new(),
@@ -1200,6 +1218,14 @@ impl Transcript {
         };
         this.sync(cx);
         this
+    }
+
+    pub fn set_content_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        let width = width.clamp(0.0, MAX_CONTENT_WIDTH);
+        if (self.content_width - width).abs() > 0.5 {
+            self.content_width = width;
+            cx.notify();
+        }
     }
 
     // ---- rail plumbing (rendering lives in crate::rail) ----
@@ -2343,7 +2369,7 @@ impl Transcript {
                         div().w_full().flex().justify_end().child(
                             div()
                                 .min_w_0()
-                                .max_w(px(MAX_CONTENT_WIDTH * 0.8))
+                                .max_w(px(self.content_width * 0.8))
                                 .when(delivery != UserDelivery::Queued, |el| {
                                     el.bg(theme.surface_raised)
                                 })
@@ -2600,13 +2626,13 @@ impl Transcript {
             .justify_center()
             .pt(px(top_gap))
             .pb(px(bottom_pad))
-            // Wide gutters (comet `px-4 @3xl:px-12`) around the 46rem column.
-            .px(px(48.0))
+            // Wide gutters around the responsive capped content column.
+            .px(px(CONTENT_GUTTER_X))
             .child(
                 div()
                     .relative()
                     .w_full()
-                    .max_w(px(MAX_CONTENT_WIDTH))
+                    .max_w(px(self.content_width))
                     .min_w_0()
                     .when(!collaborator_cursors.is_empty(), |el| {
                         el.child(
@@ -3553,6 +3579,14 @@ mod tests {
         fn identity(&self) -> *const u8 {
             self.identity.as_ref()
         }
+    }
+
+    #[test]
+    fn responsive_width_uses_available_lane_and_caps_wide_windows() {
+        assert_eq!(responsive_content_width(716.0), 620.0);
+        assert_eq!(responsive_content_width(1_152.0), MAX_CONTENT_WIDTH);
+        assert_eq!(responsive_content_width(80.0), MIN_CONTENT_WIDTH);
+        assert_eq!(aligned_chrome_width(responsive_content_width(716.0)), 652.0);
     }
 
     #[test]

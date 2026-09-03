@@ -3682,6 +3682,8 @@ pub struct Composer {
     input: Entity<ComposerInput>,
     /// Composer actions row: repo/branch/harness-model/traits (§1.7).
     pickers: Entity<Pickers>,
+    /// Shell-computed transcript content width; the pill's inner width matches it.
+    content_width: f32,
     /// Draft text per chat key ("" = new-chat canvas), surviving navigation.
     drafts: HashMap<String, String>,
     /// Staged-but-unsent attachments per chat key (use-attachments.ts `stash`):
@@ -3788,6 +3790,7 @@ impl Composer {
             state,
             input,
             pickers,
+            content_width: crate::transcript::MAX_CONTENT_WIDTH,
             drafts: HashMap::new(),
             attachments: HashMap::new(),
             preview: None,
@@ -3862,6 +3865,14 @@ impl Composer {
             .pickers
             .update(cx, |pickers, cx| pickers.prepare_harness_commands(cx));
         composer
+    }
+
+    pub fn set_content_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        let width = width.clamp(0.0, crate::transcript::MAX_CONTENT_WIDTH);
+        if (self.content_width - width).abs() > 0.5 {
+            self.content_width = width;
+            cx.notify();
+        }
     }
 
     /// Capture-knob passthrough (`COMET_OPEN_DIALOG=model`): open the
@@ -6542,10 +6553,12 @@ impl Render for Composer {
 
         let failure = self.failure.clone();
         let active_goal = self.render_active_goal_indicator(&theme, cx);
-        // Centered composer column (comet `mx-auto w-full max-w-3xl`).
+        // The shell derives this from the same available lane as the transcript.
         let container = div()
             .w_full()
-            .max_w(px(768.0))
+            .max_w(px(crate::transcript::aligned_chrome_width(
+                self.content_width,
+            )))
             .mx_auto()
             .flex()
             .flex_col()

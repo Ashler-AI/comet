@@ -100,6 +100,8 @@ pub struct UiSettings {
     pub sound_enabled: bool,
     /// Hides secondary chrome while keeping the transcript and composer live.
     pub focus_mode: bool,
+    /// Global worktree/account/goals card visibility across every session.
+    pub workspace_status_visible: bool,
     /// Device-local spacing preference.
     pub density: Density,
     pub right_pane_width: f32,
@@ -129,6 +131,7 @@ impl Default for UiSettings {
             pinned_space_ids: Vec::new(),
             sound_enabled: true,
             focus_mode: false,
+            workspace_status_visible: true,
             density: Density::default(),
             right_pane_width: RIGHT_PANE_DEFAULT,
             right_pane_open: false,
@@ -390,6 +393,7 @@ mod tests {
             sound_enabled: false,
             focus_mode: true,
             density: Density::Compact,
+            workspace_status_visible: false,
             right_pane_width: 700.0,
             right_pane_open: true,
             terminal_height: 320.0,
@@ -420,6 +424,7 @@ mod tests {
         assert_eq!(loaded.density, Density::Comfortable);
         assert_eq!(loaded.last_room_id, None);
         assert!(!loaded.focus_mode);
+        assert!(loaded.workspace_status_visible);
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled, "other keys still parse");
     }
@@ -465,6 +470,7 @@ mod tests {
         assert_eq!(d.density, Density::Comfortable);
         assert_eq!(d.last_room_id, None);
         assert!(!d.focus_mode);
+        assert!(d.workspace_status_visible);
     }
 
     #[test]
