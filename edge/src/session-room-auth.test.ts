@@ -1,5 +1,8 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath, URL as NodeUrl } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CrdtType, MessageType, decode, type JoinRequest } from "loro-protocol";
+import type { LoroDoc } from "loro-crdt";
 import {
   AUTH_CAPABILITIES_HEADER,
   AUTH_PROJECT_HEADER,
@@ -17,6 +20,22 @@ class MemorySql {
   readonly meta = new Map<string, string>();
   private readonly blobs = new Map<string, Map<number, ArrayBuffer>>();
   private readonly updates: ArrayBuffer[] = [];
+
+  putBlob(name: string, bytes: Uint8Array): void {
+    this.blobs.set(name, new Map([[0, bytes.slice().buffer as ArrayBuffer]]));
+  }
+
+  appendUpdate(bytes: Uint8Array): void {
+    this.updates.push(bytes.slice().buffer as ArrayBuffer);
+  }
+
+  hasBlob(name: string): boolean {
+    return this.blobs.has(name);
+  }
+
+  updateCount(): number {
+    return this.updates.length;
+  }
 
   exec(query: string, ...bindings: unknown[]): SqlStorageCursor<SqlRow> {
     const sql = query.replace(/\s+/g, " ").trim().toLowerCase();
@@ -71,6 +90,7 @@ class MemorySql {
 
 class CapturingSocket {
   readonly sent: Uint8Array[] = [];
+  readonly closed: Array<{ code: number | undefined; reason: string | undefined }> = [];
   private attachment: unknown;
 
   send(bytes: Uint8Array): void {
@@ -85,7 +105,9 @@ class CapturingSocket {
     return this.attachment;
   }
 
-  close(): void {}
+  close(code?: number, reason?: string): void {
+    this.closed.push({ code, reason });
+  }
 }
 
 const PROJECT_SCOPE = "project-a";
@@ -102,6 +124,7 @@ interface JoinState {
 
 interface SessionRoomInternals {
   eph?: unknown;
+  ensureDoc(): Promise<LoroDoc>;
   handleJoin(ws: WebSocket, state: JoinState, message: JoinRequest): Promise<void>;
   applyUpdates(
     ws: WebSocket,
@@ -257,6 +280,35 @@ describe("SessionRoom chat authorization", () => {
     expect(
       expired.sent.some((bytes) => decode(bytes).type === MessageType.DocUpdate)
     ).toBe(false);
+  });
+
+  it("quarantines incident-shaped persisted Loro state and forces a clean reconnect", async () => {
+    const corruptSnapshot = new Uint8Array(
+      readFileSync(
+        fileURLToPath(new NodeUrl("./fixtures/corrupt-loro-snapshot.bin", import.meta.url))
+      )
+    );
+
+    for (const source of ["snapshot", "update"] as const) {
+      const sql = new MemorySql();
+      if (source === "snapshot") sql.putBlob("snapshot", corruptSnapshot);
+      else sql.appendUpdate(corruptSnapshot);
+      const { room, sockets } = makeRoom(sql);
+      const socket = new CapturingSocket();
+      sockets.push(socket as unknown as WebSocket);
+      const internals = room as unknown as SessionRoomInternals;
+
+      await expect(internals.ensureDoc()).rejects.toBeDefined();
+      expect(sql.hasBlob("snapshot")).toBe(false);
+      expect(sql.updateCount()).toBe(0);
+      expect(sql.meta.get("postReset")).toBe("1");
+      expect(sql.meta.get("replayAttempts")).toBe("0");
+      expect(socket.closed).toContainEqual({ code: 4410, reason: "room reset" });
+
+      const clean = await internals.ensureDoc();
+      clean.getMap("after").set("usable", true);
+      expect(clean.getMap("after").get("usable")).toBe(true);
+    }
   });
 
   it("lets different authenticated users mutate and read every authorized chat surface", async () => {

@@ -547,15 +547,7 @@ export class SessionRoom implements DurableObject {
       this.dropLog();
       this.doc?.free(); // release the wasm memory, don't wait on GC finalizers
       this.doc = undefined; // force a fresh (empty) materialization next join
-      // Boot any currently-attached %LOR/%EPH sockets so their hung/half-cold
-      // sessions bail and reconnect into the now-empty doc.
-      for (const sock of this.ctx.getWebSockets()) {
-        try {
-          sock.close(4410, "room reset");
-        } catch {
-          /* already gone */
-        }
-      }
+      this.closeSocketsForRoomReset();
       return json({ ok: true, clearedUpdateRows: before ?? 0 });
     }
     return new Response("not found", { status: 404 });
@@ -972,7 +964,7 @@ export class SessionRoom implements DurableObject {
     // past the limit, drop the log+snapshot exactly like /reset-log does.
     // Recovery is by design lossless-enough: every engine holds the full doc
     // locally and re-uploads whatever the server lacks on its next join.
-    const attempts = Number(this.getMeta("replayAttempts") ?? "0");
+    let attempts = Number(this.getMeta("replayAttempts") ?? "0");
     if (attempts >= REPLAY_CRASH_LIMIT) {
       this.dropLog();
       // Boot every attached socket, exactly like POST /reset-log. The
@@ -983,13 +975,8 @@ export class SessionRoom implements DurableObject {
       // (2026-08-04: work-metal's workspace status never updated again
       // after the 20:16Z wedge-break while its chat rooms streamed fine).
       // A close → redial → empty-VV join re-uploads full state instead.
-      for (const sock of this.ctx.getWebSockets()) {
-        try {
-          sock.close(4410, "room reset");
-        } catch {
-          /* already gone */
-        }
-      }
+      this.closeSocketsForRoomReset();
+      attempts = 0;
     }
     this.setMeta("replayAttempts", String(attempts + 1));
     // INCIDENT (2026-07-30): a CPU-limit kill ROLLS BACK the event's
@@ -1005,21 +992,27 @@ export class SessionRoom implements DurableObject {
     const started = Date.now();
     const doc = new LoroDoc();
     const snapshot = this.blobs.get("snapshot");
-    if (snapshot && snapshot.length > 0) doc.import(snapshot);
+    if (snapshot && snapshot.length > 0) {
+      try {
+        doc.import(snapshot);
+      } catch (error) {
+        return await this.rejectPersistedLoroState(doc, "snapshot", error);
+      }
+    }
     let rows = 0;
     for (const row of this.ctx.storage.sql.exec("SELECT bytes FROM updates ORDER BY seq")) {
       rows++;
       try {
         doc.import(new Uint8Array(row.bytes as ArrayBuffer));
-      } catch {
-        // A poisoned row cannot be applied; skip it rather than brick the room.
+      } catch (error) {
+        return await this.rejectPersistedLoroState(doc, `update row ${rows}`, error);
       }
     }
     for (const update of this.pending) {
       try {
         doc.import(update);
-      } catch {
-        /* same */
+      } catch (error) {
+        return await this.rejectPersistedLoroState(doc, "buffered update", error);
       }
     }
     this.setMeta("replayAttempts", "0");
@@ -1095,6 +1088,44 @@ export class SessionRoom implements DurableObject {
     this.doc = undefined;
   }
 
+  private closeSocketsForRoomReset(): void {
+    for (const sock of this.ctx.getWebSockets()) {
+      try {
+        sock.close(4410, "room reset");
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+
+  /** A validated Loro import failure means the persisted replay cannot be a
+   * source of truth. Discard the whole baseline+log atomically: later rows may
+   * depend on the rejected bytes, so skipping only one row would persist a
+   * silently incomplete document at the next fold. Engines reconnect against
+   * an empty VV and re-upload their full local histories. */
+  private async rejectPersistedLoroState(
+    doc: LoroDoc,
+    source: string,
+    error: unknown
+  ): Promise<never> {
+    console.error(
+      "persisted Loro replay rejected; resetting room",
+      `room=${this.getMeta("chatId") ?? "?"}`,
+      `source=${source}`,
+      String(error)
+    );
+    try {
+      doc.free();
+    } catch {
+      /* a wasm panic may already have invalidated the handle */
+    }
+    this.doc = undefined;
+    this.dropLog();
+    await this.ctx.storage.sync();
+    this.closeSocketsForRoomReset();
+    throw error;
+  }
+
   /** Drop the persisted update log + snapshot (the /reset-log storage clear):
    * the next materialization starts empty and engines re-upload state on
    * rejoin. Preserves owner/chatId meta. */
@@ -1114,6 +1145,7 @@ export class SessionRoom implements DurableObject {
     // destroying the one copy that exists for the engine-never-returns case
     // (adversarial-review finding). Cleared by recordLoroUpdates.
     this.setMeta("postReset", "1");
+    this.setMeta("replayAttempts", "0");
   }
 
   private ensureEph(): EphemeralStore {

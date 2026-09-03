@@ -15,7 +15,7 @@
     "smoke:collaboration": "node ../scripts/headless-collaboration-smoke.mjs"
   },
   "dependencies": {
-    "loro-crdt": "^1.13.7",
+    "loro-crdt": "1.13.9",
     "loro-protocol": "^0.3.0"
   },
   "devDependencies": {

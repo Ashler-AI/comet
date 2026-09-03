@@ -20,5 +20,6 @@ uuid.workspace = true
 comet-doc.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+xxhash-rust = { version = "0.8", features = ["xxh32"] }
 # `start_paused` virtual-clock tests (the 2026-07-30 sync-stall regressions).
 tokio = { workspace = true, features = ["test-util"] }

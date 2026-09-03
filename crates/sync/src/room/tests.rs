@@ -9,6 +9,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use super::*;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+const LORO_ENVELOPE_BODY_START: usize = 20;
+const LORO_SNAPSHOT_BODY_START: usize = 22;
+const SSTABLE_BLOCK_START: usize = 5;
+
 #[test]
 fn fragment_headers_are_bounded_before_allocation() {
     assert!(fragment_batch_within_limits(1, 1));
@@ -50,6 +54,10 @@ struct FakeEdge {
     /// When set, the next %LOR DocUpdate is rejected with InvalidUpdate
     /// without being imported (simulates the shallow-trim stale-peer case).
     reject_next_update: AtomicBool,
+    /// When set, the next join sends the incident-shaped corrupt snapshot:
+    /// its outer envelope checksum is valid, but its first lazy SSTable block
+    /// is not. The following full-resync join receives a clean snapshot.
+    corrupt_next_backfill: AtomicBool,
     /// When set, frames are accepted but never answered — the 2026-07-30
     /// wedged-DO shape: the runtime keeps the socket (and would keep
     /// auto-ponging keepalives) while the room never speaks.
@@ -70,6 +78,7 @@ impl FakeEdge {
             conns: Mutex::new(Vec::new()),
             fragments: Mutex::new(HashMap::new()),
             reject_next_update: AtomicBool::new(false),
+            corrupt_next_backfill: AtomicBool::new(false),
             mute: AtomicBool::new(false),
             leaves: AtomicUsize::new(0),
             join_requests: AtomicUsize::new(0),
@@ -179,7 +188,7 @@ impl FakeEdge {
                     },
                 )
                 .await;
-                let backfill = if version.is_empty() {
+                let mut backfill = if version.is_empty() {
                     self.doc.export(ExportMode::Snapshot)
                 } else {
                     match VersionVector::decode(&version) {
@@ -188,6 +197,9 @@ impl FakeEdge {
                     }
                 }
                 .expect("export backfill");
+                if self.corrupt_next_backfill.swap(false, Ordering::SeqCst) {
+                    corrupt_oplog_sstable_block(&mut backfill);
+                }
                 if !backfill.is_empty() {
                     self.send_updates(reply_to, CrdtType::Loro, &room_id, backfill)
                         .await;
@@ -395,6 +407,23 @@ fn doc_text(doc: &LoroDoc) -> String {
     doc.get_text("t").to_string()
 }
 
+fn corrupt_oplog_sstable_block(snapshot: &mut [u8]) {
+    let oplog_len = u32::from_le_bytes(
+        snapshot[LORO_SNAPSHOT_BODY_START..LORO_SNAPSHOT_BODY_START + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let oplog_start = LORO_SNAPSHOT_BODY_START + 4;
+    assert!(oplog_len > SSTABLE_BLOCK_START);
+
+    snapshot[oplog_start + SSTABLE_BLOCK_START] ^= 0xff;
+    let checksum = xxhash_rust::xxh32::xxh32(
+        &snapshot[LORO_ENVELOPE_BODY_START..],
+        u32::from_le_bytes(*b"LORO"),
+    );
+    snapshot[16..20].copy_from_slice(&checksum.to_le_bytes());
+}
+
 #[tokio::test]
 async fn join_backfills_server_state_into_fresh_doc() {
     let edge = FakeEdge::new();
@@ -406,6 +435,39 @@ async fn join_backfills_server_state_into_fresh_doc() {
         .await
         .expect("connect");
     wait_until(|| doc_text(&doc) == "server state").await;
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn corrupt_snapshot_after_disconnect_is_rejected_then_rejoined_without_poisoning() {
+    let edge = FakeEdge::new();
+    let doc = LoroDoc::new();
+    let client = RoomClient::connect_with(edge.connector(), "room-1", doc.clone())
+        .await
+        .expect("initial connect");
+    let joins_before = edge.join_requests.load(Ordering::SeqCst);
+
+    // The incident began with a normal connection loss. The replacement
+    // connection received a snapshot whose outer Loro checksum was valid but
+    // whose first lazy SSTable block was corrupt.
+    edge.doc.get_text("t").insert(0, "server state").unwrap();
+    edge.doc.commit();
+    edge.corrupt_next_backfill.store(true, Ordering::SeqCst);
+    edge.kick_all();
+
+    wait_until(|| doc_text(&doc) == "server state").await;
+    assert!(
+        edge.join_requests.load(Ordering::SeqCst) >= joins_before + 2,
+        "failed reconnect import must request a clean full snapshot"
+    );
+    assert!(
+        edge.dials.load(Ordering::SeqCst) >= 2,
+        "connection loss must redial before snapshot recovery"
+    );
+
+    doc.get_text("t").insert(0, "still usable").unwrap();
+    doc.commit();
+    wait_until(|| doc_text(&edge.doc).contains("still usable")).await;
     client.shutdown().await.unwrap();
 }
 
