@@ -184,7 +184,7 @@ impl Shell {
         cx.notify();
     }
 
-    /// The tab strip: [scrollable tabs (edge fades)][+][drag spacer][toggle-changes].
+    /// The tab strip: [scrollable tabs (edge fades)][+][drag spacer][workspace details][toggle-changes].
     pub(super) fn render_session_tab_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let now = Utc::now();
@@ -238,6 +238,8 @@ impl Shell {
         let has_space = space_id.is_some();
         let git = self.space_git_detected(cx);
         let hovered = self.tab_hover.clone();
+        let has_selection = selected.is_some();
+        let workspace_status_visible = self.settings.workspace_status_visible;
         let on_canvas = selected.is_none();
         // No sessions yet → the canvas already shows; a `+` would be redundant.
         let has_tabs = !tabs.is_empty();
@@ -570,12 +572,30 @@ impl Shell {
             .child(tab_region)
             .when(has_space && has_tabs, |el| el.child(new_tab))
             .child(div().flex_1())
-            // Stable location: the toggle shows whether the pane is open or
-            // not (the pane's own header is gone).
+            // Stable RHS controls: workspace details remains reachable after it
+            // is hidden, beside the Changes drawer toggle.
+            .when(has_selection, |el| {
+                el.child(header_icon_button(
+                    "toggle-workspace-status",
+                    if workspace_status_visible {
+                        icons::CLOSE
+                    } else {
+                        icons::WIDGET
+                    },
+                    if workspace_status_visible {
+                        "Hide workspace details"
+                    } else {
+                        "Show workspace details"
+                    },
+                    &theme,
+                    cx.listener(|this, _, _, cx| this.toggle_workspace_status(cx)),
+                ))
+            })
             .when(git, |el| {
                 el.child(header_icon_button(
                     "toggle-changes",
                     icons::SIDEBAR_MINIMALISTIC,
+                    "Show or hide changes",
                     &theme,
                     cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
                 ))

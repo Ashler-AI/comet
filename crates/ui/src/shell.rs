@@ -2322,17 +2322,10 @@ impl Shell {
         cx.notify();
     }
 
-    fn set_workspace_status_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
-        if self.settings.workspace_status_visible == visible {
-            return;
-        }
-        self.settings.workspace_status_visible = visible;
+    fn toggle_workspace_status(&mut self, cx: &mut Context<Self>) {
+        self.settings.workspace_status_visible = !self.settings.workspace_status_visible;
         self.schedule_save(cx);
         cx.notify();
-    }
-
-    fn toggle_workspace_status(&mut self, cx: &mut Context<Self>) {
-        self.set_workspace_status_visible(!self.settings.workspace_status_visible, cx);
     }
 
     fn toggle_activity(&mut self, cx: &mut Context<Self>) {
@@ -7291,28 +7284,6 @@ impl Shell {
                                     .child("Partial"),
                             )
                         },
-                    )
-                    .child(
-                        div()
-                            .id("workspace-status-hide")
-                            .size(px(24.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.0))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(theme.glass_hover()))
-                            .tooltip(popover::text_tooltip("Hide workspace details"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.set_workspace_status_visible(false, cx);
-                            }))
-                            .child(
-                                icon(icons::CLOSE)
-                                    .size(px(11.0))
-                                    .text_color(theme.text_faint),
-                            ),
                     ),
             )
             .child(popover::menu_separator())
@@ -8205,6 +8176,7 @@ fn nav_history_button(
 fn header_icon_button(
     id: &'static str,
     icon_path: &'static str,
+    tooltip: &'static str,
     theme: &Theme,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
@@ -8226,6 +8198,7 @@ fn header_icon_button(
             crate::theme::wash(0.11),
         ))
         .on_hover(motion::hover_listener(fade_key))
+        .tooltip(popover::text_tooltip(tooltip))
         // Same occlusion + click-swallowing as [`window_control_button`]: this
         // button sits inside the chat header's titlebar drag region, so its
         // rect must be carved out of the strip's drag/double-click surface.
