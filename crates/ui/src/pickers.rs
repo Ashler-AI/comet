@@ -104,14 +104,40 @@ fn resolve_draft_ref<'a>(
 pub enum CheckoutPlan {
     /// Run in the space folder as-is. `branch` is the checkout's branch (the
     /// picked or current ref), carried onto `createChat` so the session names
-    /// it from the first frame; `None` = refs never loaded.
+    /// it from the first frame; non-Git spaces have no branch.
     CurrentCheckout { branch: Option<String> },
     /// Reuse the picked ref's existing worktree (a cwd override; no git).
     ReuseWorktree { path: String, branch: String },
-    /// `CreateWorktree` off `base` on send (comet mints a `comet/<name>`
-    /// branch). `base: None` = refs never loaded — send falls back to the
-    /// space folder rather than failing.
-    NewWorktree { base: Option<String> },
+    /// `CreateWorktree` off `base` on send (Crew mints a `comet/<name>` branch).
+    /// The base is required so selecting this mode can never fall back to the
+    /// space folder while refs are still loading.
+    NewWorktree { base: String },
+}
+
+const NEW_WORKTREE_REF_REQUIRED: &str =
+    "A Git ref is required to start a new worktree. Wait for refs to load, then select one.";
+
+fn resolve_checkout_plan(
+    git_detected: bool,
+    checkout: CheckoutKind,
+    ref_name: Option<String>,
+    worktree_path: Option<String>,
+) -> Result<CheckoutPlan, &'static str> {
+    if !git_detected {
+        return Ok(CheckoutPlan::CurrentCheckout { branch: None });
+    }
+    match checkout {
+        CheckoutKind::NewWorktree => ref_name
+            .map(|base| CheckoutPlan::NewWorktree { base })
+            .ok_or(NEW_WORKTREE_REF_REQUIRED),
+        CheckoutKind::Local => match worktree_path {
+            Some(path) => Ok(CheckoutPlan::ReuseWorktree {
+                path,
+                branch: ref_name.unwrap_or_default(),
+            }),
+            None => Ok(CheckoutPlan::CurrentCheckout { branch: ref_name }),
+        },
+    }
 }
 
 /// The fully-resolved run configuration the composer sends: concrete harness,
@@ -1695,22 +1721,15 @@ impl Pickers {
         self.selected_ref().and_then(|r| r.worktree_path.clone())
     }
 
-    /// The resolved on-send checkout action for a new session.
-    pub fn checkout_plan(&self) -> CheckoutPlan {
-        match self.config.checkout {
-            CheckoutKind::NewWorktree => CheckoutPlan::NewWorktree {
-                base: self.effective_ref_name(),
-            },
-            CheckoutKind::Local => match self.selected_ref_worktree() {
-                Some(path) => CheckoutPlan::ReuseWorktree {
-                    path,
-                    branch: self.effective_ref_name().unwrap_or_default(),
-                },
-                None => CheckoutPlan::CurrentCheckout {
-                    branch: self.effective_ref_name(),
-                },
-            },
-        }
+    /// The resolved on-send checkout action for a new session. A requested new
+    /// worktree remains pending until its required base ref has loaded.
+    pub fn checkout_plan(&self, cx: &App) -> Result<CheckoutPlan, &'static str> {
+        resolve_checkout_plan(
+            self.state.read(cx).selected_space_git(),
+            self.config.checkout,
+            self.effective_ref_name(),
+            self.selected_ref_worktree(),
+        )
     }
 
     /// Label of the checkout-kind trigger.
@@ -3232,6 +3251,24 @@ mod tests {
             )
             .map(|row| row.name.as_str()),
             Some("feature/memory-bounds")
+        );
+    }
+
+    #[test]
+    fn new_worktree_plan_requires_a_resolved_base_ref() {
+        assert_eq!(
+            resolve_checkout_plan(true, CheckoutKind::NewWorktree, None, None),
+            Err(NEW_WORKTREE_REF_REQUIRED)
+        );
+        assert_eq!(
+            resolve_checkout_plan(true, CheckoutKind::NewWorktree, Some("master".into()), None,),
+            Ok(CheckoutPlan::NewWorktree {
+                base: "master".into()
+            })
+        );
+        assert_eq!(
+            resolve_checkout_plan(false, CheckoutKind::NewWorktree, None, None),
+            Ok(CheckoutPlan::CurrentCheckout { branch: None })
         );
     }
 
