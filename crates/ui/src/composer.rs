@@ -599,6 +599,33 @@ fn should_queue_steer(requested_steer: bool, is_new: bool, is_shared: bool) -> b
     !is_new && (requested_steer || is_shared)
 }
 
+fn begin_send(sending_chats: &mut HashMap<String, usize>, chat_id: &str) {
+    *sending_chats.entry(chat_id.to_owned()).or_default() += 1;
+}
+
+fn finish_send(sending_chats: &mut HashMap<String, usize>, chat_id: &str) {
+    let remove = if let Some(count) = sending_chats.get_mut(chat_id) {
+        debug_assert!(
+            *count > 0,
+            "pending send counts never reach zero in the map"
+        );
+        *count = count.saturating_sub(1);
+        *count == 0
+    } else {
+        false
+    };
+    if remove {
+        sending_chats.remove(chat_id);
+    }
+}
+
+/// User-submitted commands are durable intent. Detaching keeps overlapping sends,
+/// stops, and question answers from canceling one another when the composer starts
+/// the next command task.
+fn detach_command_task(task: Task<()>) {
+    task.detach();
+}
+
 /// Find the unresolved input request the panel should serve, if any: an
 /// unresolved input part on the LAST assistant entry — regardless of the
 /// entry's run status. The question stays answerable until the user actually
@@ -3701,7 +3728,7 @@ pub struct Composer {
     /// composer in start mode even while a teammate's session is working.
     agent_target: Option<String>,
     start_agent: bool,
-    sending_chats: HashSet<String>,
+    sending_chats: HashMap<String, usize>,
     failure: Option<SharedString>,
     wizard: Option<Wizard>,
     wizard_focus: FocusHandle,
@@ -3709,7 +3736,6 @@ pub struct Composer {
     /// frame marks them resolved).
     answered_requests: HashSet<String>,
     advance_task: Option<Task<()>>,
-    send_task: Option<Task<()>>,
     // -- compact/expanded flip state (hysteresis; see `composer_flip`) --
     /// Current layout mode (persisted across frames — never derived fresh).
     expanded_mode: bool,
@@ -3801,13 +3827,12 @@ impl Composer {
             current_key,
             agent_target: None,
             start_agent: false,
-            sending_chats: HashSet::new(),
+            sending_chats: HashMap::new(),
             failure: None,
             wizard: None,
             wizard_focus: cx.focus_handle(),
             answered_requests: HashSet::new(),
             advance_task: None,
-            send_task: None,
             expanded_mode: false,
             flip_epoch: 0,
             compact_capacity: 0.0,
@@ -3896,7 +3921,7 @@ impl Composer {
     }
 
     pub fn is_sending(&self, chat_id: &str) -> bool {
-        self.sending_chats.contains(chat_id)
+        self.sending_chats.contains_key(chat_id)
     }
 
     // ---- attachment staging (use-attachments.ts) ----
@@ -5112,7 +5137,7 @@ impl Composer {
         self.input.update(cx, |input, cx| input.set_text("", cx));
         self.drafts.remove(&self.current_key);
         self.failure = None;
-        self.sending_chats.insert(chat_id.clone());
+        begin_send(&mut self.sending_chats, &chat_id);
         cx.emit(ComposerEvent::Sent {
             chat_id: chat_id.clone(),
         });
@@ -5140,7 +5165,6 @@ impl Composer {
                 )
             });
         }
-        let durable_startup = local_startup;
         let send_task = cx.spawn(async move |this, cx| {
         let creates_managed_worktree = local_startup
             && matches!(&plan, CheckoutPlan::NewWorktree { base: Some(_) });
@@ -5828,7 +5852,7 @@ impl Composer {
                 rollback.disarm();
             }
             this.update(cx, |composer, cx| {
-                composer.sending_chats.remove(&err_chat_id);
+                finish_send(&mut composer.sending_chats, &err_chat_id);
                 if let Err(message) = &result {
                     // Failure: red banner, echo removed, submitted prompt kept
                     // visible, and staged files returned to the chat's stash.
@@ -5869,11 +5893,7 @@ impl Composer {
             })
             .ok();
         });
-        if durable_startup {
-            send_task.detach();
-        } else {
-            self.send_task = Some(send_task);
-        }
+        detach_command_task(send_task);
     }
 
     /// Stop the selected session when it is actively running.
@@ -5916,7 +5936,7 @@ impl Composer {
                 return;
             }
         };
-        self.send_task = Some(cx.spawn(async move |this, cx| {
+        detach_command_task(cx.spawn(async move |this, cx| {
             let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
             if let Err(err) = result {
                 this.update(cx, |composer, cx| {
@@ -6034,7 +6054,7 @@ impl Composer {
                 return;
             }
         };
-        self.send_task = Some(cx.spawn(async move |this, cx| {
+        detach_command_task(cx.spawn(async move |this, cx| {
             let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
             if let Err(err) = result {
                 this.update(cx, |composer, cx| {
@@ -6858,6 +6878,49 @@ mod tests {
             range,
             path: path.into(),
         }
+    }
+
+    #[test]
+    fn overlapping_send_state_clears_after_every_send_finishes() {
+        let mut sending = HashMap::new();
+        begin_send(&mut sending, "chat-a");
+        begin_send(&mut sending, "chat-a");
+
+        finish_send(&mut sending, "chat-a");
+        assert_eq!(sending.get("chat-a"), Some(&1));
+
+        finish_send(&mut sending, "chat-a");
+        assert!(!sending.contains_key("chat-a"));
+    }
+
+    #[gpui::test]
+    fn overlapping_command_tasks_both_finish(cx: &mut gpui::TestAppContext) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let first_finished = Arc::new(AtomicBool::new(false));
+        let second_finished = Arc::new(AtomicBool::new(false));
+        let executor = cx.executor();
+
+        let first_flag = first_finished.clone();
+        let timer = executor.clone();
+        detach_command_task(executor.spawn(async move {
+            timer.timer(Duration::from_secs(1)).await;
+            first_flag.store(true, Ordering::SeqCst);
+        }));
+
+        let second_flag = second_finished.clone();
+        detach_command_task(executor.spawn(async move {
+            second_flag.store(true, Ordering::SeqCst);
+        }));
+
+        cx.run_until_parked();
+        assert!(!first_finished.load(Ordering::SeqCst));
+        assert!(second_finished.load(Ordering::SeqCst));
+
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert!(first_finished.load(Ordering::SeqCst));
     }
 
     #[test]
