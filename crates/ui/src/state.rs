@@ -345,6 +345,16 @@ impl EngineHandle {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test(service: Arc<dyn RpcService>) -> Self {
+        Self {
+            inner: Arc::new(RemoteEngine {
+                client: memory_client(service),
+                url: "memory://test".into(),
+            }),
+        }
+    }
+
     pub fn client(&self) -> &RpcClient {
         self.inner.client()
     }
@@ -2257,6 +2267,11 @@ impl AppState {
 
     pub fn engine(&self) -> Option<&EngineHandle> {
         self.engine.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_engine_for_test(&mut self, handle: EngineHandle) {
+        self.engine = Some(handle);
     }
 
     // ---- gpui glue ----

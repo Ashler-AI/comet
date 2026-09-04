@@ -619,13 +619,6 @@ fn finish_send(sending_chats: &mut HashMap<String, usize>, chat_id: &str) {
     }
 }
 
-/// User-submitted commands are durable intent. Detaching keeps overlapping sends,
-/// stops, and question answers from canceling one another when the composer starts
-/// the next command task.
-fn detach_command_task(task: Task<()>) {
-    task.detach();
-}
-
 /// Find the unresolved input request the panel should serve, if any: an
 /// unresolved input part on the LAST assistant entry — regardless of the
 /// entry's run status. The question stays answerable until the user actually
@@ -5165,7 +5158,9 @@ impl Composer {
                 )
             });
         }
-        let send_task = cx.spawn(async move |this, cx| {
+        // User-submitted commands are durable intent: a later send, stop, or
+        // question answer must not cancel this admission task by replacing it.
+        cx.spawn(async move |this, cx| {
         let creates_managed_worktree = local_startup
             && matches!(&plan, CheckoutPlan::NewWorktree { base: Some(_) });
             let command_admission_started = Rc::new(Cell::new(false));
@@ -5892,8 +5887,8 @@ impl Composer {
                 cx.notify();
             })
             .ok();
-        });
-        detach_command_task(send_task);
+        })
+        .detach();
     }
 
     /// Stop the selected session when it is actively running.
@@ -5936,7 +5931,7 @@ impl Composer {
                 return;
             }
         };
-        detach_command_task(cx.spawn(async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
             if let Err(err) = result {
                 this.update(cx, |composer, cx| {
@@ -5945,7 +5940,8 @@ impl Composer {
                 })
                 .ok();
             }
-        }));
+        })
+        .detach();
     }
 
     // ---- wizard glue ----
@@ -6054,7 +6050,7 @@ impl Composer {
                 return;
             }
         };
-        detach_command_task(cx.spawn(async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
             if let Err(err) = result {
                 this.update(cx, |composer, cx| {
@@ -6082,7 +6078,8 @@ impl Composer {
                 }
             })
             .ok();
-        }));
+        })
+        .detach();
         cx.notify();
     }
 
@@ -6872,6 +6869,7 @@ impl Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn tooltip_target(range: Range<usize>, path: &str) -> MentionTooltipTarget {
         MentionTooltipTarget {
@@ -6893,34 +6891,105 @@ mod tests {
         assert!(!sending.contains_key("chat-a"));
     }
 
+    struct OverlappingSendRpc {
+        started: std::sync::mpsc::Sender<String>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl comet_rpc::RpcService for OverlappingSendRpc {
+        async fn handle(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<comet_rpc::RpcReply, RpcError> {
+            match method {
+                methods::LIST_HARNESSES | methods::LIST_HARNESS_COMMANDS => {
+                    comet_rpc::RpcReply::value(&Vec::<serde_json::Value>::new())
+                }
+                methods::QUEUE_COMMAND => {
+                    let prompt = params
+                        .pointer("/command/request/prompt")
+                        .and_then(serde_json::Value::as_str)
+                        .expect("Run command prompt")
+                        .to_owned();
+                    self.started
+                        .send(prompt)
+                        .map_err(|error| RpcError::Failed(error.to_string()))?;
+                    self.release
+                        .acquire()
+                        .await
+                        .map_err(|error| RpcError::Failed(error.to_string()))?
+                        .forget();
+                    comet_rpc::RpcReply::value(&serde_json::json!({ "accepted": true }))
+                }
+                _ => Err(RpcError::UnknownMethod(method.to_owned())),
+            }
+        }
+    }
+
     #[gpui::test]
-    fn overlapping_command_tasks_both_finish(cx: &mut gpui::TestAppContext) {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let first_finished = Arc::new(AtomicBool::new(false));
-        let second_finished = Arc::new(AtomicBool::new(false));
-        let executor = cx.executor();
-
-        let first_flag = first_finished.clone();
-        let timer = executor.clone();
-        detach_command_task(executor.spawn(async move {
-            timer.timer(Duration::from_secs(1)).await;
-            first_flag.store(true, Ordering::SeqCst);
+    async fn overlapping_composer_sends_both_reach_queue_command(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().expect("Tokio RPC server runtime");
+        let _runtime_guard = runtime.enter();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let engine = EngineHandle::for_test(Arc::new(OverlappingSendRpc {
+            started: started_tx,
+            release: release.clone(),
         }));
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            state.apply_chats(vec![Chat {
+                id: "chat-a".into(),
+                device_id: "local".into(),
+                title: None,
+                archived: false,
+                cwd: Some("/repo".into()),
+                branch: None,
+                checkout_id: None,
+                config: None,
+                last_message_preview: None,
+                last_message_at: None,
+                created_at: chrono::Utc::now(),
+                harness_session_id: None,
+                harness_session_cwd: None,
+                fork_from: None,
+                space_id: None,
+                last_seen_at: None,
+            }]);
+            state.select_chat(Some("chat-a".into()), cx);
+            state.set_engine_for_test(engine);
+        });
+        let composer = cx.new(|cx| Composer::new(state, cx));
 
-        let second_flag = second_finished.clone();
-        detach_command_task(executor.spawn(async move {
-            second_flag.store(true, Ordering::SeqCst);
-        }));
-
+        composer.update(cx, |composer, cx| composer.submit_command("first", cx));
+        composer.update(cx, |composer, cx| composer.submit_command("second", cx));
         cx.run_until_parked();
-        assert!(!first_finished.load(Ordering::SeqCst));
-        assert!(second_finished.load(Ordering::SeqCst));
 
-        cx.executor().advance_clock(Duration::from_secs(1));
-        cx.run_until_parked();
-        assert!(first_finished.load(Ordering::SeqCst));
+        let mut prompts = vec![
+            started_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("first QueueCommand"),
+            started_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("second QueueCommand"),
+        ];
+        prompts.sort();
+        assert_eq!(prompts, ["first", "second"]);
+        assert!(composer.read_with(cx, |composer, _| composer.is_sending("chat-a")));
+        assert_eq!(
+            composer.read_with(cx, |composer, _| composer
+                .sending_chats
+                .get("chat-a")
+                .copied()),
+            Some(2)
+        );
+
+        release.add_permits(2);
+        cx.condition(&composer, |composer, _| !composer.is_sending("chat-a"))
+            .await;
     }
 
     #[test]
