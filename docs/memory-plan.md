@@ -219,14 +219,30 @@ rendered the streaming reply, allowed history scrolling, and returned to the
 tail through its jump control. These are current-path measurements, not a
 before/after claim for this release.
 
+Release validation passed 707 Rust library tests, 17 terminal/diff integration
+tests, 93 Edge tests, and 18 release-workflow/runtime-guard tests. The real local
+Edge/Rust collaboration smoke covered authenticated relay, reconnect, forged-
+actor rejection, and revocation. A real PTY firehose delivered all 64 MiB in
+order after a stalled subscriber resumed; another terminal stayed responsive,
+and closing the stalled terminal took 154 microseconds. The candidate desktop
+app passed composer-send, rendered-reply/code, and history-scroll smoke checks.
+Production and staging iOS simulator builds both rendered the large transcript.
+
+Typechecking was intentionally not run: global agent instructions prohibit it.
+The normal `main` deployment workflow retains its Typecheck step. This release
+uses a temporary deployment branch omitting that step, while retaining Rust
+build, real collaboration smoke, Edge tests, and immutable-candidate checks.
+
 ### Limits of this audit
 
 A three-second sample of the already-running desktop process showed a 1.2 GB
 physical footprint (2.1 GB peak); `vmmap` attributed 944.5 MB of swapped memory
 to IOAccelerator regions. That GPU high-water observation is **not attributed
 to or claimed fixed by this pass**. The older process was an active session,
-not a controlled idle baseline. GPU diagnostics on a controlled workload and
-the eight-hour residency acceptance criteria above remain unmeasured.
+not a controlled idle baseline. The isolated two-turn candidate smoke reported
+60.5 MB Metal device allocation, a 1 MB atlas, and one 2 MB instance-pool buffer.
+That small workload is not comparable to the user's active session. The
+eight-hour residency acceptance criteria above remain unmeasured.
 
 Source-visible costs still needing workload attribution include whole-live-
 reply display-tree construction, very large individual code blocks, Mermaid
