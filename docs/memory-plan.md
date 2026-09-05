@@ -233,6 +233,29 @@ The normal `main` deployment workflow retains its Typecheck step. This release
 uses a temporary deployment branch omitting that step, while retaining Rust
 build, real collaboration smoke, Edge tests, and immutable-candidate checks.
 
+### Staging workspace persistence repair
+
+The subsequent official desktop cutover exposed a separate device-discovery
+failure: the device relay was connected, but workspace requests returned HTTP
+500 with `SQLITE_TOOBIG`. Full workspace backfills could exceed SQLite's
+approximately 2 MB value limit before the normal post-insert compaction ran.
+Oversized pending updates now persist the merged document through the existing
+chunked snapshot store. Smaller updates retain the incremental log path; no
+workspace reset or history deletion is required.
+
+The regression failed with the original SQLite error before the fix. All 94
+Edge tests then passed. A real local Worker persisted a 2,100,000-byte payload
+and recovered identical bytes after a process restart. The installed official
+desktop binary also passed authenticated collaboration, reconnect, forged-actor
+rejection, and revocation smoke checks.
+
+The staging-only deployment is Worker version
+`d49376e2-3ad0-42cb-899f-ae25633e9cb4`, from source commit `d658daf`.
+A fresh authenticated cloud client verified the preserved desktop device ID,
+version 0.1.67, all 27 expected unarchived sessions, and a 3.9-second-old
+presence heartbeat. Workspace stats returned HTTP 200 with a 692,129-byte
+snapshot and 13 ms cold replay. Physical-phone UI visibility was not inspected.
+
 ### Limits of this audit
 
 A three-second sample of the already-running desktop process showed a 1.2 GB
