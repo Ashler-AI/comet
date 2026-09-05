@@ -38,6 +38,9 @@ class MemorySql {
   }
 
   exec(query: string, ...bindings: unknown[]): SqlStorageCursor<SqlRow> {
+    if (bindings.some((value) => value instanceof ArrayBuffer && value.byteLength > 2_000_000)) {
+      throw new Error("string or blob too big: SQLITE_TOOBIG");
+    }
     const sql = query.replace(/\s+/g, " ").trim().toLowerCase();
 
     if (sql.startsWith("create table")) return cursor([]);
@@ -395,6 +398,51 @@ describe("SessionRoom chat authorization", () => {
         status: UpdateStatusCode.PayloadTooLarge
       }))
     );
+  });
+
+  it("persists oversized Loro updates and subsequent deltas across a cold restart", async () => {
+    const { room, sql } = makeRoom();
+    await join(room, "user-a", "large-workspace");
+    const source = new LoroDoc();
+    source.getMap("metadata").set("before", true);
+    source.commit();
+    const append = (bytes: Uint8Array) => room.fetch(
+      authedRequest("/append", "user-a", { method: "POST", body: bytes })
+    );
+    expect((await append(source.export({ mode: "update" }))).status).toBe(200);
+    expect((await room.fetch(authedRequest("/stats", "user-a"))).status).toBe(200);
+
+    const payload = new Uint8Array(2_100_000);
+    let random = 0x12345678;
+    for (let i = 0; i < payload.length; i++) {
+      random ^= random << 13;
+      random ^= random >>> 17;
+      random ^= random << 5;
+      payload[i] = random & 255;
+    }
+    source.getMap("metadata").set("payload", payload);
+    source.commit();
+    const oversized = source.export({ mode: "update" });
+    expect(oversized.byteLength).toBeGreaterThan(2_000_000);
+    expect((await append(oversized)).status).toBe(200);
+    expect((await room.fetch(authedRequest("/stats", "user-a"))).status).toBe(200);
+
+    const beforeDelta = source.oplogVersion();
+    source.getMap("metadata").set("after", true);
+    source.commit();
+    expect((await append(source.export({ mode: "update", from: beforeDelta }))).status).toBe(200);
+    expect((await room.fetch(authedRequest("/stats", "user-a"))).status).toBe(200);
+
+    const reopened = makeRoom(sql).room;
+    const snapshot = await reopened.fetch(authedRequest("/snapshot", "user-a"));
+    expect(snapshot.status).toBe(200);
+    const restored = new LoroDoc();
+    restored.import(new Uint8Array(await snapshot.arrayBuffer()));
+    expect(restored.getMap("metadata").get("before")).toBe(true);
+    expect(restored.getMap("metadata").get("payload")).toEqual(payload);
+    expect(restored.getMap("metadata").get("after")).toBe(true);
+    restored.free();
+    source.free();
   });
 
   it("quarantines incident-shaped persisted Loro state and forces a clean reconnect", async () => {

@@ -46,7 +46,7 @@ import {
   RETAIN_DAYS,
   materializeTail
 } from "./session-doc";
-import { createBlobStore, getJsonBlob, putJsonBlob, type BlobStore } from "./blobs";
+import { CHUNK_BYTES, createBlobStore, getJsonBlob, putJsonBlob, type BlobStore } from "./blobs";
 import {
   AUTH_GRANT_HEADER,
   AUTH_USER_HEADER,
@@ -1257,6 +1257,20 @@ export class SessionRoom implements DurableObject {
       this.flushTimer = undefined;
     }
     if (this.pending.length === 0) return;
+    // A full backfill can exceed SQLite's per-value limit before the normal
+    // post-insert fold runs. Persist it through the existing chunked snapshot
+    // store instead; never split a Loro update into independently imported rows.
+    if (this.pending.some((update) => update.byteLength > CHUNK_BYTES)) {
+      const doc = await this.ensureDoc();
+      // No await between exporting the current state and clearing its pending
+      // updates: writes accepted while ensureDoc yielded are included too.
+      this.blobs.put("snapshot", doc.export({ mode: "snapshot" }));
+      this.ctx.storage.sql.exec("DELETE FROM updates");
+      this.setMeta("updateBytes", "0");
+      this.pending = [];
+      this.pendingBytes = 0;
+      return;
+    }
     const now = Date.now();
     for (const update of this.pending) {
       this.ctx.storage.sql.exec(
