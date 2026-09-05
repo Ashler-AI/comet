@@ -110,15 +110,17 @@ struct HomeView: View {
     // MARK: Spaces
 
     private var spacesSection: some View {
-        Section {
-            if model.spaces.isEmpty {
-                Text("No spaces yet — add one from a desktop device")
+        let occupiedSpaceIds = Set(model.overviewChats.compactMap(\.spaceId))
+        let spaces = model.spaces.filter { occupiedSpaceIds.contains($0.id) }
+        return Section {
+            if spaces.isEmpty {
+                Text("Spaces with sessions will appear here — tap + to choose a folder")
                     .font(Theme.sans(12))
                     .foregroundStyle(Theme.textFaint)
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
             }
-            ForEach(model.spaces) { space in
+            ForEach(spaces) { space in
                 Button {
                     path.append(.space(space.id))
                 } label: {

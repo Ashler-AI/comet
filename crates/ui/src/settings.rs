@@ -91,10 +91,6 @@ pub struct UiSettings {
     /// are skipped; new spaces append in creation order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub space_order: Vec<String>,
-    /// Spaces explicitly added through the folder picker. Unlike `space_order`,
-    /// these remain visible when they have no sessions.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pinned_space_ids: Vec<String>,
     /// Session notification chimes (done / awaiting-input). `COMET_DISABLE_SOUND`
     /// overrides.
     pub sound_enabled: bool,
@@ -128,7 +124,6 @@ impl Default for UiSettings {
             last_room_id: None,
             tab_order: std::collections::HashMap::new(),
             space_order: Vec::new(),
-            pinned_space_ids: Vec::new(),
             sound_enabled: true,
             focus_mode: false,
             workspace_status_visible: true,
@@ -389,7 +384,6 @@ mod tests {
                 vec!["b".to_string(), "a".to_string()],
             )]),
             space_order: vec!["space-2".to_string(), "space-1".to_string()],
-            pinned_space_ids: vec!["space-2".to_string()],
             sound_enabled: false,
             focus_mode: true,
             density: Density::Compact,

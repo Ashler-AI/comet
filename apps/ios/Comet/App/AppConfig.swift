@@ -82,10 +82,13 @@ final class AppConfig: @unchecked Sendable {
     func sessionSocketURL(chatId: String, deploymentId: String? = nil) async -> URL? {
         guard let token = await currentToken() else { return nil }
         var url = wsBase.appending(path: "session/\(chatId)/ws")
-        url.append(queryItems: [
-            URLQueryItem(name: "token", value: token),
-            URLQueryItem(name: "deploymentId", value: deploymentId ?? projectScope),
-        ])
+        url.append(queryItems: [URLQueryItem(name: "token", value: token)])
+        // Local-controller sessions use the project/session room. A deployment
+        // selects a different physical room and must come from the session's
+        // Scaffold environment, never from the workspace project scope.
+        if let deploymentId, !deploymentId.isEmpty {
+            url.append(queryItems: [URLQueryItem(name: "deploymentId", value: deploymentId)])
+        }
         return url
     }
 

@@ -218,16 +218,10 @@ fn sidebar_session_source(
 fn spaces_with_visible_sessions(
     spaces: Vec<Space>,
     visible_space_ids: &std::collections::HashSet<String>,
-    retained_space_ids: &[String],
-    selected_space_id: Option<&str>,
 ) -> Vec<Space> {
     spaces
         .into_iter()
-        .filter(|space| {
-            visible_space_ids.contains(&space.id)
-                || retained_space_ids.iter().any(|id| id == &space.id)
-                || selected_space_id == Some(space.id.as_str())
-        })
+        .filter(|space| visible_space_ids.contains(&space.id))
         .collect()
 }
 
@@ -498,12 +492,7 @@ impl Shell {
                 visible_space_ids,
             )
         };
-        let spaces = spaces_with_visible_sessions(
-            spaces,
-            &visible_space_ids,
-            &self.settings.pinned_space_ids,
-            selected.as_deref(),
-        );
+        let spaces = spaces_with_visible_sessions(spaces, &visible_space_ids);
         // Manual (drag) order overrides the synced creation order — device-
         // local, resolved exactly like the session-tab order.
         let spaces: Vec<SidebarSource> = {
@@ -705,24 +694,18 @@ impl Shell {
 
     /// Commit a drag: persist the new visual order (device-local).
     fn commit_space_reorder(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
-        let (spaces, local_device_id, selected, visible_space_ids) = {
+        let (spaces, local_device_id, visible_space_ids) = {
             let state = self.state.read(cx);
             (
                 state.spaces.clone(),
                 state.local_device_id.clone(),
-                state.selected_space.clone(),
                 state
                     .visible_chats()
                     .filter_map(|chat| chat.space_id.clone())
                     .collect(),
             )
         };
-        let spaces = spaces_with_visible_sessions(
-            spaces,
-            &visible_space_ids,
-            &self.settings.pinned_space_ids,
-            selected.as_deref(),
-        );
+        let spaces = spaces_with_visible_sessions(spaces, &visible_space_ids);
         let created: Vec<String> = spaces.iter().map(|space| space.id.clone()).collect();
         let resolved = super::tabs::resolve_tab_order(&created, &self.settings.space_order);
         let mut by_id: std::collections::HashMap<String, Space> = spaces
@@ -1199,19 +1182,6 @@ impl Shell {
         }));
     }
 
-    fn retain_space_in_sidebar(&mut self, space_id: &str, cx: &mut Context<Self>) {
-        if self
-            .settings
-            .pinned_space_ids
-            .iter()
-            .any(|id| id == space_id)
-        {
-            return;
-        }
-        self.settings.pinned_space_ids.push(space_id.to_string());
-        self.schedule_save(cx);
-    }
-
     /// Create the space for the browser's current folder.
     fn submit_add_space(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -1243,7 +1213,6 @@ impl Shell {
             .map(|s| s.id.clone())
         {
             self.add_space = None;
-            self.retain_space_in_sidebar(&existing, cx);
             self.activate_space(existing, cx);
             return;
         }
@@ -1285,7 +1254,6 @@ impl Shell {
                 match result {
                     Ok(_) => {
                         shell.add_space = None;
-                        shell.retain_space_in_sidebar(&submit_id, cx);
                         shell.activate_space(submit_id.clone(), cx);
                     }
                     Err(err) => {
@@ -2172,7 +2140,7 @@ mod tests {
         }
     }
     #[test]
-    fn sidebar_hides_stale_spaces_but_keeps_selected_and_manually_added_folders() {
+    fn sidebar_shows_only_spaces_with_visible_sessions() {
         let spaces = vec![
             space("active", "device-current", "/repo/active", 1),
             space("manual", "device-current", "/repo/manual", 2),
@@ -2180,16 +2148,15 @@ mod tests {
             space("stale", "device-current", "/repo/stale", 4),
         ];
         let visible = std::collections::HashSet::from(["active".to_string()]);
-        let retained = vec!["manual".to_string()];
 
-        let filtered = spaces_with_visible_sessions(spaces, &visible, &retained, Some("selected"));
+        let filtered = spaces_with_visible_sessions(spaces, &visible);
 
         assert_eq!(
             filtered
                 .iter()
                 .map(|space| space.id.as_str())
                 .collect::<Vec<_>>(),
-            ["active", "manual", "selected"]
+            ["active"]
         );
     }
 
@@ -2220,34 +2187,6 @@ mod tests {
                 links.web.clone(),
                 Some("https://scaffold.example/?q=sandbox-ready".into())
             )
-        );
-    }
-
-    #[test]
-    fn manual_reorder_does_not_retain_a_stale_space() {
-        let spaces = vec![
-            space("active", "device-current", "/repo/active", 1),
-            space("stale", "device-current", "/repo/stale", 2),
-        ];
-        let visible = std::collections::HashSet::from(["active".to_string()]);
-        let settings = crate::settings::UiSettings {
-            space_order: vec!["stale".to_string(), "active".to_string()],
-            ..Default::default()
-        };
-
-        let filtered = spaces_with_visible_sessions(
-            spaces,
-            &visible,
-            &settings.pinned_space_ids,
-            Some("active"),
-        );
-
-        assert_eq!(
-            filtered
-                .iter()
-                .map(|space| space.id.as_str())
-                .collect::<Vec<_>>(),
-            ["active"]
         );
     }
 

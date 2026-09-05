@@ -256,6 +256,39 @@ version 0.1.67, all 27 expected unarchived sessions, and a 3.9-second-old
 presence heartbeat. Workspace stats returned HTTP 200 with a 692,129-byte
 snapshot and 13 ms cold replay. Physical-phone UI visibility was not inspected.
 
+### Corrective staging release: desktop 0.1.68 and iOS 1.0 (3)
+
+Oversized persistence now also preserves writes accepted while snapshot storage
+is awaiting completion. Compaction folds the document before exporting and
+retains force-trimming behavior. The concurrency regression failed before the
+fix; all 95 Edge tests passed afterward. A real Worker compacted a 2.1 MB
+historical overwrite to 323 bytes and recovered it after a process restart.
+Staging Worker version `1fd8be1e-7f6f-45ee-927d-344249fa96f5` uses source
+`ad95509`; production was not changed by this corrective deployment.
+
+The blank mobile transcript was a routing error, not a rendering failure.
+iOS supplied the project scope as a fallback deployment ID, opening a separate
+empty room for an ordinary desktop session. The affected session had 46
+messages in its correct room and none in the fallback namespace. AppConfig now
+adds a deployment ID only when one is explicitly supplied, preserving actual
+Scaffold deployment scopes.
+
+Both desktop and iOS hide spaces without unarchived sessions. Obsolete desktop
+pinning exceptions were removed. The user's authorized cleanup consolidated 20
+duplicate spaces across seven paths, moving 52 archived sessions before deleting
+their empty source spaces. All 699 stored session rows and all 27 unarchived
+sessions were preserved. The two occupied spaces contain 24 and three
+unarchived sessions; unused unique spaces remain stored but hidden.
+
+Native verification rendered the affected session's actual 46-message snapshot
+in an isolated iOS simulator backed by a local Worker. Both the native iOS
+sidebar and the desktop viewport attached to the live engine showed only
+`ashler-platform` and `ashler-comet`. All 525 Rust UI library tests passed;
+the desktop executable, staging simulator app, and staging iOS archive built
+successfully. TestFlight accepted staging 1.0 (3) for the existing internal
+tester group. Physical-phone installation and rendering were not inspected.
+Typechecking was intentionally not run because global instructions prohibit it.
+
 ### Limits of this audit
 
 A three-second sample of the already-running desktop process showed a 1.2 GB
