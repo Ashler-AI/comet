@@ -334,6 +334,13 @@ reset/rematerialization interleavings. The real local Worker/official-desktop
 collaboration smoke also passed authentication, relay, reconnect, forged-actor
 rejection, and active revocation.
 
+The final guard deployment is staging Worker
+`52fd8306-d242-4639-84ac-e29322fdfc26`, from `e83a5d7`. The installed official
+desktop's live sync command confirmed the workspace and open chat rooms
+connected after rollout, with zero full resyncs. The existing engine process
+was not restarted. The recovery audit also confirmed that all 610 pre-cutover
+DocsStore snapshot IDs remain present in the live store.
+
 ### Limits of this audit
 
 A three-second sample of the already-running desktop process showed a 1.2 GB
