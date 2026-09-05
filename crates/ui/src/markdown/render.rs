@@ -152,6 +152,7 @@ pub struct RenderCache {
     // Group by row so invalidating a streaming tail never scans settled history.
     flats: HashMap<SharedString, HashMap<(usize, usize), Rc<FlatText>>>,
     code: HashMap<SharedString, HashMap<(usize, usize), Rc<CachedCode>>>,
+    tables: HashMap<SharedString, HashMap<(usize, usize), Rc<CachedTable>>>,
     /// The [`crate::theme::theme_generation`] these entries were shaped under.
     generation: u32,
 }
@@ -166,16 +167,23 @@ pub struct CachedCode {
     content_width: f32,
 }
 
+struct CachedTable {
+    flats: Vec<Vec<Option<Rc<FlatText>>>>,
+    columns: TableColumns,
+}
+
 impl RenderCache {
     /// Drop every cached entry for `row`.
     pub fn invalidate_row(&mut self, row: &str) {
         self.flats.remove(row);
         self.code.remove(row);
+        self.tables.remove(row);
     }
 
     pub fn clear(&mut self) {
         self.flats.clear();
         self.code.clear();
+        self.tables.clear();
     }
 
     /// Drop every entry if the palette changed since they were shaped. Cheap
@@ -577,57 +585,77 @@ fn render_table(
     theme: &Theme,
     window: &Window,
 ) -> AnyElement {
-    // Header row first, mirroring the source's `rows` shape (rows may be ragged).
-    let all: Vec<&[Vec<InlineRun>]> = std::iter::once(header)
-        .filter(|h| !h.is_empty())
-        .map(|h| h as &[Vec<InlineRun>])
-        .chain(rows.iter().map(|r| r.as_slice()))
-        .collect();
-    let cols = all.iter().map(|r| r.len()).max().unwrap_or(0);
-    if cols == 0 {
+    // Column max-content widths are independent of the viewport. Keep them
+    // with the flattened cells until the row or palette changes, rather than
+    // shaping every cell again on each scroll/fade frame.
+    let cached = opts.cache.as_ref().and_then(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.sync_palette();
+        cache
+            .tables
+            .get(&opts.row_key)
+            .and_then(|tables| tables.get(&(top_ix, ix)))
+            .cloned()
+    });
+    let cached = cached.unwrap_or_else(|| {
+        let all: Vec<&[Vec<InlineRun>]> = std::iter::once(header)
+            .filter(|h| !h.is_empty())
+            .chain(rows.iter().map(|r| r.as_slice()))
+            .collect();
+        let cols = all.iter().map(|r| r.len()).max().unwrap_or(0);
+        let has_header = !header.is_empty();
+        let text_system = window.text_system();
+        let mut flats = Vec::with_capacity(all.len());
+        let mut content = vec![0.0f32; cols];
+        for (r, row) in all.iter().enumerate() {
+            let weight = if has_header && r == 0 {
+                TABLE_HEADER_WEIGHT
+            } else {
+                FontWeight::NORMAL
+            };
+            let mut out = Vec::with_capacity(cols);
+            for (c, natural) in content.iter_mut().enumerate() {
+                let Some(runs) = row.get(c) else {
+                    out.push(None);
+                    continue;
+                };
+                let flat =
+                    flatten_cached(runs, weight, top_ix, table_cell_ix(ix, r, c), opts, theme);
+                if !flat.text.is_empty() {
+                    let line: SharedString = if flat.text.contains('\n') {
+                        flat.text.replace('\n', " ").into()
+                    } else {
+                        flat.text.clone()
+                    };
+                    let width = f32::from(
+                        text_system
+                            .shape_line(line, px(MD_TEXT_SIZE), &flat.runs, None)
+                            .width(),
+                    );
+                    *natural = natural.max(width);
+                }
+                out.push(Some(flat));
+            }
+            flats.push(out);
+        }
+        let cached = Rc::new(CachedTable {
+            flats,
+            columns: table_columns(&content),
+        });
+        if let Some(cache) = &opts.cache {
+            cache
+                .borrow_mut()
+                .tables
+                .entry(opts.row_key.clone())
+                .or_default()
+                .insert((top_ix, ix), cached.clone());
+        }
+        cached
+    });
+    let geo = &cached.columns;
+    if geo.naturals.is_empty() {
         return gpui::Empty.into_any_element();
     }
-    let has_header = !header.is_empty();
-
-    // Flatten every cell (cache-aware) and take per-column max-content widths.
-    let text_system = window.text_system();
-    let mut flats: Vec<Vec<Option<Rc<FlatText>>>> = Vec::with_capacity(all.len());
-    let mut content = vec![0.0f32; cols];
-    for (r, row) in all.iter().enumerate() {
-        let weight = if has_header && r == 0 {
-            TABLE_HEADER_WEIGHT
-        } else {
-            FontWeight::NORMAL
-        };
-        let mut out: Vec<Option<Rc<FlatText>>> = Vec::with_capacity(cols);
-        for (c, natural) in content.iter_mut().enumerate() {
-            let Some(runs) = row.get(c) else {
-                out.push(None);
-                continue;
-            };
-            let flat = flatten_cached(runs, weight, top_ix, table_cell_ix(ix, r, c), opts, theme);
-            if !flat.text.is_empty() {
-                // Cell sources are single-line; guard anyway (same byte count,
-                // so the runs still cover the text exactly).
-                let line: SharedString = if flat.text.contains('\n') {
-                    flat.text.replace('\n', " ").into()
-                } else {
-                    flat.text.clone()
-                };
-                let width = f32::from(
-                    text_system
-                        .shape_line(line, px(MD_TEXT_SIZE), &flat.runs, None)
-                        .width(),
-                );
-                if width > *natural {
-                    *natural = width;
-                }
-            }
-            out.push(Some(flat));
-        }
-        flats.push(out);
-    }
-    let geo = table_columns(&content);
 
     // Frameless flat-hairline chrome: 1px rules under the header and between
     // rows are the only paint (`table.gap` = 1, borderColor white@10%); the
@@ -639,7 +667,7 @@ fn render_table(
         .flex_col()
         .w_full()
         .min_w(px(geo.min_table_width));
-    for (r, row) in flats.iter().enumerate() {
+    for (r, row) in cached.flats.iter().enumerate() {
         if r > 0 {
             inner = inner.child(div().flex_none().h(px(TABLE_DIVIDER)).w_full().bg(hairline));
         }

@@ -76,9 +76,15 @@ enum E2ERunner {
             log("FAIL space row never synced")
             return
         }
-        let chatId = workspace.createChat(
-            space: space,
-            config: ChatConfig(harness: "mock", model: nil, reasoning: nil, sandbox: "workspace-write"))
+        let chatId: String
+        do {
+            chatId = try await workspace.createChat(
+                space: space,
+                config: ChatConfig(harness: "mock", model: nil, reasoning: nil, sandbox: "workspace-write"))
+        } catch {
+            log("FAIL create chat: \(error.localizedDescription)")
+            return
+        }
         guard let chat = workspace.chats.first(where: { $0.id == chatId }),
               let store = model.sessionStore(for: chat) else {
             log("FAIL chat/session store")
@@ -93,7 +99,7 @@ enum E2ERunner {
         if let entries {
             log("OK transcript streamed: \(entries.count) entries")
         } else {
-            log("FAIL no assistant reply; entries=\(store.entries.count) connected=\(store.connected)")
+            log("FAIL no assistant reply; entries=\(store.entries.count) connected=\(store.connected) sendFailure=\(store.sendFailure ?? "none") pending=\(store.pendingSends.count)")
         }
 
         // 4. Big-doc backfill (fragmented): open the chat the seeder filled.

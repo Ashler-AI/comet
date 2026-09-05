@@ -141,6 +141,12 @@ struct ComposerView: View {
         ) {
             EmptyView()
         }
+        .onChange(of: store.sendFailure) { _, failure in
+            // Keep a failed attempt editable without replacing a newer draft
+            // or automatically sending anything when connectivity returns.
+            guard failure != nil, text.isEmpty, let prompt = store.failedPrompt else { return }
+            text = prompt
+        }
     }
 
     private func send() {

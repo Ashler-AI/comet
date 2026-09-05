@@ -341,6 +341,40 @@ connected after rollout, with zero full resyncs. The existing engine process
 was not restarted. The recovery audit also confirmed that all 610 pre-cutover
 DocsStore snapshot IDs remain present in the live store.
 
+### Mobile command and desktop latency corrections
+
+The phone's ordinary-session sender wrote command-ledger entries directly,
+without the host-local admission record required to drain them. Commands now
+go through `QueueCommand` on the actual host; Scaffold commands retain their
+verified controller route. Admission/transport failures remove only the
+matching optimistic send, expose the error, and restore its draft.
+
+Native verification also caught a creation-ordering defect: directly writing
+a chat row did not establish the host's principal-scoped session membership.
+Creation now awaits the host's authenticated `Mutate:createChat` before local
+echo or sending. No ownership check was relaxed. A real iOS simulator, local
+Worker, and Rust mock host completed both the initial command and a second
+command to that existing session, producing four transcript entries.
+
+The desktop's eager sidebar layout constructed and shaped offscreen rows on
+every redraw. Rows now retain their existing geometry and scroll container
+while constructing content only when intersecting the clip. Native session
+selection and history scrolling rendered correctly. Cold document reads are
+offloaded from the RPC dispatch loop, and command ancestry/duplicate lookup
+no longer materializes the entire transcript.
+
+A throwaway dev-profile smoke with 500 messages / approximately 4 MiB verified
+raw continuation ancestry and torn-row duplicate semantics. Fifty old-style
+full-transcript ancestry lookups took 261.301 ms; fifty narrow lookups took
+216.375 microseconds. These are document-operation timings, not end-to-end
+send or session-open latency. The changed Rust library suites passed 741 tests.
+The actual Swift room client also received fresh staging status updates;
+an initial transient stale interval was not treated as proof of a persistent
+decoder or delivery defect. Unsupported timestamp compatibility code was
+removed rather than retained as a speculative fix.
+
+Typechecking was intentionally not run because global instructions prohibit it.
+
 ### Limits of this audit
 
 A three-second sample of the already-running desktop process showed a 1.2 GB

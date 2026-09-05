@@ -360,12 +360,12 @@ pub fn resort_offsets(
     offsets
 }
 
-/// Rich rows keep four compact information bands. Density changes surrounding
-/// chrome only, never the type scale or the information shown.
+/// Three single-line information bands plus density-specific gaps and padding.
+/// This exact height also sizes offscreen sidebar cards without building them.
 fn chat_row_height(density: Density) -> f32 {
     match density {
         Density::Compact => 57.0,
-        Density::Comfortable => 66.0,
+        Density::Comfortable => 67.0,
     }
 }
 
@@ -555,6 +555,7 @@ fn local_session_age(updated_at: i64, now: chrono::DateTime<Utc>) -> String {
 #[derive(Debug, Clone)]
 struct SidebarSessionMeta {
     source: comet_proto::AgentSessionSource,
+    history_source: Option<&'static str>,
     runtime_model: SharedString,
     scaffold_web: Option<SharedString>,
     scaffold_session: Option<SharedString>,
@@ -3848,17 +3849,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let subline = theme.text_muted.opacity(0.66);
-        let history_source = self
-            .state
-            .read(cx)
-            .chats
-            .iter()
-            .find(|chat| chat.id == id)
-            .and_then(|chat| {
-                imported_chat_history_source(&chat.id, chat.harness_session_id.as_deref())
-            });
-        let source_label =
-            history_source.unwrap_or_else(|| crate::multiplayer::source_label(meta.source));
+        let source_label = meta
+            .history_source
+            .unwrap_or_else(|| crate::multiplayer::source_label(meta.source));
         let compact = self.settings.density == Density::Compact;
         let (hover, text) = (theme.glass_hover(), theme.text);
         let selected_wash = crate::theme::glass_selected_bg();
@@ -4018,6 +4011,8 @@ impl Shell {
         });
         div()
             .id(SharedString::from(format!("chat-{id}")))
+            .h(px(chat_row_height(self.settings.density)))
+            .flex_none()
             .flex()
             .flex_col()
             .gap(px(if compact { 1.0 } else { 2.0 }))
@@ -4112,6 +4107,8 @@ impl Shell {
             .child(
                 div()
                     .w_full()
+                    .h(px(17.0))
+                    .line_height(px(17.0))
                     .min_w_0()
                     .flex()
                     .items_center()

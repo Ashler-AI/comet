@@ -265,73 +265,75 @@ struct SessionView: View {
     }
 
     private func content(chat: Chat?, store: SessionStore) -> some View {
-        let status = liveStatus(chatId: chatId)
-        return VStack(spacing: 0) {
-            // The status strip floats over the transcript's faded bottom edge
-            // instead of stacking below it — the loader sits on the
-            // transparent zone and content is never pushed around.
-            TranscriptView(store: store, chatId: chatId)
-                .overlay(alignment: .bottom) {
-                    statusStrip(chatId: chatId, status: status)
-                        .allowsHitTesting(false)
-                }
+        TimelineView(.periodic(from: .now, by: 1)) { timeline in
+            let now = Int64(timeline.date.timeIntervalSince1970 * 1000)
+            let status = liveStatus(chatId: chatId, now: now)
+            VStack(spacing: 0) {
+                // The status strip floats over the transcript's faded bottom edge
+                // instead of stacking below it — the loader sits on the
+                // transparent zone and content is never pushed around.
+                TranscriptView(store: store, chatId: chatId)
+                    .overlay(alignment: .bottom) {
+                        statusStrip(chatId: chatId, status: status, now: now)
+                            .allowsHitTesting(false)
+                    }
 
-            if let request = store.openInputRequest {
-                QuestionPanel(requestId: request.requestId, questions: request.questions) { requestId, answers in
-                    store.respondInput(requestId: requestId, answers: answers)
-                }
-                .padding(.bottom, 8)
-            } else {
-                ComposerView(store: store, chat: chat, runLive: status == .working)
+                if let request = store.openInputRequest {
+                    QuestionPanel(requestId: request.requestId, questions: request.questions) { requestId, answers in
+                        store.respondInput(requestId: requestId, answers: answers)
+                    }
                     .padding(.bottom, 8)
+                } else {
+                    ComposerView(store: store, chat: chat, runLive: status == .working)
+                        .padding(.bottom, 8)
+                }
             }
+            .background(Theme.bg.ignoresSafeArea())
+            .motionAnimation(Motion.fadeQuick, value: store.openInputRequest?.requestId)
         }
-        .background(Theme.bg.ignoresSafeArea())
-        .motionAnimation(Motion.fadeQuick, value: store.openInputRequest?.requestId)
     }
 
-    private func liveStatus(chatId: String) -> SessionStatus? {
+    private func liveStatus(chatId: String, now: Int64) -> SessionStatus? {
         if let demo = model.demo {
-            return effectiveStatus(demo.sessions[chatId], now: nowMs())
+            return effectiveStatus(demo.sessions[chatId], now: now)
         }
-        return effectiveStatus(model.workspace?.sessions[chatId], now: nowMs())
+        return effectiveStatus(model.workspace?.sessions[chatId], now: now)
     }
 
     /// Reserved 24pt status strip (shell.rs render_status_strip) — Working
     /// shows the sunrise spinner + rotating flavour word + elapsed; Errored
     /// shows "Run failed"; the strip always reserves its height so the
     /// composer never shifts.
-    private func statusStrip(chatId: String, status: SessionStatus?) -> some View {
-        TimelineView(.periodic(from: .now, by: 1)) { _ in
-            HStack(spacing: 6) {
-                switch status {
-                case .working:
-                    WorkingSpinner()
-                    let startedAt = sessionStartedAt(chatId: chatId)
-                    let elapsed = (nowMs() - startedAt) / 1000
-                    Text("\(Motion.flavourWord(seed: Motion.flavourSeed(chatId), elapsedSecs: elapsed))\u{2026}")
-                        .font(Theme.sans(12))
-                        .foregroundStyle(Theme.textMuted)
-                    Text(Motion.formatElapsed(elapsed))
-                        .font(Theme.sans(11))
-                        .foregroundStyle(Theme.textFaint)
-                        .monospacedDigit()
-                case .errored:
-                    Text("Run failed")
-                        .font(Theme.sans(11))
-                        .foregroundStyle(Theme.danger)
-                default:
-                    EmptyView()
-                }
+    private func statusStrip(chatId: String, status: SessionStatus?, now: Int64) -> some View {
+        HStack(spacing: 6) {
+            switch status {
+            case .working:
+                WorkingSpinner()
+                let startedAt = sessionStartedAt(chatId: chatId, now: now)
+                let elapsedMs = now.subtractingReportingOverflow(startedAt)
+                let elapsed = max(0, elapsedMs.overflow ? 0 : elapsedMs.partialValue / 1000)
+                Text("\(Motion.flavourWord(seed: Motion.flavourSeed(chatId), elapsedSecs: elapsed))\u{2026}")
+                    .font(Theme.sans(12))
+                    .foregroundStyle(Theme.textMuted)
+                Text(Motion.formatElapsed(elapsed))
+                    .font(Theme.sans(11))
+                    .foregroundStyle(Theme.textFaint)
+                    .monospacedDigit()
+            case .errored:
+                Text("Run failed")
+                    .font(Theme.sans(11))
+                    .foregroundStyle(Theme.danger)
+            default:
+                EmptyView()
             }
-            .frame(height: 24)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.leading, 26)  // aligns with the composer's text start
         }
+        .frame(height: 24)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.leading, 26)  // aligns with the composer's text start
     }
 
-    private func sessionStartedAt(chatId: String) -> Int64 {
+    private func sessionStartedAt(chatId: String, now: Int64) -> Int64 {
         let row = model.demo?.sessions[chatId] ?? model.workspace?.sessions[chatId]
-        return row?.startedAt ?? row?.updatedAt ?? nowMs()
+        return row?.startedAt ?? row?.updatedAt ?? now
     }
 }

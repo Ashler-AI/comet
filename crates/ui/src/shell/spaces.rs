@@ -18,6 +18,86 @@ use std::path::{Path, PathBuf};
 /// plus the 2px column gap.
 const SPACE_ROW_SLOT: f32 = 31.0;
 
+/// A fixed-height sidebar card whose expensive subtree is built only inside
+/// the ancestor scroll viewport. The leaf still occupies its complete slot,
+/// so the existing scrollbar, resort offsets and access to history are intact.
+struct SidebarSessionRow {
+    height: f32,
+    render: Box<dyn FnMut(&mut Window, &mut App) -> AnyElement>,
+}
+
+impl gpui::Element for SidebarSessionRow {
+    type RequestLayoutState = ();
+    type PrepaintState = Option<AnyElement>;
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (gpui::LayoutId, ()) {
+        let mut style = gpui::Style::default();
+        style.size.width = gpui::relative(1.0).into();
+        style.size.height = px(self.height).into();
+        style.flex_shrink = 0.0;
+        (window.request_layout(style, None, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        bounds: gpui::Bounds<gpui::Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        if !bounds.intersects(&window.content_mask().bounds) {
+            return None;
+        }
+        let mut element = (self.render)(window, cx);
+        element.layout_as_root(
+            gpui::size(bounds.size.width.into(), bounds.size.height.into()),
+            window,
+            cx,
+        );
+        element.prepaint_at(bounds.origin, window, cx);
+        Some(element)
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _: gpui::Bounds<gpui::Pixels>,
+        _: &mut (),
+        element: &mut Option<AnyElement>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(element) = element {
+            element.paint(window, cx);
+        }
+    }
+}
+
+impl IntoElement for SidebarSessionRow {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
 fn detached_worktree_label(cwd: &str) -> Option<String> {
     let parts: Vec<String> = Path::new(cwd)
         .components()
@@ -864,7 +944,7 @@ impl Shell {
             state
                 .overview_chats(now)
                 .into_iter()
-                .map(|(status, chat)| (status, chat.clone()))
+                .map(|(status, chat)| (status, chat.id.clone()))
                 .collect()
         };
         self.render_session_rows(chats, false, theme, cx)
@@ -881,7 +961,7 @@ impl Shell {
             state
                 .settled_chats()
                 .into_iter()
-                .map(|chat| (ChatIndicator::Idle, chat.clone()))
+                .map(|chat| (ChatIndicator::Idle, chat.id.clone()))
                 .collect()
         };
         self.render_session_rows(chats, true, theme, cx)
@@ -889,31 +969,32 @@ impl Shell {
 
     fn render_session_rows(
         &mut self,
-        chats: Vec<(ChatIndicator, comet_proto::Chat)>,
+        chats: Vec<(ChatIndicator, String)>,
         settled: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Vec<(String, f32, AnyElement)> {
         let now = Utc::now();
-        let rows: Vec<(
-            ChatIndicator,
-            comet_proto::Chat,
-            String,
-            Option<String>,
-            String,
-            super::SidebarSessionMeta,
-        )> = {
-            let state = self.state.read(cx);
-            chats
-                .into_iter()
-                .map(|(status, chat)| {
-                    let status = if state.scaffold_chat_starting(&chat.id) {
+        let height = super::chat_row_height(self.settings.density);
+        let theme = std::rc::Rc::new(theme.clone());
+        chats
+            .into_iter()
+            .map(|(status, id)| {
+                let key = format!("{}:{id}", if settled { "s" } else { "c" });
+                let theme = theme.clone();
+                let render = cx.processor(move |this, (), _, cx| {
+                    let state = this.state.clone();
+                    let state = state.read(cx);
+                    let Some(chat) = state.chats.iter().find(|chat| chat.id == id) else {
+                        return Empty.into_any_element();
+                    };
+                    let status = if state.scaffold_chat_starting(&id) {
                         ChatIndicator::Working
                     } else {
                         status
                     };
-                    let space = state.space_for_chat(&chat);
-                    let mut folder = space
+                    let mut folder = state
+                        .space_for_chat(chat)
                         .map(|space| space.display_name().to_string())
                         .unwrap_or_else(|| "?".to_string());
                     if state.local_device_id.as_deref() != Some(chat.device_id.as_str())
@@ -921,10 +1002,10 @@ impl Shell {
                     {
                         folder = format!("{folder} · {device}");
                     }
-                    let branch = sidebar_branch_label(&chat);
-                    let scaffold_environment = state.scaffold_environment(&chat.id);
+                    let branch = sidebar_branch_label(chat);
+                    let scaffold_environment = state.scaffold_environment(&id);
                     let scaffold_title =
-                        scaffold_environment.and_then(|environment| environment.name.clone());
+                        scaffold_environment.and_then(|environment| environment.name.as_deref());
                     let (scaffold_web, scaffold_session) = scaffold_environment
                         .and_then(|environment| match &environment.source {
                             comet_proto::SessionEnvironmentSource::Scaffold { links, .. } => {
@@ -934,13 +1015,13 @@ impl Shell {
                         })
                         .unwrap_or_default();
                     let title = scaffold_title
-                        .or_else(|| chat.title.clone())
-                        .unwrap_or_else(|| "New session".into());
-                    let agent_session = state.collaboration_sessions(&chat.id).next();
+                        .or(chat.title.as_deref())
+                        .unwrap_or("New session");
+                    let agent_session = state.collaboration_sessions(&id).next();
                     let source = sidebar_session_source(
                         state.local_device_id.as_deref(),
                         &chat.device_id,
-                        state.chat_is_scaffold(&chat.id),
+                        state.chat_is_scaffold(&id),
                         agent_session.map(|session| session.source),
                     );
                     let runtime = chat
@@ -954,53 +1035,45 @@ impl Shell {
                                 .as_ref()
                                 .and_then(|config| config.model.as_deref())
                         });
-                    let runtime_model = crate::multiplayer::runtime_model(runtime, model).into();
-                    (
+                    let meta = super::SidebarSessionMeta {
+                        source,
+                        history_source: imported_chat_history_source(
+                            &id,
+                            chat.harness_session_id.as_deref(),
+                        ),
+                        runtime_model: crate::multiplayer::runtime_model(runtime, model).into(),
+                        scaffold_web: scaffold_web.map(SharedString::from),
+                        scaffold_session: scaffold_session.map(SharedString::from),
+                    };
+                    let time_ago =
+                        format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now)
+                            .into();
+                    let is_selected = state.selected_chat.as_deref() == Some(id.as_str());
+                    let element = this.render_chat_row(
+                        id.clone(),
+                        transcript::single_line(title).into(),
+                        time_ago,
+                        folder.into(),
+                        branch.map(SharedString::from),
+                        meta,
                         status,
-                        chat,
-                        folder,
-                        branch,
-                        title,
-                        super::SidebarSessionMeta {
-                            source,
-                            runtime_model,
-                            scaffold_web: scaffold_web.map(SharedString::from),
-                            scaffold_session: scaffold_session.map(SharedString::from),
-                        },
-                    )
-                })
-                .collect()
-        };
-        let selected = self.state.read(cx).selected_chat.clone();
-        rows.into_iter()
-            .map(|(status, chat, folder, branch, title, meta)| {
-                let time_ago: SharedString =
-                    format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
-                let is_selected = selected.as_deref() == Some(chat.id.as_str());
-                let height = super::chat_row_height(self.settings.density);
-                let element = self.render_chat_row(
-                    chat.id.clone(),
-                    transcript::single_line(&title).into(),
-                    time_ago,
-                    folder.into(),
-                    branch.map(SharedString::from),
-                    meta,
-                    status,
-                    settled,
-                    is_selected,
-                    theme,
-                    cx,
-                );
-                let element = if settled {
-                    div().opacity(0.52).child(element).into_any_element()
-                } else {
-                    element
-                };
-                (
-                    format!("{}:{}", if settled { "s" } else { "c" }, chat.id),
+                        settled,
+                        is_selected,
+                        &theme,
+                        cx,
+                    );
+                    if settled {
+                        div().opacity(0.52).child(element).into_any_element()
+                    } else {
+                        element
+                    }
+                });
+                let element = SidebarSessionRow {
                     height,
-                    element,
-                )
+                    render: Box::new(move |window, cx| render((), window, cx)),
+                }
+                .into_any_element();
+                (key, height, element)
             })
             .collect()
     }

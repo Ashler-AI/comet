@@ -308,6 +308,56 @@ impl SessionDoc {
             .collect())
     }
 
+    /// Read the final valid raw entry's id without materializing earlier history.
+    /// Command ancestry refers to raw continuation rows, not their joined root.
+    pub fn last_message_id(&self) -> Option<String> {
+        let messages = self.doc.get_list("messages");
+        for index in (0..messages.len()).rev() {
+            let Some(row) = messages.get(index) else {
+                continue;
+            };
+            match entry_from_json(row.get_deep_value().to_json_value()) {
+                Ok(entry) => return Some(entry.id),
+                Err(err) => {
+                    tracing::warn!(error = %err, "skipping malformed transcript entry");
+                }
+            }
+        }
+        None
+    }
+
+    /// Check a message id without decoding unrelated message bodies. Matching
+    /// rows still use the full decoder: a torn row must not suppress an append.
+    pub fn contains_message(&self, message_id: &str) -> bool {
+        let messages = self.doc.get_list("messages");
+        for index in 0..messages.len() {
+            let Some(row) = messages.get(index) else {
+                continue;
+            };
+            let matches_id = match &row {
+                loro::ValueOrContainer::Container(loro::Container::Map(map)) => matches!(
+                    map.get("id"),
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(id)))
+                        if id.as_str() == message_id
+                ),
+                loro::ValueOrContainer::Value(LoroValue::Map(map)) => matches!(
+                    map.get("id"),
+                    Some(LoroValue::String(id)) if id.as_str() == message_id
+                ),
+                _ => false,
+            };
+            if matches_id {
+                match entry_from_json(row.get_deep_value().to_json_value()) {
+                    Ok(_) => return true,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "skipping malformed transcript entry");
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Read at most `max_messages` joined messages ending before the raw-list
     /// cursor `before` (`None` = current tail). Entries are materialized one at
     /// a time from the end of the Loro list, so opening a chat never converts

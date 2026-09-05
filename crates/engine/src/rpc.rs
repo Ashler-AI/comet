@@ -1965,35 +1965,48 @@ impl RpcService for EngineRpc {
             }
             methods::READ_DOC_MESSAGES => {
                 let p: ReadDocMessagesParams = parse_params(params)?;
-                let handle = self
-                    .doc_host
-                    .open_projection(&p.chat_id, p.room_projection.as_ref())
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                let page = handle
-                    .doc()
-                    .read_entry_window(Some(p.before), comet_doc::TAIL_MESSAGE_COUNT)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let doc_host = self.doc_host.clone();
+                let page = tokio::task::spawn_blocking(move || {
+                    let handle =
+                        doc_host.open_projection(&p.chat_id, p.room_projection.as_ref())?;
+                    handle
+                        .doc()
+                        .read_entry_window(Some(p.before), comet_doc::TAIL_MESSAGE_COUNT)
+                        .map_err(crate::EngineError::from)
+                })
+                .await
+                .map_err(|e| RpcError::Failed(format!("transcript read task failed: {e}")))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&page)
             }
             methods::WATCH_DOC_MESSAGES => {
                 let p: ChatParams = parse_params(params)?;
-                let handle = self
-                    .doc_host
-                    .open_projection(&p.chat_id, p.room_projection.as_ref())
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                Ok(RpcReply::Stream(doc_messages_stream(
-                    handle.watch_messages(),
-                )))
+                // Snapshot import and the first tail projection are synchronous
+                // Loro work. Keep cold opens off the interactive RPC workers.
+                let doc_host = self.doc_host.clone();
+                let messages = tokio::task::spawn_blocking(move || {
+                    let handle =
+                        doc_host.open_projection(&p.chat_id, p.room_projection.as_ref())?;
+                    Ok::<_, crate::EngineError>(handle.watch_messages())
+                })
+                .await
+                .map_err(|e| RpcError::Failed(format!("transcript watch task failed: {e}")))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                Ok(RpcReply::Stream(doc_messages_stream(messages)))
             }
             "WatchCollaboration" => {
                 let p: ChatParams = parse_params(params)?;
-                let handle = self
-                    .doc_host
-                    .open_projection(&p.chat_id, p.room_projection.as_ref())
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                let doc = handle.doc_arc();
+                let doc_host = self.doc_host.clone();
+                let projection = p.room_projection.clone();
+                let (messages, doc) = tokio::task::spawn_blocking(move || {
+                    let handle = doc_host.open_projection(&p.chat_id, projection.as_ref())?;
+                    Ok::<_, crate::EngineError>((handle.watch_messages(), handle.doc_arc()))
+                })
+                .await
+                .map_err(|e| RpcError::Failed(format!("collaboration watch task failed: {e}")))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
                 Ok(RpcReply::Stream(collaboration_stream(
-                    handle.watch_messages(),
+                    messages,
                     self.doc_host.watch_authority(),
                     doc,
                     self.doc_host.clone(),

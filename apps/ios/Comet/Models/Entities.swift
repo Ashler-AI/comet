@@ -217,9 +217,11 @@ func effectiveStatus(_ row: SessionRow?, now: Int64) -> SessionStatus? {
     guard let row else { return nil }
     switch row.status {
     case .working, .awaitingInput:
-        let age = now - row.updatedAt
-        // Negative ages (clock skew) are fresh.
-        return age > sessionStaleMs ? nil : row.status
+        // Negative ages (clock skew) are fresh. A malformed legacy extreme
+        // timestamp must expire rather than overflow during subtraction.
+        guard row.updatedAt < now else { return row.status }
+        let age = now.subtractingReportingOverflow(row.updatedAt)
+        return age.overflow || age.partialValue > sessionStaleMs ? nil : row.status
     case .errored, .idle:
         return row.status
     }
@@ -351,9 +353,7 @@ struct RepoRef: Codable, Hashable, Identifiable {
     var id: String { name }
 }
 
-// MARK: - Command ledger (commands.rs port)
-
-let commandDefaultTtlMs: Int64 = 86_400_000
+// MARK: - Command requests (commands.rs port)
 
 /// comet-proto RunRequest (agent.rs:81). `reasoning` is lowercase
 /// ("high"/"xhigh"/…), `sandbox` kebab-case ("workspace-write"), harness ids

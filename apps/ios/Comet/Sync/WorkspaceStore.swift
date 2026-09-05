@@ -406,8 +406,8 @@ final class WorkspaceStore {
                 "config": encodableDictionary(chatConfig),
             ]
         )
-        putChat(chatId: chatId, space: space, config: chatConfig,
-                branch: launch.sourceRef, cwd: ".")
+        try putChat(chatId: chatId, space: space, config: chatConfig,
+                    branch: launch.sourceRef, cwd: ".")
         _ = addSessionRef(chatId: chatId, environment: attachment.environment)
 
         let route = ScaffoldControlRoute(
@@ -426,6 +426,38 @@ final class WorkspaceStore {
                                        messageId: UUID().uuidString.lowercased())
         )
         return (chatId, route)
+    }
+
+    /// Ordinary commands must be admitted on their actual host. A different
+    /// desktop's local trust record cannot authorize this host's ledger drain.
+    func sendSessionCommand(chatId: String, payload: SessionCommandPayload) async throws {
+        guard let hostDeviceId = chats.first(where: { $0.id == chatId })?.deviceId
+            ?? sessions[chatId]?.deviceId, !hostDeviceId.isEmpty else {
+            throw MobileSessionError.unavailable("This session has no known desktop host")
+        }
+        var command: [String: Any] = ["kind": payload.kind]
+        switch payload {
+        case .run(let request, let messageId):
+            command["request"] = encodableDictionary(request)
+            command["messageId"] = messageId
+        case .steer(let prompt, let messageId):
+            command["prompt"] = prompt
+            if let messageId { command["messageId"] = messageId }
+        case .interrupt:
+            break
+        case .respondInput(let requestId, let answers):
+            command["requestId"] = requestId
+            command["answers"] = answers.map(encodableDictionary)
+        }
+        struct Reply: Decodable { var commandId: String }
+        let _: Reply = try await relay(for: hostDeviceId).call(
+            method: "QueueCommand",
+            params: [
+                "chatId": chatId,
+                "commandId": UUID().uuidString.lowercased(),
+                "command": command,
+            ]
+        )
     }
 
     func sendScaffoldCommand(controllerDeviceId: String,
@@ -598,36 +630,50 @@ final class WorkspaceStore {
     }
 
 
-    /// Mint a new chat onto a space (workspace_host.rs create_chat shape).
-    /// The host = the space's owning device picks it up via the doc.
+    /// Create through the actual host so its verified principal membership is
+    /// installed before the first QueueCommand can reach command draining.
     @discardableResult
     func createChat(space: Space, config chatConfig: ChatConfig,
-                    branch: String? = nil, cwd: String? = nil) -> String {
+                    branch: String? = nil, cwd: String? = nil) async throws -> String {
+        guard !space.deviceId.isEmpty else {
+            throw MobileSessionError.unavailable("This space has no desktop host")
+        }
         let chatId = UUID().uuidString.lowercased()
-        putChat(chatId: chatId, space: space, config: chatConfig,
-                branch: branch, cwd: cwd ?? space.path)
+        var params: [String: Any] = [
+            "op": "createChat",
+            "chatId": chatId,
+            "spaceId": space.id,
+            "config": encodableDictionary(chatConfig),
+        ]
+        if let branch { params["branch"] = branch }
+        if let cwd { params["cwd"] = cwd }
+        struct Reply: Decodable { var ok: Bool }
+        let reply: Reply = try await relay(for: space.deviceId).call(method: "Mutate", params: params)
+        guard reply.ok else {
+            throw MobileSessionError.unavailable("The desktop did not create this session")
+        }
+        try putChat(chatId: chatId, space: space, config: chatConfig,
+                    branch: branch, cwd: cwd ?? space.path)
         return chatId
     }
 
     private func putChat(chatId: String, space: Space, config chatConfig: ChatConfig,
-                         branch: String?, cwd: String) {
+                         branch: String?, cwd: String) throws {
         let map = doc.getMap(id: "chats")
-        do {
-            let row = try map.getOrCreateContainer(key: chatId, child: LoroMap())
-            try row.insert(key: "id", v: chatId)
-            try row.insert(key: "deviceId", v: space.deviceId)
-            try row.insert(key: "archived", v: false)
-            try row.insert(key: "cwd", v: cwd)
-            try row.insert(key: "spaceId", v: space.id)
-            let createdAt = row.get(key: "createdAt")?.asValue()?.i64Value ?? nowMs()
-            try row.insert(key: "createdAt", v: createdAt)
-            if let branch { try row.insert(key: "branch", v: branch) }
-            if let value = LoroValue.fromEncodable(chatConfig) {
-                try row.insert(key: "config", v: value)
-            }
-            doc.commit()
-            project()
-        } catch {}
+        let row = try map.getOrCreateContainer(key: chatId, child: LoroMap())
+        try row.insert(key: "id", v: chatId)
+        try row.insert(key: "deviceId", v: space.deviceId)
+        try row.insert(key: "archived", v: false)
+        try row.insert(key: "cwd", v: cwd)
+        try row.insert(key: "spaceId", v: space.id)
+        let createdAt = row.get(key: "createdAt")?.asValue()?.i64Value ?? nowMs()
+        try row.insert(key: "createdAt", v: createdAt)
+        if let branch { try row.insert(key: "branch", v: branch) }
+        if let value = LoroValue.fromEncodable(chatConfig) {
+            try row.insert(key: "config", v: value)
+        }
+        doc.commit()
+        project()
     }
 
     /// Create a space. Preferred path: `Mutate {op:createSpace}` straight to

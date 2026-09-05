@@ -549,12 +549,14 @@ mod tests {
             SessionControlAction::RespondInput { request_id, .. } if request_id == "input-a"
         ));
 
-        assert!(serde_json::from_value::<SessionControlAction>(serde_json::json!({
-            "action": "start",
-            "request": serde_json::to_value(run_request()).unwrap(),
-            "messageId": "wrong-key",
-        }))
-        .is_err());
+        assert!(
+            serde_json::from_value::<SessionControlAction>(serde_json::json!({
+                "action": "start",
+                "request": serde_json::to_value(run_request()).unwrap(),
+                "messageId": "wrong-key",
+            }))
+            .is_err()
+        );
     }
 
     #[test]

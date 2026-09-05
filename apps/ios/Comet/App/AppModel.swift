@@ -431,7 +431,7 @@ final class AppModel {
 
     @discardableResult
     func createChat(space: Space, config chatConfig: ChatConfig,
-                    branch: String? = nil, cwd: String? = nil) -> String? {
+                    branch: String? = nil, cwd: String? = nil) async throws -> String {
         if let demo {
             let id = "chat-\(UUID().uuidString.lowercased().prefix(8))"
             demo.chats.append(Chat(id: id, deviceId: space.deviceId, title: nil, archived: false,
@@ -441,7 +441,8 @@ final class AppModel {
                                    harnessSessionCwd: nil, spaceId: space.id, lastSeenAt: nowMs()))
             return id
         }
-        return workspace?.createChat(space: space, config: chatConfig, branch: branch, cwd: cwd)
+        guard let workspace else { throw MobileSessionError.unavailable("Not connected") }
+        return try await workspace.createChat(space: space, config: chatConfig, branch: branch, cwd: cwd)
     }
 
     var launchesScaffoldSessions: Bool {
@@ -612,39 +613,32 @@ final class AppModel {
 
     func sessionStore(for chat: Chat) -> SessionStore? {
         let environment = scaffoldEnvironment(chatId: chat.id)
-        return sessionStore(chatId: chat.id, hostDeviceId: chat.deviceId,
+        return sessionStore(chatId: chat.id,
                             deploymentId: environment?.scope.deploymentId,
-                            scaffoldEnvironment: environment,
-                            controllerDeviceId: chat.deviceId)
+                            environment: environment)
     }
 
     func sessionStore(for sessionRef: SessionRef) -> SessionStore? {
         let environment = sessionRef.environment ?? scaffoldEnvironment(chatId: sessionRef.chatId)
-        return sessionStore(chatId: sessionRef.chatId, hostDeviceId: nil,
+        return sessionStore(chatId: sessionRef.chatId,
                             deploymentId: environment?.scope.deploymentId,
-                            scaffoldEnvironment: environment,
-                            controllerDeviceId: scaffoldControllerDeviceId())
+                            environment: environment)
     }
 
-    private func sessionStore(chatId: String, hostDeviceId: String?,
-                              deploymentId: String?,
-                              scaffoldEnvironment: SessionEnvironment?,
-                              controllerDeviceId: String?) -> SessionStore? {
+    private func sessionStore(chatId: String, deploymentId: String?,
+                              environment: SessionEnvironment?) -> SessionStore? {
         if let demo { return demo.sessionStore(for: chatId) }
         guard let config else { return nil }
         let store: SessionStore
         if let existing = sessionStores[chatId] {
             store = existing
-            if existing.hostDeviceId != hostDeviceId { existing.hostDeviceId = hostDeviceId }
             existing.updateDeploymentId(deploymentId)
         } else {
             store = SessionStore(chatId: chatId, config: config, deploymentId: deploymentId)
-            store.hostDeviceId = hostDeviceId
             sessionStores[chatId] = store
             store.start()
         }
-        configureScaffoldTransport(store: store, environment: scaffoldEnvironment,
-                                   controllerDeviceId: controllerDeviceId)
+        configureSessionTransport(store: store, environment: environment)
         return store
     }
 
@@ -660,27 +654,28 @@ final class AppModel {
         })?.id ?? workspace.devices.first(where: { $0.platform != "ios" })?.id
     }
 
-    private func configureScaffoldTransport(store: SessionStore,
-                                            environment: SessionEnvironment?,
-                                            controllerDeviceId: String?) {
-        guard let workspace, let environment,
-              environment.source.kind == "scaffold",
-              let controllerDeviceId else {
-            store.scaffoldCommandSender = nil
-            return
-        }
-        store.scaffoldCommandSender = { [weak store] payload in
-            Task { @MainActor in
-                do {
-                    try await workspace.sendScaffoldCommand(
-                        controllerDeviceId: controllerDeviceId,
-                        environment: environment,
-                        payload: payload
-                    )
-                } catch {
-                    store?.reportSendFailure(error.localizedDescription,
-                                             messageId: payload.messageId)
+    private func configureSessionTransport(store: SessionStore,
+                                           environment: SessionEnvironment?) {
+        let chatId = store.chatId
+        store.commandSender = { [weak self] payload in
+            guard let self, let workspace = self.workspace else {
+                throw MobileSessionError.unavailable("Not connected")
+            }
+            // Resolve from current workspace state, not the route captured when
+            // a cached transcript was first opened.
+            let environment = self.scaffoldEnvironment(chatId: chatId) ?? environment
+            if let environment, environment.source.kind == "scaffold" {
+                guard let controllerDeviceId = self.scaffoldRoutes[chatId]?.controllerDeviceId
+                    ?? workspace.chats.first(where: { $0.id == chatId })?.deviceId
+                    ?? self.scaffoldControllerDeviceId() else {
+                    throw MobileSessionError.unavailable("This session has no Scaffold controller")
                 }
+                try await workspace.sendScaffoldCommand(
+                    controllerDeviceId: controllerDeviceId,
+                    environment: environment, payload: payload
+                )
+            } else {
+                try await workspace.sendSessionCommand(chatId: chatId, payload: payload)
             }
         }
     }

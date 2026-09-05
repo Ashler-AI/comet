@@ -1,8 +1,7 @@
-// Session doc mirror — transcript entries + the durable command queue for one
-// chat (crates/doc/src/schema.rs). A viewer device never writes message
-// entries; it appends command ledger entries (rule 1) and lets the host drain
-// them. Optimistic echo: pending sends render locally under their client-minted
-// message id until the host writes the real entry with the same id.
+// Session doc mirror — transcript entries for one chat (crates/doc/src/schema.rs).
+// Commands go through the authenticated host RPC; the phone never writes the
+// durable command ledger. Optimistic echoes keep their client-minted message
+// ids until the host materializes them, or admission fails.
 
 import Foundation
 import Loro
@@ -12,8 +11,6 @@ import Observation
 @Observable
 final class SessionStore {
     let chatId: String
-    /// The chat's host device — nudge target for cold-host command drains.
-    var hostDeviceId: String?
     private(set) var deploymentId: String?
     private(set) var entries: [MessageEntry] = []
     /// Bumped on every change to `entries` / `pendingSends`. The transcript's
@@ -31,6 +28,7 @@ final class SessionStore {
     /// Client-minted ids of sends the host hasn't materialized yet.
     private(set) var pendingSends: [(messageId: String, text: String, at: Int64)] = []
     private(set) var sendFailure: String?
+    private(set) var failedPrompt: String?
 
     let doc = LoroDoc()
     private var room: RoomClient?
@@ -41,9 +39,9 @@ final class SessionStore {
     private let offline: Bool
     /// Demo hook: invoked instead of the command plane when offline.
     @ObservationIgnored var demoResponder: ((String) -> Void)?
-    /// Scaffold commands must be admitted by a trusted desktop controller so
-    /// its fresh control grant, not the phone, signs the durable command.
-    @ObservationIgnored var scaffoldCommandSender: ((SessionCommandPayload) -> Void)?
+    /// The trusted desktop host/controller admits every command. Transport and
+    /// admission errors are handled here alongside the matching optimistic echo.
+    @ObservationIgnored var commandSender: ((SessionCommandPayload) async throws -> Void)?
 
     init(chatId: String, config: AppConfig, deploymentId: String? = nil, offline: Bool = false) {
         self.chatId = chatId
@@ -148,14 +146,22 @@ final class SessionStore {
         }
         projecting = true
         let doc = self.doc
+        let pendingMessageIds = Set(pendingSends.map(\.messageId))
         Task { @MainActor [weak self] in
-            let decoded = await Task.detached(priority: .userInitiated) {
-                Self.decodeEntries(from: doc)
+            let (decoded, failures) = await Task.detached(priority: .userInitiated) {
+                let root = doc.getDeepValue().mapValue
+                return (root.map { Self.decodeEntries(from: $0) },
+                        Self.commandFailures(from: root?["commands"]?.listValue ?? [],
+                                             messageIds: pendingMessageIds))
             }.value
             guard let self else { return }
             self.projecting = false
             if let decoded {
                 self.apply(decoded)
+            }
+            for (messageId, failure) in failures
+                where self.pendingSends.contains(where: { $0.messageId == messageId }) {
+                self.reportSendFailure(failure, messageId: messageId)
             }
             if self.projectPending {
                 self.projectPending = false
@@ -172,10 +178,35 @@ final class SessionStore {
         revision &+= 1
     }
 
+    /// Only reconcile this phone's in-flight echoes. Historical commands are
+    /// neither replayed nor modified, including malformed legacy mobile rows.
+    nonisolated private static func commandFailures(
+        from commands: [LoroValue], messageIds: Set<String>
+    ) -> [String: String] {
+        guard !messageIds.isEmpty else { return [:] }
+        var failures: [String: String] = [:]
+        for value in commands {
+            guard let command = value.mapValue,
+                  let status = command["status"]?.stringValue,
+                  ["rejected", "expired", "superseded", "cancelled"].contains(status),
+                  let payload = command["payload"]?.mapValue else { continue }
+            let messageId = payload["messageId"]?.stringValue
+                ?? payload["action"]?.mapValue?["message_id"]?.stringValue
+            guard let messageId, messageIds.contains(messageId) else { continue }
+            failures[messageId] = command["resolution"]?.stringValue
+                ?? "The desktop marked this message \(status)"
+        }
+        return failures
+    }
+
     /// Whole-doc decode. `nil` means the doc has no map root yet — leave the
     /// previous projection standing rather than blanking a live transcript.
     nonisolated static func decodeEntries(from doc: LoroDoc) -> [MessageEntry]? {
         guard let root = doc.getDeepValue().mapValue else { return nil }
+        return decodeEntries(from: root)
+    }
+
+    nonisolated private static func decodeEntries(from root: [String: LoroValue]) -> [MessageEntry] {
         let raw = (root["messages"]?.listValue ?? []).compactMap(entryFrom)
         return joinContinuations(raw)
     }
@@ -272,7 +303,7 @@ final class SessionStore {
         return nil
     }
 
-    // MARK: Command plane (ledger rule 1: append-only, own entries only)
+    // MARK: Command plane (authenticated desktop admission)
 
     func sendRun(prompt: String, chat: Chat?) {
         if offline {
@@ -285,19 +316,8 @@ final class SessionStore {
                                  reasoning: chat?.config?.reasoning,
                                  cwd: chat?.cwd ?? "",
                                  sandbox: chat?.config?.sandbox ?? "workspace-write")
-        if let scaffoldCommandSender {
-            pendingSends.append((messageId, prompt, nowMs()))
-            revision &+= 1
-            scaffoldCommandSender(.run(request: request, messageId: messageId))
-            return
-        }
-        queueCommand(kind: "run", payload: [
-            "kind": "run",
-            "request": encodableJSON(request),
-            "messageId": messageId,
-        ])
-        pendingSends.append((messageId, prompt, nowMs()))
-        revision &+= 1
+        stagePendingSend(prompt: prompt, messageId: messageId)
+        sendCommand(.run(request: request, messageId: messageId))
     }
 
     func sendSteer(prompt: String) {
@@ -306,19 +326,8 @@ final class SessionStore {
             return
         }
         let messageId = UUID().uuidString.lowercased()
-        if let scaffoldCommandSender {
-            pendingSends.append((messageId, prompt, nowMs()))
-            revision &+= 1
-            scaffoldCommandSender(.steer(prompt: prompt, messageId: messageId))
-            return
-        }
-        queueCommand(kind: "steer", payload: [
-            "kind": "steer",
-            "prompt": prompt,
-            "messageId": messageId,
-        ])
-        pendingSends.append((messageId, prompt, nowMs()))
-        revision &+= 1
+        stagePendingSend(prompt: prompt, messageId: messageId)
+        sendCommand(.steer(prompt: prompt, messageId: messageId))
     }
 
     @discardableResult
@@ -335,70 +344,38 @@ final class SessionStore {
     }
 
     func reportSendFailure(_ message: String, messageId: String?) {
+        failedPrompt = pendingSends.first(where: { $0.messageId == messageId })?.text
         if let messageId { dropPendingSend(messageId: messageId) }
         sendFailure = message
     }
 
     func clearSendFailure() {
         sendFailure = nil
+        failedPrompt = nil
     }
 
     func sendInterrupt() {
-        if let scaffoldCommandSender {
-            scaffoldCommandSender(.interrupt)
-        } else {
-            queueCommand(kind: "interrupt", payload: ["kind": "interrupt"])
-        }
+        guard !offline else { return }
+        sendCommand(.interrupt)
     }
 
     func respondInput(requestId: String, answers: [UserInputAnswer]) {
-        if let scaffoldCommandSender {
-            scaffoldCommandSender(.respondInput(requestId: requestId, answers: answers))
-        } else {
-            queueCommand(kind: "respondInput", payload: [
-                "kind": "respondInput",
-                "requestId": requestId,
-                "answers": answers.map(encodableJSON),
-            ])
-        }
+        guard !offline else { return }
+        sendCommand(.respondInput(requestId: requestId, answers: answers))
     }
 
-    /// schema.rs queue_command, field for field.
-    private func queueCommand(kind: String, payload: [String: Any]) {
-        let commands = doc.getList(id: "commands")
-        do {
-            let map = try commands.pushContainer(child: LoroMap())
-            try map.insert(key: "id", v: UUID().uuidString.lowercased())
-            try map.insert(key: "kind", v: kind)
-            try map.insert(key: "payload", v: LoroValue.fromJSON(payload))
-            try map.insert(key: "issuedBy", v: config.deviceId)
-            try map.insert(key: "issuedAt", v: nowMs())
-            if let turnId = lastEntryId {
-                try map.insert(key: "basedOn", v: LoroValue.map(value: [
-                    "turnId": .string(value: turnId),
-                    "frontier": .null,
-                ]))
+    private func sendCommand(_ payload: SessionCommandPayload) {
+        guard let commandSender else {
+            reportSendFailure("This session has no available desktop command route",
+                              messageId: payload.messageId)
+            return
+        }
+        Task { @MainActor in
+            do {
+                try await commandSender(payload)
+            } catch {
+                reportSendFailure(error.localizedDescription, messageId: payload.messageId)
             }
-            try map.insert(key: "expiresAt", v: nowMs() + commandDefaultTtlMs)
-            try map.insert(key: "status", v: "pending")
-            doc.commit()
-        } catch {}
-        nudgeHost()
-    }
-
-    /// Durable-nudge the host device so a cold host opens the doc and drains
-    /// (doc_host.rs nudge_remote_host). Fire-and-forget; the command is
-    /// durable in the doc regardless.
-    private func nudgeHost() {
-        guard let hostDeviceId else { return }
-        Task { [config, chatId] in
-            await config.nudge(deviceId: hostDeviceId, chatId: chatId)
         }
     }
-}
-
-private func encodableJSON<T: Encodable>(_ value: T) -> Any {
-    guard let data = try? JSONEncoder().encode(value),
-          let obj = try? JSONSerialization.jsonObject(with: data) else { return [:] }
-    return obj
 }

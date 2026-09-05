@@ -488,7 +488,7 @@ impl ChatDocHandle {
         created_at: i64,
         status: MessageStatus,
     ) -> Result<(), DocError> {
-        if self.doc.read_entries()?.iter().any(|e| e.id == message_id) {
+        if self.doc.contains_message(message_id) {
             return Ok(());
         }
         self.doc.push_message(&SessionMessageEntry {
@@ -1480,8 +1480,8 @@ impl DocHost {
             return Ok(existing);
         }
         let now = now_ms();
-        let based_on = handle.doc.read_entries()?.last().map(|m| CommandBasedOn {
-            turn_id: Some(m.id.clone()),
+        let based_on = handle.doc.last_message_id().map(|id| CommandBasedOn {
+            turn_id: Some(id),
             frontier: None,
         });
         let entry = SessionCommandEntry {

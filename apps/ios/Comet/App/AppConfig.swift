@@ -1,6 +1,5 @@
-// Session-wide connection config: edge base URL, identity, token minting for
-// room sockets (WS auth rides the URL query — sockets can't set headers), and
-// the durable-nudge POST. Thread-safe (rooms call in from their actors).
+// Session-wide connection config: edge base URL, identity, and token minting
+// for room sockets (WS auth rides the URL query).
 
 import Foundation
 
@@ -104,15 +103,4 @@ final class AppConfig: @unchecked Sendable {
         return "http=\(http.statusCode) body=\(String(data: data, encoding: .utf8) ?? "")"
     }
 
-    /// POST /device/{deviceId}/nudge {chatId} — wake a cold host to drain the
-    /// command queue.
-    func nudge(deviceId: String, chatId: String) async {
-        guard let token = await currentToken() else { return }
-        var request = URLRequest(url: edgeURL.appending(path: "device/\(deviceId)/nudge"))
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: ["chatId": chatId])
-        _ = try? await URLSession.shared.data(for: request)
-    }
 }

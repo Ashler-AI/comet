@@ -211,10 +211,12 @@ struct SpaceRow: View {
     var body: some View {
         HStack(spacing: 8) {
             // Leading 6pt aggregate dot — position stable, most-urgent member.
-            let agg = model.spaceIndicator(space.id)
-            Circle()
-                .fill((agg == .working || agg == .awaitingInput) ? (agg?.dotColor ?? whiteAlpha(0.14)) : whiteAlpha(0.14))
-                .frame(width: 6, height: 6)
+            TimelineView(.periodic(from: .now, by: 1)) { _ in
+                let agg = model.spaceIndicator(space.id)
+                Circle()
+                    .fill((agg == .working || agg == .awaitingInput) ? (agg?.dotColor ?? whiteAlpha(0.14)) : whiteAlpha(0.14))
+                    .frame(width: 6, height: 6)
+            }
             Image(systemName: "folder")
                 .font(.system(size: 13))
                 .foregroundStyle(Theme.textMuted)
@@ -260,7 +262,6 @@ struct ChatRow: View {
     private var subline: Color { Theme.textMuted.opacity(0.5) }
 
     var body: some View {
-        let indicator = model.indicator(for: chat)
         VStack(alignment: .leading, spacing: 2) {
             // Line 1: space · device, then spinner / attention dot / time-ago.
             HStack(spacing: 8) {
@@ -274,7 +275,9 @@ struct ChatRow: View {
                 } else {
                     Spacer(minLength: 4)
                 }
-                statusSlot(indicator)
+                TimelineView(.periodic(from: .now, by: 1)) { _ in
+                    statusSlot(model.indicator(for: chat))
+                }
             }
 
             // Line 2: the session title.
@@ -310,8 +313,7 @@ struct ChatRow: View {
     private func statusSlot(_ indicator: ChatIndicator) -> some View {
         switch indicator {
         case .working:
-            ArcSpinner()
-                .accessibilityLabel("Running")
+            RunningSessionBadge()
         case .awaitingInput, .completed, .errored:
             Circle()
                 .fill(Theme.attention)
@@ -367,10 +369,31 @@ struct SharedSessionRow: View {
                     .font(Theme.sans(10.5))
                     .foregroundStyle(Theme.textFaint)
             }
+            TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                let now = Int64(timeline.date.timeIntervalSince1970 * 1000)
+                let row = model.demo?.sessions[sessionRef.chatId]
+                    ?? model.workspace?.sessions[sessionRef.chatId]
+                if effectiveStatus(row, now: now) == .working {
+                    RunningSessionBadge()
+                }
+            }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 7)
         .contentShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+private struct RunningSessionBadge: View {
+    var body: some View {
+        HStack(spacing: 4) {
+            ArcSpinner()
+            Text("Running")
+                .font(Theme.sans(11))
+                .foregroundStyle(Theme.textMuted)
+        }
+        .fixedSize()
+        .accessibilityElement(children: .combine)
     }
 }
 

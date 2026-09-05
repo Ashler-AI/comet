@@ -3389,7 +3389,14 @@ fn spawn_transcript_watch(
                 }
             };
             while let Some(value) = rx.recv().await {
-                let frame: TranscriptFrame = match serde_json::from_value(value) {
+                // The opening bounded tail can still contain large text parts.
+                // Decode off the UI executor, preserving stream order and the
+                // selection guard below when the result returns.
+                let decoded = cx
+                    .background_executor()
+                    .spawn(async move { serde_json::from_value::<TranscriptFrame>(value) })
+                    .await;
+                let frame = match decoded {
                     Ok(frame) => frame,
                     Err(err) => {
                         // Schema skew (a newer peer's entry shape arriving

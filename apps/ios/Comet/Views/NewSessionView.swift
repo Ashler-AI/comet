@@ -408,15 +408,19 @@ struct NewSessionView: View {
             case .local:
                 if let worktree = selectedRefRow?.worktreePath { cwd = worktree }
             }
-            guard let chatId = model.createChat(space: space, config: config,
-                                                branch: branch, cwd: cwd),
-                  let chat = model.chat(id: chatId),
-                  let store = model.sessionStore(for: chat) else {
+            do {
+                let chatId = try await model.createChat(space: space, config: config,
+                                                       branch: branch, cwd: cwd)
+                guard let chat = model.chat(id: chatId),
+                      let store = model.sessionStore(for: chat) else {
+                    throw MobileSessionError.unavailable("The created session is not available")
+                }
+                store.sendRun(prompt: prompt, chat: chat)
+                finishLaunch(chatId: chatId)
+            } catch {
                 busy = false
-                return
+                launchError = error.localizedDescription
             }
-            store.sendRun(prompt: prompt, chat: chat)
-            finishLaunch(chatId: chatId)
         }
     }
 

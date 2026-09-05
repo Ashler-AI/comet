@@ -910,6 +910,7 @@ impl HighlightStore {
         block_ix: usize,
         lang: Lang,
         code: &str,
+        chat_id: Option<String>,
         cx: &mut Context<Transcript>,
     ) -> Option<Arc<Vec<Vec<Token>>>> {
         let key = (row_id.clone(), block_ix);
@@ -941,11 +942,22 @@ impl HighlightStore {
                 })
                 .await;
             this.update(cx, |transcript, cx| {
-                if let Some(entry) = transcript.highlights.entries.get_mut(&key)
+                let selected = transcript.chat_id == chat_id;
+                let highlights = if selected {
+                    Some(&mut transcript.highlights)
+                } else {
+                    chat_id
+                        .as_deref()
+                        .and_then(|id| transcript.render_windows.get_mut(id))
+                        .map(|cached| &mut cached.highlights)
+                };
+                if let Some(entry) = highlights.and_then(|store| store.entries.get_mut(&key))
                     && entry.code_len == code_len
                 {
                     entry.lines = Some(Arc::new(lines));
-                    cx.notify();
+                    if selected {
+                        cx.notify();
+                    }
                 }
             })
             .ok();
@@ -1015,6 +1027,8 @@ struct CachedTranscriptRender {
     echo_row_counts: Vec<usize>,
     row_cache: HashMap<String, CachedRows>,
     tree_cache: HashMap<String, (usize, Arc<BlockTree>)>,
+    render_cache: Rc<RefCell<RenderCache>>,
+    highlights: HighlightStore,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -1612,7 +1626,7 @@ impl Transcript {
         let missed_revision = !attached
             && (change.revision != revision || revision != self.state_revision.wrapping_add(1));
         self.state_revision = revision;
-        let echoes = state.pending_echoes().to_vec();
+        let echoes = state.pending_echoes();
         let entries = &state.transcript;
         if attached {
             if let Some(previous) = self.chat_id.take()
@@ -1627,6 +1641,8 @@ impl Transcript {
                         echo_row_counts: std::mem::take(&mut self.echo_row_counts),
                         row_cache: std::mem::take(&mut self.row_cache),
                         tree_cache: std::mem::take(&mut self.tree_cache),
+                        render_cache: std::mem::take(&mut self.render_cache),
+                        highlights: std::mem::take(&mut self.highlights),
                     },
                 );
                 self.render_window_lru.retain(|id| id != &previous);
@@ -1657,6 +1673,8 @@ impl Transcript {
                 self.echo_row_counts = cached.echo_row_counts;
                 self.row_cache = cached.row_cache;
                 self.tree_cache = cached.tree_cache;
+                self.render_cache = cached.render_cache;
+                self.highlights = cached.highlights;
             } else {
                 self.rows.clear();
                 self.entry_row_counts.clear();
@@ -1664,6 +1682,8 @@ impl Transcript {
                 self.echo_row_counts.clear();
                 self.row_cache.clear();
                 self.tree_cache.clear();
+                self.render_cache.borrow_mut().clear();
+                self.highlights.entries.clear();
             }
             self.live_parsers.clear();
             self.folds.clear();
@@ -1671,8 +1691,6 @@ impl Transcript {
             self.tool_details.clear();
             self.tool_detail_loads.clear();
             self.veils.clear();
-            self.render_cache.borrow_mut().clear();
-            self.highlights.entries.clear();
             self.list.reset(self.rows.len());
             self.pinned = true;
             self.spring.reset();
@@ -1707,7 +1725,7 @@ impl Transcript {
             let real_rows_by_entry = self.build_entry_rows(entries, false);
             let new_entry_counts: Vec<usize> = real_rows_by_entry.iter().map(Vec::len).collect();
             let new_entry_row_count: usize = new_entry_counts.iter().sum();
-            let echo_rows_by_entry = self.build_entry_rows(&echoes, true);
+            let echo_rows_by_entry = self.build_entry_rows(echoes, true);
             let new_echo_counts: Vec<usize> = echo_rows_by_entry.iter().map(Vec::len).collect();
             let mut new_rows: Vec<Row> = real_rows_by_entry.into_iter().flatten().collect();
             new_rows.extend(echo_rows_by_entry.into_iter().flatten());
@@ -1755,7 +1773,7 @@ impl Transcript {
             }
             if change.echoes_changed {
                 let old_echoes = 0..self.echo_row_counts.len();
-                let replacement = self.build_entry_rows(&echoes, true);
+                let replacement = self.build_entry_rows(echoes, true);
                 changed |= self.reconcile_entry_range(old_echoes, replacement, false);
             }
             if self.veil_attach_pending && !entries.is_empty() {
@@ -1770,7 +1788,7 @@ impl Transcript {
         };
 
         if self.cache_prune_needed {
-            self.prune_retired_caches(entries, &echoes);
+            self.prune_retired_caches(entries, echoes);
             self.cache_prune_needed = false;
         }
 
@@ -2785,8 +2803,14 @@ impl Transcript {
             return None;
         };
         let lang = language.as_deref().and_then(lang_for_tag)?;
-        self.highlights
-            .request(row_id.clone(), block_ix, lang, code, cx)
+        self.highlights.request(
+            row_id.clone(),
+            block_ix,
+            lang,
+            code,
+            self.chat_id.clone(),
+            cx,
+        )
     }
 
     fn render_tool_group(
