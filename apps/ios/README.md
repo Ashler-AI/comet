@@ -47,6 +47,12 @@ workspace-cache retention, and bounded parse-cache lifetime. Unicode numeric
 highlighting always advances, and code recoloring no longer copies each token's
 entire line prefix.
 
+The 2026-09-05 release uploaded production **1.0 (3)** and staging **1.0 (2)**
+to TestFlight. App Store Connect processed both and assigned them to the existing
+**Ashler Internal** group. The staging tester's installation of build 2 was
+confirmed; the production invitation was resent and remains awaiting acceptance.
+These are internal TestFlight releases, not public App Store submissions.
+
 ### Connecting
 
 - **Production**: Comet discovers Scaffold's OAuth metadata, dynamically
