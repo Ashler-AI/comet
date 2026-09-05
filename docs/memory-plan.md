@@ -289,6 +289,22 @@ successfully. TestFlight accepted staging 1.0 (3) for the existing internal
 tester group. Physical-phone installation and rendering were not inspected.
 Typechecking was intentionally not run because global instructions prohibit it.
 
+Official desktop release run
+[`33988484041`](https://github.com/Ashler-AI/comet/actions/runs/33988484041)
+successfully published staging 0.1.68 from `15cf6d7`. Both artifact checksums
+and the app signature verified; the installed executable matched the official
+artifact byte-for-byte. Its native viewport rendered the live transcript and
+only the two occupied spaces. The obsolete window and debug viewport were
+closed, while the existing 0.1.67 engine deliberately remained running so the
+active agent turn was not interrupted. No new workspace reconnects occurred
+during the UI cutover.
+
+The simulator retained readable transcript content across a local Worker
+process restart, with both workspace and affected-session sockets rejoining.
+The isolated app installation, Worker state, and throwaway probe were removed
+after verification. Rollback bundles and the pre-cleanup workspace snapshot
+remain under `~/Library/Application Support/Crew Migration Backups/`.
+
 ### Limits of this audit
 
 A three-second sample of the already-running desktop process showed a 1.2 GB
