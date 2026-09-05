@@ -145,13 +145,26 @@ interface SessionRoomInternals {
   ): Promise<void>;
 }
 
+const oversizedPayload = (): Uint8Array => {
+  const payload = new Uint8Array(2_100_000);
+  let random = 0x12345678;
+  for (let i = 0; i < payload.length; i++) {
+    random ^= random << 13;
+    random ^= random >>> 17;
+    random ^= random << 5;
+    payload[i] = random & 255;
+  }
+  return payload;
+};
+
 const makeRoom = (
-  sql = new MemorySql()
+  sql = new MemorySql(),
+  sync: () => Promise<void> = async () => {}
 ): { room: SessionRoom; sql: MemorySql; sockets: WebSocket[] } => {
   const sockets: WebSocket[] = [];
   const storage = {
     sql: sql as unknown as SqlStorage,
-    sync: async () => {},
+    sync,
     getAlarm: async () => null,
     setAlarm: async () => {}
   };
@@ -412,14 +425,7 @@ describe("SessionRoom chat authorization", () => {
     expect((await append(source.export({ mode: "update" }))).status).toBe(200);
     expect((await room.fetch(authedRequest("/stats", "user-a"))).status).toBe(200);
 
-    const payload = new Uint8Array(2_100_000);
-    let random = 0x12345678;
-    for (let i = 0; i < payload.length; i++) {
-      random ^= random << 13;
-      random ^= random >>> 17;
-      random ^= random << 5;
-      payload[i] = random & 255;
-    }
+    const payload = oversizedPayload();
     source.getMap("metadata").set("payload", payload);
     source.commit();
     const oversized = source.export({ mode: "update" });
@@ -443,6 +449,66 @@ describe("SessionRoom chat authorization", () => {
     expect(restored.getMap("metadata").get("after")).toBe(true);
     restored.free();
     source.free();
+  });
+
+  it("compacts oversized backfills without losing writes accepted during persistence", async () => {
+    const entered = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    let pause = false;
+    const { room, sql } = makeRoom(new MemorySql(), async () => {
+      if (!pause) return;
+      pause = false;
+      entered.resolve();
+      await resume.promise;
+    });
+    await join(room, "user-a", "compacting-workspace");
+    const source = new LoroDoc();
+    source.getMap("metadata").set("payload", oversizedPayload());
+    source.commit();
+    source.getMap("metadata").set("payload", "latest");
+    source.commit();
+    const append = (bytes: Uint8Array) => room.fetch(
+      authedRequest("/append", "user-a", { method: "POST", body: bytes })
+    );
+    expect((await append(source.export({ mode: "update" }))).status).toBe(200);
+    pause = true;
+    const flushing = room.fetch(authedRequest("/stats", "user-a"));
+    try {
+      await Promise.race([entered.promise, flushing]);
+      const beforeDelta = source.oplogVersion();
+      source.getMap("metadata").set("duringPersistence", true);
+      source.commit();
+      expect((await append(source.export({ mode: "update", from: beforeDelta }))).status).toBe(200);
+      const overlappingFlush = room.fetch(authedRequest("/stats", "user-a"));
+      resume.resolve();
+      await Promise.all([flushing, overlappingFlush]);
+
+      const live = await room.fetch(authedRequest("/snapshot", "user-a"));
+      const bytes = new Uint8Array(await live.arrayBuffer());
+      // Only the current small value belongs in the backfill, not the deleted
+      // multi-megabyte history that triggered compaction.
+      expect(bytes.byteLength).toBeLessThan(100_000);
+      const mirror = new LoroDoc();
+      mirror.import(bytes);
+      expect(mirror.getMap("metadata").toJSON()).toEqual({
+        payload: "latest",
+        duringPersistence: true
+      });
+      mirror.free();
+
+      const cold = await makeRoom(sql).room.fetch(authedRequest("/snapshot", "user-a"));
+      const recovered = new LoroDoc();
+      recovered.import(new Uint8Array(await cold.arrayBuffer()));
+      expect(recovered.getMap("metadata").toJSON()).toEqual({
+        payload: "latest",
+        duringPersistence: true
+      });
+      recovered.free();
+    } finally {
+      resume.resolve();
+      await flushing;
+      source.free();
+    }
   });
 
   it("quarantines incident-shaped persisted Loro state and forces a clean reconnect", async () => {

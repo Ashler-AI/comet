@@ -267,6 +267,7 @@ export class SessionRoom implements DurableObject {
   private pending: Uint8Array[] = [];
   private pendingBytes = 0;
   private flushTimer: ReturnType<typeof setTimeout> | undefined;
+  private flushInFlight: Promise<void> | undefined;
   /** In-memory fragment reassembly. Lost on hibernation → the sender gets a
    * FragmentTimeout ack for the unknown batch and resends — self-healing. */
   private readonly fragments = new Map<WebSocket, Map<string, FragmentBatch>>();
@@ -846,8 +847,8 @@ export class SessionRoom implements DurableObject {
       return;
     }
     if (crdt === CrdtType.Loro) {
-      const doc = await this.ensureDoc();
       if (!(await this.authorizeSocket(ws, state))) return;
+      const doc = await this.ensureDoc();
       try {
         for (const update of updates) if (update.length > 0) doc.import(update);
       } catch {
@@ -1252,6 +1253,19 @@ export class SessionRoom implements DurableObject {
   }
 
   private async flush(): Promise<void> {
+    if (this.flushInFlight) {
+      await this.flushInFlight;
+      return this.flush();
+    }
+    this.flushInFlight = this.flushPending();
+    try {
+      await this.flushInFlight;
+    } finally {
+      this.flushInFlight = undefined;
+    }
+  }
+
+  private async flushPending(): Promise<void> {
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = undefined;
@@ -1261,14 +1275,13 @@ export class SessionRoom implements DurableObject {
     // post-insert fold runs. Persist it through the existing chunked snapshot
     // store instead; never split a Loro update into independently imported rows.
     if (this.pending.some((update) => update.byteLength > CHUNK_BYTES)) {
-      const doc = await this.ensureDoc();
-      // No await between exporting the current state and clearing its pending
-      // updates: writes accepted while ensureDoc yielded are included too.
-      this.blobs.put("snapshot", doc.export({ mode: "snapshot" }));
-      this.ctx.storage.sql.exec("DELETE FROM updates");
-      this.setMeta("updateBytes", "0");
-      this.pending = [];
-      this.pendingBytes = 0;
+      const count = this.pending.length;
+      const bytes = this.pendingBytes;
+      await this.foldLog();
+      // Compaction yields for durability. Keep later arrivals buffered; the
+      // serialized flush boundary prevents another flush from draining them.
+      this.pending.splice(0, count);
+      this.pendingBytes -= bytes;
       return;
     }
     const now = Date.now();
@@ -1330,14 +1343,14 @@ export class SessionRoom implements DurableObject {
     if (cutoff && this.getMeta("lastTrimAt") !== String(cutoff.at)) {
       frontiers = cutoff.frontiers.map((f) => ({ peer: f.peer as `${number}`, counter: f.counter }));
     } else if (
-      (this.blobs.byteLength("snapshot") ?? 0) + Number(this.getMeta("updateBytes") ?? "0") >
+      (this.blobs.byteLength("snapshot") ?? 0) +
+        Number(this.getMeta("updateBytes") ?? "0") +
+        this.pendingBytes >
       TRIM_FORCE_BYTES
     ) {
-      // Snapshot AND log bytes: after a wedge-break reset the re-uploaded
-      // full histories live as LOG ROWS against an empty snapshot (observed
-      // live: 0B snapshot + 119 rows replaying for 7 SECONDS), so a
-      // snapshot-only gate never fired while every cold start ballooned the
-      // heap with the same megabytes.
+      // Include buffered backfills: oversized updates fold without first
+      // becoming log rows. Otherwise their history misses the force-trim
+      // budget until a later flush or cold start.
       // No aged checkpoint but the full history is already a heap hazard:
       // trim at the current frontier (see TRIM_FORCE_BYTES).
       frontiers = doc.frontiers().map((f) => ({ peer: String(f.peer) as `${number}`, counter: f.counter }));
@@ -1353,11 +1366,6 @@ export class SessionRoom implements DurableObject {
       this.ctx.storage.sql.exec("DELETE FROM updates");
       this.setMeta("updateBytes", "0");
       this.setMeta("lastTrimAt", String(cutoff?.at ?? now));
-      // Make the trim durable NOW: a later kill in the same event (a join's
-      // backfill export on a pressed isolate — observed live 2026-08-04)
-      // rolls back uncommitted storage writes, silently resurrecting the
-      // full-history snapshot the trim just replaced.
-      await this.ctx.storage.sync();
       const fresh = new LoroDoc();
       fresh.import(shallow);
       this.doc = fresh;
@@ -1365,10 +1373,14 @@ export class SessionRoom implements DurableObject {
       // leaks it into the shared wasm heap exactly when trimming was
       // supposed to relieve it (see handleJoin).
       if (doc !== fresh) doc.free();
-      return true;
     } catch {
       return false;
     }
+    // The live document is already replaced before yielding, so accepted writes
+    // cannot land in the discarded pre-trim doc. A durability failure must
+    // propagate, not fall back to exporting that now-freed document.
+    await this.ctx.storage.sync();
+    return true;
   }
 
   private closeExpiredGrantSockets(now: number): void {
