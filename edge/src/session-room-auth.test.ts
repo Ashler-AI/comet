@@ -1,8 +1,8 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath, URL as NodeUrl } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { CrdtType, MessageType, decode, type JoinRequest } from "loro-protocol";
-import type { LoroDoc } from "loro-crdt";
+import { CrdtType, MessageType, UpdateStatusCode, decode, encode, type JoinRequest, type ProtocolMessage } from "loro-protocol";
+import { LoroDoc } from "loro-crdt";
 import {
   AUTH_CAPABILITIES_HEADER,
   AUTH_PROJECT_HEADER,
@@ -59,6 +59,12 @@ class MemorySql {
       chunks.set(Number(bindings[1]), bindings[2] as ArrayBuffer);
       this.blobs.set(name, chunks);
       return cursor([]);
+    }
+    if (sql.startsWith("select sum(length(bytes)) as size from blobs")) {
+      const chunks = this.blobs.get(String(bindings[0]));
+      return cursor([{
+        size: chunks ? [...chunks.values()].reduce((total, bytes) => total + bytes.byteLength, 0) : null
+      }]);
     }
     if (sql.startsWith("select bytes from blobs")) {
       const chunks = this.blobs.get(String(bindings[0]));
@@ -280,6 +286,115 @@ describe("SessionRoom chat authorization", () => {
     expect(
       expired.sent.some((bytes) => decode(bytes).type === MessageType.DocUpdate)
     ).toBe(false);
+  });
+
+  it("assembles out-of-order fragments once despite retransmitted indices", async () => {
+    const { room } = makeRoom();
+    const socket = await join(room, "user-a", "fragment-chat");
+    socket.sent.length = 0;
+    const source = new LoroDoc();
+    try {
+      source.getText("text").insert(0, "fragmented transcript");
+      const update = source.export({ mode: "snapshot" });
+      const middle = Math.floor(update.length / 2);
+      const envelope = {
+        crdt: CrdtType.Loro,
+        roomId: "fragment-chat",
+        batchId: "0x0000000000000001" as const
+      };
+      const send = async (message: ProtocolMessage) => {
+        await room.webSocketMessage(socket as unknown as WebSocket, Uint8Array.from(encode(message)).buffer);
+      };
+      await send({
+        type: MessageType.DocUpdateFragmentHeader,
+        ...envelope,
+        fragmentCount: 2,
+        totalSizeBytes: update.length
+      });
+      const second = {
+        type: MessageType.DocUpdateFragment as const,
+        ...envelope,
+        index: 1,
+        fragment: update.subarray(middle)
+      };
+      await send(second);
+      await send(second);
+      expect(socket.sent).toEqual([]);
+      await send({
+        type: MessageType.DocUpdateFragment,
+        ...envelope,
+        index: 0,
+        fragment: update.subarray(0, middle)
+      });
+      expect(socket.sent.map((bytes) => decode(bytes))).toEqual([{
+        type: MessageType.Ack,
+        crdt: CrdtType.Loro,
+        roomId: "fragment-chat",
+        refId: envelope.batchId,
+        status: UpdateStatusCode.Ok
+      }]);
+      const received = await (room as unknown as SessionRoomInternals).ensureDoc();
+      expect(received.getText("text").toString()).toBe("fragmented transcript");
+    } finally {
+      source.free();
+    }
+  });
+
+  it("bounds fragment reservations across incomplete batches and rejects oversized payloads", async () => {
+    const { room } = makeRoom();
+    const socket = await join(room, "user-a", "fragment-chat");
+    socket.sent.length = 0;
+    const envelope = { crdt: CrdtType.Loro, roomId: "fragment-chat" };
+    const send = async (message: ProtocolMessage) => {
+      await room.webSocketMessage(socket as unknown as WebSocket, Uint8Array.from(encode(message)).buffer);
+    };
+    const header = { type: MessageType.DocUpdateFragmentHeader as const, ...envelope };
+    await send({
+      ...header,
+      batchId: "0x0000000000000001",
+      fragmentCount: 1025,
+      totalSizeBytes: 1
+    });
+    await send({
+      ...header,
+      batchId: "0x0000000000000002",
+      fragmentCount: 1,
+      totalSizeBytes: 64 * 1024 * 1024 + 1
+    });
+    await send({
+      ...header,
+      batchId: "0x0000000000000003",
+      fragmentCount: 1,
+      totalSizeBytes: 64 * 1024 * 1024
+    });
+    await send({
+      ...header,
+      batchId: "0x0000000000000004",
+      fragmentCount: 1,
+      totalSizeBytes: 1
+    });
+    // Replacing an existing batch releases its previous reservation.
+    await send({
+      ...header,
+      batchId: "0x0000000000000003",
+      fragmentCount: 1,
+      totalSizeBytes: 1
+    });
+    await send({
+      type: MessageType.DocUpdateFragment,
+      ...envelope,
+      batchId: "0x0000000000000003",
+      index: 0,
+      fragment: new Uint8Array([1, 2])
+    });
+    expect(socket.sent.map((bytes) => decode(bytes))).toEqual(
+      [1, 2, 4, 3].map((id) => ({
+        type: MessageType.Ack,
+        ...envelope,
+        refId: `0x${id.toString(16).padStart(16, "0")}`,
+        status: UpdateStatusCode.PayloadTooLarge
+      }))
+    );
   });
 
   it("quarantines incident-shaped persisted Loro state and forces a clean reconnect", async () => {

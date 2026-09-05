@@ -38,7 +38,7 @@ const REPAIR_INTERVAL: Duration = Duration::from_secs(120);
 
 struct SpaceEntry {
     path: PathBuf,
-    kick_tx: mpsc::UnboundedSender<()>,
+    kick_tx: mpsc::Sender<()>,
     /// Keeps the folder watcher alive; dropped on entry close.
     _watcher: Option<notify::RecommendedWatcher>,
 }
@@ -83,7 +83,7 @@ impl SpacesSync {
         let spaces = self.inner.workspace.watch_spaces().borrow().clone();
         reconcile(&self.inner, &spaces);
         for entry in lock(&self.inner.entries).values() {
-            let _ = entry.kick_tx.send(());
+            let _ = entry.kick_tx.try_send(());
         }
     }
 }
@@ -102,7 +102,8 @@ fn reconcile(inner: &Arc<SpacesSyncInner>, spaces: &[Space]) {
         if entries.contains_key(id) {
             continue; // deviceId/path are immutable — nothing to refresh
         }
-        let (kick_tx, kick_rx) = mpsc::unbounded_channel();
+        // Git presence is latest-only; coalesce signals while a check is busy.
+        let (kick_tx, kick_rx) = mpsc::channel(1);
         // Non-recursive watcher on the space folder: `.git` appearing/vanishing
         // among the direct children is exactly the signal we need. Watch
         // failures are fine — the repair tick still converges.
@@ -116,7 +117,7 @@ fn reconcile(inner: &Arc<SpacesSyncInner>, spaces: &[Space]) {
                         .iter()
                         .any(|p| p.file_name().is_some_and(|n| n == ".git"))
                     {
-                        let _ = tx.send(());
+                        let _ = tx.try_send(());
                     }
                 });
             match result {
@@ -149,7 +150,7 @@ fn reconcile(inner: &Arc<SpacesSyncInner>, spaces: &[Space]) {
             Arc::downgrade(&entry),
             kick_rx,
         ));
-        let _ = kick_tx.send(()); // initial check (boot / first observed)
+        let _ = kick_tx.try_send(()); // initial check (boot / first observed)
     }
 }
 
@@ -158,7 +159,7 @@ async fn entry_task(
     inner: Weak<SpacesSyncInner>,
     space_id: String,
     entry: Weak<SpaceEntry>,
-    mut kick_rx: mpsc::UnboundedReceiver<()>,
+    mut kick_rx: mpsc::Receiver<()>,
 ) {
     while kick_rx.recv().await.is_some() {
         loop {
@@ -264,7 +265,7 @@ async fn spaces_task(inner: Weak<SpacesSyncInner>, mut spaces_rx: watch::Receive
                 let spaces = spaces_rx.borrow().clone();
                 reconcile(&inner, &spaces);
                 for entry in lock(&inner.entries).values() {
-                    let _ = entry.kick_tx.send(());
+                    let _ = entry.kick_tx.try_send(());
                 }
                 sweep_orphans(&inner);
             }

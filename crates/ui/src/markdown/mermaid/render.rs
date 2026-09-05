@@ -76,7 +76,12 @@ pub(crate) fn mermaid_block(
                     .p(px(10.0))
                     .child(content),
             )
-            .children(code_copy_button(code, ix, opts, theme))
+            .children(code_copy_button(
+                || code.to_string().into(),
+                ix,
+                opts,
+                theme,
+            ))
             .into_any_element(),
     )
 }

@@ -9,6 +9,7 @@ const CHUNK_BYTES = 1_500_000;
 export interface BlobStore {
   put(name: string, bytes: Uint8Array): void;
   get(name: string): Uint8Array | undefined;
+  byteLength(name: string): number | undefined;
   delete(name: string): void;
 }
 
@@ -36,6 +37,13 @@ export const createBlobStore = (sql: SqlStorage): BlobStore => {
         off += p.length;
       }
       return out;
+    },
+    byteLength(name) {
+      // SQLite reads a BLOB's stored length without loading its payload.
+      for (const row of sql.exec("SELECT SUM(length(bytes)) AS size FROM blobs WHERE name = ?", name)) {
+        return row.size === null ? undefined : row.size as number;
+      }
+      return undefined;
     },
     delete(name) {
       sql.exec("DELETE FROM blobs WHERE name = ?", name);

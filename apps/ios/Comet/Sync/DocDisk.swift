@@ -40,7 +40,7 @@ enum DocDisk {
         guard let files = try? fm.contentsOfDirectory(at: directory,
                                                       includingPropertiesForKeys: [.contentModificationDateKey])
         else { return }
-        let sessions = files.filter { !$0.lastPathComponent.hasPrefix("ws3_") }
+        let sessions = files.filter { !$0.lastPathComponent.hasPrefix("ws4_") }
         guard sessions.count > keep else { return }
         let sorted = sessions.sorted {
             let a = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
@@ -65,7 +65,8 @@ enum DocDisk {
 final class DocSaver {
     private let docId: String
     private let doc: LoroDoc
-    private var generation = 0
+    private var saveTask: Task<Void, Never>?
+    private var saveDeadline: UInt64?
     private var dirty = false
 
     init(docId: String, doc: LoroDoc) {
@@ -75,16 +76,30 @@ final class DocSaver {
 
     func poke() {
         dirty = true
-        generation += 1
-        let expected = generation
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            guard let self, self.generation == expected else { return }
-            self.flush()
+        saveDeadline = DispatchTime.now().uptimeNanoseconds + 1_500_000_000
+        // Streaming moves the deadline, not the timer: keep one sleeper per
+        // doc instead of one suspended task for every update in the window.
+        guard saveTask == nil else { return }
+        saveTask = Task { @MainActor [weak self] in
+            while let deadline = self?.saveDeadline {
+                let now = DispatchTime.now().uptimeNanoseconds
+                if now >= deadline {
+                    self?.flush()
+                    return
+                }
+                do {
+                    try await Task.sleep(nanoseconds: deadline - now)
+                } catch {
+                    return
+                }
+            }
         }
     }
 
     func flush() {
+        saveTask?.cancel()
+        saveTask = nil
+        saveDeadline = nil
         guard dirty else { return }
         dirty = false
         DocDisk.save(doc: doc, id: docId)

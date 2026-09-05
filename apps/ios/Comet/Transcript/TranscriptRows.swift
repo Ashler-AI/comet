@@ -74,10 +74,14 @@ enum TranscriptRowBuilder {
                                       timestamp: nil,
                                       partKey: nil))
         }
-        // Drop memos for parts that no longer exist. The count guard keeps the
-        // common (append-only) rebuild from copying the dict every token.
-        if completed.count > live.count {
-            completed = completed.filter { live.contains($0.key) }
+        // A replacement can keep the same part count, so counts cannot prove
+        // that every memo is still live. Remove only stale keys; append-only
+        // rebuilds do not copy either dictionary.
+        for key in completed.keys where !live.contains(key) {
+            completed.removeValue(forKey: key)
+        }
+        for key in parsers.keys where !live.contains(key) {
+            parsers.removeValue(forKey: key)
         }
         for ix in rows.indices {
             rows[ix].topGap = gap(for: rows[ix],

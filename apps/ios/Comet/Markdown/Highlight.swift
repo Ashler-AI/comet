@@ -198,6 +198,10 @@ enum Highlighter {
             // Numbers
             if c.isNumber {
                 let start = i
+                // isNumber also admits numerals outside isHexDigit (e.g. ١).
+                // Consume the recognized first character so those cannot
+                // leave the tokenizer spinning forever at the same offset.
+                i += 1
                 while i < n, chars[i].isHexDigit || chars[i] == "." || chars[i] == "_"
                     || chars[i] == "x" || chars[i] == "o" || chars[i] == "b" || chars[i] == "e" {
                     i += 1

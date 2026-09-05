@@ -1,4 +1,4 @@
-# Comet for iOS
+# Crew for iOS
 
 A native SwiftUI viewport onto the comet-native mesh. The phone is a **peer
 device**: it joins the same Loro CRDT rooms as every other device (workspace
@@ -26,11 +26,11 @@ Production and staging use the same Swift target with separate checked-in scheme
 bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
 
 ```sh
-# Production: Crew, ai.ashler.crew, build 2
+# Production: Crew, ai.ashler.crew, version 1.0 build 3
 xcodebuild -project Comet.xcodeproj -scheme Comet \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 
-# Staging: Crew Staging, ai.ashler.crew.staging, build 1
+# Staging: Crew Staging, ai.ashler.crew.staging, version 1.0 build 2
 xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 ```
@@ -39,6 +39,13 @@ xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
 | --- | --- | --- | --- | --- |
 | `Comet` | `comet.internal.ashler.com` | `scaffold.internal.ashler.com` | `ashler-production` | `comet://` |
 | `Crew Staging` | `comet-staging.internal.ashler.com` | `scaffold-staging.internal.ashler.com` | `ashler-staging` | `comet-staging://` |
+
+Performance changes shared by both builds are documented in
+[`docs/memory-plan.md`](../../docs/memory-plan.md#9-crew-0167-performance-audit-2026-09-05):
+single-flight reconnects with durable resubmission, coalesced snapshot saves,
+workspace-cache retention, and bounded parse-cache lifetime. Unicode numeric
+highlighting always advances, and code recoloring no longer copies each token's
+entire line prefix.
 
 ### Connecting
 

@@ -612,6 +612,28 @@ async fn reconnects_with_backoff_and_rejoins_after_connection_loss() {
 }
 
 #[tokio::test]
+async fn burst_overflow_resyncs_all_commits_and_latest_presence() {
+    let edge = FakeEdge::new();
+    let doc = LoroDoc::new();
+    let client = RoomClient::connect_with(edge.connector(), "room-1", doc.clone())
+        .await
+        .expect("connect");
+    // No yields: the current-thread runtime cannot drain either outbound queue
+    // until the burst has overflowed. Dropped notifications must not lose data.
+    let commits = LOCAL_UPDATE_QUEUE_CAP * 4;
+    for index in 0..commits {
+        doc.get_text("t").insert(index, "x").unwrap();
+        doc.commit();
+        client.ephemeral().set("device:a", index.to_string());
+    }
+    let expected_text = "x".repeat(commits);
+    let expected_presence: loro::LoroValue = (commits - 1).to_string().into();
+    wait_until(|| doc_text(&edge.doc) == expected_text).await;
+    wait_until(|| edge.eph.get("device:a") == Some(expected_presence.clone())).await;
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn shutdown_sends_leave() {
     let edge = FakeEdge::new();
     let client = RoomClient::connect_with(edge.connector(), "room-1", LoroDoc::new())

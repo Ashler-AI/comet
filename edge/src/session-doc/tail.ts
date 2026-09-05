@@ -1,20 +1,20 @@
 /**
- * Tail materialization — vendored verbatim from comet's
- * packages/session-doc/src/schema.ts (`readMessageEntries` /
- * `materializeTail`), minus the loro-mirror schema those functions do not
- * depend on. The DO reads the doc's plain JSON shape directly; no Mirror.
+ * Tail materialization for the session doc, without a Mirror. Project only
+ * the transcript and its identifying metadata, not unrelated doc roots.
  */
 import { LoroDoc } from "loro-crdt";
 import { SESSION_SCHEMA_VERSION, TAIL_MESSAGE_COUNT } from "./constants";
 import { joinContinuations, type SessionMessageEntry } from "./messages";
 import type { SessionTail } from "./sidecar";
 
-/** Read the doc's message entries without a Mirror (used by the DO for tail
- * materialization). `doc.toJSON()` yields the plain state shape for
- * lists-of-maps. */
+/** Read the doc's message entries without projecting unrelated containers. */
 export const readMessageEntries = (doc: LoroDoc): ReadonlyArray<SessionMessageEntry> => {
-  const json = doc.toJSON() as { messages?: SessionMessageEntry[] };
-  return json.messages ?? [];
+  const messages = doc.getList("messages");
+  try {
+    return messages.toJSON() as SessionMessageEntry[];
+  } finally {
+    messages.free();
+  }
 };
 
 /** Materialize the DO's `tail` slot (§5 L2): last-N messages with
@@ -25,16 +25,17 @@ export const materializeTail = (
   now: number,
   tailCount: number = TAIL_MESSAGE_COUNT
 ): SessionTail => {
-  const json = doc.toJSON() as {
-    meta?: { chatId?: string; schemaVersion?: number };
-    messages?: SessionMessageEntry[];
-  };
-  const all = joinContinuations(json.messages ?? []);
-  return {
-    chatId: json.meta?.chatId ?? "",
-    schemaVersion: json.meta?.schemaVersion ?? SESSION_SCHEMA_VERSION,
-    messages: all.slice(-tailCount),
-    totalMessages: all.length,
-    updatedAt: now
-  };
+  const all = joinContinuations(readMessageEntries(doc));
+  const meta = doc.getMap("meta");
+  try {
+    return {
+      chatId: (meta.get("chatId") as string | undefined) ?? "",
+      schemaVersion: (meta.get("schemaVersion") as number | undefined) ?? SESSION_SCHEMA_VERSION,
+      messages: all.slice(-tailCount),
+      totalMessages: all.length,
+      updatedAt: now
+    };
+  } finally {
+    meta.free();
+  }
 };

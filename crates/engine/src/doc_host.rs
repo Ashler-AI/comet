@@ -1199,8 +1199,9 @@ impl DocHost {
         let mut by_age: Vec<(i64, String)> = {
             let handles = lock(&self.inner.handles);
             handles
-                .values()
-                .map(|h| (h.last_access.load(Ordering::Relaxed), h.chat_id.clone()))
+                .iter()
+                .filter(|(key, handle)| key.as_str() == handle.chat_id)
+                .map(|(_, h)| (h.last_access.load(Ordering::Relaxed), h.chat_id.clone()))
                 .collect()
         };
         by_age.sort_unstable();
@@ -1211,13 +1212,14 @@ impl DocHost {
             }
             let (count, estimate) = {
                 let handles = lock(&self.inner.handles);
-                (
-                    handles.len(),
-                    handles
-                        .values()
-                        .map(|h| h.resident_estimate())
-                        .sum::<usize>(),
-                )
+                // Execution keys alias a shared handle; budget each document
+                // once, not once per agent session that has used it.
+                handles
+                    .iter()
+                    .filter(|(key, handle)| key.as_str() == handle.chat_id)
+                    .fold((0, 0), |(count, bytes), (_, handle)| {
+                        (count + 1, bytes + handle.resident_estimate())
+                    })
             };
             if count <= WARM_DOC_CAP && estimate <= comet_doc::DOC_LRU_BYTE_BUDGET {
                 return;
@@ -1225,7 +1227,11 @@ impl DocHost {
             let evicted = {
                 let mut handles = lock(&self.inner.handles);
                 match handles.get(&chat_id) {
-                    Some(handle) if !self.pinned(handle) => handles.remove(&chat_id),
+                    Some(handle) if !self.pinned(handle) => {
+                        let handle = handle.clone();
+                        handles.retain(|_, candidate| !Arc::ptr_eq(candidate, &handle));
+                        Some(handle)
+                    }
                     _ => None,
                 }
             };
@@ -1263,8 +1269,11 @@ impl DocHost {
     /// Probe every open chat's room (window-focus liveness sweep). Each
     /// room ignores the hint unless it has been broadcast-quiet ≥30s.
     pub fn probe_open_chats(&self) {
-        let handles: Vec<Arc<ChatDocHandle>> =
-            lock(&self.inner.handles).values().cloned().collect();
+        let handles: Vec<Arc<ChatDocHandle>> = lock(&self.inner.handles)
+            .iter()
+            .filter(|(key, handle)| key.as_str() == handle.chat_id)
+            .map(|(_, handle)| handle.clone())
+            .collect();
         for handle in handles {
             if let Some(room) = lock(&handle.room).as_ref() {
                 room.probe();
@@ -1275,8 +1284,11 @@ impl DocHost {
     /// Per-open-chat room introspection for SyncStatus / `comet sync`.
     /// `None` room = still dialing (join retry loop) or edge-less.
     pub fn sync_statuses(&self) -> Vec<(String, Option<comet_sync::RoomStatsSnapshot>)> {
-        let handles: Vec<Arc<ChatDocHandle>> =
-            lock(&self.inner.handles).values().cloned().collect();
+        let handles: Vec<Arc<ChatDocHandle>> = lock(&self.inner.handles)
+            .iter()
+            .filter(|(key, handle)| key.as_str() == handle.chat_id)
+            .map(|(_, handle)| handle.clone())
+            .collect();
         let mut rows: Vec<(String, Option<comet_sync::RoomStatsSnapshot>)> = handles
             .iter()
             .map(|h| {
@@ -1294,8 +1306,7 @@ impl DocHost {
     /// chat is gone (DeleteChat / DeleteSpace cascade). Watchers see the
     /// stream end; a racing writer keeps its orphaned doc until the run ends.
     pub fn purge_chat(&self, chat_id: &str) {
-        let removed = lock(&self.inner.handles).remove(chat_id);
-        drop(removed);
+        lock(&self.inner.handles).retain(|_, handle| handle.chat_id != chat_id);
         if let Err(err) = self.inner.store.delete_snapshot(chat_id) {
             tracing::warn!(chat = %chat_id, error = %err, "snapshot delete failed");
         }
@@ -2667,7 +2678,11 @@ impl DocHost {
 
     /// Persist every open doc now (shutdown path; bypasses the debounce).
     pub fn flush_all(&self) {
-        let handles: Vec<_> = lock(&self.inner.handles).values().cloned().collect();
+        let handles: Vec<_> = lock(&self.inner.handles)
+            .iter()
+            .filter(|(key, handle)| key.as_str() == handle.chat_id)
+            .map(|(_, handle)| handle.clone())
+            .collect();
         for handle in handles {
             self.save_snapshot(&handle);
         }
@@ -2768,6 +2783,36 @@ mod authority_tests {
     use super::*;
     use comet_proto::AgentSessionSource;
     use loro::LoroMap;
+
+    #[tokio::test]
+    async fn shared_session_aliases_do_not_survive_document_purge() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let host = DocHost::new(
+            store.clone(),
+            DocHostConfig {
+                device_id: "device-a".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        let handle = host.open("shared-chat").unwrap();
+        host.bind_session_execution_key(&handle, "session-a");
+        host.bind_session_execution_key(&handle, "session-b");
+        host.flush_all();
+        assert_eq!(
+            host.sync_statuses()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            ["shared-chat"]
+        );
+
+        host.purge_chat("shared-chat");
+        host.flush_all();
+        assert!(host.sync_statuses().is_empty());
+        assert!(store.load_snapshot("shared-chat").unwrap().is_none());
+    }
 
     #[tokio::test]
     async fn imported_local_chats_never_join_edge_rooms() {

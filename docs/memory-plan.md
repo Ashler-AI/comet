@@ -142,3 +142,93 @@ recent chats (PARITY gap) is unchanged.
 - mem-smoke thresholds in CI: engine idle <40MB; stream-retention <3× raw
   text; reopen p95 <100ms; idle creep <1MB/10min.
 - No feel-budget regression (§2), verified per landing PR.
+
+## 9. Crew 0.1.67 performance audit (2026-09-05)
+
+Audit baseline: `ba0511d` on `origin/main`. This pass covers desktop transcript
+rendering, engine/room backpressure and document lifetime, the edge's session
+projection/storage path, and iOS rendering/reconnection/persistence.
+
+### Root causes and fixes
+
+- Desktop animation frames rebuilt the message rail from the whole transcript
+  and searched all rows for every prompt. The rail is now revision-cached, with
+  one row-index map per revision and logarithmic active-tick lookup.
+- Visible markdown rows scanned all blocks just to request one block's
+  highlights. Highlight lookup now receives that block directly. Render-cache
+  invalidation removes a row bucket rather than scanning every settled entry;
+  code-copy closures share the cached source instead of copying it each frame.
+- Incremental markdown discarded its tail with a full-prefix retain scan and
+  copied append deltas. Ordered truncation and borrowed suffixes remove those
+  costs. Structural row retirement now prunes stale entry, parse, and highlight
+  caches while retaining explicitly loaded history.
+- PTY raw output, subscriber queues, and time-only batches were unbounded.
+  Raw queues, event queues, and batch sizes are now bounded, with lossless
+  per-terminal backpressure and cancellation on close. Data-free filesystem
+  invalidation kicks coalesce to one pending notification.
+- Linux file-access notifications could make Git diff capture trigger another
+  capture of its own reads. Read-only access events no longer request capture;
+  close-after-write and mutations still do.
+- Execution-key aliases retained chat documents after canonical eviction/purge
+  and duplicated snapshot/status work. Eviction removes aliases; sweeps visit
+  canonical document handles once.
+- Slow room sends and missing ACKs retained unlimited callback updates/batches.
+  Queue overflow now requests the existing reconnect/VV recovery path. Limits
+  are update-count bounds, not an absolute cap on a single snapshot's bytes.
+- Edge fragment reservations lacked aggregate limits and duplicate-index
+  handling. Per-socket reservations now enforce the existing sync limits and
+  validate complete, exact-size reassembly. Blob size/existence reads use SQL
+  `SUM(length(bytes))`, avoiding payload materialization.
+- Edge tail projection walked unrelated document roots, and continuation
+  joining repeatedly copied all accumulated parts. Projection is now scoped to
+  messages/metadata and joining appends into one owned output array.
+- iOS numeric highlighting could loop forever on numerals outside its
+  continuation predicate. It now always advances. Token recoloring walks
+  character indices monotonically rather than rebuilding every prefix.
+- iOS reconnect callbacks could schedule duplicate sockets; obsolete batch IDs
+  retained payloads after reconnect. Generation-checked redial is single-flight
+  and resubmission derives missing operations from the durable document VV.
+- iOS snapshot debounce created a sleeper for every update, and pruning
+  protected the obsolete `ws3_` prefix. Each saver now keeps one sleeper and
+  pruning preserves current `ws4_` workspace snapshots. Retired mobile parse
+  caches are pruned by live part keys.
+
+### Measured evidence
+
+Local optimized microbenchmarks, best of five; identical old/new Loro outputs
+were asserted. These measure the named operations, not end-to-end latency.
+
+| Scenario | Baseline | Fixed |
+| --- | ---: | ---: |
+| Join 1,000 continuations | 4.565 ms | 0.107 ms |
+| Join 4,000 continuations | 28.423 ms | 0.135 ms |
+| Join 10,000 continuations | 258.059 ms | 0.657 ms |
+| Tail with unrelated 8 MB root | 2.566 ms | 0.023 ms |
+| iOS Unicode numeral highlighting | Exceeded 1.5 s deadline | Three fixtures in 11.1 ms |
+
+Actual SQLite smoke covered missing, empty, multi-chunk 4.5 MB, and deleted
+blobs. The iOS lifecycle smoke used the real Swift Loro client against a local
+WebSocket endpoint: eight evictions with lost ACKs produced one socket at a
+time, full durable convergence, and no redial after stop. Trailing persistence,
+immediate flush, absence of a delayed duplicate save, and workspace retention
+beside 81 newer snapshots passed.
+
+The optimized iOS simulator benchmark built 5,000 transcript rows in 45.06 ms
+cold and 2.07 ms warm, with 24.80 ms off-main entry decode. The 120-turn demo
+rendered the streaming reply, allowed history scrolling, and returned to the
+tail through its jump control. These are current-path measurements, not a
+before/after claim for this release.
+
+### Limits of this audit
+
+A three-second sample of the already-running desktop process showed a 1.2 GB
+physical footprint (2.1 GB peak); `vmmap` attributed 944.5 MB of swapped memory
+to IOAccelerator regions. That GPU high-water observation is **not attributed
+to or claimed fixed by this pass**. The older process was an active session,
+not a controlled idle baseline. GPU diagnostics on a controlled workload and
+the eight-hour residency acceptance criteria above remain unmeasured.
+
+Source-visible costs still needing workload attribution include whole-live-
+reply display-tree construction, very large individual code blocks, Mermaid
+layout, and collaboration/command-ledger projection. No arbitrary eviction or
+notification-cadence change was introduced to hide those costs.

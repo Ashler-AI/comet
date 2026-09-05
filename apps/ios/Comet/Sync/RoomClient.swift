@@ -54,6 +54,7 @@ actor RoomClient {
     private var receiveTask: Task<Void, Never>?
     private var pingTask: Task<Void, Never>?
     private var livenessTask: Task<Void, Never>?
+    private var reconnectTask: Task<Void, Never>?
     private var pending: [BatchId: [[UInt8]]] = [:]
     private var fragments: [BatchId: FragmentBuffer] = [:]
     private var joinedLor = false
@@ -106,6 +107,8 @@ actor RoomClient {
         receiveTask?.cancel()
         pingTask?.cancel()
         livenessTask?.cancel()
+        reconnectTask?.cancel()
+        reconnectTask = nil
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
         joinedLor = false
@@ -117,6 +120,10 @@ actor RoomClient {
         let gen = generation
         joinedLor = false
         fullResyncRequested = false
+        // Batch ids belong to the old socket. Rejoin exports all missing
+        // operations from the durable doc's VV under fresh ids; keeping the
+        // old payloads here would retain them forever when their acks were lost.
+        pending.removeAll()
         fragments.removeAll()
         joinSentAt = nil
         joinIsProbe = false
@@ -160,7 +167,11 @@ actor RoomClient {
 
         pingTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: RoomClient.pingIntervalNs)
+                do {
+                    try await Task.sleep(nanoseconds: RoomClient.pingIntervalNs)
+                } catch {
+                    return
+                }
                 guard let self else { return }
                 await self.pingTick(gen: gen)
             }
@@ -168,7 +179,11 @@ actor RoomClient {
 
         livenessTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: RoomClient.livenessTickNs)
+                do {
+                    try await Task.sleep(nanoseconds: RoomClient.livenessTickNs)
+                } catch {
+                    return
+                }
                 guard let self else { return }
                 await self.livenessTick(gen: gen)
             }
@@ -191,17 +206,34 @@ actor RoomClient {
 
     private func scheduleReconnect(gen: Int) {
         guard gen == generation, !closed else { return }
+        // Invalidate callbacks before cancelling the socket. Its receive
+        // failure can otherwise schedule a second redial for this generation,
+        // leaving duplicate sockets and periodic tasks after both connect.
+        generation += 1
+        let reconnectGeneration = generation
+        reconnectTask?.cancel()
         socket?.cancel(with: .abnormalClosure, reason: nil)
         socket = nil
+        joinedLor = false
         receiveTask?.cancel()
         pingTask?.cancel()
         livenessTask?.cancel()
         let delay = backoffMs
         backoffMs = min(backoffMs * 2, RoomClient.backoffCapMs)
-        Task {
-            try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000)
-            await self.connect()
+        reconnectTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000)
+            } catch {
+                return
+            }
+            await self?.reconnectIfCurrent(gen: reconnectGeneration)
         }
+    }
+
+    private func reconnectIfCurrent(gen: Int) {
+        guard gen == generation, !closed else { return }
+        reconnectTask = nil
+        connect()
     }
 
     private func pingTick(gen: Int) async {

@@ -97,6 +97,10 @@ const RETAIN_MS = RETAIN_DAYS * DAY_MS;
 const REPLAY_CRASH_LIMIT = 3;
 /** Payload bytes per outbound fragment (leaves room for the envelope). */
 const FRAGMENT_BYTES = 200_000;
+/** Match the sync client's healthy-snapshot limits, shared across each
+ * socket's in-flight batches so incomplete headers cannot accumulate forever. */
+const MAX_REASSEMBLED_BYTES = 64 * 1024 * 1024;
+const MAX_FRAGMENT_COUNT = 1024;
 const MAX_PRESENCE_UPDATE_BYTES = 16 * 1024;
 const WORKSPACE_PRESENCE_TTL_MS = 30_000;
 const MAX_WORKSPACE_PRESENCE_PEERS = 128;
@@ -233,8 +237,9 @@ interface SocketState extends SocketGrantState {
 }
 
 interface FragmentBatch {
-  parts: Uint8Array[];
+  parts: Array<Uint8Array | undefined>;
   received: number;
+  receivedBytes: number;
   totalSize: number;
   header: DocUpdateFragmentHeader;
 }
@@ -432,13 +437,12 @@ export class SessionRoom implements DurableObject {
       await this.flush();
       const updateRows = [...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM updates")][0]
         ?.n as number;
-      const snapshot = this.blobs.get("snapshot");
       return json({
         chatId: this.getMeta("chatId") ?? null,
         connectedSockets: this.ctx.getWebSockets().length,
         updateRows,
         updateLogBytes: Number(this.getMeta("updateBytes") ?? "0"),
-        snapshotBytes: snapshot?.length ?? 0,
+        snapshotBytes: this.blobs.byteLength("snapshot") ?? 0,
         // Cold-start cost of the LAST materialization — the wedge-risk gauge
         // (2026-07-30: this creeping toward the CPU limit was invisible).
         lastReplayMs: Number(this.getMeta("lastReplayMs") ?? "0"),
@@ -446,8 +450,8 @@ export class SessionRoom implements DurableObject {
         // True between a wedge-break log drop and the first re-uploaded state
         // (the nightly backup is paused in that window).
         postReset: this.getMeta("postReset") === "1",
-        tailCached: this.getMeta("tailDirty") !== "1" && this.blobs.get("tail") !== undefined,
-        diffPublished: this.blobs.get("diff") !== undefined,
+        tailCached: this.getMeta("tailDirty") !== "1" && this.blobs.byteLength("tail") !== undefined,
+        diffPublished: this.blobs.byteLength("diff") !== undefined,
         checkpoints: (JSON.parse(this.getMeta("checkpoints") ?? "[]") as unknown[]).length,
         lastTrimAt: this.getMeta("lastTrimAt") ?? null,
         backupDirty: this.getMeta("backupDirty") === "1",
@@ -915,13 +919,36 @@ export class SessionRoom implements DurableObject {
       return;
     }
     let batches = this.fragments.get(ws);
+    if (
+      !Number.isSafeInteger(message.fragmentCount) ||
+      message.fragmentCount <= 0 ||
+      message.fragmentCount > MAX_FRAGMENT_COUNT ||
+      !Number.isSafeInteger(message.totalSizeBytes) ||
+      message.totalSizeBytes < 0 ||
+      message.totalSizeBytes > MAX_REASSEMBLED_BYTES
+    ) {
+      this.ack(ws, message, UpdateStatusCode.PayloadTooLarge, message.batchId);
+      return;
+    }
+    let reservedBytes = message.totalSizeBytes;
+    let reservedParts = message.fragmentCount;
+    for (const [id, batch] of batches ?? []) {
+      if (id === message.batchId) continue;
+      reservedBytes += batch.totalSize;
+      reservedParts += batch.parts.length;
+    }
+    if (reservedBytes > MAX_REASSEMBLED_BYTES || reservedParts > MAX_FRAGMENT_COUNT) {
+      this.ack(ws, message, UpdateStatusCode.PayloadTooLarge, message.batchId);
+      return;
+    }
     if (!batches) {
       batches = new Map();
       this.fragments.set(ws, batches);
     }
     batches.set(message.batchId, {
-      parts: Array.from({ length: message.fragmentCount }, () => new Uint8Array()),
+      parts: new Array<Uint8Array | undefined>(message.fragmentCount),
       received: 0,
+      receivedBytes: 0,
       totalSize: message.totalSizeBytes,
       header: message
     });
@@ -939,13 +966,38 @@ export class SessionRoom implements DurableObject {
       this.ack(ws, message, UpdateStatusCode.FragmentTimeout, message.batchId);
       return;
     }
+    if (
+      message.crdt !== batch.header.crdt ||
+      message.roomId !== batch.header.roomId ||
+      !Number.isSafeInteger(message.index) ||
+      message.index < 0 ||
+      message.index >= batch.parts.length
+    ) {
+      this.fragments.get(ws)?.delete(message.batchId);
+      this.ack(ws, message, UpdateStatusCode.InvalidUpdate, message.batchId);
+      return;
+    }
+    // Retransmission must not count a part twice or complete a sparse batch.
+    if (batch.parts[message.index] !== undefined) return;
+    if (message.fragment.length > batch.totalSize - batch.receivedBytes) {
+      this.fragments.get(ws)?.delete(message.batchId);
+      this.ack(ws, message, UpdateStatusCode.PayloadTooLarge, message.batchId);
+      return;
+    }
     batch.parts[message.index] = message.fragment;
     batch.received++;
+    batch.receivedBytes += message.fragment.length;
     if (batch.received < batch.parts.length) return;
     this.fragments.get(ws)?.delete(message.batchId);
+    if (batch.receivedBytes !== batch.totalSize) {
+      this.ack(ws, message, UpdateStatusCode.InvalidUpdate, message.batchId);
+      return;
+    }
     const total = new Uint8Array(batch.totalSize);
     let off = 0;
     for (const part of batch.parts) {
+      // Every index was received exactly once before reaching this loop.
+      if (part === undefined) throw new Error("incomplete fragment batch");
       total.set(part, off);
       off += part.length;
     }
@@ -1264,7 +1316,7 @@ export class SessionRoom implements DurableObject {
     if (cutoff && this.getMeta("lastTrimAt") !== String(cutoff.at)) {
       frontiers = cutoff.frontiers.map((f) => ({ peer: f.peer as `${number}`, counter: f.counter }));
     } else if (
-      (this.blobs.get("snapshot")?.length ?? 0) + Number(this.getMeta("updateBytes") ?? "0") >
+      (this.blobs.byteLength("snapshot") ?? 0) + Number(this.getMeta("updateBytes") ?? "0") >
       TRIM_FORCE_BYTES
     ) {
       // Snapshot AND log bytes: after a wedge-break reset the re-uploaded

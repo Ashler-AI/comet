@@ -50,6 +50,10 @@ const FRAGMENT_BYTES: usize = 200_000;
 /// Refuse inbound allocation claims beyond a generous healthy snapshot budget.
 const MAX_REASSEMBLED_BYTES: usize = 64 * 1024 * 1024;
 const MAX_FRAGMENT_COUNT: u64 = 1024;
+/// Outbound commit queues and unacknowledged batches must not grow with the
+/// duration of a slow connection. Overflow rejoins from the server's VV.
+const LOCAL_UPDATE_QUEUE_CAP: usize = 64;
+const MAX_PENDING_BATCHES: usize = 64;
 
 fn fragment_batch_within_limits(fragment_count: u64, total_size_bytes: u64) -> bool {
     fragment_count > 0
@@ -467,14 +471,28 @@ impl RoomClient {
     ) -> Result<Self, SyncError> {
         let eph = EphemeralStore::new(EPHEMERAL_TIMEOUT_MS);
 
-        let (local_tx, local_rx) = mpsc::unbounded_channel();
+        let (overflow_tx, overflow_rx) = mpsc::channel(1);
+        let local_overflow = overflow_tx.clone();
+        let (local_tx, local_rx) = mpsc::channel(LOCAL_UPDATE_QUEUE_CAP);
         let sub_doc = doc.subscribe_local_update(Box::new(move |bytes: &Vec<u8>| {
-            let _ = local_tx.send(bytes.clone());
+            match local_tx.try_reserve() {
+                Ok(permit) => permit.send(bytes.clone()),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    let _ = local_overflow.try_send(());
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {}
+            }
             true
         }));
-        let (eph_tx, eph_rx) = mpsc::unbounded_channel();
+        let (eph_tx, eph_rx) = mpsc::channel(LOCAL_UPDATE_QUEUE_CAP);
         let sub_eph = eph.subscribe_local_updates(Box::new(move |bytes: &Vec<u8>| {
-            let _ = eph_tx.send(bytes.clone());
+            match eph_tx.try_reserve() {
+                Ok(permit) => permit.send(bytes.clone()),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    let _ = overflow_tx.try_send(());
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {}
+            }
             true
         }));
 
@@ -492,6 +510,7 @@ impl RoomClient {
             connector,
             local_rx,
             eph_rx,
+            overflow_rx,
             probe_rx,
             redial_rx,
             tuning,
@@ -598,8 +617,9 @@ struct RoomActor {
     eph: EphemeralStore,
     room_id: String,
     connector: Arc<dyn Connector>,
-    local_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    eph_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    local_rx: mpsc::Receiver<Vec<u8>>,
+    eph_rx: mpsc::Receiver<Vec<u8>>,
+    overflow_rx: mpsc::Receiver<()>,
     probe_rx: mpsc::Receiver<()>,
     redial_rx: mpsc::Receiver<()>,
     tuning: RoomTuning,
@@ -698,6 +718,7 @@ impl RoomActor {
                     _ = self.shutdown.changed() => return,
                     Some(_) = self.local_rx.recv() => {}
                     Some(_) = self.eph_rx.recv() => {}
+                    Some(_) = self.overflow_rx.recv() => {}
                     // Probe/redial hints while disconnected: the redial
                     // already underway is the answer, nothing to remember.
                     Some(_) = self.probe_rx.recv() => {}
@@ -725,6 +746,7 @@ impl RoomActor {
         // dropped rather than replayed.
         while self.local_rx.try_recv().is_ok() {}
         while self.eph_rx.try_recv().is_ok() {}
+        while self.overflow_rx.try_recv().is_ok() {}
 
         let mut sess = Session {
             doc: self.doc.clone(),
@@ -800,6 +822,14 @@ impl RoomActor {
                             .await;
                     }
                     break SessionEnd::Shutdown;
+                }
+                Some(_) = self.overflow_rx.recv() => {
+                    // Callbacks cannot await socket backpressure. The data is
+                    // still in the doc/store: rejoin re-exports the missing
+                    // durable updates and the current ephemeral state.
+                    break SessionEnd::Lost(SyncError::WebSocket(
+                        "local update queue full; resyncing from version vector".into(),
+                    ));
                 }
                 frame = pipe.rx.recv() => match frame {
                     None => break SessionEnd::Lost(SyncError::WebSocket("connection closed".into())),
@@ -1399,6 +1429,7 @@ impl Session {
     }
 
     async fn flush_small_batch(&mut self, updates: Vec<Vec<u8>>) -> Result<(), SyncError> {
+        self.check_pending_capacity()?;
         let batch_id = new_batch_id();
         self.pending.insert(batch_id, updates.clone());
         self.send(&ProtocolMessage::DocUpdate {
@@ -1411,6 +1442,7 @@ impl Session {
     }
 
     async fn send_fragmented(&mut self, update: Vec<u8>) -> Result<(), SyncError> {
+        self.check_pending_capacity()?;
         let batch_id = new_batch_id();
         self.pending.insert(batch_id, vec![update.clone()]);
         let fragment_count = update.len().div_ceil(FRAGMENT_BYTES);
@@ -1431,6 +1463,18 @@ impl Session {
                 fragment: chunk.to_vec(),
             })
             .await?;
+        }
+        Ok(())
+    }
+
+    fn check_pending_capacity(&self) -> Result<(), SyncError> {
+        if self.pending.len() >= MAX_PENDING_BATCHES {
+            // The next join derives all unacknowledged data from the server's
+            // VV; retaining every sent batch during a stalled ACK path is
+            // unnecessary and otherwise grows for the entire connection.
+            return Err(SyncError::WebSocket(
+                "too many unacknowledged updates; resyncing from version vector".into(),
+            ));
         }
         Ok(())
     }

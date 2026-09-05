@@ -149,15 +149,17 @@ impl RenderOptions {
 /// [`RenderCache::sync_palette`] drops everything when the palette moves.
 #[derive(Default)]
 pub struct RenderCache {
-    flats: HashMap<(SharedString, usize, usize), Rc<FlatText>>,
-    code: HashMap<(SharedString, usize, usize), Rc<CachedCode>>,
+    // Group by row so invalidating a streaming tail never scans settled history.
+    flats: HashMap<SharedString, HashMap<(usize, usize), Rc<FlatText>>>,
+    code: HashMap<SharedString, HashMap<(usize, usize), Rc<CachedCode>>>,
     /// The [`crate::theme::theme_generation`] these entries were shaped under.
     generation: u32,
 }
 
 /// Cached per-line code runs (validity: code length + highlight identity).
 pub struct CachedCode {
-    code_len: usize,
+    /// Retain the copy payload once, rather than cloning all source bytes per frame.
+    code_text: SharedString,
     /// Slice-pointer identity + len of the highlight Arc that produced this.
     hl_key: (usize, usize),
     lines: Vec<(SharedString, Vec<TextRun>)>,
@@ -167,8 +169,8 @@ pub struct CachedCode {
 impl RenderCache {
     /// Drop every cached entry for `row`.
     pub fn invalidate_row(&mut self, row: &str) {
-        self.flats.retain(|(r, _, _), _| r.as_ref() != row);
-        self.code.retain(|(r, _, _), _| r.as_ref() != row);
+        self.flats.remove(row);
+        self.code.remove(row);
     }
 
     pub fn clear(&mut self) {
@@ -1158,7 +1160,9 @@ fn flatten_cached(
             cache.sync_palette();
             cache
                 .flats
-                .entry((opts.row_key.clone(), top_ix, ix))
+                .entry(opts.row_key.clone())
+                .or_default()
+                .entry((top_ix, ix))
                 .or_insert_with(|| Rc::new(flatten_runs_weighted(runs, theme, base_weight)))
                 .clone()
         }
@@ -1679,7 +1683,7 @@ fn render_code_block(
             })
             .fold(0.0, f32::max);
         Rc::new(CachedCode {
-            code_len: code.len(),
+            code_text: code.to_string().into(),
             hl_key,
             lines,
             content_width,
@@ -1691,9 +1695,11 @@ fn render_code_block(
             cache.sync_palette();
             let entry = cache
                 .code
-                .entry((opts.row_key.clone(), top_ix, ix))
+                .entry(opts.row_key.clone())
+                .or_default()
+                .entry((top_ix, ix))
                 .or_insert_with(&build);
-            if entry.code_len != code.len() || entry.hl_key != hl_key {
+            if entry.code_text.len() != code.len() || entry.hl_key != hl_key {
                 *entry = build();
             }
             entry.clone()
@@ -1712,7 +1718,7 @@ fn render_code_block(
         None => Vec::new(),
     };
     let scroll_id: SharedString = format!("{}-code{ix}", opts.row_key).into();
-    let copy_button = code_copy_button(code, ix, opts, theme);
+    let copy_button = code_copy_button(|| cached.code_text.clone(), ix, opts, theme);
     div()
         .rounded(px(10.0))
         // Faint white wash over the near-black panel ≈ #101010 (comet's code
@@ -1787,14 +1793,14 @@ fn render_code_block(
 /// the "Copied" flash never shifts layout. Sits centered in the header when
 /// there is one, floats over the first code line otherwise.
 pub(crate) fn code_copy_button(
-    code: &str,
+    code: impl FnOnce() -> SharedString,
     ix: usize,
     opts: &RenderOptions,
     theme: &Theme,
 ) -> Option<gpui::Stateful<gpui::Div>> {
     opts.copy.clone().map(|copy| {
         let copied = copy.copied_ix == Some(ix);
-        let code_text: SharedString = code.to_string().into();
+        let code_text = code();
         let handler = copy.handler.clone();
         let fade_key = format!("{}-copy{ix}", opts.row_key);
         div()
