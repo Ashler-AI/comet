@@ -305,6 +305,35 @@ The isolated app installation, Worker state, and throwaway probe were removed
 after verification. Rollback bundles and the pre-cleanup workspace snapshot
 remain under `~/Library/Application Support/Crew Migration Backups/`.
 
+#### Archived-history availability and authorization follow-up
+
+The 699 count refers to workspace session records, not a guarantee that every
+historical transcript is cached locally. Per-user membership filtering excludes
+117 archived records from the 582-row view. In both the live principal-scoped
+DocsStore and the pre-cutover backup, 24 of those records have nonempty decoded
+transcripts, 17 have valid snapshots without messages, and 76 have no snapshot.
+All 41 existing snapshots are byte-identical to their pre-cutover copies; none
+is backup-only. No matching journals were found in the principal-scoped or
+legacy staging project directories, and none of the 41 snapshots contains an
+ownership publication. Cloud transcript availability for these historical
+records was not verified. Unarchiving alone does not create the missing
+per-user membership; recovery must use the existing authorized session-ID or
+invitation flow rather than bypassing the ownership boundary.
+
+Follow-up review found an authorization-ordering race: document materialization
+could yield after the socket's final authority check. Update and join handlers
+now materialize first, authorize last, reject closed/reset sockets, and use only
+the current live document after that await. This also avoids retaining a
+document freed by concurrent compaction. The compaction regression now asserts
+that its persistence barrier was actually entered instead of allowing a
+sequential run to pass.
+
+The revocation regression failed against the pre-fix implementation. All 102
+Edge tests passed with the final guards, including trim, idle release, and
+reset/rematerialization interleavings. The real local Worker/official-desktop
+collaboration smoke also passed authentication, relay, reconnect, forged-actor
+rejection, and active revocation.
+
 ### Limits of this audit
 
 A three-second sample of the already-running desktop process showed a 1.2 GB

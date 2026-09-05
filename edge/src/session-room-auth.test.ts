@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath, URL as NodeUrl } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { CrdtType, MessageType, UpdateStatusCode, decode, encode, type JoinRequest, type ProtocolMessage } from "loro-protocol";
+import { CrdtType, JoinErrorCode, MessageType, UpdateStatusCode, decode, encode, type JoinRequest, type ProtocolMessage } from "loro-protocol";
 import { LoroDoc } from "loro-crdt";
 import {
   AUTH_CAPABILITIES_HEADER,
@@ -98,6 +98,7 @@ class MemorySql {
 }
 
 class CapturingSocket {
+  readyState: number = WebSocket.OPEN;
   readonly sent: Uint8Array[] = [];
   readonly closed: Array<{ code: number | undefined; reason: string | undefined }> = [];
   private attachment: unknown;
@@ -115,6 +116,7 @@ class CapturingSocket {
   }
 
   close(code?: number, reason?: string): void {
+    this.readyState = WebSocket.CLOSED;
     this.closed.push({ code, reason });
   }
 }
@@ -129,11 +131,14 @@ interface JoinState {
   rooms: string[];
   deviceId?: string;
   workspace?: boolean;
+  grantId?: string;
+  grantExpiresAt?: number;
 }
 
 interface SessionRoomInternals {
   eph?: unknown;
   ensureDoc(): Promise<LoroDoc>;
+  trimHistoryIfDue(doc: LoroDoc, now: number): Promise<boolean>;
   handleJoin(ws: WebSocket, state: JoinState, message: JoinRequest): Promise<void>;
   applyUpdates(
     ws: WebSocket,
@@ -159,7 +164,8 @@ const oversizedPayload = (): Uint8Array => {
 
 const makeRoom = (
   sql = new MemorySql(),
-  sync: () => Promise<void> = async () => {}
+  sync: () => Promise<void> = async () => {},
+  grantStatus: () => Promise<Response> = async () => new Response(null, { status: 200 })
 ): { room: SessionRoom; sql: MemorySql; sockets: WebSocket[] } => {
   const sockets: WebSocket[] = [];
   const storage = {
@@ -177,7 +183,13 @@ const makeRoom = (
       throw new Error(reason ?? "aborted");
     }
   } as unknown as DurableObjectState;
-  return { room: new SessionRoom(ctx, {} as Env), sql, sockets };
+  const env = {
+    AUTH_GRANTS: {
+      idFromName: (id: string) => id,
+      get: () => ({ fetch: grantStatus })
+    }
+  } as unknown as Env;
+  return { room: new SessionRoom(ctx, env), sql, sockets };
 };
 
 const authedRequest = (path: string, userId: string, init: RequestInit = {}): Request => {
@@ -218,6 +230,7 @@ const join = async (room: SessionRoom, userId: string, roomId: string): Promise<
 describe("SessionRoom chat authorization", () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", { OPEN: 1, CLOSED: 3 });
     vi.stubGlobal(
       "WebSocketRequestResponsePair",
       class {
@@ -356,6 +369,240 @@ describe("SessionRoom chat authorization", () => {
     }
   });
 
+  it("rejects a grant revoked while a cold document is materializing", async () => {
+    const entered = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    let pause = false;
+    let authorized = true;
+    const { room } = makeRoom(new MemorySql(), async () => {
+      if (!pause) return;
+      pause = false;
+      entered.resolve();
+      await resume.promise;
+    }, async () => new Response(null, { status: authorized ? 200 : 403 }));
+    const socket = await join(room, "user-a", "authority-chat");
+    const state = socket.deserializeAttachment() as JoinState;
+    state.grantId = "grant-1";
+    state.grantExpiresAt = Date.now() + 600_000;
+    socket.sent.length = 0;
+    vi.advanceTimersByTime(61_000);
+    const source = new LoroDoc();
+    source.getMap("metadata").set("forbidden", true);
+    pause = true;
+    const applying = room.webSocketMessage(socket as unknown as WebSocket, Uint8Array.from(encode({
+      type: MessageType.DocUpdate,
+      crdt: CrdtType.Loro,
+      roomId: "authority-chat",
+      batchId: "0x0000000000000001",
+      updates: [source.export({ mode: "update" })]
+    })).buffer);
+    try {
+      await Promise.race([entered.promise, applying]);
+      expect(pause).toBe(false);
+      // The authority revokes before its notification reaches the room.
+      authorized = false;
+      resume.resolve();
+      await applying;
+      expect(socket.closed).toContainEqual({ code: 4403, reason: "device grant invalid" });
+      expect(socket.sent).toEqual([]);
+      const live = await (room as unknown as SessionRoomInternals).ensureDoc();
+      expect(live.getMap("metadata").get("forbidden")).toBeUndefined();
+      const stats = await room.fetch(authedRequest("/stats", "user-a"));
+      expect(stats.status).toBe(200);
+      const snapshot = await room.fetch(authedRequest("/snapshot", "user-a"));
+      const mirror = new LoroDoc();
+      try {
+        mirror.import(new Uint8Array(await snapshot.arrayBuffer()));
+        expect(mirror.getMap("metadata").get("forbidden")).toBeUndefined();
+      } finally {
+        mirror.free();
+      }
+    } finally {
+      resume.resolve();
+      await applying;
+      source.free();
+    }
+  });
+
+  it.each(["trim", "idle release", "reset"] as const)(
+    "uses only the live document after %s during authority lookup",
+    async (transition) => {
+      const entered = Promise.withResolvers<void>();
+      const resume = Promise.withResolvers<void>();
+      let pause = false;
+      const { room, sql, sockets } = makeRoom(new MemorySql(), undefined, async () => {
+        if (pause) {
+          pause = false;
+          entered.resolve();
+          await resume.promise;
+        }
+        return new Response(null, { status: 200 });
+      });
+      const socket = await join(room, "user-a", "authority-chat");
+      const state = socket.deserializeAttachment() as JoinState;
+      state.grantId = "grant-1";
+      state.grantExpiresAt = Date.now() + 600_000;
+      sockets.push(socket as unknown as WebSocket);
+      socket.sent.length = 0;
+      const internals = room as unknown as SessionRoomInternals;
+      const source = new LoroDoc();
+      source.getMap("metadata").set("baseline", true);
+      expect((await room.fetch(authedRequest("/append", "user-a", {
+        method: "POST",
+        body: source.export({ mode: "update" })
+      }))).status).toBe(200);
+      await room.fetch(authedRequest("/stats", "user-a"));
+      socket.sent.length = 0;
+      const before = source.oplogVersion();
+      source.getMap("metadata").set("duringAuthority", true);
+      const delta = source.export({ mode: "update", from: before });
+      before.free();
+      pause = true;
+      const applying = internals.applyUpdates(
+        socket as unknown as WebSocket, state, CrdtType.Loro, "authority-chat",
+        "0x0000000000000001", [delta]
+      );
+      try {
+        await Promise.race([entered.promise, applying]);
+        expect(pause).toBe(false);
+        if (transition === "trim") {
+          const live = await internals.ensureDoc();
+          sql.meta.set("checkpoints", JSON.stringify([{
+            at: Date.now() - 365 * 24 * 60 * 60 * 1000,
+            frontiers: live.frontiers()
+          }]));
+          expect(await internals.trimHistoryIfDue(live, Date.now())).toBe(true);
+        } else if (transition === "idle release") {
+          vi.advanceTimersByTime(61_000);
+        } else {
+          expect((await room.fetch(authedRequest("/reset-log", "user-a", {
+            method: "POST"
+          }))).status).toBe(200);
+          // Even a new live doc must not admit a pre-reset socket's write.
+          await internals.ensureDoc();
+        }
+        resume.resolve();
+        await applying;
+        const messages = socket.sent.map((bytes) => decode(bytes));
+        if (transition === "reset") {
+          expect(socket.closed).toContainEqual({ code: 4410, reason: "room reset" });
+          expect(messages).toEqual([]);
+        } else {
+          expect(messages).toEqual([{
+            type: MessageType.Ack,
+            crdt: CrdtType.Loro,
+            roomId: "authority-chat",
+            refId: "0x0000000000000001",
+            status: transition === "trim" ? UpdateStatusCode.Ok : UpdateStatusCode.InvalidUpdate
+          }]);
+        }
+        const live = await internals.ensureDoc();
+        expect(live.getMap("metadata").get("duringAuthority")).toBe(
+          transition === "trim" ? true : undefined
+        );
+        const snapshot = await room.fetch(authedRequest("/snapshot", "user-a"));
+        const mirror = new LoroDoc();
+        try {
+          mirror.import(new Uint8Array(await snapshot.arrayBuffer()));
+          expect(mirror.getMap("metadata").get("duringAuthority")).toBe(
+            transition === "trim" ? true : undefined
+          );
+        } finally {
+          mirror.free();
+        }
+      } finally {
+        resume.resolve();
+        await applying;
+        source.free();
+      }
+    }
+  );
+
+  it.each(["trim", "idle release", "reset"] as const)(
+    "answers a join safely after %s during authority lookup",
+    async (transition) => {
+      const entered = Promise.withResolvers<void>();
+      const resume = Promise.withResolvers<void>();
+      let pause = true;
+      const { room, sql, sockets } = makeRoom(new MemorySql(), undefined, async () => {
+        pause = false;
+        entered.resolve();
+        await resume.promise;
+        return new Response(null, { status: 200 });
+      });
+      const source = new LoroDoc();
+      source.getMap("metadata").set("baseline", true);
+      sql.appendUpdate(source.export({ mode: "update" }));
+      const internals = room as unknown as SessionRoomInternals;
+      const socket = new CapturingSocket();
+      const state: JoinState = {
+        userId: "user-a",
+        projectScope: PROJECT_SCOPE,
+        capabilities: CAPABILITIES,
+        rooms: [],
+        grantId: "grant-1",
+        grantExpiresAt: Date.now() + 600_000
+      };
+      socket.serializeAttachment(state);
+      sockets.push(socket as unknown as WebSocket);
+      const joining = internals.handleJoin(
+        socket as unknown as WebSocket, state, joinRequest("authority-chat")
+      );
+      try {
+        await Promise.race([entered.promise, joining]);
+        expect(pause).toBe(false);
+        if (transition === "trim") {
+          const live = await internals.ensureDoc();
+          sql.meta.set("checkpoints", JSON.stringify([{
+            at: Date.now() - 365 * 24 * 60 * 60 * 1000,
+            frontiers: live.frontiers()
+          }]));
+          expect(await internals.trimHistoryIfDue(live, Date.now())).toBe(true);
+        } else if (transition === "idle release") {
+          vi.advanceTimersByTime(61_000);
+        } else {
+          expect((await room.fetch(authedRequest("/reset-log", "user-a", {
+            method: "POST"
+          }))).status).toBe(200);
+          await internals.ensureDoc();
+        }
+        resume.resolve();
+        await joining;
+        const messages = socket.sent.map((bytes) => decode(bytes));
+        if (transition === "trim") {
+          expect(messages[0]?.type).toBe(MessageType.JoinResponseOk);
+          expect(state.rooms).toContain(CrdtType.Loro);
+          const backfill = messages.find((message) => message.type === MessageType.DocUpdate);
+          expect(backfill?.type).toBe(MessageType.DocUpdate);
+          const mirror = new LoroDoc();
+          try {
+            if (backfill?.type === MessageType.DocUpdate) {
+              for (const update of backfill.updates) mirror.import(update);
+            }
+            expect(mirror.getMap("metadata").get("baseline")).toBe(true);
+          } finally {
+            mirror.free();
+          }
+        } else {
+          expect(state.rooms).toEqual([]);
+          if (transition === "idle release") {
+            expect(messages).toEqual([expect.objectContaining({
+              type: MessageType.JoinError,
+              code: JoinErrorCode.AppError
+            })]);
+          } else {
+            expect(socket.closed).toContainEqual({ code: 4410, reason: "room reset" });
+            expect(messages).toEqual([]);
+          }
+        }
+      } finally {
+        resume.resolve();
+        await joining;
+        source.free();
+      }
+    }
+  );
+
   it("bounds fragment reservations across incomplete batches and rejects oversized payloads", async () => {
     const { room } = makeRoom();
     const socket = await join(room, "user-a", "fragment-chat");
@@ -475,6 +722,7 @@ describe("SessionRoom chat authorization", () => {
     const flushing = room.fetch(authedRequest("/stats", "user-a"));
     try {
       await Promise.race([entered.promise, flushing]);
+      expect(pause).toBe(false);
       const beforeDelta = source.oplogVersion();
       source.getMap("metadata").set("duringPersistence", true);
       source.commit();

@@ -726,8 +726,22 @@ export class SessionRoom implements DurableObject {
     if (!this.getMeta("chatId") && message.roomId) this.setMeta("chatId", message.roomId);
 
     if (message.crdt === CrdtType.Loro) {
-      const doc = await this.ensureDoc();
+      await this.ensureDoc();
       if (!(await this.authorizeSocket(ws, state))) return;
+      if (ws.readyState !== WebSocket.OPEN) return;
+      // Trimming frees the old doc while authority lookup yields; idle release
+      // may remove it entirely. Do not retain the materialization result.
+      const doc = this.doc;
+      if (!doc) {
+        this.send(ws, {
+          type: MessageType.JoinError,
+          crdt: message.crdt,
+          roomId: message.roomId,
+          code: JoinErrorCode.AppError,
+          message: "document released; rejoin"
+        });
+        return;
+      }
       if (!state.rooms.includes(message.crdt)) state.rooms.push(message.crdt);
       ws.serializeAttachment(state);
       // Wasm-bindgen objects (VersionVector here and below) free their wasm
@@ -847,8 +861,18 @@ export class SessionRoom implements DurableObject {
       return;
     }
     if (crdt === CrdtType.Loro) {
+      await this.ensureDoc();
       if (!(await this.authorizeSocket(ws, state))) return;
-      const doc = await this.ensureDoc();
+      // A reset closes the old socket even if another request has already
+      // materialized a replacement. Never admit that socket's in-flight write.
+      if (ws.readyState !== WebSocket.OPEN) return;
+      // Authority lookup may yield to a trim (which frees/replaces the doc)
+      // or idle release. Use only the current live doc, with no further await.
+      const doc = this.doc;
+      if (!doc) {
+        this.ack(ws, { crdt, roomId }, UpdateStatusCode.InvalidUpdate, batchId);
+        return;
+      }
       try {
         for (const update of updates) if (update.length > 0) doc.import(update);
       } catch {
