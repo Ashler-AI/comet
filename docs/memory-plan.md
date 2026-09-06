@@ -397,9 +397,10 @@ active. The user explicitly chose to leave that writer running. This cutover
 is **not** claimed to have been uninterrupted.
 
 Staging iOS **1.0 (4)** archived successfully and App Store Connect accepted
-its cloud-signed upload. Internal-group availability remains unverified because
-the browser's App Store Connect login expired. The physical phone was not
-inspected.
+its cloud-signed upload. After web authentication became available, App Store
+Connect showed all four builds in the internal group and confirmed that its
+tester had installed **1.0 (4)**. No additional invitation was needed. Physical
+phone interactions were not directly inspected.
 
 Owned simulator, mock-host, Worker, copied-source, and profiling fixtures were
 removed. Final archives, rollback bundles, UI screenshots, the two-turn log,
@@ -427,6 +428,20 @@ producing four transcript entries; desktop settlement also removed that
 fixture from the phone's active list. The mock host deliberately paced its
 output, so these runs are behavior checks rather than latency measurements.
 No iOS source change is required for this desktop-only layout correction.
+
+Official release run
+[`34005890849`](https://github.com/Ashler-AI/comet/actions/runs/34005890849)
+published staging desktop **0.1.70** from `0b1abdf`. Both artifact checksums,
+the installed executable comparison, and the ad-hoc signature verified.
+The user approved the internal build's installation. The new viewport
+connected to the already-running 0.1.69 engine; its old window was minimized,
+not closed. The engine retained the same PID and device identity throughout
+this handover. The surviving OMP writer was not taken over.
+
+The actual installed viewport rendered equal-width cards and the trailing
+status rail. Official artifacts, screenshots, the TestFlight installation
+receipt, and the native two-turn log are retained in the private
+`sidebar-0.1.70` directory beside the earlier release evidence.
 
 ### Limits of this audit
 
