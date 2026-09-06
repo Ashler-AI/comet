@@ -492,10 +492,17 @@ without traversing millions of JavaScript indices; its timeout and payload
 boundary are unchanged. All 104 edge tests passed locally and in CI.
 
 The accepted archive, native OMP log, model-picker and installation screenshots,
-original cache, deployment log, and release receipt are retained in the private
+original cache, deployment log, exact deployed source archive, and release receipt are retained in the private
 `mobile-recovery-1.0.5` directory beside the earlier release evidence.
 
-Typechecking was intentionally not run because global instructions prohibit it.
+Typechecking was intentionally not run locally or in CI: the global prohibition
+includes CI jobs. Run `34036591243` used the deployment-only branch
+`deploy/staging-mobile-recovery-no-typecheck-20260906`, whose workflow removed
+the `Typecheck` step. That workflow change was not merged into `main`; the
+workflow on `main` is unchanged. The real Rust/Edge collaboration smoke, binding
+generation checks, all 104 edge tests, and sealed-candidate deployment still ran.
+The one-off remote branch was deleted after preserving commit `b3d4a3d` in
+`deployment-source.tar` alongside the release evidence.
 
 ### Limits of this audit
 
