@@ -539,6 +539,14 @@ That engine returned `CREW_0_1_71_RELEASE_OK` through the shared DO to both
 clients. This proves the released engine in a real sandbox, not an updated fleet
 template; the existing image manifest was deliberately left unchanged.
 
+The exact published macOS application archive matched SHA-256
+`be317df5b7c3d402f227d783fe2bba6b39f1ee23e421207b35104e6ef823e957`.
+Its native UI opened the shared transcript and composer without any local spaces,
+showing both the release reply and `CREW_0_1_71_CONTINUATION_OK`. An apparent
+onboarding failure was traced to per-window automation input not landing;
+focused desktop input worked. No new rendering patch or replacement release
+was required.
+
 TestFlight processed production **1.0 (4)** and staging **1.0 (7)** and assigned
 both to **Ashler Internal**. The production tester still needs to accept the
 invitation. The simulator rendered the login surface; authenticated mobile UI
@@ -552,6 +560,13 @@ retains its immutable attestation after activation and rollback were denied.
 It was not deleted or bypassed. The full session-image build also invokes a
 typecheck cache builder; that workflow was not dispatched. Completing the full
 Scaffold rollout requires those release prerequisites, not just updated pins.
+
+PR 5838 also migrates existing Infisical `proxy-url` values explicitly: omission
+from a dotenv upsert does not delete a remote key. Seven focused executable
+bootstrap regressions passed, including lookup/deletion failure recovery without
+reseeding. The exact live path exposes only the required four direct-routing
+keys. The script retains credentials on a migration failure and is idempotent
+when the legacy key is already absent.
 
 ### Limits of this audit
 
