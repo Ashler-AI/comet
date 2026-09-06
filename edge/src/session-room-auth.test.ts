@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { readFileSync } from "node:fs";
 import { fileURLToPath, URL as NodeUrl } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -804,7 +805,10 @@ describe("SessionRoom chat authorization", () => {
     const restored = new LoroDoc();
     restored.import(new Uint8Array(await snapshot.arrayBuffer()));
     expect(restored.getMap("metadata").get("before")).toBe(true);
-    expect(restored.getMap("metadata").get("payload")).toEqual(payload);
+    const recoveredPayload = restored.getMap("metadata").get("payload");
+    expect(recoveredPayload).toBeInstanceOf(Uint8Array);
+    // Compare every byte without recursively inspecting millions of indices.
+    expect(Buffer.compare(recoveredPayload as Uint8Array, payload)).toBe(0);
     expect(restored.getMap("metadata").get("after")).toBe(true);
     restored.free();
     source.free();
