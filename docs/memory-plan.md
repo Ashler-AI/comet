@@ -562,11 +562,14 @@ typecheck cache builder; that workflow was not dispatched. Completing the full
 Scaffold rollout requires those release prerequisites, not just updated pins.
 
 PR 5838 also migrates existing Infisical `proxy-url` values explicitly: omission
-from a dotenv upsert does not delete a remote key. Seven focused executable
-bootstrap regressions passed, including lookup/deletion failure recovery without
+from a dotenv upsert does not delete a remote key. Ten focused executable
+bootstrap/capacity regressions passed, including lookup/deletion recovery without
 reseeding. The exact live path exposes only the required four direct-routing
 keys. The script retains credentials on a migration failure and is idempotent
 when the legacy key is already absent.
+Capacity coverage executes the quota plan and validates the workflow's
+10-vCPU/16-GiB profile; unsupported odd template CPU counts are rejected before
+provisioning. The tier fixture refuses execution while the seed tunnel is open.
 
 Release receipts, source archives, signed iOS archives, and the exact-release
 native screenshot are retained under
