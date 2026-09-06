@@ -373,6 +373,39 @@ an initial transient stale interval was not treated as proof of a persistent
 decoder or delivery defect. Unsupported timestamp compatibility code was
 removed rather than retained as a speculative fix.
 
+The final native two-turn smoke completed with four transcript entries.
+During a separately paced live turn, the phone rendered streaming content and
+`Riffing... 1s`; its session list showed an explicit `Running` label while a
+desktop-submitted command streamed. The desktop composer cleared and the
+captured response showed `Pondering... 1s`. These are observed UI states, not
+latency percentiles.
+
+Official release run
+[`33996352949`](https://github.com/Ashler-AI/comet/actions/runs/33996352949)
+published staging desktop **0.1.69** from `fe64931`. Artifact checksums and the
+installed executable matched; the app's ad-hoc signature verified. The
+repository's unnotarized packaging fails Gatekeeper assessment. Installation
+through the existing internal staging launcher received explicit user approval;
+no system-wide trust setting was changed.
+
+The installed viewport rendered populated session history and navigation.
+The old engine unexpectedly exited during the separately targeted viewport
+shutdown; this was reported as a process-isolation anomaly. The new embedded
+0.1.69 engine recovered two journals: one resumed and reported `working`,
+while the other reported `errored` because its original OMP writer remained
+active. The user explicitly chose to leave that writer running. This cutover
+is **not** claimed to have been uninterrupted.
+
+Staging iOS **1.0 (4)** archived successfully and App Store Connect accepted
+its cloud-signed upload. Internal-group availability remains unverified because
+the browser's App Store Connect login expired. The physical phone was not
+inspected.
+
+Owned simulator, mock-host, Worker, copied-source, and profiling fixtures were
+removed. Final archives, rollback bundles, UI screenshots, the two-turn log,
+and recovery receipt are retained in the private `latency-0.1.69` directory
+under `~/Library/Application Support/Crew Migration Backups/20260905-staging/`.
+
 Typechecking was intentionally not run because global instructions prohibit it.
 
 ### Limits of this audit
