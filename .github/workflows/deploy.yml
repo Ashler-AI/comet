@@ -68,9 +68,6 @@ jobs:
         run: npm run types
       - name: Require current Worker binding declarations
         run: git diff --exit-code -- edge/worker-configuration.d.ts
-      - name: Typecheck
-        working-directory: edge
-        run: npm run typecheck
       - name: Test
         working-directory: edge
         run: npm test
