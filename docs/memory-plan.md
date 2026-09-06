@@ -568,6 +568,13 @@ reseeding. The exact live path exposes only the required four direct-routing
 keys. The script retains credentials on a migration failure and is idempotent
 when the legacy key is already absent.
 
+Release receipts, source archives, signed iOS archives, and the exact-release
+native screenshot are retained under
+`~/Library/Application Support/Crew Migration Backups/20260905-staging/coordinated-0.1.71/`.
+Both smoke sandboxes are paused with history retained; isolated native clients
+were stopped and their copied session credential was removed. Four focused
+managed-secret projection tests also passed.
+
 ### Limits of this audit
 
 A three-second sample of the already-running desktop process showed a 1.2 GB
