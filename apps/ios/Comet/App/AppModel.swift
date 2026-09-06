@@ -323,11 +323,21 @@ final class AppModel {
         return spaces.first { $0.id == spaceId }
     }
 
+    func activity(chatId: String, now: Int64) -> SessionActivity {
+        let store = sessionStores[chatId]
+        return sessionActivity(
+            workspace: demo?.sessions[chatId] ?? workspace?.sessions[chatId],
+            published: store?.publishedSession, transcript: store?.transcriptActivity, now: now
+        )
+    }
+
+    func hasPendingSend(chatId: String) -> Bool {
+        !(sessionStores[chatId]?.pendingSends.isEmpty ?? true)
+    }
+
     func indicator(for chat: Chat) -> ChatIndicator {
-        if let demo {
-            return chatIndicator(chat: chat, live: effectiveStatus(demo.sessions[chat.id], now: nowMs()))
-        }
-        return workspace?.indicator(for: chat) ?? .idle
+        let now = nowMs()
+        return chatIndicator(chat: chat, live: activity(chatId: chat.id, now: now).status)
     }
 
     func spaceIndicator(_ spaceId: String) -> ChatIndicator? {

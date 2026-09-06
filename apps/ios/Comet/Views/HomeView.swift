@@ -263,7 +263,7 @@ struct ChatRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            // Line 1: space · device, then spinner / attention dot / time-ago.
+            // Unread, live status, and recency are independent signals.
             HStack(spacing: 8) {
                 if showLocation {
                     Text(location)
@@ -275,8 +275,26 @@ struct ChatRow: View {
                 } else {
                     Spacer(minLength: 4)
                 }
-                TimelineView(.periodic(from: .now, by: 1)) { _ in
-                    statusSlot(model.indicator(for: chat))
+                TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                    let now = Int64(timeline.date.timeIntervalSince1970 * 1000)
+                    let activity = model.activity(chatId: chat.id, now: now)
+                    HStack(spacing: 6) {
+                        if chat.unseen {
+                            Circle()
+                                .fill(Theme.attention)
+                                .frame(width: 7, height: 7)
+                                .accessibilityLabel("Unread")
+                        }
+                        SessionStatusBadge(status: activity.status,
+                                           sending: model.hasPendingSend(chatId: chat.id))
+                        let updatedAt = max(chat.lastMessageAt ?? chat.createdAt, activity.row?.updatedAt ?? 0)
+                        Text(relativeTime(updatedAt))
+                            .font(Theme.sans(11))
+                            .foregroundStyle(Theme.textMuted)
+                            .fixedSize()
+                            .accessibilityLabel("Last updated")
+                            .accessibilityValue(Text(Date(timeIntervalSince1970: Double(updatedAt) / 1000), style: .relative))
+                    }
                 }
             }
 
@@ -309,32 +327,6 @@ struct ChatRow: View {
         .contentShape(RoundedRectangle(cornerRadius: 8))
     }
 
-    @ViewBuilder
-    private func statusSlot(_ indicator: ChatIndicator) -> some View {
-        switch indicator {
-        case .working:
-            RunningSessionBadge()
-        case .awaitingInput, .completed, .errored:
-            Circle()
-                .fill(Theme.attention)
-                .frame(width: 7, height: 7)
-                .accessibilityLabel(attentionLabel(indicator))
-        case .idle:
-            Text(relativeTime(chat.lastMessageAt ?? chat.createdAt))
-                .font(Theme.sans(11))
-                .foregroundStyle(subline)
-                .fixedSize()
-        }
-    }
-
-    private func attentionLabel(_ indicator: ChatIndicator) -> String {
-        switch indicator {
-        case .awaitingInput: return "Awaiting input"
-        case .errored: return "Error"
-        case .completed: return "New activity"
-        case .working, .idle: return ""
-        }
-    }
 
     /// "space · device", with offline marker. The space name (not the cwd
     /// basename) is what the desktop row shows — they differ once a space has
@@ -354,28 +346,29 @@ struct SharedSessionRow: View {
     let sessionRef: SessionRef
 
     var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "globe")
-                .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(Theme.textMuted.opacity(0.7))
-                .frame(width: 16)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(model.sessionTitle(for: sessionRef))
-                    .font(Theme.sans(13))
-                    .foregroundStyle(Theme.text)
-                    .lineLimit(1)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                Text(relativeTime(sessionRef.addedAt))
-                    .font(Theme.sans(10.5))
-                    .foregroundStyle(Theme.textFaint)
-            }
-            TimelineView(.periodic(from: .now, by: 1)) { timeline in
-                let now = Int64(timeline.date.timeIntervalSince1970 * 1000)
-                let row = model.demo?.sessions[sessionRef.chatId]
-                    ?? model.workspace?.sessions[sessionRef.chatId]
-                if effectiveStatus(row, now: now) == .working {
-                    RunningSessionBadge()
+        TimelineView(.periodic(from: .now, by: 1)) { timeline in
+            let now = Int64(timeline.date.timeIntervalSince1970 * 1000)
+            let activity = model.activity(chatId: sessionRef.chatId, now: now)
+            let updatedAt = max(sessionRef.addedAt, activity.row?.updatedAt ?? 0)
+            HStack(spacing: 10) {
+                Image(systemName: "globe")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Theme.textMuted.opacity(0.7))
+                    .frame(width: 16)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(model.sessionTitle(for: sessionRef))
+                        .font(Theme.sans(13))
+                        .foregroundStyle(Theme.text)
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Text(relativeTime(updatedAt))
+                        .font(Theme.sans(10.5))
+                        .foregroundStyle(Theme.textMuted)
+                        .accessibilityLabel("Last updated")
+                        .accessibilityValue(Text(Date(timeIntervalSince1970: Double(updatedAt) / 1000), style: .relative))
                 }
+                SessionStatusBadge(status: activity.status,
+                                   sending: model.hasPendingSend(chatId: sessionRef.chatId))
             }
         }
         .padding(.horizontal, 8)
@@ -384,14 +377,25 @@ struct SharedSessionRow: View {
     }
 }
 
-private struct RunningSessionBadge: View {
+private struct SessionStatusBadge: View {
+    let status: SessionStatus?
+    var sending = false
+
     var body: some View {
-        HStack(spacing: 4) {
-            ArcSpinner()
-            Text("Running")
-                .font(Theme.sans(11))
-                .foregroundStyle(Theme.textMuted)
+        Group {
+            if sending || status == .working {
+                HStack(spacing: 4) {
+                    ArcSpinner()
+                    Text(sending ? "Sending" : "Running")
+                }
+            } else if status == .awaitingInput {
+                Text("Awaiting input").foregroundStyle(Theme.attention)
+            } else if status == .errored {
+                Text("Failed").foregroundStyle(Theme.danger)
+            }
         }
+        .font(Theme.sans(11))
+        .foregroundStyle(Theme.textMuted)
         .fixedSize()
         .accessibilityElement(children: .combine)
     }

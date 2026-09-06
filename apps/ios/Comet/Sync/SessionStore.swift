@@ -13,6 +13,8 @@ final class SessionStore {
     let chatId: String
     private(set) var deploymentId: String?
     private(set) var entries: [MessageEntry] = []
+    private(set) var publishedSession: SessionRow?
+    private(set) var transcriptActivity: SessionRow?
     /// Bumped on every change to `entries` / `pendingSends`. The transcript's
     /// row builder memoizes on it, so a body re-eval that was triggered by
     /// something else (scrolling) costs O(1) instead of re-deriving every row.
@@ -34,6 +36,7 @@ final class SessionStore {
     private var room: RoomClient?
     private var subscriptions: [Subscription] = []
     @ObservationIgnored private var roomEpoch: UInt64 = 0
+    @ObservationIgnored private var lastRemoteUpdateAt: Int64?
     private let config: AppConfig
 
     /// Demo mode: no room, entries driven externally.
@@ -54,6 +57,7 @@ final class SessionStore {
     /// Demo-mode injection point (also used by previews).
     func setEntries(_ new: [MessageEntry]) {
         entries = new
+        transcriptActivity = Self.activity(in: new, chatId: chatId, observedAt: nowMs())
         revision &+= 1
     }
 
@@ -140,6 +144,7 @@ final class SessionStore {
         case .disconnected:
             connected = false
         case .remoteUpdate:
+            lastRemoteUpdateAt = nowMs()
             project()
             saver?.poke()
         case .ephemeralUpdate:
@@ -173,10 +178,12 @@ final class SessionStore {
         projecting = true
         let doc = self.doc
         let pendingMessageIds = Set(pendingSends.map(\.messageId))
+        let chatId = self.chatId
+        let observedAt = lastRemoteUpdateAt
         Task { @MainActor [weak self] in
             let (decoded, failures) = await Task.detached(priority: .userInitiated) {
                 let root = doc.getDeepValue().mapValue
-                return (root.map { Self.decodeEntries(from: $0) },
+                return (root.map { Self.decodeProjection(from: $0, chatId: chatId, observedAt: observedAt) },
                         Self.commandFailures(from: root?["commands"]?.listValue ?? [],
                                              messageIds: pendingMessageIds))
             }.value
@@ -203,8 +210,10 @@ final class SessionStore {
         }
     }
 
-    private func apply(_ decoded: [MessageEntry]) {
-        entries = decoded
+    private func apply(_ decoded: Projection) {
+        entries = decoded.entries
+        publishedSession = decoded.session
+        transcriptActivity = decoded.activity
         // Drop echoes the host has materialized.
         let ids = Set(entries.map(\.id))
         pendingSends.removeAll { ids.contains($0.messageId) }
@@ -242,6 +251,50 @@ final class SessionStore {
     nonisolated private static func decodeEntries(from root: [String: LoroValue]) -> [MessageEntry] {
         let raw = (root["messages"]?.listValue ?? []).compactMap(entryFrom)
         return joinContinuations(raw)
+    }
+
+    private struct Projection {
+        var entries: [MessageEntry]
+        var session: SessionRow?
+        var activity: SessionRow?
+    }
+
+    nonisolated private static func decodeProjection(
+        from root: [String: LoroValue], chatId: String, observedAt: Int64?
+    ) -> Projection {
+        let raw = (root["messages"]?.listValue ?? []).compactMap(entryFrom)
+        var session: SessionRow?
+        for publication in root["publications"]?.listValue ?? [] {
+            guard let record = publication.mapValue?["record"]?.mapValue,
+                  record["kind"]?.stringValue == "agentSession",
+                  let value = record["value"]?.mapValue,
+                  value["chatId"]?.stringValue == chatId,
+                  let deviceId = value["ownerDeviceId"]?.stringValue,
+                  let createdAt = value["createdAt"]?.i64Value else { continue }
+            let updatedAt = value["updatedAt"]?.i64Value ?? createdAt
+            session = SessionRow(
+                chatId: chatId, deviceId: deviceId,
+                status: value["status"]?.stringValue.flatMap(SessionStatus.init(rawValue:)) ?? .idle,
+                startedAt: updatedAt, updatedAt: updatedAt
+            )
+        }
+        return Projection(entries: joinContinuations(raw), session: session,
+                          activity: activity(in: raw, chatId: chatId, observedAt: observedAt))
+    }
+
+    /// Read the raw tail, not joined roots: a terminal continuation can finish a
+    /// root that is still stamped streaming, and older turns must never win.
+    nonisolated private static func activity(
+        in raw: [MessageEntry], chatId: String, observedAt: Int64?
+    ) -> SessionRow? {
+        guard let entry = raw.last(where: { $0.role == .assistant }),
+              let status = entry.status else { return nil }
+        return SessionRow(
+            chatId: chatId, deviceId: entry.deviceId,
+            status: status == .streaming ? .working : .idle,
+            startedAt: entry.createdAt,
+            updatedAt: status == .streaming ? max(entry.createdAt, observedAt ?? entry.createdAt) : entry.createdAt
+        )
     }
 
     nonisolated private static func entryFrom(_ value: LoroValue) -> MessageEntry? {
