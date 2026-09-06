@@ -26,11 +26,11 @@ Production and staging use the same Swift target with separate checked-in scheme
 bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
 
 ```sh
-# Production: Crew, ai.ashler.crew, version 1.0 build 3
+# Production: Crew, ai.ashler.crew, version 1.0 build 4
 xcodebuild -project Comet.xcodeproj -scheme Comet \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 
-# Staging: Crew Staging, ai.ashler.crew.staging, version 1.0 build 6
+# Staging: Crew Staging, ai.ashler.crew.staging, version 1.0 build 7
 xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 ```
@@ -80,6 +80,19 @@ Uploaded to **Ashler Internal** on 2026-09-06. App Store Connect confirmed
 installation of **1.0 (6)** on the existing tester's iPhone 13 Pro. Verification
 covered 19 native simulator checks, visible sending/processing/terminal states,
 and a fixture-free `Release-Staging` build before the device archive and upload.
+
+### Coordinated Crew 0.1.71 release
+
+Production **1.0 (4)** and staging **1.0 (7)** were archived, cloud-signed, and
+uploaded on 2026-09-06 from the same source as Crew 0.1.71. App Store Connect
+processed both builds and assigned them to **Ashler Internal**. The production
+tester remains **Invited**; neither new build's physical-device installation
+is claimed. Staging build 7 preserves the previously distributed build 6 fixes.
+
+The fresh simulator build rendered the Crew login surface. Authenticated mobile
+verification awaits the system sign-in consent; two independent native Crew
+engines separately verified live Scaffold messaging and reconnect convergence.
+Typechecks were intentionally not run because global instructions prohibit them.
 
 ### Connecting
 

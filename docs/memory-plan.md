@@ -504,6 +504,55 @@ generation checks, all 104 edge tests, and sealed-candidate deployment still ran
 The one-off remote branch was deleted after preserving commit `b3d4a3d` in
 `deployment-source.tar` alongside the release evidence.
 
+### Coordinated Scaffold and mobile release (2026-09-06)
+
+Crew 0.1.71 preserves the managed-worktree draft fix after rebasing onto current
+`main` and integrates the source of the previously distributed staging mobile
+build 6. [Candidate run 34044550324](https://github.com/Ashler-AI/comet/actions/runs/34044550324)
+built macOS and both Linux architectures from `8667124`.
+[Promotion run 34045163805](https://github.com/Ashler-AI/comet/actions/runs/34045163805)
+reused those exact bytes for both staging and production desktop/Scaffold feeds.
+
+[Edge deployment 34045152900](https://github.com/Ashler-AI/comet/actions/runs/34045152900)
+deployed the same sealed candidate to staging
+`0e6198e1-ed06-49d0-a6d7-285d7c2fc24a` and production
+`09e9eb8c-e780-41ce-bbd6-f5bbb7d166a3`. The deployment-only source `ca559fa`
+omits the prohibited typecheck without changing `main`'s workflow. All 104 edge
+tests and the real Rust/Edge collaboration smoke passed. Both native overlapping
+send admission and unresolved worktree-base regressions passed.
+
+A fresh native Scaffold launch exposed `runtime_unreachable` in
+`write_omp_inference_access`: the managed proxy override used the non-resolving
+bare canary domain. Removing that override through Infisical and rolling the
+provider restored SDK-generated per-sandbox routing. A new sandbox became ready,
+completed a real OMP command, and produced the identical transcript on two
+independent authorized Crew engines. The second client continued the same session
+and recovered identical history after its engine restarted. The wrong model
+namespace in the initial diagnostic RPC was rejected; the supported
+`openai-codex/gpt-6-astra` binding completed normally.
+
+A second fresh sandbox received the immutable 0.1.71 Linux artifact through a
+scoped upload before its first engine attach. The uploaded binary and running
+`/proc/<pid>/exe` both matched SHA-256
+`ea8253d6ffa805eba2926fc7361226aae030766ce9ff0d82e5e2e4e01eb9b136`.
+That engine returned `CREW_0_1_71_RELEASE_OK` through the shared DO to both
+clients. This proves the released engine in a real sandbox, not an updated fleet
+template; the existing image manifest was deliberately left unchanged.
+
+TestFlight processed production **1.0 (4)** and staging **1.0 (7)** and assigned
+both to **Ashler Internal**. The production tester still needs to accept the
+invitation. The simulator rendered the login surface; authenticated mobile UI
+verification awaits system sign-in consent. No physical installation is claimed.
+
+Scaffold's future Crew version/digest pins now select 0.1.71, but its deployed
+template still contains 0.1.64. [Platform PR 5838](https://github.com/Ashler-AI/ashler-platform/pull/5838)
+contains the permanent direct-routing fix and is queued for squash merge after
+independent review. A pre-existing failed staging deployment, run 34043670364,
+retains its immutable attestation after activation and rollback were denied.
+It was not deleted or bypassed. The full session-image build also invokes a
+typecheck cache builder; that workflow was not dispatched. Completing the full
+Scaffold rollout requires those release prerequisites, not just updated pins.
+
 ### Limits of this audit
 
 A three-second sample of the already-running desktop process showed a 1.2 GB
