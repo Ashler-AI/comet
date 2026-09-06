@@ -475,6 +475,26 @@ real OMP commands with transcript entries. Large catalogs use lazy rows and
 search; fetch failures remain visible and retryable. Scaffold stays OMP-only.
 
 Staging **1.0 (5)** archived and its cloud-signed TestFlight upload succeeded.
+App Store Connect confirmed its assignment to **Ashler Internal** and installation
+by `zhenchristopher@gmail.com` on the registered iPhone. Physical phone behavior
+was not directly inspected.
+
+Deployment run
+[`34036591243`](https://github.com/Ashler-AI/comet/actions/runs/34036591243)
+published staging Worker **72172176-7ac9-4e6f-ab27-3c73324bb4a5** from `b3d4a3d`.
+Against that deployment, the original cached native replica recovered once,
+materialized 702 chats and 592 session rows, and stayed connected while fresh
+remote updates advanced from two to five over the 21-second observation.
+
+CI also exposed recursive assertion overhead on a 2.1 MB binary regression
+fixture. The assertion now compares every byte using the native buffer comparator
+without traversing millions of JavaScript indices; its timeout and payload
+boundary are unchanged. All 104 edge tests passed locally and in CI.
+
+The accepted archive, native OMP log, model-picker and installation screenshots,
+original cache, deployment log, and release receipt are retained in the private
+`mobile-recovery-1.0.5` directory beside the earlier release evidence.
+
 Typechecking was intentionally not run because global instructions prohibit it.
 
 ### Limits of this audit

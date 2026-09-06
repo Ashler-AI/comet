@@ -63,6 +63,8 @@ Recovery validates a fresh server snapshot, preserves recoverable offline edits,
 and atomically switches the room, projection, and disk saver to the recovered
 replica. Divergent offline conflicts or unsupported container changes retain the
 old data and surface a synchronization error rather than silently overwriting it.
+App Store Connect confirmed build 5 in **Ashler Internal** and its installation
+by the existing tester on 2026-09-06.
 
 ### Connecting
 
