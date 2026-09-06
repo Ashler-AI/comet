@@ -18,9 +18,10 @@ final class WorkspaceStore {
     private(set) var presence: [String: Int64] = [:]  // deviceId → last heartbeat ms
     private(set) var connected = false
 
-    let doc = LoroDoc()
+    private(set) var doc = LoroDoc()
     private var room: RoomClient?
     private var subscriptions: [Subscription] = []
+    @ObservationIgnored private var roomEpoch: UInt64 = 0
     private let config: AppConfig
 
     init(config: AppConfig) {
@@ -31,6 +32,8 @@ final class WorkspaceStore {
 
     func start() {
         guard room == nil else { return }
+        roomEpoch &+= 1
+        let epoch = roomEpoch
         let roomId = "ws4/\(config.projectScope)"
         // Local-first: hydrate from the on-device snapshot before joining —
         // the sidebar renders immediately and the join backfills incrementally.
@@ -41,22 +44,44 @@ final class WorkspaceStore {
         let client = RoomClient(roomId: roomId, doc: doc) { [config] in
             await config.workspaceSocketURL()
         } events: { [weak self] event in
-            Task { @MainActor [weak self] in self?.handle(event) }
+            Task { @MainActor [weak self] in
+                guard let self, self.roomEpoch == epoch else { return }
+                self.handle(event)
+            }
+        } adoptSnapshot: { [weak self] previous, replacement in
+            guard let self, self.roomEpoch == epoch else { return false }
+            return self.adoptSnapshot(previous: previous, replacement: replacement)
         }
         room = client
 
+        subscribeLocalUpdates(client: client)
+
+        Task { await client.start() }
+        project()
+    }
+
+    private func subscribeLocalUpdates(client: RoomClient) {
         // Local commits → room. The subscription fires synchronously inside
         // commit; hop to the actor to send.
-        let localSub = doc.subscribeLocalUpdate { [weak client, weak self] update in
+        subscriptions.append(doc.subscribeLocalUpdate { [weak client, weak self] update in
             guard let client else { return }
             let bytes = [UInt8](update)
             Task { await client.sendLocalUpdate(bytes) }
             Task { @MainActor [weak self] in self?.saver?.poke() }
-        }
-        subscriptions.append(localSub)
+        })
+    }
 
-        Task { await client.start() }
+    private func adoptSnapshot(previous: LoroDoc, replacement: LoroDoc) -> Bool {
+        guard doc === previous, let room,
+              DocDisk.preserveLocalOperations(from: previous, in: replacement) else { return false }
+        // No suspension between the final local-op merge and binding swap.
+        // Keep projections, presence, relays, and all non-doc store state alive.
+        subscriptions.removeAll()
+        doc = replacement
+        subscribeLocalUpdates(client: room)
+        saver?.replaceDocument(with: replacement)
         project()
+        return true
     }
 
     /// Backgrounding hook: persist immediately.
@@ -65,6 +90,7 @@ final class WorkspaceStore {
     }
 
     func stop() {
+        roomEpoch &+= 1
         subscriptions.removeAll()
         saver?.flush()
         if let room {
@@ -294,22 +320,29 @@ final class WorkspaceStore {
         try? await relay(for: deviceId).call(method: "ListRefs", params: ["repoPath": repoPath])
     }
 
-    /// ListModels — the target device's live harness catalog (the desktop
-    /// discovers models from the CLI itself; static lists are only fallback).
-    func listModels(deviceId: String, harness: String) async -> [ModelInfo]? {
+    /// Catalogs are discovered on the host that owns the selected space.
+    func listHarnesses(deviceId: String) async throws -> [HarnessInfo] {
+        struct WireHarness: Decodable {
+            var id: String
+            var name: String
+        }
+        let wire: [WireHarness] = try await relay(for: deviceId)
+            .call(method: "ListHarnesses", params: [:])
+        return wire.map { HarnessInfo(id: $0.id, label: $0.name) }
+    }
+
+    func listModels(deviceId: String, harness: String) async throws -> [ModelInfo] {
         struct WireModel: Decodable {
             var id: String
             var label: String
             var description: String?
             var reasoningLevels: [String]?
         }
-        let wire: [WireModel]? = try? await relay(for: deviceId)
+        let wire: [WireModel] = try await relay(for: deviceId)
             .call(method: "ListModels", params: ["harness": harness])
-        return wire.map { models in
-            models.map {
-                ModelInfo(id: $0.id, label: $0.label, description: $0.description,
-                          reasoningLevels: $0.reasoningLevels ?? [])
-            }
+        return wire.map {
+            ModelInfo(id: $0.id, label: $0.label, description: $0.description,
+                      reasoningLevels: $0.reasoningLevels ?? [])
         }
     }
 

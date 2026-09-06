@@ -346,19 +346,39 @@ final class AppModel {
         return workspace?.deviceOnline(deviceId) ?? false
     }
 
-    /// Live model catalog from the space's owning device (the desktop's
-    /// "catalog source = the device that runs the session" rule); static
-    /// fallback when the device is unreachable.
-    func listModels(space: Space, harness: String) async -> [ModelInfo] {
+    func listHarnesses(space: Space) async throws -> [HarnessInfo] {
         if demo != nil {
-            try? await Task.sleep(nanoseconds: 100_000_000)
-            return HarnessCatalog.models(for: harness)
+            return HarnessCatalog.fallbackHarnesses + [HarnessInfo(id: "omp", label: "OMP")]
         }
-        if let live = await workspace?.listModels(deviceId: space.deviceId, harness: harness),
-           !live.isEmpty {
-            return live
+        guard let workspace else { throw MobileSessionError.unavailable("Not connected") }
+        return try await workspace.listHarnesses(deviceId: space.deviceId)
+    }
+
+    /// Only curated harnesses have an offline fallback. Dynamic catalogs
+    /// propagate failure so the picker can explain it and offer retry.
+    func listModelsDetailed(space: Space, harness: String) async throws -> [ModelInfo] {
+        let fallback = HarnessCatalog.models(for: harness)
+        if demo != nil {
+            // Demo-only selectors keep simulated Scaffold launches usable;
+            // real OMP catalogs always come from the selected host.
+            if harness == "omp" {
+                return [("codex", "openai-codex"), ("claude-code", "anthropic")].flatMap { harness, provider in
+                    HarnessCatalog.models(for: harness).map {
+                        ModelInfo(id: "\(provider)/\($0.id)", label: $0.label,
+                                  description: $0.description, reasoningLevels: $0.reasoningLevels)
+                    }
+                }
+            }
+            return fallback
         }
-        return HarnessCatalog.models(for: harness)
+        do {
+            guard let workspace else { throw MobileSessionError.unavailable("Not connected") }
+            let live = try await workspace.listModels(deviceId: space.deviceId, harness: harness)
+            return live.isEmpty ? fallback : live
+        } catch {
+            guard !fallback.isEmpty else { throw error }
+            return fallback
+        }
     }
 
     /// Refs of the space's repo (git spaces only).

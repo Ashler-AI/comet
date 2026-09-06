@@ -30,9 +30,10 @@ final class SessionStore {
     private(set) var sendFailure: String?
     private(set) var failedPrompt: String?
 
-    let doc = LoroDoc()
+    private(set) var doc = LoroDoc()
     private var room: RoomClient?
     private var subscriptions: [Subscription] = []
+    @ObservationIgnored private var roomEpoch: UInt64 = 0
     private let config: AppConfig
 
     /// Demo mode: no room, entries driven externally.
@@ -60,6 +61,8 @@ final class SessionStore {
 
     func start() {
         guard room == nil, !offline else { return }
+        roomEpoch &+= 1
+        let epoch = roomEpoch
         // Local-first: last-synced transcript renders instantly (even when the
         // host device is offline); the join backfills incrementally from here.
         if DocDisk.load(into: doc, id: chatId) {
@@ -69,18 +72,40 @@ final class SessionStore {
         let client = RoomClient(roomId: chatId, doc: doc) { [config, chatId, deploymentId] in
             await config.sessionSocketURL(chatId: chatId, deploymentId: deploymentId)
         } events: { [weak self] event in
-            Task { @MainActor [weak self] in self?.handle(event) }
+            Task { @MainActor [weak self] in
+                guard let self, self.roomEpoch == epoch else { return }
+                self.handle(event)
+            }
+        } adoptSnapshot: { [weak self] previous, replacement in
+            guard let self, self.roomEpoch == epoch else { return false }
+            return self.adoptSnapshot(previous: previous, replacement: replacement)
         }
         room = client
-        let localSub = doc.subscribeLocalUpdate { [weak client, weak self] update in
+        subscribeLocalUpdates(client: client)
+        Task { await client.start() }
+        project()
+    }
+
+    private func subscribeLocalUpdates(client: RoomClient) {
+        subscriptions.append(doc.subscribeLocalUpdate { [weak client, weak self] update in
             guard let client else { return }
             let bytes = [UInt8](update)
             Task { await client.sendLocalUpdate(bytes) }
             Task { @MainActor [weak self] in self?.saver?.poke() }
-        }
-        subscriptions.append(localSub)
-        Task { await client.start() }
+        })
+    }
+
+    private func adoptSnapshot(previous: LoroDoc, replacement: LoroDoc) -> Bool {
+        guard doc === previous, let room,
+              DocDisk.preserveLocalOperations(from: previous, in: replacement) else { return false }
+        // Keep entries visible until the replacement projection is ready, and
+        // retain optimistic sends, command admission, and the reveal state.
+        subscriptions.removeAll()
+        doc = replacement
+        subscribeLocalUpdates(client: room)
+        saver?.replaceDocument(with: replacement)
         project()
+        return true
     }
 
     /// Backgrounding hook: persist immediately.
@@ -89,6 +114,7 @@ final class SessionStore {
     }
 
     func stop() {
+        roomEpoch &+= 1
         subscriptions.removeAll()
         saver?.flush()
         if let room {
@@ -156,6 +182,13 @@ final class SessionStore {
             }.value
             guard let self else { return }
             self.projecting = false
+            // An old detached projection may finish after the binding swap.
+            // Never let it overwrite the recovered transcript or resolve echoes.
+            guard self.doc === doc else {
+                self.projectPending = false
+                self.project()
+                return
+            }
             if let decoded {
                 self.apply(decoded)
             }

@@ -124,9 +124,8 @@ extension ChatIndicator {
 }
 
 
-/// Harness brand mark (pickers.rs harness_brand_icon) — the desktop's actual
-/// SVG marks, rendered via BrandMarkShape. Claude keeps its brand orange even
-/// on the mono surface; others stay neutral (icons.rs convention).
+/// Harness identity matches the desktop picker: OMP and Prime Agent use the
+/// Crew mark; third-party harnesses retain their own brand marks.
 struct HarnessBadge: View {
     let harness: String
     var size: CGFloat = 14
@@ -136,8 +135,15 @@ struct HarnessBadge: View {
     var neutral: Color = Theme.text
 
     var body: some View {
-        BrandMarkShape(mark: BrandMark.forHarness(harness))
-            .fill((BrandMark.brandTint(for: harness) ?? neutral).opacity(dimmed ? 0.6 : 0.9))
-            .frame(width: size, height: size)
+        Group {
+            if harness == "omp" || harness == "prime-agent" {
+                CrewMark(color: neutral)
+            } else {
+                BrandMarkShape(mark: BrandMark.forHarness(harness))
+                    .fill(BrandMark.brandTint(for: harness) ?? neutral)
+            }
+        }
+        .opacity(dimmed ? 0.6 : 0.9)
+        .frame(width: size, height: size)
     }
 }

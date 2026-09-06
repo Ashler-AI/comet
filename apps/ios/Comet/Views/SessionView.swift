@@ -10,6 +10,9 @@ struct SessionView: View {
     @State private var showConfig = false
     @State private var refs: [RepoRef] = []
     @State private var catalogs: [String: [ModelInfo]] = [:]
+    @State private var modelsLoading = false
+    @State private var modelsError: String?
+    @State private var modelsRetry = 0
     @State private var forking = false
     @State private var forkError: String?
 
@@ -163,7 +166,7 @@ struct SessionView: View {
                     modelId: Binding(
                         get: {
                             chat.config?.model
-                                ?? HarnessCatalog.defaultModel(for: harness).id
+                                ?? HarnessCatalog.defaultModel(for: harness)?.id ?? ""
                         },
                         set: { newModel in
                             writeConfig(model: newModel, reasoning: chat.config?.reasoning)
@@ -177,18 +180,22 @@ struct SessionView: View {
                     ),
                     lockedHarness: true,
                     catalogs: catalogs,
+                    modelsLoading: modelsLoading,
+                    modelsError: modelsError,
+                    onRetryModels: { modelsRetry += 1 },
                     checkout: checkoutContext(chat: chat)
                 )
             }
         }
         .task(id: chatId) {
             guard let space = chatSpace else { return }
-            let harness = chat?.config?.harness ?? "claude-code"
-            catalogs[harness] = await model.listModels(space: space, harness: harness)
             guard space.gitDetected else { return }
             if let loaded = await model.listRefs(space: space) {
                 refs = loaded
             }
+        }
+        .task(id: "\(chatId)/\(chatSpace?.deviceId ?? "")/\(chat?.config?.harness ?? "")/\(modelsRetry)") {
+            await loadModels()
         }
         .onAppear {
             if chat != nil {
@@ -205,6 +212,26 @@ struct SessionView: View {
             }
             model.releaseSessionStore(chatId: chatId)
         }
+    }
+
+    private func loadModels() async {
+        guard let space = chatSpace else { return }
+        let harness = chat?.config?.harness ?? "claude-code"
+        modelsLoading = true
+        modelsError = nil
+        do {
+            let loaded = try await model.listModelsDetailed(space: space, harness: harness)
+            guard !Task.isCancelled else { return }
+            catalogs[harness] = loaded
+            if loaded.isEmpty {
+                modelsError = "This harness did not return any models. Check its setup on the host, then retry."
+            }
+        } catch {
+            guard !Task.isCancelled else { return }
+            catalogs[harness] = []
+            modelsError = error.localizedDescription
+        }
+        modelsLoading = false
     }
 
     private func canFork(_ chat: Chat) -> Bool {

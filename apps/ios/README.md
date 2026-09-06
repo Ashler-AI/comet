@@ -30,7 +30,7 @@ bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
 xcodebuild -project Comet.xcodeproj -scheme Comet \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 
-# Staging: Crew Staging, ai.ashler.crew.staging, version 1.0 build 2
+# Staging: Crew Staging, ai.ashler.crew.staging, version 1.0 build 5
 xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 ```
@@ -53,9 +53,20 @@ to TestFlight. App Store Connect processed both and assigned them to the existin
 confirmed; the production invitation was resent and remains awaiting acceptance.
 These are internal TestFlight releases, not public App Store submissions.
 
+Staging **1.0 (5)** adds compacted-history recovery and host-discovered harnesses.
+The model picker exposes Claude Code, Codex, OMP, and Prime Agent when advertised
+by the selected host, with lazy model rows and search. Catalog failures remain
+visible and retryable; Scaffold retains its OMP-only launch contract.
+
+A stale cache must not treat an import with pending dependencies as successful.
+Recovery validates a fresh server snapshot, preserves recoverable offline edits,
+and atomically switches the room, projection, and disk saver to the recovered
+replica. Divergent offline conflicts or unsupported container changes retain the
+old data and surface a synchronization error rather than silently overwriting it.
+
 ### Connecting
 
-- **Production**: Comet discovers Scaffold's OAuth metadata, dynamically
+- **Production**: Crew discovers Scaffold's OAuth metadata, dynamically
   registers the native client, completes authorization-code + PKCE S256 in the
   system browser, validates the issued `sc_rc_` bearer, and joins the
   deployment's verified project scope.
@@ -139,10 +150,12 @@ the desktop sources cited in each file header.
 
 ### Writer discipline (what the phone writes)
 
-- Workspace doc: its own device row, chat creates (host = the space's owning
-  device), `archived`/`title`/`lastSeenAt` LWW sets, presence heartbeats.
-- Session docs: command ledger appends only (`run`/`steer`/`interrupt`/
-  `respondInput`), with client-minted message ids for optimistic echo. The
-  host writes all transcript entries and command outcomes.
-- After queuing a command it POSTs `/device/{host}/nudge` so a cold host
-  opens the doc and drains — delivery stays durable in the doc regardless.
+- Workspace doc: `archived`/`title`/`lastSeenAt` and related chat metadata,
+  plus principal-scoped session refs. The phone does not advertise an engine
+  device row or presence heartbeat.
+- Chat creation awaits the owning host's authenticated `Mutate:createChat`
+  before local echo or sending.
+- Ordinary-session commands use the host's `QueueCommand` admission path;
+  Scaffold commands use the verified controller route. Client-minted message
+  IDs connect optimistic sends to admission errors and committed transcript
+  entries. The host writes transcript entries and command outcomes.

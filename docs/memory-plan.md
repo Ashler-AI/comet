@@ -443,6 +443,40 @@ status rail. Official artifacts, screenshots, the TestFlight installation
 receipt, and the native two-turn log are retained in the private
 `sidebar-0.1.70` directory beside the earlier release evidence.
 
+### Staging mobile cached-history recovery and harness launch
+
+The reported staging 1.0 (4) failure was reproduced with a preserved old
+workspace cache against the live staging room. Server history had been
+compacted past the cache's version vector. Loro accepted incoming bytes but
+reported pending dependencies; the phone treated that as successful progress.
+Importing a full snapshot into the same stale replica also remained pending.
+This was not fixed by changing heartbeat cadence or restarting the host.
+
+The edge now checks coverage of the retained-history floor before choosing an
+incremental join backfill, including after a regular snapshot rematerializes a
+shallow document. The mobile client validates a full snapshot in a fresh replica,
+preserves recoverable local operations, and atomically adopts it across the room,
+store subscriptions, projection, and disk saver. Disjoint nested-map edits,
+deletions, and already-satisfied writes survive dependency gaps. Diverged values
+or unsupported container changes fail closed with the old data preserved.
+
+A read-only native probe recovered the original stale workspace cache and
+continued receiving live updates. Native safety scenarios preserved both early
+and late offline edits, reloaded the recovered cache, and rejected corrupt,
+truncated, and update-only replacement payloads. Separate nested-map, deletion,
+same-value, conflicting-value, and new-container cases passed. The integrated
+edge suite passed **104 tests in 15 files**, including stale versus covered
+clients after compacted-room rematerialization.
+
+Mobile harness selection now uses the selected host's `ListHarnesses` and
+`ListModels` results. The actual simulator exposed Claude Code, Codex, OMP, and
+Prime Agent, loaded OMP's 540-model catalog, and completed initial and subsequent
+real OMP commands with transcript entries. Large catalogs use lazy rows and
+search; fetch failures remain visible and retryable. Scaffold stays OMP-only.
+
+Staging **1.0 (5)** archived and its cloud-signed TestFlight upload succeeded.
+Typechecking was intentionally not run because global instructions prohibit it.
+
 ### Limits of this audit
 
 A three-second sample of the already-running desktop process showed a 1.2 GB

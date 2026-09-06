@@ -1,8 +1,5 @@
-// Harness + model catalogs — ports of crates/harness's curated static
-// catalogs (claude/catalog.rs, codex/catalog.rs). The desktop overlays these
-// on runtime discovery; the phone uses them directly for the pickers.
-// Defaults mirror pickers.rs: first catalog row, reasoning xhigh where the
-// ladder has it, else high.
+// Curated Claude Code and Codex fallbacks. Other harnesses require the
+// selected host's live catalog; never substitute another harness's models.
 
 import Foundation
 
@@ -20,7 +17,7 @@ struct ModelInfo: Identifiable, Hashable {
 }
 
 enum HarnessCatalog {
-    static let harnesses: [HarnessInfo] = [
+    static let fallbackHarnesses: [HarnessInfo] = [
         HarnessInfo(id: "claude-code", label: "Claude Code"),
         HarnessInfo(id: "codex", label: "Codex"),
     ]
@@ -33,16 +30,6 @@ enum HarnessCatalog {
 
     static func models(for harness: String) -> [ModelInfo] {
         switch harness {
-        case "omp":
-            let codex = models(for: "codex").map {
-                ModelInfo(id: "openai-codex/\($0.id)", label: $0.label,
-                          description: $0.description, reasoningLevels: $0.reasoningLevels)
-            }
-            let claude = models(for: "claude-code").map {
-                ModelInfo(id: "anthropic/\($0.id)", label: $0.label,
-                          description: $0.description, reasoningLevels: $0.reasoningLevels)
-            }
-            return codex + claude
         case "codex":
             return [
                 ModelInfo(id: "gpt-5.6-sol", label: "GPT-5.6-Sol",
@@ -60,7 +47,7 @@ enum HarnessCatalog {
                 ModelInfo(id: "gpt-5.3-codex-spark", label: "GPT-5.3-Codex-Spark",
                           description: "Ultra-fast lightweight coding", reasoningLevels: codexXhighLadder),
             ]
-        default:  // claude-code (mock shares it)
+        case "claude-code", "mock":
             return [
                 ModelInfo(id: "claude-fable-5", label: "Fable 5",
                           description: "Most intelligent model for building agents", reasoningLevels: fullLadder),
@@ -75,17 +62,20 @@ enum HarnessCatalog {
                 ModelInfo(id: "claude-haiku-4-5", label: "Haiku 4.5",
                           description: "Fastest model for everyday tasks", reasoningLevels: []),
             ]
+        default:
+            return []
         }
     }
 
-    static func defaultModel(for harness: String) -> ModelInfo {
-        models(for: harness)[0]
+    static func defaultModel(for harness: String) -> ModelInfo? {
+        models(for: harness).first
     }
 
     /// pickers.rs:126 — X-High when the ladder has it, else High.
     static func defaultReasoning(for model: ModelInfo) -> String? {
         if model.reasoningLevels.isEmpty { return nil }
-        return model.reasoningLevels.contains("xhigh") ? "xhigh" : "high"
+        return ["xhigh", "high"].first(where: model.reasoningLevels.contains)
+            ?? model.reasoningLevels.first
     }
 
     static func reasoningLabel(_ level: String) -> String {
@@ -103,7 +93,7 @@ enum HarnessCatalog {
     }
 
     static func modelLabel(harness: String, modelId: String?) -> String {
-        guard let modelId else { return defaultModel(for: harness).label }
+        guard let modelId else { return defaultModel(for: harness)?.label ?? "Select model" }
         return models(for: harness).first { $0.id == modelId }?.label ?? modelId
     }
 }

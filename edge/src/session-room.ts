@@ -764,14 +764,23 @@ export class SessionRoom implements DurableObject {
       let backfill: Uint8Array;
       if (message.version.length > 0) {
         let from: VersionVector | undefined;
+        let retainedSince: VersionVector | undefined;
         try {
           from = VersionVector.decode(message.version);
-          backfill = doc.export({ mode: "update", from });
+          retainedSince = doc.shallowSinceVV();
+          const coverage = from.compare(retainedSince);
+          // Exporting from before retained history can succeed with missing
+          // dependencies. Only a client covering the retained-history boundary
+          // can use deltas; older or concurrent clients need the full state.
+          backfill = coverage !== undefined && coverage >= 0
+            ? doc.export({ mode: "update", from })
+            : doc.export({ mode: "snapshot" });
         } catch {
           // Unknown/garbled client version — fall back to a full snapshot.
           backfill = doc.export({ mode: "snapshot" });
         } finally {
           from?.free();
+          retainedSince?.free();
         }
       } else {
         backfill = doc.export({ mode: "snapshot" });
@@ -1359,11 +1368,9 @@ export class SessionRoom implements DurableObject {
     const checkpoints = JSON.parse(this.getMeta("checkpoints") ?? "[]") as FrontierCheckpoint[];
     const cutoff = checkpoints.filter((c) => now - c.at >= RETAIN_MS).pop();
     let frontiers: { peer: `${number}`; counter: number }[];
-    // lastTrimAt alone gates the cutoff trim: the trim is durable (sync()
-    // below), and requiring doc.isShallow() re-fired it on EVERY cold start
-    // once a log fold re-exported the once-shallow doc as a regular
-    // snapshot (isShallow reads false after rematerializing from it) —
-    // observed as the same rooms "trimming" every few minutes all evening.
+    // The durable lastTrimAt marker identifies the cutoff already applied.
+    // A cold start or regular snapshot re-export must not re-trim that cutoff,
+    // regardless of the materialized document's shallow status.
     if (cutoff && this.getMeta("lastTrimAt") !== String(cutoff.at)) {
       frontiers = cutoff.frontiers.map((f) => ({ peer: f.peer as `${number}`, counter: f.counter }));
     } else if (

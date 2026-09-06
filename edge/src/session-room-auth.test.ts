@@ -208,7 +208,12 @@ const joinRequest = (roomId: string): JoinRequest => ({
   version: new Uint8Array()
 });
 
-const join = async (room: SessionRoom, userId: string, roomId: string): Promise<CapturingSocket> => {
+const join = async (
+  room: SessionRoom,
+  userId: string,
+  roomId: string,
+  version = new Uint8Array()
+): Promise<CapturingSocket> => {
   const socket = new CapturingSocket();
   const state: JoinState = {
     userId,
@@ -220,11 +225,51 @@ const join = async (room: SessionRoom, userId: string, roomId: string): Promise<
   await (room as unknown as SessionRoomInternals).handleJoin(
     socket as unknown as WebSocket,
     state,
-    joinRequest(roomId)
+    { ...joinRequest(roomId), version }
   );
   expect(state.rooms).toContain(CrdtType.Loro);
   expect(socket.sent.some((bytes) => decode(bytes).type === MessageType.JoinResponseOk)).toBe(true);
   return socket;
+};
+
+const compactedJoinFixture = () => {
+  const source = new LoroDoc();
+  const compacted = new LoroDoc();
+  try {
+    source.setPeerId("1");
+    source.getMap("metadata").set("revision", "old");
+    source.commit();
+    const stale = source.version();
+    let staleVersion: Uint8Array;
+    try {
+      staleVersion = stale.encode();
+    } finally {
+      stale.free();
+    }
+    source.getText("history").insert(
+      0,
+      Array.from({ length: 512 }, (_, i) => `${i}: retained value ${i * i}\n`).join("")
+    );
+    source.commit();
+    const cutoff = source.frontiers();
+    const coveredSnapshot = source.export({ mode: "snapshot" });
+    source.getMap("metadata").set("revision", "latest");
+    source.commit();
+    const shallow = source.export({ mode: "shallow-snapshot", frontiers: cutoff });
+    compacted.import(shallow);
+    const sql = new MemorySql();
+    // A log fold persists a regular re-export, then a cold room imports it.
+    sql.putBlob("snapshot", compacted.export({ mode: "snapshot" }));
+    return {
+      room: makeRoom(sql).room,
+      staleVersion,
+      coveredSnapshot,
+      expected: source.toJSON()
+    };
+  } finally {
+    compacted.free();
+    source.free();
+  }
 };
 
 describe("SessionRoom chat authorization", () => {
@@ -253,6 +298,73 @@ describe("SessionRoom chat authorization", () => {
     await join(room, "user-b", "shared-chat");
     expect(sql.meta.get("owner")).toBe(PROJECT_SCOPE);
   });
+
+  it(
+    "fully backfills a stale client after compacted room rematerialization",
+    async () => {
+      const { room, staleVersion, expected } = compactedJoinFixture();
+      const socket = await join(room, "user-a", "retained-chat", staleVersion);
+      const backfill = socket.sent
+        .map((bytes) => decode(bytes))
+        .find((message) => message.type === MessageType.DocUpdate);
+      expect(backfill?.type).toBe(MessageType.DocUpdate);
+      // Native recovery installs a validated replacement replica: importing a
+      // truncated snapshot into an old nonempty replica can itself stay pending.
+      const recovered = new LoroDoc();
+      try {
+        if (backfill?.type === MessageType.DocUpdate) {
+          for (const update of backfill.updates) {
+            expect(recovered.import(update).pending?.size ?? 0).toBe(0);
+          }
+        }
+        expect(recovered.toJSON()).toEqual(expected);
+        const state = recovered.version();
+        const oplog = recovered.oplogVersion();
+        try {
+          expect(state.compare(oplog)).toBe(0);
+        } finally {
+          oplog.free();
+          state.free();
+        }
+      } finally {
+        recovered.free();
+      }
+    }
+  );
+
+  it(
+    "incrementally catches up a covered client after compacted room rematerialization",
+    async () => {
+      const { room, coveredSnapshot, expected } = compactedJoinFixture();
+      const mirror = new LoroDoc();
+      try {
+        mirror.import(coveredSnapshot);
+        const version = mirror.version();
+        let socket: CapturingSocket;
+        try {
+          socket = await join(room, "user-a", "retained-chat", version.encode());
+        } finally {
+          version.free();
+        }
+        const backfill = socket.sent
+          .map((bytes) => decode(bytes))
+          .find((message) => message.type === MessageType.DocUpdate);
+        expect(backfill?.type).toBe(MessageType.DocUpdate);
+        if (backfill?.type === MessageType.DocUpdate) {
+          // The unchanged retained text must not be retransmitted to a caught-up
+          // client. This also rejects an unconditional full-snapshot fallback.
+          const bytes = backfill.updates.reduce((total, update) => total + update.byteLength, 0);
+          expect(bytes).toBeLessThan(coveredSnapshot.byteLength / 2);
+          for (const update of backfill.updates) {
+            expect(mirror.import(update).pending?.size ?? 0).toBe(0);
+          }
+        }
+        expect(mirror.toJSON()).toEqual(expected);
+      } finally {
+        mirror.free();
+      }
+    }
+  );
 
   it("replays bounded workspace presence without allocating another WASM store", async () => {
     const { room, sockets } = makeRoom();
