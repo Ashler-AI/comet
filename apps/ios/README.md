@@ -30,7 +30,7 @@ bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
 xcodebuild -project Comet.xcodeproj -scheme Comet \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 
-# Staging: Crew Staging, ai.ashler.crew.staging, version 1.0 build 5
+# Staging: Crew Staging, ai.ashler.crew.staging, version 1.0 build 6
 xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 ```
@@ -65,6 +65,21 @@ replica. Divergent offline conflicts or unsupported container changes retain the
 old data and surface a synchronization error rather than silently overwriting it.
 App Store Connect confirmed build 5 in **Ashler Internal** and its installation
 by the existing tester on 2026-09-06.
+
+### Staging 1.0 (6): mobile status feedback
+
+- Session rows show unread, live status, and last-updated time independently.
+  Local and shared sessions combine owner status with current-turn transcript
+  activity; inferred liveness does not refresh the displayed timestamp.
+- Pending sends show `Sending…` immediately. Host admission hands off to the
+  processing spinner and elapsed time, including before the first response
+  frame. Completion clears processing; rejected sends clear sending feedback
+  and preserve the draft for retry.
+
+Uploaded to **Ashler Internal** on 2026-09-06. App Store Connect confirmed
+installation of **1.0 (6)** on the existing tester's iPhone 13 Pro. Verification
+covered 19 native simulator checks, visible sending/processing/terminal states,
+and a fixture-free `Release-Staging` build before the device archive and upload.
 
 ### Connecting
 
@@ -105,8 +120,8 @@ Sync/
   WorkspaceStore.swift  ws4/{projectScope} mirror: project-shared
                         devices/spaces/chats/sessions plus principal-scoped
                         session refs and viewer-side writes
-  SessionStore.swift    session doc mirror: entries/parts (continuations
-                        joined), command ledger appends (rule 1), host nudge
+  SessionStore.swift    session doc mirror: joined transcript, owner
+                        publications, send reconciliation; off-main projection
 Markdown/
   MarkdownModel.swift   block model + incremental tail re-parser (re-parse
                         from the 2nd-to-last top-level block; link-defs force
@@ -134,8 +149,8 @@ Theme/                  theme.rs port: oklch→sRGB converter, exact palette,
 
 | Desktop | iOS |
 | --- | --- |
-| Sidebar: Spaces + attention-sorted Sessions | Home screen sections (same sort ranks: awaiting > errored > working > completed > idle) |
-| Horizontal session tabs per space | Space detail: vertical session list (creation order) |
+| Sidebar: Spaces + recent Sessions | Home screen sections; unread, status, and recency remain independent |
+| Horizontal session tabs per space | Space detail: recency-sorted session list |
 | Tab close = archive | Swipe-to-archive |
 | Composer `white_alpha(0.03)` pill + hairline | Liquid Glass pill (`glassEffect`) + hairline |
 | Harness brand SVG marks (icons.rs) | Same path data via a native SVG path parser (`BrandMarks.swift`) |

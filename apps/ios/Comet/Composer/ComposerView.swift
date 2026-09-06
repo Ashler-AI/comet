@@ -92,14 +92,14 @@ struct ComposerShell<Chips: View>: View {
             }
         } label: {
             Group {
-                if busy {
-                    ProgressView()
-                        .controlSize(.small)
-                        .tint(Theme.bg)
-                } else if showStop, draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if showStop, draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     RoundedRectangle(cornerRadius: 3.5)
                         .fill(Theme.bg)
                         .frame(width: 12, height: 12)
+                } else if busy {
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(Theme.textFaint)
                 } else {
                     Image(systemName: "arrow.up")
                         .font(.system(size: 16, weight: .semibold))
@@ -136,6 +136,7 @@ struct ComposerView: View {
             draft: $text,
             sendEnabled: true,
             showStop: runLive,
+            busy: !store.pendingSends.isEmpty,
             onSend: send,
             onStop: { store.sendInterrupt() }
         ) {

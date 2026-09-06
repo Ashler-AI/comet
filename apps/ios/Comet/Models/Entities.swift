@@ -227,6 +227,47 @@ func effectiveStatus(_ row: SessionRow?, now: Int64) -> SessionStatus? {
     }
 }
 
+struct SessionActivity {
+    var row: SessionRow?
+    var status: SessionStatus?
+}
+
+/// Workspace rows describe local runs; collaboration publications describe
+/// remote owners. A current-turn transcript bridges delayed status delivery.
+func sessionActivity(
+    workspace: SessionRow?, published: SessionRow?, transcript: SessionRow?, now: Int64
+) -> SessionActivity {
+    let usesPublication = published.map { $0.updatedAt >= (workspace?.updatedAt ?? Int64.min) } ?? false
+    let row = usesPublication ? published : workspace
+    let base = SessionActivity(row: row, status: effectiveStatus(row, now: now))
+    guard var transcript, let entryAt = transcript.startedAt else { return base }
+    if let row {
+        guard transcript.deviceId == row.deviceId else { return base }
+        switch row.status {
+        case .working:
+            if !usesPublication, base.status == .working { return base }
+            guard entryAt >= (row.startedAt ?? row.updatedAt) else { return base }
+        case .awaitingInput:
+            if base.status == .awaitingInput { return base }
+            guard entryAt >= (row.startedAt ?? row.updatedAt) else { return base }
+        case .idle, .errored:
+            guard entryAt > row.updatedAt else { return base }
+        }
+    }
+    var status = effectiveStatus(transcript, now: now)
+    if transcript.status == .working, status != .working {
+        // Match desktop agent_indicator_with_transcript for remote owners:
+        // the current streaming turn outlives a one-shot working publication.
+        // Local fallback still expires when neither room delivers activity.
+        guard usesPublication, row?.status == .working else { return base }
+        status = .working
+    }
+    if let row, row.status == .working || row.status == .awaitingInput {
+        transcript.startedAt = row.startedAt ?? row.updatedAt
+    }
+    return SessionActivity(row: transcript, status: status)
+}
+
 /// entities.rs:147 — live Working/AwaitingInput win; Errored only if unseen;
 /// else unseen ⇒ Completed; else Idle.
 func chatIndicator(chat: Chat, live: SessionStatus?) -> ChatIndicator {

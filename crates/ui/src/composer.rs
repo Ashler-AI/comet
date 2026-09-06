@@ -146,7 +146,7 @@ fn scaffold_source_ref(plan: &CheckoutPlan) -> Option<&str> {
     match plan {
         CheckoutPlan::CurrentCheckout { branch } => branch.as_deref(),
         CheckoutPlan::ReuseWorktree { branch, .. } => Some(branch.as_str()),
-        CheckoutPlan::NewWorktree { base } => base.as_deref(),
+        CheckoutPlan::NewWorktree { base } => Some(base.as_str()),
     }
 }
 
@@ -4207,8 +4207,8 @@ impl Composer {
             cx.notify();
             return;
         };
-        let selected_worktree = match self.pickers.read(cx).checkout_plan() {
-            crate::pickers::CheckoutPlan::ReuseWorktree { path, .. } => Some(path),
+        let selected_worktree = match self.pickers.read(cx).checkout_plan(cx) {
+            Ok(crate::pickers::CheckoutPlan::ReuseWorktree { path, .. }) => Some(path),
             _ => None,
         };
         let (params, target) = {
@@ -4942,10 +4942,20 @@ impl Composer {
             cx.notify();
             return;
         }
-        // Where the new session runs (Current checkout / reuse an existing
-        // worktree / fresh worktree off the picked base) — resolved NOW so
-        // the async block needs no picker access.
-        let plan = self.pickers.read(cx).checkout_plan();
+        // Where the new session runs (current checkout / existing worktree /
+        // fresh worktree). A fresh worktree must have a resolved base ref;
+        // never reinterpret a still-loading selection as the current checkout.
+        let plan = match self.pickers.read(cx).checkout_plan(cx) {
+            Ok(plan) => plan,
+            Err(message) if is_new || scaffold_draft.is_some() => {
+                self.failure = Some(message.into());
+                cx.notify();
+                return;
+            }
+            // Persisted local sessions already own their cwd; the draft
+            // checkout selection is irrelevant to subsequent turns.
+            Err(_) => CheckoutPlan::CurrentCheckout { branch: None },
+        };
         // Fully-resolved model/reasoning/options — concrete values (chat config
         // or defaults), so the engine never has to guess a "default".
         let resolved = self.pickers.read(cx).resolved(cx);
@@ -5161,8 +5171,8 @@ impl Composer {
         // User-submitted commands are durable intent: a later send, stop, or
         // question answer must not cancel this admission task by replacing it.
         cx.spawn(async move |this, cx| {
-        let creates_managed_worktree = local_startup
-            && matches!(&plan, CheckoutPlan::NewWorktree { base: Some(_) });
+        let creates_managed_worktree =
+            local_startup && matches!(&plan, CheckoutPlan::NewWorktree { .. });
             let command_admission_started = Rc::new(Cell::new(false));
             let admission_started = command_admission_started.clone();
             let startup_worktree_path = Rc::new(RefCell::new(None));
@@ -5499,31 +5509,29 @@ impl Composer {
                             }
                         }
                         CheckoutPlan::NewWorktree { base } => {
-                            chat_branch = base.clone();
-                            if let Some(base) = base {
-                                let repo_path = if scaffold_attached {
-                                    Some(".".to_string())
-                                } else {
-                                    space_path.clone()
-                                };
-                                let worktree_base = if scaffold_attached {
-                                    attached_scaffold_source_ref
-                                        .clone()
-                                        .unwrap_or_else(|| base.clone())
-                                } else {
-                                    base.clone()
-                                };
-                                let target_device_id = if scaffold_attached {
-                                    host_device_id.clone()
-                                } else if space_remote {
-                                    Some(device_id.clone())
-                                } else {
-                                    None
-                                };
-                                if let Some(repo_path) = repo_path {
-                                    new_worktree =
-                                        Some((repo_path, worktree_base, target_device_id));
-                                }
+                            chat_branch = Some(base.clone());
+                            let repo_path = if scaffold_attached {
+                                Some(".".to_string())
+                            } else {
+                                space_path.clone()
+                            };
+                            let worktree_base = if scaffold_attached {
+                                attached_scaffold_source_ref
+                                    .clone()
+                                    .unwrap_or_else(|| base.clone())
+                            } else {
+                                base.clone()
+                            };
+                            let target_device_id = if scaffold_attached {
+                                host_device_id.clone()
+                            } else if space_remote {
+                                Some(device_id.clone())
+                            } else {
+                                None
+                            };
+                            if let Some(repo_path) = repo_path {
+                                new_worktree =
+                                    Some((repo_path, worktree_base, target_device_id));
                             }
                         }
                     }
@@ -7056,7 +7064,7 @@ mod tests {
         );
         assert_eq!(
             scaffold_source_ref(&CheckoutPlan::NewWorktree {
-                base: Some("feat/identity".into()),
+                base: "feat/identity".into(),
             }),
             Some("feat/identity")
         );

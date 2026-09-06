@@ -273,15 +273,6 @@ final class WorkspaceStore {
         sortActive(chats.filter { !$0.archived && $0.spaceId == spaceId })
     }
 
-    func indicator(for chat: Chat) -> ChatIndicator {
-        chatIndicator(chat: chat, live: effectiveStatus(sessions[chat.id], now: nowMs()))
-    }
-
-    /// Aggregate most-urgent member status for a space's leading dot.
-    func spaceIndicator(_ spaceId: String) -> ChatIndicator? {
-        let members = chats(in: spaceId).map { indicator(for: $0) }
-        return members.min(by: { $0.rawValue < $1.rawValue })
-    }
 
     // MARK: Device relay (folder browsing / direct host RPCs)
 
