@@ -408,6 +408,26 @@ under `~/Library/Application Support/Crew Migration Backups/20260905-staging/`.
 
 Typechecking was intentionally not run because global instructions prohibit it.
 
+### Sidebar sizing and trailing controls follow-up
+
+Deferred card layout exposed an implicit parent-stretch assumption: the
+rendered card root did not request the full available width. Active cards
+and the settled opacity wrapper now explicitly fill their fixed-height slots.
+The existing clip-aware construction and scroll geometry remain intact.
+
+Status indicators and settle actions share a trailing slot with an 18px
+minimum width. The hover overlay no longer crowds a long folder label.
+In the native desktop smoke, short and long cards had matching dimensions;
+clicking the relocated settle button moved only its fixture into Settled,
+preserved the selected Short session, and retained full-width settled rows.
+
+A freshly built native iOS simulator showed consistent rows and the live
+`Running` label. Its initial and existing-session commands both completed,
+producing four transcript entries; desktop settlement also removed that
+fixture from the phone's active list. The mock host deliberately paced its
+output, so these runs are behavior checks rather than latency measurements.
+No iOS source change is required for this desktop-only layout correction.
+
 ### Limits of this audit
 
 A three-second sample of the already-running desktop process showed a 1.2 GB

@@ -4011,6 +4011,7 @@ impl Shell {
         });
         div()
             .id(SharedString::from(format!("chat-{id}")))
+            .w_full()
             .h(px(chat_row_height(self.settings.density)))
             .flex_none()
             .flex()
@@ -4071,17 +4072,17 @@ impl Shell {
                             .child(space_name),
                     )
                     .child(
-                        // Fixed to the header line's 13px so dot/spinner/label
-                        // all center on the same baseline band. The button
-                        // rides an absolute overlay pinned to the band's right
-                        // edge: the read-out keeps owning the slot's width, so
-                        // the swap costs no reflow at any indicator width.
+                        // Keep status and settle affordances in one trailing
+                        // slot. Reserve the button's 18px width so its hover
+                        // overlay cannot overlap the folder label or reflow it.
                         div()
                             .flex_none()
+                            .min_w(px(18.0))
                             .h(px(13.0))
                             .relative()
                             .flex()
                             .items_center()
+                            .justify_center()
                             .child(div().opacity(1.0 - reveal).child(status_slot))
                             .when_some(settle_button, |el, button| {
                                 el.child(

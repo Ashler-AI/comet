@@ -1063,7 +1063,11 @@ impl Shell {
                         cx,
                     );
                     if settled {
-                        div().opacity(0.52).child(element).into_any_element()
+                        div()
+                            .w_full()
+                            .opacity(0.52)
+                            .child(element)
+                            .into_any_element()
                     } else {
                         element
                     }
