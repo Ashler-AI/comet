@@ -35,6 +35,8 @@ use crate::omp_session_artifact::CapturedOmpSessionFile;
 use crate::worktree_handoff::{MAX_HANDOFF_ARCHIVE_BYTES, WorktreeHandoffArchive};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const RUNTIME_START_WAIT: Duration = Duration::from_secs(120);
+const RUNTIME_START_POLL: Duration = Duration::from_millis(500);
 const JOIN_GRANT_TTL_SECONDS: u32 = 15 * 60;
 const DEVICE_ACCESS_TTL_MS: i64 = 12 * 60 * 60 * 1000;
 const SCAFFOLD_WORKSPACE_CWD: &str = "/workspace/ashler-platform";
@@ -123,6 +125,11 @@ impl fmt::Display for ScaffoldApiErrorDisplay {
 }
 
 impl ScaffoldError {
+    fn is_runtime_starting(&self) -> bool {
+        self.api_error()
+            .is_some_and(|error| error.status == 503 && error.code == "sandbox_runtime_starting")
+    }
+
     pub fn api_error(&self) -> Option<&ScaffoldApiError> {
         match self {
             Self::Api(error) => Some(&error.0),
@@ -1174,12 +1181,24 @@ fn api_error(status: StatusCode, body: &[u8]) -> ScaffoldError {
         message: Option<String>,
         #[serde(default)]
         error_description: Option<String>,
+        #[serde(default)]
+        body: Value,
     }
 
     let decoded = serde_json::from_slice::<Envelope>(body).ok();
     let error_value = decoded.as_ref().map(|value| &value.error);
-    let code = error_value
-        .and_then(Value::as_str)
+    // The provider wrapper is retained on the wire for installed clients.
+    // Promote only its exact provisioning code, never free-form messages.
+    let runtime_starting = status == StatusCode::SERVICE_UNAVAILABLE
+        && error_value.and_then(Value::as_str) == Some("sandbox_provider_error")
+        && decoded
+            .as_ref()
+            .and_then(|value| value.body.get("error"))
+            .and_then(Value::as_str)
+            == Some("sandbox_runtime_starting");
+    let code = runtime_starting
+        .then_some("sandbox_runtime_starting")
+        .or_else(|| error_value.and_then(Value::as_str))
         .or_else(|| {
             error_value
                 .and_then(|value| value.get("error"))
@@ -2305,6 +2324,72 @@ impl ScaffoldRuntime {
         })
     }
 
+    // Only retry the read-only authority probe, before minting credentials or
+    // launching a process. Application readiness depends on that bootstrap.
+    async fn probe_attach_authority(
+        &self,
+        sandbox_id: &str,
+        scope: &CollaborationScope,
+        environment: &SessionEnvironment,
+        argv: &[String],
+        cancellation: &CancellationToken,
+    ) -> Result<ExecResponse, ScaffoldError> {
+        let deadline = tokio::time::Instant::now() + RUNTIME_START_WAIT;
+        loop {
+            let body = ExecBody {
+                argv,
+                mode: "inline",
+                timeout_ms: 10_000,
+            };
+            let result = tokio::time::timeout_at(
+                deadline,
+                self.inner.client.exec(sandbox_id, &body, cancellation),
+            )
+            .await
+            .map_err(|_| {
+                ScaffoldError::InvalidResponse("sandbox runtime startup deadline exceeded".into())
+            })?;
+            let error = match result {
+                Err(error) if error.is_runtime_starting() => error,
+                result => return result,
+            };
+            let pending = async {
+                let current = self
+                    .inner
+                    .client
+                    .inspect(sandbox_id, scope, cancellation)
+                    .await?;
+                let (lifecycle, epoch, current_id) = scaffold_source(&current)?;
+                if current_id != sandbox_id
+                    || current.scope != environment.scope
+                    || current.owner_principal != environment.owner_principal
+                    || epoch != scaffold_source(environment)?.1
+                    || !matches!(
+                        lifecycle,
+                        comet_proto::ScaffoldLifecycle::Creating
+                            | comet_proto::ScaffoldLifecycle::RestoringSnapshot
+                            | comet_proto::ScaffoldLifecycle::Starting
+                            | comet_proto::ScaffoldLifecycle::Resuming
+                            | comet_proto::ScaffoldLifecycle::Ready
+                            | comet_proto::ScaffoldLifecycle::AgentRunning
+                    )
+                {
+                    return Err(ScaffoldError::InvalidResponse(
+                        "sandbox lifecycle changed while waiting for its runtime".into(),
+                    ));
+                }
+                tokio::time::sleep(RUNTIME_START_POLL).await;
+                Ok(())
+            };
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(ScaffoldError::Cancelled),
+                _ = tokio::time::sleep_until(deadline) => return Err(error),
+                result = pending => result?,
+            }
+        }
+    }
+
     async fn attach(
         &self,
         sandbox_id: &str,
@@ -2315,12 +2400,15 @@ impl ScaffoldRuntime {
         let (lifecycle, lifecycle_epoch, _) = scaffold_source(environment)?;
         if !matches!(
             lifecycle,
-            comet_proto::ScaffoldLifecycle::Starting
+            comet_proto::ScaffoldLifecycle::Creating
+                | comet_proto::ScaffoldLifecycle::RestoringSnapshot
+                | comet_proto::ScaffoldLifecycle::Resuming
+                | comet_proto::ScaffoldLifecycle::Starting
                 | comet_proto::ScaffoldLifecycle::Ready
                 | comet_proto::ScaffoldLifecycle::AgentRunning
         ) {
             return Err(ScaffoldError::InvalidResponse(format!(
-                "sandbox {sandbox_id} is not ready"
+                "sandbox {sandbox_id} cannot attach in lifecycle {lifecycle:?}"
             )));
         }
         let deployment_id = scope
@@ -2343,20 +2431,16 @@ impl ScaffoldRuntime {
         // keeps repeated attach idempotent while preserving a fail-closed fallback
         // when the prior process is missing, stale, or bound to another room.
         let authority_argv = vec!["comet".to_string(), "scaffold-authority".to_string()];
-        if let Ok(authority) = self
-            .inner
-            .client
-            .exec(
+        let authority = self
+            .probe_attach_authority(
                 sandbox_id,
-                &ExecBody {
-                    argv: &authority_argv,
-                    mode: "inline",
-                    timeout_ms: 10_000,
-                },
+                scope,
+                environment,
+                &authority_argv,
                 cancellation,
             )
-            .await
-            && authority.ok
+            .await?;
+        if authority.ok
             && authority.exit_code == Some(0)
             && let Some(stdout) = authority.stdout.as_deref()
             && let Ok(existing) =
@@ -2657,11 +2741,17 @@ mod tests {
     }
 
     async fn mock_server(responses: Vec<String>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        mock_server_with_status(responses.into_iter().map(|body| (200, body)).collect()).await
+    }
+
+    async fn mock_server_with_status(
+        responses: Vec<(u16, String)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move {
             let mut requests = Vec::new();
-            for body in responses {
+            for (status, body) in responses {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
                 loop {
@@ -2689,7 +2779,7 @@ mod tests {
                 }
                 requests.push(String::from_utf8(bytes).unwrap());
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {status} Response\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                     body.len(),
                     body,
                 );
@@ -3204,6 +3294,144 @@ mod tests {
         assert!(grant_body.contains(r#""deploymentId":"deployment-a""#));
         assert!(grant_body.contains(r#""lifecycleEpoch":1"#));
     }
+    #[tokio::test]
+    async fn attach_waits_for_explicit_runtime_starting_before_bootstrap() {
+        let join_expires_at = now_ms() + 60_000;
+        let (origin, captured) = mock_server_with_status(vec![
+            (200, comet_sandbox("starting")),
+            (503, r#"{"error":"sandbox_provider_error","body":{"error":"sandbox_runtime_starting","sessionId":"sandbox-a","lifecycleEpoch":1,"status":"starting"}}"#.into()),
+            (200, comet_sandbox("starting")),
+            (200, r#"{"ok":false,"exitCode":1}"#.into()),
+            (200, r#"{"ok":true,"exitCode":0}"#.into()),
+            (200, format!(r#"{{"grant":"cg1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narrow_secret","expiresAt":{join_expires_at}}}"#)),
+            (200, r#"{"ok":true}"#.into()),
+            (200, r#"{"ok":true,"exitCode":0}"#.into()),
+            (200, r#"{"ok":true,"runId":"run-a"}"#.into()),
+        ]).await;
+        let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("token".into()));
+        let runtime = ScaffoldRuntime::new(
+            ScaffoldClient::new(&origin, "project-a", bearer.clone()).unwrap(),
+            "https://comet-edge.example",
+            Arc::new(EdgeDeviceJoinGrantClient::new(&origin, bearer).unwrap()),
+        );
+        let result = runtime
+            .control(
+                ScaffoldEnvironmentControl::Attach {
+                    sandbox_id: "sandbox-a".into(),
+                    scope: scope(),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.attached_device_id.as_deref(),
+            Some("comet-scaffold-sandbox-a-e1")
+        );
+        assert_eq!(
+            result.room_projection.unwrap().session_id,
+            scope().session_id.unwrap()
+        );
+        assert_eq!(result.run_id.as_deref(), Some("run-a"));
+        let requests = captured.await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.contains("POST /auth/device-grants "))
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.contains("--device-bootstrap-file"))
+                .count(),
+            1
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r.starts_with("POST /api/code-sandboxes HTTP"))
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_runtime_wait_fails_closed_on_missing_and_terminal_lifecycle() {
+        for (status, code, terminal) in [
+            (404, "sandbox_provider_error", None),
+            (403, "sandbox_profile_mismatch", None),
+            (404, "sandbox_runtime_starting", None),
+            (503, "scaffold_request_rejected", None),
+            (503, "sandbox_runtime_starting", Some("failed")),
+            (503, "sandbox_runtime_starting", Some("paused")),
+        ] {
+            let mut responses = vec![
+                (200, comet_sandbox("starting")),
+                (status, serde_json::json!({"error":code}).to_string()),
+            ];
+            if let Some(lifecycle) = terminal {
+                responses.push((200, comet_sandbox(lifecycle)));
+            }
+            let expected_requests = responses.len();
+            let (origin, captured) = mock_server_with_status(responses).await;
+            let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("token".into()));
+            let runtime = ScaffoldRuntime::new(
+                ScaffoldClient::new(&origin, "project-a", bearer.clone()).unwrap(),
+                "https://comet-edge.example",
+                Arc::new(EdgeDeviceJoinGrantClient::new(&origin, bearer).unwrap()),
+            );
+            let error = runtime
+                .control(
+                    ScaffoldEnvironmentControl::Attach {
+                        sandbox_id: "sandbox-a".into(),
+                        scope: scope(),
+                    },
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            if terminal.is_some() {
+                assert!(matches!(error, ScaffoldError::InvalidResponse(_)));
+            } else {
+                let api = error.api_error().unwrap();
+                assert_eq!((api.status, api.code.as_str()), (status, code));
+            }
+            assert_eq!(captured.await.unwrap().len(), expected_requests);
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_runtime_wait_is_cancellable_before_credentials_are_minted() {
+        let (origin, captured) = mock_server_with_status(vec![
+            (200, comet_sandbox("starting")),
+            (503, r#"{"error":"sandbox_provider_error","body":{"error":"sandbox_runtime_starting","sessionId":"sandbox-a","lifecycleEpoch":1,"status":"starting"}}"#.into()),
+            (200, comet_sandbox("starting")),
+        ]).await;
+        let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("token".into()));
+        let runtime = ScaffoldRuntime::new(
+            ScaffoldClient::new(&origin, "project-a", bearer.clone()).unwrap(),
+            "https://comet-edge.example",
+            Arc::new(EdgeDeviceJoinGrantClient::new(&origin, bearer).unwrap()),
+        );
+        let cancellation = CancellationToken::new();
+        let attach = runtime.control(
+            ScaffoldEnvironmentControl::Attach {
+                sandbox_id: "sandbox-a".into(),
+                scope: scope(),
+            },
+            &cancellation,
+        );
+        let cancel = async {
+            let requests = captured.await.unwrap();
+            cancellation.cancel();
+            requests
+        };
+        let (result, requests) = tokio::join!(attach, cancel);
+        assert!(matches!(result, Err(ScaffoldError::Cancelled)));
+        assert_eq!(requests.len(), 3);
+        assert!(!requests.iter().any(|r| r.contains("/auth/device-grants")));
+    }
+
     #[tokio::test]
     async fn repeated_attach_reuses_matching_scaffold_host_authority() {
         let expires_at = now_ms() + 60_000;
