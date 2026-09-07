@@ -107,7 +107,8 @@ export class ApnsProvider {
   async send(device: Registration, chatId: string, projectScope: string, userId: string, attention: Attention, authorization?: string): Promise<{ remove: boolean; invalidatedAt?: number }> {
     const jwt = authorization ?? await this.authorization();
     const host = device.environment === "sandbox" ? "api.sandbox.push.apple.com" : "api.push.apple.com";
-    const response = await this.transport(`https://${host}/3/device/${device.token}`, {
+    const transport = this.transport;
+    const response = await transport(`https://${host}/3/device/${device.token}`, {
       method: "POST",
       headers: {
         authorization: `bearer ${jwt}`,
