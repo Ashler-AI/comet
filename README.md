@@ -60,9 +60,12 @@ closed main window. On macOS, launch the installed Crew app bundle rather than
 the bare executable; OS permission and Focus settings still control delivery.
 
 Mobile attention alerts use the same factual transition policy. Production iOS
-1.0 (5) is prepared with the missing-session visibility fixes and production
-APNs entitlement. Background delivery requires separately configured production
-Worker credentials; see [iOS notification setup](apps/ios/README.md#session-attention-notifications).
+1.0 (5) was rebuilt after a regression teardown crash fix and uploaded to Apple
+with the missing-session visibility fixes and verified production APNs entitlement.
+Apple reported processing; TestFlight availability is not yet verified. Background
+delivery remains blocked on production Worker credentials; see
+[iOS release evidence](apps/ios/README.md#crew-0172--production-ios-10-5) and
+[notification setup](apps/ios/README.md#session-attention-notifications).
 
 ## GitHub deployment setup
 

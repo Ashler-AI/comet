@@ -113,6 +113,22 @@ scenarios and remained alive for over two minutes before intentional shutdown.
 The original iOS upload was cancelled during App Store Connect analysis. A fresh
 production archive was built after this fix; the earlier archive is rejected.
 
+The fresh archive, built from crash fix `ed34d79`, uploaded successfully on
+2026-09-07 at **15:23:50 UTC** as production **1.0 (5)**. Xcode reported the
+package processing, then upload success with no errors or warnings; delivery ID
+`ce659ad3-9bcc-4b1f-ae8c-ecf8a5536ffc`. The inspection IPA passed signature
+verification, and both its signed entitlements and embedded profile specify
+`aps-environment = production` for `825LYXGJR6.ai.ashler.crew`.
+App Store Connect browser access requires renewed sign-in: processing completion,
+TestFlight availability, physical-device installation, and notification delivery
+are not yet verified. Production Worker deployment remains blocked on approved
+production APNs credentials; no background-delivery readiness is claimed.
+
+The release workflow verified the desktop production manifest, checksums, and
+latest pointer. Local `comet update --check` returned HTTP 401 without a current
+production login, so authenticated client download was not verified locally.
+Typechecks were intentionally not run because global instructions prohibit them.
+
 Home includes detached and missing-space sessions and an **Archived sessions**
 section with explicit **Restore**. Imported chat IDs remain opaque, while
 `SessionEnvironment` projection/writes and verified deployment routing are retained.
