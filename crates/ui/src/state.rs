@@ -1912,6 +1912,14 @@ impl AppState {
     /// Release a failed first-send reservation after its durable chat and any
     /// managed checkout have been rolled back.
     pub fn cancel_pending_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        if self
+            .pending_scaffold_session
+            .as_ref()
+            .is_some_and(|draft| draft.chat_id == chat_id)
+        {
+            self.pending_scaffold_session = None;
+            self.scaffold_starting_chats.remove(chat_id);
+        }
         self.pending_local_chat_ids.remove(chat_id);
         self.chat_startup_phases.remove(chat_id);
         self.chats.retain(|chat| chat.id != chat_id);
@@ -4630,6 +4638,12 @@ mod tests {
             assert!(state.chat_is_scaffold("chat-a"));
             assert!(state.transcript_task.is_none());
             assert!(state.collaboration_task.is_none());
+            state.scaffold_scope = Some(("project-a".into(), "deployment-a".into()));
+            state.selected_space = Some("space-a".into());
+            assert!(!state.can_start_scaffold_session());
+            state.cancel_pending_chat("chat-a", cx);
+            assert!(state.can_start_scaffold_session());
+            assert!(!state.chat_is_scaffold("chat-a"));
         });
         assert!(
             operations
