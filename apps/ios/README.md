@@ -124,10 +124,11 @@ Authenticated App Store Connect inspection on 2026-09-07 confirmed build **5**
 upload **Complete** at **11:23 AM**, with access assigned to **Ashler Internal**.
 That group's one internal tester remains **Invited**, with no install/session
 recorded. No physical-device installation or notification delivery is claimed.
-Production Worker deployment remains blocked on approved production APNs
-credentials and must use `deploy.yml` dispatch `target=production`, never a local
-production deploy. The checked-in workflow also invokes a typecheck, which this
-agent is prohibited from starting; its approval gate must not be bypassed.
+Production notification code was deployed through the staging-verified workflow
+after direct integration into main. Background APNs delivery remains blocked on
+approved production credentials; code deployment alone does not enable pushes.
+Manual deploys may set `skip_typecheck=true` when required by agent policy; the
+default remains false, and builds, tests and deployment environment gates remain.
 
 The release workflow verified the desktop production manifest, checksums, and
 latest pointer. Local `comet update --check` returned HTTP 401 without a current
@@ -137,18 +138,17 @@ Typechecks were intentionally not run because global instructions prohibit them.
 Source reconciliation verified that fetched `origin/main` (`f89dd43`) is an
 ancestor of the production release branch, which initially held exactly three
 additional release commits. The stale local `main` checkout was not its baseline.
-The already-published branch had not been merged, however. The release workflow
-now fetches main explicitly and checks dispatch/tag ancestry against `FETCH_HEAD`,
-not an assumed `origin/main` tracking ref. This also gates candidate-reuse
-dispatches. Further promotion must wait for the PR merge; published 0.1.72
-artifacts must not be overwritten.
+The previously published release branch was merged directly into main as
+`4a1a398` on 2026-09-07; PR #16 was automatically marked merged. The workflow
+fetches main explicitly and checks dispatch/tag ancestry against `FETCH_HEAD`,
+including candidate-reuse dispatches. Published 0.1.72 artifacts are immutable.
 
 `node --test scripts/release-workflow.test.mjs` passed **22 tests**. The new
 behavioral cases execute the actual version/reuse shell blocks with temporary
 single-branch Git clones and tar archives: no `origin/main` tracking ref, merged
 and unmerged source, invalid/nonproduction reuse IDs, GitHub compare outcomes,
 unsuccessful/foreign-workflow source runs, outer archive corruption, and separate
-desktop/Scaffold/unified checksum failures. No production workflow was dispatched.
+desktop/Scaffold/unified checksum failures.
 
 The full `cargo test -p comet-ui` suite passed **531 tests** with zero failures;
 the production port changed no comet-doc or comet-engine source files. A fresh
@@ -156,6 +156,27 @@ the production port changed no comet-doc or comet-engine source files. A fresh
 but macOS displayed its Crew permission notice rather than an attention banner.
 Permission was not granted automatically; real banner delivery and click routing
 remain unverified until the user allows Crew notifications.
+
+After direct integration, builds and tests ran from `/tmp/crew-notifications-main`:
+**825 Rust tests passed**, with three existing environment-dependent tests ignored;
+**132 edge tests** and **22 release tests** passed. `package-macos.sh` produced
+Crew **0.1.72**, and the bundle passed signature verification. A fresh production
+iOS **1.0 (5)** archive exported successfully; the signed IPA and embedded profile
+both specify production APNs. This merged-source archive was not re-uploaded over
+the already accepted TestFlight build 5.
+
+Main commit `d8e1239` deployed through
+[34141398021](https://github.com/Ashler-AI/comet/actions/runs/34141398021).
+The real Edge/Rust collaboration smoke, binding freshness, and edge tests passed;
+Typecheck was explicitly skipped. The workflow promoted the byte-identical staging
+candidate with digest `fab2ce12da3cd918dd2f11b4c0953e6ef569fde80646171b0c0ba9d44a085620`.
+Production Worker version: `5f344996-6aec-4b27-81de-01a96f9b4f65`.
+Both staging and production `/health` returned `ok: true` after deployment.
+The existing 0.1.72 desktop candidate was promoted from merged main by
+[34141507706](https://github.com/Ashler-AI/comet/actions/runs/34141507706), with
+all publish/readback jobs successful; no released artifact bytes were replaced.
+The `comet-release-production` environment currently has no configured protection
+rules; the workflow boundary was retained, but no manual reviewer approval is claimed.
 
 The bounded Debug build was installed and exercised with `-visibility-e2e`:
 the lifecycle completed with `drained logout DELETE`. Both missing-DELETE and
@@ -172,12 +193,12 @@ The bounded `SessionNotifications.swift` copies in the release, local preservati
 and staging worktrees share SHA-256
 `d86de1dd1d066d720b3ee300e7d02dfb993c47b6269481511d9bcdbfdc5e14a2`.
 
-Integration is tracked in [PR #16](https://github.com/Ashler-AI/comet/pull/16).
+The direct main merge automatically closed [PR #16](https://github.com/Ashler-AI/comet/pull/16).
 The user checkout is intentionally left on
 `work/crew-notifications-local-preservation`, **not main**, with the notification
-work committed and pushed. Switching back to main would remove those committed
-files from the working tree until integration; they remain recoverable from the
-preservation branch. Unrelated doc/engine/harness and data-script changes remain
+work committed and pushed. Main now also contains the integrated feature, while
+the local main branch has not been reset over the preserved checkout. Unrelated
+doc/engine/harness and data-script changes remain
 untouched. Staging copies are committed on
 `release/crew-staging-notification-activation`, not left as dirty release edits.
 

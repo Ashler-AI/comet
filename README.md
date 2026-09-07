@@ -94,6 +94,14 @@ project/provider assertions pass. Release-feed synchronization does not reuse
 that boundary: it enters the matching protected `comet-release-*` environment
 before either edge deployment.
 
+For a manual run only, `skip_typecheck=true` explicitly omits the TypeScript
+check; it defaults to false and does not affect push CI. Builds, tests, staging
+verification, candidate-digest checks and deployment environment gates still run.
+The notification release was integrated directly into main and deployed by
+[34141398021](https://github.com/Ashler-AI/comet/actions/runs/34141398021), with
+the existing desktop candidate promoted from main by
+[34141507706](https://github.com/Ashler-AI/comet/actions/runs/34141507706).
+
 Add these environment-scoped secrets to `comet-release-staging` and `comet-release-production`:
 
 - `GCP_WORKLOAD_IDENTITY_PROVIDER`
