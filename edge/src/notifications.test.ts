@@ -315,7 +315,8 @@ describe("APNs provider", () => {
     const { env, keys } = await signingEnv();
     let payload: Record<string, unknown> | undefined;
     let headers: Headers | undefined;
-    const provider = new ApnsProvider(env, (async (_url, init) => {
+    const provider = new ApnsProvider(env, (async function (this: unknown, _url, init) {
+      if (this !== undefined && this !== globalThis) throw new TypeError("Illegal invocation");
       payload = JSON.parse(init!.body as string);
       headers = new Headers(init!.headers);
       return new Response(null, { status: 200 });
