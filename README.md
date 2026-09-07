@@ -187,7 +187,9 @@ An exact `503 sandbox_runtime_starting` response (including the provider's neste
 `body.error` envelope) keeps one native Attach operation waiting, bounded to two
 minutes and cancellable. Each wait rechecks the sandbox, owner, room, and lifecycle
 epoch; unrelated 404s and terminal states still fail. Manual retry uses the same
-accepted sandbox, while confirmed chat deletion discards the pending draft.
+accepted sandbox. A failed launch without an accepted remote target discards its
+pending draft; confirmed deletion discards an accepted pending draft. Deleting a
+persisted chat keeps the ordinary chat-deletion behavior.
 
 ```bash
 version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
