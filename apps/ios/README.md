@@ -136,12 +136,15 @@ contract. Allowlisted rejection diagnostics never log provider bodies,
 credentials, tokens, request URLs, or session content. Final staging Worker
 version is `5f208fff-1f91-43bd-85e4-4b2825c10f27`.
 
-After full workspace hydration, isolated working-to-awaiting-input transitions
+After full workspace hydration, temporary working-to-awaiting-input transitions
 reached Apple in **Production and Sandbox**, each returning **400 BadDeviceToken**
 for the intentionally invalid probe token. No **403 InvalidProviderToken** was
 observed. Both probe registrations and temporary workspace chat/session rows
 were removed. Temporary tracing and local signing fixtures were removed.
 These are real upstream rejection results, not successful device delivery.
+The probes used disposable rows in the shared staging workspace, not a separate
+project. The existing registration list was not inspected first, so other
+subscribed tester devices may have received a generic attention alert.
 
 **Background delivery is configured; physical-device delivery remains unverified.**
 The paired iPhone was unavailable to local tooling. In TestFlight build 8,
