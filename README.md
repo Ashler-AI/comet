@@ -48,6 +48,86 @@ npm --prefix edge run smoke:collaboration
 
 It covers a scope-bound invite and join, two concurrent agent sessions, shared transcript provenance, owner-only teammate command execution and audit, reconnect replay, stable annotations, and attachment metadata without embedding blob bytes.
 
+## Session attention alerts
+
+Desktop: **Settings → Crew notifications → Turn on Crew alerts**. Input requests,
+errors, and working→idle completions produce generic notifications; initial and
+reconnected snapshots, heartbeat/replay, stale updates and archived sessions do
+not. Alerts for the actively viewed session are suppressed. Clicking a session
+alert opens Crew and selects that session.
+
+macOS requires the installed app bundle and explicit notification permission;
+use **Send Crew test alert** to request permission, then send another after
+allowing Crew. System Settings and Focus govern delivery. Linux uses the desktop
+notification service; its notification history ages out according to that service.
+The separate chime toggle remains available. The platform API does not expose
+permission or delivery receipts to Crew.
+
+Mobile: account menu → **Notifications**. Background alerts require the deployed
+APNs backend and a push-enabled signed iOS build; see
+[iOS notification setup](apps/ios/README.md#session-attention-notifications).
+
+
+## MIT OpenCourseWare ingestion
+
+`scripts/mit-ocw-to-gcs.py` discovers the approved department/topic scope from
+MIT OpenCourseWare, writes a reviewable manifest, and syncs course materials to
+a private GCS bucket:
+
+```bash
+python3 scripts/mit-ocw-to-gcs.py discover \
+  --output target/mit-ocw-ingest/full-manifest.json \
+  --workers 8
+
+python3 scripts/mit-ocw-to-gcs.py sync \
+  --manifest target/mit-ocw-ingest/full-manifest.json \
+  --output-dir target/mit-ocw-ingest/full-run \
+  --bucket "$MIT_OCW_GCS_BUCKET" \
+  --workers 8
+```
+
+Review the discovery manifest before `sync`. The selected scope is all OCW
+courses in departments 1, 2, 10, and 12; structural courses in departments 4,
+16, and 22; and electrical-engineering courses in department 6. Native OCW
+course archives are preserved as `archive.zip`. Courses for which OCW sets
+`hide_download` use a deterministic snapshot limited to same-course OCW pages
+and resources; external course websites are not followed. `materials.zip`
+contains the filtered course content without OCW's shared site runtime.
+
+Objects are organized under
+`courses/<course-id>/versions/v2-<archive-sha256>/`, with immutable
+`archive.zip`, `materials.zip`, and `manifest.json` objects. The mutable
+`courses/<course-id>/manifest.json` pointer selects the current version, and
+`catalog.json` lists the complete run. The local `run-manifest.json` is an
+atomic restart checkpoint; re-running the same command resumes incomplete
+courses and republishes the catalog. Bucket preflight rejects public IAM
+principals. Use uniform bucket-level access and enforced public-access
+prevention.
+
+To publish useful static OCW files into the model-factory document taxonomy,
+first write and review the classification, then run the resumable publisher:
+
+```bash
+python3 scripts/categorize-mit-ocw.py classify \
+  --catalog target/mit-ocw-ingest/full-run/run-manifest.json \
+  --output target/mit-ocw-categorized/classification.json
+
+python3 scripts/categorize-mit-ocw.py publish \
+  --catalog target/mit-ocw-ingest/full-run/run-manifest.json \
+  --work-dir target/mit-ocw-categorized/full-run \
+  --manifest target/mit-ocw-categorized/classification.json \
+  --workers 8
+```
+
+The publisher targets
+`documents/<subject>/mit-ocw/<course-id>/`, preserves archive-relative static
+file paths, and writes `_course.json` provenance beside each course. Every
+subject receives `mit-ocw/_catalog.json`, including subjects with no honest OCW
+match. It retains useful documents, presentations, datasets, code, diagrams,
+images, archives, and CAD files; it excludes HTML/CSS/JavaScript scaffolding and
+audio/video. Classification is primary-subject only: an OCW course is published
+once, and adjacent courses that do not fit the target taxonomy remain excluded.
+
 ## GitHub deployment setup
 
 The checked-in `edge/wrangler.jsonc` is the deployment contract. It defines isolated `staging` and `production` Worker, Durable Object, and R2 resources. It contains no Cloudflare account ID. Scaffold access uses verified Google Cloud IAP principals and environment-specific Scaffold project scope, independent of Ashler's customer-facing application stack.

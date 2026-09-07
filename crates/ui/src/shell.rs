@@ -170,16 +170,18 @@ pub enum SettingsSection {
     Agents,
     Advisor,
     Appearance,
+    Notifications,
     Shortcuts,
     Archived,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 6] = [
+    pub const ALL: [SettingsSection; 7] = [
         SettingsSection::Devices,
         SettingsSection::Agents,
         SettingsSection::Advisor,
         SettingsSection::Appearance,
+        SettingsSection::Notifications,
         SettingsSection::Shortcuts,
         SettingsSection::Archived,
     ];
@@ -192,6 +194,7 @@ impl SettingsSection {
             SettingsSection::Agents => "Accounts",
             SettingsSection::Advisor => "Advisor",
             SettingsSection::Appearance => "Appearance",
+            SettingsSection::Notifications => "Crew notifications",
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Archived => "Settled sessions",
         }
@@ -1535,9 +1538,6 @@ pub struct Shell {
     space_boot_applied: bool,
     /// `settings.last_room_id` applied once after the first chat frame.
     room_boot_applied: bool,
-    /// Last seen session status per chat — the chime trigger compares against
-    /// it (a row's FIRST appearance never chimes, so boot stays silent).
-    sound_prev: std::collections::HashMap<String, comet_proto::SessionStatus>,
     user_menu_open: bool,
     /// Session-scoped multiplayer surfaces.
     command_palette_open: bool,
@@ -1664,12 +1664,6 @@ impl Shell {
         let now = Utc::now();
         let state_projection = ShellStateProjection::capture(state.read(cx), now);
         let transcript_chrome = TranscriptChromeCache::new(state.read(cx), now);
-        let sound_prev = state
-            .read(cx)
-            .sessions
-            .iter()
-            .map(|session| (session.chat_id.clone(), session.status))
-            .collect();
         let observation = cx.observe(&state, |this: &mut Shell, state, cx| {
             this.on_app_state_notification(&state, cx);
         });
@@ -1718,6 +1712,7 @@ impl Shell {
             }
             Some("settings/agents") => Route::Settings(SettingsSection::Agents),
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
+            Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
             Some("settings/advisor") => Route::Settings(SettingsSection::Advisor),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
@@ -1776,7 +1771,6 @@ impl Shell {
             sidebar_scroll: gpui::ScrollHandle::new(),
             space_boot_applied: false,
             room_boot_applied: false,
-            sound_prev,
             user_menu_open: false,
             command_palette_open: false,
             activity_open: false,
@@ -1902,7 +1896,7 @@ impl Shell {
         };
         if state_changed {
             self.state_projection = ShellStateProjection::capture(state.read(cx), now);
-            // Chimes, optimistic audit reconciliation, navigation/panel switching,
+            // Optimistic audit reconciliation, navigation/panel switching,
             // and splash transitions only depend on non-transcript state.
             self.on_state_changed(state, cx);
         }
@@ -1943,37 +1937,6 @@ impl Shell {
                     self.delete_confirm = Some(first);
                 }
                 _ => {}
-            }
-        }
-        // Session chimes follow factual session-row updates, never the
-        // time-derived display indicator. `effective_indicator` intentionally
-        // turns a 45s-old Working row into `None`; treating that visual expiry
-        // as Idle produced a phantom Working→Idle completion chime even when no
-        // session had updated. Fresh raw transitions still ring for ANY session
-        // on any device. A row's first appearance only seeds the baseline, and
-        // delayed/backfilled transitions older than the freshness window stay
-        // silent.
-        {
-            let now = Utc::now();
-            let app_state = state.read(cx);
-            for session in &app_state.sessions {
-                let prev = match self.sound_prev.get_mut(session.chat_id.as_str()) {
-                    Some(prev) => {
-                        let old = *prev;
-                        *prev = session.status;
-                        old
-                    }
-                    None => {
-                        self.sound_prev
-                            .insert(session.chat_id.clone(), session.status);
-                        continue;
-                    }
-                };
-                if self.settings.sound_enabled
-                    && let Some(sound) = crate::sound::sound_for_session_update(prev, session, now)
-                {
-                    crate::sound::play(sound);
-                }
             }
         }
         // Reconcile optimistic controls with immutable audit publications.
@@ -3176,6 +3139,80 @@ impl Shell {
         cx.notify();
     }
 
+    pub(crate) fn is_viewing_session(&self, chat_id: &str, cx: &App) -> bool {
+        matches!(self.route, Route::Chat)
+            && self.state.read(cx).selected_chat.as_deref() == Some(chat_id)
+    }
+
+    pub(crate) fn open_notified_session(
+        &mut self,
+        chat_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_nav(NavEntry::Chat(chat_id), cx);
+        self.nav.push(NavEntry::Chat(
+            self.state
+                .read(cx)
+                .selected_chat
+                .clone()
+                .unwrap_or_default(),
+        ));
+        window.activate_window();
+        window.focus(&self.composer.focus_handle(cx), cx);
+    }
+
+    fn render_notification_settings(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        use crate::settings::widgets;
+        let theme = Theme::of(cx).clone();
+        let enabled = self.settings.notifications_enabled;
+        let sound = self.settings.sound_enabled;
+        let unavailable = crate::notifications::unavailable_reason();
+        let platform_copy = if cfg!(target_os = "macos") {
+            "Crew asks macOS for permission on the first alert. Send a Crew test alert to request permission, then send another after allowing Crew. System Settings → Notifications and Focus control delivery; Crew cannot read delivery or permission status."
+        } else {
+            "Crew requires a running desktop notification service. Your desktop controls delivery, sound, and click actions. Crew cannot read delivery status; Linux alerts age out in the notification center."
+        };
+        widgets::page_column()
+            .child(widgets::page_header(&theme, "Crew notifications", None))
+            .child(widgets::page_subtitle(&theme, "Get generic Crew alerts when a session needs input, encounters an error, or finishes working. Session content is never included. Alerts are hidden for the Crew session you are viewing."))
+            .child(widgets::section_card(&theme)
+                .child(widgets::card_row(&theme, true)
+                    .child(widgets::row_title(&theme, "Crew desktop alerts"))
+                    .child(widgets::ghost_action(&theme)
+                        .id("crew-notifications-toggle")
+                        .child(if enabled { "Turn off Crew alerts" } else { "Turn on Crew alerts" })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !enabled && crate::notifications::unavailable_reason().is_some() {
+                                return;
+                            }
+                            this.settings.notifications_enabled = !enabled;
+                            crate::notifications::set_preferences(&this.settings, cx);
+                            this.schedule_save(cx);
+                            cx.notify();
+                        }))))
+                .child(widgets::card_row(&theme, false)
+                    .child(widgets::row_title(&theme, "Crew attention chimes"))
+                    .child(widgets::ghost_action(&theme)
+                        .id("crew-sound-toggle")
+                        .child(if sound { "Mute Crew chimes" } else { "Enable Crew chimes" })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.settings.sound_enabled = !sound;
+                            crate::notifications::set_preferences(&this.settings, cx);
+                            this.schedule_save(cx);
+                            cx.notify();
+                        })))))
+            .when(enabled && unavailable.is_none(), |page| {
+                page.child(widgets::ghost_action(&theme)
+                    .id("crew-test-notification")
+                    .child("Send Crew test alert")
+                    .on_click(cx.listener(|_, _, _, cx| crate::notifications::send_test(cx))))
+            })
+            .child(widgets::page_subtitle(&theme, platform_copy))
+            .when_some(unavailable, |page, reason| page.child(widgets::warning_strip(&theme, reason)))
+            .into_any_element()
+    }
+
     /// Lazily create the entity for a settings section and return it renderable.
     fn settings_outlet(&mut self, section: SettingsSection, cx: &mut Context<Self>) -> AnyElement {
         match section {
@@ -3218,6 +3255,7 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
+            SettingsSection::Notifications => self.render_notification_settings(cx),
             SettingsSection::Shortcuts => {
                 if self.shortcuts_page.is_none() {
                     let state = self.state.clone();
@@ -3731,6 +3769,7 @@ impl Shell {
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
             SettingsSection::Advisor => icons::CHAT_ROUND_LINE,
             SettingsSection::Appearance => icons::TUNING,
+            SettingsSection::Notifications => icons::CHAT_ROUND_LINE,
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
         };

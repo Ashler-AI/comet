@@ -1108,6 +1108,10 @@ pub struct AppState {
     /// replaces the optimistic row and clears `pending_local_chat_ids`.
     chat_startup_phases: HashMap<String, ChatStartupPhase>,
     pub sessions: Vec<Session>,
+    /// Factual watch publications, independent of UI/heartbeat notifications.
+    pub sessions_revision: u64,
+    /// First frame of each subscription establishes a silent attention baseline.
+    pub sessions_epoch: u64,
     /// Imported session memberships from the workspace `sessionRefs` map.
     pub session_refs: Vec<SessionRef>,
     /// Transcript-derived labels learned after an imported room has opened.
@@ -1243,6 +1247,8 @@ impl AppState {
             pending_local_chat_ids: HashSet::new(),
             chat_startup_phases: HashMap::new(),
             sessions: Vec::new(),
+            sessions_revision: 0,
+            sessions_epoch: 0,
             session_refs: Vec::new(),
             shared_session_previews: HashMap::new(),
             selected_space: None,
@@ -1368,6 +1374,7 @@ impl AppState {
 
     pub fn apply_sessions(&mut self, sessions: Vec<Session>) {
         self.sessions = sessions;
+        self.sessions_revision = self.sessions_revision.wrapping_add(1);
     }
 
     pub fn apply_scaffold_environments(&mut self, snapshot: ScaffoldEnvironmentSnapshot) {
@@ -3245,6 +3252,7 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
                 return;
             }
         };
+        let mut first_frame = true;
         while let Some(value) = rx.recv().await {
             let parsed: T = match serde_json::from_value(value) {
                 Ok(parsed) => parsed,
@@ -3254,6 +3262,10 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
                 }
             };
             let alive = this.update(cx, |state, cx| {
+                if first_frame && method == methods::WATCH_SESSIONS {
+                    state.sessions_epoch = state.sessions_epoch.wrapping_add(1);
+                }
+                first_frame = false;
                 apply(state, parsed);
                 cx.notify();
             });

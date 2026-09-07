@@ -17,6 +17,7 @@ import {
   AUTH_USER_HEADER,
   DEVICE_HOST_AUTH_HEADER,
   ROOM_KIND_HEADER,
+  NOTIFICATION_BEARER_HEADER,
   stripTrustedAuthHeaders,
   type Env
 } from "./env";
@@ -103,6 +104,9 @@ const forward = (
         revokedAt: grant.revokedAt
       })
     );
+  }
+  if (path === "/notifications/device" && identity.credential !== "device") {
+    headers.set(NOTIFICATION_BEARER_HEADER, bearerFromRequest(request) ?? "");
   }
   if (roomKind) headers.set(ROOM_KIND_HEADER, roomKind);
   if (deviceHostAuthorization) {
@@ -207,6 +211,12 @@ export default {
     // A sandbox credential is a single-session, single-device host identity.
     // Every route must opt in below; project-wide resources deny by default.
     const deviceCredential = identity.credential === "device";
+
+    if (url.pathname === "/notifications/device") {
+      if (deviceCredential || !hasCapability(identity, "session.read")) return json({ error: "forbidden" }, 403);
+      if (request.method !== "PUT" && request.method !== "DELETE") return json({ error: "method_not_allowed" }, 405);
+      return forward(env.SESSION_ROOMS, `ws4/${identity.projectScope}`, request, identity, "/notifications/device", "", "workspace");
+    }
 
     const sessionId = canonicalSessionId(parts[1]);
     if (parts[0] === "session" && sessionId && ID_RE.test(sessionId) && parts[2] === "ws") {

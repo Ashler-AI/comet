@@ -4,6 +4,30 @@
 
 import Foundation
 
+enum ReleaseConfig {
+    static let edgeURL = requiredURL("CrewEdgeURL")
+    static let scaffoldURL = requiredURL("CrewScaffoldURL")
+    static let projectScope = requiredString("CrewProjectScope")
+    static let inviteScheme = requiredString("CrewInviteScheme")
+    static let displayName = requiredString("CFBundleDisplayName")
+
+    private static func requiredString(_ key: String) -> String {
+        guard let value = Bundle.main.object(forInfoDictionaryKey: key) as? String,
+              !value.isEmpty else {
+            fatalError("Missing required Info.plist value: \(key)")
+        }
+        return value
+    }
+
+    private static func requiredURL(_ key: String) -> URL {
+        let value = requiredString(key)
+        guard let url = URL(string: value), url.scheme == "https", url.host != nil else {
+            fatalError("Invalid required URL in Info.plist: \(key)")
+        }
+        return url
+    }
+}
+
 final class AppConfig: @unchecked Sendable {
     enum Mode: String {
         case scaffold

@@ -158,6 +158,7 @@ struct SessionView: View {
             }
         }
         .onAppear {
+            model.notifications.visibleChatId = chatId
             if chat != nil {
                 model.markSeen(chatId: chatId)
             }
@@ -167,6 +168,9 @@ struct SessionView: View {
             }
         }
         .onDisappear {
+            if model.notifications.visibleChatId == chatId {
+                model.notifications.visibleChatId = nil
+            }
             if chat != nil {
                 model.markSeen(chatId: chatId)
             }

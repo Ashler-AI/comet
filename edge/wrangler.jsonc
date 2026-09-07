@@ -63,6 +63,8 @@
       "vars": {
         "AUTH_MODE": "scaffold",
         "ENVIRONMENT": "staging",
+        "APNS_TOPIC": "ai.ashler.crew.staging",
+        "APNS_TEAM_ID": "825LYXGJR6",
         "SCAFFOLD_CONTROL_PLANE_URL": "https://scaffold-staging.internal.ashler.com",
         "SCAFFOLD_PROJECT_SCOPE": "ashler-staging",
         "SCAFFOLD_REQUIRED_CAPABILITIES": "session.read session.chat session.control session.annotate session.invite session.files session.environment"

@@ -20,9 +20,10 @@ final class AppModel {
     private var demoSessionRefs: [SessionRef] = []
     private var sessionStores: [String: SessionStore] = [:]
     private var config: AppConfig?
+    let notifications = SessionNotifications.shared
 
     // Persisted connection settings.
-    @ObservationIgnored @AppStorage("edgeURL") var edgeURLString = "https://comet.internal.ashler.com"
+    @ObservationIgnored @AppStorage("edgeURL") var edgeURLString = ReleaseConfig.edgeURL.absoluteString
     @ObservationIgnored @AppStorage("authMode") var authModeRaw = AppConfig.Mode.scaffold.rawValue
     @ObservationIgnored @AppStorage("userId") var storedUserId = ""
     @ObservationIgnored @AppStorage("projectScope") var storedProjectScope = ""
@@ -51,7 +52,7 @@ final class AppModel {
     var launchAutosend = false
 
     func restore() {
-        if demo != nil { return }
+        if demo != nil || workspace != nil { return }
         DocDisk.prune(keep: 80)
         let args = ProcessInfo.processInfo.arguments
         // Debug-rig config overrides (cfprefsd caching defeats external
@@ -65,6 +66,15 @@ final class AppModel {
         override("-setmode") { authModeRaw = $0 }
         override("-setuser") { storedUserId = $0 }
         override("-setproject") { storedProjectScope = $0 }
+        if args.contains("-visibility-e2e") {
+            E2ERunner.runSessionVisibility()
+            E2ERunner.runAttentionTransitions()
+            #if DEBUG
+            Task { await SessionNotifications.runLifecycleRegression() }
+            #endif
+            enterDemoMode()
+            return
+        }
         if args.contains("-bench") {
             Task { await BenchRunner.run() }
             return
@@ -174,6 +184,7 @@ final class AppModel {
     }
 
     func signOut() {
+        notifications.signOut()
         workspace?.stop()
         workspace = nil
         sessionStores.values.forEach { $0.stop() }
@@ -198,7 +209,14 @@ final class AppModel {
                                projectScope: projectScope, deviceId: deviceId,
                                deviceName: deviceName, tokens: tokens, devBearer: devBearer)
         self.config = config
+        notifications.configure(config) { [weak self] chatId in
+            self?.launchRoute = .chat(chatId)
+        }
         let store = WorkspaceStore(config: config)
+        store.onProjection = { [weak self] in
+            guard let self, let workspace = self.workspace else { return }
+            self.notifications.update(sessions: workspace.sessions, chats: workspace.chats)
+        }
         workspace = store
         store.start()
         phase = .ready
@@ -212,19 +230,18 @@ final class AppModel {
     var connected: Bool { demo != nil || workspace?.connected == true }
 
     var overviewChats: [Chat] {
-        if let demo {
-            let liveIds = Set(demo.spaces.map(\.id))
-            let live = demo.chats.filter { !$0.archived && $0.spaceId.map(liveIds.contains) == true }
-            return sortActive(live)
-        }
-        return workspace?.overviewChats ?? []
+        demo?.overviewChats ?? workspace?.overviewChats ?? []
     }
+
+    var settledChats: [Chat] {
+        demo?.settledChats ?? workspace?.settledChats ?? []
+    }
+
     /// Imported memberships with no chat row — a chat row always wins and
-    /// renders as a normal session row with full context.
+    /// renders with full context in Sessions or Archived sessions.
     var sharedSessionRefs: [SessionRef] {
         if let demo {
-            let rowIds = Set(demo.chats.map(\.id))
-            return demoSessionRefs.filter { !rowIds.contains($0.chatId) }
+            return foreignSessionRefs(demoSessionRefs, chats: demo.chats)
         }
         return workspace?.sharedSessionRefs ?? []
     }
@@ -234,10 +251,7 @@ final class AppModel {
     }
 
     @discardableResult
-    func addSessionRef(_ rawChatId: String) -> SessionRef? {
-        guard let uuid = UUID(uuidString: rawChatId.trimmingCharacters(in: .whitespacesAndNewlines))
-        else { return nil }
-        let chatId = uuid.uuidString.lowercased()
+    func addSessionRef(_ chatId: String) -> SessionRef? {
         if demo != nil {
             if let existing = demoSessionRefs.first(where: { $0.chatId == chatId }) {
                 return existing
@@ -259,10 +273,10 @@ final class AppModel {
 
     // MARK: One-click invitations
 
-    /// `comet://invite/{chatId}/{sessionId}/{grantId}` — the desktop's
-    /// one-click join link (`CometInvitation`). The session/grant ids route
-    /// engine command authority; a viewport needs only the chat id: pin
-    /// membership when the workspace has no chat row, then open the session.
+    /// Production uses `comet://invite/{chatId}/{sessionId}/{grantId}`;
+    /// staging uses the equivalent configured scheme. The session and grant
+    /// segments route engine authority; this viewport only needs the chat id
+    /// to pin membership and open the session.
     func openInvitation(url: URL) {
         guard let chatId = Self.invitationChatId(url) else { return }
         pendingInviteChatId = chatId
@@ -281,7 +295,7 @@ final class AppModel {
     /// Mirrors `comet_proto::CometInvitation::parse_deep_link`: exactly three
     /// non-empty `[A-Za-z0-9._-]{1,256}` segments, no query or fragment.
     static func invitationChatId(_ url: URL) -> String? {
-        let prefix = "comet://invite/"
+        let prefix = "\(ReleaseConfig.inviteScheme)://invite/"
         guard url.absoluteString.hasPrefix(prefix) else { return nil }
         let path = String(url.absoluteString.dropFirst(prefix.count))
         guard !path.contains("?"), !path.contains("#") else { return nil }
@@ -468,6 +482,16 @@ final class AppModel {
             return
         }
         workspace?.setArchived(chatId: chatId, archived: true)
+    }
+
+    func restoreChat(chatId: String) {
+        if let demo {
+            if let ix = demo.chats.firstIndex(where: { $0.id == chatId }) {
+                demo.chats[ix].archived = false
+            }
+            return
+        }
+        workspace?.setArchived(chatId: chatId, archived: false)
     }
 
     func setChatConfig(chatId: String, config: ChatConfig) {

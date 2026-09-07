@@ -27,6 +27,9 @@ final class DemoDataset {
         self.sessions = sessions
     }
 
+    var overviewChats: [Chat] { sessionListChats(chats, archived: false) }
+    var settledChats: [Chat] { sessionListChats(chats, archived: true) }
+
     static func standard() -> DemoDataset {
         let now = nowMs()
         let mac = DeviceRow(id: "dev-mac", name: "MacBook Pro", platform: "macos",
@@ -67,6 +70,21 @@ final class DemoDataset {
                  config: claude, lastMessagePreview: "Hibernation-safe flush timer",
                  lastMessageAt: now - 86_400_000, createdAt: now - 86_400_000 * 2,
                  spaceId: edge.id, lastSeenAt: now - 86_400_000),
+            Chat(id: "chat-detached", deviceId: "dev-mac", title: "Crew session without a space",
+                 archived: false, cwd: "/tmp", branch: nil, checkoutId: nil,
+                 config: codex, lastMessagePreview: nil,
+                 lastMessageAt: now - 86_400_000 * 2, createdAt: now - 86_400_000 * 3,
+                 spaceId: nil, lastSeenAt: now),
+            Chat(id: "chat-missing-space", deviceId: "dev-vps", title: "Crew session from a missing space",
+                 archived: false, cwd: "/srv/previous-workspace", branch: nil, checkoutId: nil,
+                 config: claude, lastMessagePreview: nil,
+                 lastMessageAt: now - 86_400_000 * 3, createdAt: now - 86_400_000 * 4,
+                 spaceId: "space-missing", lastSeenAt: now),
+            Chat(id: "chat-archived", deviceId: "dev-mac", title: "Crew archived session",
+                 archived: true, cwd: comet.path, branch: nil, checkoutId: nil,
+                 config: codex, lastMessagePreview: nil,
+                 lastMessageAt: now - 86_400_000 * 4, createdAt: now - 86_400_000 * 5,
+                 spaceId: comet.id, lastSeenAt: now),
         ]
         let sessions: [String: SessionRow] = [
             "chat-veil": SessionRow(chatId: "chat-veil", deviceId: "dev-mac", status: .working,
