@@ -5,6 +5,7 @@
 // Documents/e2e.log for the harness to read via simctl.
 
 import Foundation
+import Loro
 
 @MainActor
 enum E2ERunner {
@@ -28,6 +29,7 @@ enum E2ERunner {
     static func run(model: AppModel) async {
         try? FileManager.default.removeItem(at: logURL)
         log("start")
+        guard runSessionVisibility() else { return }
         model.signInDev(edgeURL: URL(string: "http://localhost:8787")!,
                         userId: "devuser", projectScope: "dev-org")
 
@@ -125,6 +127,175 @@ enum E2ERunner {
         }
 
         log("done")
+    }
+
+    /// Isolated visibility regression: no edge, authority changes, or writes to
+    /// the signed-in workspace. Uses the same accessors consumed by the UI.
+    @discardableResult
+    static func runSessionVisibility() -> Bool {
+        let probe = AppModel()
+        let space = Space(id: "visible-space", deviceId: "host", path: "/tmp",
+                          gitDetected: false, createdAt: 0)
+        func chat(_ id: String, spaceId: String?, archived: Bool, at: Int64) -> Chat {
+            Chat(id: id, deviceId: "host",
+                 title: "Crew visibility scenario", archived: archived,
+                 createdAt: at, spaceId: spaceId)
+        }
+        let attached = chat("legacy-attached", spaceId: space.id, archived: false, at: 10)
+        let detached = chat("AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE", spaceId: nil, archived: false, at: 30)
+        let missing = chat("legacy-missing", spaceId: "missing-space", archived: false, at: 20)
+        let archived = chat("legacy-archived", spaceId: space.id, archived: true, at: 40)
+        let archivedDetached = chat("BBBBBBBB-BBBB-4CCC-8DDD-EEEEEEEEEEEE", spaceId: nil, archived: true, at: 50)
+        let archivedMissing = chat("legacy-archived-missing", spaceId: "missing-space", archived: true, at: 60)
+        let rows = [attached, detached, missing, archived, archivedDetached, archivedMissing]
+        probe.demo = DemoDataset(devices: [], spaces: [space], chats: rows, sessions: [:])
+        let foreignIds = ["00000000-0000-4000-8000-000000000007", " legacy-membership ",
+                          "CCCCCCCC-BBBB-4CCC-8DDD-EEEEEEEEEEEE", detached.id.lowercased()]
+        let refIds = rows.map(\.id) + foreignIds
+        for id in refIds {
+            guard let first = probe.addSessionRef(id), first.chatId == id,
+                  probe.addSessionRef(id) == first else {
+                log("FAIL Crew demo membership: opaque ID changed or upsert duplicated")
+                return false
+            }
+        }
+        guard probe.overviewChats.map(\.id) == [detached.id, missing.id, attached.id],
+              probe.settledChats.map(\.id) == [archivedMissing.id, archivedDetached.id, archived.id],
+              Set(probe.sharedSessionRefs.map(\.chatId)) == Set(foreignIds),
+              probe.sharedSessionRefs.count == foreignIds.count,
+              probe.chats(in: space.id).map(\.id) == [attached.id] else {
+            log("FAIL Crew session visibility: missing, duplicate, or misordered source")
+            return false
+        }
+        // Import a real workspace snapshot, then use a normal membership write
+        // to trigger production projection. No room, disk cache, or network starts.
+        do {
+            let userId = "principal:é"
+            let config = AppConfig(edgeURL: URL(string: "http://127.0.0.1:1")!, mode: .dev,
+                                   userId: userId, projectScope: "visibility-regression",
+                                   deviceId: "viewer", deviceName: "Crew regression")
+            let source = LoroDoc()
+            let chatMap = source.getMap(id: "chats")
+            for chat in rows {
+                let row = try chatMap.getOrCreateContainer(key: chat.id, child: LoroMap())
+                try row.insert(key: "id", v: chat.id)
+                try row.insert(key: "deviceId", v: chat.deviceId)
+                try row.insert(key: "archived", v: chat.archived)
+                try row.insert(key: "createdAt", v: chat.createdAt)
+                if let spaceId = chat.spaceId { try row.insert(key: "spaceId", v: spaceId) }
+            }
+            let refs = source.getMap(id: "sessionRefs")
+            for (index, id) in (refIds + ["other-principal-only"]).enumerated() {
+                let owner = index < refIds.count ? userId : "other-principal"
+                let row = try refs.getOrCreateContainer(
+                    key: "\(owner.utf8.count):\(owner):\(id)", child: LoroMap())
+                try row.insert(key: "userId", v: owner)
+                try row.insert(key: "chatId", v: id)
+                try row.insert(key: "addedAt", v: Int64(index))
+            }
+            source.commit()
+            let workspace = WorkspaceStore(config: config)
+            _ = try workspace.doc.importWith(bytes: source.export(mode: .snapshot), origin: "visibility-regression")
+            // A valid UUID triggers projection even on the old UUID-filtered path.
+            guard workspace.addSessionRef(chatId: foreignIds[0])?.chatId == foreignIds[0],
+                  Set(workspace.sessionRefs.map(\.chatId)) == Set(refIds),
+                  workspace.sessionRefs.count == refIds.count,
+                  workspace.overviewChats.map(\.id) == probe.overviewChats.map(\.id),
+                  workspace.settledChats.map(\.id) == probe.settledChats.map(\.id),
+                  Set(workspace.sharedSessionRefs.map(\.chatId)) == Set(foreignIds),
+                  workspace.sharedSessionRefs.count == foreignIds.count else {
+                log("FAIL Crew workspace projection: opaque IDs, principal isolation, or exact row/ref dedupe")
+                return false
+            }
+            for (index, id) in refIds.enumerated() {
+                guard workspace.addSessionRef(chatId: id) == SessionRef(chatId: id, addedAt: Int64(index)),
+                      workspace.sessionRefs.count == refIds.count else {
+                    log("FAIL Crew workspace membership: opaque ID, scoped key, or original timestamp changed")
+                    return false
+                }
+            }
+        } catch {
+            log("FAIL Crew workspace snapshot projection: \(error)")
+            return false
+        }
+        // Legacy memberships remain visible; this does not authorize opening
+        // their transcripts. The edge still rejects non-UUID session routes and
+        // canonicalizes UUID routes independently of these exact document IDs.
+        // Removing a space or opening an archived session cannot hide rows or
+        // restore them implicitly. A vanished row must reveal its retained ref.
+        probe.demo?.spaces = []
+        if let row = probe.chat(id: archived.id) { _ = probe.sessionStore(for: row) }
+        probe.markSeen(chatId: archived.id)
+        guard probe.overviewChats.map(\.id) == [detached.id, missing.id, attached.id],
+              probe.chat(id: archived.id)?.archived == true else {
+            log("FAIL Crew session visibility: space removal or opening changed visibility")
+            return false
+        }
+        probe.demo?.chats.removeAll { $0.id == missing.id }
+        guard Set(probe.sharedSessionRefs.map(\.chatId)) == Set(foreignIds + [missing.id]) else {
+            log("FAIL Crew session visibility: retained membership became unreachable")
+            return false
+        }
+        probe.archive(chatId: detached.id)
+        guard !probe.overviewChats.contains(where: { $0.id == detached.id }),
+              probe.settledChats.contains(where: { $0.id == detached.id }),
+              !probe.sharedSessionRefs.contains(where: { $0.chatId == detached.id }) else {
+            log("FAIL Crew session visibility: archive lost or duplicated a session")
+            return false
+        }
+        probe.restoreChat(chatId: archivedMissing.id)
+        guard probe.overviewChats.first?.id == archivedMissing.id,
+              !probe.settledChats.contains(where: { $0.id == archivedMissing.id }),
+              probe.chat(id: archived.id)?.archived == true else {
+            log("FAIL Crew session visibility: explicit restore changed the wrong sessions")
+            return false
+        }
+        log("OK Crew session visibility: production snapshot and demo, opaque refs, principal isolation, exact row dedupe, archive, restore, recency")
+        return true
+    }
+
+    @discardableResult
+    static func runAttentionTransitions() -> Bool {
+        let now: Int64 = 100_000
+        var tracker = AttentionTracker()
+        var chat = Chat(id: "attention", deviceId: "host", archived: false, createdAt: 0)
+        func update(_ status: SessionStatus, at: Int64) -> [(String, String)] {
+            tracker.update([chat.id: SessionRow(chatId: chat.id, deviceId: chat.deviceId,
+                status: status, updatedAt: at)], chats: [chat], now: now)
+        }
+        guard update(.working, at: now - 10).isEmpty,
+              update(.awaitingInput, at: now - 9).map(\.0) == [chat.id],
+              update(.awaitingInput, at: now - 8).isEmpty,
+              update(.working, at: now - 10).isEmpty,
+              update(.awaitingInput, at: now - 7).isEmpty,
+              update(.errored, at: now - 6).map(\.0) == [chat.id],
+              update(.idle, at: now - 5).isEmpty,
+              update(.working, at: now - 4).isEmpty,
+              update(.idle, at: now - 3).map(\.0) == [chat.id],
+              tracker.update([:], chats: [chat], now: now).isEmpty,
+              update(.working, at: now - 4).isEmpty,
+              update(.idle, at: now - 2).isEmpty else {
+            log("FAIL Crew attention transitions: baseline, input, error, completion, heartbeat or replay")
+            return false
+        }
+        // Advance from an older baseline: unlike replay, this stale transition
+        // reaches the age guard, and the exact 45-second boundary stays fresh.
+        tracker = AttentionTracker()
+        guard update(.working, at: now - 60_000).isEmpty,
+              update(.awaitingInput, at: now - 45_001).isEmpty,
+              update(.errored, at: now - 45_000).map(\.0) == [chat.id],
+              update(.working, at: now - 45_001).isEmpty,
+              update(.errored, at: now - 44_999).isEmpty else {
+            log("FAIL Crew attention freshness: stale transition, exact 45s boundary, or replay high-watermark")
+            return false
+        }
+        chat.archived = true
+        guard update(.awaitingInput, at: now).isEmpty else {
+            log("FAIL Crew archived session alerted")
+            return false
+        }
+        log("OK Crew attention transitions: input, error, working-only completion; baseline, heartbeat, stale age, exact 45s, replay high-watermark and archived suppression")
+        return true
     }
 
     private static func poll<T>(timeout: TimeInterval, label: String,

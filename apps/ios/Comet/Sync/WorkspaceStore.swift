@@ -23,6 +23,7 @@ final class WorkspaceStore {
     private var subscriptions: [Subscription] = []
     @ObservationIgnored private var roomEpoch: UInt64 = 0
     private let config: AppConfig
+    @ObservationIgnored var onProjection: (() -> Void)?
 
     init(config: AppConfig) {
         self.config = config
@@ -214,8 +215,7 @@ final class WorkspaceStore {
         sessionRefs = (root["sessionRefs"]?.mapValue ?? [:]).compactMap { _, value in
             guard let row = value.mapValue,
                   row["userId"]?.stringValue == config.userId,
-                  let rawChatId = row["chatId"]?.stringValue,
-                  let uuid = UUID(uuidString: rawChatId),
+                  let chatId = row["chatId"]?.stringValue,
                   let addedAt = row["addedAt"]?.i64Value else { return nil }
             let environment: SessionEnvironment? = row["environment"].flatMap { value in
                 guard let data = try? JSONSerialization.data(withJSONObject: value.jsonObject) else {
@@ -223,7 +223,7 @@ final class WorkspaceStore {
                 }
                 return try? JSONDecoder().decode(SessionEnvironment.self, from: data)
             }
-            return SessionRef(chatId: uuid.uuidString.lowercased(), addedAt: addedAt,
+            return SessionRef(chatId: chatId, addedAt: addedAt,
                               environment: environment)
         }.sorted {
             ($0.addedAt, $0.chatId) > ($1.addedAt, $1.chatId)
@@ -241,25 +241,25 @@ final class WorkspaceStore {
                                       updatedAt: m["updatedAt"]?.i64Value ?? 0)
         }
         sessions = rows
+        onProjection?()
     }
 
     // MARK: Derived views
 
-    /// state.rs `overview_chats`: every non-archived chat of a live space,
-    /// attention-sorted. A chat row always wins over a membership ref — the
-    /// row carries the context (status, harness, branch) a bare ref lacks.
+    /// Every non-archived workspace chat, including detached and missing-space
+    /// rows, in recency order. Space membership is context, not visibility.
     var overviewChats: [Chat] {
-        let liveSpaceIds = Set(spaces.map(\.id))
-        let live = chats.filter {
-            !$0.archived && $0.spaceId.map(liveSpaceIds.contains) == true
-        }
-        return sortActive(live)
+        sessionListChats(chats, archived: false)
     }
-    /// Imported memberships with no workspace chat row — sessions genuinely
-    /// foreign to this workspace. Row-backed refs are served by `overviewChats`.
+
+    var settledChats: [Chat] {
+        sessionListChats(chats, archived: true)
+    }
+
+    /// Foreign memberships only; workspace rows appear in active or archived
+    /// sections with their full context rather than as duplicate bare refs.
     var sharedSessionRefs: [SessionRef] {
-        let rowIds = Set(chats.map(\.id))
-        return sessionRefs.filter { !rowIds.contains($0.chatId) }
+        foreignSessionRefs(sessionRefs, chats: chats)
     }
 
 
@@ -619,10 +619,7 @@ final class WorkspaceStore {
     }
 
     @discardableResult
-    func addSessionRef(chatId rawChatId: String, environment: SessionEnvironment? = nil) -> SessionRef? {
-        guard let uuid = UUID(uuidString: rawChatId.trimmingCharacters(in: .whitespacesAndNewlines))
-        else { return nil }
-        let chatId = uuid.uuidString.lowercased()
+    func addSessionRef(chatId: String, environment: SessionEnvironment? = nil) -> SessionRef? {
         let map = doc.getMap(id: "sessionRefs")
         do {
             let row = try map.getOrCreateContainer(
@@ -740,6 +737,9 @@ final class WorkspaceStore {
     func setArchived(chatId: String, archived: Bool) {
         updateChat(chatId) { row in
             try row.insert(key: "archived", v: archived)
+            if !archived {
+                try doc.getMap(id: "worktreeDeletions").delete(key: chatId)
+            }
         }
     }
 

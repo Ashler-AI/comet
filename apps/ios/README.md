@@ -81,6 +81,26 @@ installation of **1.0 (6)** on the existing tester's iPhone 13 Pro. Verification
 covered 19 native simulator checks, visible sending/processing/terminal states,
 and a fixture-free `Release-Staging` build before the device archive and upload.
 
+### Staging 1.0 (8): session visibility and attention alerts
+
+Uploaded on 2026-09-07 and processed by App Store Connect; assigned to the
+existing **Ashler Internal** group (one tester). Production was not uploaded.
+Includes detached/missing-space sessions, opaque imported session refs,
+archive/restore, and attention-notification lifecycle fixes. The integrated
+staging simulator passed visibility, attention-transition, and APNs-registration
+lifecycle scenarios before upload.
+
+The signed IPA and embedded store profile both have
+`aps-environment = production`. Export used refreshed staging profile
+`a9f3f9ce-32c7-4e9f-a678-bc967e5a44aa`, not the older no-push profile. An archive
+built with `CODE_SIGNING_ALLOWED=NO` must retain the push entitlement before
+distribution export; verify the final signed IPA, not just source entitlements.
+
+Background delivery is **not yet activated**: the staging Worker still lacks
+APNs credentials and the notification credential-encryption secret. Build 8
+can test session visibility and local alerts; end-to-end background delivery
+requires staging backend deployment/configuration and a physical-device check.
+
 ### Connecting
 
 - **Production**: Crew discovers Scaffold's OAuth metadata, dynamically
@@ -149,9 +169,9 @@ Theme/                  theme.rs port: oklch→sRGB converter, exact palette,
 
 | Desktop | iOS |
 | --- | --- |
-| Sidebar: Spaces + recent Sessions | Home screen sections; unread, status, and recency remain independent |
-| Horizontal session tabs per space | Space detail: recency-sorted session list |
-| Tab close = archive | Swipe-to-archive |
+| Sidebar: Spaces + recency-sorted Sessions | Home includes every active workspace chat, including detached/missing-space rows, plus foreign memberships |
+| Horizontal session tabs per space | Space detail: vertical session list in recency order |
+| Tab close = archive | Swipe-to-archive; Archived sessions remain accessible, with explicit Restore |
 | Composer `white_alpha(0.03)` pill + hairline | Liquid Glass pill (`glassEffect`) + hairline |
 | Harness brand SVG marks (icons.rs) | Same path data via a native SVG path parser (`BrandMarks.swift`) |
 | Harness/model picker popover + curated catalogs | Brand-mark cards + catalog menu + reasoning-ladder chips (`HarnessCatalog.swift`, ported from crates/harness) |
@@ -176,3 +196,57 @@ the desktop sources cited in each file header.
   Scaffold commands use the verified controller route. Client-minted message
   IDs connect optimistic sends to admission errors and committed transcript
   entries. The host writes transcript entries and command outcomes.
+
+## Session attention notifications
+
+Open the account menu → **Notifications** and enable **Session attention alerts**.
+iOS permission is opt-in. Fresh input requests, errors, and working→idle
+completions alert; initial per-session hydration, heartbeat, stale/reordered
+updates and archived sessions stay silent. Fresh transitions received after reconnect
+still alert. Viewing the affected session suppresses foreground banners. Tapping an alert opens its session only when
+its user and project match the current sign-in.
+
+Background delivery uses APNs, not a background WebSocket. The Xcode target
+has the Push Notifications capability and `Comet/Comet.entitlements`; a device
+build needs an Apple provisioning profile with that capability. APNs environment
+comes from the embedded profile (sandbox on Simulator; production for App Store
+distribution). Configure the deployed edge with:
+
+- `APNS_KEY_ID`: Apple APNs signing key ID.
+- `APNS_TEAM_ID`: Apple developer team ID.
+- `APNS_PRIVATE_KEY`: the complete Apple `.p8` PKCS#8 PEM, stored as a Worker secret.
+- `APNS_TOPIC`: exact signed app bundle identifier (`ai.ashler.crew.staging` for
+  Crew Staging; `ai.ashler.crew` for production).
+- `NOTIFICATION_CREDENTIAL_KEY`: a dedicated Worker secret containing canonical
+  base64 for exactly 32 cryptographically random bytes. Used for AES-256-GCM
+  encryption, not an APNs credential. Keep it stable across deployments;
+  rotation requires foreground registration renewal before old registrations can deliver.
+
+Without valid configuration, registration returns HTTP 503 and the settings
+screen reports that only running-app local alerts are available. It does not
+claim background delivery. Foreground activation retries registration and
+renews its 30-day lifetime. Sign-out immediately clears local state and unregisters
+from APNs; server DELETE is best-effort after an in-flight PUT. It never blocks
+offline logout. Explicitly disabling alerts requires successful server confirmation
+and reports network failures. Server registrations expire after 30 days or are
+removed when current human authorization is rejected or APNs invalidates the token.
+
+The edge stores push tokens privately and AES-256-GCM encrypted credentials in
+Durable Object SQL, never plaintext credentials in SQL, shared documents, or logs.
+The dedicated encryption key lives in Worker secrets; authenticated encryption
+binds each credential to installation, user, and project. Legacy plaintext
+registration tables are purged during migration; apps must renew registration.
+The credential is decrypted transiently to recheck human authorization before each
+delivery. Existing `AuthGrant` records cover sandbox device grants, not human
+Scaffold credentials, so they cannot replace these checks. Authority outages fail
+closed without deleting registrations; explicit authorization rejection and APNs
+invalid-token responses remove only the matching registration revision.
+
+Alerts contain generic Crew copy and routing IDs, not titles or transcripts.
+Registration is principal/project scoped; single-session device grants cannot register.
+
+Offline regression launch: `-visibility-e2e` runs session visibility and
+attention-transition scenarios and opens demo mode. Debug builds additionally
+exercise queued APNs token arrival, scoped routing, offline disable/logout and
+late-response isolation using an in-process HTTP responder. Results append to
+`Documents/e2e.log`; no sign-in or push permission is requested.
