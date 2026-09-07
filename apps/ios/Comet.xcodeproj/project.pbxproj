@@ -208,6 +208,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Comet/Comet.entitlements;
 				CODE_SIGN_STYLE = Automatic;
+				CREW_APS_ENVIRONMENT = development;
 				CREW_DISPLAY_NAME = Crew;
 				CREW_EDGE_URL = "https://comet.internal.ashler.com";
 				CREW_INVITE_SCHEME = comet;
@@ -240,6 +241,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Comet/Comet.entitlements;
 				CODE_SIGN_STYLE = Automatic;
+				CREW_APS_ENVIRONMENT = production;
 				CREW_DISPLAY_NAME = Crew;
 				CREW_EDGE_URL = "https://comet.internal.ashler.com";
 				CREW_INVITE_SCHEME = comet;
@@ -322,6 +324,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Comet/Comet.entitlements;
 				CODE_SIGN_STYLE = Automatic;
+				CREW_APS_ENVIRONMENT = development;
 				CREW_DISPLAY_NAME = "Crew Staging";
 				CREW_EDGE_URL = "https://comet-staging.internal.ashler.com";
 				CREW_INVITE_SCHEME = "comet-staging";
@@ -354,6 +357,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Comet/Comet.entitlements;
 				CODE_SIGN_STYLE = Automatic;
+				CREW_APS_ENVIRONMENT = production;
 				CREW_DISPLAY_NAME = "Crew Staging";
 				CREW_EDGE_URL = "https://comet-staging.internal.ashler.com";
 				CREW_INVITE_SCHEME = "comet-staging";

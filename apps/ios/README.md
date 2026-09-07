@@ -26,11 +26,11 @@ Production and staging use the same Swift target with separate checked-in scheme
 bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
 
 ```sh
-# Production: Crew, ai.ashler.crew, version 1.0 build 3
+# Production: Crew, ai.ashler.crew, version 1.0 build 4
 xcodebuild -project Comet.xcodeproj -scheme Comet \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 
-# Staging: Crew Staging, ai.ashler.crew.staging, version 1.0 build 6
+# Staging: Crew Staging, ai.ashler.crew.staging, version 1.0 build 8
 xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 ```
@@ -95,6 +95,26 @@ The signed IPA and embedded store profile both have
 `a9f3f9ce-32c7-4e9f-a678-bc967e5a44aa`, not the older no-push profile. An archive
 built with `CODE_SIGNING_ALLOWED=NO` must retain the push entitlement before
 distribution export; verify the final signed IPA, not just source entitlements.
+
+Subsequent activation source uses `$(CREW_APS_ENVIRONMENT)` in
+`Comet/Comet.entitlements`: `development` for `Debug` / `Debug-Staging` and
+`production` for `Release` / `Release-Staging`. All four target configurations
+explicitly set `CODE_SIGN_ENTITLEMENTS = Comet/Comet.entitlements`. This source
+change does not alter the already-uploaded build 8 artifact.
+
+The exact build 8 application source is committed as `67dadc7` on
+`release/crew-staging-1.0-8`. Subsequent mobile configuration and edge integration
+live separately on `release/crew-staging-notification-activation`; the latter
+includes the authenticated `/notifications/device` route and workspace observer,
+not just the mobile patch. Its staging vars set `APNS_TOPIC` to
+`ai.ashler.crew.staging` and `APNS_TEAM_ID` to `825LYXGJR6`.
+
+Integration verification passed 60 focused notification/auth/room tests and
+real local-Worker registration, token rotation, cross-user denial, deletion,
+and missing-credential fail-closed checks. Local signing fixtures were
+disposable test credentials; no Apple push delivery was exercised. Apple had
+no existing APNs keys; key creation, staging secret configuration, and deployment
+await explicit approval.
 
 Background delivery is **not yet activated**: the staging Worker still lacks
 APNs credentials and the notification credential-encryption secret. Build 8
