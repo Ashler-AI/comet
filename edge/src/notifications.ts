@@ -25,6 +25,15 @@ const MAX_BODY_BYTES = 2048;
 const MAX_USER_DEVICES = 16;
 const MAX_PROJECT_DEVICES = 1024;
 const REGISTRATION_TTL_MS = 30 * 24 * 60 * 60_000;
+const APNS_DIAGNOSTIC_REASONS: Record<string, true> = {
+  BadDeviceToken: true,
+  DeviceTokenNotForTopic: true,
+  Unregistered: true,
+  TopicDisallowed: true,
+  InvalidProviderToken: true,
+  ExpiredProviderToken: true,
+  MissingProviderToken: true
+};
 const COPY: Record<Attention, string> = {
   input: "A Crew session needs your input.",
   error: "A Crew session encountered an error.",
@@ -117,6 +126,10 @@ export class ApnsProvider {
     });
     if (response.ok) return { remove: false };
     const body = await response.json().catch(() => ({})) as { reason?: string; timestamp?: number };
+    // Only fixed reason labels may reach logs; never provider bodies or identifiers.
+    const reason = typeof body.reason === "string" && APNS_DIAGNOSTIC_REASONS[body.reason] === true
+      ? body.reason : "Other";
+    console.warn("Crew push delivery rejected", response.status, reason);
     if (response.status === 410 && body.reason === "Unregistered") {
       return { remove: true, invalidatedAt: typeof body.timestamp === "number" ? body.timestamp : undefined };
     }
@@ -124,8 +137,6 @@ export class ApnsProvider {
       return { remove: true };
     }
     if (body.reason === "ExpiredProviderToken") this.cached = undefined;
-    // Never include provider bodies, request URLs, tokens, or transcript content in logs.
-    console.warn("Crew push delivery rejected", response.status);
     return { remove: false };
   }
 }

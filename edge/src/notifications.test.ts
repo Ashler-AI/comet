@@ -340,6 +340,24 @@ describe("APNs provider", () => {
     }
   });
 
+  it("reports terminal APNs reasons without leaking arbitrary provider content", async () => {
+    const log = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { env } = await signingEnv();
+    for (const reason of ["BadDeviceToken", "InvalidProviderToken", "private-provider-content"]) {
+      const provider = new ApnsProvider(env, (async () => Response.json({
+        reason, token: device.token, detail: "private-provider-content"
+      }, { status: reason === "BadDeviceToken" ? 400 : 403 })) as typeof fetch);
+      await provider.send(device, installationId, "project", "alice", "input");
+    }
+    const messages = log.mock.calls.flat();
+    expect(messages).toContain("BadDeviceToken");
+    expect(messages).toContain("InvalidProviderToken");
+    expect(messages).toContain("Other");
+    expect(JSON.stringify(messages)).not.toContain("private-provider-content");
+    expect(JSON.stringify(messages)).not.toContain(device.token);
+    expect(JSON.stringify(messages)).not.toContain(installationId);
+  });
+
   it("reports missing or invalid signing configuration without a network request", async () => {
     await expect(new ApnsProvider({}).authorization()).rejects.toThrow("apns_not_configured");
     const { env } = await signingEnv();
