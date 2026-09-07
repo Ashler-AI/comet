@@ -299,5 +299,8 @@ Registration is principal/project scoped; single-session device grants cannot re
 Offline regression launch: `-visibility-e2e` runs session visibility and
 attention-transition scenarios and opens demo mode. Debug builds additionally
 exercise queued APNs token arrival, scoped routing, offline disable/logout and
-late-response isolation using an in-process HTTP responder. Results append to
-`Documents/e2e.log`; no sign-in or push permission is requested.
+late-response isolation using an in-process HTTP responder. The regression drains
+the logout DELETE before invalidating its URLSession, including on failure paths.
+Results append to `Documents/e2e.log`; no sign-in or push permission is requested.
+Check process survival after the lifecycle marker as well as the log: a marker
+alone cannot catch a subsequent teardown crash.

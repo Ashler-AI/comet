@@ -182,7 +182,9 @@ final class SessionNotifications: NSObject, UNUserNotificationCenterDelegate {
     /// Local logout never waits on network or a pending permission response.
     /// A best-effort DELETE runs after any in-flight PUT, using only the old
     /// in-memory credential; APNs also invalidates the unregistered device token.
-    func signOut() {
+    /// Callers disposing network resources can await the returned cleanup task.
+    @discardableResult
+    func signOut() -> Task<Void, Never>? {
         let oldConfig = config
         let oldInstallationId = installationId
         let pending = operation
@@ -205,11 +207,12 @@ final class SessionNotifications: NSObject, UNUserNotificationCenterDelegate {
         center.removeAllPendingNotificationRequests()
         center.removeAllDeliveredNotifications()
         if let oldConfig, needsDelete {
-            Task { [self] in
+            return Task { [self] in
                 await pending?.value
                 try? await request(oldConfig, method: "DELETE", values: ["installationId": oldInstallationId])
             }
         }
+        return pending
     }
 
     private func unregister(generation epoch: UInt64) async -> Bool {
@@ -360,29 +363,36 @@ final class SessionNotifications: NSObject, UNUserNotificationCenterDelegate {
         await probe.setEnabled(false)
         guard probe.enabled, probe.error != nil else { E2ERunner.log("FAIL Crew offline disable pretended success"); return }
         var releasePut: CheckedContinuation<Void, Never>?
+        var releaseDelete: CheckedContinuation<Void, Never>?
         NotificationRegressionProtocol.respond = { request in
             if request.httpMethod == "PUT" {
                 await withCheckedContinuation { releasePut = $0 }
                 return 200
             }
+            await withCheckedContinuation { releaseDelete = $0 }
             throw URLError(.notConnectedToInternet)
         }
         probe.didRegister(Data(repeating: 2, count: 32))
         while releasePut == nil { await Task.yield() }
         let pending = probe.operation
-        probe.signOut()
-        guard probe.config == nil, !probe.busy, probe.registeredToken == nil else {
-            E2ERunner.log("FAIL Crew logout waited for push deletion")
-            releasePut?.resume()
-            return
-        }
+        let cleanup = probe.signOut()
+        let signedOutImmediately = probe.config == nil && !probe.busy && probe.registeredToken == nil
         releasePut?.resume()
         await pending?.value
+        while releaseDelete == nil { await Task.yield() }
+        releaseDelete?.resume()
+        // The DELETE is separate from the PUT queue. Drain both before the
+        // deferred URLSession invalidation, including on assertion failure.
+        await cleanup?.value
+        guard signedOutImmediately else {
+            E2ERunner.log("FAIL Crew logout waited for push deletion")
+            return
+        }
         guard probe.config == nil, probe.registeredToken == nil else {
             E2ERunner.log("FAIL Crew late registration revived signed-out state")
             return
         }
-        E2ERunner.log("OK Crew APNs lifecycle: queued token, scoped route, offline disable, immediate logout, late-response isolation")
+        E2ERunner.log("OK Crew APNs lifecycle: queued token, scoped route, offline disable, immediate logout, late-response isolation, drained logout DELETE")
     }
     #endif
 }
