@@ -138,9 +138,17 @@ Source reconciliation verified that fetched `origin/main` (`f89dd43`) is an
 ancestor of the production release branch, which initially held exactly three
 additional release commits. The stale local `main` checkout was not its baseline.
 The already-published branch had not been merged, however. The release workflow
-now fails production promotion unless its dispatch/tag SHA is an ancestor of
-`origin/main`, including candidate-reuse dispatches. Further promotion must wait
-for the PR merge; published 0.1.72 artifacts must not be overwritten.
+now fetches main explicitly and checks dispatch/tag ancestry against `FETCH_HEAD`,
+not an assumed `origin/main` tracking ref. This also gates candidate-reuse
+dispatches. Further promotion must wait for the PR merge; published 0.1.72
+artifacts must not be overwritten.
+
+`node --test scripts/release-workflow.test.mjs` passed **22 tests**. The new
+behavioral cases execute the actual version/reuse shell blocks with temporary
+single-branch Git clones and tar archives: no `origin/main` tracking ref, merged
+and unmerged source, invalid/nonproduction reuse IDs, GitHub compare outcomes,
+unsuccessful/foreign-workflow source runs, outer archive corruption, and separate
+desktop/Scaffold/unified checksum failures. No production workflow was dispatched.
 
 The full `cargo test -p comet-ui` suite passed **531 tests** with zero failures;
 the production port changed no comet-doc or comet-engine source files. A fresh
@@ -156,10 +164,21 @@ five seconds, with no lifecycle success marker. The supervised processes stayed
 alive after those markers until intentional shutdown. DiagnosticReports still
 contained only the two pre-check Comet reports; no new Comet `.ips` appeared.
 
+Both the bounded `xcodebuild` run and `package-macos.sh` ran with cwd
+`/tmp/crew-production-notifications-release`. Simulator derived data was
+`/tmp/crew-production-notifications-build5/SimulatorDerivedData`; its recorded
+`WorkspacePath` points to that release worktree's `apps/ios/Comet.xcodeproj`.
+The bounded `SessionNotifications.swift` copies in the release, local preservation,
+and staging worktrees share SHA-256
+`d86de1dd1d066d720b3ee300e7d02dfb993c47b6269481511d9bcdbfdc5e14a2`.
+
 Integration is tracked in [PR #16](https://github.com/Ashler-AI/comet/pull/16).
-The main checkout's notification work is committed separately on
-`work/crew-notifications-local-preservation`; unrelated doc/engine/harness and
-data-script changes remain untouched. Staging copies are committed on
+The user checkout is intentionally left on
+`work/crew-notifications-local-preservation`, **not main**, with the notification
+work committed and pushed. Switching back to main would remove those committed
+files from the working tree until integration; they remain recoverable from the
+preservation branch. Unrelated doc/engine/harness and data-script changes remain
+untouched. Staging copies are committed on
 `release/crew-staging-notification-activation`, not left as dirty release edits.
 
 Home includes detached and missing-space sessions and an **Archived sessions**

@@ -101,7 +101,7 @@ jobs:
           esac
           if [[ "$promotion_target" == "production" ]]; then
             git fetch origin main
-            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
               echo "::error::production release source must be merged into main before promotion"
               exit 1
             fi
