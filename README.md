@@ -80,6 +80,13 @@ Create these GitHub environments:
 - `comet-release-staging`
 - `comet-release-production`, with required reviewers and deployment-branch protection for release tags
 
+Required reviewers and deployment-branch protection are recommended setup, not
+properties supplied by this workflow. As inspected on 2026-09-07,
+`comet-release-production` has `protection_rules: []` and
+`deployment_branch_policy: null`. It currently provides **no required-reviewer
+approval or branch restriction**. An authorized production dispatch can proceed
+without a review after its prerequisite jobs succeed.
+
 Add these environment-scoped deployment secrets to `comet-staging`:
 
 - `CLOUDFLARE_API_TOKEN`: token limited to the Crew staging and production Worker, Durable Object, and R2 resources
@@ -91,12 +98,12 @@ Add `GCP_PROJECT_ID` and `GCP_IAP_AUDIENCE` as variables. The staging job
 uses this environment directly. The current production deploy reuses the same
 platform-scoped credentials only after the staged candidate digest and GCP
 project/provider assertions pass. Release-feed synchronization does not reuse
-that boundary: it enters the matching protected `comet-release-*` environment
+that boundary: it enters the matching `comet-release-*` environment
 before either edge deployment.
 
-For a manual run only, `skip_typecheck=true` explicitly omits the TypeScript
-check; it defaults to false and does not affect push CI. Builds, tests, staging
-verification, candidate-digest checks and deployment environment gates still run.
+The candidate job requires its TypeScript check on both push and manual triggers;
+there is no supported input to skip it. Builds, tests, staging verification and
+candidate-digest checks are also required.
 The notification release was integrated directly into main and deployed by
 [34141398021](https://github.com/Ashler-AI/comet/actions/runs/34141398021), with
 the existing desktop candidate promoted from main by
@@ -132,19 +139,19 @@ gh workflow run deploy.yml -f target=staging
 gh workflow run deploy.yml -f target=production
 ```
 
-The production command still deploys staging first. Every production edge
-deploy then requires one approval through the protected
-`comet-release-production` synchronization job. That approval authorizes the
-production deployment, so the gate intentionally remains when the reader pair
-is absent and secret synchronization is a no-op. Production starts only after
-the gate succeeds.
-For an authenticated local deployment, use the checked-in environment contract and environment-specific Cloudflare credentials:
+The production command deploys staging first, then waits for the
+`comet-release-production` synchronization job and verifies the same candidate
+digest. A manual review is required **only when** the GitHub environment has
+required reviewers configured. With the current empty protection rules, this is
+job ordering and credential scoping, not an approval gate. Synchronization remains
+a prerequisite even when the reader credential pair is absent and it is a no-op.
+Do not deploy production locally; use `workflow_dispatch target=production`.
+For an authenticated local **staging** deployment:
 
 ```bash
 cd edge
 npm ci
 CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... npx wrangler deploy --env staging
-CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... npx wrangler deploy --env production
 ```
 
 Never reuse production credentials for the staging command.
@@ -195,7 +202,7 @@ git tag "v$version"
 git push origin "v$version"
 ```
 
-Manual production publication still requires both private release environments and the production approval. It does not create a GitHub Release or public object. Cargo workspace packages keep `publish = false`, so the workflow cannot publish crates.
+Manual production publication uses both private release environments. Reviewer approval depends on their actual GitHub protection rules; environment names alone do not require it. It does not create a GitHub Release or public object. Cargo workspace packages keep `publish = false`, so the workflow cannot publish crates.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the runtime design.
 The required local/Scaffold cutover and multi-client acceptance contract is in [docs/ASHLER-SCAFFOLD-END-STATE.md](docs/ASHLER-SCAFFOLD-END-STATE.md).

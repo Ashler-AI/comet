@@ -127,8 +127,9 @@ recorded. No physical-device installation or notification delivery is claimed.
 Production notification code was deployed through the staging-verified workflow
 after direct integration into main. Background APNs delivery remains blocked on
 approved production credentials; code deployment alone does not enable pushes.
-Manual deploys may set `skip_typecheck=true` when required by agent policy; the
-default remains false, and builds, tests and deployment environment gates remain.
+The temporary manual typecheck-bypass input was removed after review. Both push
+and manual deployment candidates again require the TypeScript check; agent policy
+does not change the release pipeline's requirements.
 
 The release workflow verified the desktop production manifest, checksums, and
 latest pointer. Local `comet update --check` returned HTTP 401 without a current
@@ -177,6 +178,9 @@ The existing 0.1.72 desktop candidate was promoted from merged main by
 all publish/readback jobs successful; no released artifact bytes were replaced.
 The `comet-release-production` environment currently has no configured protection
 rules; the workflow boundary was retained, but no manual reviewer approval is claimed.
+This successful run is not evidence of reviewer approval or TypeScript-check
+completion. The subsequent pipeline restoration was not followed by another
+deployment; no new workflow was started to evade the no-typecheck agent rule.
 
 The bounded Debug build was installed and exercised with `-visibility-e2e`:
 the lifecycle completed with `drained logout DELETE`. Both missing-DELETE and
