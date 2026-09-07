@@ -50,7 +50,10 @@ afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 const signingEnv = async () => {
   const keys = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
-  const der = new Uint8Array(await crypto.subtle.exportKey("pkcs8", keys.privateKey));
+  if (!("privateKey" in keys)) throw new Error("ECDSA generation did not return a key pair");
+  const exported = await crypto.subtle.exportKey("pkcs8", keys.privateKey);
+  if (!(exported instanceof ArrayBuffer)) throw new Error("PKCS8 export did not return bytes");
+  const der = new Uint8Array(exported);
   return {
     keys,
     env: {
@@ -100,7 +103,7 @@ describe("Crew push registration boundaries", () => {
     const env = {
       AUTH_MODE: "dev", ENVIRONMENT: "local", SCAFFOLD_PROJECT_SCOPE: "ashler-local",
       SCAFFOLD_REQUIRED_CAPABILITIES: "session.chat"
-    } as Env;
+    } as unknown as Env;
     for (const authorization of [undefined, "Bearer alice@other", "Bearer alice@ashler-local"]) {
       const response = await worker.fetch(new Request("http://127.0.0.1/notifications/device", {
         method: "PUT", headers: authorization ? { authorization } : {}, body: JSON.stringify(device)
