@@ -4,6 +4,7 @@ import { fileURLToPath, URL as NodeUrl } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CrdtType, JoinErrorCode, MessageType, UpdateStatusCode, decode, encode, type JoinRequest, type ProtocolMessage } from "loro-protocol";
 import { LoroDoc } from "loro-crdt";
+import type { VersionVector } from "loro-crdt";
 import {
   AUTH_CAPABILITIES_HEADER,
   AUTH_PROJECT_HEADER,
@@ -172,6 +173,7 @@ const makeRoom = (
   const storage = {
     sql: sql as unknown as SqlStorage,
     sync,
+    transactionSync: <T>(body: () => T): T => body(),
     getAlarm: async () => null,
     setAlarm: async () => {}
   };
@@ -298,6 +300,149 @@ describe("SessionRoom chat authorization", () => {
     await join(room, "user-a", "shared-chat");
     await join(room, "user-b", "shared-chat");
     expect(sql.meta.get("owner")).toBe(PROJECT_SCOPE);
+  });
+
+  it("preserves durable state when four readers cold-start the same room", async () => {
+    const source = new LoroDoc();
+    const map = source.getMap("metadata");
+    try {
+      map.set("retained", "must survive simultaneous joins");
+      const sql = new MemorySql();
+      sql.meta.set("owner", PROJECT_SCOPE);
+      sql.meta.set("chatId", "concurrent-cold-chat");
+      sql.putBlob("snapshot", source.export({ mode: "snapshot" }));
+      const { room } = makeRoom(sql);
+      const responses = await Promise.all(Array.from({ length: 4 }, () =>
+        room.fetch(authedRequest("/snapshot", "user-a"))));
+      for (const response of responses) {
+        expect(response.status).toBe(200);
+        const mirror = new LoroDoc();
+        try {
+          mirror.import(new Uint8Array(await response.arrayBuffer()));
+          expect(mirror.toJSON()).toEqual(source.toJSON());
+        } finally { mirror.free(); }
+      }
+    } finally { map.free(); source.free(); }
+  });
+
+  it("resyncs concurrent snapshots before preserving their union across cold restart", async () => {
+    const first = new LoroDoc();
+    const second = new LoroDoc();
+    const firstMap = first.getMap("metadata");
+    const secondMap = second.getMap("metadata");
+    const mirror = new LoroDoc();
+    try {
+      firstMap.set("firstPeer", "retained baseline");
+      secondMap.set("secondPeer", "incoming branch");
+      const sql = new MemorySql();
+      sql.meta.set("owner", PROJECT_SCOPE);
+      sql.meta.set("chatId", "concurrent-snapshot-chat");
+      sql.putBlob("snapshot", first.export({ mode: "snapshot" }));
+      const { room } = makeRoom(sql);
+      const incoming = second.export({ mode: "snapshot" });
+      expect((await room.fetch(authedRequest("/append", "user-a", {
+        method: "POST", body: incoming
+      }))).status).toBe(400);
+      const rejoin = await join(room, "user-a", "concurrent-snapshot-chat");
+      for (const bytes of rejoin.sent) {
+        const message = decode(bytes);
+        if (message.type === MessageType.DocUpdate) {
+          for (const update of message.updates) second.import(update);
+        }
+      }
+      expect((await room.fetch(authedRequest("/append", "user-a", {
+        method: "POST", body: second.export({ mode: "snapshot" })
+      }))).status).toBe(200);
+      first.import(incoming);
+      const restarted = makeRoom(sql).room;
+      const response = await restarted.fetch(authedRequest("/snapshot", "user-a"));
+      expect(response.status).toBe(200);
+      mirror.import(new Uint8Array(await response.arrayBuffer()));
+      expect(mirror.toJSON()).toEqual(first.toJSON());
+    } finally {
+      firstMap.free(); secondMap.free(); mirror.free(); second.free(); first.free();
+    }
+  });
+
+  it("bootstraps out-of-order pending deltas without losing them across cold replay", async () => {
+    const source = new LoroDoc();
+    const map = source.getMap("metadata");
+    let before: VersionVector | undefined;
+    const mirror = new LoroDoc();
+    try {
+      map.set("base", "preserved");
+      source.commit();
+      const snapshot = source.export({ mode: "snapshot" });
+      before = source.version();
+      map.set("late", "retained");
+      source.commit();
+      const delta = source.export({ mode: "update", from: before });
+      const intermediate = source.version();
+      let later: Uint8Array;
+      try {
+        map.set("last", "also retained");
+        source.commit();
+        later = source.export({ mode: "update", from: intermediate });
+      } finally { intermediate.free(); }
+      const sql = new MemorySql();
+      sql.appendUpdate(later);
+      sql.appendUpdate(delta);
+      const { room } = makeRoom(sql);
+      await join(room, "user-a", "bootstrap-chat");
+      const response = await room.fetch(authedRequest("/append", "user-a", { method: "POST", body: snapshot }));
+      expect(response.status).toBe(200);
+      const restarted = makeRoom(sql).room;
+      const replay = await restarted.fetch(authedRequest("/snapshot", "user-a"));
+      mirror.import(new Uint8Array(await replay.arrayBuffer()));
+      expect(mirror.toJSON()).toEqual(source.toJSON());
+    } finally {
+      before?.free();
+      map.free();
+      mirror.free();
+      source.free();
+    }
+  });
+
+  it("rejects an earlier unresolved delta even when the last replay row is covered", async () => {
+    const source = new LoroDoc();
+    const map = source.getMap("metadata");
+    const unrelated = new LoroDoc();
+    const unrelatedMap = unrelated.getMap("metadata");
+    let before: VersionVector | undefined;
+    const mirror = new LoroDoc();
+    try {
+      map.set("base", "preserved");
+      source.commit();
+      const snapshot = source.export({ mode: "snapshot" });
+      before = source.version();
+      map.set("late", "retained");
+      source.commit();
+      const delta = source.export({ mode: "update", from: before });
+      const sql = new MemorySql();
+      sql.appendUpdate(delta);
+      unrelatedMap.set("old", true);
+      sql.appendUpdate(unrelated.export({ mode: "snapshot" }));
+      const { room } = makeRoom(sql);
+      await join(room, "user-a", "bootstrap-chat");
+      unrelatedMap.set("unrelated", true);
+      const rejected = await room.fetch(authedRequest("/append", "user-a", {
+        method: "POST", body: unrelated.export({ mode: "snapshot" })
+      }));
+      expect(rejected.status).toBe(400);
+      source.import(unrelated.export({ mode: "snapshot" }));
+      const accepted = await room.fetch(authedRequest("/append", "user-a", { method: "POST", body: source.export({ mode: "snapshot" }) }));
+      expect(accepted.status).toBe(200);
+      const replay = await makeRoom(sql).room.fetch(authedRequest("/snapshot", "user-a"));
+      mirror.import(new Uint8Array(await replay.arrayBuffer()));
+      expect(mirror.toJSON()).toEqual(source.toJSON());
+    } finally {
+      before?.free();
+      map.free();
+      unrelatedMap.free();
+      mirror.free();
+      unrelated.free();
+      source.free();
+    }
   });
 
   it(

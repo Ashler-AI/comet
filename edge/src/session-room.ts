@@ -24,7 +24,8 @@
  * (which only exists while traffic keeps the DO awake anyway); scheduled work
  * (checkpoints, history trim, R2 backup §3.3) rides the durable alarm.
  */
-import { LoroDoc, EphemeralStore, VersionVector } from "loro-crdt";
+import { LoroDoc, EphemeralStore, VersionVector, decodeImportBlobMeta } from "loro-crdt";
+import type { PeerID } from "loro-crdt";
 import {
   CrdtType,
   JoinErrorCode,
@@ -262,6 +263,7 @@ export class SessionRoom implements DurableObject {
   private notifications: WorkspaceNotifications | undefined;
   /** Lazily materialized doc — the log is authoritative; this is a cache. */
   private doc: LoroDoc | undefined;
+  private docLoad: Promise<LoroDoc> | undefined;
   private eph: EphemeralStore | undefined;
   /** Bounded byte snapshots for workspace presence. Avoids another Loro WASM
    * allocation while letting fresh joiners observe peers before the next
@@ -521,14 +523,13 @@ export class SessionRoom implements DurableObject {
         if (owner !== projectScope) return json({ error: "forbidden" }, 403);
       }
       const body = new Uint8Array(await request.arrayBuffer());
-      const doc = await this.ensureDoc();
+      let doc = await this.ensureDoc();
       if (workspace) this.notifyWorkspace(doc, projectScope, true);
       try {
-        if (body.length > 0) doc.import(body);
+        doc = this.importLoroUpdates(doc, [body]);
       } catch {
         return json({ error: "invalid_update" }, 400);
       }
-      this.recordLoroUpdates([body]);
       if (workspace) this.notifyWorkspace(doc, projectScope);
       // Converge live peers: relay the update to connected %LOR sockets.
       const roomId = this.getMeta("chatId") ?? "";
@@ -888,21 +889,20 @@ export class SessionRoom implements DurableObject {
       if (ws.readyState !== WebSocket.OPEN) return;
       // Authority lookup may yield to a trim (which frees/replaces the doc)
       // or idle release. Use only the current live doc, with no further await.
-      const doc = this.doc;
+      let doc = this.doc;
       if (!doc) {
         this.ack(ws, { crdt, roomId }, UpdateStatusCode.InvalidUpdate, batchId);
         return;
       }
       if (state.workspace) this.notifyWorkspace(doc, state.projectScope, true);
       try {
-        for (const update of updates) if (update.length > 0) doc.import(update);
+        doc = this.importLoroUpdates(doc, updates);
       } catch {
         // Includes imports concurrent to a shallow-snapshot start (§3.1 stale
         // peer) — the client resyncs fresh and re-submits at the app layer.
         this.ack(ws, { crdt, roomId }, UpdateStatusCode.InvalidUpdate, batchId);
         return;
       }
-      this.recordLoroUpdates(updates);
       if (state.workspace) this.notifyWorkspace(doc, state.projectScope);
       this.ack(ws, { crdt, roomId }, UpdateStatusCode.Ok, batchId);
       await this.relay(ws, crdt, roomId, updates);
@@ -932,31 +932,131 @@ export class SessionRoom implements DurableObject {
     this.ack(ws, { crdt, roomId }, UpdateStatusCode.Unknown, batchId);
   }
 
+  private importLoroUpdates(doc: LoroDoc, updates: Uint8Array[]): LoroDoc {
+    const snapshotIndex = updates.findIndex((update) => {
+        if (update.length === 0) return false;
+        const metadata = decodeImportBlobMeta(update, false);
+        try {
+          return metadata.mode === "snapshot" || metadata.mode === "shallow-snapshot" || metadata.mode === "outdated-snapshot";
+        } finally {
+          metadata.partialStartVersionVector.free();
+          metadata.partialEndVersionVector.free();
+        }
+      });
+    if (snapshotIndex < 0) {
+      for (const update of updates) if (update.length > 0) doc.import(update);
+      this.recordLoroUpdates(updates);
+      return doc;
+    }
+
+    // Pending deltas make snapshot import take the eager history-replay path.
+    // Load state first, then merge EVERY retained delta into a fresh candidate.
+    // Neither accepted bytes nor the live doc change until validation succeeds.
+    const snapshot = updates[snapshotIndex];
+    const candidate = new LoroDoc();
+    let ownsCandidate = true;
+    let previousVersion: VersionVector | undefined;
+    try {
+      const initial = candidate.import(snapshot);
+      if (initial.pending?.size) throw new Error("incomplete bootstrap snapshot");
+      previousVersion = doc.oplogVersion();
+      const candidateVersion = candidate.oplogVersion();
+      try {
+        const coverage = candidateVersion.compare(previousVersion);
+        if (coverage === undefined) {
+          throw new Error("concurrent bootstrap snapshot requires resync");
+        }
+        if (coverage <= 0) {
+          // This snapshot adds no operations. Do not replay it into warm state.
+          candidate.free();
+          ownsCandidate = false;
+          return this.importLoroUpdates(doc, updates.filter((_, i) => i !== snapshotIndex));
+        }
+      } finally {
+        candidateVersion.free();
+      }
+      // importBatch detaches and checks out the whole history after replay.
+      // Single imports retain the incremental state path and release each SQL
+      // row before reading the next. Track earlier pending spans explicitly:
+      // a later import with no pending entries does not prove they resolved.
+      let pendingEnds: Map<PeerID, number> | undefined;
+      const replay = (update: Uint8Array): void => {
+        if (update.length === 0) return;
+        const imported = candidate.import(update);
+        for (const [peer, span] of imported.pending ?? []) {
+          pendingEnds ??= new Map();
+          pendingEnds.set(peer, Math.max(pendingEnds.get(peer) ?? 0, span.end));
+        }
+      };
+      for (const row of this.ctx.storage.sql.exec("SELECT bytes FROM updates ORDER BY seq")) {
+        replay(new Uint8Array(row.bytes as ArrayBuffer));
+      }
+      for (const update of this.pending) replay(update);
+      for (let i = 0; i < updates.length; i++) {
+        if (i !== snapshotIndex) replay(updates[i]);
+      }
+      const mergedVersion = candidate.oplogVersion();
+      try {
+        const coverage = mergedVersion.compare(previousVersion);
+        if (coverage === undefined || coverage < 0) throw new Error("bootstrap lost retained operations");
+        for (const [peer, end] of pendingEnds ?? []) {
+          if ((mergedVersion.get(peer) ?? 0) < end) throw new Error("bootstrap snapshot does not cover retained dependencies");
+        }
+      } finally { mergedVersion.free(); }
+      // Equivalent frontiers prove state/oplog agreement without walking the
+      // causal DAG to reconstruct state.version() on a large lazy snapshot.
+      const state = candidate.frontiers();
+      const oplog = candidate.oplogFrontiers();
+      if (candidate.isDetached() || state.length !== oplog.length ||
+          !state.every((head) => oplog.some((other) => head.peer === other.peer && head.counter === other.counter))) {
+        throw new Error("incomplete bootstrap state");
+      }
+      // The incoming snapshot already covers all previously applied operations.
+      // Retain the delta log and buffered updates for the candidate's additions;
+      // cold replay imports this baseline before those deltas in the same order.
+      this.ctx.storage.transactionSync(() => this.blobs.put("snapshot", snapshot));
+      this.doc = candidate;
+      ownsCandidate = false;
+      doc.free();
+      this.recordLoroUpdates(updates, snapshotIndex);
+      return candidate;
+    } finally {
+      previousVersion?.free();
+      if (ownsCandidate) candidate.free();
+    }
+  }
+
   private workspaceNotifications(): WorkspaceNotifications {
     return this.notifications ??= new WorkspaceNotifications(this.ctx.storage, this.env);
   }
 
   private notifyWorkspace(doc: LoroDoc, projectScope: string, baseline = false): void {
+    let phase = "workspace_notifications_construct";
     try {
       const notifications = this.workspaceNotifications();
+      phase = "observe";
       const events = notifications.observe(doc, baseline);
+      phase = "schedule_delivery";
       if (events.length) {
         this.ctx.waitUntil(notifications.deliver(events, projectScope).catch(() => {
           console.warn("Crew push delivery failed");
         }));
       }
-    } catch {
-      console.warn("Crew push observation failed");
+    } catch (error) {
+      if (this.env.ENVIRONMENT === "staging") console.warn("Crew push observation failed", phase, (error instanceof Error ? error.message : String(error)).slice(0, 512));
+      else console.warn("Crew push observation failed");
     }
   }
 
   /** Durability bookkeeping for accepted %LOR updates: buffer for the flush
    * batch, dirty the tail/backup caches, keep the daily alarm armed. */
-  private recordLoroUpdates(updates: Uint8Array[]): void {
+  private recordLoroUpdates(updates: Uint8Array[], persistedSnapshotIndex = -1): void {
     let real = false;
-    for (const update of updates) {
+    for (let i = 0; i < updates.length; i++) {
+      const update = updates[i];
       if (update.length === 0) continue;
       real = true;
+      if (i === persistedSnapshotIndex) continue;
       this.pending.push(update);
       this.pendingBytes += update.length;
     }
@@ -1073,7 +1173,17 @@ export class SessionRoom implements DurableObject {
 
   private async ensureDoc(): Promise<LoroDoc> {
     this.touchDoc();
+    if (this.docLoad) return this.docLoad;
     if (this.doc) return this.doc;
+    this.docLoad = this.materializeDoc();
+    try {
+      return await this.docLoad;
+    } finally {
+      this.docLoad = undefined;
+    }
+  }
+
+  private async materializeDoc(): Promise<LoroDoc> {
     // AUTOMATED WEDGE BREAK: a cold replay that exceeds the DO CPU limit kills
     // the invocation before `replayAttempts` is cleared below — and every
     // reconnecting client cold-starts the room into the same death, forever

@@ -66,6 +66,68 @@ old data and surface a synchronization error rather than silently overwriting it
 App Store Connect confirmed build 5 in **Ashler Internal** and its installation
 by the existing tester on 2026-09-06.
 
+### Snapshot-first bootstrap recovery
+
+Native and mobile clients send a snapshot when the edge has no history. For
+fragmented catch-up, they prefer a snapshot only when it is smaller than the
+missing-operation export; normal incremental updates stay unchanged.
+
+The edge loads a snapshot into a fresh candidate before replaying persisted and
+buffered deltas. Adoption requires complete replay, coverage of accepted history,
+and matching state/oplog frontiers. Already-included snapshots are acknowledged
+without re-import; concurrent snapshots require a rejoin/resync before submission.
+Missing dependencies reject the candidate without replacing accepted state. The
+incoming covering snapshot is stored through the chunked blob store, with the
+existing delta log and buffered deltas retained for cold replay. No merged-snapshot
+re-export is needed at adoption. Notification policy is unchanged.
+
+Cold materialization is single-flight: simultaneous joins share one replay and
+cannot spend the replay-crash budget several times or overwrite each other's
+materialized documents. Four simultaneous cold reads previously reproduced an
+automatic snapshot/log drop without a preceding replay failure. The serialized
+path preserves all 604 session entries in the same Cloudflare runtime scenario.
+
+The staging safeguards were deployed on 2026-09-07 as
+`c8be5b20-9eba-43f4-9b74-fda0eb8a4e6a`; removal of the redundant adoption export
+was deployed as `e907dc7e-9d77-4535-b6f9-9271ff2d6bf2`.
+
+A version-attributed workerd comparison used the same real workspace plus 499
+synthetic dependent deltas. When the incoming snapshot already included those
+deltas, both implementations used 28,966,912 bytes (27.63 MiB) through bootstrap
+and observation, and 75,759,616 bytes (72.25 MiB) after cold-replay trimming.
+Both preserved 595 valid notification rows and emitted zero attention events.
+Removing the full-snapshot export avoided redundant work but did not lower that
+fixture's WASM high-water mark. The earlier 499-row captured-live-log experiment
+was a different fixture and is not the basis for these version-specific numbers.
+
+The missing-history fixture exposed a separate `importBatch` problem in Loro:
+batch replay detaches the document and checks out the latest operation log at
+the end. With 499 deltas absent from the incoming snapshot, `e907dc7e` reached
+240,189,440 bytes through observation and failed the memory assertion.
+
+Staging `bcf5b1cd-3773-441f-9a45-adaa8bf8bcb7` replaces batch replay with streamed
+single-delta imports. A final applied-version check covers every earlier pending
+span, so later successful rows cannot hide unresolved dependencies. No retained
+rows are dropped. In a matched-byte workerd API experiment, batch import reached
+236,388,352 bytes; single imports applied all 499 missing deltas and read all 604
+sessions at 70,320,128 bytes.
+
+The actual edge bootstrap, observer, and cold-replay paths also passed using the
+real workspace plus 499 genuinely new dependent deltas: 73,793,536 bytes (70.38 MiB)
+through observation and 76,152,832 bytes (72.63 MiB) after cold-replay trimming.
+Reverse-order replay passed at 70.38 MiB through observation and 72.38 MiB after
+trimming, including resolution of the accumulated pending chain. Both preserved
+the final delta value and 595 notification rows, and emitted zero attention events.
+These are isolated scenario measurements, not a bound for arbitrary payloads or
+multiple co-resident rooms. Old clients' full-history update uploads remain a
+separate activation concern.
+
+The complete edge Vitest suite passed: 136 tests across 16 files. Local typechecks
+were intentionally not run under workstation policy; remote type validation is
+still outstanding. No live recovery or iPhone delivery is claimed. Client
+encoding changes still require new builds and safe activation; active engines
+were not restarted during this repair.
+
 ### Staging 1.0 (6): mobile status feedback
 
 - Session rows show unread, live status, and last-updated time independently.

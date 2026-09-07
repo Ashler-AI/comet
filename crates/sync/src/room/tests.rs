@@ -439,6 +439,24 @@ async fn join_backfills_server_state_into_fresh_doc() {
 }
 
 #[tokio::test]
+async fn compacted_client_bootstraps_empty_server_with_complete_state() {
+    let source = LoroDoc::new();
+    source.get_text("t").insert(0, "retained state").unwrap();
+    source.commit();
+    let snapshot = source
+        .export(ExportMode::shallow_snapshot(&source.state_frontiers()))
+        .unwrap();
+    let doc = LoroDoc::new();
+    doc.import(&snapshot).unwrap();
+    let edge = FakeEdge::new();
+    let client = RoomClient::connect_with(edge.connector(), "room-1", doc)
+        .await
+        .expect("connect");
+    wait_until(|| doc_text(&edge.doc) == "retained state").await;
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn corrupt_snapshot_after_disconnect_is_rejected_then_rejoined_without_poisoning() {
     let edge = FakeEdge::new();
     let doc = LoroDoc::new();
