@@ -112,14 +112,28 @@ not just the mobile patch. Its staging vars set `APNS_TOPIC` to
 Integration verification passed 60 focused notification/auth/room tests and
 real local-Worker registration, token rotation, cross-user denial, deletion,
 and missing-credential fail-closed checks. Local signing fixtures were
-disposable test credentials; no Apple push delivery was exercised. Apple had
-no existing APNs keys; key creation, staging secret configuration, and deployment
-await explicit approval.
+disposable test credentials; no Apple push delivery was exercised in those checks.
 
-Background delivery is **not yet activated**: the staging Worker still lacks
-APNs credentials and the notification credential-encryption secret. Build 8
-can test session visibility and local alerts; end-to-end background delivery
-requires staging backend deployment/configuration and a physical-device check.
+After explicit approval on 2026-09-07, backend source `8a7877d` was deployed to
+`ashler-comet-edge-staging` as Worker version
+`13508539-fe5a-47d9-a5d5-5cf5bd362bb5`. Production was not deployed. Apple key
+`99D9D7GGF4` (**Crew Staging Notifications**) enables APNs only, **Sandbox &
+Production**, **Team Scoped (All Topics)**. The Worker still uses only the staging
+topic above. `APNS_PRIVATE_KEY`, `APNS_KEY_ID`, and a newly generated 32-byte
+`NOTIFICATION_CREDENTIAL_KEY` are stored in staging Worker secrets. The one-time
+PKCS#8 P-256 download was uploaded successfully and local `.p8` copies removed.
+
+Live staging health returned `ok: true`, `auth: scaffold`, `environment: staging`.
+Using an existing authenticated staging identity, temporary Sandbox and
+Production registration probes both returned HTTP 200; DELETE also returned
+200 and removed the probe. These requests verify credential encryption and
+signing-key parsing, not APNs acceptance or device delivery.
+
+**Background delivery is configured; physical-device delivery remains unverified.**
+The paired iPhone was unavailable to local tooling. In TestFlight build 8,
+foreground Crew Staging, enable **Session attention alerts**, then background
+the app and trigger a fresh session attention transition to verify the banner
+and its session-opening action. No app rebuild is needed for this backend activation.
 
 ### Connecting
 
