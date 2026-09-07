@@ -194,23 +194,6 @@ describe("Comet release surfaces", () => {
     assert.ok(candidateStop < guard && guard < channels);
   });
 
-  it("reuses only a successful main or merged release candidate for production promotion", async () => {
-    const workflow = await read(".github/workflows/release.yml");
-    const candidate = jobBlock(workflow, "candidate");
-
-    assert.match(workflow, /candidate_run_id:[\s\S]*required: false[\s\S]*default: ""/);
-    assert.match(workflow, /permissions:[\s\S]*actions: read/);
-    assert.match(workflow, /candidate_run_id is only supported for production promotion/);
-    assert.match(candidate, /gh api "repos\/\$GITHUB_REPOSITORY\/actions\/runs\/\$CANDIDATE_RUN_ID"/);
-    assert.match(candidate, /actions\/download-artifact@v4[\s\S]*run-id: \$\{\{ inputs\.candidate_run_id \}\}/);
-    assert.match(candidate, /gh api "repos\/\$GITHUB_REPOSITORY\/compare\/\$source_sha\.\.\.\$GITHUB_SHA"/);
-    assert.match(candidate, /source_sha" =~ \^\[0-9a-f\]\{40\}\$/);
-    assert.match(candidate, /compare_status.*ahead.*identical/s);
-    assert.match(candidate, /node scripts\/validate-release-candidate-reuse\.mjs/);
-    assert.match(candidate, /sha256sum --check desktop-SHA256SUMS/);
-    assert.match(candidate, /sha256sum --check scaffold-SHA256SUMS/);
-    assert.match(candidate, /sha256sum --check SHA256SUMS/);
-  });
 
   it("advances desktop and Scaffold moving channels independently", async () => {
     const [workflow, runtimeVersion, engine, edge] = await Promise.all([

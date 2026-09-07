@@ -103,15 +103,16 @@ by [34136878825](https://github.com/Ashler-AI/comet/actions/runs/34136878825), w
 verified byte-identical artifacts and production channel readback. Scaffold runtime
 deployment was unchanged. Staging remains **1.0 (8)**.
 
-The initial production-review simulator build **5** crashed after its regression
-logged success. LLDB reproduced `__URLSESSION_CLIENT_API_MISUSE_INVALIDATED_SESSION__`:
-the logout DELETE started after regression teardown invalidated its URLSession.
-`signOut()` now returns an optional cleanup task without delaying local logout;
-the regression drains the PUT and delayed DELETE before assertions and teardown.
-The rebuilt simulator passed visibility, attention-transition, and lifecycle
-scenarios and remained alive for over two minutes before intentional shutdown.
-The original iOS upload was cancelled during App Store Connect analysis. A fresh
-production archive was built after this fix; the earlier archive is rejected.
+The initial Debug production-review simulator build **5** crashed after its
+regression logged success: logout DELETE started after regression teardown
+invalidated the probe's ephemeral URLSession. This was **Debug-harness-only**:
+Release uses `URLSession.shared`, never invalidates it, and excludes the harness.
+The faulting request method is also used in Release, but the invalidated-session
+condition is not reachable there. `signOut()` returns optional cleanup work so
+the regression can drain it without delaying local logout. The original upload
+was cancelled during analysis after transferring only its asset-description XML;
+it did not complete an IPA upload. The subsequent rebuilt archive is the one
+uploaded successfully; no shipping crash is inferred from the Debug incident.
 
 The fresh archive, built from crash fix `ed34d79`, uploaded successfully on
 2026-09-07 at **15:23:50 UTC** as production **1.0 (5)**. Xcode reported the
@@ -119,15 +120,34 @@ package processing, then upload success with no errors or warnings; delivery ID
 `ce659ad3-9bcc-4b1f-ae8c-ecf8a5536ffc`. The inspection IPA passed signature
 verification, and both its signed entitlements and embedded profile specify
 `aps-environment = production` for `825LYXGJR6.ai.ashler.crew`.
-App Store Connect browser access requires renewed sign-in: processing completion,
-TestFlight availability, physical-device installation, and notification delivery
-are not yet verified. Production Worker deployment remains blocked on approved
-production APNs credentials; no background-delivery readiness is claimed.
+Authenticated App Store Connect inspection on 2026-09-07 confirmed build **5**
+upload **Complete** at **11:23 AM**, with access assigned to **Ashler Internal**.
+That group's one internal tester remains **Invited**, with no install/session
+recorded. No physical-device installation or notification delivery is claimed.
+Production Worker deployment remains blocked on approved production APNs
+credentials and must use `deploy.yml` dispatch `target=production`, never a local
+production deploy. The checked-in workflow also invokes a typecheck, which this
+agent is prohibited from starting; its approval gate must not be bypassed.
 
 The release workflow verified the desktop production manifest, checksums, and
 latest pointer. Local `comet update --check` returned HTTP 401 without a current
 production login, so authenticated client download was not verified locally.
 Typechecks were intentionally not run because global instructions prohibit them.
+
+Source reconciliation verified that fetched `origin/main` (`f89dd43`) is an
+ancestor of the production release branch, which initially held exactly three
+additional release commits. The stale local `main` checkout was not its baseline.
+The already-published branch had not been merged, however. The release workflow
+now fails production promotion unless its dispatch/tag SHA is an ancestor of
+`origin/main`, including candidate-reuse dispatches. Further promotion must wait
+for the PR merge; published 0.1.72 artifacts must not be overwritten.
+
+The full `cargo test -p comet-ui` suite passed **531 tests** with zero failures;
+the production port changed no comet-doc or comet-engine source files. A fresh
+`scripts/package-macos.sh` bundle generated an actual `awaitingInput` transition,
+but macOS displayed its Crew permission notice rather than an attention banner.
+Permission was not granted automatically; real banner delivery and click routing
+remain unverified until the user allows Crew notifications.
 
 Home includes detached and missing-space sessions and an **Archived sessions**
 section with explicit **Restore**. Imported chat IDs remain opaque, while
@@ -288,8 +308,10 @@ Registration is principal/project scoped; single-session device grants cannot re
 Offline regression launch: `-visibility-e2e` runs session visibility and
 attention-transition scenarios and opens demo mode. Debug builds additionally
 exercise queued APNs token arrival, scoped routing, offline disable/logout and
-late-response isolation using an in-process HTTP responder. Results append to
-`Documents/e2e.log`; no sign-in or push permission is requested.
+late-response isolation using an in-process HTTP responder. Every lifecycle wait
+has a five-second deadline and logs a stage-specific `FAIL` before cancelling
+the probe safely; success is logged only after logout cleanup drains. Results
+append to `Documents/e2e.log`; no sign-in or push permission is requested.
 
 With a Debug simulator build installed, run the existing offline hook:
 
@@ -303,5 +325,12 @@ Read `Documents/e2e.log` below the returned data-container path. Expect the
 `OK Crew APNs lifecycle` markers and no `FAIL` entries from this launch. The
 lifecycle marker includes `drained logout DELETE`; verify the app remains alive
 afterward, since a log marker alone cannot catch a subsequent teardown crash.
+For deterministic Debug-only failure coverage, append
+`-notification-e2e-missing-delete` to suppress the logout response, or
+`-notification-e2e-missing-token` to remove the logout credential before the
+DELETE can reach the responder. Run these separately; each must log
+`FAIL Crew APNs lifecycle deadline: logout DELETE responder` within five seconds
+of that stage, omit the lifecycle `OK` marker, and leave the app alive after
+teardown. Neither flag affects a release build or sends real network traffic.
 The visibility scenario also checks environment/deployment routing survives
 opaque-ID upsert and projection. Substitute `ai.ashler.crew.staging` for staging.
