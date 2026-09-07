@@ -5886,8 +5886,8 @@ impl Composer {
                     composer.state.update(cx, |s, cx| {
                         s.remove_echo(&err_chat_id, &err_message_id);
                         s.clear_scaffold_chat_starting(&err_chat_id, cx);
-                        if is_new && !scaffold_demo {
-                            s.cancel_pending_chat(&err_chat_id, cx);
+                        if is_new {
+                            s.cancel_unaccepted_chat(&err_chat_id, cx);
                         }
                         cx.notify();
                     });

@@ -3437,8 +3437,18 @@ impl Shell {
 
     fn delete_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.delete_confirm = None;
-        self.state
-            .update(cx, |state, cx| state.cancel_pending_chat(&chat_id, cx));
+        if self
+            .state
+            .read(cx)
+            .scaffold_session_draft_for_chat(&chat_id)
+            .is_some()
+        {
+            self.state
+                .update(cx, |state, cx| state.cancel_pending_chat(&chat_id, cx));
+        } else if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
+            self.state
+                .update(cx, |state, cx| state.select_chat(None, cx));
+        }
         self.composer
             .update(cx, |composer, _| composer.purge_chat(&chat_id));
         self.mutate(

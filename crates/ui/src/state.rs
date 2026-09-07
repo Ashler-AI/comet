@@ -1928,6 +1928,17 @@ impl AppState {
         }
     }
 
+    pub(crate) fn cancel_unaccepted_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        if self.scaffold_control_targets.contains_key(chat_id)
+            || self
+                .scaffold_session_draft_for_chat(chat_id)
+                .is_some_and(|draft| draft.target.is_some())
+        {
+            return;
+        }
+        self.cancel_pending_chat(chat_id, cx);
+    }
+
     /// Drop an echo (send failed — the prompt returns to the draft).
     pub fn remove_echo(&mut self, chat_id: &str, message_id: &str) {
         let removed = self.echoes.get_mut(chat_id).is_some_and(|echoes| {
@@ -2692,9 +2703,18 @@ impl AppState {
     }
 
     pub(crate) fn scaffold_session_draft(&self) -> Option<&ScaffoldSessionDraft> {
+        self.selected_chat
+            .as_deref()
+            .and_then(|chat_id| self.scaffold_session_draft_for_chat(chat_id))
+    }
+
+    pub(crate) fn scaffold_session_draft_for_chat(
+        &self,
+        chat_id: &str,
+    ) -> Option<&ScaffoldSessionDraft> {
         self.pending_scaffold_session
             .as_ref()
-            .filter(|draft| self.selected_chat.as_deref() == Some(draft.chat_id.as_str()))
+            .filter(|draft| draft.chat_id == chat_id)
     }
 
     pub(crate) fn retain_scaffold_target(
@@ -4611,6 +4631,12 @@ mod tests {
                 },
                 cx,
             );
+            let unaccepted = state.scaffold_session_draft().unwrap().clone();
+            state.cancel_unaccepted_chat("chat-a", cx);
+            assert!(state.pending_scaffold_session.is_none());
+            assert!(!state.pending_local_chat_ids.contains("chat-a"));
+            assert!(state.selected_chat.is_none());
+            state.select_pending_scaffold_chat(unaccepted, cx);
 
             assert_eq!(state.selected_chat.as_deref(), Some("chat-a"));
             assert!(!state.scaffold_chat_starting("chat-a"));
@@ -4629,6 +4655,15 @@ mod tests {
             assert!(state.transcript_task.is_none());
             assert!(state.collaboration_task.is_none());
             state.select_chat(None, cx);
+            state.cancel_unaccepted_chat("chat-a", cx);
+            assert_eq!(
+                state
+                    .scaffold_session_draft_for_chat("chat-a")
+                    .unwrap()
+                    .target
+                    .as_ref(),
+                Some(&target)
+            );
             state.select_space(None, cx);
             state.select_chat(Some("chat-a".into()), cx);
             assert_eq!(
