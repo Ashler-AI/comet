@@ -129,6 +129,20 @@ Production registration probes both returned HTTP 200; DELETE also returned
 200 and removed the probe. These requests verify credential encryption and
 signing-key parsing, not APNs acceptance or device delivery.
 
+The subsequent live attention probe exposed a native Workers `fetch` receiver
+bug before Apple was contacted. Source fix `eefd8e3` invokes the transport as
+a standalone function; regression coverage preserves that native calling
+contract. Allowlisted rejection diagnostics never log provider bodies,
+credentials, tokens, request URLs, or session content. Final staging Worker
+version is `5f208fff-1f91-43bd-85e4-4b2825c10f27`.
+
+After full workspace hydration, isolated working-to-awaiting-input transitions
+reached Apple in **Production and Sandbox**, each returning **400 BadDeviceToken**
+for the intentionally invalid probe token. No **403 InvalidProviderToken** was
+observed. Both probe registrations and temporary workspace chat/session rows
+were removed. Temporary tracing and local signing fixtures were removed.
+These are real upstream rejection results, not successful device delivery.
+
 **Background delivery is configured; physical-device delivery remains unverified.**
 The paired iPhone was unavailable to local tooling. In TestFlight build 8,
 foreground Crew Staging, enable **Session attention alerts**, then background
