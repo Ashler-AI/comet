@@ -94,13 +94,24 @@ verification awaits the system sign-in consent; two independent native Crew
 engines separately verified live Scaffold messaging and reconnect convergence.
 Typechecks were intentionally not run because global instructions prohibit them.
 
-### Crew 0.1.72 / production iOS 1.0 (5) preparation
+### Crew 0.1.72 / production iOS 1.0 (5)
 
 The release worktree ports the staging build 8 session-visibility and notification
-source onto the current production baseline. Production build **5** is tentative
-pending the release owner's App Store Connect check; staging remains **1.0 (8)**.
-This is source preparation only: it does not claim a production archive, upload,
-deployment, or physical-device notification delivery.
+source onto the current production baseline. Desktop **0.1.72** was promoted from
+candidate run [34135975355](https://github.com/Ashler-AI/comet/actions/runs/34135975355)
+by [34136878825](https://github.com/Ashler-AI/comet/actions/runs/34136878825), which
+verified byte-identical artifacts and production channel readback. Scaffold runtime
+deployment was unchanged. Staging remains **1.0 (8)**.
+
+The initial production-review simulator build **5** crashed after its regression
+logged success. LLDB reproduced `__URLSESSION_CLIENT_API_MISUSE_INVALIDATED_SESSION__`:
+the logout DELETE started after regression teardown invalidated its URLSession.
+`signOut()` now returns an optional cleanup task without delaying local logout;
+the regression drains the PUT and delayed DELETE before assertions and teardown.
+The rebuilt simulator passed visibility, attention-transition, and lifecycle
+scenarios and remained alive for over two minutes before intentional shutdown.
+The original iOS upload was cancelled during App Store Connect analysis. A fresh
+production archive was built after this fix; the earlier archive is rejected.
 
 Home includes detached and missing-space sessions and an **Archived sessions**
 section with explicit **Restore**. Imported chat IDs remain opaque, while
@@ -274,7 +285,7 @@ xcrun simctl get_app_container booted ai.ashler.crew data
 Read `Documents/e2e.log` below the returned data-container path. Expect the
 `OK Crew session visibility`, `OK Crew attention transitions`, and
 `OK Crew APNs lifecycle` markers and no `FAIL` entries from this launch. The
-visibility scenario also checks environment/deployment routing survives opaque-ID
-upsert and projection. Substitute `ai.ashler.crew.staging` for staging. These
-invocations are preparation instructions, not a claim that this production port
-has been built or exercised.
+lifecycle marker includes `drained logout DELETE`; verify the app remains alive
+afterward, since a log marker alone cannot catch a subsequent teardown crash.
+The visibility scenario also checks environment/deployment routing survives
+opaque-ID upsert and projection. Substitute `ai.ashler.crew.staging` for staging.
