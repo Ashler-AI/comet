@@ -104,7 +104,7 @@ export class ApnsProvider {
     }
   }
 
-  async send(device: Registration, chatId: string, projectScope: string, userId: string, attention: Attention, authorization?: string): Promise<{ remove: boolean; invalidatedAt?: number }> {
+  async send(device: Registration, chatId: string, projectScope: string, userId: string, attention: Attention, authorization?: string): Promise<{ status: number; apnsId?: string; remove: boolean; invalidatedAt?: number }> {
     const jwt = authorization ?? await this.authorization();
     const host = device.environment === "sandbox" ? "api.sandbox.push.apple.com" : "api.push.apple.com";
     const transport = this.transport;
@@ -125,21 +125,23 @@ export class ApnsProvider {
       }),
       signal: AbortSignal.timeout(10_000)
     });
-    if (this.env.APNS_TOPIC === "ai.ashler.crew.staging") console.info("Crew push diagnostic", JSON.stringify({ stage: "apns_response", at: Date.now(), status: response.status }));
-    if (response.ok) return { remove: false };
+    const status = response.status;
+    const apnsId = response.headers.get("apns-id") ?? undefined;
+    if (this.env.APNS_TOPIC === "ai.ashler.crew.staging") console.info("Crew push diagnostic", JSON.stringify({ stage: "apns_response", at: Date.now(), status, apnsId }));
+    if (response.ok) return { status, apnsId, remove: false };
     const body = await response.json().catch(() => ({})) as { reason?: string; timestamp?: number };
-    // Only fixed reason labels may reach logs; never provider bodies or identifiers.
+    // Only fixed reason labels may reach logs; never provider bodies or device identifiers.
     const reason = typeof body.reason === "string" && APNS_DIAGNOSTIC_REASONS[body.reason] === true
       ? body.reason : "Other";
     console.warn("Crew push delivery rejected", response.status, reason);
     if (response.status === 410 && body.reason === "Unregistered") {
-      return { remove: true, invalidatedAt: typeof body.timestamp === "number" ? body.timestamp : undefined };
+      return { status, apnsId, remove: true, invalidatedAt: typeof body.timestamp === "number" ? body.timestamp : undefined };
     }
     if (response.status === 400 && (body.reason === "BadDeviceToken" || body.reason === "DeviceTokenNotForTopic")) {
-      return { remove: true };
+      return { status, apnsId, remove: true };
     }
     if (body.reason === "ExpiredProviderToken") this.cached = undefined;
-    return { remove: false };
+    return { status, apnsId, remove: false };
   }
 }
 
@@ -420,7 +422,7 @@ export class WorkspaceNotifications {
             }
             this.trace("apns_started", { updatedAt: event.updatedAt, ageMs: Date.now() - event.updatedAt });
             const delivery = await this.provider.send(device, event.chatId, projectScope, device.userId, event.attention, authorization);
-            this.trace("apns_finished", { updatedAt: event.updatedAt, removeRegistration: delivery.remove });
+            this.trace("apns_finished", { updatedAt: event.updatedAt, status: delivery.status, apnsId: delivery.apnsId, removeRegistration: delivery.remove });
             if (delivery.remove && (delivery.invalidatedAt === undefined || device.registeredAt <= delivery.invalidatedAt)) {
               this.storage.sql.exec("DELETE FROM notification_devices WHERE installationId = ? AND revision = ?", device.installationId, device.revision);
             }
