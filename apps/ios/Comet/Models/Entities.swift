@@ -294,6 +294,19 @@ func sortActive(_ chats: [Chat]) -> [Chat] {
     }
 }
 
+/// Workspace rows remain reachable even without a current space. Archiving
+/// changes their section, never their membership or persisted state.
+func sessionListChats(_ chats: [Chat], archived: Bool) -> [Chat] {
+    sortActive(chats.filter { $0.archived == archived })
+}
+
+/// Every row is shown in either Sessions or Archived sessions, so row-backed
+/// memberships must not also render as context-free shared-session rows.
+func foreignSessionRefs(_ refs: [SessionRef], chats: [Chat]) -> [SessionRef] {
+    let rowIds = Set(chats.map(\.id))
+    return refs.filter { !rowIds.contains($0.chatId) }
+}
+
 // MARK: - Session doc entries
 
 enum MessageRole: String {

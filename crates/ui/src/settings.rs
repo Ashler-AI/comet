@@ -91,9 +91,11 @@ pub struct UiSettings {
     /// are skipped; new spaces append in creation order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub space_order: Vec<String>,
-    /// Session notification chimes (done / awaiting-input). `COMET_DISABLE_SOUND`
+    /// Session attention chimes (done / input / error). `COMET_DISABLE_SOUND`
     /// overrides.
     pub sound_enabled: bool,
+    /// Native desktop alerts are opt-in and contain no session content.
+    pub notifications_enabled: bool,
     /// Hides secondary chrome while keeping the transcript and composer live.
     pub focus_mode: bool,
     /// Global worktree/account/goals card visibility across every session.
@@ -125,6 +127,7 @@ impl Default for UiSettings {
             tab_order: std::collections::HashMap::new(),
             space_order: Vec::new(),
             sound_enabled: true,
+            notifications_enabled: false,
             focus_mode: false,
             workspace_status_visible: true,
             density: Density::default(),
@@ -385,6 +388,7 @@ mod tests {
             )]),
             space_order: vec!["space-2".to_string(), "space-1".to_string()],
             sound_enabled: false,
+            notifications_enabled: true,
             focus_mode: true,
             density: Density::Compact,
             workspace_status_visible: false,

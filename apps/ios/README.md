@@ -26,11 +26,11 @@ Production and staging use the same Swift target with separate checked-in scheme
 bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
 
 ```sh
-# Production: Crew, ai.ashler.crew, version 1.0 build 4
+# Production preparation: Crew, ai.ashler.crew, version 1.0 build 5 (tentative)
 xcodebuild -project Comet.xcodeproj -scheme Comet \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 
-# Staging: Crew Staging, ai.ashler.crew.staging, version 1.0 build 7
+# Staging: Crew Staging, ai.ashler.crew.staging, version 1.0 build 8
 xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 ```
@@ -93,6 +93,24 @@ The fresh simulator build rendered the Crew login surface. Authenticated mobile
 verification awaits the system sign-in consent; two independent native Crew
 engines separately verified live Scaffold messaging and reconnect convergence.
 Typechecks were intentionally not run because global instructions prohibit them.
+
+### Crew 0.1.72 / production iOS 1.0 (5) preparation
+
+The release worktree ports the staging build 8 session-visibility and notification
+source onto the current production baseline. Production build **5** is tentative
+pending the release owner's App Store Connect check; staging remains **1.0 (8)**.
+This is source preparation only: it does not claim a production archive, upload,
+deployment, or physical-device notification delivery.
+
+Home includes detached and missing-space sessions and an **Archived sessions**
+section with explicit **Restore**. Imported chat IDs remain opaque, while
+`SessionEnvironment` projection/writes and verified deployment routing are retained.
+All four target configurations use `Comet/Comet.entitlements`, with
+`aps-environment = $(CREW_APS_ENVIRONMENT)`: Debug variants use `development`,
+Release variants use `production`. Production remains `ai.ashler.crew`, team
+`825LYXGJR6`, the production Crew/Scaffold endpoints, and `ashler-production`.
+Verify the final distribution-signed IPA's push entitlement and provisioning
+profile before uploading; source configuration alone is not delivery evidence.
 
 ### Connecting
 
@@ -162,9 +180,9 @@ Theme/                  theme.rs port: oklch→sRGB converter, exact palette,
 
 | Desktop | iOS |
 | --- | --- |
-| Sidebar: Spaces + recent Sessions | Home screen sections; unread, status, and recency remain independent |
+| Sidebar: Spaces + recency-sorted Sessions | Home includes every active workspace chat, including detached/missing-space rows, plus foreign memberships |
 | Horizontal session tabs per space | Space detail: recency-sorted session list |
-| Tab close = archive | Swipe-to-archive |
+| Tab close = archive | Swipe-to-archive; Archived sessions remain accessible, with explicit Restore |
 | Composer `white_alpha(0.03)` pill + hairline | Liquid Glass pill (`glassEffect`) + hairline |
 | Harness brand SVG marks (icons.rs) | Same path data via a native SVG path parser (`BrandMarks.swift`) |
 | Harness/model picker popover + curated catalogs | Brand-mark cards + catalog menu + reasoning-ladder chips (`HarnessCatalog.swift`, ported from crates/harness) |
@@ -181,7 +199,9 @@ the desktop sources cited in each file header.
 ### Writer discipline (what the phone writes)
 
 - Workspace doc: `archived`/`title`/`lastSeenAt` and related chat metadata,
-  plus principal-scoped session refs. The phone does not advertise an engine
+  plus principal-scoped session refs and their `SessionEnvironment` routing data.
+  Explicit restore clears that chat's pending worktree-deletion request; viewing
+  an archived session never restores it. The phone does not advertise an engine
   device row or presence heartbeat.
 - Chat creation awaits the owning host's authenticated `Mutate:createChat`
   before local echo or sending.
@@ -189,3 +209,72 @@ the desktop sources cited in each file header.
   Scaffold commands use the verified controller route. Client-minted message
   IDs connect optimistic sends to admission errors and committed transcript
   entries. The host writes transcript entries and command outcomes.
+
+## Session attention notifications
+
+Open the account menu → **Notifications** and enable **Session attention alerts**.
+iOS permission is opt-in. Fresh input requests, errors, and working→idle
+completions alert; initial per-session hydration, heartbeat, stale/reordered
+updates and archived sessions stay silent. Fresh transitions received after reconnect
+still alert. Viewing the affected session suppresses foreground banners. Tapping an alert opens its session only when
+its user and project match the current sign-in.
+
+Background delivery uses APNs, not a background WebSocket. The Xcode target
+has the Push Notifications capability and `Comet/Comet.entitlements`; a device
+build needs an Apple provisioning profile with that capability. APNs environment
+comes from the embedded profile (sandbox on Simulator; production for App Store
+distribution). Configure the deployed edge with:
+
+- `APNS_KEY_ID`: Apple APNs signing key ID.
+- `APNS_TEAM_ID`: Apple developer team ID.
+- `APNS_PRIVATE_KEY`: the complete Apple `.p8` PKCS#8 PEM, stored as a Worker secret.
+- `APNS_TOPIC`: exact signed app bundle identifier (`ai.ashler.crew.staging` for
+  Crew Staging; `ai.ashler.crew` for production).
+- `NOTIFICATION_CREDENTIAL_KEY`: a dedicated Worker secret containing canonical
+  base64 for exactly 32 cryptographically random bytes. Used for AES-256-GCM
+  encryption, not an APNs credential. Keep it stable across deployments;
+  rotation requires foreground registration renewal before old registrations can deliver.
+
+Without valid configuration, registration returns HTTP 503 and the settings
+screen reports that only running-app local alerts are available. It does not
+claim background delivery. Foreground activation retries registration and
+renews its 30-day lifetime. Sign-out immediately clears local state and unregisters
+from APNs; server DELETE is best-effort after an in-flight PUT. It never blocks
+offline logout. Explicitly disabling alerts requires successful server confirmation
+and reports network failures. Server registrations expire after 30 days or are
+removed when current human authorization is rejected or APNs invalidates the token.
+
+The edge stores push tokens privately and AES-256-GCM encrypted credentials in
+Durable Object SQL, never plaintext credentials in SQL, shared documents, or logs.
+The dedicated encryption key lives in Worker secrets; authenticated encryption
+binds each credential to installation, user, and project. Legacy plaintext
+registration tables are purged during migration; apps must renew registration.
+The credential is decrypted transiently to recheck human authorization before each
+delivery. Existing `AuthGrant` records cover sandbox device grants, not human
+Scaffold credentials, so they cannot replace these checks. Authority outages fail
+closed without deleting registrations; explicit authorization rejection and APNs
+invalid-token responses remove only the matching registration revision.
+
+Alerts contain generic Crew copy and routing IDs, not titles or transcripts.
+Registration is principal/project scoped; single-session device grants cannot register.
+
+Offline regression launch: `-visibility-e2e` runs session visibility and
+attention-transition scenarios and opens demo mode. Debug builds additionally
+exercise queued APNs token arrival, scoped routing, offline disable/logout and
+late-response isolation using an in-process HTTP responder. Results append to
+`Documents/e2e.log`; no sign-in or push permission is requested.
+
+With a Debug simulator build installed, run the existing offline hook:
+
+```sh
+xcrun simctl launch --terminate-running-process booted ai.ashler.crew -visibility-e2e
+xcrun simctl get_app_container booted ai.ashler.crew data
+```
+
+Read `Documents/e2e.log` below the returned data-container path. Expect the
+`OK Crew session visibility`, `OK Crew attention transitions`, and
+`OK Crew APNs lifecycle` markers and no `FAIL` entries from this launch. The
+visibility scenario also checks environment/deployment routing survives opaque-ID
+upsert and projection. Substitute `ai.ashler.crew.staging` for staging. These
+invocations are preparation instructions, not a claim that this production port
+has been built or exercised.
