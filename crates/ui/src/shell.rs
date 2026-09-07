@@ -3437,9 +3437,8 @@ impl Shell {
 
     fn delete_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.delete_confirm = None;
-        if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
-            self.state.update(cx, |s, cx| s.select_chat(None, cx));
-        }
+        self.state
+            .update(cx, |state, cx| state.cancel_pending_chat(&chat_id, cx));
         self.composer
             .update(cx, |composer, _| composer.purge_chat(&chat_id));
         self.mutate(
