@@ -149,6 +149,19 @@ but macOS displayed its Crew permission notice rather than an attention banner.
 Permission was not granted automatically; real banner delivery and click routing
 remain unverified until the user allows Crew notifications.
 
+The bounded Debug build was installed and exercised with `-visibility-e2e`:
+the lifecycle completed with `drained logout DELETE`. Both missing-DELETE and
+missing-token fault injections emitted the expected deadline `FAIL` after about
+five seconds, with no lifecycle success marker. The supervised processes stayed
+alive after those markers until intentional shutdown. DiagnosticReports still
+contained only the two pre-check Comet reports; no new Comet `.ips` appeared.
+
+Integration is tracked in [PR #16](https://github.com/Ashler-AI/comet/pull/16).
+The main checkout's notification work is committed separately on
+`work/crew-notifications-local-preservation`; unrelated doc/engine/harness and
+data-script changes remain untouched. Staging copies are committed on
+`release/crew-staging-notification-activation`, not left as dirty release edits.
+
 Home includes detached and missing-space sessions and an **Archived sessions**
 section with explicit **Restore**. Imported chat IDs remain opaque, while
 `SessionEnvironment` projection/writes and verified deployment routing are retained.
