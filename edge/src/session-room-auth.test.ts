@@ -215,7 +215,7 @@ const join = async (
   room: SessionRoom,
   userId: string,
   roomId: string,
-  version = new Uint8Array()
+  version: Uint8Array = new Uint8Array()
 ): Promise<CapturingSocket> => {
   const socket = new CapturingSocket();
   const state: JoinState = {
@@ -413,7 +413,6 @@ describe("SessionRoom chat authorization", () => {
     try {
       map.set("base", "preserved");
       source.commit();
-      const snapshot = source.export({ mode: "snapshot" });
       before = source.version();
       map.set("late", "retained");
       source.commit();
@@ -598,8 +597,8 @@ describe("SessionRoom chat authorization", () => {
         fragmentCount: 2,
         totalSizeBytes: update.length
       });
-      const second = {
-        type: MessageType.DocUpdateFragment as const,
+      const second: ProtocolMessage = {
+        type: MessageType.DocUpdateFragment,
         ...envelope,
         index: 1,
         fragment: update.subarray(middle)
@@ -869,7 +868,7 @@ describe("SessionRoom chat authorization", () => {
     const send = async (message: ProtocolMessage) => {
       await room.webSocketMessage(socket as unknown as WebSocket, Uint8Array.from(encode(message)).buffer);
     };
-    const header = { type: MessageType.DocUpdateFragmentHeader as const, ...envelope };
+    const header = { type: MessageType.DocUpdateFragmentHeader, ...envelope } as const;
     await send({
       ...header,
       batchId: "0x0000000000000001",

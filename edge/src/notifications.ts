@@ -208,7 +208,7 @@ export class WorkspaceNotifications {
     const decode = (value: string): Uint8Array => Uint8Array.from(atob(value.replace(/-/g, "+").replace(/_/g, "/")), (char) => char.charCodeAt(0));
     const additionalData = this.credentialContext(device.installationId, device.userId);
     const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv: decode(parts[1]), additionalData }, await this.encryptionKey(), decode(parts[2]));
-    return new TextDecoder("utf-8", { fatal: true }).decode(plaintext);
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(plaintext);
   }
 
   async register(request: Request, userId: string, bearer: string): Promise<Response> {
