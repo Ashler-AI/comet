@@ -182,6 +182,13 @@ contract cannot ship as a desktop-only release. An unacknowledged bump,
 including one introduced by a tag push, fails with the required deployment
 sequence.
 
+Crew preserves the accepted Scaffold sandbox and room while attachment is pending.
+An exact `503 sandbox_runtime_starting` response (including the provider's nested
+`body.error` envelope) keeps one native Attach operation waiting, bounded to two
+minutes and cancellable. Each wait rechecks the sandbox, owner, room, and lifecycle
+epoch; unrelated 404s and terminal states still fail. Manual retry uses the same
+accepted sandbox, while confirmed chat deletion discards the pending draft.
+
 ```bash
 version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
 
