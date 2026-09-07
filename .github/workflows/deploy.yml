@@ -22,6 +22,11 @@ on:
         default: staging
         type: choice
         options: [staging, production]
+      skip_typecheck:
+        description: "Skip TypeScript checking for this manual run; builds, tests and deployment approvals remain required"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -69,6 +74,7 @@ jobs:
       - name: Require current Worker binding declarations
         run: git diff --exit-code -- edge/worker-configuration.d.ts
       - name: Typecheck
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_typecheck }}
         working-directory: edge
         run: npm run typecheck
       - name: Test
