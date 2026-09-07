@@ -465,7 +465,7 @@ pub(crate) struct ScaffoldOmpHandoffDraft {
 
 /// A local Comet session selected for Scaffold. The sandbox does not exist
 /// until this session's first prompt is submitted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ScaffoldSessionDraft {
     pub project_id: String,
     pub deployment_id: String,
@@ -478,6 +478,8 @@ pub(crate) struct ScaffoldSessionDraft {
     /// Existing local OMP session to materialize in Scaffold. `None` creates a
     /// blank session.
     pub omp_handoff: Option<ScaffoldOmpHandoffDraft>,
+    /// Accepted remote identity survives attachment failure and manual retry.
+    pub target: Option<ScaffoldControlTarget>,
 }
 impl ScaffoldSessionDraft {
     pub fn collaboration_scope(&self) -> CollaborationScope {
@@ -951,7 +953,7 @@ where
 /// Create the sandbox and immediately dispatch its supervised Comet bootstrap.
 /// Runtime readiness depends on this attachment, so callers must not wait for
 /// `Ready` before attaching.
-pub(crate) async fn create_and_attach_scaffold_session<Wait, WaitFuture>(
+pub(crate) async fn create_and_attach_scaffold_session<Wait, WaitFuture, Created>(
     handle: &EngineHandle,
     scope: &CollaborationScope,
     name: Option<&str>,
@@ -959,22 +961,34 @@ pub(crate) async fn create_and_attach_scaffold_session<Wait, WaitFuture>(
     database_environment: ScaffoldDatabaseEnvironment,
     agent_route: &AgentRoute,
     wait: &Wait,
+    target: &mut Option<ScaffoldControlTarget>,
+    mut on_created: Created,
 ) -> Result<(String, ScaffoldSessionAttachment), RpcError>
 where
     Wait: Fn(std::time::Duration) -> WaitFuture,
     WaitFuture: Future<Output = ()>,
+    Created: FnMut(&ScaffoldControlTarget) -> Result<(), RpcError>,
 {
-    let (sandbox_id, authoritative_scope) = create_scaffold_session(
-        handle,
-        scope,
-        name,
-        source_ref,
-        database_environment,
-        agent_route,
-    )
-    .await?;
+    if target.is_none() {
+        let (sandbox_id, authoritative_scope) = create_scaffold_session(
+            handle,
+            scope,
+            name,
+            source_ref,
+            database_environment,
+            agent_route,
+        )
+        .await?;
+        *target = Some(ScaffoldControlTarget {
+            sandbox_id,
+            scope: authoritative_scope,
+        });
+        on_created(target.as_ref().expect("accepted remote target"))?;
+    }
+    let target = target.as_ref().expect("accepted remote target");
+    let sandbox_id = target.sandbox_id.clone();
     let attachment = retry_scaffold_control_operation(
-        || attach_scaffold_session(handle, &sandbox_id, authoritative_scope.clone()),
+        || attach_scaffold_session(handle, &sandbox_id, target.scope.clone()),
         wait,
     )
     .await?;
@@ -1898,12 +1912,31 @@ impl AppState {
     /// Release a failed first-send reservation after its durable chat and any
     /// managed checkout have been rolled back.
     pub fn cancel_pending_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        if self
+            .pending_scaffold_session
+            .as_ref()
+            .is_some_and(|draft| draft.chat_id == chat_id)
+        {
+            self.pending_scaffold_session = None;
+            self.scaffold_starting_chats.remove(chat_id);
+        }
         self.pending_local_chat_ids.remove(chat_id);
         self.chat_startup_phases.remove(chat_id);
         self.chats.retain(|chat| chat.id != chat_id);
         if self.selected_chat.as_deref() == Some(chat_id) {
             self.select_chat(None, cx);
         }
+    }
+
+    pub(crate) fn cancel_unaccepted_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        if self.scaffold_control_targets.contains_key(chat_id)
+            || self
+                .scaffold_session_draft_for_chat(chat_id)
+                .is_some_and(|draft| draft.target.is_some())
+        {
+            return;
+        }
+        self.cancel_pending_chat(chat_id, cx);
     }
 
     /// Drop an echo (send failed — the prompt returns to the draft).
@@ -2639,6 +2672,7 @@ impl AppState {
                 database_environment,
                 source_ref,
                 omp_handoff: handoff,
+                target: None,
             },
             cx,
         );
@@ -2669,7 +2703,32 @@ impl AppState {
     }
 
     pub(crate) fn scaffold_session_draft(&self) -> Option<&ScaffoldSessionDraft> {
-        self.pending_scaffold_session.as_ref()
+        self.selected_chat
+            .as_deref()
+            .and_then(|chat_id| self.scaffold_session_draft_for_chat(chat_id))
+    }
+
+    pub(crate) fn scaffold_session_draft_for_chat(
+        &self,
+        chat_id: &str,
+    ) -> Option<&ScaffoldSessionDraft> {
+        self.pending_scaffold_session
+            .as_ref()
+            .filter(|draft| draft.chat_id == chat_id)
+    }
+
+    pub(crate) fn retain_scaffold_target(
+        &mut self,
+        chat_id: &str,
+        target: &ScaffoldControlTarget,
+    ) -> Result<(), RpcError> {
+        let draft = self
+            .pending_scaffold_session
+            .as_mut()
+            .filter(|draft| draft.chat_id == chat_id)
+            .ok_or_else(|| RpcError::Failed("Crew session is no longer available".into()))?;
+        draft.target = Some(target.clone());
+        Ok(())
     }
 
     pub(crate) fn install_scaffold_session(
@@ -2725,6 +2784,10 @@ impl AppState {
             || self.selected_chat.as_deref() != Some(chat_id)
             || self.transcript_task.is_some()
             || self.collaboration_task.is_some()
+            || self
+                .pending_scaffold_session
+                .as_ref()
+                .is_some_and(|draft| draft.chat_id == chat_id)
         {
             return;
         }
@@ -2997,11 +3060,11 @@ impl AppState {
     /// watch server-side. Selecting a chat also lands in its space and marks it
     /// seen (a global-list click must switch the tab strip too).
     pub fn select_chat(&mut self, chat_id: Option<String>, cx: &mut Context<Self>) {
-        if self
-            .pending_scaffold_session
-            .as_ref()
-            .is_some_and(|draft| Some(draft.chat_id.as_str()) != chat_id.as_deref())
-        {
+        if self.pending_scaffold_session.as_ref().is_some_and(|draft| {
+            draft.target.is_none()
+                && !self.scaffold_starting_chats.contains(&draft.chat_id)
+                && Some(draft.chat_id.as_str()) != chat_id.as_deref()
+        }) {
             self.pending_scaffold_session = None;
         }
         if self.selected_chat == chat_id {
@@ -3078,7 +3141,11 @@ impl AppState {
                 }
                 self.selected_space = None;
                 self.selected_space_members.clear();
-                self.pending_scaffold_session = None;
+                if self.pending_scaffold_session.as_ref().is_some_and(|draft| {
+                    draft.target.is_none() && !self.scaffold_starting_chats.contains(&draft.chat_id)
+                }) {
+                    self.pending_scaffold_session = None;
+                }
                 cx.notify();
             }
         }
@@ -3102,7 +3169,11 @@ impl AppState {
         {
             return;
         }
-        self.pending_scaffold_session = None;
+        if self.pending_scaffold_session.as_ref().is_some_and(|draft| {
+            draft.target.is_none() && !self.scaffold_starting_chats.contains(&draft.chat_id)
+        }) {
+            self.pending_scaffold_session = None;
+        }
         self.selected_space = Some(space_id);
         self.selected_space_members = member_ids;
         cx.notify();
@@ -3778,6 +3849,8 @@ mod tests {
             ScaffoldDatabaseEnvironment::StagingSnapshot,
             &AgentRoute::automatic(comet_proto::AgentProvider::OpenAi, "gpt-5.6-sol"),
             &no_wait,
+            &mut None,
+            |_| Ok(()),
         )
         .await
         .unwrap();
@@ -3870,6 +3943,82 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn scaffold_retry_after_interrupted_attach_reuses_accepted_remote_target() {
+        let operations = Arc::new(StdMutex::new(Vec::new()));
+        let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
+            operations: operations.clone(),
+            attach_failures_remaining: AtomicU16::new(1),
+            inspect_lifecycle: "ready",
+            archive_fails: false,
+            update_route_failures_remaining: AtomicU16::new(0),
+        });
+        let handle = EngineHandle {
+            inner: Arc::new(RemoteEngine {
+                client: memory_client(service),
+                url: "memory://pending-scaffold".into(),
+            }),
+        };
+        let scope = CollaborationScope {
+            project_id: "ashler-staging".into(),
+            deployment_id: Some("ashler-staging".into()),
+            session_id: Some("session-pending".into()),
+            unknown: Default::default(),
+        };
+        let route = AgentRoute::automatic(comet_proto::AgentProvider::OpenAi, "gpt-5.6-sol");
+        let mut target = None;
+        let retained = std::cell::RefCell::new(None);
+        let (waiting_tx, waiting_rx) = futures::channel::oneshot::channel();
+        let waiting_tx = std::cell::RefCell::new(Some(waiting_tx));
+        let wait = |_| {
+            waiting_tx.borrow_mut().take().unwrap().send(()).unwrap();
+            futures::future::pending::<()>()
+        };
+        {
+            let launch = create_and_attach_scaffold_session(
+                &handle,
+                &scope,
+                Some("Investigate staging resume delivery"),
+                Some("feat/comet-identity-integration"),
+                ScaffoldDatabaseEnvironment::Local,
+                &route,
+                &wait,
+                &mut target,
+                |target| {
+                    *retained.borrow_mut() = Some(target.clone());
+                    Ok(())
+                },
+            );
+            futures::pin_mut!(launch);
+            match futures::future::select(launch, waiting_rx).await {
+                futures::future::Either::Right((Ok(()), _)) => {}
+                _ => panic!("attach must be waiting before cancellation"),
+            }
+        }
+        // The outer UI deadline dropped Attach, not the accepted remote route.
+        let mut retry_target = retained.into_inner();
+        assert_eq!(retry_target, target);
+        let (_, attached) = create_and_attach_scaffold_session(
+            &handle,
+            &scope,
+            None,
+            None,
+            ScaffoldDatabaseEnvironment::Local,
+            &route,
+            &|_| futures::future::ready(()),
+            &mut retry_target,
+            |_| panic!("retry must not create another sandbox"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(attached.control_target, target.unwrap());
+        assert_eq!(attached.projection.session_id, "session-pending");
+        assert_eq!(
+            operations.lock().unwrap().as_slice(),
+            ["create", "attach", "attach"]
+        );
+    }
+
     #[test]
     fn scaffold_control_retries_transient_provider_and_readiness_failures() {
         assert!(is_retryable_scaffold_control_error(&RpcError::Failed(
@@ -3934,6 +4083,8 @@ mod tests {
                 ScaffoldDatabaseEnvironment::ProductionSnapshot,
                 &AgentRoute::automatic(comet_proto::AgentProvider::OpenAi, "gpt-5.6-sol"),
                 &no_wait,
+                &mut None,
+                |_| Ok(()),
             )
             .await
             .unwrap();
@@ -4252,6 +4403,7 @@ mod tests {
             chat_id: "chat-a".into(),
             database_environment: ScaffoldDatabaseEnvironment::StagingSnapshot,
             source_ref: "master".into(),
+            target: None,
             omp_handoff: Some(ScaffoldOmpHandoffDraft {
                 native_session_id: "omp-native-a".into(),
                 cwd: "/repo".into(),
@@ -4434,6 +4586,7 @@ mod tests {
                 database_environment: ScaffoldDatabaseEnvironment::Local,
                 source_ref: "master".into(),
                 omp_handoff: None,
+                target: None,
             });
 
             state.select_chat(Some("chat-a".into()), cx);
@@ -4474,14 +4627,58 @@ mod tests {
                     database_environment: ScaffoldDatabaseEnvironment::ProductionSnapshot,
                     source_ref: "master".into(),
                     omp_handoff: None,
+                    target: None,
                 },
                 cx,
             );
+            let unaccepted = state.scaffold_session_draft().unwrap().clone();
+            state.cancel_unaccepted_chat("chat-a", cx);
+            assert!(state.pending_scaffold_session.is_none());
+            assert!(!state.pending_local_chat_ids.contains("chat-a"));
+            assert!(state.selected_chat.is_none());
+            state.select_pending_scaffold_chat(unaccepted, cx);
 
             assert_eq!(state.selected_chat.as_deref(), Some("chat-a"));
             assert!(!state.scaffold_chat_starting("chat-a"));
             assert!(state.transcript_task.is_none());
             assert!(state.collaboration_task.is_none());
+            let target = ScaffoldControlTarget {
+                sandbox_id: "sandbox-pending".into(),
+                scope: state
+                    .scaffold_session_draft()
+                    .unwrap()
+                    .collaboration_scope(),
+            };
+            state.mark_scaffold_chat_starting("chat-a");
+            state.retain_scaffold_target("chat-a", &target).unwrap();
+            state.clear_scaffold_chat_starting("chat-a", cx);
+            assert!(state.transcript_task.is_none());
+            assert!(state.collaboration_task.is_none());
+            state.select_chat(None, cx);
+            state.cancel_unaccepted_chat("chat-a", cx);
+            assert_eq!(
+                state
+                    .scaffold_session_draft_for_chat("chat-a")
+                    .unwrap()
+                    .target
+                    .as_ref(),
+                Some(&target)
+            );
+            state.select_space(None, cx);
+            state.select_chat(Some("chat-a".into()), cx);
+            assert_eq!(
+                state.scaffold_session_draft().unwrap().target.as_ref(),
+                Some(&target)
+            );
+            assert!(state.chat_is_scaffold("chat-a"));
+            assert!(state.transcript_task.is_none());
+            assert!(state.collaboration_task.is_none());
+            state.scaffold_scope = Some(("project-a".into(), "deployment-a".into()));
+            state.selected_space = Some("space-a".into());
+            assert!(!state.can_start_scaffold_session());
+            state.cancel_pending_chat("chat-a", cx);
+            assert!(state.can_start_scaffold_session());
+            assert!(!state.chat_is_scaffold("chat-a"));
         });
         assert!(
             operations
