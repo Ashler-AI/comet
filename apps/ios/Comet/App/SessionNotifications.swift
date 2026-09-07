@@ -54,6 +54,9 @@ final class SessionNotifications: NSObject, UNUserNotificationCenterDelegate {
     @ObservationIgnored private var operationId: UInt64 = 0
     private let center = UNUserNotificationCenter.current()
     @ObservationIgnored private var session = URLSession.shared
+    #if DEBUG
+    @ObservationIgnored private var regressionFinished = false
+    #endif
 
     private var installationId: String {
         if let id = UserDefaults.standard.string(forKey: "notificationInstallationId") { return id }
@@ -235,6 +238,11 @@ final class SessionNotifications: NSObject, UNUserNotificationCenterDelegate {
 
     private func request(_ config: AppConfig, method: String, values: [String: String]) async throws {
         guard let bearer = await config.currentToken() else { throw URLError(.userAuthenticationRequired) }
+        #if DEBUG
+        // A timed-out regression may still have a queued logout DELETE. Never
+        // let it create a URLSession task after the probe has been disposed.
+        guard !regressionFinished else { throw URLError(.cancelled) }
+        #endif
         var request = URLRequest(url: config.edgeURL.appending(path: "notifications/device"))
         request.httpMethod = method
         request.timeoutInterval = 20
@@ -330,7 +338,21 @@ final class SessionNotifications: NSObject, UNUserNotificationCenterDelegate {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [NotificationRegressionProtocol.self]
         probe.session = URLSession(configuration: configuration)
+        let queued = NotificationRegressionGate()
+        let put = NotificationRegressionGate()
+        let delete = NotificationRegressionGate()
+        var tasks: [Task<Void, Never>] = []
         defer {
+            // Close admission before cancelling requests: cancellation can wake
+            // the PUT queue and start its separate logout cleanup task.
+            probe.regressionFinished = true
+            probe.generation &+= 1
+            probe.config = nil
+            probe.operation?.cancel()
+            for task in tasks { task.cancel() }
+            queued.released = true
+            put.released = true
+            delete.released = true
             probe.session.invalidateAndCancel()
             NotificationRegressionProtocol.respond = nil
             UNUserNotificationCenter.current().delegate = oldDelegate
@@ -341,14 +363,13 @@ final class SessionNotifications: NSObject, UNUserNotificationCenterDelegate {
             userId: "notification-test", projectScope: "notification-test", deviceId: "phone",
             deviceName: "Crew regression", devBearer: "notification-test@notification-test")
         NotificationRegressionProtocol.respond = { _ in 200 }
-        var release: CheckedContinuation<Void, Never>?
-        probe.enqueue { _ in await withCheckedContinuation { release = $0 } }
-        while release == nil { await Task.yield() }
+        tasks.append(probe.enqueue { _ in _ = await queued.wait(stage: "queued token release") })
+        guard await notificationRegressionWait(stage: "queued token start", { queued.entered }) else { return }
         let first = Data(repeating: 1, count: 32)
         probe.didRegister(first)
-        release?.resume()
-        await probe.operation?.value
-        guard probe.registeredToken == String(repeating: "01", count: 32), !probe.busy else {
+        queued.released = true
+        guard await notificationRegressionWait(stage: "queued token completion", { !probe.busy }) else { return }
+        guard probe.registeredToken == String(repeating: "01", count: 32) else {
             E2ERunner.log("FAIL Crew APNs callback was lost while busy")
             return
         }
@@ -360,30 +381,47 @@ final class SessionNotifications: NSObject, UNUserNotificationCenterDelegate {
         guard opened == "legacy-SESSION" else { E2ERunner.log("FAIL Crew notification lost routing ID"); return }
 
         NotificationRegressionProtocol.respond = { _ in throw URLError(.notConnectedToInternet) }
-        await probe.setEnabled(false)
+        var disabled = false
+        tasks.append(Task { await probe.setEnabled(false); disabled = true })
+        guard await notificationRegressionWait(stage: "offline disable completion", { disabled }) else { return }
         guard probe.enabled, probe.error != nil else { E2ERunner.log("FAIL Crew offline disable pretended success"); return }
-        var releasePut: CheckedContinuation<Void, Never>?
-        var releaseDelete: CheckedContinuation<Void, Never>?
+        let args = ProcessInfo.processInfo.arguments
         NotificationRegressionProtocol.respond = { request in
             if request.httpMethod == "PUT" {
-                await withCheckedContinuation { releasePut = $0 }
+                guard await put.wait(stage: "delayed PUT release") else { throw URLError(.cancelled) }
                 return 200
             }
-            await withCheckedContinuation { releaseDelete = $0 }
+            // Debug-only fault injection: leave the URLSession request pending
+            // without invoking its client, so teardown must cancel it safely.
+            if args.contains("-notification-e2e-missing-delete") { return nil }
+            guard await delete.wait(stage: "delayed DELETE release") else { throw URLError(.cancelled) }
             throw URLError(.notConnectedToInternet)
         }
         probe.didRegister(Data(repeating: 2, count: 32))
-        while releasePut == nil { await Task.yield() }
+        guard await notificationRegressionWait(stage: "delayed PUT responder", { put.entered }) else { return }
+        if args.contains("-notification-e2e-missing-token") {
+            // The PUT already holds its credential. Logout gets none and never
+            // reaches the protocol responder; the arrival deadline must fail.
+            probe.config = AppConfig(edgeURL: URL(string: "http://localhost")!, mode: .dev,
+                userId: "notification-test", projectScope: "notification-test", deviceId: "phone",
+                deviceName: "Crew regression")
+        }
         let pending = probe.operation
         let cleanup = probe.signOut()
         let signedOutImmediately = probe.config == nil && !probe.busy && probe.registeredToken == nil
-        releasePut?.resume()
-        await pending?.value
-        while releaseDelete == nil { await Task.yield() }
-        releaseDelete?.resume()
-        // The DELETE is separate from the PUT queue. Drain both before the
-        // deferred URLSession invalidation, including on assertion failure.
-        await cleanup?.value
+        if let pending { tasks.append(pending) }
+        if let cleanup { tasks.append(cleanup) }
+        var drained = false
+        tasks.append(Task {
+            await pending?.value
+            await cleanup?.value
+            drained = true
+        })
+        put.released = true
+        guard await notificationRegressionWait(stage: "logout DELETE responder", { delete.entered }) else { return }
+        delete.released = true
+        guard await notificationRegressionWait(stage: "logout cleanup drain", { drained }) else { return }
+        guard !queued.failed, !put.failed, !delete.failed else { return }
         guard signedOutImmediately else {
             E2ERunner.log("FAIL Crew logout waited for push deletion")
             return
@@ -413,21 +451,78 @@ final class NotificationAppDelegate: NSObject, UIApplicationDelegate {
 }
 
 #if DEBUG
+@MainActor
+private func notificationRegressionWait(stage: String, _ ready: () -> Bool) async -> Bool {
+    let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+    while ContinuousClock.now < deadline {
+        if Task.isCancelled { return false }
+        if ready() { return true }
+        do { try await Task.sleep(nanoseconds: 10_000_000) }
+        catch { return false }
+    }
+    E2ERunner.log("FAIL Crew APNs lifecycle deadline: \(stage)")
+    return false
+}
+
+@MainActor
+private final class NotificationRegressionGate {
+    var entered = false
+    var released = false
+    var failed = false
+
+    func wait(stage: String) async -> Bool {
+        entered = true
+        let completed = await notificationRegressionWait(stage: stage, { released })
+        failed = !completed
+        return completed
+    }
+}
+
 private final class NotificationRegressionProtocol: URLProtocol {
-    @MainActor static var respond: ((URLRequest) async throws -> Int)?
+    @MainActor static var respond: ((URLRequest) async throws -> Int?)?
+    private let lock = NSRecursiveLock()
+    private var stopped = false
+    private var loading: Task<Void, Never>?
+
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
     override func startLoading() {
-        Task { @MainActor in
-            do {
-                guard let respond = Self.respond else { throw URLError(.cancelled) }
-                let status = try await respond(request)
-                let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!
-                client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-                client?.urlProtocolDidFinishLoading(self)
-            } catch { client?.urlProtocol(self, didFailWithError: error) }
+        lock.withLock {
+            guard !stopped else { return }
+            loading = Task { @MainActor in
+                do {
+                    try Task.checkCancellation()
+                    guard let respond = Self.respond else { throw URLError(.cancelled) }
+                    guard let status = try await respond(request) else { return }
+                    lock.withLock {
+                        guard !stopped, !Task.isCancelled else { return }
+                        let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!
+                        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+                        // A client may synchronously stop loading from didReceive.
+                        guard !stopped else { return }
+                        stopped = true
+                        client?.urlProtocolDidFinishLoading(self)
+                        loading = nil
+                    }
+                } catch {
+                    lock.withLock {
+                        guard !stopped, !Task.isCancelled else { return }
+                        stopped = true
+                        client?.urlProtocol(self, didFailWithError: error)
+                        loading = nil
+                    }
+                }
+            }
         }
     }
-    override func stopLoading() {}
+
+    override func stopLoading() {
+        lock.withLock {
+            stopped = true
+            loading?.cancel()
+            loading = nil
+        }
+    }
 }
 #endif

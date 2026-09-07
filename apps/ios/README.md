@@ -299,8 +299,11 @@ Registration is principal/project scoped; single-session device grants cannot re
 Offline regression launch: `-visibility-e2e` runs session visibility and
 attention-transition scenarios and opens demo mode. Debug builds additionally
 exercise queued APNs token arrival, scoped routing, offline disable/logout and
-late-response isolation using an in-process HTTP responder. The regression drains
-the logout DELETE before invalidating its URLSession, including on failure paths.
+late-response isolation using an in-process HTTP responder. Each stage has a
+five-second deadline; timeout logs `FAIL Crew APNs lifecycle deadline: <stage>`
+and cancels probe work before invalidating its URLSession. Add
+`-notification-e2e-missing-delete` or `-notification-e2e-missing-token` to exercise
+the bounded failure paths. These flags and the probe exist only in Debug.
 Results append to `Documents/e2e.log`; no sign-in or push permission is requested.
 Check process survival after the lifecycle marker as well as the log: a marker
 alone cannot catch a subsequent teardown crash.
