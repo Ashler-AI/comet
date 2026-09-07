@@ -17,12 +17,14 @@ struct HomeView: View {
     @Environment(AppModel.self) private var model
     @State private var path: [Route] = []
     @State private var showNewSpace = false
+    @State private var showNotifications = false
 
     var body: some View {
         NavigationStack(path: $path) {
             List {
                 spacesSection
                 sessionsSection
+                ArchivedSessionsSection(chats: model.settledChats, path: $path)
             }
             .listStyle(.plain)
             .environment(\.defaultMinListRowHeight, 10)
@@ -66,6 +68,7 @@ struct HomeView: View {
                         if model.demo != nil {
                             Text("Demo mode")
                         }
+                        Button("Notifications") { showNotifications = true }
                         Button("Sign out", role: .destructive) { model.signOut() }
                     } label: {
                         Image(systemName: "person.circle")
@@ -76,6 +79,9 @@ struct HomeView: View {
                 NewSpaceSheet { spaceId in
                     path.append(.space(spaceId))
                 }
+            }
+            .sheet(isPresented: $showNotifications) {
+                NotificationSettingsView()
             }
             .task(id: (model.overviewChats.map(\.id) + model.sharedSessionRefs.map(\.chatId)).joined()) {
                 model.preloadSessions()
@@ -143,7 +149,7 @@ struct HomeView: View {
             let chats = model.overviewChats
             let refs = model.sharedSessionRefs
             if chats.isEmpty && refs.isEmpty {
-                Text("No sessions yet")
+                Text(model.settledChats.isEmpty ? "No Crew sessions yet" : "No active Crew sessions")
                     .font(Theme.sans(12))
                     .foregroundStyle(Theme.textFaint)
                     .listRowBackground(Color.clear)

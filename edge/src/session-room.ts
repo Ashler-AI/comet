@@ -53,9 +53,11 @@ import {
   GRANT_EVENT_HEADER,
   ROOM_KIND_HEADER,
   SESSION_OWNER_AUTH_HEADER,
+  NOTIFICATION_BEARER_HEADER,
   type Env
 } from "./env";
 import { parseTrustedDeviceGrant } from "./device-room";
+import { WorkspaceNotifications } from "./notifications";
 
 const AUTH_PROJECT_HEADER = "x-comet-auth-project";
 const AUTH_CAPABILITIES_HEADER = "x-comet-auth-capabilities";
@@ -257,6 +259,7 @@ export class SessionRoom implements DurableObject {
   private readonly ctx: DurableObjectState;
   private readonly env: Env;
   private readonly blobs: BlobStore;
+  private notifications: WorkspaceNotifications | undefined;
   /** Lazily materialized doc — the log is authoritative; this is a cache. */
   private doc: LoroDoc | undefined;
   private eph: EphemeralStore | undefined;
@@ -369,6 +372,12 @@ export class SessionRoom implements DurableObject {
     // Workspace routing was scope-checked by the Worker; this DO independently
     // binds the same verified project scope above.
     const workspace = request.headers.get(ROOM_KIND_HEADER) === "workspace";
+    if (url.pathname === "/notifications/device") {
+      if (!workspace || request.headers.has(AUTH_GRANT_HEADER)) return json({ error: "forbidden" }, 403);
+      const bearer = request.headers.get(NOTIFICATION_BEARER_HEADER);
+      if (!bearer) return json({ error: "forbidden" }, 403);
+      return this.workspaceNotifications().register(request, userId, bearer);
+    }
 
     if (url.pathname === "/ws") {
       const chatId = url.searchParams.get("chatId") ?? "";
@@ -513,12 +522,14 @@ export class SessionRoom implements DurableObject {
       }
       const body = new Uint8Array(await request.arrayBuffer());
       const doc = await this.ensureDoc();
+      if (workspace) this.notifyWorkspace(doc, projectScope, true);
       try {
         if (body.length > 0) doc.import(body);
       } catch {
         return json({ error: "invalid_update" }, 400);
       }
       this.recordLoroUpdates([body]);
+      if (workspace) this.notifyWorkspace(doc, projectScope);
       // Converge live peers: relay the update to connected %LOR sockets.
       const roomId = this.getMeta("chatId") ?? "";
       for (const ws of this.ctx.getWebSockets()) {
@@ -882,6 +893,7 @@ export class SessionRoom implements DurableObject {
         this.ack(ws, { crdt, roomId }, UpdateStatusCode.InvalidUpdate, batchId);
         return;
       }
+      if (state.workspace) this.notifyWorkspace(doc, state.projectScope, true);
       try {
         for (const update of updates) if (update.length > 0) doc.import(update);
       } catch {
@@ -891,6 +903,7 @@ export class SessionRoom implements DurableObject {
         return;
       }
       this.recordLoroUpdates(updates);
+      if (state.workspace) this.notifyWorkspace(doc, state.projectScope);
       this.ack(ws, { crdt, roomId }, UpdateStatusCode.Ok, batchId);
       await this.relay(ws, crdt, roomId, updates);
       return;
@@ -917,6 +930,24 @@ export class SessionRoom implements DurableObject {
       return;
     }
     this.ack(ws, { crdt, roomId }, UpdateStatusCode.Unknown, batchId);
+  }
+
+  private workspaceNotifications(): WorkspaceNotifications {
+    return this.notifications ??= new WorkspaceNotifications(this.ctx.storage, this.env);
+  }
+
+  private notifyWorkspace(doc: LoroDoc, projectScope: string, baseline = false): void {
+    try {
+      const notifications = this.workspaceNotifications();
+      const events = notifications.observe(doc, baseline);
+      if (events.length) {
+        this.ctx.waitUntil(notifications.deliver(events, projectScope).catch(() => {
+          console.warn("Crew push delivery failed");
+        }));
+      }
+    } catch {
+      console.warn("Crew push observation failed");
+    }
   }
 
   /** Durability bookkeeping for accepted %LOR updates: buffer for the flush

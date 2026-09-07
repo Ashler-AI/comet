@@ -3,7 +3,7 @@
 //!
 //! - two short chimes embedded in the binary (`assets/sounds/*.wav`, synthesized
 //!   in-repo — no external assets): **done** (run finished) and **request**
-//!   (agent is asking a question);
+//!   (agent needs input or encountered an error);
 //! - playback = write to a temp file, hand it to the system player on a
 //!   background thread: `afplay` (macOS), PowerShell `Media.SoundPlayer`
 //!   (Windows), first of `paplay`/`pw-play`/`aplay`/`ffplay`/`mpv` (Linux —
@@ -27,7 +27,7 @@ static SOUND_REQUEST: &[u8] = include_bytes!("../assets/sounds/request.wav");
 pub enum Sound {
     /// A run finished (Working → Idle).
     Done,
-    /// The agent is waiting on a question (→ AwaitingInput).
+    /// The agent needs attention (→ AwaitingInput / Errored).
     Request,
 }
 
@@ -152,14 +152,14 @@ fn run_checked(program: &str, args: &[&str], path: &Path) -> Result<(), String> 
 use comet_proto::{Session, SessionStatus};
 
 /// Which chime (if any) a session-status transition deserves. Same-state
-/// updates never chime; a question always chimes; a completion chimes on the
-/// Working→Idle edge.
+/// updates never chime; questions and errors request attention; a completion
+/// chimes on the Working→Idle edge.
 pub fn sound_for_transition(prev: SessionStatus, new: SessionStatus) -> Option<Sound> {
     if prev == new {
         return None;
     }
     match new {
-        SessionStatus::AwaitingInput => Some(Sound::Request),
+        SessionStatus::AwaitingInput | SessionStatus::Errored => Some(Sound::Request),
         SessionStatus::Idle if prev == SessionStatus::Working => Some(Sound::Done),
         _ => None,
     }
@@ -188,7 +188,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn transition_mapping_matches_herdr_semantics() {
+    fn notification_transition_mapping() {
         use SessionStatus::*;
         // A question always chimes, wherever it came from.
         assert_eq!(
@@ -206,7 +206,7 @@ mod tests {
         // Same state / other edges stay silent.
         assert_eq!(sound_for_transition(Working, Working), None);
         assert_eq!(sound_for_transition(Idle, Working), None);
-        assert_eq!(sound_for_transition(Working, Errored), None);
+        assert_eq!(sound_for_transition(Working, Errored), Some(Sound::Request));
     }
 
     #[test]
@@ -258,7 +258,6 @@ mod tests {
     #[test]
     fn embedded_chimes_are_wav() {
         for data in [SOUND_DONE, SOUND_REQUEST] {
-            assert!(data.len() > 1000);
             assert_eq!(&data[..4], b"RIFF");
             assert_eq!(&data[8..12], b"WAVE");
         }

@@ -48,6 +48,26 @@ npm --prefix edge run smoke:collaboration
 
 It covers a scope-bound invite and join, two concurrent agent sessions, shared transcript provenance, owner-only teammate command execution and audit, reconnect replay, stable annotations, and attachment metadata without embedding blob bytes.
 
+## Session attention notifications
+
+Crew 0.1.72 adds opt-in native desktop alerts for fresh session input requests,
+errors, and working-to-idle completion. Enable them in **Settings → Notifications**;
+use **Send test notification** to check OS delivery. Existing chime preferences
+remain independent. Initial/reconnected snapshots, stale or reordered updates,
+archived sessions, and the actively viewed session do not produce banners.
+Notification actions open the corresponding session, including reopening a
+closed main window. On macOS, launch the installed Crew app bundle rather than
+the bare executable; OS permission and Focus settings still control delivery.
+
+Mobile attention alerts use the same factual transition policy. Production iOS
+1.0 (5) was uploaded with the missing-session visibility fixes and verified
+production APNs entitlement. Its preceding simulator crash was confined to the
+Debug regression harness, not Release. App Store Connect reports processing
+complete and assignment to Ashler Internal; the tester remains Invited. Background
+delivery remains blocked on production Worker credentials; see
+[iOS release evidence](apps/ios/README.md#crew-0172--production-ios-10-5) and
+[notification setup](apps/ios/README.md#session-attention-notifications).
+
 ## GitHub deployment setup
 
 The checked-in `edge/wrangler.jsonc` is the deployment contract. It defines isolated `staging` and `production` Worker, Durable Object, and R2 resources. It contains no Cloudflare account ID. Scaffold access uses verified Google Cloud IAP principals and environment-specific Scaffold project scope, independent of Ashler's customer-facing application stack.

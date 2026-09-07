@@ -1,4 +1,6 @@
-export type Env = Cloudflare.Env;
+import type { ApnsEnv, NotificationCredentialEnv } from "./notifications";
+
+export type Env = Cloudflare.Env & ApnsEnv & NotificationCredentialEnv;
 
 /** Trusted identity headers are replaced after authentication before DO forwarding. */
 export const AUTH_USER_HEADER = "x-comet-auth-user";
@@ -9,6 +11,7 @@ export const ROOM_KIND_HEADER = "x-comet-room-kind";
 export const GRANT_EVENT_HEADER = "x-comet-internal-grant-event";
 export const DEVICE_HOST_AUTH_HEADER = "x-comet-internal-device-host-auth";
 export const SESSION_OWNER_AUTH_HEADER = "x-comet-internal-session-owner-auth";
+export const NOTIFICATION_BEARER_HEADER = "x-comet-notification-bearer";
 
 export const stripTrustedAuthHeaders = (headers: Headers): void => {
   headers.delete(AUTH_USER_HEADER);
@@ -19,4 +22,5 @@ export const stripTrustedAuthHeaders = (headers: Headers): void => {
   headers.delete(SESSION_OWNER_AUTH_HEADER);
   headers.delete(GRANT_EVENT_HEADER);
   headers.delete(ROOM_KIND_HEADER);
+  headers.delete(NOTIFICATION_BEARER_HEADER);
 };

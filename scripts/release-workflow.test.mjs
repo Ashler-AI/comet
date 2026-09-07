@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -74,6 +78,224 @@ function jobBlock(workflow, name) {
   const next = workflow.slice(start + marker.length).search(/\n  [A-Za-z0-9_-]+:\n/);
   return workflow.slice(start, next === -1 ? undefined : start + marker.length + next);
 }
+
+function shellStep(workflow, job, id) {
+  const block = jobBlock(workflow.slice(workflow.indexOf("\njobs:\n")), job);
+  const start = block.indexOf(`      - id: ${id}\n`);
+  assert.notEqual(start, -1, `missing step ${job}.${id}`);
+  const rest = block.slice(start);
+  const next = rest.indexOf("\n      - ");
+  const step = next === -1 ? rest : rest.slice(0, next);
+  const script = step.match(/        run: \|\n([\s\S]*)$/)?.[1];
+  assert.ok(script, `missing shell in ${job}.${id}`);
+  return script.replace(/^          /gm, "");
+}
+
+const fixtureEnv = {
+  ...process.env,
+  ASHLER_INCREMENTAL_TSC_CHECKS: "false",
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_CONFIG_COUNT: "1",
+  GIT_CONFIG_KEY_0: "core.hooksPath",
+  GIT_CONFIG_VALUE_0: "/dev/null",
+  GIT_AUTHOR_NAME: "Crew release test",
+  GIT_AUTHOR_EMAIL: "release-test@example.invalid",
+  GIT_COMMITTER_NAME: "Crew release test",
+  GIT_COMMITTER_EMAIL: "release-test@example.invalid",
+};
+
+function command(cwd, executable, args, env = {}) {
+  const result = spawnSync(executable, args, {
+    cwd, env: { ...fixtureEnv, ...env }, encoding: "utf8", timeout: 30_000,
+  });
+  assert.ifError(result.error);
+  return result;
+}
+
+function fixtureCommand(cwd, executable, ...args) {
+  const result = command(cwd, executable, args);
+  assert.equal(result.status, 0, result.stderr);
+  return result.stdout.trim();
+}
+
+function scratch(t) {
+  const dir = mkdtempSync(path.join(tmpdir(), "crew-release-gate-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
+
+function releaseCheckout(t, merged) {
+  const dir = scratch(t);
+  const upstream = path.join(dir, "upstream");
+  const checkout = path.join(dir, "checkout");
+  fixtureCommand(dir, "git", "init", "-b", "main", upstream);
+  writeFileSync(path.join(upstream, "Cargo.toml"), `[workspace]\nmembers = ["."]\n[workspace.package]\nversion = "${VERSION}"\n[package]\nname = "comet"\nversion.workspace = true\nedition = "2024"\n[lib]\npath = "lib.rs"\n`);
+  writeFileSync(path.join(upstream, "lib.rs"), "");
+  fixtureCommand(upstream, "git", "add", ".");
+  fixtureCommand(upstream, "git", "commit", "-m", "main baseline");
+  fixtureCommand(upstream, "git", "checkout", "-b", "release-fixture");
+  writeFileSync(path.join(upstream, "release-input"), "candidate\n");
+  fixtureCommand(upstream, "git", "add", ".");
+  fixtureCommand(upstream, "git", "commit", "-m", "candidate");
+  const sha = fixtureCommand(upstream, "git", "rev-parse", "HEAD");
+  fixtureCommand(upstream, "git", "checkout", "main");
+  if (merged) fixtureCommand(upstream, "git", "merge", "--ff-only", "release-fixture");
+  fixtureCommand(dir, "git", "clone", "--single-branch", "--branch", "release-fixture", "--no-local", upstream, checkout);
+  assert.notEqual(command(checkout, "git", ["rev-parse", "--verify", "refs/remotes/origin/main"]).status, 0);
+  return { checkout, sha };
+}
+
+function runVersion(script, { checkout, sha }, overrides = {}) {
+  const output = path.join(checkout, "version-output");
+  writeFileSync(output, "");
+  const result = command(checkout, "bash", ["-c", script], {
+    GITHUB_REF: "refs/heads/release-fixture", GITHUB_SHA: sha, GITHUB_OUTPUT: output,
+    REQUESTED_VERSION: VERSION, REQUESTED_RELEASE_SURFACE: "desktop",
+    REQUESTED_PROMOTION_TARGET: "production", REQUESTED_CANDIDATE_RUN_ID: RUN_ID,
+    ...overrides,
+  });
+  return { ...result, output: readFileSync(output, "utf8") };
+}
+
+const digest = (data) => createHash("sha256").update(data).digest("hex");
+
+function candidateArchive(t, { corrupt, archiveCorrupt = false, branch = "release-fixture" } = {}) {
+  const dir = scratch(t);
+  const payload = path.join(dir, "payload");
+  for (const name of ["payload", "reused", "scripts", "bin"]) mkdirSync(path.join(dir, name));
+  copyFileSync(path.join(root, "scripts/validate-release-candidate-reuse.mjs"), path.join(dir, "scripts/validate-release-candidate-reuse.mjs"));
+  const candidate = reusableCandidate();
+  candidate.run.head_branch = branch;
+  writeFileSync(path.join(dir, "candidate-source-run.json"), JSON.stringify(candidate.run));
+  for (const name of Object.keys(candidate.unifiedManifest.files)) {
+    writeFileSync(path.join(payload, name), `release artifact ${name}\n`);
+  }
+  for (const [manifestName, sumsName, manifest] of [
+    ["desktop-manifest.json", "desktop-SHA256SUMS", candidate.desktopManifest],
+    ["scaffold-manifest.json", "scaffold-SHA256SUMS", candidate.scaffoldManifest],
+    ["manifest.json", "SHA256SUMS", candidate.unifiedManifest],
+  ]) {
+    const sums = Object.keys(manifest.files).map((name) => {
+      const sha = digest(readFileSync(path.join(payload, name)));
+      manifest.files[name].sha256 = sha;
+      return `${corrupt === sumsName ? "0".repeat(64) : sha}  ${name}\n`;
+    }).join("");
+    writeFileSync(path.join(payload, manifestName), JSON.stringify(manifest));
+    writeFileSync(path.join(payload, sumsName), sums);
+  }
+  const archive = path.join(dir, "reused/release-candidate.tar.gz");
+  fixtureCommand(dir, "tar", "-czf", archive, "-C", payload, ".");
+  const sha = digest(readFileSync(archive));
+  writeFileSync(`${archive}.sha256`, `${archiveCorrupt ? "0".repeat(64) : sha}  release-candidate.tar.gz\n`);
+  // The GitHub compare endpoint is the external boundary; all local checksum,
+  // manifest validation and publication-output logic below is the real step.
+  writeFileSync(path.join(dir, "bin/gh"), '#!/bin/sh\n[ "$1" = api ] && [ "$2" = "repos/$GITHUB_REPOSITORY/compare/' + RUN_SHA + '...$GITHUB_SHA" ] || exit 2\nprintf "%s\\n" "$COMPARE_STATUS"\n', { mode: 0o755 });
+  return { dir, sha };
+}
+
+function runReuse(script, { dir }, overrides = {}) {
+  const output = path.join(dir, "reuse-output");
+  writeFileSync(output, "");
+  const result = command(dir, "bash", ["-c", script], {
+    PATH: `${path.join(dir, "bin")}${path.delimiter}${process.env.PATH}`,
+    GITHUB_REPOSITORY: REPOSITORY, GITHUB_SHA: "c".repeat(40), GITHUB_OUTPUT: output,
+    VERSION, RELEASE_SURFACE: "desktop-and-scaffold", CANDIDATE_RUN_ID: RUN_ID,
+    COMPARE_STATUS: "ahead", ...overrides,
+  });
+  return { ...result, output: readFileSync(output, "utf8") };
+}
+
+describe("executable production release gates", () => {
+  it("accepts a merged release checkout without an origin/main tracking ref", async (t) => {
+    const checkout = releaseCheckout(t, true);
+    const script = shellStep(await read(".github/workflows/release.yml"), "version", "version");
+    const result = runVersion(script, checkout);
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(result.output.includes(`candidate_run_id=${RUN_ID}\n`));
+    assert.notEqual(command(checkout.checkout, "git", ["rev-parse", "--verify", "refs/remotes/origin/main"]).status, 0);
+  });
+
+  it("rejects unmerged production source but still permits private candidates", async (t) => {
+    const checkout = releaseCheckout(t, false);
+    const script = shellStep(await read(".github/workflows/release.yml"), "version", "version");
+    const production = runVersion(script, checkout);
+    assert.notEqual(production.status, 0);
+    assert.equal(production.output, "");
+    const privateCandidate = runVersion(script, checkout, {
+      REQUESTED_PROMOTION_TARGET: "none", REQUESTED_CANDIDATE_RUN_ID: "",
+    });
+    assert.equal(privateCandidate.status, 0, privateCandidate.stderr);
+    assert.ok(privateCandidate.output.includes("promotion_target=none\n"));
+  });
+
+  it("rejects invalid reuse identifiers and nonproduction reuse dispatches", async (t) => {
+    const checkout = releaseCheckout(t, true);
+    const script = shellStep(await read(".github/workflows/release.yml"), "version", "version");
+    for (const overrides of [
+      { REQUESTED_CANDIDATE_RUN_ID: "not-a-run-id" },
+      { REQUESTED_PROMOTION_TARGET: "staging" },
+    ]) {
+      const result = runVersion(script, checkout, overrides);
+      assert.notEqual(result.status, 0);
+      assert.equal(result.output, "");
+    }
+  });
+
+  it("reuses verified bytes only when GitHub reports ancestor or identical source", async (t) => {
+    const script = shellStep(await read(".github/workflows/release.yml"), "candidate", "reuse");
+    for (const status of ["ahead", "identical", "behind", "diverged", "unknown"]) {
+      const fixture = candidateArchive(t);
+      const result = runReuse(script, fixture, { COMPARE_STATUS: status });
+      if (status === "ahead" || status === "identical") {
+        assert.equal(result.status, 0, result.stderr);
+        assert.equal(result.output, `digest=${fixture.sha}\n`);
+      } else {
+        assert.notEqual(result.status, 0, status);
+        assert.equal(result.output, "");
+      }
+    }
+  });
+
+  it("rejects a valid candidate supplied under another run identifier", async (t) => {
+    const script = shellStep(await read(".github/workflows/release.yml"), "candidate", "reuse");
+    const result = runReuse(script, candidateArchive(t), { CANDIDATE_RUN_ID: "123" });
+    assert.notEqual(result.status, 0);
+    assert.equal(result.output, "");
+  });
+
+  it("rejects unsuccessful runs and foreign workflows despite valid artifact bytes", async (t) => {
+    const script = shellStep(await read(".github/workflows/release.yml"), "candidate", "reuse");
+    for (const changes of [
+      { status: "in_progress" },
+      { conclusion: "failure" },
+      { path: ".github/workflows/untrusted.yml" },
+    ]) {
+      const fixture = candidateArchive(t);
+      const runFile = path.join(fixture.dir, "candidate-source-run.json");
+      writeFileSync(runFile, JSON.stringify({ ...JSON.parse(readFileSync(runFile, "utf8")), ...changes }));
+      const result = runReuse(script, fixture);
+      assert.notEqual(result.status, 0);
+      assert.equal(result.output, "");
+    }
+  });
+
+  it("rejects an altered archive before publishing its digest", async (t) => {
+    const script = shellStep(await read(".github/workflows/release.yml"), "candidate", "reuse");
+    const result = runReuse(script, candidateArchive(t, { archiveCorrupt: true }));
+    assert.notEqual(result.status, 0);
+    assert.equal(result.output, "");
+  });
+
+  for (const sums of ["desktop-SHA256SUMS", "scaffold-SHA256SUMS", "SHA256SUMS"]) {
+    it(`rejects bad ${sums} even with a valid archive digest`, async (t) => {
+      const script = shellStep(await read(".github/workflows/release.yml"), "candidate", "reuse");
+      const result = runReuse(script, candidateArchive(t, { corrupt: sums }));
+      assert.notEqual(result.status, 0);
+      assert.equal(result.output, "");
+    });
+  }
+});
 
 describe("Crew edge deployment", () => {
   const complete = {
@@ -194,23 +416,6 @@ describe("Comet release surfaces", () => {
     assert.ok(candidateStop < guard && guard < channels);
   });
 
-  it("reuses only a successful main or merged release candidate for production promotion", async () => {
-    const workflow = await read(".github/workflows/release.yml");
-    const candidate = jobBlock(workflow, "candidate");
-
-    assert.match(workflow, /candidate_run_id:[\s\S]*required: false[\s\S]*default: ""/);
-    assert.match(workflow, /permissions:[\s\S]*actions: read/);
-    assert.match(workflow, /candidate_run_id is only supported for production promotion/);
-    assert.match(candidate, /gh api "repos\/\$GITHUB_REPOSITORY\/actions\/runs\/\$CANDIDATE_RUN_ID"/);
-    assert.match(candidate, /actions\/download-artifact@v4[\s\S]*run-id: \$\{\{ inputs\.candidate_run_id \}\}/);
-    assert.match(candidate, /gh api "repos\/\$GITHUB_REPOSITORY\/compare\/\$source_sha\.\.\.\$GITHUB_SHA"/);
-    assert.match(candidate, /source_sha" =~ \^\[0-9a-f\]\{40\}\$/);
-    assert.match(candidate, /compare_status.*ahead.*identical/s);
-    assert.match(candidate, /node scripts\/validate-release-candidate-reuse\.mjs/);
-    assert.match(candidate, /sha256sum --check desktop-SHA256SUMS/);
-    assert.match(candidate, /sha256sum --check scaffold-SHA256SUMS/);
-    assert.match(candidate, /sha256sum --check SHA256SUMS/);
-  });
 
   it("advances desktop and Scaffold moving channels independently", async () => {
     const [workflow, runtimeVersion, engine, edge] = await Promise.all([
