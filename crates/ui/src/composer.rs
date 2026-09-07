@@ -5013,6 +5013,9 @@ impl Composer {
         let scaffold_omp_handoff = scaffold_draft
             .as_ref()
             .and_then(|draft| draft.omp_handoff.clone());
+        let scaffold_target = scaffold_draft
+            .as_ref()
+            .and_then(|draft| draft.target.clone());
         start_agent_mode |= scaffold_demo;
         let local_device_id = self.state.read(cx).local_device_id.clone();
         let device_id = if is_new {
@@ -5240,12 +5243,15 @@ impl Composer {
                 }
                 if let Some(scope) = scaffold_scope {
                     let wait_started = Instant::now();
-                    let mut sandbox_id = None;
+                    let mut target = scaffold_target;
+                    let mut sandbox_id = target.as_ref().map(|target| target.sandbox_id.clone());
                     let mut pending_attachment = None;
                     let mut last_error = None;
                     let scaffold_retry_executor = cx.background_executor().clone();
                     let scaffold_retry_delay =
                         move |delay| scaffold_retry_executor.timer(delay);
+                    {
+                    let deadline = cx.background_executor().timer(SCAFFOLD_DEMO_WAIT);
                     let launch = crate::state::create_and_attach_scaffold_session(
                         &engine,
                         &scope,
@@ -5257,8 +5263,17 @@ impl Composer {
                             .expect("Scaffold route is resolved before launch")
                             .route,
                         &scaffold_retry_delay,
+                        &mut target,
+                        |target| {
+                            this.update(cx, |composer, cx| {
+                                composer.state.update(cx, |state, cx| {
+                                    let result = state.retain_scaffold_target(&chat_id, target);
+                                    cx.notify();
+                                    result
+                                })
+                            }).map_err(|error| comet_rpc::RpcError::Failed(error.to_string()))?
+                        },
                     );
-                    let deadline = cx.background_executor().timer(SCAFFOLD_DEMO_WAIT);
                     futures::pin_mut!(launch);
                     match futures::future::select(launch, deadline).await {
                         futures::future::Either::Left((
@@ -5279,6 +5294,10 @@ impl Composer {
                             last_error =
                                 Some("Scaffold sandbox creation exceeded the deadline".into());
                         }
+                    }
+                    }
+                    if sandbox_id.is_none() {
+                        sandbox_id = target.as_ref().map(|target| target.sandbox_id.clone());
                     }
 
                     if let (Some(created_id), Some(attachment)) =
@@ -5311,6 +5330,10 @@ impl Composer {
                                         ) {
                                             true
                                         } else {
+                                            if matches!(lifecycle, ScaffoldLifecycle::Stopped | ScaffoldLifecycle::Failed | ScaffoldLifecycle::Paused) {
+                                                last_error = Some(format!("Crew sandbox is {lifecycle:?}"));
+                                                break;
+                                            }
                                             last_error = Some(format!(
                                                 "sandbox lifecycle remained {lifecycle:?}"
                                             ));
@@ -5319,7 +5342,7 @@ impl Composer {
                                     }
                                     futures::future::Either::Left((Err(error), _)) => {
                                         last_error = Some(error.to_string());
-                                        false
+                                        break;
                                     }
                                     futures::future::Either::Right(_) => {
                                         last_error = Some(
@@ -5404,7 +5427,7 @@ impl Composer {
                             error = %reason,
                             "Scaffold readiness deadline reached"
                         );
-                        return Err("Could not start Scaffold session".into());
+                        return Err("Could not attach Crew session. Retry to reconnect to the same sandbox.".into());
                     }
                     this.update(cx, |composer, cx| {
                         composer.state.update(cx, |state, cx| {
@@ -5863,7 +5886,7 @@ impl Composer {
                     composer.state.update(cx, |s, cx| {
                         s.remove_echo(&err_chat_id, &err_message_id);
                         s.clear_scaffold_chat_starting(&err_chat_id, cx);
-                        if is_new && !(scaffold_demo && scaffold_attached) {
+                        if is_new && !scaffold_demo {
                             s.cancel_pending_chat(&err_chat_id, cx);
                         }
                         cx.notify();
