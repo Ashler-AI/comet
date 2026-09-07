@@ -30,7 +30,7 @@ bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
 xcodebuild -project Comet.xcodeproj -scheme Comet \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 
-# Staging: Crew Staging, ai.ashler.crew.staging, version 1.0 build 8
+# Staging: Crew Staging, ai.ashler.crew.staging, version 1.0 build 11
 xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 ```
@@ -122,11 +122,29 @@ These are isolated scenario measurements, not a bound for arbitrary payloads or
 multiple co-resident rooms. Old clients' full-history update uploads remain a
 separate activation concern.
 
-The complete edge Vitest suite passed: 136 tests across 16 files. Local typechecks
-were intentionally not run under workstation policy; remote type validation is
-still outstanding. No live recovery or iPhone delivery is claimed. Client
-encoding changes still require new builds and safe activation; active engines
-were not restarted during this repair.
+The complete edge Vitest suite passed: 136 tests across 16 files. The later
+[staging deployment](https://github.com/Ashler-AI/comet/actions/runs/34165594033)
+passed remote typechecking, tests, and the real Edge/Rust collaboration smoke;
+it deployed `b683ff3e-8af0-4d1d-a80d-7a840df95ef1`. Local typechecks remain
+intentionally disabled under workstation policy.
+
+Desktop **0.1.75** was published to staging and installed. Its separate viewport
+was restarted; the embedded engine was not, because its supervisors terminate
+active agent runs on engine exit. Live recovery and physical iPhone delivery
+remain unverified until the new engine is activated.
+
+Staging iOS **1.0 (11)** was uploaded on 2026-09-07 with the snapshot catch-up
+changes. Its archive and cloud-signed inspection IPA both contain
+`aps-environment = production`; the IPA passed strict signature verification
+before upload. Build **10** must not be used for push testing: its unsigned
+archive lost the push entitlement during cloud signing.
+
+When archiving with `CODE_SIGNING_ALLOWED=NO` for cloud-managed distribution,
+first ad-hoc sign the archived app with the expanded Release entitlement
+(`aps-environment = production`), as builds 9 and 11 did. Export for inspection
+before upload, inspect the signed IPA with `codesign -d --entitlements :-`, and
+verify the signature with `codesign --verify --deep --strict`. A push-enabled
+provisioning profile alone does not add the entitlement to an unsigned archive.
 
 ### Staging 1.0 (6): mobile status feedback
 
