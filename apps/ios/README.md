@@ -128,16 +128,26 @@ passed remote typechecking, tests, and the real Edge/Rust collaboration smoke;
 it deployed `b683ff3e-8af0-4d1d-a80d-7a840df95ef1`. Local typechecks remain
 intentionally disabled under workstation policy.
 
-Desktop **0.1.75** was published to staging and installed. Its separate viewport
-was restarted; the embedded engine was not, because its supervisors terminate
-active agent runs on engine exit. Live recovery and physical iPhone delivery
-remain unverified until the new engine is activated.
+Desktop **0.1.75** was published to staging and installed. After explicit user
+approval to interrupt active runs, the old **0.1.70** engine exited on
+2026-09-07 at 22:39:51 UTC. The new engine reported **0.1.75**, restored the
+same device identity, and resumed the existing native OMP conversation.
+At 22:41:46 UTC, workspace sync was connected with a fresh acknowledgement and
+zero rejoins, full resyncs, or disconnects since startup. This verifies workspace
+recovery, not every chat room: one open chat reported three rejoins.
+
+Staging then recorded six APNs HTTP **200** responses around 22:40 UTC, including
+receipt `85E8F1FA-4390-4168-5184-745C1FCA5265` for event timestamp
+`1788820786445`. These were recovery-time session transitions, not an additional
+manual test notification. Physical iPhone display and tap routing remain
+unverified; provider acceptance is not a delivery receipt from the device.
 
 Staging iOS **1.0 (11)** was uploaded on 2026-09-07 with the snapshot catch-up
 changes. Its archive and cloud-signed inspection IPA both contain
 `aps-environment = production`; the IPA passed strict signature verification
-before upload. Build **10** must not be used for push testing: its unsigned
-archive lost the push entitlement during cloud signing.
+before upload. Build **11** finished processing and was assigned to Ashler
+Internal. Build **10** lost its push entitlement during unsigned-archive cloud
+signing; it was expired in App Store Connect with user approval.
 
 When archiving with `CODE_SIGNING_ALLOWED=NO` for cloud-managed distribution,
 first ad-hoc sign the archived app with the expanded Release entitlement
