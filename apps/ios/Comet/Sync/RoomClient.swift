@@ -471,9 +471,17 @@ actor RoomClient {
 
     private func resubmitMissingUpdates() async {
         guard joinedLor, invalidRejoins < RoomClient.maxInvalidRejoins,
-              let serverVersion, !serverVersion.includesVv(other: doc.oplogVv()),
-              let missing = try? doc.export(mode: .updates(from: serverVersion)),
-              !missing.isEmpty else { return }
+              let serverVersion, !serverVersion.includesVv(other: doc.oplogVv())
+        else { return }
+        // Bootstrap an empty peer with state; replaying all operations can
+        // exhaust the edge's bounded WASM heap before the first snapshot fold.
+        let mode: ExportMode = serverVersion.isEmpty() ? .snapshot
+            : .updates(from: serverVersion)
+        guard var missing = try? doc.export(mode: mode), !missing.isEmpty else { return }
+        if !serverVersion.isEmpty(), missing.count > RoomClient.fragmentBytes,
+           let snapshot = try? doc.export(mode: .snapshot), snapshot.count < missing.count {
+            missing = snapshot
+        }
         await sendLoroUpdates([[UInt8](missing)])
     }
 
