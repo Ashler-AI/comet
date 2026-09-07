@@ -146,6 +146,13 @@ before upload, inspect the signed IPA with `codesign -d --entitlements :-`, and
 verify the signature with `codesign --verify --deep --strict`. A push-enabled
 provisioning profile alone does not add the entitlement to an unsigned archive.
 
+For physical-device verification, correlate staging `apns_finished` with the
+attention event's `updatedAt`. The trace includes the provider HTTP `status`,
+the response `apns-id` as `apnsId` when present, and `removeRegistration`.
+`apns_response` records the same status and receipt before parsing a rejection
+body. A 200 establishes APNs acceptance, not display or tap delivery on the
+iPhone. Transport failures remain `delivery_exception`, not an acceptance.
+
 ### Staging 1.0 (6): mobile status feedback
 
 - Session rows show unread, live status, and last-updated time independently.
