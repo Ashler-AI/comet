@@ -315,12 +315,13 @@ describe("APNs provider", () => {
     const { env, keys } = await signingEnv();
     let payload: Record<string, unknown> | undefined;
     let headers: Headers | undefined;
-    const provider = new ApnsProvider(env, (async function (this: unknown, _url, init) {
+    vi.stubGlobal("fetch", async function (this: unknown, _url: RequestInfo | URL, init?: RequestInit) {
       if (this !== undefined && this !== globalThis) throw new TypeError("Illegal invocation");
       payload = JSON.parse(init!.body as string);
       headers = new Headers(init!.headers);
       return new Response(null, { status: 200 });
-    }) as typeof fetch);
+    });
+    const provider = new ApnsProvider(env);
     await provider.send(device, installationId, "project", "alice", "input");
     expect(payload).toEqual({ aps: { alert: { title: "Crew", body: "A Crew session needs your input." }, sound: "default" }, chatId: installationId, projectScope: "project", userId: "alice" });
     expect(headers!.get("apns-collapse-id")).toBe(installationId);
