@@ -31,6 +31,15 @@ enum DocDisk {
             && !doc.isDetached() && doc.stateVv() == doc.oplogVv()
     }
 
+    /// Load into an isolated replica so cancellation or a failed import cannot
+    /// mutate a store that has stopped, restarted, or switched deployments.
+    static func loadReplica(id: String) -> LoroDoc? {
+        guard !Task.isCancelled else { return nil }
+        let replica = LoroDoc()
+        guard load(into: replica, id: id), !Task.isCancelled else { return nil }
+        return replica
+    }
+
     /// Only a checksum-checked snapshot that materializes completely in an
     /// empty replica is eligible to replace a warm cache. An update envelope
     /// (even an independently importable one) is never a replacement snapshot.

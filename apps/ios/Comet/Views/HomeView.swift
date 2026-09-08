@@ -83,10 +83,6 @@ struct HomeView: View {
             .sheet(isPresented: $showNotifications) {
                 NotificationSettingsView()
             }
-            .task(id: (model.overviewChats.map(\.id) + model.settledChats.map(\.id)
-                       + model.sharedSessionRefs.map(\.chatId)).joined(separator: "/")) {
-                model.preloadSessionMetadata()
-            }
             .onChange(of: model.launchRoute) { _, route in
                 // Live one-click invite while Home is already up (cold-start
                 // routes land via onAppear below).
@@ -117,8 +113,7 @@ struct HomeView: View {
     // MARK: Spaces
 
     private var spacesSection: some View {
-        let occupiedSpaceIds = Set(model.overviewChats.compactMap(\.spaceId))
-        let spaces = model.spaces.filter { occupiedSpaceIds.contains($0.id) }
+        let spaces = model.occupiedSpaces
         return Section {
             if spaces.isEmpty {
                 Text("Spaces with sessions will appear here — tap + to choose a folder")
@@ -332,6 +327,8 @@ struct ChatRow: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
         .contentShape(RoundedRectangle(cornerRadius: 8))
+        .onAppear { model.retainListMetadata(chatId: chat.id) }
+        .onDisappear { model.releaseListMetadata(chatId: chat.id) }
     }
 
 
@@ -381,6 +378,8 @@ struct SharedSessionRow: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 7)
         .contentShape(RoundedRectangle(cornerRadius: 8))
+        .onAppear { model.retainListMetadata(chatId: sessionRef.chatId) }
+        .onDisappear { model.releaseListMetadata(chatId: sessionRef.chatId) }
     }
 }
 

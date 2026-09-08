@@ -9,10 +9,11 @@ import Observation
 @MainActor
 @Observable
 final class DemoDataset {
-    var devices: [DeviceRow]
-    var spaces: [Space]
-    var chats: [Chat]
+    var devices: [DeviceRow] { didSet { rebuildLists() } }
+    var spaces: [Space] { didSet { rebuildLists() } }
+    var chats: [Chat] { didSet { rebuildLists() } }
     var sessions: [String: SessionRow]
+    private(set) var lists = WorkspaceLists()
     private var stores: [String: SessionStore] = [:]
     private var streamTask: Task<Void, Never>?
 
@@ -25,10 +26,16 @@ final class DemoDataset {
         self.spaces = spaces
         self.chats = chats
         self.sessions = sessions
+        rebuildLists()
     }
 
-    var overviewChats: [Chat] { sessionListChats(chats, archived: false) }
-    var settledChats: [Chat] { sessionListChats(chats, archived: true) }
+    private func rebuildLists() {
+        let next = WorkspaceLists(devices: devices, spaces: spaces, chats: chats)
+        if lists != next { lists = next }
+    }
+
+    var overviewChats: [Chat] { lists.overviewChats }
+    var settledChats: [Chat] { lists.settledChats }
 
     static func standard() -> DemoDataset {
         let now = nowMs()

@@ -10,13 +10,13 @@ struct SpaceView: View {
     @Binding var path: [Route]
 
     private var space: Space? {
-        model.spaces.first { $0.id == spaceId }
+        model.space(id: spaceId)
     }
 
     var body: some View {
         List {
             let chats = model.chats(in: spaceId)
-            let archived = model.settledChats.filter { $0.spaceId == spaceId }
+            let archived = model.settledChats(in: spaceId)
             if chats.isEmpty && archived.isEmpty {
                 emptyState
             }

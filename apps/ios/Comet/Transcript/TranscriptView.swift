@@ -20,7 +20,6 @@ struct TranscriptView: View {
         // revealed must come back visible on the FIRST frame after any view
         // re-creation, or it blinks out mid-typing when the composer resizes.
         _settled = State(initialValue: store.hasRevealed)
-        _hydrated = State(initialValue: store.hasRevealed)
     }
 
     static let gapTurn: CGFloat = 14
@@ -29,12 +28,10 @@ struct TranscriptView: View {
     static let stickThreshold: CGFloat = 70
     static let jumpThreshold: CGFloat = 320
 
-    @State private var builder = TranscriptBuilderCache()
+    private var builder: TranscriptBuilderCache { store.transcriptBuilder }
     @State private var veils = VeilStore()
     @State private var folds: [String: Bool] = [:]
     @State private var pinned = true
-    /// One-shot guard for the first non-empty projection.
-    @State private var hydrated = false
     /// Gates the reveal: false until the transcript has landed at the bottom.
     @State private var settled = false
     /// Live content height — the settle loop's "layout stopped moving" signal.
@@ -44,17 +41,19 @@ struct TranscriptView: View {
     @State private var scrollPosition = ScrollPosition(edge: .bottom)
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
+    private enum Anchor: Hashable { case bottom }
+
     var body: some View {
-        let rows = builder.rows(revision: store.revision,
-                                entries: store.entries,
-                                pendingSends: store.pendingSends)
+        let rows = builder.rows
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
                 ForEach(rows) { row in
                     rowView(row).id(row.id)
                 }
                 Color.clear.frame(height: 44)  // bottom pad clears the fade + floating status strip
+                    .id(Anchor.bottom)
             }
+            .scrollTargetLayout()
             .frame(maxWidth: Self.maxContentWidth)
             .frame(maxWidth: .infinity)
         }
@@ -67,20 +66,16 @@ struct TranscriptView: View {
         .opacity(settled ? 1 : 0)
         .motionAnimation(Motion.fadeQuick, value: settled)
         .background(Theme.bg)
-        .task {
-            // Warm sessions already have rows at first layout, and `onChange`
-            // never fires for an initial value — this is the only hook for them.
-            await settleToBottom()
+        .task(id: store.revision) {
+            await builder.update(revision: store.revision, entries: store.entries,
+                                 pendingSends: store.pendingSends)
         }
-        .onChange(of: rows.isEmpty) { _, isEmpty in
-            // Projection is off-main, so a cached transcript usually lands after
-            // the pass above ran on an empty list. Only ever hides a transcript
-            // that has never been shown — re-hiding a visible one is what made
-            // it blink out mid-typing.
-            guard !isEmpty, !hydrated, !store.hasRevealed else { return }
-            hydrated = true
-            settled = false
-            Task { await settleToBottom() }
+        .task(id: rows.isEmpty) {
+            // Recreated lazy stacks need bottom correction even with warm rows;
+            // only a never-revealed transcript waits invisibly for that layout.
+            guard !rows.isEmpty else { return }
+            if !store.hasRevealed { settled = false }
+            await settleToBottom()
         }
         .onScrollGeometryChange(for: CGFloat.self) { $0.contentSize.height } action: { _, new in
             contentHeight = new
@@ -103,7 +98,7 @@ struct TranscriptView: View {
             }
         }
         .onChange(of: contentSignature(rows)) {
-            guard pinned else { return }
+            guard settled, pinned else { return }
             if reduceMotion {
                 scrollPosition.scrollTo(edge: .bottom)
             } else {
@@ -183,11 +178,12 @@ struct TranscriptView: View {
     private func settleToBottom() async {
         var lastHeight: CGFloat = -1
         for _ in 0..<16 {
+            guard !Task.isCancelled else { return }
             guard pinned, !userScrolling else { break }
-            scrollPosition.scrollTo(edge: .bottom)
-            if contentHeight == lastHeight { break }
+            scrollPosition.scrollTo(id: Anchor.bottom, anchor: .bottom)
+            if contentHeight == lastHeight, distanceFromBottom <= 1 { break }
             lastHeight = contentHeight
-            try? await Task.sleep(nanoseconds: 30_000_000)
+            do { try await Task.sleep(nanoseconds: 30_000_000) } catch { return }
         }
         settled = true
         store.hasRevealed = true
@@ -236,23 +232,46 @@ struct TranscriptView: View {
 /// Row-build cache: one incremental parser per streaming part plus a memo of
 /// settled parses, reused across body evaluations (a reference type, so
 /// building rows never mutates state mid-render).
+@MainActor
+@Observable
 final class TranscriptBuilderCache {
+    private(set) var rows: [TranscriptRow] = []
+    @ObservationIgnored private var worker = TranscriptRowWorker()
+    @ObservationIgnored private var cachedRevision: UInt64?
+    @ObservationIgnored private var generation: UInt64 = 0
+
+    /// Parsing a cold history must not block navigation or the first scroll
+    /// frame. The store retains this cache so returning to a session is warm.
+    func update(revision: UInt64, entries: [MessageEntry],
+                pendingSends: [(messageId: String, text: String, at: Int64)]) async {
+        guard cachedRevision != revision, !Task.isCancelled else { return }
+        generation &+= 1
+        let generation = self.generation
+        guard let built = await worker.build(entries: entries, pendingSends: pendingSends),
+              !Task.isCancelled, self.generation == generation else { return }
+        rows = built
+        cachedRevision = revision
+    }
+
+    func reset() {
+        generation &+= 1
+        cachedRevision = nil
+        rows = []
+        worker = TranscriptRowWorker()
+    }
+}
+
+private actor TranscriptRowWorker {
     private var parsers: [String: IncrementalMarkdownParser] = [:]
     private var completed: [String: CompletedParse] = [:]
-    private var cachedRevision: UInt64?
-    private var cachedRows: [TranscriptRow] = []
 
-    /// Rows for the store's current `revision`. The body re-runs on every
-    /// scroll frame (it reads `distanceFromBottom`), and rows only change when
-    /// the doc does — so gate on the revision and hand back the same array.
-    func rows(revision: UInt64,
-              entries: [MessageEntry],
-              pendingSends: [(messageId: String, text: String, at: Int64)]) -> [TranscriptRow] {
-        if cachedRevision == revision { return cachedRows }
-        cachedRows = TranscriptRowBuilder.rows(entries: entries, pendingSends: pendingSends,
-                                               parsers: &parsers, completed: &completed)
-        cachedRevision = revision
-        return cachedRows
+    func build(entries: [MessageEntry],
+               pendingSends: [(messageId: String, text: String, at: Int64)]) -> [TranscriptRow]? {
+        // A cancelled view update can wait behind a cold parse. Do not parse
+        // its obsolete snapshot once the worker becomes available.
+        guard !Task.isCancelled else { return nil }
+        return TranscriptRowBuilder.rows(entries: entries, pendingSends: pendingSends,
+                                         parsers: &parsers, completed: &completed)
     }
 }
 

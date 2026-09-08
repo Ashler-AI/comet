@@ -47,6 +47,42 @@ workspace-cache retention, and bounded parse-cache lifetime. Unicode numeric
 highlighting always advances, and code recoloring no longer copies each token's
 entire line prefix.
 
+The September 8 mobile performance pass moves remote workspace projection and
+session-cache imports off the UI actor. Workspace lists and row-context lookups
+use equality-gated retained arrays/indexes instead of repeated filtering/sorting.
+Only visible rows lease metadata rooms; disposal waits for 300 ms of viewport
+quiet and yields between stores. Snapshot flushes remain synchronous to preserve
+background/sign-out durability and replica-adoption ordering.
+
+Session projection reads transcript messages and the latest matching publication,
+not the entire command ledger, and unchanged inputs do not rebuild rows. Cold
+markdown row preparation runs on a worker actor. The three most recently opened
+live sessions retain their parsed rows; deployment changes reset them. A typed
+bottom target corrects cold and warm navigation to the actual final message.
+
+Release-Staging simulator verification (iPhone 17 Pro, iOS 26.5):
+
+- A 600-session list/context pass measured 1.85 ms with the former filtering and
+  lookup path versus 0.09 ms with retained indexes, with matching row context.
+- A cached 500-turn/1,000-message session returned from `start()` in 0.113 ms on
+  the main actor; the complete projection was ready in 54.99 ms.
+- The 5,000-row cold parse measured 46.72 ms synchronously versus 64.55 ms total
+  on the worker; the benefit is UI availability, not less total parsing work.
+  The main-actor heartbeat's largest gap during that worker run was 8.80 ms.
+  Retained-cache access on reopen measured 0.0010 ms (not total navigation time).
+- Native list swipes rendered later rows; tapping and reopening the long
+  conversation displayed its final pass-499 message, without a jump button.
+- Existing visibility, attention, mobile parity and store-eviction scenarios
+  passed, as did hydration cancellation, deployment isolation and unchanged
+  projection checks. OpenCode findings were fixed and the final review reported
+  no remaining actionable findings.
+
+Reproduce with `-bench`, `-visibility-e2e`, or the offline UI fixture
+`-demo -large-list` (600 sessions, first session contains 500 turns). These are
+local simulator results, not physical-iPhone frame timings. No new TestFlight
+upload or production deployment is claimed. Local typecheck commands were
+intentionally not run; simulator application builds used Xcode's normal compiler.
+
 The 2026-09-05 release uploaded production **1.0 (3)** and staging **1.0 (2)**
 to TestFlight. App Store Connect processed both and assigned them to the existing
 **Ashler Internal** group. The staging tester's installation of build 2 was
