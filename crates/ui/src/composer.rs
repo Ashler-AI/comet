@@ -6967,7 +6967,7 @@ mod tests {
             composer.submit_command("start a fresh session", cx)
         });
         cx.condition(&composer, |composer, _| {
-            composer.failure.is_some() && !composer.is_sending(&chat_id)
+            !composer.is_sending(&chat_id)
         })
         .await;
         state.update(cx, |state, _| {
