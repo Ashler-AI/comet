@@ -118,6 +118,51 @@ on an iPhone 13 Pro. Installation of the newly published builds 7 and 13 is not
 claimed. This release did not submit either app to the public App Store or deploy
 desktop/backend changes.
 
+The later September 8 named-notification release shipped staging **1.0 (14)**
+and production **1.0 (8)** from `3851e8f048af9ea7deaf614ac68e423a9a54936e`,
+merged in [PR #19](https://github.com/Ashler-AI/comet/pull/19) as
+`906cb25ef6571c3d47248c5ff41a4e69c0b2f536`. It includes the performance work above,
+bounded clock-skew handling, and session names in attention alerts. An unnamed
+local session uses an ID fallback, never its first-user-message preview.
+OpenCode's final source re-review reported no remaining actionable findings.
+
+[Staging CI](https://github.com/Ashler-AI/comet/actions/runs/34277731165) and
+[production CI](https://github.com/Ashler-AI/comet/actions/runs/34277731313)
+passed all five mobile scenarios. Production's first attempt compiled, then
+timed out booting the CI simulator; the unchanged-source retry passed.
+Downloaded artifacts passed SHA-256 verification, and both simulator apps passed
+the same five scenarios locally and remained visible after lifecycle teardown.
+Distribution export/upload performed no local compilation or typechecks.
+Both inspection IPAs and the exact uploaded apps passed strict signature
+verification with their correct bundle identifiers and
+`aps-environment = production`. Uploaded IPA SHA-256 values:
+
+- Staging 14: `40f4bf9588347f50776e300c5ebb4f679be94590c16a6e61e5323901f6484c92`
+- Production 8: `326f52f162f7121b14a6d5db6662a13d75ddb4ea0fb7623550265116e8e8705e`
+
+Apple accepted staging at **21:12 UTC** and production at **21:21 UTC**.
+Both builds subsequently showed **Testing** in their existing **Ashler Internal**
+groups. This is internal TestFlight distribution, not public App Store submission;
+physical-iPhone installation, notification display, and tap routing are unverified.
+
+Desktop **0.1.82** passed **536 UI tests** and **3 large-journal fork regressions**
+in [candidate CI](https://github.com/Ashler-AI/comet/actions/runs/34277731362).
+[Promotion](https://github.com/Ashler-AI/comet/actions/runs/34279604790) reused
+that exact candidate for both channels and verified production readback.
+The downloaded bundle passed checksum/signature checks, and its update CLI read
+**0.1.82** from the live staging feed. The installed/running desktop remained
+**0.1.81**; no active session was interrupted. Native desktop banner inspection
+was blocked by missing macOS Screen Recording permission.
+
+[Backend rollout](https://github.com/Ashler-AI/comet/actions/runs/34279110036)
+deployed the merged source through staging to production using a byte-identical
+candidate. Remote typechecking, **140 edge tests**, and the real Edge/Rust
+collaboration smoke passed. Final Worker versions were
+`4b9d09de-d46c-4cd1-8f3e-8007d3bb9108` (staging) and
+`0b8f5481-7fe2-4595-accf-285d7a732a5e` (production); both live health endpoints
+returned `ok: true` with the expected environment. Local typechecks were
+intentionally skipped to preserve workstation resources.
+
 The 2026-09-05 release uploaded production **1.0 (3)** and staging **1.0 (2)**
 to TestFlight. App Store Connect processed both and assigned them to the existing
 **Ashler Internal** group. The staging tester's installation of build 2 was
