@@ -194,6 +194,10 @@ jobs:
         run: cargo test --locked -p comet-ui --lib
       - name: Verify large-journal fork behavior
         run: cargo test --locked -p comet-harness fork_session_file_
+      - name: Verify gateway extension ownership and discovery
+        run: cargo test --locked -p comet-harness auth_gateway::tests
+      - name: Verify desktop and Scaffold gateway launch policies
+        run: cargo test --locked -p comet-harness shared_inference_
       - name: Package
         run: scripts/package-macos.sh
       - name: Record artifact checksums
