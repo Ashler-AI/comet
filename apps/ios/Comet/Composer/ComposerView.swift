@@ -1,7 +1,7 @@
 // Composer — the floating glass shell, a port of the old mobile app's
 // composer (compact↔expanded morph, 36pt controls, focus-widen) carrying the
-// desktop's Send→Steer→Stop semantics: live run + text = steer (same
-// up-arrow), live run + empty = stop.
+// desktop's Send→Steer→Stop semantics: live run + text/images = steer (same
+// up-arrow), live run + no draft = stop. Upload/admission never becomes Stop.
 //
 // The compact→expanded flip is deterministic (newline or >26 chars), NOT
 // content-size measured — measurement oscillates at the boundary.
@@ -17,6 +17,7 @@ struct ComposerShell<Chips: View>: View {
     var sendEnabled: Bool
     var showStop: Bool
     var busy = false
+    var hasAttachments = false
     var onSend: () -> Void
     var onStop: () -> Void = {}
     @ViewBuilder var chips: Chips
@@ -83,7 +84,7 @@ struct ComposerShell<Chips: View>: View {
 
     private var actionButton: some View {
         Button {
-            if showStop, draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if showStop, !hasAttachments, draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                 onStop()
             } else {
@@ -92,14 +93,14 @@ struct ComposerShell<Chips: View>: View {
             }
         } label: {
             Group {
-                if showStop, draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    RoundedRectangle(cornerRadius: 3.5)
-                        .fill(Theme.bg)
-                        .frame(width: 12, height: 12)
-                } else if busy {
+                if busy {
                     ProgressView()
                         .controlSize(.small)
                         .tint(Theme.textFaint)
+                } else if showStop, !hasAttachments, draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    RoundedRectangle(cornerRadius: 3.5)
+                        .fill(Theme.bg)
+                        .frame(width: 12, height: 12)
                 } else {
                     Image(systemName: "arrow.up")
                         .font(.system(size: 16, weight: .semibold))
@@ -113,63 +114,100 @@ struct ComposerShell<Chips: View>: View {
         }
         .buttonStyle(.plain)
         .disabled(!buttonActive)
+        .accessibilityLabel(busy ? "Sending message" : showStop && !hasAttachments && draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Stop" : "Send message")
         .motionAnimation(Motion.fadeQuick, value: showStop)
     }
 
     private var buttonActive: Bool {
-        if showStop, draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
-        return sendEnabled && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !busy
+        guard !busy else { return false }
+        if showStop, !hasAttachments, draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
+        return sendEnabled && (hasAttachments || !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     }
 }
 
-/// The live-chat composer: config is locked once the chat exists, so no chips —
-/// just the input and the morphing action button.
+/// Existing sessions share the same image intake as the new-session composer.
 struct ComposerView: View {
     let store: SessionStore
     let chat: Chat?
     let runLive: Bool
 
     @State private var text = ""
+    @State private var draftRevision: UInt64 = 0
+    @State private var images = MobileImageDraft()
+    @State private var submitting = false
+    @State private var previousFailure: String?
+    @State private var previousImages: [MobileImageAttachment] = []
 
     var body: some View {
-        ComposerShell(
-            draft: $text,
-            sendEnabled: true,
-            showStop: runLive,
-            busy: !store.pendingSends.isEmpty,
-            onSend: send,
-            onStop: { store.sendInterrupt() }
-        ) {
-            EmptyView()
+        VStack(spacing: 0) {
+            if let previousFailure {
+                Button("Retry previous failed message") {
+                    guard !submitting else { return }
+                    submitting = true
+                    let submittedImages = previousImages
+                    Task { @MainActor in
+                        let sent = await submit(previousFailure, images: submittedImages)
+                        if sent { self.previousFailure = nil; previousImages = [] }
+                        submitting = false
+                    }
+                }
+                .font(Theme.sans(12))
+                .disabled(submitting || store.sending || !store.pendingSends.isEmpty)
+            }
+            MobileImageDraftView(draft: images, busy: submitting)
+            ComposerShell(
+                draft: Binding(get: { text }, set: { text = $0; draftRevision &+= 1 }),
+                sendEnabled: !images.loading,
+                showStop: runLive,
+                busy: submitting || store.sending || !store.pendingSends.isEmpty || images.loading,
+                hasAttachments: !images.images.isEmpty,
+                onSend: send,
+                onStop: { store.sendInterrupt() }
+            ) {
+                MobileImagePicker(draft: images, disabled: submitting)
+            }
         }
-        .onChange(of: store.sendFailure) { _, failure in
-            // Keep a failed attempt editable without replacing a newer draft
-            // or automatically sending anything when connectivity returns.
-            guard failure != nil, text.isEmpty, let prompt = store.failedPrompt else { return }
+        .onChange(of: store.sendFailure) { _, _ in restoreFailure() }
+        .onAppear { restoreFailure() }
+        .onDisappear { images.cancelImport() }
+    }
+
+    private func restoreFailure() {
+        guard store.sendFailure != nil, let prompt = store.failedPrompt else { return }
+        if text.isEmpty, images.images.isEmpty {
             text = prompt
+            images.images = store.failedImages
+        } else if text.trimmingCharacters(in: .whitespacesAndNewlines) != prompt
+                    || images.images.map(\.id) != store.failedImages.map(\.id) {
+            previousFailure = prompt
+            previousImages = store.failedImages
         }
     }
 
-    private func send() {
-        let prompt = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !prompt.isEmpty else { return }
-        // Shared sessions deliberately have no local Chat row. Steer lets the
-        // owner host resume with its own cwd/model configuration instead of
-        // accepting an importer-manufactured RunRequest with empty defaults.
+    private func submit(_ prompt: String, images: [MobileImageAttachment]) async -> Bool {
+        // Shared sessions have no local Chat row; the owner supplies run config.
         if runLive || chat == nil {
-            store.sendSteer(prompt: prompt)
-        } else {
-            store.sendRun(prompt: prompt, chat: chat)
+            return await store.sendSteer(prompt: prompt, images: images)
         }
-        text = ""
-        // The clear above is unconditional, so a prompt left sitting in the
-        // composer after a successful send is not this path failing to run —
-        // it is the text view writing the pre-send string back. A focused
-        // multiline TextField commits pending autocorrect/marked text through
-        // the binding AFTER a programmatic change, which restores the prompt.
-        // Re-clear once that has drained; a keystroke can't land inside the
-        // same main-actor turn, so this can never eat real input.
-        Task { @MainActor in text = "" }
+        return await store.sendRun(prompt: prompt, chat: chat, images: images)
+    }
+
+    private func send() {
+        let submittedText = text
+        let prompt = submittedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let submittedImages = images.images
+        let revision = draftRevision
+        guard !submitting, !store.sending, store.pendingSends.isEmpty, !images.loading,
+              !prompt.isEmpty || !submittedImages.isEmpty else { return }
+        submitting = true
+        Task { @MainActor in
+            let sent = await submit(prompt, images: submittedImages)
+            if sent {
+                if text == submittedText, draftRevision == revision { text = "" }
+                images.removeSubmitted(submittedImages)
+            }
+            submitting = false
+        }
     }
 }
 

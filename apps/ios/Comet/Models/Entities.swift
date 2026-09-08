@@ -173,7 +173,7 @@ struct Chat: Identifiable, Hashable {
     var lastSeenAt: Int64?
 
     var displayTitle: String {
-        if let title, !title.isEmpty { return title }
+        if let title = normalizedSessionTitle(title) { return title }
         return "New session"
     }
 
@@ -183,6 +183,14 @@ struct Chat: Identifiable, Hashable {
         guard let lastSeenAt else { return true }
         return lastMessageAt > lastSeenAt
     }
+}
+
+/// Titles use the same single-line whitespace treatment for local rows,
+/// Scaffold environment names, and imported-session previews.
+func normalizedSessionTitle(_ title: String?) -> String? {
+    guard let title else { return nil }
+    let oneLine = title.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    return oneLine.isEmpty ? nil : oneLine
 }
 
 enum SessionStatus: String {
@@ -421,6 +429,7 @@ struct RunRequest: Codable {
     var sandbox: String = "workspace-write"
     var autoApprove: Bool = true
     var resume: String?
+    var attachments: [String] = []
 }
 
 enum SessionCommandPayload {
