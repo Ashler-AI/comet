@@ -1206,10 +1206,28 @@ impl Session {
                         VersionVector::decode(&version).unwrap_or_default()
                     };
                     if !server_vv.includes_vv(&self.doc.oplog_vv()) {
-                        let missing = self
+                        // An empty peer needs materialized state, not a replay
+                        // of the entire history into the edge's bounded heap.
+                        let mode = if server_vv.is_empty() {
+                            ExportMode::Snapshot
+                        } else {
+                            ExportMode::updates(&server_vv)
+                        };
+                        let mut missing = self
                             .doc
-                            .export(ExportMode::updates(&server_vv))
+                            .export(mode)
                             .map_err(|e| SyncError::Loro(e.to_string()))?;
+                        // Bulk catch-up can be cheaper as state than as an
+                        // operation replay. Small deltas keep the fast path.
+                        if !server_vv.is_empty() && missing.len() > FRAGMENT_BYTES {
+                            let snapshot = self
+                                .doc
+                                .export(ExportMode::Snapshot)
+                                .map_err(|e| SyncError::Loro(e.to_string()))?;
+                            if snapshot.len() < missing.len() {
+                                missing = snapshot;
+                            }
+                        }
                         if !missing.is_empty() {
                             self.send_loro_updates(vec![missing]).await?;
                         }

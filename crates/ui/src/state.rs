@@ -1327,12 +1327,6 @@ impl AppState {
     // ---- reducers (pure) ----
 
     pub fn apply_chats(&mut self, mut chats: Vec<Chat>) {
-        chats.retain(|chat| {
-            !chat
-                .space_id
-                .as_deref()
-                .is_some_and(|id| id.starts_with(LEGACY_SCAFFOLD_SPACE_ID_PREFIX))
-        });
         // First-send setup may spend seconds materializing a large worktree.
         // Preserve its optimistic row across unrelated watch frames so tabs and
         // the sidebar acknowledge the session immediately. The authoritative
@@ -2160,17 +2154,31 @@ impl AppState {
         self.chats.iter().any(|chat| chat.id == chat_id)
     }
 
-    /// Cached transcript-derived title without allocating the id fallback.
+    /// Canonical imported environment name, then a learned transcript preview.
     pub(crate) fn shared_session_preview(&self, chat_id: &str) -> Option<&str> {
-        self.shared_session_previews
-            .get(chat_id)
-            .map(String::as_str)
+        self.scaffold_environment(chat_id)
+            .and_then(|environment| environment.name.as_deref())
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .or_else(|| {
+                self.session_refs
+                    .iter()
+                    .find(|session_ref| session_ref.chat_id == chat_id)
+                    .and_then(|session_ref| session_ref.environment.as_ref())
+                    .and_then(|environment| environment.name.as_deref())
+            })
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .or_else(|| {
+                self.shared_session_previews
+                    .get(chat_id)
+                    .map(String::as_str)
+            })
     }
 
     pub fn shared_session_title(&self, chat_id: &str) -> String {
-        self.shared_session_previews
-            .get(chat_id)
-            .cloned()
+        self.shared_session_preview(chat_id)
+            .map(str::to_owned)
             .unwrap_or_else(|| session_ref_fallback(chat_id))
     }
 
@@ -2251,36 +2259,25 @@ impl AppState {
         }
     }
 
-    /// The sidebar's Sessions list: every non-archived chat of a LIVE space,
-    /// on any device — idle included — in pure recency order (status drives
-    /// the dot, never the position; see [`sort_active`]).
+    /// Every non-archived member session, including detached/missing-space
+    /// rows, in pure recency order. Space membership supplies context, never
+    /// visibility; the engine has already applied the principal's memberships.
     pub fn overview_chats(&self, now: DateTime<Utc>) -> Vec<(ChatIndicator, &Chat)> {
         let mut rows: Vec<(ChatIndicator, &Chat)> = self
             .visible_chats()
-            .filter(|c| {
-                c.space_id
-                    .as_deref()
-                    .is_some_and(|id| self.space_row(id).is_some())
-            })
             .map(|c| (self.display_status_for(c, now), c))
             .collect();
         sort_active(&mut rows);
         rows
     }
 
-    /// Archived chats of a live space, newest first. The main sidebar presents
-    /// these as settled sessions below the active list.
+    /// Archived member sessions, newest first, including detached rows.
+    /// Archiving changes the section, never the session's reachability.
     pub fn settled_chats(&self) -> Vec<&Chat> {
         let mut rows: Vec<(ChatIndicator, &Chat)> = self
             .chats
             .iter()
-            .filter(|chat| {
-                chat.archived
-                    && chat
-                        .space_id
-                        .as_deref()
-                        .is_some_and(|id| self.space_row(id).is_some())
-            })
+            .filter(|chat| chat.archived)
             .map(|chat| (ChatIndicator::Idle, chat))
             .collect();
         sort_active(&mut rows);
@@ -2312,6 +2309,11 @@ impl AppState {
     #[cfg(test)]
     pub(crate) fn set_engine_for_test(&mut self, handle: EngineHandle) {
         self.engine = Some(handle);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_scaffold_scope_for_test(&mut self, project: &str, deployment: &str) {
+        self.scaffold_scope = Some((project.into(), deployment.into()));
     }
 
     // ---- gpui glue ----
@@ -5080,16 +5082,19 @@ mod tests {
             .map(|c| c.id.as_str())
             .collect();
         assert_eq!(ids, ["old", "new"]);
-        assert!(!state.chats.iter().any(|chat| chat.id == "legacy-scaffold"));
-        // The overview shows every live-space chat (idle included) — chats of
-        // unknown spaces stay hidden. Completed ("old") outranks idle ("new").
+        assert!(state.chats.iter().any(|chat| chat.id == "legacy-scaffold"));
+        // Missing space context must not hide a member session. Status never
+        // reorders the list: activity/creation recency determines position.
         let now = Utc::now();
         let overview: Vec<&str> = state
             .overview_chats(now)
             .iter()
             .map(|(_, c)| c.id.as_str())
             .collect();
-        assert_eq!(overview, ["old", "new"]);
+        assert_eq!(
+            overview,
+            ["legacy-scaffold", "old", "new", "dangling", "other"]
+        );
     }
 
     #[test]
@@ -5295,7 +5300,7 @@ mod tests {
     }
 
     #[test]
-    fn settled_chats_are_archived_live_space_rows_in_recency_order() {
+    fn settled_chats_keep_detached_members_in_recency_order() {
         let mut state = AppState::new();
         state.apply_spaces(vec![space("space", "dev", "/workspace", 0)]);
         let mut older = chat("older", 0, Some(2));
@@ -5316,7 +5321,7 @@ mod tests {
             .into_iter()
             .map(|chat| chat.id.as_str())
             .collect();
-        assert_eq!(settled, ["newer", "older"]);
+        assert_eq!(settled, ["dangling", "newer", "older"]);
     }
 
     #[test]

@@ -1004,8 +1004,20 @@ impl Shell {
                     }
                     let branch = sidebar_branch_label(chat);
                     let scaffold_environment = state.scaffold_environment(&id);
-                    let scaffold_title =
-                        scaffold_environment.and_then(|environment| environment.name.as_deref());
+                    let scaffold_title = scaffold_environment
+                        .and_then(|environment| environment.name.as_deref())
+                        .map(str::trim)
+                        .filter(|title| !title.is_empty())
+                        .or_else(|| {
+                            state
+                                .session_refs
+                                .iter()
+                                .find(|session_ref| session_ref.chat_id == id)
+                                .and_then(|session_ref| session_ref.environment.as_ref())
+                                .and_then(|environment| environment.name.as_deref())
+                        })
+                        .map(str::trim)
+                        .filter(|title| !title.is_empty());
                     let (scaffold_web, scaffold_session) = scaffold_environment
                         .and_then(|environment| match &environment.source {
                             comet_proto::SessionEnvironmentSource::Scaffold { links, .. } => {
@@ -1015,7 +1027,12 @@ impl Shell {
                         })
                         .unwrap_or_default();
                     let title = scaffold_title
-                        .or(chat.title.as_deref())
+                        .or_else(|| {
+                            chat.title
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|title| !title.is_empty())
+                        })
                         .unwrap_or("New session");
                     let agent_session = state.collaboration_sessions(&id).next();
                     let source = sidebar_session_source(

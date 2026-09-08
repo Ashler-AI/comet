@@ -30,7 +30,7 @@ bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
 xcodebuild -project Comet.xcodeproj -scheme Comet \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 
-# Staging: Crew Staging, ai.ashler.crew.staging, version 1.0 build 8
+# Staging: Crew Staging, ai.ashler.crew.staging, version 1.0 build 12
 xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 ```
@@ -65,6 +65,103 @@ replica. Divergent offline conflicts or unsupported container changes retain the
 old data and surface a synchronization error rather than silently overwriting it.
 App Store Connect confirmed build 5 in **Ashler Internal** and its installation
 by the existing tester on 2026-09-06.
+
+### Snapshot-first bootstrap recovery
+
+Native and mobile clients send a snapshot when the edge has no history. For
+fragmented catch-up, they prefer a snapshot only when it is smaller than the
+missing-operation export; normal incremental updates stay unchanged.
+
+The edge loads a snapshot into a fresh candidate before replaying persisted and
+buffered deltas. Adoption requires complete replay, coverage of accepted history,
+and matching state/oplog frontiers. Already-included snapshots are acknowledged
+without re-import; concurrent snapshots require a rejoin/resync before submission.
+Missing dependencies reject the candidate without replacing accepted state. The
+incoming covering snapshot is stored through the chunked blob store, with the
+existing delta log and buffered deltas retained for cold replay. No merged-snapshot
+re-export is needed at adoption. Notification policy is unchanged.
+
+Cold materialization is single-flight: simultaneous joins share one replay and
+cannot spend the replay-crash budget several times or overwrite each other's
+materialized documents. Four simultaneous cold reads previously reproduced an
+automatic snapshot/log drop without a preceding replay failure. The serialized
+path preserves all 604 session entries in the same Cloudflare runtime scenario.
+
+The staging safeguards were deployed on 2026-09-07 as
+`c8be5b20-9eba-43f4-9b74-fda0eb8a4e6a`; removal of the redundant adoption export
+was deployed as `e907dc7e-9d77-4535-b6f9-9271ff2d6bf2`.
+
+A version-attributed workerd comparison used the same real workspace plus 499
+synthetic dependent deltas. When the incoming snapshot already included those
+deltas, both implementations used 28,966,912 bytes (27.63 MiB) through bootstrap
+and observation, and 75,759,616 bytes (72.25 MiB) after cold-replay trimming.
+Both preserved 595 valid notification rows and emitted zero attention events.
+Removing the full-snapshot export avoided redundant work but did not lower that
+fixture's WASM high-water mark. The earlier 499-row captured-live-log experiment
+was a different fixture and is not the basis for these version-specific numbers.
+
+The missing-history fixture exposed a separate `importBatch` problem in Loro:
+batch replay detaches the document and checks out the latest operation log at
+the end. With 499 deltas absent from the incoming snapshot, `e907dc7e` reached
+240,189,440 bytes through observation and failed the memory assertion.
+
+Staging `bcf5b1cd-3773-441f-9a45-adaa8bf8bcb7` replaces batch replay with streamed
+single-delta imports. A final applied-version check covers every earlier pending
+span, so later successful rows cannot hide unresolved dependencies. No retained
+rows are dropped. In a matched-byte workerd API experiment, batch import reached
+236,388,352 bytes; single imports applied all 499 missing deltas and read all 604
+sessions at 70,320,128 bytes.
+
+The actual edge bootstrap, observer, and cold-replay paths also passed using the
+real workspace plus 499 genuinely new dependent deltas: 73,793,536 bytes (70.38 MiB)
+through observation and 76,152,832 bytes (72.63 MiB) after cold-replay trimming.
+Reverse-order replay passed at 70.38 MiB through observation and 72.38 MiB after
+trimming, including resolution of the accumulated pending chain. Both preserved
+the final delta value and 595 notification rows, and emitted zero attention events.
+These are isolated scenario measurements, not a bound for arbitrary payloads or
+multiple co-resident rooms. Old clients' full-history update uploads remain a
+separate activation concern.
+
+The complete edge Vitest suite passed: 136 tests across 16 files. The later
+[staging deployment](https://github.com/Ashler-AI/comet/actions/runs/34165594033)
+passed remote typechecking, tests, and the real Edge/Rust collaboration smoke;
+it deployed `b683ff3e-8af0-4d1d-a80d-7a840df95ef1`. Local typechecks remain
+intentionally disabled under workstation policy.
+
+Desktop **0.1.75** was published to staging and installed. After explicit user
+approval to interrupt active runs, the old **0.1.70** engine exited on
+2026-09-07 at 22:39:51 UTC. The new engine reported **0.1.75**, restored the
+same device identity, and resumed the existing native OMP conversation.
+At 22:41:46 UTC, workspace sync was connected with a fresh acknowledgement and
+zero rejoins, full resyncs, or disconnects since startup. This verifies workspace
+recovery, not every chat room: one open chat reported three rejoins.
+
+Staging then recorded six APNs HTTP **200** responses around 22:40 UTC, including
+receipt `85E8F1FA-4390-4168-5184-745C1FCA5265` for event timestamp
+`1788820786445`. These were recovery-time session transitions, not an additional
+manual test notification. Physical iPhone display and tap routing remain
+unverified; provider acceptance is not a delivery receipt from the device.
+
+Staging iOS **1.0 (11)** was uploaded on 2026-09-07 with the snapshot catch-up
+changes. Its archive and cloud-signed inspection IPA both contain
+`aps-environment = production`; the IPA passed strict signature verification
+before upload. Build **11** finished processing and was assigned to Ashler
+Internal. Build **10** lost its push entitlement during unsigned-archive cloud
+signing; it was expired in App Store Connect with user approval.
+
+When archiving with `CODE_SIGNING_ALLOWED=NO` for cloud-managed distribution,
+first ad-hoc sign the archived app with the expanded Release entitlement
+(`aps-environment = production`), as builds 9 and 11 did. Export for inspection
+before upload, inspect the signed IPA with `codesign -d --entitlements :-`, and
+verify the signature with `codesign --verify --deep --strict`. A push-enabled
+provisioning profile alone does not add the entitlement to an unsigned archive.
+
+For physical-device verification, correlate staging `apns_finished` with the
+attention event's `updatedAt`. The trace includes the provider HTTP `status`,
+the response `apns-id` as `apnsId` when present, and `removeRegistration`.
+`apns_response` records the same status and receipt before parsing a rejection
+body. A 200 establishes APNs acceptance, not display or tap delivery on the
+iPhone. Transport failures remain `delivery_exception`, not an acceptance.
 
 ### Staging 1.0 (6): mobile status feedback
 
@@ -231,8 +328,9 @@ profile before uploading; source configuration alone is not delivery evidence.
 
 ### Session control coverage
 
-- The home screen merges every non-archived workspace chat with the signed-in
-  principal's imported session refs.
+- The home screen merges the signed-in principal's workspace chat memberships
+  with imported session refs. Unrelated project chat/status rows are not projected;
+  detached and missing-space members remain reachable on desktop and mobile.
 - `comet://invite/{chatId}/{sessionId}/{grantId}` links pin missing membership
   and open the session directly.
 - New-session launch supports the selected desktop device or a Scaffold OMP
@@ -242,6 +340,75 @@ profile before uploading; source configuration alone is not delivery evidence.
 - Existing local and Scaffold sessions accept run/steer/stop/input commands.
   Local OMP sessions with durable native context can be forked from the session
   toolbar.
+- Existing and new sessions accept images from Photos or Files, including image-only
+  drafts. The phone normalizes HEIC/other images to JPEG or PNG, caps selection at
+  10 images (24 MiB each, 32 MiB total), and shows removable previews.
+- Images upload in 45 KB chunks to the actual execution device before command
+  admission. Runs carry typed attachment paths plus the desktop's prompt trailer;
+  steers use the same trailer. Failure preserves the draft. Uncertain retries retain
+  command identity and payload; a later materialized message is not admitted again.
+- Mobile transcript image rendering is not implemented: sent images currently
+  appear as attachment path text. Inline image display remains desktop-only;
+  successful mobile upload/send does not imply mobile image read-back support.
+- Scaffold creation is separated from first-run admission, retaining the created
+  environment and route across attach/upload/admission retries. Scoped hosts permit
+  upload RPCs only with file capability, the exact session, and no other-device target.
+- List/header names use canonical environment/workspace metadata, with a cached
+  first-user preview for untitled sessions. Metadata preload avoids full transcript
+  projection and skips already-named archived rows; navigation activates transcripts.
+- Disk caches are scoped by edge, auth mode, principal, project, room, and deployment.
+  Old unscoped caches are not merged into a new identity's replica.
+- Workspace reprojection does not prune cached stores while membership is empty,
+  or while a session is open, has a Scaffold route, is sending, or awaits a send
+  acknowledgement. This defers cache cleanup; it does not alter membership
+  visibility or server-side authorization. Sign-out still stops all stores.
+
+### Mobile parity verification and activation
+
+The staging simulator exercised principal-scoped visibility, detached/archived rows,
+image selection/preview, and image-only sending in existing and new sessions through the offline demo. The native
+regression also passed lost-reply retry identity/payload, late-materialization dedupe,
+metadata-only titles, transcript activation, and deployment cache isolation.
+
+An isolated real Edge/Rust host relay committed **100,019 byte-identical bytes** in
+45 KB chunks, denied another session's upload, and retained grant-revocation behavior.
+The full edge suite passed **137 tests**. These are local simulator/isolated-host
+proofs, not a physical-phone or live Scaffold image-send claim.
+The final source was subsequently compiled and exercised entirely in authorized
+remote CI. [Mobile run 34179062008](https://github.com/Ashler-AI/comet/actions/runs/34179062008)
+built commit `4f8c10d94020ff3d7600fff9a08b99af8be31953` on arm64 with Xcode 26.6
+and iOS SDK 26.5. All five probes passed, including **OK Crew store eviction**;
+the Release-Staging archive succeeded with production APNs in its ad-hoc signature.
+The downloaded simulator binary, identified as build 12, also passed all five
+probes and rendered the session list locally without recompilation.
+
+[Desktop release 34178218428](https://github.com/Ashler-AI/comet/actions/runs/34178218428)
+compiled and passed **532 UI tests**, packaged **0.1.76**, and published staging.
+Its source is `7dd1222a8f098a961866623a8203a8f45b58aa31`; the later mobile-only
+regression inference and archive packaging fixes do not change desktop/edge source.
+The production publication job was skipped; no active desktop engine was restarted.
+
+[Backend deployment 34178218455](https://github.com/Ashler-AI/comet/actions/runs/34178218455)
+passed remote typechecking, the 137 tests, and real scoped-host upload/revocation
+smoke, then deployed staging Worker **8b5a9c92-7678-4b2a-89a9-ffd5cccb217b**.
+The staging health endpoint returned `ok: true`; production deployment was skipped.
+
+The downloaded mobile archive was locally exported for distribution signing,
+without compilation. The **Crew Staging 1.0 (12)** inspection IPA passed strict
+signature verification; its signature and provisioning profile both contain
+`aps-environment = production` and `825LYXGJR6.ai.ashler.crew.staging`.
+Inspection IPA SHA-256: `36d045233715d1daad37cdf3141bd18e7affb4b9380cd71f0803fd26edb29ef2`.
+The same archive uploaded successfully at **2026-09-08 02:21:32 UTC**, delivery
+`ecc19154-6e66-405a-8f0d-33473c70bf09`, with no upload errors or warnings.
+The actual uploaded IPA also passed strict signature verification and retains
+the production APNs entitlement. Uploaded IPA SHA-256:
+`05fb66e5e2381090732934f1fc3a57eda12a780355c6f944d5e361e1d02b2034`.
+App Store Connect subsequently showed upload **Complete** for **1.0 (12)**.
+The TestFlight build list shows build **12**, **Ready to Submit**, expiry in
+90 days, the existing **AI** internal-group badge, and **1 invite**. Its installs
+column is still `–`; no physical-iPhone installation or image/notification
+delivery is claimed. No local typechecks or compilation ran during this
+authorized rollout.
 
 ## Architecture
 
@@ -252,11 +419,10 @@ Sync/
   RoomClient.swift      room.rs port: join with oplog VV, snapshot backfill,
                         resubmit-from-server-VV, DocUpdate+Ack, fragments,
                         %EPH presence sub-room, ping/pong lease, backoff
-  WorkspaceStore.swift  ws4/{projectScope} mirror: project-shared
-                        devices/spaces/chats/sessions plus principal-scoped
-                        session refs and viewer-side writes
-  SessionStore.swift    session doc mirror: joined transcript, owner
-                        publications, send reconciliation; off-main projection
+  WorkspaceStore.swift  ws4/{projectScope} mirror: project-shared storage,
+                        principal-member chat/status projection and viewer writes
+  SessionStore.swift    metadata-only list projection; joined transcript on open,
+                        owner publications, upload/admission and send reconciliation
 Markdown/
   MarkdownModel.swift   block model + incremental tail re-parser (re-parse
                         from the 2nd-to-last top-level block; link-defs force
@@ -362,8 +528,8 @@ invalid-token responses remove only the matching registration revision.
 Alerts contain generic Crew copy and routing IDs, not titles or transcripts.
 Registration is principal/project scoped; single-session device grants cannot register.
 
-Offline regression launch: `-visibility-e2e` runs session visibility and
-attention-transition scenarios and opens demo mode. Debug builds additionally
+Offline regression launch: `-visibility-e2e` runs session visibility,
+attention-transition, retry, metadata and cache-isolation scenarios and opens demo mode. Debug builds additionally
 exercise queued APNs token arrival, scoped routing, offline disable/logout and
 late-response isolation using an in-process HTTP responder. Every lifecycle wait
 has a five-second deadline and logs a stage-specific `FAIL` before cancelling

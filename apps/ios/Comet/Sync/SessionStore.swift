@@ -14,6 +14,9 @@ final class SessionStore {
     private(set) var deploymentId: String?
     private(set) var entries: [MessageEntry] = []
     private(set) var publishedSession: SessionRow?
+    private(set) var publishedEnvironment: SessionEnvironment?
+    private(set) var previewTitle: String?
+    @ObservationIgnored private var metadataOnly: Bool
     private(set) var transcriptActivity: SessionRow?
     /// Bumped on every change to `entries` / `pendingSends`. The transcript's
     /// row builder memoizes on it, so a body re-eval that was triggered by
@@ -31,6 +34,21 @@ final class SessionStore {
     private(set) var pendingSends: [(messageId: String, text: String, at: Int64)] = []
     private(set) var sendFailure: String?
     private(set) var failedPrompt: String?
+    private(set) var failedImages: [MobileImageAttachment] = []
+    private(set) var sending = false
+    @ObservationIgnored var attachmentUploader: (([MobileImageAttachment]) async throws -> [String])?
+    @ObservationIgnored private var uploadedImages: [UUID: String] = [:]
+    @ObservationIgnored private var submittedDrafts: [String: SubmittedDraft] = [:]
+    @ObservationIgnored private var retryDraft: SubmittedDraft?
+    @ObservationIgnored private var retryIsTerminal = false
+
+    private struct SubmittedDraft {
+        var messageId: String
+        var prompt: String
+        var images: [MobileImageAttachment]
+        var steer: Bool
+        var payload: SessionCommandPayload?
+    }
 
     private(set) var doc = LoroDoc()
     private var room: RoomClient?
@@ -47,18 +65,27 @@ final class SessionStore {
     /// admission errors are handled here alongside the matching optimistic echo.
     @ObservationIgnored var commandSender: ((SessionCommandPayload) async throws -> Void)?
 
-    init(chatId: String, config: AppConfig, deploymentId: String? = nil, offline: Bool = false) {
+    init(chatId: String, config: AppConfig, deploymentId: String? = nil, offline: Bool = false,
+         metadataOnly: Bool = false) {
         self.chatId = chatId
         self.config = config
         self.deploymentId = deploymentId
         self.offline = offline
+        self.metadataOnly = metadataOnly
     }
 
     /// Demo-mode injection point (also used by previews).
     func setEntries(_ new: [MessageEntry]) {
         entries = new
+        previewTitle = Self.titlePreview(in: new)
         transcriptActivity = Self.activity(in: new, chatId: chatId, observedAt: nowMs())
         revision &+= 1
+    }
+
+    func activateTranscript() {
+        guard metadataOnly else { return }
+        metadataOnly = false
+        project()
     }
 
     @ObservationIgnored private var saver: DocSaver?
@@ -69,10 +96,11 @@ final class SessionStore {
         let epoch = roomEpoch
         // Local-first: last-synced transcript renders instantly (even when the
         // host device is offline); the join backfills incrementally from here.
-        if DocDisk.load(into: doc, id: chatId) {
+        let cacheId = config.documentCacheId(roomId: chatId, deploymentId: deploymentId)
+        if DocDisk.load(into: doc, id: cacheId) {
             project()
         }
-        saver = DocSaver(docId: chatId, doc: doc)
+        saver = DocSaver(docId: cacheId, doc: doc)
         let client = RoomClient(roomId: chatId, doc: doc) { [config, chatId, deploymentId] in
             await config.sessionSocketURL(chatId: chatId, deploymentId: deploymentId)
         } events: { [weak self] event in
@@ -133,6 +161,15 @@ final class SessionStore {
         deploymentId = value
         guard !offline else { return }
         stop()
+        doc = LoroDoc()
+        entries = []
+        publishedSession = nil
+        publishedEnvironment = nil
+        previewTitle = nil
+        transcriptActivity = nil
+        lastRemoteUpdateAt = nil
+        hasRevealed = false
+        uploadedImages.removeAll()
         start()
     }
 
@@ -180,8 +217,12 @@ final class SessionStore {
         let pendingMessageIds = Set(pendingSends.map(\.messageId))
         let chatId = self.chatId
         let observedAt = lastRemoteUpdateAt
+        let metadataOnly = self.metadataOnly
         Task { @MainActor [weak self] in
             let (decoded, failures) = await Task.detached(priority: .userInitiated) {
+                if metadataOnly {
+                    return (Optional(Self.decodeMetadata(from: doc, chatId: chatId)), [String: String]())
+                }
                 let root = doc.getDeepValue().mapValue
                 return (root.map { Self.decodeProjection(from: $0, chatId: chatId, observedAt: observedAt) },
                         Self.commandFailures(from: root?["commands"]?.listValue ?? [],
@@ -201,7 +242,7 @@ final class SessionStore {
             }
             for (messageId, failure) in failures
                 where self.pendingSends.contains(where: { $0.messageId == messageId }) {
-                self.reportSendFailure(failure, messageId: messageId)
+                self.reportSendFailure(failure, messageId: messageId, terminal: true)
             }
             if self.projectPending {
                 self.projectPending = false
@@ -214,9 +255,16 @@ final class SessionStore {
         entries = decoded.entries
         publishedSession = decoded.session
         transcriptActivity = decoded.activity
+        publishedEnvironment = decoded.environment
+        previewTitle = decoded.previewTitle
         // Drop echoes the host has materialized.
         let ids = Set(entries.map(\.id))
         pendingSends.removeAll { ids.contains($0.messageId) }
+        for id in ids {
+            if let draft = submittedDrafts.removeValue(forKey: id) {
+                for image in draft.images { uploadedImages.removeValue(forKey: image.id) }
+            }
+        }
         revision &+= 1
     }
 
@@ -257,6 +305,8 @@ final class SessionStore {
         var entries: [MessageEntry]
         var session: SessionRow?
         var activity: SessionRow?
+        var environment: SessionEnvironment?
+        var previewTitle: String?
     }
 
     nonisolated private static func decodeProjection(
@@ -264,7 +314,8 @@ final class SessionStore {
     ) -> Projection {
         let raw = (root["messages"]?.listValue ?? []).compactMap(entryFrom)
         var session: SessionRow?
-        for publication in root["publications"]?.listValue ?? [] {
+        var environment: SessionEnvironment?
+        for publication in (root["publications"]?.listValue ?? []).reversed() {
             guard let record = publication.mapValue?["record"]?.mapValue,
                   record["kind"]?.stringValue == "agentSession",
                   let value = record["value"]?.mapValue,
@@ -277,9 +328,54 @@ final class SessionStore {
                 status: value["status"]?.stringValue.flatMap(SessionStatus.init(rawValue:)) ?? .idle,
                 startedAt: updatedAt, updatedAt: updatedAt
             )
+            if let value = value["environment"],
+               let data = try? JSONSerialization.data(withJSONObject: value.jsonObject) {
+                environment = try? JSONDecoder().decode(SessionEnvironment.self, from: data)
+            }
+            break
         }
         return Projection(entries: joinContinuations(raw), session: session,
-                          activity: activity(in: raw, chatId: chatId, observedAt: observedAt))
+                          activity: activity(in: raw, chatId: chatId, observedAt: observedAt),
+                          environment: environment, previewTitle: titlePreview(in: raw))
+    }
+
+    nonisolated private static func titlePreview(in entries: [MessageEntry]) -> String? {
+        guard let first = entries.first(where: { $0.role == .user }) else { return nil }
+        let text = first.parts.compactMap { part -> String? in
+            if case .text(_, let text) = part { return text }
+            return nil
+        }.joined(separator: " ")
+        guard let title = normalizedSessionTitle(text) else { return nil }
+        return String(title.prefix(48)) + (title.count > 48 ? "…" : "")
+    }
+
+    nonisolated private static func decodeMetadata(from doc: LoroDoc, chatId: String) -> Projection {
+        let publications = doc.getList(id: "publications")
+        var latest: [LoroValue] = []
+        for index in (0..<publications.len()).reversed() {
+            guard let item = publications.get(index: index),
+                  let value = item.asValue() ?? item.asLoroMap()?.getDeepValue(),
+                  let record = value.mapValue?["record"]?.mapValue,
+                  record["kind"]?.stringValue == "agentSession",
+                  record["value"]?.mapValue?["chatId"]?.stringValue == chatId else { continue }
+            latest = [value]
+            break
+        }
+        var decoded = decodeProjection(from: ["publications": .list(value: latest)],
+                                       chatId: chatId, observedAt: nil)
+        let messages = doc.getList(id: "messages")
+        for index in 0..<messages.len() {
+            guard let item = messages.get(index: index) else { continue }
+            // Check the scalar role before converting a possibly large tool row.
+            let map = item.asLoroMap()
+            let value = item.asValue()
+            let role = value?.mapValue?["role"]?.stringValue ?? map?.get(key: "role")?.asValue()?.stringValue
+            guard role == "user", let value = value ?? map?.getDeepValue(),
+                  let entry = entryFrom(value) else { continue }
+            decoded.previewTitle = titlePreview(in: [entry])
+            break
+        }
+        return decoded
     }
 
     /// Read the raw tail, not joined roots: a terminal continuation can finish a
@@ -391,29 +487,92 @@ final class SessionStore {
 
     // MARK: Command plane (authenticated desktop admission)
 
-    func sendRun(prompt: String, chat: Chat?) {
-        if offline {
-            demoResponder?(prompt)
-            return
-        }
-        let messageId = UUID().uuidString.lowercased()
-        let request = RunRequest(prompt: prompt,
-                                 model: chat?.config?.model,
-                                 reasoning: chat?.config?.reasoning,
-                                 cwd: chat?.cwd ?? "",
-                                 sandbox: chat?.config?.sandbox ?? "workspace-write")
-        stagePendingSend(prompt: prompt, messageId: messageId)
-        sendCommand(.run(request: request, messageId: messageId))
+    @discardableResult
+    func sendRun(prompt: String, chat: Chat?, images: [MobileImageAttachment] = []) async -> Bool {
+        await sendMessage(prompt: prompt, chat: chat, images: images, steer: false)
     }
 
-    func sendSteer(prompt: String) {
-        if offline {
-            demoResponder?(prompt)
-            return
+    @discardableResult
+    func sendSteer(prompt: String, images: [MobileImageAttachment] = []) async -> Bool {
+        await sendMessage(prompt: prompt, chat: nil, images: images, steer: true)
+    }
+
+    private func sendMessage(prompt: String, chat: Chat?, images: [MobileImageAttachment], steer: Bool) async -> Bool {
+        guard !sending, !prompt.isEmpty || !images.isEmpty else { return false }
+        sending = true
+        defer { sending = false }
+        clearSendFailure()
+        let retry = retryDraft.flatMap {
+            $0.prompt == prompt && $0.images.map(\.id) == images.map(\.id) ? $0 : nil
         }
-        let messageId = UUID().uuidString.lowercased()
-        stagePendingSend(prompt: prompt, messageId: messageId)
-        sendCommand(.steer(prompt: prompt, messageId: messageId))
+        if let retry, entries.contains(where: { $0.id == retry.messageId }) {
+            retryDraft = nil
+            return true
+        }
+        var draft = retry ?? SubmittedDraft(messageId: UUID().uuidString.lowercased(), prompt: prompt,
+                                            images: images, steer: steer)
+        if retry != nil, retryIsTerminal {
+            draft.messageId = UUID().uuidString.lowercased()
+            draft.payload = nil
+            draft.steer = steer
+        }
+        submittedDrafts[draft.messageId] = draft
+        do {
+            let missing = images.filter { uploadedImages[$0.id] == nil }
+            if !missing.isEmpty {
+                guard let attachmentUploader else {
+                    throw MobileSessionError.unavailable("This session has no available image upload route.")
+                }
+                let paths = try await attachmentUploader(missing)
+                guard paths.count == missing.count,
+                      paths.allSatisfy({ $0.hasPrefix("/") && !$0.contains("\n") && !$0.contains("\r") }) else {
+                    throw MobileSessionError.unavailable("The host did not commit every attached image.")
+                }
+                for (image, path) in zip(missing, paths) { uploadedImages[image.id] = path }
+            }
+            try Task.checkCancellation()
+            let paths = images.compactMap { uploadedImages[$0.id] }
+            let content = MobileImageAttachment.prompt(prompt, paths: paths)
+            if offline {
+                demoResponder?(content)
+                submittedDrafts.removeValue(forKey: draft.messageId)
+                retryDraft = nil
+                return true
+            }
+            guard let commandSender else {
+                throw MobileSessionError.unavailable("This session has no available desktop command route")
+            }
+            let payload: SessionCommandPayload
+            if let retained = draft.payload {
+                payload = retained
+            } else if draft.steer {
+                payload = .steer(prompt: content, messageId: draft.messageId)
+            } else {
+                var request = RunRequest(prompt: content,
+                                         model: chat?.config?.model,
+                                         reasoning: chat?.config?.reasoning,
+                                         cwd: chat?.cwd ?? "",
+                                         sandbox: chat?.config?.sandbox ?? "workspace-write")
+                request.attachments = paths
+                payload = .run(request: request, messageId: draft.messageId)
+            }
+            draft.payload = payload
+            submittedDrafts[draft.messageId] = draft
+            stagePendingSend(prompt: content, messageId: draft.messageId)
+            try await commandSender(payload)
+            // Projection may report a rejection while admission is suspended.
+            guard retryDraft?.messageId != draft.messageId || sendFailure == nil else { return false }
+            retryDraft = nil
+            return true
+        } catch {
+            // A lost RPC response must not turn an already materialized send
+            // into a second user message on deliberate retry.
+            if entries.contains(where: { $0.id == draft.messageId }) { return true }
+            if retryDraft?.messageId == draft.messageId, sendFailure != nil { return false }
+            reportSendFailure(error is CancellationError ? "Send cancelled. Your draft is still here." : error.localizedDescription,
+                              messageId: draft.messageId)
+            return false
+        }
     }
 
     @discardableResult
@@ -429,8 +588,15 @@ final class SessionStore {
         if pendingSends.count != count { revision &+= 1 }
     }
 
-    func reportSendFailure(_ message: String, messageId: String?) {
-        failedPrompt = pendingSends.first(where: { $0.messageId == messageId })?.text
+    func reportSendFailure(_ message: String, messageId: String?, terminal: Bool = false) {
+        if let messageId, let draft = submittedDrafts.removeValue(forKey: messageId) {
+            retryDraft = draft
+            retryIsTerminal = terminal
+            failedPrompt = draft.prompt
+            failedImages = draft.images
+        } else {
+            failedPrompt = pendingSends.first(where: { $0.messageId == messageId })?.text
+        }
         if let messageId { dropPendingSend(messageId: messageId) }
         sendFailure = message
     }
@@ -438,6 +604,7 @@ final class SessionStore {
     func clearSendFailure() {
         sendFailure = nil
         failedPrompt = nil
+        failedImages = []
     }
 
     func sendInterrupt() {

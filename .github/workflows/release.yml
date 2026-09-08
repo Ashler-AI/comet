@@ -190,6 +190,8 @@ jobs:
       - name: Select checked-in Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - name: Verify desktop session and attachment behavior
+        run: cargo test --locked -p comet-ui --lib
       - name: Package
         run: scripts/package-macos.sh
       - name: Record artifact checksums

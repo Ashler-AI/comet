@@ -92,7 +92,10 @@ enum E2ERunner {
             log("FAIL chat/session store")
             return
         }
-        store.sendRun(prompt: "e2e ping", chat: chat)
+        guard await store.sendRun(prompt: "e2e ping", chat: chat) else {
+            log("FAIL run admission: \(store.sendFailure ?? "unknown")")
+            return
+        }
         log("run queued on \(chatId)")
 
         let entries = await poll(timeout: 30, label: "assistant reply") {
@@ -176,13 +179,24 @@ enum E2ERunner {
                                    deviceId: "viewer", deviceName: "Crew regression")
             let source = LoroDoc()
             let chatMap = source.getMap(id: "chats")
-            for chat in rows {
+            let unrelated = [chat("other-principal-only", spaceId: space.id, archived: false, at: 90),
+                             chat("unclaimed-project-row", spaceId: nil, archived: true, at: 100)]
+            for chat in rows + unrelated {
                 let row = try chatMap.getOrCreateContainer(key: chat.id, child: LoroMap())
                 try row.insert(key: "id", v: chat.id)
                 try row.insert(key: "deviceId", v: chat.deviceId)
+                try row.insert(key: "title", v: chat.title ?? "")
                 try row.insert(key: "archived", v: chat.archived)
                 try row.insert(key: "createdAt", v: chat.createdAt)
                 if let spaceId = chat.spaceId { try row.insert(key: "spaceId", v: spaceId) }
+            }
+            let statuses = source.getMap(id: "sessions")
+            for chat in rows + unrelated {
+                let row = try statuses.getOrCreateContainer(key: chat.id, child: LoroMap())
+                try row.insert(key: "chatId", v: chat.id)
+                try row.insert(key: "deviceId", v: chat.deviceId)
+                try row.insert(key: "status", v: "working")
+                try row.insert(key: "updatedAt", v: Int64(100))
             }
             let refs = source.getMap(id: "sessionRefs")
             for (index, id) in (refIds + ["other-principal-only"]).enumerated() {
@@ -200,6 +214,7 @@ enum E2ERunner {
             guard workspace.addSessionRef(chatId: foreignIds[0])?.chatId == foreignIds[0],
                   Set(workspace.sessionRefs.map(\.chatId)) == Set(refIds),
                   workspace.sessionRefs.count == refIds.count,
+                  Set(workspace.sessions.keys) == Set(rows.map(\.id)),
                   workspace.overviewChats.map(\.id) == probe.overviewChats.map(\.id),
                   workspace.settledChats.map(\.id) == probe.settledChats.map(\.id),
                   Set(workspace.sharedSessionRefs.map(\.chatId)) == Set(foreignIds),
@@ -213,6 +228,19 @@ enum E2ERunner {
                     log("FAIL Crew workspace membership: opaque ID, scoped key, or original timestamp changed")
                     return false
                 }
+            }
+            workspace.rename(chatId: attached.id, title: "  Renamed\n Crew session  ")
+            guard workspace.chats.first(where: { $0.id == attached.id })?.displayTitle == "Renamed Crew session" else {
+                log("FAIL Crew workspace title: rename did not update the displayed title")
+                return false
+            }
+            workspace.removeSessionRef(chatId: attached.id)
+            guard !workspace.chats.contains(where: { $0.id == attached.id }),
+                  workspace.sessions[attached.id] == nil,
+                  workspace.doc.getMap(id: "chats").get(key: attached.id) != nil,
+                  workspace.doc.getMap(id: "chats").get(key: unrelated[0].id) != nil else {
+                log("FAIL Crew workspace membership: removal leaked status or deleted project data")
+                return false
             }
             let environment = SessionEnvironment(
                 source: SessionEnvironmentSource(kind: "scaffold", sandboxId: "visibility-sandbox"),
@@ -310,6 +338,71 @@ enum E2ERunner {
         }
         log("OK Crew attention transitions: input, error, working-only completion; baseline, heartbeat, stale age, exact 45s, replay high-watermark and archived suppression")
         return true
+    }
+
+    /// Uncertain admission must not duplicate a send when its reply is lost,
+    /// even if the session becomes working or the message arrives later.
+    static func runMobileParity() async {
+        let config = AppConfig(edgeURL: URL(string: "http://127.0.0.1:1")!, mode: .dev,
+                               userId: "parity-\(UUID().uuidString)", projectScope: "parity",
+                               deviceId: "viewer", deviceName: "Crew regression")
+        let store = SessionStore(chatId: "parity-retry", config: config)
+        let chat = Chat(id: store.chatId, deviceId: "host", archived: false, cwd: "/tmp", createdAt: 0)
+        var attempts: [SessionCommandPayload] = []
+        store.commandSender = { payload in
+            attempts.append(payload)
+            throw RelayError.timeout
+        }
+        guard !(await store.sendRun(prompt: "keep this draft", chat: chat)),
+              !(await store.sendSteer(prompt: "keep this draft")),
+              attempts.count == 2,
+              attempts[0].messageId == attempts[1].messageId,
+              case .run = attempts[1],
+              let messageId = attempts[0].messageId else {
+            log("FAIL Crew retry changed identity or payload after lost admission reply")
+            return
+        }
+        store.setEntries([MessageEntry(id: messageId, role: .user,
+            parts: [.text(id: "text", text: "keep this draft")], createdAt: nowMs(), deviceId: "host")])
+        guard await store.sendSteer(prompt: "keep this draft"), attempts.count == 2 else {
+            log("FAIL Crew late materialization admitted a duplicate message")
+            return
+        }
+        let metadata = SessionStore(chatId: "parity-metadata", config: config, metadataOnly: true)
+        defer { metadata.stop() }
+        do {
+            let row = try metadata.doc.getList(id: "messages").pushContainer(child: LoroMap())
+            try row.insert(key: "id", v: "first-user")
+            try row.insert(key: "role", v: "user")
+            try row.insert(key: "parts", v: LoroValue.fromJSON([["id": "text", "kind": "text", "text": "  First   user\n title  "]]))
+            metadata.doc.commit()
+            metadata.start()
+            guard await poll(timeout: 5, label: "metadata title", { metadata.previewTitle == "First user title" ? true : nil }) != nil,
+                  metadata.entries.isEmpty else {
+                log("FAIL Crew metadata title required full transcript hydration")
+                return
+            }
+            metadata.activateTranscript()
+            guard await poll(timeout: 5, label: "transcript activation", { metadata.entries.first?.id == "first-user" ? true : nil }) != nil else {
+                log("FAIL Crew metadata navigation failed to activate transcript")
+                return
+            }
+            metadata.updateDeploymentId("another-deployment")
+            guard metadata.entries.isEmpty, metadata.previewTitle == nil,
+                  metadata.doc.getList(id: "messages").len() == 0 else {
+                log("FAIL Crew deployment change reused another room's transcript")
+                return
+            }
+        } catch {
+            log("FAIL Crew metadata regression: \(error.localizedDescription)")
+            return
+        }
+        log("OK Crew mobile parity: uncertain retry identity/payload, late materialization dedupe, metadata-only title, transcript activation, deployment isolation")
+    }
+
+    static func runStoreEviction() async {
+        guard await AppModel.runStoreEvictionRegression() else { return }
+        log("OK Crew store eviction")
     }
 
     private static func poll<T>(timeout: TimeInterval, label: String,

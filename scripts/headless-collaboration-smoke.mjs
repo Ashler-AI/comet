@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import net from "node:net";
 import os from "node:os";
@@ -492,7 +492,7 @@ const main = async () => {
       targetDeviceId: DEVICE_ID,
       sessionId: SESSION_ID,
       lifecycleEpoch: LIFECYCLE_EPOCH,
-      capabilities: ["session.read", "session.control", "session.environment"],
+      capabilities: ["session.read", "session.control", "session.environment", "session.files"],
       ttlSeconds: 60
     })
   });
@@ -562,6 +562,29 @@ const main = async () => {
     `${edgeOrigin.replace("http:", "ws:")}/device/${DEVICE_ID}/ws?role=client&connId=client-b&token=${CLIENT_B_TOKEN}`,
     "authenticated relay client B"
   );
+  // Exercise the mobile upload contract against the real scoped host, not a
+  // permissive local-controller relay. Verify every committed byte on disk.
+  const imageBytes = Buffer.alloc(100_019);
+  for (let index = 0; index < imageBytes.length; index++) imageBytes[index] = index % 251;
+  const uploadId = crypto.randomUUID();
+  let uploadRPC = 40;
+  for (let offset = 0, seq = 0; offset < imageBytes.length; offset += 45_000, seq++) {
+    const reply = await rpcCall(clientA, uploadRPC++, "UploadChunk", {
+      uploadId, seq, sessionId: SESSION_ID,
+      data: imageBytes.subarray(offset, offset + 45_000).toString("base64")
+    });
+    assert.equal(reply.ok, true);
+  }
+  const committed = await rpcCall(clientA, uploadRPC++, "UploadCommit", {
+    uploadId, sessionId: SESSION_ID, fileName: "mobile-image.png"
+  });
+  assert.ok(committed.path.startsWith(dataDir + path.sep));
+  assert.deepEqual(await readFile(committed.path), imageBytes);
+  assert.equal(await expectRelayDenial(clientA, uploadRPC++, "UploadChunk", {
+    uploadId, sessionId: "other-session", data: "AA=="
+  }), "session_scope_denied");
+  console.log("PASS mobile chunk upload committed 100019 byte-identical bytes on scoped Rust host; cross-session upload denied");
+
   const actorDenial = await expectRelayDenial(clientA, 0, "QueueCommand", {
     command: {
       kind: "control",

@@ -5694,6 +5694,7 @@ impl Composer {
                             &engine,
                             cx.background_executor(),
                             host_device_id.as_deref(),
+                            &chat_id,
                             att,
                         )
                         .await
@@ -5886,7 +5887,7 @@ impl Composer {
                     composer.state.update(cx, |s, cx| {
                         s.remove_echo(&err_chat_id, &err_message_id);
                         s.clear_scaffold_chat_starting(&err_chat_id, cx);
-                        if is_new {
+                        if is_new || scaffold_demo {
                             s.cancel_unaccepted_chat(&err_chat_id, cx);
                         }
                         cx.notify();
@@ -6901,6 +6902,81 @@ impl Render for Composer {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    struct RejectedScaffoldCreateRpc;
+
+    #[async_trait::async_trait]
+    impl comet_rpc::RpcService for RejectedScaffoldCreateRpc {
+        async fn handle(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<comet_rpc::RpcReply, RpcError> {
+            match method {
+                methods::LIST_HARNESSES | methods::LIST_HARNESS_COMMANDS => {
+                    comet_rpc::RpcReply::value(&Vec::<serde_json::Value>::new())
+                }
+                methods::CONTROL_SCAFFOLD_ENVIRONMENT if params["operation"] == "create" => {
+                    Err(RpcError::Failed("create rejected before acceptance".into()))
+                }
+                _ => Err(RpcError::UnknownMethod(method.to_owned())),
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn failed_scaffold_first_send_releases_unaccepted_draft(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _runtime_guard = runtime.enter();
+        let state = cx.new(|_| AppState::new());
+        let chat_id = state.update(cx, |state, cx| {
+            state.local_device_id = Some("local".into());
+            state.set_scaffold_scope_for_test("project", "deployment");
+            state.spaces = vec![comet_proto::Space {
+                id: "folder".into(),
+                device_id: "local".into(),
+                path: "/repo".into(),
+                name: None,
+                git_detected: false,
+                git_checked_at: None,
+                checkout_id: None,
+                created_at: chrono::Utc::now(),
+            }];
+            state.selected_space = Some("folder".into());
+            state.start_scaffold_session(comet_proto::ScaffoldDatabaseEnvironment::Local, cx);
+            let chat_id = state.selected_chat.clone().unwrap();
+            state
+                .chats
+                .iter_mut()
+                .find(|chat| chat.id == chat_id)
+                .unwrap()
+                .config = Some(comet_proto::ChatConfig {
+                harness: HarnessId::Omp,
+                model: Some("openai-codex/gpt-6-astra".into()),
+                reasoning: None,
+                agent_account_id: None,
+                model_options: Default::default(),
+                sandbox: SandboxLevel::WorkspaceWrite,
+            });
+            state.set_engine_for_test(EngineHandle::for_test(Arc::new(RejectedScaffoldCreateRpc)));
+            chat_id
+        });
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        composer.update(cx, |composer, cx| {
+            composer.submit_command("start a fresh session", cx)
+        });
+        cx.condition(&composer, |composer, _| {
+            composer.failure.is_some() && !composer.is_sending(&chat_id)
+        })
+        .await;
+        state.update(cx, |state, _| {
+            assert!(state.can_start_scaffold_session());
+            state.apply_chats(Vec::new());
+            assert!(!state.chats.iter().any(|chat| chat.id == chat_id));
+            assert!(state.selected_chat.is_none());
+        });
+    }
 
     fn tooltip_target(range: Range<usize>, path: &str) -> MentionTooltipTarget {
         MentionTooltipTarget {

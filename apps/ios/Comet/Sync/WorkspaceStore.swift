@@ -30,18 +30,20 @@ final class WorkspaceStore {
     }
 
     @ObservationIgnored private var saver: DocSaver?
+    @ObservationIgnored private var createdScaffoldEnvironments: [String: ScaffoldEnvironmentControlResult] = [:]
 
     func start() {
         guard room == nil else { return }
         roomEpoch &+= 1
         let epoch = roomEpoch
         let roomId = "ws4/\(config.projectScope)"
+        let cacheId = config.documentCacheId(roomId: roomId)
         // Local-first: hydrate from the on-device snapshot before joining —
         // the sidebar renders immediately and the join backfills incrementally.
-        if DocDisk.load(into: doc, id: roomId) {
+        if DocDisk.load(into: doc, id: cacheId) {
             project()
         }
-        saver = DocSaver(docId: roomId, doc: doc)
+        saver = DocSaver(docId: cacheId, doc: doc)
         let client = RoomClient(roomId: roomId, doc: doc) { [config] in
             await config.workspaceSocketURL()
         } events: { [weak self] event in
@@ -187,7 +189,7 @@ final class WorkspaceStore {
                          createdAt: m["createdAt"]?.i64Value ?? 0)
         }.sorted { ($0.createdAt, $0.id) < ($1.createdAt, $1.id) }  // creation order, id tiebreak
 
-        chats = (root["chats"]?.mapValue ?? [:]).compactMap { _, v in
+        let projectChats: [Chat] = (root["chats"]?.mapValue ?? [:]).compactMap { _, v in
             guard let m = v.mapValue, let id = m["id"]?.stringValue,
                   let deviceId = m["deviceId"]?.stringValue else { return nil }
             var chatConfig: ChatConfig?
@@ -226,8 +228,14 @@ final class WorkspaceStore {
             return SessionRef(chatId: chatId, addedAt: addedAt,
                               environment: environment)
         }.sorted {
-            ($0.addedAt, $0.chatId) > ($1.addedAt, $1.chatId)
+            if $0.addedAt != $1.addedAt { return $0.addedAt > $1.addedAt }
+            return $0.chatId < $1.chatId
         }
+        // The project room is shared, but sidebar membership is per principal,
+        // exactly like WorkspaceHost::retain_visible_sessions. Never mutate
+        // other project rows to implement this presentation boundary.
+        let memberIds = Set(sessionRefs.map(\.chatId))
+        chats = projectChats.filter { memberIds.contains($0.id) }
 
 
         var rows: [String: SessionRow] = [:]
@@ -235,6 +243,7 @@ final class WorkspaceStore {
             guard let m = v.mapValue, let chatId = m["chatId"]?.stringValue,
                   let deviceId = m["deviceId"]?.stringValue,
                   let statusStr = m["status"]?.stringValue,
+                  memberIds.contains(chatId),
                   let status = SessionStatus(rawValue: statusStr) else { continue }
             rows[chatId] = SessionRow(chatId: chatId, deviceId: deviceId, status: status,
                                       startedAt: m["startedAt"]?.i64Value,
@@ -368,12 +377,10 @@ final class WorkspaceStore {
         return reply.chatId
     }
 
-    /// Create, attach, and start a Scaffold-hosted OMP session through the
-    /// selected desktop controller. The desktop remains the trusted control
-    /// plane client; iOS never receives sandbox bootstrap credentials.
-    func launchScaffoldSession(space: Space, prompt: String,
-                               launch: ScaffoldLaunchConfig) async throws -> (String, ScaffoldControlRoute) {
-        let chatId = UUID().uuidString.lowercased()
+    /// Prepare a Scaffold route before uploading attachments or admitting the
+    /// first run. A failed attach/upload retry retains the created environment.
+    func prepareScaffoldSession(space: Space, chatId: String,
+                                launch: ScaffoldLaunchConfig) async throws -> ScaffoldControlRoute {
         let requestedScope: [String: Any] = [
             "projectId": config.projectScope,
             "deploymentId": config.projectScope,
@@ -385,17 +392,23 @@ final class WorkspaceStore {
             "fallback": "disabled",
             "routingMode": "automatic",
         ]
-        let create: ScaffoldEnvironmentControlResult = try await relay(for: space.deviceId).call(
-            method: "ControlScaffoldEnvironment",
-            params: [
-                "operation": "create",
-                "scope": requestedScope,
-                "source_ref": launch.sourceRef,
-                "database_environment": launch.databaseEnvironment.rawValue,
-                "agentRoute": agentRoute,
-            ],
-            timeoutNanoseconds: 30_000_000_000
-        )
+        let create: ScaffoldEnvironmentControlResult
+        if let existing = createdScaffoldEnvironments[chatId] {
+            create = existing
+        } else {
+            create = try await relay(for: space.deviceId).call(
+                method: "ControlScaffoldEnvironment",
+                params: [
+                    "operation": "create",
+                    "scope": requestedScope,
+                    "source_ref": launch.sourceRef,
+                    "database_environment": launch.databaseEnvironment.rawValue,
+                    "agentRoute": agentRoute,
+                ],
+                timeoutNanoseconds: 30_000_000_000
+            )
+            createdScaffoldEnvironments[chatId] = create
+        }
         guard create.environment.source.kind == "scaffold",
               let sandboxId = create.environment.source.sandboxId else {
             throw MobileSessionError.unavailable("Scaffold returned an invalid environment")
@@ -442,14 +455,7 @@ final class WorkspaceStore {
             projection: projection,
             environment: attachment.environment
         )
-        let request = RunRequest(prompt: prompt, model: chatConfig.model,
-                                 reasoning: chatConfig.reasoning, cwd: ".",
-                                 sandbox: "workspace-write")
-        try await queueScaffoldCommand(
-            route: route, payload: .run(request: request,
-                                       messageId: UUID().uuidString.lowercased())
-        )
-        return (chatId, route)
+        return route
     }
 
     /// Ordinary commands must be admitted on their actual host. A different
@@ -478,7 +484,7 @@ final class WorkspaceStore {
             method: "QueueCommand",
             params: [
                 "chatId": chatId,
-                "commandId": UUID().uuidString.lowercased(),
+                "commandId": payload.messageId ?? UUID().uuidString.lowercased(),
                 "command": command,
             ]
         )
@@ -487,6 +493,11 @@ final class WorkspaceStore {
     func sendScaffoldCommand(controllerDeviceId: String,
                              environment: SessionEnvironment,
                              payload: SessionCommandPayload) async throws {
+        let route = try await scaffoldRoute(controllerDeviceId: controllerDeviceId, environment: environment)
+        try await queueScaffoldCommand(route: route, payload: payload)
+    }
+
+    func scaffoldRoute(controllerDeviceId: String, environment: SessionEnvironment) async throws -> ScaffoldControlRoute {
         guard environment.source.kind == "scaffold",
               let sandboxId = environment.source.sandboxId else {
             throw MobileSessionError.unavailable("This session has no Scaffold route")
@@ -510,7 +521,35 @@ final class WorkspaceStore {
             environment: attachment.environment
         )
         _ = addSessionRef(chatId: projection.sessionId, environment: attachment.environment)
-        try await queueScaffoldCommand(route: route, payload: payload)
+        return route
+    }
+
+    func uploadImages(_ images: [MobileImageAttachment], chatId: String, deviceId: String) async throws -> [String] {
+        struct OkReply: Decodable { var ok: Bool }
+        struct CommitReply: Decodable { var path: String }
+        var paths: [String] = []
+        for image in images {
+            let uploadId = UUID().uuidString.lowercased()
+            for (seq, offset) in stride(from: 0, to: image.bytes.count, by: 45_000).enumerated() {
+                try Task.checkCancellation()
+                let end = min(offset + 45_000, image.bytes.count)
+                let reply: OkReply = try await relay(for: deviceId).call(
+                    method: "UploadChunk",
+                    params: ["uploadId": uploadId, "seq": seq, "sessionId": chatId,
+                             "data": image.bytes[offset..<end].base64EncodedString()],
+                    timeoutNanoseconds: 90_000_000_000
+                )
+                guard reply.ok else { throw MobileSessionError.unavailable("The host rejected an image chunk") }
+            }
+            try Task.checkCancellation()
+            let reply: CommitReply = try await relay(for: deviceId).call(
+                method: "UploadCommit",
+                params: ["uploadId": uploadId, "fileName": image.filename, "sessionId": chatId],
+                timeoutNanoseconds: 180_000_000_000
+            )
+            paths.append(reply.path)
+        }
+        return paths
     }
 
     private func attachScaffoldEnvironment(controllerDeviceId: String, sandboxId: String,
@@ -590,7 +629,7 @@ final class WorkspaceStore {
             method: "QueueCommand",
             params: [
                 "chatId": route.projection.sessionId,
-                "commandId": UUID().uuidString.lowercased(),
+                "commandId": payload.messageId ?? UUID().uuidString.lowercased(),
                 "command": command,
             ],
             timeoutNanoseconds: 30_000_000_000
@@ -694,7 +733,9 @@ final class WorkspaceStore {
             try row.insert(key: "config", v: value)
         }
         doc.commit()
-        project()
+        guard addSessionRef(chatId: chatId) != nil else {
+            throw MobileSessionError.unavailable("Couldn’t save this session’s membership")
+        }
     }
 
     /// Create a space. Preferred path: `Mutate {op:createSpace}` straight to
