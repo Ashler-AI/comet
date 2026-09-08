@@ -30,7 +30,7 @@ bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
 xcodebuild -project Comet.xcodeproj -scheme Comet \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 
-# Staging: Crew Staging, ai.ashler.crew.staging, version 1.0 build 11
+# Staging: Crew Staging, ai.ashler.crew.staging, version 1.0 build 12
 xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 ```
@@ -374,21 +374,36 @@ An isolated real Edge/Rust host relay committed **100,019 byte-identical bytes**
 45 KB chunks, denied another session's upload, and retained grant-revocation behavior.
 The full edge suite passed **137 tests**. These are local simulator/isolated-host
 proofs, not a physical-phone or live Scaffold image-send claim.
-Two local `xcodebuild` runs produced the simulator app used above. The later
-rebuild included `runMobileParity`, and its installed app logged that probe's
-success. Both builds preceded the active-store eviction guard. Those local
-builds were performed despite the active no-local-typecheck instruction; they
-are not precedent authorizing another local compile-based verification run.
+The final source was subsequently compiled and exercised entirely in authorized
+remote CI. [Mobile run 34179062008](https://github.com/Ashler-AI/comet/actions/runs/34179062008)
+built commit `4f8c10d94020ff3d7600fff9a08b99af8be31953` on arm64 with Xcode 26.6
+and iOS SDK 26.5. All five probes passed, including **OK Crew store eviction**;
+the Release-Staging archive succeeded with production APNs in its ad-hoc signature.
+The downloaded simulator binary, identified as build 12, also passed all five
+probes and rendered the session list locally without recompilation.
 
-The eviction guard passed syntax parsing only. The final source has not been
-runtime-verified and is not release-ready. The local iOS toolchain is available;
-the restriction is policy, not missing tooling. Authorized remote build/runtime
-verification is required before release. The desktop visibility and upload-signature
-changes also remain Rust compile/test-unverified.
+[Desktop release 34178218428](https://github.com/Ashler-AI/comet/actions/runs/34178218428)
+compiled and passed **532 UI tests**, packaged **0.1.76**, and published staging.
+Its source is `7dd1222a8f098a961866623a8203a8f45b58aa31`; the later mobile-only
+regression inference and archive packaging fixes do not change desktop/edge source.
+The production publication job was skipped; no active desktop engine was restarted.
 
-The parity changes require a new mobile build and the scoped-upload edge change.
-They have not been uploaded to TestFlight or deployed. The previous desktop 0.1.75
-release published staging; its production publication job was skipped.
+[Backend deployment 34178218455](https://github.com/Ashler-AI/comet/actions/runs/34178218455)
+passed remote typechecking, the 137 tests, and real scoped-host upload/revocation
+smoke, then deployed staging Worker **8b5a9c92-7678-4b2a-89a9-ffd5cccb217b**.
+The staging health endpoint returned `ok: true`; production deployment was skipped.
+
+The downloaded mobile archive was locally exported for distribution signing,
+without compilation. The **Crew Staging 1.0 (12)** inspection IPA passed strict
+signature verification; its signature and provisioning profile both contain
+`aps-environment = production` and `825LYXGJR6.ai.ashler.crew.staging`.
+Inspection IPA SHA-256: `36d045233715d1daad37cdf3141bd18e7affb4b9380cd71f0803fd26edb29ef2`.
+The same archive uploaded successfully at **2026-09-08 02:21:32 UTC**, delivery
+`ecc19154-6e66-405a-8f0d-33473c70bf09`, with no upload errors or warnings.
+Apple reported the uploaded package processing. Processing completion and tester
+group availability are not yet confirmed: the App Store Connect browser session
+requires sign-in. No physical-iPhone installation or image/notification delivery
+is claimed. No local typechecks or compilation ran during this authorized rollout.
 
 ## Architecture
 
