@@ -425,9 +425,17 @@ Desktop **0.1.78** passed 532 UI tests and all three fork regressions in
 [34236389287](https://github.com/Ashler-AI/comet/actions/runs/34236389287), including
 the large-journal fix from main `14f4344`. Its production promotion was cancelled
 before publication when another session advanced main and began staging
-**0.1.79**. The final desktop-only production preparation is **0.1.80**, based on
+**0.1.79**. The final desktop-only production release is **0.1.80**, based on
 main `0c99f65`, including the newer accepted-session cleanup fixes. This avoids
 moving staging backward and does not promote the other run's Linux artifacts.
+[34239638163](https://github.com/Ashler-AI/comet/actions/runs/34239638163) built
+`634b6143bb3c9fcf512071af97360cd999cb164f`, passed **534 UI tests** and all
+**3 fork regressions**, then promoted a byte-identical staging candidate to
+production. The production channel readback returned **0.1.80**, the same
+source SHA, and matching manifest/checksums. The downloaded package passed
+checksum verification and rendered the Crew login surface in an isolated
+local smoke instance; that instance was then stopped. Existing desktop
+engines and production Scaffold/Linux channels were not changed by this release.
 
 Production mobile **1.0 (6)** was compiled and passed all five probes in
 [34236389108](https://github.com/Ashler-AI/comet/actions/runs/34236389108) at
