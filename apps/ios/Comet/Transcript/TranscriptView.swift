@@ -45,120 +45,126 @@ struct TranscriptView: View {
 
     var body: some View {
         let rows = builder.rows
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(rows) { row in
-                    rowView(row).id(row.id)
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(rows) { row in
+                        rowView(row).id(row.id)
+                    }
+                    Color.clear.frame(height: 44)  // bottom pad clears the fade + floating status strip
+                        .id(Anchor.bottom)
                 }
-                Color.clear.frame(height: 44)  // bottom pad clears the fade + floating status strip
-                    .id(Anchor.bottom)
+                .frame(maxWidth: Self.maxContentWidth)
+                .frame(maxWidth: .infinity)
             }
-            .scrollTargetLayout()
-            .frame(maxWidth: Self.maxContentWidth)
-            .frame(maxWidth: .infinity)
-        }
-        .scrollPosition($scrollPosition)
-        .defaultScrollAnchor(.bottom)
-        // Held invisible until it has settled at the bottom, then faded in.
-        // The settling itself is unavoidable (see settleToBottom) — what is
-        // avoidable is WATCHING it: painting mid-settle is what read as the
-        // transcript sliding on load.
-        .opacity(settled ? 1 : 0)
-        .motionAnimation(Motion.fadeQuick, value: settled)
-        .background(Theme.bg)
-        .task(id: store.revision) {
-            await builder.update(revision: store.revision, entries: store.entries,
-                                 pendingSends: store.pendingSends)
-        }
-        .task(id: rows.isEmpty) {
-            // Recreated lazy stacks need bottom correction even with warm rows;
-            // only a never-revealed transcript waits invisibly for that layout.
-            guard !rows.isEmpty else { return }
-            if !store.hasRevealed { settled = false }
-            await settleToBottom()
-        }
-        .onScrollGeometryChange(for: CGFloat.self) { $0.contentSize.height } action: { _, new in
-            contentHeight = new
-        }
-        .onScrollPhaseChange { _, newPhase in
-            // Desktop rule: the pin breaks only on USER input (wheel-up/drag),
-            // never on streaming growth. Phases track the gesture.
-            userScrolling = newPhase == .interacting || newPhase == .decelerating
-        }
-        .onScrollGeometryChange(for: CGFloat.self) { geo in
-            max(0, geo.contentSize.height + geo.contentInsets.bottom - geo.containerSize.height - geo.contentOffset.y)
-        } action: { old, new in
-            distanceFromBottom = new
-            if userScrolling, new > old + 1, new > 2 {
-                pinned = false
-            } else if !pinned, new <= Self.stickThreshold, new < old {
-                // Re-stick only when moving TOWARD the bottom inside the 70pt
-                // band, else the pin would be unbreakable.
-                pinned = true
+            .scrollPosition($scrollPosition)
+            .defaultScrollAnchor(.bottom)
+            // Held invisible until it has settled at the bottom, then faded in.
+            // The settling itself is unavoidable (see settleToBottom) — what is
+            // avoidable is WATCHING it: painting mid-settle is what read as the
+            // transcript sliding on load.
+            .opacity(settled ? 1 : 0)
+            .motionAnimation(Motion.fadeQuick, value: settled)
+            .background(Theme.bg)
+            .task(id: store.revision) {
+                await builder.update(
+                    revision: store.revision, entries: store.entries,
+                    pendingSends: store.pendingSends)
             }
-        }
-        .onChange(of: contentSignature(rows)) {
-            guard settled, pinned else { return }
-            if reduceMotion {
-                scrollPosition.scrollTo(edge: .bottom)
-            } else {
-                withAnimation(.spring(duration: 0.3)) {
-                    scrollPosition.scrollTo(edge: .bottom)
-                }
+            .task(id: rows.isEmpty) {
+                // Recreated lazy stacks need bottom correction even with warm rows;
+                // only a never-revealed transcript waits invisibly for that layout.
+                guard !rows.isEmpty else { return }
+                if !store.hasRevealed { settled = false }
+                await settleToBottom(proxy: proxy)
             }
-        }
-        .overlay(alignment: .top) {
-            // Soft fade under the nav bar — content dissolves instead of
-            // hard-clipping against the header.
-            LinearGradient(
-                stops: [
-                    .init(color: Theme.bg, location: 0),
-                    .init(color: Theme.bg.opacity(0.85), location: 0.45),
-                    .init(color: Theme.bg.opacity(0), location: 1),
-                ],
-                startPoint: .top, endPoint: .bottom
-            )
-            .frame(height: 130)
-            .ignoresSafeArea(edges: .top)
-            .allowsHitTesting(false)
-        }
-        .overlay(alignment: .bottom) {
-            // Short ramp that reaches FULL bg at the bottom edge — content
-            // dissolves completely beneath the floating status strip, but the
-            // fade starts low enough that message bottoms stay legible.
-            LinearGradient(
-                stops: [
-                    .init(color: Theme.bg.opacity(0), location: 0),
-                    .init(color: Theme.bg.opacity(0.55), location: 0.45),
-                    .init(color: Theme.bg, location: 0.9),
-                    .init(color: Theme.bg, location: 1),
-                ],
-                startPoint: .top, endPoint: .bottom
-            )
-            .frame(height: 44)
-            .allowsHitTesting(false)
-        }
-        .overlay(alignment: .bottomTrailing) {
-            // Jump-to-bottom floats ABOVE the fades.
-            if distanceFromBottom > Self.jumpThreshold {
-                Button {
+            .onScrollGeometryChange(for: CGFloat.self) {
+                $0.contentSize.height
+            } action: { _, new in
+                contentHeight = new
+            }
+            .onScrollPhaseChange { _, newPhase in
+                // Desktop rule: the pin breaks only on USER input (wheel-up/drag),
+                // never on streaming growth. Phases track the gesture.
+                userScrolling = newPhase == .interacting || newPhase == .decelerating
+            }
+            .onScrollGeometryChange(for: CGFloat.self) { geo in
+                max(
+                    0,
+                    geo.contentSize.height + geo.contentInsets.bottom - geo.containerSize.height - geo.contentOffset.y)
+            } action: { old, new in
+                distanceFromBottom = new
+                if userScrolling, new > old + 1, new > 2 {
+                    pinned = false
+                } else if !pinned, new <= Self.stickThreshold, new < old {
+                    // Re-stick only when moving TOWARD the bottom inside the 70pt
+                    // band, else the pin would be unbreakable.
                     pinned = true
-                    withAnimation(.spring(duration: 0.35)) {
+                }
+            }
+            .onChange(of: contentSignature(rows)) {
+                guard settled, pinned else { return }
+                if reduceMotion {
+                    scrollPosition.scrollTo(edge: .bottom)
+                } else {
+                    withAnimation(.spring(duration: 0.3)) {
                         scrollPosition.scrollTo(edge: .bottom)
                     }
-                } label: {
-                    Image(systemName: "arrow.down")
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundStyle(Theme.text)
-                        .frame(width: 36, height: 36)
                 }
-                .glassEffect(.regular.interactive(), in: Circle())
-                .padding(.trailing, 16)
-                .padding(.bottom, 12)
-                .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
+            .overlay(alignment: .top) {
+                // Soft fade under the nav bar — content dissolves instead of
+                // hard-clipping against the header.
+                LinearGradient(
+                    stops: [
+                        .init(color: Theme.bg, location: 0),
+                        .init(color: Theme.bg.opacity(0.85), location: 0.45),
+                        .init(color: Theme.bg.opacity(0), location: 1),
+                    ],
+                    startPoint: .top, endPoint: .bottom
+                )
+                .frame(height: 130)
+                .ignoresSafeArea(edges: .top)
+                .allowsHitTesting(false)
+            }
+            .overlay(alignment: .bottom) {
+                // Short ramp that reaches FULL bg at the bottom edge — content
+                // dissolves completely beneath the floating status strip, but the
+                // fade starts low enough that message bottoms stay legible.
+                LinearGradient(
+                    stops: [
+                        .init(color: Theme.bg.opacity(0), location: 0),
+                        .init(color: Theme.bg.opacity(0.55), location: 0.45),
+                        .init(color: Theme.bg, location: 0.9),
+                        .init(color: Theme.bg, location: 1),
+                    ],
+                    startPoint: .top, endPoint: .bottom
+                )
+                .frame(height: 44)
+                .allowsHitTesting(false)
+            }
+            .overlay(alignment: .bottomTrailing) {
+                // Jump-to-bottom floats ABOVE the fades.
+                if distanceFromBottom > Self.jumpThreshold {
+                    Button {
+                        pinned = true
+                        withAnimation(.spring(duration: 0.35)) {
+                            scrollPosition.scrollTo(edge: .bottom)
+                        }
+                    } label: {
+                        Image(systemName: "arrow.down")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(Theme.text)
+                            .frame(width: 36, height: 36)
+                    }
+                    .glassEffect(.regular.interactive(), in: Circle())
+                    .padding(.trailing, 16)
+                    .padding(.bottom, 12)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+                }
+            }
+            .motionAnimation(Motion.fadeQuick, value: distanceFromBottom > Self.jumpThreshold)
         }
-        .motionAnimation(Motion.fadeQuick, value: distanceFromBottom > Self.jumpThreshold)
     }
 
     /// Hold the bottom until layout stops moving, then reveal.
@@ -175,17 +181,19 @@ struct TranscriptView: View {
     /// case) so a pathological reflow can't spin, and it yields the moment the
     /// user takes the scroll view — their drag wins. `settled` flips either way,
     /// so the transcript can never be left invisible.
-    private func settleToBottom() async {
+    private func settleToBottom(proxy: ScrollViewProxy) async {
+        // Cancellation (including an empty projection) must never strand the
+        // current view at zero opacity. Only completed settling marks the store.
+        defer { settled = true }
         var lastHeight: CGFloat = -1
         for _ in 0..<16 {
             guard !Task.isCancelled else { return }
             guard pinned, !userScrolling else { break }
-            scrollPosition.scrollTo(id: Anchor.bottom, anchor: .bottom)
+            proxy.scrollTo(Anchor.bottom, anchor: .bottom)
             if contentHeight == lastHeight, distanceFromBottom <= 1 { break }
             lastHeight = contentHeight
             do { try await Task.sleep(nanoseconds: 30_000_000) } catch { return }
         }
-        settled = true
         store.hasRevealed = true
     }
 

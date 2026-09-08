@@ -58,20 +58,28 @@ Session projection reads transcript messages and the latest matching publication
 not the entire command ledger, and unchanged inputs do not rebuild rows. Cold
 markdown row preparation runs on a worker actor. The three most recently opened
 live sessions retain their parsed rows; deployment changes reset them. A typed
-bottom target corrects cold and warm navigation to the actual final message.
+bottom-pad ID, reached through `ScrollViewReader`, corrects navigation without
+marking every transcript row as a scroll target. Cancelled settling always
+restores view opacity; it does not mark the store as successfully revealed.
 
 Release-Staging simulator verification (iPhone 17 Pro, iOS 26.5):
 
-- A 600-session list/context pass measured 1.85 ms with the former filtering and
+- A 600-session list/context pass measured 2.97 ms with the former filtering and
   lookup path versus 0.09 ms with retained indexes, with matching row context.
-- A cached 500-turn/1,000-message session returned from `start()` in 0.113 ms on
-  the main actor; the complete projection was ready in 54.99 ms.
-- The 5,000-row cold parse measured 46.72 ms synchronously versus 64.55 ms total
-  on the worker; the benefit is UI availability, not less total parsing work.
-  The main-actor heartbeat's largest gap during that worker run was 8.80 ms.
-  Retained-cache access on reopen measured 0.0010 ms (not total navigation time).
+- A cached 500-turn/1,000-message session returned from `start()` in 0.126 ms on
+  the main actor; the complete projection was ready in 80.37 ms.
+- The benchmark now warms the same worker/task runtime, then clears its parser
+  memos before measuring the full cold history. The 5,000-row parse measured
+  49.60 ms synchronously versus 82.45 ms total on the warmed worker; this moves
+  work off the UI actor, not out of the process. Heartbeat maximum gaps measured
+  11.04/5.78/2.63 ms with 1/16/46 ticks at 50/200/500 turns. These scheduling
+  samples do not establish device frame rates or eliminate every UI stall;
+  earlier un-warmed heartbeat readings included startup/scheduling noise.
+  Retained-cache access on reopen measured 0.0011 ms (not total navigation time).
 - Native list swipes rendered later rows; tapping and reopening the long
   conversation displayed its final pass-499 message, without a jump button.
+  A subsequent launch verified the same final message without whole-stack scroll
+  target tracking, using only simulator launch and screenshot commands.
 - Existing visibility, attention, mobile parity and store-eviction scenarios
   passed, as did hydration cancellation, deployment isolation and unchanged
   projection checks. OpenCode findings were fixed and the final review reported

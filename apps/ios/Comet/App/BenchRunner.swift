@@ -73,6 +73,12 @@ enum BenchRunner {
 
         // Stage 4 — cold preparation on the worker, with a main-actor heartbeat.
         let cache = TranscriptBuilderCache()
+        // Exercise this worker and the task runtime before collecting timing.
+        // Clearing its rows at a new revision also clears parser memos, so the
+        // measured history remains a cold parse rather than a warmed-cache hit.
+        await cache.update(revision: 0, entries: Array(entries.prefix(2)), pendingSends: [])
+        await cache.update(revision: 1, entries: [], pendingSends: [])
+        try? await Task.sleep(nanoseconds: 10_000_000)
         let heartbeat = Task { @MainActor in
             var ticks = 0
             var largestGap = 0.0
@@ -88,13 +94,13 @@ enum BenchRunner {
         }
         await Task.yield()
         let started = CFAbsoluteTimeGetCurrent()
-        await cache.update(revision: 1, entries: entries, pendingSends: [])
+        await cache.update(revision: 2, entries: entries, pendingSends: [])
         let prepared = (CFAbsoluteTimeGetCurrent() - started) * 1000
         heartbeat.cancel()
         let (ticks, largestGap) = await heartbeat.value
         let cached = best(5) { _ = cache.rows.count }
         let reopened = CFAbsoluteTimeGetCurrent()
-        await cache.update(revision: 1, entries: entries, pendingSends: [])
+        await cache.update(revision: 2, entries: entries, pendingSends: [])
         let reopenMs = (CFAbsoluteTimeGetCurrent() - reopened) * 1000
 
         log("--- \(turns) turns · \(entries.count) entries · \(rowCount) rows · \(bytes / 1024) KB snapshot")
@@ -102,8 +108,8 @@ enum BenchRunner {
         log(String(format: "decode raw              %8.2f ms", decode))
         log(String(format: "row build cold sync     %8.2f ms", cold))
         log(String(format: "row build warm sync     %8.2f ms", warm))
-        log(String(format: "row prepare off-main    %8.2f ms", prepared))
-        log(String(format: "main heartbeat max gap  %8.2f ms · %d ticks", largestGap, ticks))
+        log(String(format: "row prepare warmed worker %8.2f ms", prepared))
+        log(String(format: "warmed heartbeat max gap %8.2f ms · %d ticks", largestGap, ticks))
         log(String(format: "retained reopen         %8.4f ms", reopenMs))
         log(String(format: "scroll row access       %8.4f ms", cached))
     }
