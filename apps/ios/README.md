@@ -421,11 +421,37 @@ invite scheme, version, architecture, and archive push entitlement. No Apple
 credentials are uploaded to CI: distribution export, signed-IPA inspection,
 and upload use the established local Xcode account flow above.
 
-Desktop **0.1.78** includes the large-journal fork fix from main commit
-`14f4344`, so it requires a new verified candidate rather than promotion of
-staging **0.1.76**. Backend recovery and scoped-upload changes require the
-normal staged production deploy. Scaffold runtime version and Linux release
-channels remain unchanged.
+Desktop **0.1.78** passed 532 UI tests and all three fork regressions in
+[34236389287](https://github.com/Ashler-AI/comet/actions/runs/34236389287), including
+the large-journal fix from main `14f4344`. Its production promotion was cancelled
+before publication when another session advanced main and began staging
+**0.1.79**. The final desktop-only production preparation is **0.1.80**, based on
+main `0c99f65`, including the newer accepted-session cleanup fixes. This avoids
+moving staging backward and does not promote the other run's Linux artifacts.
+
+Production mobile **1.0 (6)** was compiled and passed all five probes in
+[34236389108](https://github.com/Ashler-AI/comet/actions/runs/34236389108) at
+`d7a548a70e29367d533d7ba1207815d9cfd67ca8`. The downloaded simulator app passed
+the same probes locally and visibly rendered detached and archived sessions.
+The later main changes are desktop-only; no additional mobile archive is needed.
+The distribution-signed inspection IPA passed strict signature verification;
+both its signature and profile contain production APNs and
+`825LYXGJR6.ai.ashler.crew`. Its SHA-256 is
+`df102ff052785a25dd5925503bb4338c39256eaa99ab8f63b33731af8fd3840b`.
+Apple accepted the upload at **2026-09-08 14:32:34 UTC**, delivery
+`1e919453-4b14-4f99-8aad-4e6cff7e7264`, with no errors or warnings.
+The actual uploaded IPA also passed strict signature verification and preserves
+production APNs; its SHA-256 is
+`b88f40ede84d414df287d05db6fd6cb4c9cf01fb87deba4bb6dde737bfc6fd56`.
+Apple processing completion, tester availability, physical-phone installation,
+and device notification/image delivery are not yet verified for build 6.
+
+[Backend run 34236389366](https://github.com/Ashler-AI/comet/actions/runs/34236389366)
+passed remote typechecking, 137 tests, byte-identical scoped image upload,
+cross-session denial, and host revocation before deploying the exact staged
+candidate to production as **14510f54-5185-430f-9719-6e9a803e7f3d**. Production
+and staging health endpoints returned `ok: true`. No local compilation or
+typechecks ran, and no active desktop engine was restarted by this rollout.
 
 On 2026-09-08, production Worker secret-name inspection found no `APNS_KEY_ID`
 or `APNS_PRIVATE_KEY`. Production background pushes require approved production
