@@ -222,8 +222,11 @@ upload **Complete** at **11:23 AM**, with access assigned to **Ashler Internal**
 That group's one internal tester remains **Invited**, with no install/session
 recorded. No physical-device installation or notification delivery is claimed.
 Production notification code was deployed through the staging-verified workflow
-after direct integration into main. Background APNs delivery remains blocked on
-approved production credentials; code deployment alone does not enable pushes.
+after direct integration into main. At that time, background APNs delivery was
+blocked on approved production credentials. The September 8
+[production parity activation](#production-parity-release) below provisioned
+them and verified registration and provider authorization; code deployment alone
+had not enabled pushes.
 The temporary manual typecheck-bypass input was removed after review. Both push
 and manual deployment candidates again require the TypeScript check; agent policy
 does not change the release pipeline's requirements.
@@ -451,10 +454,11 @@ Apple accepted the upload at **2026-09-08 14:32:34 UTC**, delivery
 The actual uploaded IPA also passed strict signature verification and preserves
 production APNs; its SHA-256 is
 `b88f40ede84d414df287d05db6fd6cb4c9cf01fb87deba4bb6dde737bfc6fd56`.
-Apple processing completion, tester availability, physical-phone installation,
-and device notification/image delivery are not yet verified for build 6.
-Both existing App Store Connect browser tabs subsequently showed Apple Account
-sign-in (one with `authResult=FAILED`); confirmation requires interactive sign-in.
+Authenticated App Store Connect inspection subsequently confirmed upload
+**Complete** for **1.0 (6)**, **Ready to Submit** in the general build list, and
+**Testing** in **Ashler Internal**. The group's one tester remains **Invited**;
+no physical-phone installation, sessions, or device notification/image delivery
+is claimed.
 
 [Backend run 34236389366](https://github.com/Ashler-AI/comet/actions/runs/34236389366)
 passed remote typechecking, 137 tests, byte-identical scoped image upload,
@@ -464,15 +468,37 @@ and staging health endpoints returned `ok: true`. No local compilation or
 typechecks ran, and no active desktop engine was restarted by this rollout.
 
 On 2026-09-08, secret-name checks from `edge` with explicit
-`--config wrangler.jsonc --env production` confirmed that production lacks
-`APNS_KEY_ID`, `APNS_PRIVATE_KEY`, and `NOTIFICATION_CREDENTIAL_KEY`; the matching
-staging check lists all three. The last key encrypts stored notification renewal
-credentials: without it, registration returns HTTP 503
-`notification_credential_invalid_configuration`, before APNs authorization.
-Production background pushes require approved APNs signing credentials and a
-production-specific credential-encryption key. Deploying source or distributing
-a push-entitled app does not provision these secrets. Staging credentials are
-not implicitly authorized for copying.
+`--config wrangler.jsonc --env production` initially found no `APNS_KEY_ID`,
+`APNS_PRIVATE_KEY`, or `NOTIFICATION_CREDENTIAL_KEY`; staging listed all three.
+After user approval, a separate random 32-byte production
+`NOTIFICATION_CREDENTIAL_KEY` was generated in memory and uploaded via stdin.
+Explicit production secret-name readback confirmed it exists, and `/health`
+returned `ok: true`. It was not copied from staging or retained in a local file.
+
+The existing Apple Developer profile was used after the user enabled Chrome
+scripting. Apple registered **Crew Production Notifications**, key
+**`LJJWQWK6LS`**, for team **`825LYXGJR6`**: **APNs only**, **Production**, and
+**Topic Specific** for **`ai.ashler.crew`**. The one-time P-256 private key was
+downloaded, secured, and installed with `APNS_KEY_ID` in one production Worker
+secret-bulk update. Readback confirms all three notification secrets exist.
+The existing staging key **`99D9D7GGF4`** and staging secrets were unchanged.
+An owner-only local key backup was retained; temporary and Downloads copies
+were removed. Secret values were neither printed nor committed.
+
+Production activation is Worker version **`a0cb060b-a1a7-4441-a368-02031774d672`**.
+Using the ordinary production Crew OAuth flow, a disposable non-deliverable
+device registration returned **200 `{ok:true}`**; immediate DELETE also returned
+**200 `{ok:true}`**. This exercised deployed credential encryption and APNs
+token signing, then removed the registration. The isolated local login was
+logged out and its saved credential removed; active Crew engines were untouched.
+
+A direct production APNs negative-control probe returned **403
+`InvalidProviderToken`** for an intentionally invalid signature. The real key
+returned **400 `BadDeviceToken`** for the same all-zero sentinel token, receipt
+`E8DDE581-F55B-14B2-5BB0-7F7DCBCE2425`. This verifies provider authorization,
+not successful push delivery: no notification was sent to a real device.
+Foreground registration and attention-notification display/tap routing on an
+installed production iPhone remain the end-to-end device check.
 
 ## Architecture
 
