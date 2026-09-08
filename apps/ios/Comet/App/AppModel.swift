@@ -28,6 +28,19 @@ final class AppModel {
     var demo: DemoDataset?
     private var demoSessionRefs: [SessionRef] = []
     private var sessionStores: [String: SessionStore] = [:]
+    @ObservationIgnored private var metadataReaders: [String: Int] = [:]
+    @ObservationIgnored private var metadataOnlyStores: Set<String> = []
+    @ObservationIgnored private var recentTranscriptIds: [String] = []
+    @ObservationIgnored private var pendingMetadataReleases: Set<String> = []
+    @ObservationIgnored private var metadataReleaseTask: Task<Void, Never>?
+    @ObservationIgnored private var metadataReleaseDeadline: UInt64?
+    private struct ListMetadata {
+        var deploymentId: String?
+        var environment: SessionEnvironment?
+        var previewTitle: String?
+        var session: SessionRow?
+    }
+    private var listMetadata: [String: ListMetadata] = [:]
     private var config: AppConfig?
     let notifications = SessionNotifications.shared
 
@@ -106,6 +119,7 @@ final class AppModel {
         }
         if args.contains("-demo") {
             enterDemoMode()
+            if args.contains("-large-list"), let demo { BenchRunner.populateList(demo: demo) }
             if let ix = args.firstIndex(of: "-route"), ix + 1 < args.count {
                 let spec = args[ix + 1]
                 if spec.hasPrefix("chat:") {
@@ -202,6 +216,14 @@ final class AppModel {
         workspace = nil
         sessionStores.values.forEach { $0.stop() }
         sessionStores.removeAll()
+        metadataReaders.removeAll()
+        metadataOnlyStores.removeAll()
+        metadataReleaseTask?.cancel()
+        metadataReleaseTask = nil
+        metadataReleaseDeadline = nil
+        pendingMetadataReleases.removeAll()
+        recentTranscriptIds.removeAll()
+        listMetadata.removeAll()
         scaffoldRoutes.removeAll()
         demoSessionRefs.removeAll()
         config = nil
@@ -229,7 +251,11 @@ final class AppModel {
         let store = WorkspaceStore(config: config)
         store.onProjection = { [weak self] in
             guard let self, let workspace = self.workspace else { return }
-            self.notifications.update(sessions: workspace.sessions, chats: workspace.chats)
+            self.notifications.update(sessions: workspace.sessions, chats: workspace.chats) { chatId in
+                guard let chat = workspace.chat(id: chatId) else { return nil }
+                return self.sessionTitle(for: chat, fallbackTitle: "Session \(chatId.prefix(8))")
+            }
+            self.preloadSessionMetadata()
         }
         workspace = store
         store.start()
@@ -240,6 +266,9 @@ final class AppModel {
     // MARK: Unified data accessors (demo or live — one path for views)
 
     var spaces: [Space] { demo?.spaces ?? workspace?.spaces ?? [] }
+    var occupiedSpaces: [Space] { demo?.lists.occupiedSpaces ?? workspace?.occupiedSpaces ?? [] }
+
+    func space(id: String) -> Space? { demo?.lists.spacesById[id] ?? workspace?.space(id: id) }
 
     var connected: Bool { demo != nil || workspace?.connected == true }
 
@@ -255,13 +284,18 @@ final class AppModel {
     /// renders with full context in Sessions or Archived sessions.
     var sharedSessionRefs: [SessionRef] {
         if let demo {
-            return foreignSessionRefs(demoSessionRefs, chats: demo.chats)
+            return demoSessionRefs.filter { demo.lists.chatsById[$0.chatId] == nil }
         }
         return workspace?.sharedSessionRefs ?? []
     }
 
     func sessionRef(id: String) -> SessionRef? {
-        sharedSessionRefs.first { $0.chatId == id }
+        if let demo {
+            guard demo.lists.chatsById[id] == nil else { return nil }
+            return demoSessionRefs.first { $0.chatId == id }
+        }
+        guard workspace?.chat(id: id) == nil else { return nil }
+        return workspace?.sessionRef(id: id)
     }
 
     @discardableResult
@@ -325,27 +359,30 @@ final class AppModel {
 
 
     func chats(in spaceId: String) -> [Chat] {
-        if let demo {
-            return sortActive(demo.chats.filter { !$0.archived && $0.spaceId == spaceId })
-        }
+        if let demo { return demo.lists.activeBySpace[spaceId] ?? [] }
         return workspace?.chats(in: spaceId) ?? []
     }
 
+    func settledChats(in spaceId: String) -> [Chat] {
+        demo?.lists.archivedBySpace[spaceId] ?? workspace?.settledChats(in: spaceId) ?? []
+    }
+
     func chat(id: String) -> Chat? {
-        (demo?.chats ?? workspace?.chats)?.first { $0.id == id }
+        demo?.lists.chatsById[id] ?? workspace?.chat(id: id)
     }
 
     /// state.rs `space_for_chat` — nil for a dangling/missing space_id.
     func space(for chat: Chat) -> Space? {
         guard let spaceId = chat.spaceId else { return nil }
-        return spaces.first { $0.id == spaceId }
+        return space(id: spaceId)
     }
 
     func activity(chatId: String, now: Int64) -> SessionActivity {
         let store = sessionStores[chatId]
         return sessionActivity(
             workspace: demo?.sessions[chatId] ?? workspace?.sessions[chatId],
-            published: store?.publishedSession, transcript: store?.transcriptActivity, now: now
+            published: store?.publishedSession ?? cachedListMetadata(chatId: chatId)?.session,
+            transcript: store?.transcriptActivity, now: now
         )
     }
 
@@ -359,16 +396,22 @@ final class AppModel {
     }
 
     func spaceIndicator(_ spaceId: String) -> ChatIndicator? {
-        chats(in: spaceId).map { indicator(for: $0) }.min { $0.rawValue < $1.rawValue }
+        let now = nowMs()
+        var result: ChatIndicator?
+        for chat in chats(in: spaceId) {
+            let indicator = chatIndicator(chat: chat, live: activity(chatId: chat.id, now: now).status)
+            if result == nil || indicator.rawValue < result!.rawValue { result = indicator }
+        }
+        return result
     }
 
     func deviceName(_ deviceId: String) -> String {
-        (demo?.devices ?? workspace?.devices)?.first { $0.id == deviceId }?.name ?? deviceId
+        (demo?.lists.devicesById[deviceId] ?? workspace?.device(id: deviceId))?.name ?? deviceId
     }
 
     func deviceOnline(_ deviceId: String) -> Bool {
         if let demo {
-            guard let seen = demo.devices.first(where: { $0.id == deviceId })?.lastSeenAt else { return false }
+            guard let seen = demo.lists.devicesById[deviceId]?.lastSeenAt else { return false }
             return nowMs() - seen < presenceFreshMs
         }
         return workspace?.deviceOnline(deviceId) ?? false
@@ -596,7 +639,7 @@ final class AppModel {
         let deviceId: String
         if let environment = scaffoldEnvironment(chatId: chatId), environment.source.kind == "scaffold" {
             guard let controller = scaffoldRoutes[chatId]?.controllerDeviceId
-                ?? workspace.chats.first(where: { $0.id == chatId })?.deviceId
+                ?? workspace.chat(id: chatId)?.deviceId
                 ?? scaffoldControllerDeviceId() else {
                 throw MobileSessionError.unavailable("This session has no Scaffold controller")
             }
@@ -604,7 +647,7 @@ final class AppModel {
             scaffoldRoutes[chatId] = route
             deviceId = route.ownerDeviceId
         } else {
-            guard let host = workspace.chats.first(where: { $0.id == chatId })?.deviceId
+            guard let host = workspace.chat(id: chatId)?.deviceId
                 ?? workspace.sessions[chatId]?.deviceId, !host.isEmpty else {
                 throw MobileSessionError.unavailable("This session has no known desktop host")
             }
@@ -744,20 +787,38 @@ final class AppModel {
         if let existing = sessionStores[chatId] {
             store = existing
             existing.updateDeploymentId(deploymentId)
-            if !metadataOnly { existing.activateTranscript() }
+            if !metadataOnly {
+                metadataOnlyStores.remove(chatId)
+                if pendingMetadataReleases.remove(chatId) != nil { scheduleMetadataRelease() }
+                existing.activateTranscript()
+            }
         } else {
             store = SessionStore(chatId: chatId, config: config, deploymentId: deploymentId,
                                  metadataOnly: metadataOnly)
             sessionStores[chatId] = store
+            if metadataOnly { metadataOnlyStores.insert(chatId) }
             store.start()
         }
         configureSessionTransport(store: store, environment: environment)
+        if !metadataOnly { retainTranscriptBuilder(chatId: chatId) }
         return store
+    }
+
+    private func retainTranscriptBuilder(chatId: String) {
+        recentTranscriptIds.removeAll { $0 == chatId }
+        recentTranscriptIds.append(chatId)
+        while recentTranscriptIds.count > 3 {
+            guard let index = recentTranscriptIds.firstIndex(where: {
+                $0 != chatId && $0 != notifications.visibleChatId
+            }) else { break }
+            let oldest = recentTranscriptIds.remove(at: index)
+            sessionStores[oldest]?.transcriptBuilder.reset()
+        }
     }
 
     private func scaffoldEnvironment(chatId: String) -> SessionEnvironment? {
         scaffoldRoutes[chatId]?.environment
-            ?? workspace?.sessionRefs.first(where: { $0.chatId == chatId })?.environment
+            ?? workspace?.sessionRef(id: chatId)?.environment
     }
 
     private func scaffoldControllerDeviceId() -> String? {
@@ -783,7 +844,7 @@ final class AppModel {
             let environment = self.scaffoldEnvironment(chatId: chatId) ?? environment
             if let environment, environment.source.kind == "scaffold" {
                 guard let controllerDeviceId = self.scaffoldRoutes[chatId]?.controllerDeviceId
-                    ?? workspace.chats.first(where: { $0.id == chatId })?.deviceId
+                    ?? workspace.chat(id: chatId)?.deviceId
                     ?? self.scaffoldControllerDeviceId() else {
                     throw MobileSessionError.unavailable("This session has no Scaffold controller")
                 }
@@ -800,13 +861,17 @@ final class AppModel {
     /// Reading a list label never creates a room or hydrates a transcript.
     /// Environment names are the canonical Scaffold labels used by desktop;
     /// ordinary workspace titles remain authoritative for local renames.
-    func sessionTitle(for chat: Chat) -> String {
+    /// An explicit fallback bypasses transcript-derived previews for notifications.
+    func sessionTitle(for chat: Chat, fallbackTitle: String? = nil) -> String {
         let store = demo?.sessionStore(for: chat.id) ?? sessionStores[chat.id]
-        return normalizedSessionTitle(workspace?.sessionRefs.first(where: { $0.chatId == chat.id })?.environment?.name)
+        return normalizedSessionTitle(workspace?.sessionRef(id: chat.id)?.environment?.name)
             ?? normalizedSessionTitle(scaffoldRoutes[chat.id]?.environment.name)
             ?? normalizedSessionTitle(store?.publishedEnvironment?.name)
+            ?? normalizedSessionTitle(cachedListMetadata(chatId: chat.id)?.environment?.name)
             ?? normalizedSessionTitle(chat.title)
+            ?? fallbackTitle
             ?? store?.previewTitle
+            ?? cachedListMetadata(chatId: chat.id)?.previewTitle
             ?? chat.displayTitle
     }
 
@@ -815,18 +880,20 @@ final class AppModel {
         return normalizedSessionTitle(sessionRef.environment?.name)
             ?? normalizedSessionTitle(scaffoldRoutes[sessionRef.chatId]?.environment.name)
             ?? normalizedSessionTitle(store?.publishedEnvironment?.name)
+            ?? normalizedSessionTitle(cachedListMetadata(chatId: sessionRef.chatId)?.environment?.name)
             ?? store?.previewTitle
+            ?? cachedListMetadata(chatId: sessionRef.chatId)?.previewTitle
             ?? sessionRef.fallbackTitle
     }
 
     func releaseSessionStore(chatId: String) {
-        // Preloaded stores stay warm — nothing to evict on navigation.
+        // Opened transcript stores stay warm; row metadata has a separate lease.
     }
 
-    /// Keep sidebar metadata syncing without decoding every session's full
-    /// transcript. Navigation upgrades only the opened store to transcript mode.
+    /// Sweep removed memberships and refresh only rows actually on screen.
+    /// Empty bootstrap projections and stores serving a send/navigation stay safe.
     func preloadSessionMetadata() {
-        let visible = Set((workspace?.chats.map(\.id) ?? []) + (workspace?.sessionRefs.map(\.chatId) ?? []))
+        let visible = workspace?.lists.memberIds ?? []
         // An empty projection can be bootstrap/recovery, not a membership
         // revocation. Never invalidate a store still used by an open view or
         // an in-flight launch/send; authoritative room access stays server-side.
@@ -837,23 +904,101 @@ final class AppModel {
                       let store = sessionStores[id], !store.sending,
                       store.pendingSends.isEmpty else { continue }
                 sessionStores.removeValue(forKey: id)?.stop()
+                metadataOnlyStores.remove(id)
+                recentTranscriptIds.removeAll { $0 == id }
+                listMetadata.removeValue(forKey: id)
             }
         }
-        // Archived rows already have canonical workspace titles; don't open
-        // hundreds of transcript sockets just to render a settled sidebar.
-        let unnamedArchived = settledChats.filter {
-            normalizedSessionTitle($0.title) == nil && scaffoldEnvironment(chatId: $0.id) == nil
+        for id in metadataReaders.keys where visible.isEmpty || visible.contains(id) {
+            loadVisibleMetadata(chatId: id)
         }
-        for chat in overviewChats + unnamedArchived {
-            let environment = scaffoldEnvironment(chatId: chat.id)
-            _ = sessionStore(chatId: chat.id, deploymentId: environment?.scope.deploymentId,
-                             environment: environment, metadataOnly: true)
+        if !visible.isEmpty {
+            for id in Array(listMetadata.keys) where !visible.contains(id) {
+                listMetadata.removeValue(forKey: id)
+            }
         }
-        for sessionRef in sharedSessionRefs {
-            let environment = sessionRef.environment ?? scaffoldEnvironment(chatId: sessionRef.chatId)
-            _ = sessionStore(chatId: sessionRef.chatId, deploymentId: environment?.scope.deploymentId,
-                             environment: environment, metadataOnly: true)
+    }
+
+    func retainListMetadata(chatId: String) {
+        guard demo == nil else { return }
+        metadataReaders[chatId, default: 0] += 1
+        pendingMetadataReleases.remove(chatId)
+        scheduleMetadataRelease()
+        if metadataReaders[chatId] == 1 { loadVisibleMetadata(chatId: chatId) }
+    }
+
+    private func loadVisibleMetadata(chatId: String) {
+        let environment = scaffoldEnvironment(chatId: chatId)
+        _ = sessionStore(chatId: chatId, deploymentId: environment?.scope.deploymentId,
+                         environment: environment, metadataOnly: true)
+    }
+
+    private func cachedListMetadata(chatId: String) -> ListMetadata? {
+        guard let cached = listMetadata[chatId],
+              cached.deploymentId == scaffoldEnvironment(chatId: chatId)?.scope.deploymentId else { return nil }
+        return cached
+    }
+
+    func releaseListMetadata(chatId: String) {
+        guard let readers = metadataReaders[chatId] else { return }
+        if readers > 1 {
+            metadataReaders[chatId] = readers - 1
+            scheduleMetadataRelease()
+            return
         }
+        metadataReaders.removeValue(forKey: chatId)
+        if metadataOnlyStores.contains(chatId) { pendingMetadataReleases.insert(chatId) }
+        scheduleMetadataRelease()
+    }
+
+    /// Wait for viewport movement to settle before synchronously persisting a
+    /// metadata document. One sleeper handles the whole viewport, not each row.
+    private func scheduleMetadataRelease() {
+        guard !pendingMetadataReleases.isEmpty else {
+            metadataReleaseTask?.cancel()
+            metadataReleaseTask = nil
+            metadataReleaseDeadline = nil
+            return
+        }
+        metadataReleaseDeadline = DispatchTime.now().uptimeNanoseconds + 300_000_000
+        guard metadataReleaseTask == nil else { return }
+        metadataReleaseTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled, let deadline = self?.metadataReleaseDeadline {
+                let now = DispatchTime.now().uptimeNanoseconds
+                if now < deadline {
+                    do { try await Task.sleep(nanoseconds: deadline - now) }
+                    catch { return }
+                    continue
+                }
+                guard let id = self?.pendingMetadataReleases.first else {
+                    self?.metadataReleaseDeadline = nil
+                    self?.metadataReleaseTask = nil
+                    return
+                }
+                self?.pendingMetadataReleases.remove(id)
+                self?.releaseInactiveMetadata(chatId: id)
+                // Never export several dirty documents in a single UI turn.
+                await Task.yield()
+            }
+        }
+    }
+
+    private func releaseInactiveMetadata(chatId: String) {
+        guard metadataReaders[chatId] == nil else { return }
+        guard metadataOnlyStores.contains(chatId),
+              chatId != notifications.visibleChatId, scaffoldRoutes[chatId] == nil,
+              let store = sessionStores[chatId], !store.sending,
+              store.pendingSends.isEmpty else { return }
+        // Retain labels and timestamped activity, not a document/socket per row.
+        // sessionActivity still expires stale publications while off screen.
+        let previous = cachedListMetadata(chatId: chatId)
+        listMetadata[chatId] = ListMetadata(deploymentId: store.deploymentId,
+                                            environment: store.publishedEnvironment ?? previous?.environment,
+                                            previewTitle: store.previewTitle ?? previous?.previewTitle,
+                                            session: store.publishedSession ?? previous?.session)
+        metadataOnlyStores.remove(chatId)
+        sessionStores.removeValue(forKey: chatId)
+        store.stop()
     }
 }
 

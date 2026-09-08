@@ -26,11 +26,11 @@ Production and staging use the same Swift target with separate checked-in scheme
 bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
 
 ```sh
-# Production: Crew, ai.ashler.crew, version 1.0 build 6
+# Production: Crew, ai.ashler.crew, version 1.0 build 8
 xcodebuild -project Comet.xcodeproj -scheme Comet \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 
-# Staging: Crew Staging, ai.ashler.crew.staging, version 1.0 build 12
+# Staging: Crew Staging, ai.ashler.crew.staging, version 1.0 build 14
 xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 ```
@@ -47,10 +47,81 @@ workspace-cache retention, and bounded parse-cache lifetime. Unicode numeric
 highlighting always advances, and code recoloring no longer copies each token's
 entire line prefix.
 
+The September 8 mobile performance pass moves remote workspace projection and
+session-cache imports off the UI actor. Workspace lists and row-context lookups
+use equality-gated retained arrays/indexes instead of repeated filtering/sorting.
+Only visible rows lease metadata rooms; disposal waits for 300 ms of viewport
+quiet and yields between stores. Snapshot flushes remain synchronous to preserve
+background/sign-out durability and replica-adoption ordering.
+
+Session projection reads transcript messages and the latest matching publication,
+not the entire command ledger, and unchanged inputs do not rebuild rows. Cold
+markdown row preparation runs on a worker actor. The three most recently opened
+live sessions retain their parsed rows; deployment changes reset them. A typed
+bottom-pad ID, reached through `ScrollViewReader`, corrects navigation without
+marking every transcript row as a scroll target. Cancelled settling always
+restores view opacity; it does not mark the store as successfully revealed.
+
+Release-Staging simulator verification (iPhone 17 Pro, iOS 26.5):
+
+- A 600-session list/context pass measured 2.97 ms with the former filtering and
+  lookup path versus 0.09 ms with retained indexes, with matching row context.
+- A cached 500-turn/1,000-message session returned from `start()` in 0.126 ms on
+  the main actor; the complete projection was ready in 80.37 ms.
+- The benchmark now warms the same worker/task runtime, then clears its parser
+  memos before measuring the full cold history. The 5,000-row parse measured
+  49.60 ms synchronously versus 82.45 ms total on the warmed worker; this moves
+  work off the UI actor, not out of the process. Heartbeat maximum gaps measured
+  11.04/5.78/2.63 ms with 1/16/46 ticks at 50/200/500 turns. These scheduling
+  samples do not establish device frame rates or eliminate every UI stall;
+  earlier un-warmed heartbeat readings included startup/scheduling noise.
+  Retained-cache access on reopen measured 0.0011 ms (not total navigation time).
+- Native list swipes rendered later rows; tapping and reopening the long
+  conversation displayed its final pass-499 message, without a jump button.
+  A subsequent launch verified the same final message without whole-stack scroll
+  target tracking, using only simulator launch and screenshot commands.
+- Existing visibility, attention, mobile parity and store-eviction scenarios
+  passed, as did hydration cancellation, deployment isolation and unchanged
+  projection checks. OpenCode findings were fixed and the final review reported
+  no remaining actionable findings.
+
+Reproduce with `-bench`, `-visibility-e2e`, or the offline UI fixture
+`-demo -large-list` (600 sessions, first session contains 500 turns). These are
+local simulator results, not physical-iPhone frame timings. Local typecheck
+commands were intentionally not run; simulator application builds used Xcode's
+normal compiler.
+
+The performance changes were published to TestFlight on 2026-09-08 as staging
+**1.0 (13)** and production **1.0 (7)** from `6043e425df30b3f60c57b922cef958be048215d8`.
+[Staging CI](https://github.com/Ashler-AI/comet/actions/runs/34264583266) and
+[production CI](https://github.com/Ashler-AI/comet/actions/runs/34264583288)
+compiled on arm64 with Xcode 26.6 / iOS SDK 26.5 and passed all five mobile
+scenarios: session visibility, attention transitions, APNs lifecycle, mobile
+parity, and store eviction. OpenCode reviewed the complete proposed source
+against `origin/main` and reported no actionable findings before the release push.
+
+Downloaded artifacts passed SHA-256 verification. Distribution export and upload
+ran locally without compilation or typechecks. Both inspection IPAs and the exact
+uploaded apps passed strict signature verification; their signatures retain
+`aps-environment = production`, and the inspected profiles match their respective
+bundle identifiers. Uploaded IPA SHA-256 values:
+
+- Staging 13: `167c15d60a13e36d995742d3eb6e79fe1d02a97bff883c0c06ad7327071440e4`
+- Production 7: `18c0b64578f6a12dbbb2d074dc538315094d049d775bad323ae7e84524a48fe6`
+
+Apple accepted both uploads at approximately **19:00 UTC**, then reported
+**Complete** with no processing errors or warnings. Both new builds show
+**Testing** in their existing **Ashler Internal** groups. The existing production
+tester's invitation was resent successfully (Apple returned HTTP 201); final
+App Store Connect inspection shows that tester installed production **1.0 (6)**
+on an iPhone 13 Pro. Installation of the newly published builds 7 and 13 is not
+claimed. This release did not submit either app to the public App Store or deploy
+desktop/backend changes.
+
 The 2026-09-05 release uploaded production **1.0 (3)** and staging **1.0 (2)**
 to TestFlight. App Store Connect processed both and assigned them to the existing
 **Ashler Internal** group. The staging tester's installation of build 2 was
-confirmed; the production invitation was resent and remains awaiting acceptance.
+confirmed; the production invitation was resent and was awaiting acceptance at that time.
 These are internal TestFlight releases, not public App Store submissions.
 
 Staging **1.0 (5)** adds compacted-history recovery and host-discovered harnesses.
@@ -162,6 +233,29 @@ the response `apns-id` as `apnsId` when present, and `removeRegistration`.
 `apns_response` records the same status and receipt before parsing a rejection
 body. A 200 establishes APNs acceptance, not display or tap delivery on the
 iPhone. Transport failures remain `delivery_exception`, not an acceptance.
+
+### Staging notification clock skew (2026-09-08)
+
+A controlled completion was rejected because its device timestamp was 29 ms
+ahead of the Worker's clock. The next pre-import baseline consumed the
+`working` → `idle` transition silently. The notification observer and transition
+policy now tolerate up to 5 seconds of future skew, retaining the 45-second
+stale cutoff, raw timestamp ordering, archive filtering, and durable dedupe.
+
+The reproduction failed before the fix and passed afterward; all 138 edge tests
+passed. On staging, test session `c13c8c0c-5238-4d48-bc3f-e0b86fb204a5`
+completed at `updatedAt=1788886631502`, 174 ms ahead of the observer clock.
+The server classified it as `completion`, authorized one recipient, and received
+APNs **200**, receipt `15F6E975-855A-EE10-8427-4BD10F027022`, for that exact
+timestamp. This proves provider acceptance, not iPhone display or tap routing.
+
+Clean staging version `4f754902-7336-41a0-ad2e-b3d19d279934` contains the fix
+without the temporary authenticated decision probe. Production was unchanged.
+The source changes are on `fix/staging-notification-clock-skew`, based on
+`9175314` (a descendant of the diagnosed deployment commit `b41d34d`).
+OpenCode review could not run: Agent Auth listed the required primary model but
+not `openai-codex/gpt-5.4-mini`. No PR push or review approval is claimed.
+Local typechecks were intentionally skipped to preserve workstation resources.
 
 ### Staging 1.0 (6): mobile status feedback
 
@@ -615,8 +709,19 @@ Scaffold credentials, so they cannot replace these checks. Authority outages fai
 closed without deleting registrations; explicit authorization rejection and APNs
 invalid-token responses remove only the matching registration revision.
 
-Alerts contain generic Crew copy and routing IDs, not titles or transcripts.
-Registration is principal/project scoped; single-session device grants cannot register.
+Alerts now identify the session in the notification title; the body states whether
+it needs input, encountered an error, or finished working. Session names can appear
+on the lock screen. Transcript bodies are not included. Names are normalized to
+one line and capped at 120 characters, with an ellipsis for longer names; unnamed
+sessions fall back to `Session <first 8 ID characters>`.
+
+Desktop and local iOS alerts use the existing visible session-name precedence.
+Background APNs alerts use the recipient's own principal-scoped Scaffold
+environment name when available, then the workspace chat title. The edge snapshots
+names only for real attention events and does not persist titles in notification
+SQL or log them. Routing IDs, opt-in, current authorization checks, freshness,
+dedupe, and focused-session suppression are unchanged. Registration is
+principal/project scoped; single-session device grants cannot register.
 
 Offline regression launch: `-visibility-e2e` runs session visibility,
 attention-transition, retry, metadata and cache-isolation scenarios and opens demo mode. Debug builds additionally

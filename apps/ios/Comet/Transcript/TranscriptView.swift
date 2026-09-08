@@ -20,7 +20,6 @@ struct TranscriptView: View {
         // revealed must come back visible on the FIRST frame after any view
         // re-creation, or it blinks out mid-typing when the composer resizes.
         _settled = State(initialValue: store.hasRevealed)
-        _hydrated = State(initialValue: store.hasRevealed)
     }
 
     static let gapTurn: CGFloat = 14
@@ -29,12 +28,10 @@ struct TranscriptView: View {
     static let stickThreshold: CGFloat = 70
     static let jumpThreshold: CGFloat = 320
 
-    @State private var builder = TranscriptBuilderCache()
+    private var builder: TranscriptBuilderCache { store.transcriptBuilder }
     @State private var veils = VeilStore()
     @State private var folds: [String: Bool] = [:]
     @State private var pinned = true
-    /// One-shot guard for the first non-empty projection.
-    @State private var hydrated = false
     /// Gates the reveal: false until the transcript has landed at the bottom.
     @State private var settled = false
     /// Live content height — the settle loop's "layout stopped moving" signal.
@@ -44,126 +41,130 @@ struct TranscriptView: View {
     @State private var scrollPosition = ScrollPosition(edge: .bottom)
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
+    private enum Anchor: Hashable { case bottom }
+
     var body: some View {
-        let rows = builder.rows(revision: store.revision,
-                                entries: store.entries,
-                                pendingSends: store.pendingSends)
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(rows) { row in
-                    rowView(row).id(row.id)
+        let rows = builder.rows
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(rows) { row in
+                        rowView(row).id(row.id)
+                    }
+                    Color.clear.frame(height: 44)  // bottom pad clears the fade + floating status strip
+                        .id(Anchor.bottom)
                 }
-                Color.clear.frame(height: 44)  // bottom pad clears the fade + floating status strip
+                .frame(maxWidth: Self.maxContentWidth)
+                .frame(maxWidth: .infinity)
             }
-            .frame(maxWidth: Self.maxContentWidth)
-            .frame(maxWidth: .infinity)
-        }
-        .scrollPosition($scrollPosition)
-        .defaultScrollAnchor(.bottom)
-        // Held invisible until it has settled at the bottom, then faded in.
-        // The settling itself is unavoidable (see settleToBottom) — what is
-        // avoidable is WATCHING it: painting mid-settle is what read as the
-        // transcript sliding on load.
-        .opacity(settled ? 1 : 0)
-        .motionAnimation(Motion.fadeQuick, value: settled)
-        .background(Theme.bg)
-        .task {
-            // Warm sessions already have rows at first layout, and `onChange`
-            // never fires for an initial value — this is the only hook for them.
-            await settleToBottom()
-        }
-        .onChange(of: rows.isEmpty) { _, isEmpty in
-            // Projection is off-main, so a cached transcript usually lands after
-            // the pass above ran on an empty list. Only ever hides a transcript
-            // that has never been shown — re-hiding a visible one is what made
-            // it blink out mid-typing.
-            guard !isEmpty, !hydrated, !store.hasRevealed else { return }
-            hydrated = true
-            settled = false
-            Task { await settleToBottom() }
-        }
-        .onScrollGeometryChange(for: CGFloat.self) { $0.contentSize.height } action: { _, new in
-            contentHeight = new
-        }
-        .onScrollPhaseChange { _, newPhase in
-            // Desktop rule: the pin breaks only on USER input (wheel-up/drag),
-            // never on streaming growth. Phases track the gesture.
-            userScrolling = newPhase == .interacting || newPhase == .decelerating
-        }
-        .onScrollGeometryChange(for: CGFloat.self) { geo in
-            max(0, geo.contentSize.height + geo.contentInsets.bottom - geo.containerSize.height - geo.contentOffset.y)
-        } action: { old, new in
-            distanceFromBottom = new
-            if userScrolling, new > old + 1, new > 2 {
-                pinned = false
-            } else if !pinned, new <= Self.stickThreshold, new < old {
-                // Re-stick only when moving TOWARD the bottom inside the 70pt
-                // band, else the pin would be unbreakable.
-                pinned = true
+            .scrollPosition($scrollPosition)
+            .defaultScrollAnchor(.bottom)
+            // Held invisible until it has settled at the bottom, then faded in.
+            // The settling itself is unavoidable (see settleToBottom) — what is
+            // avoidable is WATCHING it: painting mid-settle is what read as the
+            // transcript sliding on load.
+            .opacity(settled ? 1 : 0)
+            .motionAnimation(Motion.fadeQuick, value: settled)
+            .background(Theme.bg)
+            .task(id: store.revision) {
+                await builder.update(
+                    revision: store.revision, entries: store.entries,
+                    pendingSends: store.pendingSends)
             }
-        }
-        .onChange(of: contentSignature(rows)) {
-            guard pinned else { return }
-            if reduceMotion {
-                scrollPosition.scrollTo(edge: .bottom)
-            } else {
-                withAnimation(.spring(duration: 0.3)) {
-                    scrollPosition.scrollTo(edge: .bottom)
-                }
+            .task(id: rows.isEmpty) {
+                // Recreated lazy stacks need bottom correction even with warm rows;
+                // only a never-revealed transcript waits invisibly for that layout.
+                guard !rows.isEmpty else { return }
+                if !store.hasRevealed { settled = false }
+                await settleToBottom(proxy: proxy)
             }
-        }
-        .overlay(alignment: .top) {
-            // Soft fade under the nav bar — content dissolves instead of
-            // hard-clipping against the header.
-            LinearGradient(
-                stops: [
-                    .init(color: Theme.bg, location: 0),
-                    .init(color: Theme.bg.opacity(0.85), location: 0.45),
-                    .init(color: Theme.bg.opacity(0), location: 1),
-                ],
-                startPoint: .top, endPoint: .bottom
-            )
-            .frame(height: 130)
-            .ignoresSafeArea(edges: .top)
-            .allowsHitTesting(false)
-        }
-        .overlay(alignment: .bottom) {
-            // Short ramp that reaches FULL bg at the bottom edge — content
-            // dissolves completely beneath the floating status strip, but the
-            // fade starts low enough that message bottoms stay legible.
-            LinearGradient(
-                stops: [
-                    .init(color: Theme.bg.opacity(0), location: 0),
-                    .init(color: Theme.bg.opacity(0.55), location: 0.45),
-                    .init(color: Theme.bg, location: 0.9),
-                    .init(color: Theme.bg, location: 1),
-                ],
-                startPoint: .top, endPoint: .bottom
-            )
-            .frame(height: 44)
-            .allowsHitTesting(false)
-        }
-        .overlay(alignment: .bottomTrailing) {
-            // Jump-to-bottom floats ABOVE the fades.
-            if distanceFromBottom > Self.jumpThreshold {
-                Button {
+            .onScrollGeometryChange(for: CGFloat.self) {
+                $0.contentSize.height
+            } action: { _, new in
+                contentHeight = new
+            }
+            .onScrollPhaseChange { _, newPhase in
+                // Desktop rule: the pin breaks only on USER input (wheel-up/drag),
+                // never on streaming growth. Phases track the gesture.
+                userScrolling = newPhase == .interacting || newPhase == .decelerating
+            }
+            .onScrollGeometryChange(for: CGFloat.self) { geo in
+                max(
+                    0,
+                    geo.contentSize.height + geo.contentInsets.bottom - geo.containerSize.height - geo.contentOffset.y)
+            } action: { old, new in
+                distanceFromBottom = new
+                if userScrolling, new > old + 1, new > 2 {
+                    pinned = false
+                } else if !pinned, new <= Self.stickThreshold, new < old {
+                    // Re-stick only when moving TOWARD the bottom inside the 70pt
+                    // band, else the pin would be unbreakable.
                     pinned = true
-                    withAnimation(.spring(duration: 0.35)) {
+                }
+            }
+            .onChange(of: contentSignature(rows)) {
+                guard settled, pinned else { return }
+                if reduceMotion {
+                    scrollPosition.scrollTo(edge: .bottom)
+                } else {
+                    withAnimation(.spring(duration: 0.3)) {
                         scrollPosition.scrollTo(edge: .bottom)
                     }
-                } label: {
-                    Image(systemName: "arrow.down")
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundStyle(Theme.text)
-                        .frame(width: 36, height: 36)
                 }
-                .glassEffect(.regular.interactive(), in: Circle())
-                .padding(.trailing, 16)
-                .padding(.bottom, 12)
-                .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
+            .overlay(alignment: .top) {
+                // Soft fade under the nav bar — content dissolves instead of
+                // hard-clipping against the header.
+                LinearGradient(
+                    stops: [
+                        .init(color: Theme.bg, location: 0),
+                        .init(color: Theme.bg.opacity(0.85), location: 0.45),
+                        .init(color: Theme.bg.opacity(0), location: 1),
+                    ],
+                    startPoint: .top, endPoint: .bottom
+                )
+                .frame(height: 130)
+                .ignoresSafeArea(edges: .top)
+                .allowsHitTesting(false)
+            }
+            .overlay(alignment: .bottom) {
+                // Short ramp that reaches FULL bg at the bottom edge — content
+                // dissolves completely beneath the floating status strip, but the
+                // fade starts low enough that message bottoms stay legible.
+                LinearGradient(
+                    stops: [
+                        .init(color: Theme.bg.opacity(0), location: 0),
+                        .init(color: Theme.bg.opacity(0.55), location: 0.45),
+                        .init(color: Theme.bg, location: 0.9),
+                        .init(color: Theme.bg, location: 1),
+                    ],
+                    startPoint: .top, endPoint: .bottom
+                )
+                .frame(height: 44)
+                .allowsHitTesting(false)
+            }
+            .overlay(alignment: .bottomTrailing) {
+                // Jump-to-bottom floats ABOVE the fades.
+                if distanceFromBottom > Self.jumpThreshold {
+                    Button {
+                        pinned = true
+                        withAnimation(.spring(duration: 0.35)) {
+                            scrollPosition.scrollTo(edge: .bottom)
+                        }
+                    } label: {
+                        Image(systemName: "arrow.down")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(Theme.text)
+                            .frame(width: 36, height: 36)
+                    }
+                    .glassEffect(.regular.interactive(), in: Circle())
+                    .padding(.trailing, 16)
+                    .padding(.bottom, 12)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+                }
+            }
+            .motionAnimation(Motion.fadeQuick, value: distanceFromBottom > Self.jumpThreshold)
         }
-        .motionAnimation(Motion.fadeQuick, value: distanceFromBottom > Self.jumpThreshold)
     }
 
     /// Hold the bottom until layout stops moving, then reveal.
@@ -180,16 +181,19 @@ struct TranscriptView: View {
     /// case) so a pathological reflow can't spin, and it yields the moment the
     /// user takes the scroll view — their drag wins. `settled` flips either way,
     /// so the transcript can never be left invisible.
-    private func settleToBottom() async {
+    private func settleToBottom(proxy: ScrollViewProxy) async {
+        // Cancellation (including an empty projection) must never strand the
+        // current view at zero opacity. Only completed settling marks the store.
+        defer { settled = true }
         var lastHeight: CGFloat = -1
         for _ in 0..<16 {
+            guard !Task.isCancelled else { return }
             guard pinned, !userScrolling else { break }
-            scrollPosition.scrollTo(edge: .bottom)
-            if contentHeight == lastHeight { break }
+            proxy.scrollTo(Anchor.bottom, anchor: .bottom)
+            if contentHeight == lastHeight, distanceFromBottom <= 1 { break }
             lastHeight = contentHeight
-            try? await Task.sleep(nanoseconds: 30_000_000)
+            do { try await Task.sleep(nanoseconds: 30_000_000) } catch { return }
         }
-        settled = true
         store.hasRevealed = true
     }
 
@@ -236,23 +240,46 @@ struct TranscriptView: View {
 /// Row-build cache: one incremental parser per streaming part plus a memo of
 /// settled parses, reused across body evaluations (a reference type, so
 /// building rows never mutates state mid-render).
+@MainActor
+@Observable
 final class TranscriptBuilderCache {
+    private(set) var rows: [TranscriptRow] = []
+    @ObservationIgnored private var worker = TranscriptRowWorker()
+    @ObservationIgnored private var cachedRevision: UInt64?
+    @ObservationIgnored private var generation: UInt64 = 0
+
+    /// Parsing a cold history must not block navigation or the first scroll
+    /// frame. The store retains this cache so returning to a session is warm.
+    func update(revision: UInt64, entries: [MessageEntry],
+                pendingSends: [(messageId: String, text: String, at: Int64)]) async {
+        guard cachedRevision != revision, !Task.isCancelled else { return }
+        generation &+= 1
+        let generation = self.generation
+        guard let built = await worker.build(entries: entries, pendingSends: pendingSends),
+              !Task.isCancelled, self.generation == generation else { return }
+        rows = built
+        cachedRevision = revision
+    }
+
+    func reset() {
+        generation &+= 1
+        cachedRevision = nil
+        rows = []
+        worker = TranscriptRowWorker()
+    }
+}
+
+private actor TranscriptRowWorker {
     private var parsers: [String: IncrementalMarkdownParser] = [:]
     private var completed: [String: CompletedParse] = [:]
-    private var cachedRevision: UInt64?
-    private var cachedRows: [TranscriptRow] = []
 
-    /// Rows for the store's current `revision`. The body re-runs on every
-    /// scroll frame (it reads `distanceFromBottom`), and rows only change when
-    /// the doc does — so gate on the revision and hand back the same array.
-    func rows(revision: UInt64,
-              entries: [MessageEntry],
-              pendingSends: [(messageId: String, text: String, at: Int64)]) -> [TranscriptRow] {
-        if cachedRevision == revision { return cachedRows }
-        cachedRows = TranscriptRowBuilder.rows(entries: entries, pendingSends: pendingSends,
-                                               parsers: &parsers, completed: &completed)
-        cachedRevision = revision
-        return cachedRows
+    func build(entries: [MessageEntry],
+               pendingSends: [(messageId: String, text: String, at: Int64)]) -> [TranscriptRow]? {
+        // A cancelled view update can wait behind a cold parse. Do not parse
+        // its obsolete snapshot once the worker becomes available.
+        guard !Task.isCancelled else { return nil }
+        return TranscriptRowBuilder.rows(entries: entries, pendingSends: pendingSends,
+                                         parsers: &parsers, completed: &completed)
     }
 }
 

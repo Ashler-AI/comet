@@ -38,11 +38,8 @@ final class WorkspaceStore {
         let epoch = roomEpoch
         let roomId = "ws4/\(config.projectScope)"
         let cacheId = config.documentCacheId(roomId: roomId)
-        // Local-first: hydrate from the on-device snapshot before joining —
-        // the sidebar renders immediately and the join backfills incrementally.
-        if DocDisk.load(into: doc, id: cacheId) {
-            project()
-        }
+        // Hydrate locally before joining; materialize the sidebar off-main.
+        _ = DocDisk.load(into: doc, id: cacheId)
         saver = DocSaver(docId: cacheId, doc: doc)
         let client = RoomClient(roomId: roomId, doc: doc) { [config] in
             await config.workspaceSocketURL()
@@ -60,7 +57,7 @@ final class WorkspaceStore {
         subscribeLocalUpdates(client: client)
 
         Task { await client.start() }
-        project()
+        scheduleProjection()
     }
 
     private func subscribeLocalUpdates(client: RoomClient) {
@@ -83,7 +80,7 @@ final class WorkspaceStore {
         doc = replacement
         subscribeLocalUpdates(client: room)
         saver?.replaceDocument(with: replacement)
-        project()
+        scheduleProjection()
         return true
     }
 
@@ -94,6 +91,9 @@ final class WorkspaceStore {
 
     func stop() {
         roomEpoch &+= 1
+        projectionGeneration &+= 1
+        projectionTask?.cancel()
+        projectionTask = nil
         subscriptions.removeAll()
         saver?.flush()
         if let room {
@@ -107,13 +107,11 @@ final class WorkspaceStore {
         switch event {
         case .connected:
             connected = true
-            purgeLegacyMobileDevices()
-            project()
+            scheduleProjection()
         case .disconnected:
             connected = false
         case .remoteUpdate:
-            purgeLegacyMobileDevices()
-            project()
+            scheduleProjection()
             saver?.poke()
         case .ephemeralUpdate:
             projectPresence()
@@ -123,16 +121,17 @@ final class WorkspaceStore {
     /// Older iOS builds registered themselves as engine devices. Mobile is a
     /// controller only: remove those synced rows so desktop device pickers do
     /// not retain simulator/phone model names forever.
-    private func purgeLegacyMobileDevices() {
-        guard let root = doc.getDeepValue().mapValue,
-              let deviceRows = root["devices"]?.mapValue else { return }
-        let staleIds = deviceRows.compactMap { id, value -> String? in
-            value.mapValue?["platform"]?.stringValue == "ios" ? id : nil
-        }
+    private func purgeLegacyMobileDevices(_ staleIds: [String]) {
         guard !staleIds.isEmpty else { return }
         let map = doc.getMap(id: "devices")
         do {
             for id in staleIds {
+                // Recheck only candidate rows: a newer remote edit can land
+                // after the background read without its event arriving yet.
+                guard let row = map.get(key: id) else { continue }
+                let platform = row.asValue()?.mapValue?["platform"]?.stringValue
+                    ?? row.asLoroMap()?.get(key: "platform")?.asValue()?.stringValue
+                guard platform == "ios" else { continue }
                 try map.delete(key: id)
             }
             doc.commit()
@@ -164,20 +163,87 @@ final class WorkspaceStore {
 
     // MARK: Projection (doc → rows)
 
-    private func project() {
-        let value = doc.getDeepValue()
-        guard let root = value.mapValue else { return }
+    /// One immutable projection is built off-main, including the lists and indexes
+    /// consumed by rows. Status-only updates never rebuild lists on the UI actor.
+    struct Projection {
+        var devices: [DeviceRow]
+        var spaces: [Space]
+        var chats: [Chat]
+        var sessions: [String: SessionRow]
+        var sessionRefs: [SessionRef]
+        var legacyMobileIds: [String]
+        var lists: WorkspaceLists
 
-        devices = (root["devices"]?.mapValue ?? [:]).compactMap { _, v in
-            guard let m = v.mapValue, let id = m["id"]?.stringValue else { return nil }
+        init(devices: [DeviceRow], spaces: [Space], chats: [Chat],
+             sessions: [String: SessionRow], sessionRefs: [SessionRef], legacyMobileIds: [String],
+             lists: WorkspaceLists? = nil) {
+            self.devices = devices
+            self.spaces = spaces
+            self.chats = chats
+            self.sessions = sessions
+            self.sessionRefs = sessionRefs
+            self.legacyMobileIds = legacyMobileIds
+            self.lists = lists ?? WorkspaceLists(devices: devices, spaces: spaces, chats: chats, refs: sessionRefs)
+        }
+    }
+
+    @ObservationIgnored private var projectionTask: Task<Void, Never>?
+    @ObservationIgnored private var projectionGeneration: UInt64 = 0
+    @ObservationIgnored private var previousProjection: Projection?
+
+    /// Local writes retain their synchronous read-after-write contract. Invalidating
+    /// the generation prevents an older background read undoing an optimistic edit.
+    private func project() {
+        projectionGeneration &+= 1
+        if let decoded = Self.decodeProjection(from: doc, userId: config.userId, previous: previousProjection) {
+            applyProjection(decoded)
+        }
+    }
+
+    /// A burst has at most one conversion in flight and one trailing conversion.
+    private func scheduleProjection() {
+        projectionGeneration &+= 1
+        guard projectionTask == nil else { return }
+        projectionTask = Task { @MainActor [weak self] in
+            while let self, !Task.isCancelled {
+                let generation = self.projectionGeneration
+                let epoch = self.roomEpoch
+                let document = self.doc
+                let userId = self.config.userId
+                let previous = self.previousProjection
+                let decoded = await Task.detached(priority: .userInitiated) {
+                    Self.decodeProjection(from: document, userId: userId, previous: previous)
+                }.value
+                guard !Task.isCancelled else { return }
+                if self.roomEpoch == epoch, self.doc === document,
+                   self.projectionGeneration == generation, let decoded {
+                    self.purgeLegacyMobileDevices(decoded.legacyMobileIds)
+                    self.applyProjection(decoded)
+                }
+                if self.projectionGeneration == generation {
+                    self.projectionTask = nil
+                    return
+                }
+            }
+        }
+    }
+
+    nonisolated static func decodeProjection(from doc: LoroDoc, userId: String,
+                                             previous: Projection? = nil) -> Projection? {
+        let value = doc.getDeepValue()
+        guard let root = value.mapValue else { return nil }
+
+        let devices: [DeviceRow] = (root["devices"]?.mapValue ?? [:]).compactMap { _, v in
+            guard let m = v.mapValue, let id = m["id"]?.stringValue,
+                  m["platform"]?.stringValue != "ios" else { return nil }
             return DeviceRow(id: id,
                             name: m["name"]?.stringValue ?? id,
                             platform: m["platform"]?.stringValue ?? "",
                             lastSeenAt: m["lastSeenAt"]?.i64Value,
                             createdAt: m["createdAt"]?.i64Value)
-        }.sorted { $0.name < $1.name }
+        }.sorted { ($0.name, $0.id) < ($1.name, $1.id) }
 
-        spaces = (root["spaces"]?.mapValue ?? [:]).compactMap { _, v in
+        let spaces: [Space] = (root["spaces"]?.mapValue ?? [:]).compactMap { _, v in
             guard let m = v.mapValue, let id = m["id"]?.stringValue,
                   let deviceId = m["deviceId"]?.stringValue,
                   let path = m["path"]?.stringValue else { return nil }
@@ -214,9 +280,9 @@ final class WorkspaceStore {
                         spaceId: m["spaceId"]?.stringValue,
                         lastSeenAt: m["lastSeenAt"]?.i64Value)
         }
-        sessionRefs = (root["sessionRefs"]?.mapValue ?? [:]).compactMap { _, value in
+        let sessionRefs: [SessionRef] = (root["sessionRefs"]?.mapValue ?? [:]).compactMap { _, value in
             guard let row = value.mapValue,
-                  row["userId"]?.stringValue == config.userId,
+                  row["userId"]?.stringValue == userId,
                   let chatId = row["chatId"]?.stringValue,
                   let addedAt = row["addedAt"]?.i64Value else { return nil }
             let environment: SessionEnvironment? = row["environment"].flatMap { value in
@@ -235,7 +301,7 @@ final class WorkspaceStore {
         // exactly like WorkspaceHost::retain_visible_sessions. Never mutate
         // other project rows to implement this presentation boundary.
         let memberIds = Set(sessionRefs.map(\.chatId))
-        chats = projectChats.filter { memberIds.contains($0.id) }
+        let chats = projectChats.filter { memberIds.contains($0.id) }
 
 
         var rows: [String: SessionRow] = [:]
@@ -249,38 +315,62 @@ final class WorkspaceStore {
                                       startedAt: m["startedAt"]?.i64Value,
                                       updatedAt: m["updatedAt"]?.i64Value ?? 0)
         }
-        sessions = rows
+        let orderedChats = chats.sorted { $0.id < $1.id }
+        let reusableLists = previous.flatMap { previous in
+            previous.devices == devices && previous.spaces == spaces && previous.chats == orderedChats
+                && previous.sessionRefs == sessionRefs ? previous.lists : nil
+        }
+        return Projection(devices: devices, spaces: spaces, chats: orderedChats,
+                          sessions: rows, sessionRefs: sessionRefs,
+                          legacyMobileIds: (root["devices"]?.mapValue ?? [:]).compactMap { id, value in
+                              value.mapValue?["platform"]?.stringValue == "ios" ? id : nil
+                          }, lists: reusableLists)
+    }
+
+    func applyProjection(_ decoded: Projection) {
+        previousProjection = decoded
+        if devices != decoded.devices { devices = decoded.devices }
+        if spaces != decoded.spaces { spaces = decoded.spaces }
+        if chats != decoded.chats { chats = decoded.chats }
+        if sessions != decoded.sessions { sessions = decoded.sessions }
+        if sessionRefs != decoded.sessionRefs { sessionRefs = decoded.sessionRefs }
+        let next = decoded.lists
+        if overviewChats != next.overviewChats { overviewChats = next.overviewChats }
+        if settledChats != next.settledChats { settledChats = next.settledChats }
+        if sharedSessionRefs != next.sharedSessionRefs { sharedSessionRefs = next.sharedSessionRefs }
+        if occupiedSpaces != next.occupiedSpaces { occupiedSpaces = next.occupiedSpaces }
+        if activeBySpace != next.activeBySpace { activeBySpace = next.activeBySpace }
+        if archivedBySpace != next.archivedBySpace { archivedBySpace = next.archivedBySpace }
+        if chatsById != next.chatsById { chatsById = next.chatsById }
+        if spacesById != next.spacesById { spacesById = next.spacesById }
+        if devicesById != next.devicesById { devicesById = next.devicesById }
+        if refsById != next.refsById { refsById = next.refsById }
+        lists = next
+        // Notifications must see the complete new projection, even when no list
+        // changed (session freshness/status can be the only updated field).
         onProjection?()
     }
 
     // MARK: Derived views
 
-    /// Every non-archived workspace chat, including detached and missing-space
-    /// rows, in recency order. Space membership is context, not visibility.
-    var overviewChats: [Chat] {
-        sessionListChats(chats, archived: false)
-    }
+    @ObservationIgnored private(set) var lists = WorkspaceLists()
+    private(set) var overviewChats: [Chat] = []
+    private(set) var settledChats: [Chat] = []
+    private(set) var sharedSessionRefs: [SessionRef] = []
+    private(set) var occupiedSpaces: [Space] = []
+    private var activeBySpace: [String: [Chat]] = [:]
+    private var archivedBySpace: [String: [Chat]] = [:]
+    private var chatsById: [String: Chat] = [:]
+    private var spacesById: [String: Space] = [:]
+    private var devicesById: [String: DeviceRow] = [:]
+    private var refsById: [String: SessionRef] = [:]
 
-    var settledChats: [Chat] {
-        sessionListChats(chats, archived: true)
-    }
-
-    /// Foreign memberships only; workspace rows appear in active or archived
-    /// sections with their full context rather than as duplicate bare refs.
-    var sharedSessionRefs: [SessionRef] {
-        foreignSessionRefs(sessionRefs, chats: chats)
-    }
-
-
-    /// A space's owned sessions, in the sidebar's Sessions order (recency).
-    ///
-    /// NOT desktop's `chats_in_space`, which is creation order because there
-    /// the rows are TABS and activity must never reorder tabs. The phone has
-    /// no tabs — a space opens into the same list, with the same rows, as the
-    /// Sessions section — so it follows that list's ordering instead.
-    func chats(in spaceId: String) -> [Chat] {
-        sortActive(chats.filter { !$0.archived && $0.spaceId == spaceId })
-    }
+    func chats(in spaceId: String) -> [Chat] { activeBySpace[spaceId] ?? [] }
+    func settledChats(in spaceId: String) -> [Chat] { archivedBySpace[spaceId] ?? [] }
+    func chat(id: String) -> Chat? { chatsById[id] }
+    func space(id: String) -> Space? { spacesById[id] }
+    func device(id: String) -> DeviceRow? { devicesById[id] }
+    func sessionRef(id: String) -> SessionRef? { refsById[id] }
 
 
     // MARK: Device relay (folder browsing / direct host RPCs)
@@ -461,7 +551,7 @@ final class WorkspaceStore {
     /// Ordinary commands must be admitted on their actual host. A different
     /// desktop's local trust record cannot authorize this host's ledger drain.
     func sendSessionCommand(chatId: String, payload: SessionCommandPayload) async throws {
-        guard let hostDeviceId = chats.first(where: { $0.id == chatId })?.deviceId
+        guard let hostDeviceId = chat(id: chatId)?.deviceId
             ?? sessions[chatId]?.deviceId, !hostDeviceId.isEmpty else {
             throw MobileSessionError.unavailable("This session has no known desktop host")
         }
@@ -814,5 +904,41 @@ final class WorkspaceStore {
             doc.commit()
             project()
         } catch {}
+    }
+}
+
+/// Shared by live projection and demo mutations; reads return retained arrays,
+/// never filter/sort the workspace during a SwiftUI body or timeline tick.
+struct WorkspaceLists: Equatable {
+    var overviewChats: [Chat] = []
+    var settledChats: [Chat] = []
+    var sharedSessionRefs: [SessionRef] = []
+    var occupiedSpaces: [Space] = []
+    var activeBySpace: [String: [Chat]] = [:]
+    var archivedBySpace: [String: [Chat]] = [:]
+    var chatsById: [String: Chat] = [:]
+    var spacesById: [String: Space] = [:]
+    var devicesById: [String: DeviceRow] = [:]
+    var refsById: [String: SessionRef] = [:]
+    var memberIds: Set<String> = []
+
+    init(devices: [DeviceRow] = [], spaces: [Space] = [], chats: [Chat] = [], refs: [SessionRef] = []) {
+        overviewChats = sessionListChats(chats, archived: false)
+        settledChats = sessionListChats(chats, archived: true)
+        for chat in chats { chatsById[chat.id] = chat }
+        for space in spaces { spacesById[space.id] = space }
+        for device in devices { devicesById[device.id] = device }
+        for ref in refs {
+            refsById[ref.chatId] = ref
+            memberIds.insert(ref.chatId)
+            if chatsById[ref.chatId] == nil { sharedSessionRefs.append(ref) }
+        }
+        for chat in overviewChats {
+            if let id = chat.spaceId { activeBySpace[id, default: []].append(chat) }
+        }
+        for chat in settledChats {
+            if let id = chat.spaceId { archivedBySpace[id, default: []].append(chat) }
+        }
+        occupiedSpaces = spaces.filter { activeBySpace[$0.id] != nil }
     }
 }

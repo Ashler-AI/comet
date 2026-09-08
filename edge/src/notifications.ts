@@ -25,6 +25,9 @@ const MAX_BODY_BYTES = 2048;
 const MAX_USER_DEVICES = 16;
 const MAX_PROJECT_DEVICES = 1024;
 const REGISTRATION_TTL_MS = 30 * 24 * 60 * 60_000;
+// Source-device and Worker clocks can differ by milliseconds. Reject only
+// substantial future dates; strict rejection lets the next baseline eat an edge.
+const MAX_CLOCK_SKEW_MS = 5_000;
 const APNS_DIAGNOSTIC_REASONS: Record<string, true> = {
   BadDeviceToken: true,
   DeviceTokenNotForTopic: true,
@@ -35,9 +38,48 @@ const APNS_DIAGNOSTIC_REASONS: Record<string, true> = {
   MissingProviderToken: true
 };
 const COPY: Record<Attention, string> = {
-  input: "A Crew session needs your input.",
-  error: "A Crew session encountered an error.",
-  completion: "A Crew session finished working."
+  input: "Needs your input.",
+  error: "Encountered an error.",
+  completion: "Finished working."
+};
+
+const notificationTitle = (value: unknown): string | undefined => {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.replace(/\s+/gu, " ").trim();
+  if (!normalized) return undefined;
+  let title = "";
+  let characters = 0;
+  for (const character of normalized) {
+    if (characters === 119) {
+      return title + (normalized.length > title.length + character.length ? "…" : character);
+    }
+    title += character;
+    characters += 1;
+  }
+  return title;
+};
+
+const stringField = (row: unknown, key: string): string | undefined => {
+  const value = row instanceof LoroMap ? row.get(key)
+    : row && typeof row === "object" && !isContainer(row) ? (row as Record<string, unknown>)[key] : undefined;
+  if (isContainer(value)) { value.free(); return undefined; }
+  return typeof value === "string" ? value : undefined;
+};
+
+const sessionRefTitle = (refs: LoroMap, chatId: string, userId: string): string | undefined => {
+  // Matches the workspace's UTF-8 byte-length-prefixed principal membership key.
+  const key = `${new TextEncoder().encode(userId).byteLength}:${userId}:${chatId}`;
+  const row = refs.get(key);
+  let environment: unknown;
+  try {
+    if (stringField(row, "userId") !== userId || stringField(row, "chatId") !== chatId) return undefined;
+    environment = row instanceof LoroMap ? row.get("environment")
+      : row && typeof row === "object" && !isContainer(row) ? (row as Record<string, unknown>).environment : undefined;
+    return notificationTitle(stringField(environment, "name"));
+  } finally {
+    if (isContainer(environment)) environment.free();
+    if (isContainer(row)) row.free();
+  }
 };
 
 export const attentionTransition = (
@@ -47,7 +89,7 @@ export const attentionTransition = (
   now: number
 ): Attention | undefined => {
   if (!previous || archived || next.status === previous.status ||
-      next.updatedAt <= previous.updatedAt || next.updatedAt > now ||
+      next.updatedAt <= previous.updatedAt || next.updatedAt > now + MAX_CLOCK_SKEW_MS ||
       now - next.updatedAt > 45_000) return undefined;
   if (next.status === "awaitingInput") return "input";
   if (next.status === "errored") return "error";
@@ -104,7 +146,7 @@ export class ApnsProvider {
     }
   }
 
-  async send(device: Registration, chatId: string, projectScope: string, userId: string, attention: Attention, authorization?: string): Promise<{ status: number; apnsId?: string; remove: boolean; invalidatedAt?: number }> {
+  async send(device: Registration, chatId: string, projectScope: string, userId: string, attention: Attention, title: string, authorization?: string): Promise<{ status: number; apnsId?: string; remove: boolean; invalidatedAt?: number }> {
     const jwt = authorization ?? await this.authorization();
     const host = device.environment === "sandbox" ? "api.sandbox.push.apple.com" : "api.push.apple.com";
     const transport = this.transport;
@@ -120,7 +162,7 @@ export class ApnsProvider {
         "content-type": "application/json"
       },
       body: JSON.stringify({
-        aps: { alert: { title: "Crew", body: COPY[attention] }, sound: "default" },
+        aps: { alert: { title: notificationTitle(title) ?? `Session ${chatId.slice(0, 8)}`, body: COPY[attention] }, sound: "default" },
         chatId, projectScope, userId
       }),
       signal: AbortSignal.timeout(10_000)
@@ -151,7 +193,7 @@ type StoredDevice = Registration & {
   registeredAt: number;
   sealedCredential: string;
 };
-interface Event { chatId: string; attention: Attention; updatedAt: number }
+interface Event { chatId: string; attention: Attention; updatedAt: number; title: string; titlesByUser?: Map<string, string> }
 
 export class WorkspaceNotifications {
   private readonly provider: ApnsProvider;
@@ -276,6 +318,8 @@ export class WorkspaceNotifications {
     let phase = "registration_lookup";
     let sessionsMap: LoroMap | undefined;
     let chatsMap: LoroMap | undefined;
+    let refsMap: LoroMap | undefined;
+    let recipients: { userId: string }[] | undefined;
     try {
       // No subscribers means no CRDT materialization or per-session SQL writes.
       // The first accepted update after registration still calls the pre-import
@@ -310,8 +354,8 @@ export class WorkspaceNotifications {
             updatedAt = raw instanceof LoroMap ? raw.get("updatedAt") : (raw as SessionAttentionState).updatedAt;
             if (typeof status !== "string" || typeof updatedAt !== "number" ||
                 !["idle", "working", "awaitingInput", "errored"].includes(status) ||
-                !Number.isSafeInteger(updatedAt) || updatedAt > now || updatedAt < 0) {
-              if (diagnose && typeof updatedAt === "number" && Number.isSafeInteger(updatedAt) && updatedAt > now) this.trace("observe_skip", { reason: "future", baseline, observedAt: now, updatedAt });
+                !Number.isSafeInteger(updatedAt) || updatedAt > now + MAX_CLOCK_SKEW_MS || updatedAt < 0) {
+              if (diagnose && typeof updatedAt === "number" && Number.isSafeInteger(updatedAt) && updatedAt > now + MAX_CLOCK_SKEW_MS) this.trace("observe_skip", { reason: "future", baseline, observedAt: now, updatedAt });
               continue;
             }
             const next: SessionAttentionState = { status, updatedAt };
@@ -336,7 +380,19 @@ export class WorkspaceNotifications {
           });
           phase = "status_upsert";
           this.storage.sql.exec("INSERT INTO notification_status (chatId, status, updatedAt, active, edgeAt) VALUES (?, ?, ?, ?, ?) ON CONFLICT(chatId) DO UPDATE SET edgeAt = CASE WHEN notification_status.status != excluded.status THEN excluded.edgeAt ELSE notification_status.edgeAt END, status = excluded.status, updatedAt = excluded.updatedAt, active = excluded.active", chatId, next.status, next.updatedAt, active ? 1 : 0, next.updatedAt);
-          if (attention) events.push({ chatId, attention, updatedAt: next.updatedAt });
+          if (attention) {
+            // Snapshot names while the imported document is alive. Do not open
+            // transcripts, persist titles in SQL, or borrow another user's label.
+            const title = notificationTitle(stringField(chat, "title")) ?? `Session ${chatId.slice(0, 8)}`;
+            refsMap ??= doc.getMap("sessionRefs");
+            recipients ??= [...this.storage.sql.exec<{ userId: string }>("SELECT DISTINCT userId FROM notification_devices WHERE registeredAt >= ?", now - REGISTRATION_TTL_MS)];
+            let titlesByUser: Map<string, string> | undefined;
+            for (const { userId } of recipients) {
+              const name = sessionRefTitle(refsMap, chatId, userId);
+              if (name) (titlesByUser ??= new Map()).set(userId, name);
+            }
+            events.push({ chatId, attention, updatedAt: next.updatedAt, title, titlesByUser });
+          }
           } finally {
             if (isContainer(raw)) raw.free();
             if (isContainer(chat)) chat.free();
@@ -354,6 +410,7 @@ export class WorkspaceNotifications {
     } finally {
       try { sessionsMap?.free(); } catch (error) { this.trace("observe_cleanup_exception", { phase: "sessions_free", error: (error instanceof Error ? error.message : String(error)).slice(0, 256) }); }
       try { chatsMap?.free(); } catch (error) { this.trace("observe_cleanup_exception", { phase: "chats_free", error: (error instanceof Error ? error.message : String(error)).slice(0, 256) }); }
+      try { refsMap?.free(); } catch { this.trace("observe_cleanup_exception", { phase: "refs_free" }); }
     }
   }
 
@@ -421,7 +478,7 @@ export class WorkspaceNotifications {
               return;
             }
             this.trace("apns_started", { updatedAt: event.updatedAt, ageMs: Date.now() - event.updatedAt });
-            const delivery = await this.provider.send(device, event.chatId, projectScope, device.userId, event.attention, authorization);
+            const delivery = await this.provider.send(device, event.chatId, projectScope, device.userId, event.attention, event.titlesByUser?.get(device.userId) ?? event.title, authorization);
             this.trace("apns_finished", { updatedAt: event.updatedAt, status: delivery.status, apnsId: delivery.apnsId, removeRegistration: delivery.remove });
             if (delivery.remove && (delivery.invalidatedAt === undefined || device.registeredAt <= delivery.invalidatedAt)) {
               this.storage.sql.exec("DELETE FROM notification_devices WHERE installationId = ? AND revision = ?", device.installationId, device.revision);

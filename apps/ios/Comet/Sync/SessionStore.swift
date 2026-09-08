@@ -29,6 +29,7 @@ final class SessionStore {
     /// already-visible transcript until the settle loop finished. The store is
     /// cached per chat, so it outlives that churn.
     @ObservationIgnored var hasRevealed = false
+    @ObservationIgnored let transcriptBuilder = TranscriptBuilderCache()
     private(set) var connected = false
     /// Client-minted ids of sends the host hasn't materialized yet.
     private(set) var pendingSends: [(messageId: String, text: String, at: Int64)] = []
@@ -76,6 +77,8 @@ final class SessionStore {
 
     /// Demo-mode injection point (also used by previews).
     func setEntries(_ new: [MessageEntry]) {
+        guard entries != new else { return }
+        invalidateProjection()
         entries = new
         previewTitle = Self.titlePreview(in: new)
         transcriptActivity = Self.activity(in: new, chatId: chatId, observedAt: nowMs())
@@ -85,21 +88,50 @@ final class SessionStore {
     func activateTranscript() {
         guard metadataOnly else { return }
         metadataOnly = false
+        invalidateProjection()
         project()
     }
 
     @ObservationIgnored private var saver: DocSaver?
+    @ObservationIgnored private var hydrationTask: Task<LoroDoc?, Never>?
+    @ObservationIgnored private(set) var hydrationComplete = false
+    var isHydrating: Bool { hydrationTask != nil }
 
     func start() {
-        guard room == nil, !offline else { return }
+        guard room == nil, hydrationTask == nil, !offline else { return }
         roomEpoch &+= 1
+        invalidateProjection()
         let epoch = roomEpoch
-        // Local-first: last-synced transcript renders instantly (even when the
-        // host device is offline); the join backfills incrementally from here.
         let cacheId = config.documentCacheId(roomId: chatId, deploymentId: deploymentId)
-        if DocDisk.load(into: doc, id: cacheId) {
-            project()
+        // Restarts retain their already-hydrated replica. Never re-import a
+        // potentially older cache over the live transcript.
+        guard !hydrationComplete else {
+            joinRoom(cacheId: cacheId, epoch: epoch)
+            return
         }
+        let previous = doc
+        let load = Task.detached(priority: .userInitiated) {
+            DocDisk.loadReplica(id: cacheId)
+        }
+        hydrationTask = load
+        Task { @MainActor [weak self] in
+            let cached = await load.value
+            guard let self, self.roomEpoch == epoch, self.doc === previous,
+                  !load.isCancelled else { return }
+            self.hydrationTask = nil
+            // Optimistic sends do not write the doc. Preserve any actual local
+            // operations that did land while the isolated cache was importing.
+            if let cached, DocDisk.preserveLocalOperations(from: previous, in: cached) {
+                self.invalidateProjection()
+                self.doc = cached
+            }
+            self.hydrationComplete = true
+            self.joinRoom(cacheId: cacheId, epoch: epoch)
+        }
+    }
+
+    private func joinRoom(cacheId: String, epoch: UInt64) {
+        guard roomEpoch == epoch, room == nil else { return }
         saver = DocSaver(docId: cacheId, doc: doc)
         let client = RoomClient(roomId: chatId, doc: doc) { [config, chatId, deploymentId] in
             await config.sessionSocketURL(chatId: chatId, deploymentId: deploymentId)
@@ -114,16 +146,25 @@ final class SessionStore {
         }
         room = client
         subscribeLocalUpdates(client: client)
-        Task { await client.start() }
+        Task { @MainActor [weak self] in
+            guard let self, self.roomEpoch == epoch else { return }
+            await client.start()
+        }
         project()
     }
 
     private func subscribeLocalUpdates(client: RoomClient) {
-        subscriptions.append(doc.subscribeLocalUpdate { [weak client, weak self] update in
+        let epoch = roomEpoch
+        let subscribedDoc = doc
+        subscriptions.append(doc.subscribeLocalUpdate { [weak client, weak self, weak subscribedDoc] update in
             guard let client else { return }
             let bytes = [UInt8](update)
             Task { await client.sendLocalUpdate(bytes) }
-            Task { @MainActor [weak self] in self?.saver?.poke() }
+            Task { @MainActor [weak self, weak subscribedDoc] in
+                guard let self, let subscribedDoc, self.roomEpoch == epoch,
+                      self.doc === subscribedDoc else { return }
+                self.saver?.poke()
+            }
         })
     }
 
@@ -132,6 +173,7 @@ final class SessionStore {
               DocDisk.preserveLocalOperations(from: previous, in: replacement) else { return false }
         // Keep entries visible until the replacement projection is ready, and
         // retain optimistic sends, command admission, and the reveal state.
+        invalidateProjection()
         subscriptions.removeAll()
         doc = replacement
         subscribeLocalUpdates(client: room)
@@ -147,8 +189,12 @@ final class SessionStore {
 
     func stop() {
         roomEpoch &+= 1
+        hydrationTask?.cancel()
+        hydrationTask = nil
+        invalidateProjection()
         subscriptions.removeAll()
         saver?.flush()
+        saver = nil
         if let room {
             Task { await room.stop() }
         }
@@ -162,13 +208,18 @@ final class SessionStore {
         guard !offline else { return }
         stop()
         doc = LoroDoc()
-        entries = []
+        hydrationComplete = false
+        if !entries.isEmpty {
+            entries = []
+            revision &+= 1
+        }
         publishedSession = nil
         publishedEnvironment = nil
         previewTitle = nil
         transcriptActivity = nil
         lastRemoteUpdateAt = nil
         hasRevealed = false
+        transcriptBuilder.reset()
         uploadedImages.removeAll()
         start()
     }
@@ -191,56 +242,91 @@ final class SessionStore {
 
     // MARK: Projection
 
-    /// In-flight guard + trailing re-run for the off-main projection below.
-    @ObservationIgnored private var projecting = false
+    @ObservationIgnored private var projectionTask: Task<ProjectionResult?, Never>?
     @ObservationIgnored private var projectPending = false
+    @ObservationIgnored private var projectionEpoch: UInt64 = 0
+    @ObservationIgnored private var lastProjectionKey: ProjectionKey?
+    @ObservationIgnored private(set) var projectionCount: UInt64 = 0
+    var isProjecting: Bool { projectionTask != nil }
 
-    /// Re-derive `entries` from the doc, off the main thread.
-    ///
-    /// `getDeepValue()` materializes the WHOLE doc and the decode walks every
-    /// message and every part, so this is O(transcript) — tens of ms on a big
-    /// session, and it runs on every remote update. On the main actor that
-    /// stalled the first frame of a cached session and janked streaming.
-    /// Reading the doc from a background task is the access class the design
-    /// already has: `RoomClient` is a non-main actor that imports into this
-    /// same doc, so it is concurrently read/written today regardless.
-    ///
-    /// Overlapping calls coalesce to a single trailing re-run — a streaming
-    /// burst must not queue one whole-doc projection per token.
-    private func project() {
-        guard !projecting else {
+    private struct ProjectionKey: Equatable {
+        var version: VersionVector
+        var metadataOnly: Bool
+        var observedAt: Int64?
+        var pendingMessageIds: Set<String>
+    }
+
+    private struct ProjectionResult {
+        var key: ProjectionKey
+        var decoded: Projection?
+        var entriesChanged: Bool
+        var failures: [String: String]
+    }
+
+    private func invalidateProjection() {
+        projectionEpoch &+= 1
+        projectionTask?.cancel()
+        projectionTask = nil
+        projectPending = false
+        lastProjectionKey = nil
+    }
+
+    /// Container reads and decoding stay off-main. Streaming bursts coalesce;
+    /// unchanged version/inputs skip materialization altogether. Internal for
+    /// the benchmark runner to measure the same path the room uses.
+    func project() {
+        guard hydrationTask == nil else { return }
+        guard projectionTask == nil else {
             projectPending = true
             return
         }
-        projecting = true
         let doc = self.doc
+        let epoch = roomEpoch
+        let generation = projectionEpoch
         let pendingMessageIds = Set(pendingSends.map(\.messageId))
         let chatId = self.chatId
         let observedAt = lastRemoteUpdateAt
         let metadataOnly = self.metadataOnly
+        let previousKey = lastProjectionKey
+        let previousEntries = entries
+        let work = Task.detached(priority: .userInitiated) { () -> ProjectionResult? in
+            guard !Task.isCancelled else { return nil }
+            let key = ProjectionKey(version: doc.stateVv(), metadataOnly: metadataOnly,
+                                    observedAt: metadataOnly ? nil : observedAt,
+                                    pendingMessageIds: pendingMessageIds)
+            if key == previousKey {
+                return ProjectionResult(key: key, decoded: nil, entriesChanged: false, failures: [:])
+            }
+            let decoded = metadataOnly
+                ? Self.decodeMetadata(from: doc, chatId: chatId)
+                : Self.decodeProjection(from: doc, chatId: chatId, observedAt: observedAt)
+            guard !Task.isCancelled else { return nil }
+            let failures = pendingMessageIds.isEmpty || metadataOnly ? [:]
+                : Self.commandFailures(from: doc.getList(id: "commands").getDeepValue().listValue ?? [],
+                                       messageIds: pendingMessageIds)
+            return ProjectionResult(key: key, decoded: decoded,
+                                    entriesChanged: !metadataOnly && decoded.entries != previousEntries,
+                                    failures: failures)
+        }
+        projectionTask = work
         Task { @MainActor [weak self] in
-            let (decoded, failures) = await Task.detached(priority: .userInitiated) {
-                if metadataOnly {
-                    return (Optional(Self.decodeMetadata(from: doc, chatId: chatId)), [String: String]())
-                }
-                let root = doc.getDeepValue().mapValue
-                return (root.map { Self.decodeProjection(from: $0, chatId: chatId, observedAt: observedAt) },
-                        Self.commandFailures(from: root?["commands"]?.listValue ?? [],
-                                             messageIds: pendingMessageIds))
-            }.value
-            guard let self else { return }
-            self.projecting = false
-            // An old detached projection may finish after the binding swap.
-            // Never let it overwrite the recovered transcript or resolve echoes.
-            guard self.doc === doc else {
+            let result = await work.value
+            guard let self, self.roomEpoch == epoch, self.projectionEpoch == generation,
+                  self.doc === doc, self.metadataOnly == metadataOnly, !work.isCancelled else { return }
+            self.projectionTask = nil
+            // A multi-container read can straddle a remote import. Do not
+            // publish that mixed view, or let it resolve an optimistic echo.
+            guard let result, doc.stateVv() == result.key.version else {
                 self.projectPending = false
                 self.project()
                 return
             }
-            if let decoded {
-                self.apply(decoded)
+            self.lastProjectionKey = result.key
+            if let decoded = result.decoded {
+                self.projectionCount &+= 1
+                self.apply(decoded, metadataOnly: metadataOnly, entriesChanged: result.entriesChanged)
             }
-            for (messageId, failure) in failures
+            for (messageId, failure) in result.failures
                 where self.pendingSends.contains(where: { $0.messageId == messageId }) {
                 self.reportSendFailure(failure, messageId: messageId, terminal: true)
             }
@@ -251,21 +337,26 @@ final class SessionStore {
         }
     }
 
-    private func apply(_ decoded: Projection) {
-        entries = decoded.entries
-        publishedSession = decoded.session
-        transcriptActivity = decoded.activity
-        publishedEnvironment = decoded.environment
-        previewTitle = decoded.previewTitle
-        // Drop echoes the host has materialized.
-        let ids = Set(entries.map(\.id))
-        pendingSends.removeAll { ids.contains($0.messageId) }
-        for id in ids {
-            if let draft = submittedDrafts.removeValue(forKey: id) {
-                for image in draft.images { uploadedImages.removeValue(forKey: image.id) }
+    private func apply(_ decoded: Projection, metadataOnly: Bool, entriesChanged: Bool) {
+        if publishedSession != decoded.session { publishedSession = decoded.session }
+        if publishedEnvironment != decoded.environment { publishedEnvironment = decoded.environment }
+        if previewTitle != decoded.previewTitle { previewTitle = decoded.previewTitle }
+        // Metadata projections never own history or optimistic sends, including
+        // a metadata result queued immediately before transcript activation.
+        guard !metadataOnly else { return }
+        if entriesChanged { entries = decoded.entries }
+        if transcriptActivity != decoded.activity { transcriptActivity = decoded.activity }
+        let pendingCount = pendingSends.count
+        if !pendingSends.isEmpty || !submittedDrafts.isEmpty {
+            let ids = Set(entries.map(\.id))
+            pendingSends.removeAll { ids.contains($0.messageId) }
+            for id in ids {
+                if let draft = submittedDrafts.removeValue(forKey: id) {
+                    for image in draft.images { uploadedImages.removeValue(forKey: image.id) }
+                }
             }
         }
-        revision &+= 1
+        if entriesChanged || pendingSends.count != pendingCount { revision &+= 1 }
     }
 
     /// Only reconcile this phone's in-flight echoes. Historical commands are
@@ -289,19 +380,13 @@ final class SessionStore {
         return failures
     }
 
-    /// Whole-doc decode. `nil` means the doc has no map root yet — leave the
-    /// previous projection standing rather than blanking a live transcript.
+    /// Materialize only transcript messages; never commands or publications.
     nonisolated static func decodeEntries(from doc: LoroDoc) -> [MessageEntry]? {
-        guard let root = doc.getDeepValue().mapValue else { return nil }
-        return decodeEntries(from: root)
+        guard let messages = doc.getList(id: "messages").getDeepValue().listValue else { return nil }
+        return joinContinuations(messages.compactMap(entryFrom))
     }
 
-    nonisolated private static func decodeEntries(from root: [String: LoroValue]) -> [MessageEntry] {
-        let raw = (root["messages"]?.listValue ?? []).compactMap(entryFrom)
-        return joinContinuations(raw)
-    }
-
-    private struct Projection {
+    struct Projection {
         var entries: [MessageEntry]
         var session: SessionRow?
         var activity: SessionRow?
@@ -309,17 +394,36 @@ final class SessionStore {
         var previewTitle: String?
     }
 
-    nonisolated private static func decodeProjection(
-        from root: [String: LoroValue], chatId: String, observedAt: Int64?
+    nonisolated static func decodeProjection(
+        from doc: LoroDoc, chatId: String, observedAt: Int64?
     ) -> Projection {
-        let raw = (root["messages"]?.listValue ?? []).compactMap(entryFrom)
+        let raw = (doc.getList(id: "messages").getDeepValue().listValue ?? []).compactMap(entryFrom)
+        var decoded = decodePublication(from: doc, chatId: chatId)
+        decoded.entries = joinContinuations(raw)
+        decoded.activity = activity(in: raw, chatId: chatId, observedAt: observedAt)
+        decoded.previewTitle = titlePreview(in: raw)
+        return decoded
+    }
+
+    nonisolated private static func decodePublication(from doc: LoroDoc, chatId: String) -> Projection {
         var session: SessionRow?
         var environment: SessionEnvironment?
-        for publication in (root["publications"]?.listValue ?? []).reversed() {
-            guard let record = publication.mapValue?["record"]?.mapValue,
-                  record["kind"]?.stringValue == "agentSession",
-                  let value = record["value"]?.mapValue,
-                  value["chatId"]?.stringValue == chatId,
+        let publications = doc.getList(id: "publications")
+        for index in (0..<publications.len()).reversed() {
+            guard let item = publications.get(index: index) else { continue }
+            let recordItem = item.asLoroMap()?.get(key: "record")
+            let record = item.asValue()?.mapValue?["record"] ?? recordItem?.asValue()
+            let recordMap = recordItem?.asLoroMap()
+            let kind = record?.mapValue?["kind"]?.stringValue
+                ?? recordMap?.get(key: "kind")?.asValue()?.stringValue
+            guard kind == "agentSession" else { continue }
+            let valueItem = recordMap?.get(key: "value")
+            let scalarValue = record?.mapValue?["value"] ?? valueItem?.asValue()
+            let valueMap = valueItem?.asLoroMap()
+            let publishedChatId = scalarValue?.mapValue?["chatId"]?.stringValue
+                ?? valueMap?.get(key: "chatId")?.asValue()?.stringValue
+            guard publishedChatId == chatId,
+                  let value = (scalarValue ?? valueMap?.getDeepValue())?.mapValue,
                   let deviceId = value["ownerDeviceId"]?.stringValue,
                   let createdAt = value["createdAt"]?.i64Value else { continue }
             let updatedAt = value["updatedAt"]?.i64Value ?? createdAt
@@ -334,9 +438,8 @@ final class SessionStore {
             }
             break
         }
-        return Projection(entries: joinContinuations(raw), session: session,
-                          activity: activity(in: raw, chatId: chatId, observedAt: observedAt),
-                          environment: environment, previewTitle: titlePreview(in: raw))
+        return Projection(entries: [], session: session, activity: nil,
+                          environment: environment, previewTitle: nil)
     }
 
     nonisolated private static func titlePreview(in entries: [MessageEntry]) -> String? {
@@ -350,19 +453,7 @@ final class SessionStore {
     }
 
     nonisolated private static func decodeMetadata(from doc: LoroDoc, chatId: String) -> Projection {
-        let publications = doc.getList(id: "publications")
-        var latest: [LoroValue] = []
-        for index in (0..<publications.len()).reversed() {
-            guard let item = publications.get(index: index),
-                  let value = item.asValue() ?? item.asLoroMap()?.getDeepValue(),
-                  let record = value.mapValue?["record"]?.mapValue,
-                  record["kind"]?.stringValue == "agentSession",
-                  record["value"]?.mapValue?["chatId"]?.stringValue == chatId else { continue }
-            latest = [value]
-            break
-        }
-        var decoded = decodeProjection(from: ["publications": .list(value: latest)],
-                                       chatId: chatId, observedAt: nil)
+        var decoded = decodePublication(from: doc, chatId: chatId)
         let messages = doc.getList(id: "messages")
         for index in 0..<messages.len() {
             guard let item = messages.get(index: index) else { continue }
