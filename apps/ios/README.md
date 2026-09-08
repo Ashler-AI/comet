@@ -421,11 +421,11 @@ invite scheme, version, architecture, and archive push entitlement. No Apple
 credentials are uploaded to CI: distribution export, signed-IPA inspection,
 and upload use the established local Xcode account flow above.
 
-Desktop **0.1.76** can reuse the staging-tested candidate from run
-`34178218428`; the production preparation does not change its compiled source.
-The candidate source must be reachable from main before promotion. Backend
-recovery and scoped-upload changes require the normal staged production deploy.
-Scaffold runtime version and Linux release channels remain unchanged.
+Desktop **0.1.78** includes the large-journal fork fix from main commit
+`14f4344`, so it requires a new verified candidate rather than promotion of
+staging **0.1.76**. Backend recovery and scoped-upload changes require the
+normal staged production deploy. Scaffold runtime version and Linux release
+channels remain unchanged.
 
 On 2026-09-08, production Worker secret-name inspection found no `APNS_KEY_ID`
 or `APNS_PRIVATE_KEY`. Production background pushes require approved production
