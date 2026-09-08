@@ -36,6 +36,29 @@ This installs the official [oh-my-pi v17.2.9](https://github.com/can1357/oh-my-p
 
 To use a remote OMP auth broker, launch Comet with `OMP_AUTH_BROKER_URL` and either `OMP_AUTH_BROKER_TOKEN` or `OMP_AUTH_BROKER_TOKEN_FILE`. The token-file form is preferred for service managers: it must be mode `0600`, is removed before parsing/spawn on every outcome, and Comet passes the bearer only in the OMP child environment, never argv or logs. Do not print or interpolate the token in shell commands. Scaffold-host OMP launches remain isolated with `--profile scaffold-host --no-extensions --no-skills --no-rules`.
 
+### Desktop gateway extension discovery
+
+Crew 0.1.83 installs a credential-free, Crew-owned discovery adapter at
+`extensions/crew-auth-gateway.ts` in the selected OMP agent directory. Ordinary
+cold-revived subagents discover the same gateway provider as their parent instead
+of removing its authentication registration. The adapter is inert unless both
+`COMET_SESSION_ID` and `COMET_INFERENCE_TOKEN` are present; bare OMP sessions do not
+gain Crew providers merely because the file exists.
+
+An existing user-owned `extensions/omp-auth-gateway.ts` keeps precedence, including
+when added after Crew's adapter was installed. Crew does not overwrite unrelated
+extensions. Symlinked extension directories and conflicting managed-path files
+are rejected rather than overwritten or silently falling back to the broken
+explicit-only revival path. Scaffold's no-discovery policy and Prime's explicit
+adapter remain separate. This desktop-only release does not replace the installed
+OMP executable or advance the Scaffold release channel.
+
+The isolated installed-runtime regression can be run without provider credentials:
+
+```bash
+node scripts/omp-gateway-revival-smoke.mjs ~/.local/bin/omp --compare-explicit
+```
+
 ## Local collaboration smoke
 
 The deterministic smoke uses two in-memory headless devices and needs no cloud credentials, agent CLI, network, or persistent state:

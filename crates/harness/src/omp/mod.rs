@@ -1103,6 +1103,7 @@ fn configure_inference_gateway(
     command: &mut Command,
     agent_dir: &Path,
     inference: &InferenceRoute,
+    scaffold_host: bool,
 ) -> Result<(), HarnessError> {
     let provider = crate::auth_gateway::provider(&inference.provider).ok_or_else(|| {
         HarnessError::Protocol(format!(
@@ -1110,8 +1111,14 @@ fn configure_inference_gateway(
             inference.provider
         ))
     })?;
-    if let Some(extension) = crate::auth_gateway::install_extension(agent_dir)? {
-        command.arg("--extension").arg(extension);
+    if scaffold_host {
+        // Scaffold disables extension discovery; preserve its explicit adapter.
+        if !agent_dir.join("extensions/omp-auth-gateway.ts").is_file() {
+            let extension = crate::auth_gateway::install_prime_extension(agent_dir)?;
+            command.arg("--extension").arg(extension);
+        }
+    } else {
+        crate::auth_gateway::install_extension(agent_dir)?;
     }
     let model = inference
         .model
@@ -2063,6 +2070,7 @@ impl Harness for OmpHarness {
                 &mut command,
                 &omp_agent_dir(self.scaffold_host),
                 inference,
+                self.scaffold_host,
             )?;
         } else if self.scaffold_host {
             configure_scaffold_inference_profile(&mut command, request.model.as_deref())?;
@@ -3468,6 +3476,7 @@ mod tests {
                 provider: "openai".into(),
                 model: "gpt-5.6-sol".into(),
             },
+            true,
         )
         .unwrap();
         let args: Vec<String> = command
@@ -3487,6 +3496,37 @@ mod tests {
             &args[args.len() - 2..],
             ["--model", "comet-openai/gpt-5.6-sol"]
         );
+    }
+
+    #[test]
+    fn shared_inference_desktop_installs_discoverable_gateway_without_duplicate_flag() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut command =
+            OmpHarness::new().run_command(Path::new("/usr/local/bin/omp"), &run_request(None));
+        configure_inference_gateway(
+            &mut command,
+            temp.path(),
+            &InferenceRoute {
+                base_url: "http://127.0.0.1:41234".into(),
+                token: "local-inference-token".into(),
+                provider: "openai".into(),
+                model: "gpt-6-astra".into(),
+            },
+            false,
+        )
+        .unwrap();
+        assert!(
+            temp.path()
+                .join("extensions/crew-auth-gateway.ts")
+                .is_file()
+        );
+        assert!(
+            temp.path()
+                .join("comet-runtime/agent-auth-gateway.ts")
+                .is_file()
+        );
+        assert!(!temp.path().join("extensions/omp-auth-gateway.ts").exists());
+        assert!(!command.as_std().get_args().any(|arg| arg == "--extension"));
     }
 
     #[test]
