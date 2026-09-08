@@ -941,8 +941,8 @@ extension AppModel {
         probe.notifications.visibleChatId = visible.chatId
         let suspended = upload != nil && sending.sending && sending.pendingSends.isEmpty
         probe.preloadSessionMetadata()
-        let activeRetained = [member, visible, routed, sending, queued].allSatisfy {
-            probe.sessionStores[$0.chatId] === $0
+        let activeRetained = [member, visible, routed, sending, queued].allSatisfy { (store: SessionStore) in
+            probe.sessionStores[store.chatId] === store
         }
         let idleEvicted = probe.sessionStores[idle.chatId] == nil
         probe.notifications.visibleChatId = oldVisibleChatId
