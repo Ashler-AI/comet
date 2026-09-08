@@ -18,7 +18,16 @@ const logs = path.join(output, "logs");
 const release = path.join(output, "release");
 const work = path.join(process.env.RUNNER_TEMP, "crew-mobile");
 for (const directory of [logs, release, work]) mkdirSync(directory, { recursive: true });
-const bundleId = "ai.ashler.crew.staging";
+const environment = process.env.CREW_MOBILE_ENVIRONMENT ?? "staging";
+const profiles = {
+  staging: { scheme: "Crew Staging", bundleId: "ai.ashler.crew.staging", build: "12", suffix: "-Staging", name: "Crew-Staging" },
+  production: { scheme: "Comet", bundleId: "ai.ashler.crew", build: "6", suffix: "", name: "Crew" },
+};
+if (!Object.hasOwn(profiles, environment)) throw new Error(`Unsupported mobile environment: ${environment}`);
+const { scheme, bundleId, build, suffix, name } = profiles[environment];
+const simulatorConfiguration = `Debug${suffix}`;
+const archiveConfiguration = `Release${suffix}`;
+const artifactPrefix = `${name}-1.0-${build}`;
 const markers = [
   "OK Crew session visibility",
   "OK Crew attention transitions",
@@ -67,8 +76,13 @@ function verifyApp(app, platform) {
   const info = plist(path.join(app, "Info.plist"));
   requireEqual(info.CFBundleIdentifier, bundleId, "Bundle identifier");
   requireEqual(info.CFBundleShortVersionString, "1.0", "Marketing version");
-  requireEqual(info.CFBundleVersion, "12", "Source build number (never overridden by CI)");
+  requireEqual(info.CFBundleVersion, build, "Source build number (never overridden by CI)");
   requireEqual(info.DTPlatformName, platform, "Built platform");
+  const hostSuffix = environment === "staging" ? "-staging" : "";
+  requireEqual(info.CrewEdgeURL, `https://comet${hostSuffix}.internal.ashler.com`, "Edge endpoint");
+  requireEqual(info.CrewScaffoldURL, `https://scaffold${hostSuffix}.internal.ashler.com`, "Scaffold endpoint");
+  requireEqual(info.CrewProjectScope, `ashler-${environment}`, "Project scope");
+  requireEqual(info.CrewInviteScheme, `comet${hostSuffix}`, "Invite scheme");
   requireEqual(run("lipo", ["-archs", path.join(app, info.CFBundleExecutable)]), "arm64", "Binary architecture");
   return info;
 }
@@ -162,18 +176,18 @@ try {
   if (!/^26(?:\.|$)/.test(sdk)) throw new Error(`Expected iOS 26 SDK: ${sdk}`);
   console.log(`${process.env.DEVELOPER_DIR}\n${xcode}\niOS SDK ${sdk}`);
   const base = [
-    "-project", project, "-scheme", "Crew Staging", "-jobs", "2",
+    "-project", project, "-scheme", scheme, "-jobs", "2",
     "-clonedSourcePackagesDirPath", path.join(work, "packages"),
     "-disableAutomaticPackageResolution", "-onlyUsePackageVersionsFromResolvedFile",
   ];
   const simulatorBuild = [
-    ...base, "-configuration", "Debug-Staging", "-sdk", "iphonesimulator",
+    ...base, "-configuration", simulatorConfiguration, "-sdk", "iphonesimulator",
     "-destination", "generic/platform=iOS Simulator", "-derivedDataPath", path.join(work, "simulator-derived"),
     "ARCHS=arm64", "ONLY_ACTIVE_ARCH=YES", "CODE_SIGNING_ALLOWED=YES", "CODE_SIGN_IDENTITY=-",
   ];
-  const archive = path.join(work, "Crew-Staging.xcarchive");
+  const archive = path.join(work, `${name}.xcarchive`);
   const deviceBuild = [
-    ...base, "-configuration", "Release-Staging", "-sdk", "iphoneos",
+    ...base, "-configuration", archiveConfiguration, "-sdk", "iphoneos",
     "-destination", "generic/platform=iOS", "-derivedDataPath", path.join(work, "device-derived"),
     "ARCHS=arm64", "CODE_SIGNING_ALLOWED=NO",
   ];
@@ -183,7 +197,7 @@ try {
     writeFileSync(path.join(logs, `${name}-build-settings.json`), json);
     const settings = JSON.parse(json).find((item) => item.target === "Comet")?.buildSettings;
     if (!settings) throw new Error(`Missing Comet build settings for ${name}`);
-    requireEqual(settings.CURRENT_PROJECT_VERSION, "12", `${name} source build number`);
+    requireEqual(settings.CURRENT_PROJECT_VERSION, build, `${name} source build number`);
     requireEqual(settings.MARKETING_VERSION, "1.0", `${name} source marketing version`);
     requireEqual(settings.PRODUCT_BUNDLE_IDENTIFIER, bundleId, `${name} source bundle identifier`);
     buildSettings[name] = settings;
@@ -200,8 +214,8 @@ try {
   if (!lockBefore.equals(readFileSync(lockfile))) throw new Error("Build modified Package.resolved");
 
   // Upload-artifact does not preserve Unix modes; tar does, including symlinks.
-  run("tar", ["-czf", path.join(release, "Crew-Staging-1.0-12-simulator-arm64.tar.gz"), "-C", path.dirname(simulatorApp), path.basename(simulatorApp)], { timeout: 300_000 });
-  run("tar", ["-czf", path.join(release, "Crew-Staging-1.0-12-unsigned.xcarchive.tar.gz"), "-C", work, path.basename(archive)], { timeout: 300_000 });
+  run("tar", ["-czf", path.join(release, `${artifactPrefix}-simulator-arm64.tar.gz`), "-C", path.dirname(simulatorApp), path.basename(simulatorApp)], { timeout: 300_000 });
+  run("tar", ["-czf", path.join(release, `${artifactPrefix}-unsigned.xcarchive.tar.gz`), "-C", work, path.basename(archive)], { timeout: 300_000 });
   copyFileSync(path.join(logs, "e2e.log"), path.join(release, "e2e.log"));
   copyFileSync(path.join(logs, "archive-signed.entitlements"), path.join(release, "archive-signed.entitlements"));
   writeFileSync(path.join(release, "source-sha.txt"), `${process.env.GITHUB_SHA}\n`);
@@ -211,14 +225,14 @@ try {
     runner: { architecture: process.arch, image: process.env.ImageOS, imageVersion: process.env.ImageVersion },
     toolchain: { developerDirectory: process.env.DEVELOPER_DIR, xcode, sdk },
     bundleId, version: deviceInfo.CFBundleShortVersionString, build: deviceInfo.CFBundleVersion,
-    simulator: { configuration: "Debug-Staging", platform: simulatorInfo.DTPlatformName, ...regression },
-    archive: { configuration: "Release-Staging", path: path.basename(archive), signing: "ad-hoc; requires local Apple distribution re-sign/export", apsEnvironment: "production" },
+    simulator: { configuration: simulatorConfiguration, platform: simulatorInfo.DTPlatformName, ...regression },
+    archive: { configuration: archiveConfiguration, path: path.basename(archive), signing: "ad-hoc; requires local Apple distribution re-sign/export", apsEnvironment: "production" },
     packageResolvedSha256: await sha256(lockfile),
   }, null, 2)}\n`);
   const checksums = [];
   for (const name of readdirSync(release).sort()) checksums.push(`${await sha256(path.join(release, name))}  ${name}`);
   writeFileSync(path.join(release, "SHA256SUMS"), `${checksums.join("\n")}\n`);
-  console.log(`Verified Crew Staging 1.0 (12); release files: ${release}`);
+  console.log(`Verified ${name} 1.0 (${build}); release files: ${release}`);
 } catch (error) {
   console.error(error.stack ?? error);
   writeFileSync(path.join(logs, "failure.log"), `${error.stack ?? error}\n`);

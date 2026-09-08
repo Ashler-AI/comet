@@ -3437,8 +3437,13 @@ impl Shell {
 
     fn delete_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.delete_confirm = None;
-        self.state
-            .update(cx, |state, cx| state.cancel_pending_chat(&chat_id, cx));
+        self.state.update(cx, |state, cx| {
+            if state.chat_is_pending(&chat_id) {
+                state.cancel_pending_chat(&chat_id, cx);
+            } else if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
+                state.select_chat(None, cx);
+            }
+        });
         self.composer
             .update(cx, |composer, _| composer.purge_chat(&chat_id));
         self.mutate(
@@ -8704,6 +8709,12 @@ mod tests {
             state.apply_chats(vec![persisted.clone()]);
             assert_eq!(state.chats, vec![persisted]);
             assert_eq!(state.chat_startup_phase("background-pending"), None);
+        });
+
+        // A disconnected engine cannot confirm deletion of a persisted row.
+        shell.update(cx, |shell, cx| shell.delete_chat("persisted".into(), cx));
+        state.read_with(cx, |state, _| {
+            assert!(state.chats.iter().any(|chat| chat.id == "persisted"));
         });
     }
 

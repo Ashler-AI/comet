@@ -1891,6 +1891,11 @@ impl AppState {
         sort_chats(&mut self.chats);
     }
 
+    pub(crate) fn chat_is_pending(&self, chat_id: &str) -> bool {
+        self.pending_local_chat_ids.contains(chat_id)
+            || self.scaffold_session_draft_for_chat(chat_id).is_some()
+    }
+
     pub fn set_chat_startup_phase(&mut self, chat_id: &str, phase: ChatStartupPhase) {
         self.chat_startup_phases.insert(chat_id.to_string(), phase);
     }

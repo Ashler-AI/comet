@@ -26,7 +26,7 @@ Production and staging use the same Swift target with separate checked-in scheme
 bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
 
 ```sh
-# Production preparation: Crew, ai.ashler.crew, version 1.0 build 5 (tentative)
+# Production: Crew, ai.ashler.crew, version 1.0 build 6
 xcodebuild -project Comet.xcodeproj -scheme Comet \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 
@@ -409,6 +409,28 @@ The TestFlight build list shows build **12**, **Ready to Submit**, expiry in
 column is still `–`; no physical-iPhone installation or image/notification
 delivery is claimed. No local typechecks or compilation ran during this
 authorized rollout.
+
+### Production parity release
+
+Production uses the same session, notification, image-upload, and recovery source
+as staging. The mobile workflow accepts `environment=production` to build the
+`Comet` scheme with `Debug`/`Release`, bundle `ai.ashler.crew`, and build **6**.
+The default remains staging build **12**. Both environments verify all five
+simulator probes and the built app's Edge/Scaffold endpoints, project scope,
+invite scheme, version, architecture, and archive push entitlement. No Apple
+credentials are uploaded to CI: distribution export, signed-IPA inspection,
+and upload use the established local Xcode account flow above.
+
+Desktop **0.1.78** includes the large-journal fork fix from main commit
+`14f4344`, so it requires a new verified candidate rather than promotion of
+staging **0.1.76**. Backend recovery and scoped-upload changes require the
+normal staged production deploy. Scaffold runtime version and Linux release
+channels remain unchanged.
+
+On 2026-09-08, production Worker secret-name inspection found no `APNS_KEY_ID`
+or `APNS_PRIVATE_KEY`. Production background pushes require approved production
+APNs credentials; neither deploying source nor distributing a push-entitled app
+provisions them. Staging credentials are not implicitly authorized for copying.
 
 ## Architecture
 

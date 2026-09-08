@@ -214,7 +214,7 @@
 				CREW_INVITE_SCHEME = comet;
 				CREW_PROJECT_SCOPE = "ashler-production";
 				CREW_SCAFFOLD_URL = "https://scaffold.internal.ashler.com";
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 6;
 				DEVELOPMENT_TEAM = 825LYXGJR6;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -247,7 +247,7 @@
 				CREW_INVITE_SCHEME = comet;
 				CREW_PROJECT_SCOPE = "ashler-production";
 				CREW_SCAFFOLD_URL = "https://scaffold.internal.ashler.com";
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 6;
 				DEVELOPMENT_TEAM = 825LYXGJR6;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;

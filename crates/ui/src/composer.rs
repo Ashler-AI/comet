@@ -6966,10 +6966,8 @@ mod tests {
         composer.update(cx, |composer, cx| {
             composer.submit_command("start a fresh session", cx)
         });
-        cx.condition(&composer, |composer, _| {
-            !composer.is_sending(&chat_id)
-        })
-        .await;
+        cx.condition(&composer, |composer, _| !composer.is_sending(&chat_id))
+            .await;
         state.update(cx, |state, _| {
             assert!(state.can_start_scaffold_session());
             state.apply_chats(Vec::new());
