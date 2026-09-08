@@ -3437,18 +3437,13 @@ impl Shell {
 
     fn delete_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.delete_confirm = None;
-        if self
-            .state
-            .read(cx)
-            .scaffold_session_draft_for_chat(&chat_id)
-            .is_some()
-        {
-            self.state
-                .update(cx, |state, cx| state.cancel_pending_chat(&chat_id, cx));
-        } else if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
-            self.state
-                .update(cx, |state, cx| state.select_chat(None, cx));
-        }
+        self.state.update(cx, |state, cx| {
+            if state.chat_is_pending(&chat_id) {
+                state.cancel_pending_chat(&chat_id, cx);
+            } else if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
+                state.select_chat(None, cx);
+            }
+        });
         self.composer
             .update(cx, |composer, _| composer.purge_chat(&chat_id));
         self.mutate(
@@ -8641,6 +8636,87 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::rc::Rc;
+
+    #[gpui::test]
+    fn deleting_first_send_chats_does_not_resurrect_optimistic_rows(cx: &mut gpui::TestAppContext) {
+        let data_dir = tempfile::tempdir().unwrap();
+        let state = cx.new(|_| AppState::new());
+        let shell = cx.new(|cx| {
+            Shell::new(
+                state.clone(),
+                EngineBootConfig {
+                    data_dir: data_dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:0".into(),
+                    edge_token: None,
+                    project_scope: "test".into(),
+                    deployment_id: None,
+                    scaffold_url: None,
+                    default_harness: comet_proto::HarnessId::Mock,
+                    runtime_profile: comet_proto::RuntimeProfile::LocalController,
+                },
+                cx,
+            )
+        });
+        let row = |id: &str| comet_proto::Chat {
+            id: id.into(),
+            device_id: "local".into(),
+            title: None,
+            archived: false,
+            cwd: None,
+            branch: None,
+            checkout_id: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            fork_from: None,
+            space_id: None,
+            last_seen_at: None,
+        };
+        let persisted = row("persisted");
+        state.update(cx, |state, cx| {
+            state.apply_chats(vec![persisted.clone()]);
+            for id in ["selected-pending", "background-pending"] {
+                state.stage_pending_chat(row(id));
+                state.set_chat_startup_phase(id, ChatStartupPhase::PreparingCheckout);
+            }
+            state.select_chat(Some("selected-pending".into()), cx);
+        });
+
+        shell.update(cx, |shell, cx| {
+            shell.delete_chat("selected-pending".into(), cx)
+        });
+        state.update(cx, |state, _| {
+            state.apply_chats(vec![persisted.clone()]);
+            assert!(!state.chats.iter().any(|chat| chat.id == "selected-pending"));
+            assert_eq!(state.chat_startup_phase("selected-pending"), None);
+            assert!(state.selected_chat.is_none());
+            assert!(
+                state
+                    .chats
+                    .iter()
+                    .any(|chat| chat.id == "background-pending")
+            );
+        });
+
+        shell.update(cx, |shell, cx| {
+            shell.delete_chat("background-pending".into(), cx)
+        });
+        state.update(cx, |state, _| {
+            state.apply_chats(vec![persisted.clone()]);
+            assert_eq!(state.chats, vec![persisted]);
+            assert_eq!(state.chat_startup_phase("background-pending"), None);
+        });
+
+        // A disconnected engine cannot confirm deletion of a persisted row.
+        shell.update(cx, |shell, cx| shell.delete_chat("persisted".into(), cx));
+        state.read_with(cx, |state, _| {
+            assert!(state.chats.iter().any(|chat| chat.id == "persisted"));
+        });
+    }
 
     #[test]
     fn ready_before_shell_observation_cannot_leave_boot_splash_visible() {

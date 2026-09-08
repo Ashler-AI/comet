@@ -190,6 +190,8 @@ epoch; unrelated 404s and terminal states still fail. Manual retry uses the same
 accepted sandbox. A failed launch without an accepted remote target discards its
 pending draft; confirmed deletion discards an accepted pending draft. Deleting a
 persisted chat keeps the ordinary chat-deletion behavior.
+Deleting a chat during its first send also removes the pending sidebar entry, so
+later workspace updates cannot restore a deleted session as still starting.
 
 ```bash
 version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
