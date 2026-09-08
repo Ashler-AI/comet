@@ -193,8 +193,8 @@ try {
   const simulatorInfo = verifyApp(simulatorApp, "iphonesimulator");
   const regression = await verifySimulator(simulatorApp);
   run("xcodebuild", [...deviceBuild, "-archivePath", archive, "archive"], { timeout: 1_200_000, log: "archive-build.log" });
-  const archiveInfo = plist(path.join(archive, "Info.plist"));
-  const archiveApp = path.join(archive, "Products", archiveInfo.ApplicationProperties.ApplicationPath);
+  const applicationPath = run("plutil", ["-extract", "ApplicationProperties.ApplicationPath", "raw", "-o", "-", path.join(archive, "Info.plist")]);
+  const archiveApp = path.join(archive, "Products", applicationPath);
   const deviceInfo = verifyApp(archiveApp, "iphoneos");
   signArchiveApp(archiveApp, buildSettings.archive);
   if (!lockBefore.equals(readFileSync(lockfile))) throw new Error("Build modified Package.resolved");
