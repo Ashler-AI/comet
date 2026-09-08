@@ -400,10 +400,15 @@ signature verification; its signature and provisioning profile both contain
 Inspection IPA SHA-256: `36d045233715d1daad37cdf3141bd18e7affb4b9380cd71f0803fd26edb29ef2`.
 The same archive uploaded successfully at **2026-09-08 02:21:32 UTC**, delivery
 `ecc19154-6e66-405a-8f0d-33473c70bf09`, with no upload errors or warnings.
-Apple reported the uploaded package processing. Processing completion and tester
-group availability are not yet confirmed: the App Store Connect browser session
-requires sign-in. No physical-iPhone installation or image/notification delivery
-is claimed. No local typechecks or compilation ran during this authorized rollout.
+The actual uploaded IPA also passed strict signature verification and retains
+the production APNs entitlement. Uploaded IPA SHA-256:
+`05fb66e5e2381090732934f1fc3a57eda12a780355c6f944d5e361e1d02b2034`.
+App Store Connect subsequently showed upload **Complete** for **1.0 (12)**.
+The TestFlight build list shows build **12**, **Ready to Submit**, expiry in
+90 days, the existing **AI** internal-group badge, and **1 invite**. Its installs
+column is still `–`; no physical-iPhone installation or image/notification
+delivery is claimed. No local typechecks or compilation ran during this
+authorized rollout.
 
 ## Architecture
 
