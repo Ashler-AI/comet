@@ -125,19 +125,39 @@ impl Baseline {
     }
 }
 
-fn show(session: &Session, enabled: bool, viewing: bool, cx: &App) {
+fn notification_title(state: &AppState, chat_id: &str) -> String {
+    let Some(name) = state
+        .chats
+        .iter()
+        .find(|chat| chat.id == chat_id)
+        .and_then(|chat| state.chat_display_name(chat))
+    else {
+        return crate::state::session_ref_fallback(chat_id);
+    };
+    let mut title = crate::transcript::single_line(name);
+    let mut chars = title.char_indices();
+    if let Some((end, _)) = chars.nth(119)
+        && chars.next().is_some()
+    {
+        title.truncate(end);
+        title.push('…');
+    }
+    title
+}
+
+fn show(state: &AppState, session: &Session, enabled: bool, viewing: bool, cx: &App) {
     if !enabled || viewing {
         return;
     }
     let body = match session.status {
-        SessionStatus::AwaitingInput => "A Crew session needs your input.",
-        SessionStatus::Errored => "A Crew session encountered an error.",
-        SessionStatus::Idle => "A Crew session finished working.",
+        SessionStatus::AwaitingInput => "Needs your input.",
+        SessionStatus::Errored => "Encountered an error.",
+        SessionStatus::Idle => "Finished working.",
         SessionStatus::Working => return,
     };
     cx.show_system_notification(SystemNotification {
         tag: format!("{TAG_PREFIX}{}", session.chat_id).into(),
-        title: "Crew".into(),
+        title: notification_title(state, &session.chat_id).into(),
         body: body.into(),
         actions: vec![SystemNotificationAction {
             id: "open".into(),
@@ -162,7 +182,7 @@ pub fn init(state: Entity<AppState>, settings: &UiSettings, cx: &mut App) {
                 .and_then(|window| window.read(cx).ok())
                 .is_some_and(|shell| shell.is_viewing_session(&session.chat_id, cx));
             let show_native = native && !viewing;
-            show(session, native, viewing, cx);
+            show(state.read(cx), session, native, viewing, cx);
             // GPUI posts silent macOS banners. XDG daemons may add sound,
             // so never layer a Crew chime over a Linux banner.
             if sound_enabled && !(show_native && cfg!(target_os = "linux")) {
@@ -413,9 +433,31 @@ mod tests {
         });
     }
 
+    #[test]
+    fn notification_names_bound_unicode_and_keep_untitled_sessions_identifiable() {
+        let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let mut state = state(now);
+        let exact = "\u{10400}".repeat(120);
+        state.chats[0].title = Some(format!("\n {exact}\t"));
+        assert_eq!(notification_title(&state, "chat"), exact);
+        state.chats[0].title = Some(format!("{exact}x"));
+        assert_eq!(
+            notification_title(&state, "chat"),
+            format!("{}…", "\u{10400}".repeat(119))
+        );
+        state.chats[0].title = Some(" \n\t ".into());
+        assert_eq!(notification_title(&state, "chat"), "Session chat");
+        assert_eq!(
+            notification_title(&state, "\u{10400}2345678extra"),
+            "Session \u{10400}2345678"
+        );
+    }
+
     #[gpui::test]
     fn native_banner_requires_opt_in_and_an_unviewed_session(cx: &mut gpui::TestAppContext) {
         let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let mut state = state(now);
+        state.chats[0].title = Some("  Renamed\n session  ".into());
         let session = Session {
             chat_id: "chat".into(),
             device_id: "device".into(),
@@ -425,14 +467,16 @@ mod tests {
         };
         cx.update(|cx| {
             cx.set_app_identity("comet", "Crew");
-            show(&session, false, false, cx);
-            show(&session, true, true, cx);
+            show(&state, &session, false, false, cx);
+            show(&state, &session, true, true, cx);
         });
         assert!(cx.shown_system_notifications().is_empty());
-        cx.update(|cx| show(&session, true, false, cx));
+        cx.update(|cx| show(&state, &session, true, false, cx));
         let delivered = cx.delivered_system_notifications();
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].tag.as_ref(), "crew-session:chat");
+        assert_eq!(delivered[0].title.as_ref(), "Renamed session");
+        assert_eq!(delivered[0].body.as_ref(), "Needs your input.");
         assert_eq!(delivered[0].actions[0].id.as_ref(), "open");
     }
 
@@ -516,7 +560,10 @@ mod tests {
         });
         assert_eq!(
             cx.dismissed_system_notifications(),
-            vec![gpui::SharedString::from("crew-session:chat"), "crew-session:other".into()]
+            vec![
+                gpui::SharedString::from("crew-session:chat"),
+                "crew-session:other".into()
+            ]
         );
     }
 }

@@ -31,7 +31,7 @@ struct NotificationSettingsView: View {
                         }
                     }
                 } footer: {
-                    Text("Crew alerts you when a session needs input, encounters an error, or finishes. Alerts contain no session title or transcript. Background delivery stores your push token privately and your revocable sign-in credential encrypted on the Crew server to recheck access before each alert. Sign-out always completes locally and attempts to remove registration in the background. Disabling alerts requires server confirmation. Background delivery requires the server's Apple push configuration.")
+                    Text("Crew alerts you when a session needs input, encounters an error, or finishes. Session names may appear on your lock screen; transcript content is not included. Background delivery stores your push token privately and your revocable sign-in credential encrypted on the Crew server to recheck access before each alert. Sign-out always completes locally and attempts to remove registration in the background. Disabling alerts requires server confirmation. Background delivery requires the server's Apple push configuration.")
                 }
             }
             .navigationTitle("Notifications")

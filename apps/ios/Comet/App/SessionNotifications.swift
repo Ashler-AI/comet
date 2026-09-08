@@ -23,9 +23,9 @@ struct AttentionTracker {
                   chats.contains(where: { $0.id == chatId && !$0.archived }) else { continue }
             let body: String
             switch row.status {
-            case .awaitingInput: body = "A session needs your input."
-            case .errored: body = "A session encountered an error."
-            case .idle where old.status == .working: body = "A session finished and is ready for review."
+            case .awaitingInput: body = "Needs your input."
+            case .errored: body = "Encountered an error."
+            case .idle where old.status == .working: body = "Finished working."
             default: continue
             }
             alerts.append((chatId, body))
@@ -277,13 +277,20 @@ final class SessionNotifications: NSObject, UNUserNotificationCenterDelegate {
         #endif
     }
 
-    func update(sessions: [String: SessionRow], chats: [Chat]) {
+    static func notificationTitle(_ title: String?, chatId: String) -> String {
+        let title = normalizedSessionTitle(title) ?? "Session \(chatId.prefix(8))"
+        let end = title.index(title.startIndex, offsetBy: 120, limitedBy: title.endIndex)
+        guard let end, end != title.endIndex else { return title }
+        return String(title.prefix(119)) + "…"
+    }
+
+    func update(sessions: [String: SessionRow], chats: [Chat], resolveTitle: (String) -> String?) {
         let alerts = tracker.update(sessions, chats: chats, now: nowMs())
         guard enabled, registeredToken == nil, let config else { return }
         for (chatId, body) in alerts {
             guard !(UIApplication.shared.applicationState == .active && visibleChatId == chatId) else { continue }
             let content = UNMutableNotificationContent()
-            content.title = "Crew"
+            content.title = Self.notificationTitle(resolveTitle(chatId), chatId: chatId)
             content.body = body
             content.sound = .default
             content.threadIdentifier = chatId

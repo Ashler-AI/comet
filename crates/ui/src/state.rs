@@ -447,7 +447,7 @@ fn agent_indicator_with_transcript(
     }
 }
 
-fn session_ref_fallback(chat_id: &str) -> String {
+pub(crate) fn session_ref_fallback(chat_id: &str) -> String {
     format!("Session {}", chat_id.chars().take(8).collect::<String>())
 }
 
@@ -2159,8 +2159,17 @@ impl AppState {
         self.chats.iter().any(|chat| chat.id == chat_id)
     }
 
-    /// Canonical imported environment name, then a learned transcript preview.
-    pub(crate) fn shared_session_preview(&self, chat_id: &str) -> Option<&str> {
+    /// Existing sidebar name precedence, without loading session content.
+    pub(crate) fn chat_display_name<'a>(&'a self, chat: &'a Chat) -> Option<&'a str> {
+        self.scaffold_session_name(&chat.id).or_else(|| {
+            chat.title
+                .as_deref()
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+        })
+    }
+
+    fn scaffold_session_name(&self, chat_id: &str) -> Option<&str> {
         self.scaffold_environment(chat_id)
             .and_then(|environment| environment.name.as_deref())
             .map(str::trim)
@@ -2174,11 +2183,15 @@ impl AppState {
             })
             .map(str::trim)
             .filter(|title| !title.is_empty())
-            .or_else(|| {
-                self.shared_session_previews
-                    .get(chat_id)
-                    .map(String::as_str)
-            })
+    }
+
+    /// Canonical imported environment name, then a learned transcript preview.
+    pub(crate) fn shared_session_preview(&self, chat_id: &str) -> Option<&str> {
+        self.scaffold_session_name(chat_id).or_else(|| {
+            self.shared_session_previews
+                .get(chat_id)
+                .map(String::as_str)
+        })
     }
 
     pub fn shared_session_title(&self, chat_id: &str) -> String {
@@ -5759,6 +5772,36 @@ mod tests {
 
         state.apply_session_refs(Vec::new());
         assert!(state.selected_chat.is_none());
+    }
+
+    #[test]
+    fn chat_display_name_prefers_canonical_environment_then_local_rename() {
+        let mut state = AppState::new();
+        let mut chat = chat("chat", 0, None);
+        chat.title = Some("  Local rename  ".into());
+        let mut environment: SessionEnvironment = serde_json::from_value(serde_json::json!({
+            "source": { "kind": "scaffold", "sandbox_id": "sandbox", "lifecycle": "ready", "links": {} },
+            "name": "  Imported name  ",
+            "ownerPrincipal": "owner",
+            "scope": { "projectId": "project", "deploymentId": "deployment", "sessionId": "chat" }
+        }))
+        .unwrap();
+        state.session_refs.push(SessionRef {
+            chat_id: chat.id.clone(),
+            added_at: Utc::now(),
+            environment: Some(environment.clone()),
+        });
+        environment.name = Some("  Canonical name  ".into());
+        state
+            .scaffold_environments
+            .insert(chat.id.clone(), environment);
+        assert_eq!(state.chat_display_name(&chat), Some("Canonical name"));
+        state.scaffold_environments.clear();
+        assert_eq!(state.chat_display_name(&chat), Some("Imported name"));
+        state.session_refs[0].environment.as_mut().unwrap().name = Some("\n \t".into());
+        assert_eq!(state.chat_display_name(&chat), Some("Local rename"));
+        chat.title = Some("\n \t".into());
+        assert_eq!(state.chat_display_name(&chat), None);
     }
 
     #[test]

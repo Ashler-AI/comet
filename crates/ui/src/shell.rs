@@ -3176,7 +3176,7 @@ impl Shell {
         };
         widgets::page_column()
             .child(widgets::page_header(&theme, "Crew notifications", None))
-            .child(widgets::page_subtitle(&theme, "Get generic Crew alerts when a session needs input, encounters an error, or finishes working. Session content is never included. Alerts are hidden for the Crew session you are viewing."))
+            .child(widgets::page_subtitle(&theme, "Get Crew alerts when a session needs input, encounters an error, or finishes working. Session names may appear on your lock screen; transcript content is not included. Alerts are hidden for the Crew session you are viewing."))
             .child(widgets::section_card(&theme)
                 .child(widgets::card_row(&theme, true)
                     .child(widgets::row_title(&theme, "Crew desktop alerts"))

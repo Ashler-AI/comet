@@ -94,7 +94,7 @@ pub struct UiSettings {
     /// Session attention chimes (done / input / error). `COMET_DISABLE_SOUND`
     /// overrides.
     pub sound_enabled: bool,
-    /// Native desktop alerts are opt-in and contain no session content.
+    /// Opt-in native alerts include session names, but no transcript content.
     pub notifications_enabled: bool,
     /// Hides secondary chrome while keeping the transcript and composer live.
     pub focus_mode: bool,

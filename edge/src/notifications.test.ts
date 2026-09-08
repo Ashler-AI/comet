@@ -40,9 +40,9 @@ const pendingAttention = (notifications: WorkspaceNotifications) => {
   } finally { doc.free(); }
 };
 
-const authorizedSession = () => Response.json({
+const authorizedSession = (userId = "alice") => Response.json({
   ok: true, resource: "https://scaffold-staging.internal.ashler.com",
-  actor: { sub: "alice", auth: "iap" },
+  actor: { sub: userId, auth: "iap" },
   scopes: ["remote_code:create", "remote_code:read", "remote_code:write", "remote_code:exec"]
 });
 
@@ -335,10 +335,48 @@ describe("Crew sealed notification credentials", () => {
       expect(db.prepare("SELECT COUNT(*) AS count FROM notification_devices").get()!.count).toBe(invalidation === "current" ? 0 : 1);
     } finally { db.close(); }
   });
+
+  it("delivers event-time session names with principal-scoped environment precedence", async () => {
+    const { db, storage } = notificationStorage();
+    const { env } = await signingEnv();
+    const doc = new LoroDoc();
+    const other = { installationId: "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee", token: "cd".repeat(32), environment: "sandbox" as const };
+    const payloads: { userId: string; aps: { alert: { title: string } } }[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url, init) => {
+      if (String(url).includes("/auth/session")) {
+        return authorizedSession(new Headers(init?.headers).get("authorization") === "Bearer sc_rc_bea" ? "béa" : "alice");
+      }
+      payloads.push(JSON.parse(String(init?.body)));
+      return new Response(null, { status: 200 });
+    }));
+    try {
+      const notifications = new WorkspaceNotifications(storage, env as Env);
+      await notifications.register(registration(), "alice", scaffoldBearer);
+      await notifications.register(registration("PUT", other), "béa", "sc_rc_bea");
+      const timestamp = Date.now();
+      const chat = doc.getMap("chats").setContainer(installationId, new LoroMap());
+      const session = doc.getMap("sessions").setContainer(installationId, new LoroMap());
+      const refs = doc.getMap("sessionRefs");
+      refs.set(`4:béa:${installationId}`, { userId: "béa", chatId: installationId, environment: { name: "  Cloud\n release  " } });
+      refs.set(`5:carol:${installationId}`, { userId: "carol", chatId: installationId, environment: { name: "Carol private environment" } });
+      chat.set("archived", false); chat.set("title", "Review old release");
+      session.set("status", "working"); session.set("updatedAt", timestamp - 1);
+      doc.commit(); notifications.observe(doc, true, timestamp);
+      chat.set("title", "Renamed release"); session.set("status", "idle"); session.set("updatedAt", timestamp);
+      doc.commit();
+      const events = notifications.observe(doc, false, timestamp);
+      doc.free();
+      await notifications.deliver(events, env.SCAFFOLD_PROJECT_SCOPE);
+      expect(payloads.map(payload => [payload.userId, payload.aps.alert.title]).sort()).toEqual([
+        ["alice", "Renamed release"], ["béa", "Cloud release"]
+      ]);
+      expect(JSON.stringify(db.prepare("SELECT * FROM notification_status").all())).not.toContain("release");
+    } finally { db.close(); }
+  });
 });
 
 describe("APNs provider", () => {
-  it("signs a verifiable ES256 JWT and delivers generic scoped alert payloads", async () => {
+  it("signs a verifiable ES256 JWT and delivers named scoped alerts", async () => {
     const { env, keys } = await signingEnv();
     let payload: Record<string, unknown> | undefined;
     let headers: Headers | undefined;
@@ -349,12 +387,32 @@ describe("APNs provider", () => {
       return new Response(null, { status: 200 });
     });
     const provider = new ApnsProvider(env);
-    await provider.send(device, installationId, "project", "alice", "input");
-    expect(payload).toEqual({ aps: { alert: { title: "Crew", body: "A Crew session needs your input." }, sound: "default" }, chatId: installationId, projectScope: "project", userId: "alice" });
+    await provider.send(device, installationId, "project", "alice", "input", "  Review\n release  ");
+    expect(payload).toMatchObject({ aps: { alert: { title: "Review release" } }, chatId: installationId, projectScope: "project", userId: "alice" });
     expect(headers!.get("apns-collapse-id")).toBe(installationId);
     const [header, claims, signature] = headers!.get("authorization")!.slice(7).split(".");
     const bytes = Uint8Array.from(atob(signature.replace(/-/g, "+").replace(/_/g, "/")), (char) => char.charCodeAt(0));
     expect(await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, keys.publicKey, bytes, new TextEncoder().encode(`${header}.${claims}`))).toBe(true);
+  });
+
+  it("keeps Unicode titles within the APNs payload budget and identifies untitled sessions", async () => {
+    const { env } = await signingEnv();
+    const payloads: { aps: { alert: { title: string } } }[] = [];
+    const bodies: string[] = [];
+    const provider = new ApnsProvider(env, (async (_url, init) => {
+      const body = String(init?.body);
+      bodies.push(body);
+      payloads.push(JSON.parse(body));
+      return new Response(null, { status: 200 });
+    }) as typeof fetch);
+    const supplementary = String.fromCodePoint(0x10400);
+    await provider.send(device, installationId, "project", "alice", "completion", supplementary.repeat(120));
+    await provider.send(device, installationId, "project", "alice", "error", supplementary.repeat(2_000));
+    await provider.send(device, installationId, "project", "alice", "input", " \n\t ");
+    expect(payloads.map(payload => payload.aps.alert.title)).toEqual([
+      supplementary.repeat(120), supplementary.repeat(119) + "…", "Session aaaaaaaa"
+    ]);
+    for (const body of bodies) expect(new TextEncoder().encode(body).byteLength).toBeLessThan(4096);
   });
 
   it("removes only terminal device errors, not provider failures or throttling", async () => {
@@ -365,7 +423,7 @@ describe("APNs provider", () => {
       [429, "TooManyRequests", false], [500, "InternalServerError", false]
     ] as const) {
       const provider = new ApnsProvider(env, (async () => Response.json({ reason, timestamp: 123 }, { status })) as typeof fetch);
-      expect((await provider.send(device, installationId, "project", "alice", "completion")).remove).toBe(remove);
+      expect((await provider.send(device, installationId, "project", "alice", "completion", "Release check")).remove).toBe(remove);
     }
   });
 
@@ -376,7 +434,7 @@ describe("APNs provider", () => {
       const provider = new ApnsProvider(env, (async () => Response.json({
         reason, token: device.token, detail: "private-provider-content"
       }, { status: reason === "BadDeviceToken" ? 400 : 403 })) as typeof fetch);
-      await provider.send(device, installationId, "project", "alice", "input");
+      await provider.send(device, installationId, "project", "alice", "input", "Private session name");
     }
     const messages = log.mock.calls.flat();
     expect(messages).toContain("BadDeviceToken");
@@ -384,6 +442,7 @@ describe("APNs provider", () => {
     expect(messages).toContain("Other");
     expect(JSON.stringify(messages)).not.toContain("private-provider-content");
     expect(JSON.stringify(messages)).not.toContain(device.token);
+    expect(JSON.stringify(messages)).not.toContain("Private session name");
     expect(JSON.stringify(messages)).not.toContain(installationId);
   });
 

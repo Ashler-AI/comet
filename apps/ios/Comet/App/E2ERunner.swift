@@ -336,6 +336,65 @@ enum E2ERunner {
             log("FAIL Crew archived session alerted")
             return false
         }
+        let model = AppModel()
+        let config = AppConfig(edgeURL: URL(string: "http://127.0.0.1:1")!, mode: .dev,
+                               userId: "attention", projectScope: "attention",
+                               deviceId: "viewer", deviceName: "Crew regression")
+        let workspace = WorkspaceStore(config: config)
+        model.workspace = workspace
+        tracker = AttentionTracker()
+        chat.archived = false
+        chat.title = "  Review\n session  "
+        func titles(_ status: SessionStatus, at: Int64) -> [String] {
+            update(status, at: at).map { chatId, _ in
+                SessionNotifications.notificationTitle(
+                    model.sessionTitle(for: chat, fallbackTitle: "Session \(chatId.prefix(8))"), chatId: chatId)
+            }
+        }
+        guard titles(.working, at: now - 10).isEmpty,
+              titles(.awaitingInput, at: now - 9) == ["Review session"] else {
+            log("FAIL Crew attention title: visible session name")
+            return false
+        }
+        chat.title = "Renamed session"
+        guard titles(.errored, at: now - 8) == ["Renamed session"] else {
+            log("FAIL Crew attention title: workspace rename did not reach the next alert")
+            return false
+        }
+        let environment = SessionEnvironment(
+            source: SessionEnvironmentSource(kind: "scaffold", sandboxId: "attention-sandbox"),
+            name: "  Scaffold\n name  ", ownerPrincipal: config.userId,
+            scope: CollaborationScope(projectId: config.projectScope,
+                                      deploymentId: "attention-deployment", sessionId: chat.id))
+        guard workspace.addSessionRef(chatId: chat.id, environment: environment) != nil,
+              titles(.working, at: now - 7).isEmpty,
+              titles(.idle, at: now - 6) == ["Scaffold name"] else {
+            log("FAIL Crew attention title: Scaffold name must precede workspace rename")
+            return false
+        }
+        workspace.removeSessionRef(chatId: chat.id)
+        chat.title = " \n\t "
+        let unicodeTitle = String(repeating: "\u{10400}", count: 120)
+        guard titles(.awaitingInput, at: now - 5) == ["Session attentio"],
+              SessionNotifications.notificationTitle(" \n\t ", chatId: chat.id) == "Session attentio",
+              SessionNotifications.notificationTitle(unicodeTitle, chatId: chat.id) == unicodeTitle,
+              SessionNotifications.notificationTitle(unicodeTitle + "x", chatId: chat.id)
+                == String(unicodeTitle.prefix(119)) + "…",
+              SessionNotifications.notificationTitle("New session", chatId: chat.id) == "New session" else {
+            log("FAIL Crew attention title: blank fallback, explicit name, or Unicode truncation")
+            return false
+        }
+        model.demo = DemoDataset(devices: [], spaces: [], chats: [chat], sessions: [:])
+        model.demo?.sessionStore(for: chat.id).setEntries([
+            MessageEntry(id: "private-prompt", role: .user,
+                parts: [.text(id: "text", text: "Private prompt must stay in the transcript")],
+                createdAt: now, deviceId: "host")
+        ])
+        guard model.sessionTitle(for: chat) == "Private prompt must stay in the transcript",
+              titles(.errored, at: now - 4) == ["Session attentio"] else {
+            log("FAIL Crew attention title: transcript-derived preview leaked into notification")
+            return false
+        }
         log("OK Crew attention transitions: input, error, working-only completion; baseline, heartbeat, stale age, exact 45s, replay high-watermark and archived suppression")
         return true
     }

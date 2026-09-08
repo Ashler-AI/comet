@@ -251,7 +251,10 @@ final class AppModel {
         let store = WorkspaceStore(config: config)
         store.onProjection = { [weak self] in
             guard let self, let workspace = self.workspace else { return }
-            self.notifications.update(sessions: workspace.sessions, chats: workspace.chats)
+            self.notifications.update(sessions: workspace.sessions, chats: workspace.chats) { chatId in
+                guard let chat = workspace.chat(id: chatId) else { return nil }
+                return self.sessionTitle(for: chat, fallbackTitle: "Session \(chatId.prefix(8))")
+            }
             self.preloadSessionMetadata()
         }
         workspace = store
@@ -858,13 +861,15 @@ final class AppModel {
     /// Reading a list label never creates a room or hydrates a transcript.
     /// Environment names are the canonical Scaffold labels used by desktop;
     /// ordinary workspace titles remain authoritative for local renames.
-    func sessionTitle(for chat: Chat) -> String {
+    /// An explicit fallback bypasses transcript-derived previews for notifications.
+    func sessionTitle(for chat: Chat, fallbackTitle: String? = nil) -> String {
         let store = demo?.sessionStore(for: chat.id) ?? sessionStores[chat.id]
         return normalizedSessionTitle(workspace?.sessionRef(id: chat.id)?.environment?.name)
             ?? normalizedSessionTitle(scaffoldRoutes[chat.id]?.environment.name)
             ?? normalizedSessionTitle(store?.publishedEnvironment?.name)
             ?? normalizedSessionTitle(cachedListMetadata(chatId: chat.id)?.environment?.name)
             ?? normalizedSessionTitle(chat.title)
+            ?? fallbackTitle
             ?? store?.previewTitle
             ?? cachedListMetadata(chatId: chat.id)?.previewTitle
             ?? chat.displayTitle

@@ -26,11 +26,11 @@ Production and staging use the same Swift target with separate checked-in scheme
 bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
 
 ```sh
-# Production: Crew, ai.ashler.crew, version 1.0 build 7
+# Production: Crew, ai.ashler.crew, version 1.0 build 8
 xcodebuild -project Comet.xcodeproj -scheme Comet \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 
-# Staging: Crew Staging, ai.ashler.crew.staging, version 1.0 build 13
+# Staging: Crew Staging, ai.ashler.crew.staging, version 1.0 build 14
 xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 ```
@@ -709,8 +709,19 @@ Scaffold credentials, so they cannot replace these checks. Authority outages fai
 closed without deleting registrations; explicit authorization rejection and APNs
 invalid-token responses remove only the matching registration revision.
 
-Alerts contain generic Crew copy and routing IDs, not titles or transcripts.
-Registration is principal/project scoped; single-session device grants cannot register.
+Alerts now identify the session in the notification title; the body states whether
+it needs input, encountered an error, or finished working. Session names can appear
+on the lock screen. Transcript bodies are not included. Names are normalized to
+one line and capped at 120 characters, with an ellipsis for longer names; unnamed
+sessions fall back to `Session <first 8 ID characters>`.
+
+Desktop and local iOS alerts use the existing visible session-name precedence.
+Background APNs alerts use the recipient's own principal-scoped Scaffold
+environment name when available, then the workspace chat title. The edge snapshots
+names only for real attention events and does not persist titles in notification
+SQL or log them. Routing IDs, opt-in, current authorization checks, freshness,
+dedupe, and focused-session suppression are unchanged. Registration is
+principal/project scoped; single-session device grants cannot register.
 
 Offline regression launch: `-visibility-e2e` runs session visibility,
 attention-transition, retry, metadata and cache-isolation scenarios and opens demo mode. Debug builds additionally

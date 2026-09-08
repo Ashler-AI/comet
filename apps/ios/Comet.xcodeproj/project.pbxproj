@@ -214,7 +214,7 @@
 				CREW_INVITE_SCHEME = comet;
 				CREW_PROJECT_SCOPE = "ashler-production";
 				CREW_SCAFFOLD_URL = "https://scaffold.internal.ashler.com";
-				CURRENT_PROJECT_VERSION = 7;
+				CURRENT_PROJECT_VERSION = 8;
 				DEVELOPMENT_TEAM = 825LYXGJR6;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -247,7 +247,7 @@
 				CREW_INVITE_SCHEME = comet;
 				CREW_PROJECT_SCOPE = "ashler-production";
 				CREW_SCAFFOLD_URL = "https://scaffold.internal.ashler.com";
-				CURRENT_PROJECT_VERSION = 7;
+				CURRENT_PROJECT_VERSION = 8;
 				DEVELOPMENT_TEAM = 825LYXGJR6;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -330,7 +330,7 @@
 				CREW_INVITE_SCHEME = "comet-staging";
 				CREW_PROJECT_SCOPE = "ashler-staging";
 				CREW_SCAFFOLD_URL = "https://scaffold-staging.internal.ashler.com";
-                CURRENT_PROJECT_VERSION = 13;
+                CURRENT_PROJECT_VERSION = 14;
 				DEVELOPMENT_TEAM = 825LYXGJR6;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -363,7 +363,7 @@
 				CREW_INVITE_SCHEME = "comet-staging";
 				CREW_PROJECT_SCOPE = "ashler-staging";
 				CREW_SCAFFOLD_URL = "https://scaffold-staging.internal.ashler.com";
-                CURRENT_PROJECT_VERSION = 13;
+                CURRENT_PROJECT_VERSION = 14;
 				DEVELOPMENT_TEAM = 825LYXGJR6;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
