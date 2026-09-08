@@ -78,6 +78,10 @@ final class AppModel {
         if args.contains("-visibility-e2e") {
             E2ERunner.runSessionVisibility()
             E2ERunner.runAttentionTransitions()
+            Task {
+                await E2ERunner.runMobileParity()
+                await E2ERunner.runStoreEviction()
+            }
             #if DEBUG
             Task { await SessionNotifications.runLifecycleRegression() }
             #endif
@@ -496,7 +500,8 @@ final class AppModel {
     func launchScaffoldSession(space: Space, prompt: String, harness: String,
                                model modelId: String, reasoning: String?,
                                databaseEnvironment: ScaffoldDatabaseEnvironment,
-                               sourceRef: String?) async throws -> String {
+                               sourceRef: String?, creationId: String = UUID().uuidString.lowercased(),
+                               images: [MobileImageAttachment] = []) async throws -> String {
         let selected = modelId.trimmingCharacters(in: .whitespacesAndNewlines)
         let provider: String
         let providerModel: String
@@ -530,7 +535,7 @@ final class AppModel {
             sourceRef: resolvedRef
         )
         if let demo {
-            let chatId = UUID().uuidString.lowercased()
+            let chatId = creationId
             let chatConfig = ChatConfig(harness: "omp", model: persistedModel,
                                         reasoning: reasoning, sandbox: "workspace-write")
             demo.chats.append(Chat(
@@ -552,15 +557,60 @@ final class AppModel {
             )
             demoSessionRefs.insert(SessionRef(chatId: chatId, addedAt: nowMs(),
                                               environment: environment), at: 0)
-            demo.sessionStore(for: chatId).sendRun(prompt: prompt, chat: demo.chats.last)
+            let store = demo.sessionStore(for: chatId)
+            store.attachmentUploader = { [weak self] images in
+                guard let self else { throw MobileSessionError.unavailable("Not connected") }
+                return try await self.uploadImages(images, chatId: chatId)
+            }
+            guard await store.sendRun(prompt: prompt, chat: demo.chats.last, images: images) else {
+                throw MobileSessionError.unavailable(store.sendFailure ?? "Could not send the message")
+            }
             return chatId
         }
         guard let workspace else { throw MobileSessionError.unavailable("Not connected") }
-        let (chatId, route) = try await workspace.launchScaffoldSession(
-            space: space, prompt: prompt, launch: launch
-        )
-        scaffoldRoutes[chatId] = route
-        return chatId
+        if scaffoldRoutes[creationId] == nil {
+            scaffoldRoutes[creationId] = try await workspace.prepareScaffoldSession(
+                space: space, chatId: creationId, launch: launch
+            )
+        }
+        guard let chat = chat(id: creationId), let store = sessionStore(for: chat) else {
+            throw MobileSessionError.unavailable("The created session is not available yet")
+        }
+        guard await store.sendRun(prompt: prompt, chat: chat, images: images) else {
+            throw MobileSessionError.unavailable(store.sendFailure ?? "Could not send the message")
+        }
+        return creationId
+    }
+
+    func uploadImages(_ images: [MobileImageAttachment], chatId: String) async throws -> [String] {
+        if demo != nil {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("crew-demo-images", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            return try images.map { image in
+                let file = directory.appendingPathComponent("\(image.id.uuidString).\((image.filename as NSString).pathExtension)")
+                try image.bytes.write(to: file, options: .atomic)
+                return file.path
+            }
+        }
+        guard let workspace else { throw MobileSessionError.unavailable("Not connected") }
+        let deviceId: String
+        if let environment = scaffoldEnvironment(chatId: chatId), environment.source.kind == "scaffold" {
+            guard let controller = scaffoldRoutes[chatId]?.controllerDeviceId
+                ?? workspace.chats.first(where: { $0.id == chatId })?.deviceId
+                ?? scaffoldControllerDeviceId() else {
+                throw MobileSessionError.unavailable("This session has no Scaffold controller")
+            }
+            let route = try await workspace.scaffoldRoute(controllerDeviceId: controller, environment: environment)
+            scaffoldRoutes[chatId] = route
+            deviceId = route.ownerDeviceId
+        } else {
+            guard let host = workspace.chats.first(where: { $0.id == chatId })?.deviceId
+                ?? workspace.sessions[chatId]?.deviceId, !host.isEmpty else {
+                throw MobileSessionError.unavailable("This session has no known desktop host")
+            }
+            deviceId = host
+        }
+        return try await workspace.uploadImages(images, chatId: chatId, deviceId: deviceId)
     }
 
     func forkSession(_ source: Chat) async throws -> String {
@@ -680,15 +730,24 @@ final class AppModel {
     }
 
     private func sessionStore(chatId: String, deploymentId: String?,
-                              environment: SessionEnvironment?) -> SessionStore? {
-        if let demo { return demo.sessionStore(for: chatId) }
+                              environment: SessionEnvironment?, metadataOnly: Bool = false) -> SessionStore? {
+        if let demo {
+            let store = demo.sessionStore(for: chatId)
+            store.attachmentUploader = { [weak self] images in
+                guard let self else { throw MobileSessionError.unavailable("Not connected") }
+                return try await self.uploadImages(images, chatId: chatId)
+            }
+            return store
+        }
         guard let config else { return nil }
         let store: SessionStore
         if let existing = sessionStores[chatId] {
             store = existing
             existing.updateDeploymentId(deploymentId)
+            if !metadataOnly { existing.activateTranscript() }
         } else {
-            store = SessionStore(chatId: chatId, config: config, deploymentId: deploymentId)
+            store = SessionStore(chatId: chatId, config: config, deploymentId: deploymentId,
+                                 metadataOnly: metadataOnly)
             sessionStores[chatId] = store
             store.start()
         }
@@ -711,6 +770,10 @@ final class AppModel {
     private func configureSessionTransport(store: SessionStore,
                                            environment: SessionEnvironment?) {
         let chatId = store.chatId
+        store.attachmentUploader = { [weak self] images in
+            guard let self else { throw MobileSessionError.unavailable("Not connected") }
+            return try await self.uploadImages(images, chatId: chatId)
+        }
         store.commandSender = { [weak self] payload in
             guard let self, let workspace = self.workspace else {
                 throw MobileSessionError.unavailable("Not connected")
@@ -734,33 +797,179 @@ final class AppModel {
         }
     }
 
+    /// Reading a list label never creates a room or hydrates a transcript.
+    /// Environment names are the canonical Scaffold labels used by desktop;
+    /// ordinary workspace titles remain authoritative for local renames.
+    func sessionTitle(for chat: Chat) -> String {
+        let store = demo?.sessionStore(for: chat.id) ?? sessionStores[chat.id]
+        return normalizedSessionTitle(workspace?.sessionRefs.first(where: { $0.chatId == chat.id })?.environment?.name)
+            ?? normalizedSessionTitle(scaffoldRoutes[chat.id]?.environment.name)
+            ?? normalizedSessionTitle(store?.publishedEnvironment?.name)
+            ?? normalizedSessionTitle(chat.title)
+            ?? store?.previewTitle
+            ?? chat.displayTitle
+    }
+
     func sessionTitle(for sessionRef: SessionRef) -> String {
-        guard let store = sessionStore(for: sessionRef),
-              let entry = store.entries.first(where: { $0.role == .user }) else {
-            return sessionRef.fallbackTitle
-        }
-        let text = entry.parts.compactMap { part -> String? in
-            guard case .text(_, let text) = part else { return nil }
-            return text
-        }.joined(separator: " ")
-        let oneLine = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
-        guard !oneLine.isEmpty else { return sessionRef.fallbackTitle }
-        return oneLine.count > 48 ? String(oneLine.prefix(48)) + "\u{2026}" : oneLine
+        let store = demo?.sessionStore(for: sessionRef.chatId) ?? sessionStores[sessionRef.chatId]
+        return normalizedSessionTitle(sessionRef.environment?.name)
+            ?? normalizedSessionTitle(scaffoldRoutes[sessionRef.chatId]?.environment.name)
+            ?? normalizedSessionTitle(store?.publishedEnvironment?.name)
+            ?? store?.previewTitle
+            ?? sessionRef.fallbackTitle
     }
 
     func releaseSessionStore(chatId: String) {
         // Preloaded stores stay warm — nothing to evict on navigation.
     }
 
-    /// Warm every non-archived session: stores hydrate from disk instantly
-    /// and keep their rooms syncing, so opening a session never shows a
-    /// loading state.
-    func preloadSessions() {
-        for chat in overviewChats {
-            _ = sessionStore(for: chat)
+    /// Keep sidebar metadata syncing without decoding every session's full
+    /// transcript. Navigation upgrades only the opened store to transcript mode.
+    func preloadSessionMetadata() {
+        let visible = Set((workspace?.chats.map(\.id) ?? []) + (workspace?.sessionRefs.map(\.chatId) ?? []))
+        // An empty projection can be bootstrap/recovery, not a membership
+        // revocation. Never invalidate a store still used by an open view or
+        // an in-flight launch/send; authoritative room access stays server-side.
+        if !visible.isEmpty {
+            for id in Array(sessionStores.keys) where !visible.contains(id) {
+                guard id != notifications.visibleChatId,
+                      scaffoldRoutes[id] == nil,
+                      let store = sessionStores[id], !store.sending,
+                      store.pendingSends.isEmpty else { continue }
+                sessionStores.removeValue(forKey: id)?.stop()
+            }
+        }
+        // Archived rows already have canonical workspace titles; don't open
+        // hundreds of transcript sockets just to render a settled sidebar.
+        let unnamedArchived = settledChats.filter {
+            normalizedSessionTitle($0.title) == nil && scaffoldEnvironment(chatId: $0.id) == nil
+        }
+        for chat in overviewChats + unnamedArchived {
+            let environment = scaffoldEnvironment(chatId: chat.id)
+            _ = sessionStore(chatId: chat.id, deploymentId: environment?.scope.deploymentId,
+                             environment: environment, metadataOnly: true)
         }
         for sessionRef in sharedSessionRefs {
-            _ = sessionStore(for: sessionRef)
+            let environment = sessionRef.environment ?? scaffoldEnvironment(chatId: sessionRef.chatId)
+            _ = sessionStore(chatId: sessionRef.chatId, deploymentId: environment?.scope.deploymentId,
+                             environment: environment, metadataOnly: true)
         }
+    }
+}
+
+extension AppModel {
+    /// Exercise the production cache sweep without restoring credentials,
+    /// starting rooms, or signing out the app's shared notification service.
+    static func runStoreEvictionRegression() async -> Bool {
+        let probe = AppModel()
+        let config = AppConfig(edgeURL: URL(string: "http://127.0.0.1:1")!, mode: .dev,
+                               userId: "eviction-\(UUID().uuidString)", projectScope: "eviction",
+                               deviceId: "viewer", deviceName: "Crew regression")
+        let workspace = WorkspaceStore(config: config)
+        probe.workspace = workspace
+        // Leave probe.config unset: metadata warming cannot open replacement
+        // rooms, including when a broken sweep removes one of these fixtures.
+        let member = SessionStore(chatId: "eviction-member", config: config, offline: true)
+        let idle = SessionStore(chatId: "eviction-idle", config: config, offline: true)
+        let visible = SessionStore(chatId: "eviction-visible", config: config, offline: true)
+        let routed = SessionStore(chatId: "eviction-routed", config: config, offline: true)
+        let sending = SessionStore(chatId: "eviction-sending", config: config, offline: true)
+        let queued = SessionStore(chatId: "eviction-queued", config: config, offline: true)
+        let stores = [member, idle, visible, routed, sending, queued]
+        probe.sessionStores = Dictionary(uniqueKeysWithValues: stores.map { ($0.chatId, $0) })
+        let oldVisibleChatId = probe.notifications.visibleChatId
+        defer {
+            probe.notifications.visibleChatId = oldVisibleChatId
+            for store in stores { store.stop() }
+        }
+
+        probe.notifications.visibleChatId = nil
+        probe.preloadSessionMetadata()
+        probe.notifications.visibleChatId = oldVisibleChatId
+        guard stores.allSatisfy({ probe.sessionStores[$0.chatId] === $0 }) else {
+            E2ERunner.log("FAIL Crew store eviction: empty membership replaced or evicted a cached store")
+            return false
+        }
+        guard workspace.addSessionRef(chatId: member.chatId) != nil,
+              workspace.sessionRefs.map(\.chatId) == [member.chatId] else {
+            E2ERunner.log("FAIL Crew store eviction: member fixture did not project")
+            return false
+        }
+        let environment = SessionEnvironment(
+            source: SessionEnvironmentSource(kind: "scaffold", sandboxId: "eviction-sandbox"),
+            ownerPrincipal: config.userId,
+            scope: CollaborationScope(projectId: config.projectScope,
+                                      deploymentId: "eviction-deployment", sessionId: routed.chatId))
+        probe.scaffoldRoutes[routed.chatId] = ScaffoldControlRoute(
+            controllerDeviceId: "controller", ownerDeviceId: "owner", actorSubject: config.userId,
+            grantId: "eviction-grant",
+            projection: SessionRoomProjection(projectId: config.projectScope,
+                                              deploymentId: "eviction-deployment", sessionId: routed.chatId),
+            environment: environment)
+        let queuedMessageId = queued.stagePendingSend(prompt: "queued fixture")
+        defer { queued.dropPendingSend(messageId: queuedMessageId) }
+
+        // Suspend a real send during attachment upload, before its optimistic
+        // echo is staged. Only `sending`, not `pendingSends`, can protect it.
+        var upload: CheckedContinuation<[String], Error>?
+        var started: CheckedContinuation<Void, Never>?
+        var sendTask: Task<Bool, Never>?
+        sending.attachmentUploader = { _ in
+            try await withCheckedThrowingContinuation { continuation in
+                upload = continuation
+                let waiting = started
+                started = nil
+                waiting?.resume()
+            }
+        }
+        let image = MobileImageAttachment(id: UUID(), filename: "eviction.png",
+                                          bytes: Data(), preview: UIImage())
+        await withCheckedContinuation { ready in
+            started = ready
+            sendTask = Task {
+                let result = await sending.sendRun(prompt: "suspended fixture", chat: nil, images: [image])
+                // A premature send failure must report a failure, not leave
+                // the regression waiting for an upload that never started.
+                let waiting = started
+                started = nil
+                waiting?.resume()
+                return result
+            }
+        }
+
+        // There are no awaits while shared notification visibility is changed.
+        probe.notifications.visibleChatId = visible.chatId
+        let suspended = upload != nil && sending.sending && sending.pendingSends.isEmpty
+        probe.preloadSessionMetadata()
+        let activeRetained = [member, visible, routed, sending, queued].allSatisfy {
+            probe.sessionStores[$0.chatId] === $0
+        }
+        let idleEvicted = probe.sessionStores[idle.chatId] == nil
+        probe.notifications.visibleChatId = oldVisibleChatId
+
+        // Always finish the upload and join the send before checking results,
+        // including when the production sweep has evicted the sending store.
+        upload?.resume(returning: ["/tmp/eviction.png"])
+        upload = nil
+        let sent = await sendTask?.value ?? false
+        guard suspended, sent, !sending.sending, sending.pendingSends.isEmpty,
+              !queued.sending, queued.pendingSends.map(\.messageId) == [queuedMessageId],
+              activeRetained, idleEvicted else {
+            E2ERunner.log("FAIL Crew store eviction: active identity, idle pruning, or suspended send completion")
+            return false
+        }
+
+        // Protection is temporary: after each reason goes away, the same
+        // nonmembers must be evictable while legitimate membership survives.
+        probe.notifications.visibleChatId = nil
+        probe.scaffoldRoutes.removeAll()
+        queued.dropPendingSend(messageId: queuedMessageId)
+        probe.preloadSessionMetadata()
+        guard probe.sessionStores.count == 1,
+              probe.sessionStores[member.chatId] === member else {
+            E2ERunner.log("FAIL Crew store eviction: inactive nonmembers leaked or legitimate member was evicted")
+            return false
+        }
+        return true
     }
 }

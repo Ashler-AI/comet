@@ -20,6 +20,9 @@ struct NewSessionView: View {
     @AppStorage("newSessionDatabase") private var databaseEnvironmentRaw = ScaffoldDatabaseEnvironment.local.rawValue
 
     @State private var draft = ""
+    @State private var images = MobileImageDraft()
+    @State private var creationId = UUID().uuidString.lowercased()
+    @State private var createdChatId: String?
     @State private var showPicker = false
     @State private var showRefPicker = false
     @State private var showCheckoutPicker = false
@@ -91,8 +94,10 @@ struct NewSessionView: View {
                 offlineNotice(space: space)
             }
 
+            MobileImageDraftView(draft: images, busy: busy)
             composer
                 .padding(.bottom, 8)
+                .disabled(busy)
         }
         .background(Theme.bg.ignoresSafeArea())
         .navigationTitle("New session")  // feeds the back menu
@@ -180,6 +185,7 @@ struct NewSessionView: View {
                 }
             }
         }
+        .onDisappear { images.cancelImport() }
     }
 
     private func loadHarnesses() async {
@@ -229,11 +235,13 @@ struct NewSessionView: View {
         ComposerShell(
             draft: $draft,
             placeholder: "Do anything…",
-            sendEnabled: selectedModel != nil && availableHarnesses.contains { $0.id == selectedHarness },
+            sendEnabled: !images.loading && selectedModel != nil && availableHarnesses.contains { $0.id == selectedHarness },
             showStop: false,
-            busy: busy,
+            busy: busy || images.loading,
+            hasAttachments: !images.images.isEmpty,
             onSend: send
         ) {
+            MobileImagePicker(draft: images, disabled: busy)
             // Agent chip — brand mark + model, opens the picker sheet
             // (desktop's in-pill HarnessModel trigger chip).
             Button {
@@ -423,9 +431,9 @@ struct NewSessionView: View {
     }
 
     private var canSend: Bool {
-        guard !busy, space != nil, selectedModel != nil,
+        guard !busy, !images.loading, space != nil, selectedModel != nil,
               availableHarnesses.contains(where: { $0.id == selectedHarness }) else { return false }
-        return !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        return !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !images.images.isEmpty
     }
 
     private func offlineNotice(space: Space) -> some View {
@@ -449,6 +457,11 @@ struct NewSessionView: View {
         let reasoning = reasoning
         let launchTarget = launchTarget
         let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let submittedImages = images.images
+        let databaseEnvironment = databaseEnvironment
+        let selectedRef = selectedRef
+        let selectedWorktree = selectedRefRow?.worktreePath
+        let checkoutKind = checkoutKind
         busy = true
         Task { @MainActor in
             if launchTarget == .scaffold {
@@ -460,9 +473,11 @@ struct NewSessionView: View {
                         model: selectedModel.id,
                         reasoning: reasoning,
                         databaseEnvironment: databaseEnvironment,
-                        sourceRef: selectedRef
+                        sourceRef: selectedRef,
+                        creationId: creationId,
+                        images: submittedImages
                     )
-                    finishLaunch(chatId: chatId)
+                    finishLaunch(chatId: chatId, submittedImages: submittedImages)
                 } catch {
                     busy = false
                     launchError = error.localizedDescription
@@ -474,28 +489,39 @@ struct NewSessionView: View {
                                     reasoning: reasoning, sandbox: "workspace-write")
             var cwd: String?
             var branch = selectedRef
-            switch checkoutKind {
+            if createdChatId == nil {
+                switch checkoutKind {
             case .newWorktree:
                 if let base = selectedRef {
                     guard let worktreePath = await model.createWorktree(space: space, base: base) else {
                         busy = false
+                        launchError = "Crew couldn’t create the worktree. Your draft is still here."
                         return
                     }
                     cwd = worktreePath
                     branch = base
                 }
             case .local:
-                if let worktree = selectedRefRow?.worktreePath { cwd = worktree }
+                if let worktree = selectedWorktree { cwd = worktree }
+            }
             }
             do {
-                let chatId = try await model.createChat(space: space, config: config,
-                                                       branch: branch, cwd: cwd)
+                let chatId: String
+                if let existing = createdChatId {
+                    chatId = existing
+                } else {
+                    chatId = try await model.createChat(space: space, config: config,
+                                                        branch: branch, cwd: cwd)
+                    createdChatId = chatId
+                }
                 guard let chat = model.chat(id: chatId),
                       let store = model.sessionStore(for: chat) else {
                     throw MobileSessionError.unavailable("The created session is not available")
                 }
-                store.sendRun(prompt: prompt, chat: chat)
-                finishLaunch(chatId: chatId)
+                guard await store.sendRun(prompt: prompt, chat: chat, images: submittedImages) else {
+                    throw MobileSessionError.unavailable(store.sendFailure ?? "Crew couldn’t send this message. Your draft is still here.")
+                }
+                finishLaunch(chatId: chatId, submittedImages: submittedImages)
             } catch {
                 busy = false
                 launchError = error.localizedDescription
@@ -503,9 +529,10 @@ struct NewSessionView: View {
         }
     }
 
-    private func finishLaunch(chatId: String) {
+    private func finishLaunch(chatId: String, submittedImages: [MobileImageAttachment]) {
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
         draft = ""
+        images.removeSubmitted(submittedImages)
         busy = false
         if path.last == .newSession(spaceId: spaceId) { path.removeLast() }
         path.append(.chat(chatId))
