@@ -87,14 +87,41 @@ Release-Staging simulator verification (iPhone 17 Pro, iOS 26.5):
 
 Reproduce with `-bench`, `-visibility-e2e`, or the offline UI fixture
 `-demo -large-list` (600 sessions, first session contains 500 turns). These are
-local simulator results, not physical-iPhone frame timings. No new TestFlight
-upload or production deployment is claimed. Local typecheck commands were
-intentionally not run; simulator application builds used Xcode's normal compiler.
+local simulator results, not physical-iPhone frame timings. Local typecheck
+commands were intentionally not run; simulator application builds used Xcode's
+normal compiler.
+
+The performance changes were published to TestFlight on 2026-09-08 as staging
+**1.0 (13)** and production **1.0 (7)** from `6043e425df30b3f60c57b922cef958be048215d8`.
+[Staging CI](https://github.com/Ashler-AI/comet/actions/runs/34264583266) and
+[production CI](https://github.com/Ashler-AI/comet/actions/runs/34264583288)
+compiled on arm64 with Xcode 26.6 / iOS SDK 26.5 and passed all five mobile
+scenarios: session visibility, attention transitions, APNs lifecycle, mobile
+parity, and store eviction. OpenCode reviewed the complete proposed source
+against `origin/main` and reported no actionable findings before the release push.
+
+Downloaded artifacts passed SHA-256 verification. Distribution export and upload
+ran locally without compilation or typechecks. Both inspection IPAs and the exact
+uploaded apps passed strict signature verification; their signatures retain
+`aps-environment = production`, and the inspected profiles match their respective
+bundle identifiers. Uploaded IPA SHA-256 values:
+
+- Staging 13: `167c15d60a13e36d995742d3eb6e79fe1d02a97bff883c0c06ad7327071440e4`
+- Production 7: `18c0b64578f6a12dbbb2d074dc538315094d049d775bad323ae7e84524a48fe6`
+
+Apple accepted both uploads at approximately **19:00 UTC**, then reported
+**Complete** with no processing errors or warnings. Both new builds show
+**Testing** in their existing **Ashler Internal** groups. The existing production
+tester's invitation was resent successfully (Apple returned HTTP 201); final
+App Store Connect inspection shows that tester installed production **1.0 (6)**
+on an iPhone 13 Pro. Installation of the newly published builds 7 and 13 is not
+claimed. This release did not submit either app to the public App Store or deploy
+desktop/backend changes.
 
 The 2026-09-05 release uploaded production **1.0 (3)** and staging **1.0 (2)**
 to TestFlight. App Store Connect processed both and assigned them to the existing
 **Ashler Internal** group. The staging tester's installation of build 2 was
-confirmed; the production invitation was resent and remains awaiting acceptance.
+confirmed; the production invitation was resent and was awaiting acceptance at that time.
 These are internal TestFlight releases, not public App Store submissions.
 
 Staging **1.0 (5)** adds compacted-history recovery and host-discovered harnesses.
