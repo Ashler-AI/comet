@@ -25,6 +25,9 @@ const MAX_BODY_BYTES = 2048;
 const MAX_USER_DEVICES = 16;
 const MAX_PROJECT_DEVICES = 1024;
 const REGISTRATION_TTL_MS = 30 * 24 * 60 * 60_000;
+// Source-device and Worker clocks can differ by milliseconds. Reject only
+// substantial future dates; strict rejection lets the next baseline eat an edge.
+const MAX_CLOCK_SKEW_MS = 5_000;
 const APNS_DIAGNOSTIC_REASONS: Record<string, true> = {
   BadDeviceToken: true,
   DeviceTokenNotForTopic: true,
@@ -47,7 +50,7 @@ export const attentionTransition = (
   now: number
 ): Attention | undefined => {
   if (!previous || archived || next.status === previous.status ||
-      next.updatedAt <= previous.updatedAt || next.updatedAt > now ||
+      next.updatedAt <= previous.updatedAt || next.updatedAt > now + MAX_CLOCK_SKEW_MS ||
       now - next.updatedAt > 45_000) return undefined;
   if (next.status === "awaitingInput") return "input";
   if (next.status === "errored") return "error";
@@ -310,8 +313,8 @@ export class WorkspaceNotifications {
             updatedAt = raw instanceof LoroMap ? raw.get("updatedAt") : (raw as SessionAttentionState).updatedAt;
             if (typeof status !== "string" || typeof updatedAt !== "number" ||
                 !["idle", "working", "awaitingInput", "errored"].includes(status) ||
-                !Number.isSafeInteger(updatedAt) || updatedAt > now || updatedAt < 0) {
-              if (diagnose && typeof updatedAt === "number" && Number.isSafeInteger(updatedAt) && updatedAt > now) this.trace("observe_skip", { reason: "future", baseline, observedAt: now, updatedAt });
+                !Number.isSafeInteger(updatedAt) || updatedAt > now + MAX_CLOCK_SKEW_MS || updatedAt < 0) {
+              if (diagnose && typeof updatedAt === "number" && Number.isSafeInteger(updatedAt) && updatedAt > now + MAX_CLOCK_SKEW_MS) this.trace("observe_skip", { reason: "future", baseline, observedAt: now, updatedAt });
               continue;
             }
             const next: SessionAttentionState = { status, updatedAt };

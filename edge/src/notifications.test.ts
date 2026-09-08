@@ -84,7 +84,8 @@ describe("Crew session attention", () => {
     expect(attentionTransition(previous, { status: "idle", updatedAt: now - 45_000 }, false, now)).toBe("completion");
     expect(attentionTransition(previous, { status: "idle", updatedAt: now - 45_001 }, false, now)).toBeUndefined();
     expect(attentionTransition(previous, { status: "idle", updatedAt: 1 }, false, now)).toBeUndefined();
-    expect(attentionTransition(previous, { status: "idle", updatedAt: now + 1 }, false, now)).toBeUndefined();
+    expect(attentionTransition(previous, { status: "idle", updatedAt: now + 5_000 }, false, now)).toBe("completion");
+    expect(attentionTransition(previous, { status: "idle", updatedAt: now + 5_001 }, false, now)).toBeUndefined();
     expect(attentionTransition(previous, { status: "idle", updatedAt: now }, true, now)).toBeUndefined();
   });
 });
@@ -110,6 +111,29 @@ describe("Crew push registration boundaries", () => {
       }), env);
       expect([401, 403]).toContain(response.status);
     }
+  });
+
+  it("emits a slightly future completion once before reconnect baselining", async () => {
+    const { db, storage } = notificationStorage();
+    const { env } = await signingEnv();
+    const notifications = new WorkspaceNotifications(storage, env as Env);
+    const doc = new LoroDoc();
+    try {
+      await notifications.register(registration(), "alice", scaffoldBearer);
+      const chat = doc.getMap("chats").setContainer(installationId, new LoroMap());
+      const session = doc.getMap("sessions").setContainer(installationId, new LoroMap());
+      chat.set("archived", false); session.set("status", "working"); session.set("updatedAt", now - 1);
+      doc.commit(); notifications.observe(doc, true, now);
+      session.set("status", "idle"); session.set("updatedAt", now + 5_001); doc.commit();
+      expect(notifications.observe(doc, false, now)).toEqual([]);
+      session.set("status", "idle"); session.set("updatedAt", now + 29); doc.commit();
+      expect(notifications.observe(doc, false, now).map((event) => event.attention)).toEqual(["completion"]);
+      const resumed = new WorkspaceNotifications(storage, env as Env);
+      expect(resumed.observe(doc, true, now + 200)).toEqual([]);
+      expect(resumed.observe(doc, false, now + 200)).toEqual([]);
+      session.set("updatedAt", now + 201); doc.commit();
+      expect(resumed.observe(doc, false, now + 201)).toEqual([]);
+    } finally { doc.free(); db.close(); }
   });
 
   it("keeps registration ownership and status dedupe across room recreation", async () => {

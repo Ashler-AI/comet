@@ -163,6 +163,29 @@ the response `apns-id` as `apnsId` when present, and `removeRegistration`.
 body. A 200 establishes APNs acceptance, not display or tap delivery on the
 iPhone. Transport failures remain `delivery_exception`, not an acceptance.
 
+### Staging notification clock skew (2026-09-08)
+
+A controlled completion was rejected because its device timestamp was 29 ms
+ahead of the Worker's clock. The next pre-import baseline consumed the
+`working` → `idle` transition silently. The notification observer and transition
+policy now tolerate up to 5 seconds of future skew, retaining the 45-second
+stale cutoff, raw timestamp ordering, archive filtering, and durable dedupe.
+
+The reproduction failed before the fix and passed afterward; all 138 edge tests
+passed. On staging, test session `c13c8c0c-5238-4d48-bc3f-e0b86fb204a5`
+completed at `updatedAt=1788886631502`, 174 ms ahead of the observer clock.
+The server classified it as `completion`, authorized one recipient, and received
+APNs **200**, receipt `15F6E975-855A-EE10-8427-4BD10F027022`, for that exact
+timestamp. This proves provider acceptance, not iPhone display or tap routing.
+
+Clean staging version `4f754902-7336-41a0-ad2e-b3d19d279934` contains the fix
+without the temporary authenticated decision probe. Production was unchanged.
+The source changes are on `fix/staging-notification-clock-skew`, based on
+`9175314` (a descendant of the diagnosed deployment commit `b41d34d`).
+OpenCode review could not run: Agent Auth listed the required primary model but
+not `openai-codex/gpt-5.4-mini`. No PR push or review approval is claimed.
+Local typechecks were intentionally skipped to preserve workstation resources.
+
 ### Staging 1.0 (6): mobile status feedback
 
 - Session rows show unread, live status, and last-updated time independently.
