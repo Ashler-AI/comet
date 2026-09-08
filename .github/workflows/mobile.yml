@@ -1,0 +1,49 @@
+name: mobile
+
+on:
+  push:
+    branches: ["release/mobile-*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ASHLER_INCREMENTAL_TSC_CHECKS: "false"
+
+jobs:
+  staging:
+    # Standard macos-26 runners are Apple silicon. Select the newest installed
+    # stable Xcode 26 in the script rather than following the default into 27.
+    runs-on: macos-26
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Verify simulator and archive Crew Staging without Apple credentials
+        timeout-minutes: 65
+        run: node scripts/mobile-ci.mjs
+      - name: Upload verified staging binaries and provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: crew-mobile-staging-1.0-12-${{ github.sha }}
+          path: mobile-artifacts/release/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - name: Upload mobile diagnostics even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crew-mobile-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: mobile-artifacts/logs/
+          if-no-files-found: warn
+          retention-days: 14

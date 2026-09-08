@@ -330,7 +330,7 @@
 				CREW_INVITE_SCHEME = "comet-staging";
 				CREW_PROJECT_SCOPE = "ashler-staging";
 				CREW_SCAFFOLD_URL = "https://scaffold-staging.internal.ashler.com";
-                CURRENT_PROJECT_VERSION = 11;
+                CURRENT_PROJECT_VERSION = 12;
 				DEVELOPMENT_TEAM = 825LYXGJR6;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -363,7 +363,7 @@
 				CREW_INVITE_SCHEME = "comet-staging";
 				CREW_PROJECT_SCOPE = "ashler-staging";
 				CREW_SCAFFOLD_URL = "https://scaffold-staging.internal.ashler.com";
-                CURRENT_PROJECT_VERSION = 11;
+                CURRENT_PROJECT_VERSION = 12;
 				DEVELOPMENT_TEAM = 825LYXGJR6;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;

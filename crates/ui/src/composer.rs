@@ -5694,6 +5694,7 @@ impl Composer {
                             &engine,
                             cx.background_executor(),
                             host_device_id.as_deref(),
+                            &chat_id,
                             att,
                         )
                         .await

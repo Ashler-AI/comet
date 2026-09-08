@@ -34,7 +34,7 @@ struct SessionView: View {
     }
 
     private var displayTitle: String {
-        if let chat { return chat.displayTitle }
+        if let chat { return model.sessionTitle(for: chat) }
         if let sessionRef { return model.sessionTitle(for: sessionRef) }
         return "Session"
     }
@@ -78,7 +78,7 @@ struct SessionView: View {
                                 // The badge and chevron are fixed; only the
                                 // title gives way, so a long name truncates
                                 // instead of pushing the chevron off-screen.
-                                Text(chat.displayTitle)
+                                Text(displayTitle)
                                     .font(Theme.sans(13, weight: .medium))
                                     .foregroundStyle(Theme.text)
                                     .lineLimit(1)

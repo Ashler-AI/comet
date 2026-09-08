@@ -2,6 +2,7 @@
 // for room sockets (WS auth rides the URL query).
 
 import Foundation
+import CryptoKit
 
 enum ReleaseConfig {
     static let edgeURL = requiredURL("CrewEdgeURL")
@@ -54,6 +55,16 @@ final class AppConfig: @unchecked Sendable {
         self.deviceName = deviceName
         self.tokens = tokens
         self.devBearer = devBearer
+    }
+
+    /// Disk replicas must never be reused across an edge, principal, project,
+    /// or deployment boundary. Legacy unscoped caches are intentionally left
+    /// untouched; the correct room backfills a fresh replica after sign-in.
+    func documentCacheId(roomId: String, deploymentId: String? = nil) -> String {
+        let identity = [edgeURL.absoluteString, mode.rawValue, userId, projectScope,
+                        roomId, deploymentId ?? ""]
+        let bytes = Data(identity.map { "\($0.utf8.count):\($0)" }.joined().utf8)
+        return "scoped-" + SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
     }
 
     /// Current revocable Scaffold bearer. The control plane validates it on

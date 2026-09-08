@@ -728,6 +728,14 @@ export const rpcAllowedForScopedHost = (
     ) {
       return true;
     }
+    if (value.method === "UploadChunk" || value.method === "UploadCommit") {
+      return (
+        grant.capabilities.includes("session.files") &&
+        value.params?.sessionId === grant.scope.sessionId &&
+        (value.params.targetDeviceId === undefined ||
+          value.params.targetDeviceId === grant.targetDeviceId)
+      );
+    }
     return (
       value.method === "QueueCommand" &&
       value.params?.command?.sessionId === grant.scope.sessionId

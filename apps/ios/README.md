@@ -328,8 +328,9 @@ profile before uploading; source configuration alone is not delivery evidence.
 
 ### Session control coverage
 
-- The home screen merges every non-archived workspace chat with the signed-in
-  principal's imported session refs.
+- The home screen merges the signed-in principal's workspace chat memberships
+  with imported session refs. Unrelated project chat/status rows are not projected;
+  detached and missing-space members remain reachable on desktop and mobile.
 - `comet://invite/{chatId}/{sessionId}/{grantId}` links pin missing membership
   and open the session directly.
 - New-session launch supports the selected desktop device or a Scaffold OMP
@@ -339,6 +340,55 @@ profile before uploading; source configuration alone is not delivery evidence.
 - Existing local and Scaffold sessions accept run/steer/stop/input commands.
   Local OMP sessions with durable native context can be forked from the session
   toolbar.
+- Existing and new sessions accept images from Photos or Files, including image-only
+  drafts. The phone normalizes HEIC/other images to JPEG or PNG, caps selection at
+  10 images (24 MiB each, 32 MiB total), and shows removable previews.
+- Images upload in 45 KB chunks to the actual execution device before command
+  admission. Runs carry typed attachment paths plus the desktop's prompt trailer;
+  steers use the same trailer. Failure preserves the draft. Uncertain retries retain
+  command identity and payload; a later materialized message is not admitted again.
+- Mobile transcript image rendering is not implemented: sent images currently
+  appear as attachment path text. Inline image display remains desktop-only;
+  successful mobile upload/send does not imply mobile image read-back support.
+- Scaffold creation is separated from first-run admission, retaining the created
+  environment and route across attach/upload/admission retries. Scoped hosts permit
+  upload RPCs only with file capability, the exact session, and no other-device target.
+- List/header names use canonical environment/workspace metadata, with a cached
+  first-user preview for untitled sessions. Metadata preload avoids full transcript
+  projection and skips already-named archived rows; navigation activates transcripts.
+- Disk caches are scoped by edge, auth mode, principal, project, room, and deployment.
+  Old unscoped caches are not merged into a new identity's replica.
+- Workspace reprojection does not prune cached stores while membership is empty,
+  or while a session is open, has a Scaffold route, is sending, or awaits a send
+  acknowledgement. This defers cache cleanup; it does not alter membership
+  visibility or server-side authorization. Sign-out still stops all stores.
+
+### Mobile parity verification and activation
+
+The staging simulator exercised principal-scoped visibility, detached/archived rows,
+image selection/preview, and image-only sending in existing and new sessions through the offline demo. The native
+regression also passed lost-reply retry identity/payload, late-materialization dedupe,
+metadata-only titles, transcript activation, and deployment cache isolation.
+
+An isolated real Edge/Rust host relay committed **100,019 byte-identical bytes** in
+45 KB chunks, denied another session's upload, and retained grant-revocation behavior.
+The full edge suite passed **137 tests**. These are local simulator/isolated-host
+proofs, not a physical-phone or live Scaffold image-send claim.
+Two local `xcodebuild` runs produced the simulator app used above. The later
+rebuild included `runMobileParity`, and its installed app logged that probe's
+success. Both builds preceded the active-store eviction guard. Those local
+builds were performed despite the active no-local-typecheck instruction; they
+are not precedent authorizing another local compile-based verification run.
+
+The eviction guard passed syntax parsing only. The final source has not been
+runtime-verified and is not release-ready. The local iOS toolchain is available;
+the restriction is policy, not missing tooling. Authorized remote build/runtime
+verification is required before release. The desktop visibility and upload-signature
+changes also remain Rust compile/test-unverified.
+
+The parity changes require a new mobile build and the scoped-upload edge change.
+They have not been uploaded to TestFlight or deployed. The previous desktop 0.1.75
+release published staging; its production publication job was skipped.
 
 ## Architecture
 
@@ -349,11 +399,10 @@ Sync/
   RoomClient.swift      room.rs port: join with oplog VV, snapshot backfill,
                         resubmit-from-server-VV, DocUpdate+Ack, fragments,
                         %EPH presence sub-room, ping/pong lease, backoff
-  WorkspaceStore.swift  ws4/{projectScope} mirror: project-shared
-                        devices/spaces/chats/sessions plus principal-scoped
-                        session refs and viewer-side writes
-  SessionStore.swift    session doc mirror: joined transcript, owner
-                        publications, send reconciliation; off-main projection
+  WorkspaceStore.swift  ws4/{projectScope} mirror: project-shared storage,
+                        principal-member chat/status projection and viewer writes
+  SessionStore.swift    metadata-only list projection; joined transcript on open,
+                        owner publications, upload/admission and send reconciliation
 Markdown/
   MarkdownModel.swift   block model + incremental tail re-parser (re-parse
                         from the 2nd-to-last top-level block; link-defs force
@@ -459,8 +508,8 @@ invalid-token responses remove only the matching registration revision.
 Alerts contain generic Crew copy and routing IDs, not titles or transcripts.
 Registration is principal/project scoped; single-session device grants cannot register.
 
-Offline regression launch: `-visibility-e2e` runs session visibility and
-attention-transition scenarios and opens demo mode. Debug builds additionally
+Offline regression launch: `-visibility-e2e` runs session visibility,
+attention-transition, retry, metadata and cache-isolation scenarios and opens demo mode. Debug builds additionally
 exercise queued APNs token arrival, scoped routing, offline disable/logout and
 late-response isolation using an in-process HTTP responder. Every lifecycle wait
 has a five-second deadline and logs a stage-specific `FAIL` before cancelling

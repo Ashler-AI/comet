@@ -83,8 +83,9 @@ struct HomeView: View {
             .sheet(isPresented: $showNotifications) {
                 NotificationSettingsView()
             }
-            .task(id: (model.overviewChats.map(\.id) + model.sharedSessionRefs.map(\.chatId)).joined()) {
-                model.preloadSessions()
+            .task(id: (model.overviewChats.map(\.id) + model.settledChats.map(\.id)
+                       + model.sharedSessionRefs.map(\.chatId)).joined(separator: "/")) {
+                model.preloadSessionMetadata()
             }
             .onChange(of: model.launchRoute) { _, route in
                 // Live one-click invite while Home is already up (cold-start
@@ -305,7 +306,7 @@ struct ChatRow: View {
             }
 
             // Line 2: the session title.
-            Text(chat.displayTitle)
+            Text(model.sessionTitle(for: chat))
                 .font(Theme.sans(13))
                 .foregroundStyle(Theme.text)
                 .lineLimit(1)
