@@ -357,7 +357,11 @@ describe("Crew sealed notification credentials", () => {
       const chat = doc.getMap("chats").setContainer(installationId, new LoroMap());
       const session = doc.getMap("sessions").setContainer(installationId, new LoroMap());
       const refs = doc.getMap("sessionRefs");
-      refs.set(`4:béa:${installationId}`, { userId: "béa", chatId: installationId, environment: { name: "  Cloud\n release  " } });
+      const beaRef = refs.setContainer(`4:béa:${installationId}`, new LoroMap());
+      beaRef.set("userId", "béa");
+      beaRef.set("chatId", installationId);
+      beaRef.set("environment", { name: "  Cloud\n release  " });
+      beaRef.free();
       refs.set(`5:carol:${installationId}`, { userId: "carol", chatId: installationId, environment: { name: "Carol private environment" } });
       chat.set("archived", false); chat.set("title", "Review old release");
       session.set("status", "working"); session.set("updatedAt", timestamp - 1);
