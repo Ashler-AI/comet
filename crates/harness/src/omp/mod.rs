@@ -76,7 +76,7 @@ computer:
   maxHeight: 896
 "#;
 pub const OMP_SUPERVISOR_MARKER: &str = "__comet-omp-supervisor";
-const OMP_SESSION_FORK_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const OMP_SESSION_FORK_RECORD_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Run the hidden OMP supervisor command when this process was invoked for it.
 ///
@@ -1263,8 +1263,6 @@ fn fork_session_file(
     session_dirs: &[PathBuf],
     source_session_id: &str,
 ) -> Result<String, HarnessError> {
-    const RECORD_MAX_BYTES: usize = OMP_SESSION_FORK_MAX_BYTES as usize;
-
     let (matches, exhaustive) = matching_session_files(session_dirs, source_session_id);
     if !exhaustive || matches.len() != 1 {
         return Err(HarnessError::Protocol(
@@ -1274,9 +1272,9 @@ fn fork_session_file(
     let source_path = &matches[0];
     let source = std::fs::File::open(source_path)?;
     let byte_count = source.metadata()?.len();
-    if byte_count == 0 || byte_count > OMP_SESSION_FORK_MAX_BYTES {
+    if byte_count == 0 {
         return Err(HarnessError::Protocol(
-            "OMP session journal is empty or exceeds the fork limit".into(),
+            "OMP session journal is empty".into(),
         ));
     }
     let active = match session_writer_state(source_path) {
@@ -1312,12 +1310,17 @@ fn fork_session_file(
 
         loop {
             line.clear();
-            let read = reader.read_until(b'\n', &mut line)?;
+            // Journals grow across turns. Bound the buffered record, not the
+            // whole history, and stop reading before an oversized allocation.
+            let read = reader
+                .by_ref()
+                .take(OMP_SESSION_FORK_RECORD_MAX_BYTES + 1)
+                .read_until(b'\n', &mut line)?;
             if read == 0 {
                 break;
             }
             source_bytes += read as u64;
-            if line.len() > RECORD_MAX_BYTES {
+            if line.len() as u64 > OMP_SESSION_FORK_RECORD_MAX_BYTES {
                 return Err(HarnessError::Protocol(
                     "OMP session journal record exceeds the fork limit".into(),
                 ));
@@ -3226,6 +3229,77 @@ mod tests {
         assert!(!fork.contains("\"id\":\"native-source\""));
         assert!(fork.contains("\"id\":\"m1\""));
         assert!(fork.contains("\"content\":\"keep me\""));
+    }
+
+    #[test]
+    fn fork_session_file_preserves_history_larger_than_64_mib() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.jsonl");
+        let header = b"{\"type\":\"session\",\"id\":\"native-source\",\"cwd\":\"/repo\"}\n";
+        let record = format!(
+            "{{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":\"{}\"}}}}\n",
+            "x".repeat(1024)
+        );
+        let record_count = (64 * 1024 * 1024) / record.len() + 1;
+        {
+            let mut output = std::io::BufWriter::new(std::fs::File::create(&source).unwrap());
+            output.write_all(header).unwrap();
+            for _ in 0..record_count {
+                output.write_all(record.as_bytes()).unwrap();
+            }
+            output.flush().unwrap();
+        }
+
+        let fork_id = fork_session_file(&[temp.path().to_path_buf()], "native-source").unwrap();
+        let fork = temp.path().join(format!("crew-fork-{fork_id}.jsonl"));
+        let mut original = BufReader::new(std::fs::File::open(&source).unwrap());
+        let mut forked = BufReader::new(std::fs::File::open(&fork).unwrap());
+        let mut line = String::new();
+        original.read_line(&mut line).unwrap();
+        assert_eq!(line.as_bytes(), header);
+        line.clear();
+        forked.read_line(&mut line).unwrap();
+        let fork_header: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(fork_header["id"], fork_id);
+        assert_eq!(fork_header["cwd"], "/repo");
+        for _ in 0..record_count {
+            for reader in [&mut original, &mut forked] {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line, record);
+            }
+        }
+        assert!(original.fill_buf().unwrap().is_empty());
+        assert!(forked.fill_buf().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fork_session_file_rejects_oversized_record_without_leaving_a_fork() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.jsonl");
+        {
+            let mut output = std::fs::File::create(&source).unwrap();
+            output
+                .write_all(b"{\"type\":\"session\",\"id\":\"native-source\"}\n")
+                .unwrap();
+            // A valid JSON record whose whitespace alone crosses the bound.
+            std::io::copy(
+                &mut std::io::repeat(b' ').take(OMP_SESSION_FORK_RECORD_MAX_BYTES),
+                &mut output,
+            )
+            .unwrap();
+            output.write_all(b"{}\n").unwrap();
+        }
+
+        assert!(matches!(
+            fork_session_file(&[temp.path().to_path_buf()], "native-source"),
+            Err(HarnessError::Protocol(_))
+        ));
+        let remaining = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, [source]);
     }
 
     #[test]
