@@ -453,6 +453,8 @@ production APNs; its SHA-256 is
 `b88f40ede84d414df287d05db6fd6cb4c9cf01fb87deba4bb6dde737bfc6fd56`.
 Apple processing completion, tester availability, physical-phone installation,
 and device notification/image delivery are not yet verified for build 6.
+Both existing App Store Connect browser tabs subsequently showed Apple Account
+sign-in (one with `authResult=FAILED`); confirmation requires interactive sign-in.
 
 [Backend run 34236389366](https://github.com/Ashler-AI/comet/actions/runs/34236389366)
 passed remote typechecking, 137 tests, byte-identical scoped image upload,
@@ -461,10 +463,16 @@ candidate to production as **14510f54-5185-430f-9719-6e9a803e7f3d**. Production
 and staging health endpoints returned `ok: true`. No local compilation or
 typechecks ran, and no active desktop engine was restarted by this rollout.
 
-On 2026-09-08, production Worker secret-name inspection found no `APNS_KEY_ID`
-or `APNS_PRIVATE_KEY`. Production background pushes require approved production
-APNs credentials; neither deploying source nor distributing a push-entitled app
-provisions them. Staging credentials are not implicitly authorized for copying.
+On 2026-09-08, secret-name checks from `edge` with explicit
+`--config wrangler.jsonc --env production` confirmed that production lacks
+`APNS_KEY_ID`, `APNS_PRIVATE_KEY`, and `NOTIFICATION_CREDENTIAL_KEY`; the matching
+staging check lists all three. The last key encrypts stored notification renewal
+credentials: without it, registration returns HTTP 503
+`notification_credential_invalid_configuration`, before APNs authorization.
+Production background pushes require approved APNs signing credentials and a
+production-specific credential-encryption key. Deploying source or distributing
+a push-entitled app does not provision these secrets. Staging credentials are
+not implicitly authorized for copying.
 
 ## Architecture
 
