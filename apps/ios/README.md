@@ -162,6 +162,10 @@ collaboration smoke passed. Final Worker versions were
 `0b8f5481-7fe2-4595-accf-285d7a732a5e` (production); both live health endpoints
 returned `ok: true` with the expected environment. Local typechecks were
 intentionally skipped to preserve workstation resources.
+No post-deployment named APNs receipt or end-to-end delivery was captured for
+this release. Versions and release availability are verified; named notification
+behavior was exercised only in local/CI scenarios, not against the deployed
+backend. Released notification delivery remains unverified.
 
 The 2026-09-05 release uploaded production **1.0 (3)** and staging **1.0 (2)**
 to TestFlight. App Store Connect processed both and assigned them to the existing
