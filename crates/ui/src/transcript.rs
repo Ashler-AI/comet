@@ -4584,8 +4584,7 @@ mod tests {
 
     /// A sent prompt's file mentions render as chips in the transcript: the
     /// row carries the projected display text plus spans, while ordinary
-    /// prompts keep the empty-spans fast path. The row version derives from
-    /// the RAW text either way, so projection never perturbs the diff key.
+    /// prompts keep the empty-spans fast path.
     #[test]
     fn user_rows_project_file_mentions_into_chips() {
         let raw = "look at [composer.rs](comet-file:crates/ui/src/composer.rs) please";
@@ -4609,8 +4608,17 @@ mod tests {
             let projected: &str = "\u{00A0}@composer.rs\u{00A0}";
             projected
         });
-        // Raw length in the high bits; delivery (Normal) and pending are zero.
-        assert_eq!(rows[0].version, (raw.len() as u64) << 3);
+
+        // A same-length target edit keeps the chip label, but must invalidate
+        // the row so its click target is rebuilt rather than left stale.
+        entry.parts = vec![text_part("t0", &raw.replace("crates/ui/", "crates/ux/"))];
+        let replaced = rows_for_entry(&entry, false, &mut parse);
+        let RowKind::User { text: replaced_text, mentions: replaced_mentions, .. } = &replaced[0].kind else {
+            panic!("expected a user row");
+        };
+        assert_eq!(replaced_text, text);
+        assert_eq!(replaced_mentions[0].path.as_ref(), "crates/ux/src/composer.rs");
+        assert_eq!(diff_rows(&rows, &replaced), Some((0..1, 1)));
 
         entry.parts = vec![text_part("t0", "no mentions here")];
         let rows = rows_for_entry(&entry, false, &mut parse);
