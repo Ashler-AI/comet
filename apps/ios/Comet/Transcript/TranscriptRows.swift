@@ -42,6 +42,40 @@ struct TranscriptRow: Identifiable {
     var topGap: CGFloat = 0
 }
 
+/// View-local disclosure; body replacements, navigation, and removed rows must
+/// require a new reveal rather than reusing a prior message's open state.
+struct PeerMessageVisibility {
+    private struct Key: Hashable {
+        let chatId: String
+        let messageId: String
+        let version: UInt64
+    }
+    private var revealed: Set<Key> = []
+
+    func body(for row: TranscriptRow, chatId: String) -> String? {
+        guard case .peerMessage(let text) = row.kind,
+              revealed.contains(Key(chatId: chatId, messageId: row.id, version: row.version)) else { return nil }
+        return text
+    }
+
+    mutating func toggle(_ row: TranscriptRow, chatId: String) {
+        guard case .peerMessage = row.kind else { return }
+        let key = Key(chatId: chatId, messageId: row.id, version: row.version)
+        if !revealed.insert(key).inserted { revealed.remove(key) }
+    }
+
+    mutating func retain(rows: [TranscriptRow], chatId: String) {
+        revealed = revealed.filter { key in
+            key.chatId == chatId && rows.contains { row in
+                guard case .peerMessage = row.kind else { return false }
+                return row.id == key.messageId && row.version == key.version
+            }
+        }
+    }
+
+    mutating func clear() { revealed.removeAll() }
+}
+
 /// A settled part's parse, keyed by content so a completed block is parsed
 /// once rather than on every rebuild.
 struct CompletedParse {
@@ -119,7 +153,7 @@ enum TranscriptRowBuilder {
             }.joined(separator: "\n")
             guard !text.isEmpty || isPeerMessage else { return }
             rows.append(TranscriptRow(id: entry.id,
-                                      version: fnv1a(text) | (isPeerMessage ? 1 : 0),
+                                      version: (fnv1a(text) << 1) | (isPeerMessage ? 1 : 0),
                                       turnStart: true,
                                       kind: isPeerMessage ? .peerMessage(text: text) : .user(text: text),
                                       entryId: entry.id, timestamp: entry.createdAt,

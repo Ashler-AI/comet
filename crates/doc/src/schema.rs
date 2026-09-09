@@ -398,6 +398,36 @@ impl SessionDoc {
         self.read_entry(message_id).ok().flatten().is_some()
     }
 
+    /// Full original for an explicit reveal. Only this root and its compatible
+    /// continuations are decoded; normal transcript windows remain byte-bounded.
+    pub fn read_message(&self, message_id: &str) -> Result<Option<SessionMessageEntry>, DocError> {
+        let Some(root) = self.read_entry(message_id)? else { return Ok(None); };
+        if root.continuation_of.is_some() { return Ok(Some(root)); }
+        let messages = self.doc.get_list("messages");
+        let mut entries = vec![root];
+        for index in 0..messages.len() {
+            let Some(row) = messages.get(index) else { continue; };
+            let is_continuation = match &row {
+                loro::ValueOrContainer::Container(loro::Container::Map(map)) => matches!(
+                    map.get("continuationOf"),
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(id))) if id.as_str() == message_id
+                ),
+                loro::ValueOrContainer::Value(LoroValue::Map(map)) => matches!(
+                    map.get("continuationOf"),
+                    Some(LoroValue::String(id)) if id.as_str() == message_id
+                ),
+                _ => false,
+            };
+            if is_continuation {
+                match entry_from_json(row.get_deep_value().to_json_value()) {
+                    Ok(entry) => entries.push(entry),
+                    Err(err) => tracing::warn!(error = %err, "skipping malformed transcript entry"),
+                }
+            }
+        }
+        Ok(join_continuation_entries(entries).into_iter().next())
+    }
+
     /// Read at most `max_messages` joined messages ending before the raw-list
     /// cursor `before` (`None` = current tail). Entries are materialized one at
     /// a time from the end of the Loro list, so opening a chat never converts
@@ -1352,6 +1382,8 @@ mod tests {
             text: source[10..].into(),
             omitted_prefix_bytes: 10,
         }]);
+        assert_eq!(doc.read_message("peer-command").unwrap(), Some(entry.clone()));
+        assert!(doc.read_message("missing").unwrap().is_none());
         assert_eq!(doc.read_entries().unwrap(), vec![entry]);
     }
 
@@ -1459,6 +1491,8 @@ mod tests {
             assert!(!entries[1].is_peer_message());
             assert!(!entries[2].is_peer_message());
         }
+        assert_eq!(doc.read_message("peer-command").unwrap(), Some(joined_root.clone()));
+        assert_eq!(doc.read_message("ordinary").unwrap(), Some(ordinary));
         // Even a self-matching orphan must not become hidden without its root.
         continuation.peer_message.as_mut().unwrap().command_id = continuation.id.clone();
         let orphan = join_continuation_entries(vec![continuation.clone()]);

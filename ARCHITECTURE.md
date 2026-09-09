@@ -61,6 +61,51 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
    verified project (and to the deployment for sandbox-device credentials), so knowing a UUID is
    not authorization.
 
+   **Inter-session message visibility:** Crew collapses native peer inputs behind an
+   explicit Show/Hide disclosure on desktop and iOS. The host derives optional
+   `peerMessage: { commandId, sourceChatId, threadId, replyTo? }` from the exact typed
+   `PeerMessage` command whose id becomes the user message id. Metadata and original
+   parts are committed together; waiter delivery, active steering, queued turns,
+   command correlation, and agent input remain unchanged. Snapshots, full/window
+   reads, continuation joins, RPC reset/upsert deltas, and edge tails retain it.
+   Hidden inputs do not provide rail/shared-session body previews or generated titles;
+   workspace activity still advances with a content-free preview. Assistant replies
+   remain ordinary visible conversation.
+
+   Missing/malformed metadata, mismatched identity, non-user roles, and orphan
+   continuations remain visible. User text imitating a peer prefix is never classified.
+   Old records stay visible even when an old command ledger supplies a matching id:
+   no backfill or destructive migration. Native history imported without this metadata
+   stays visible. Unknown additive metadata fields are tolerated; older clients that
+   do not implement the disclosure will continue showing the original message.
+
+   Desktop transcript windows keep their text budget. Explicit reveal of a truncated
+   peer row calls `ReadDocMessage { chatId, messageId, roomProjection? }` to load only
+   the original message and compatible continuations, using the same scoped document
+   access as `ReadDocMessages`. Failed reads expose a retryable error, not an invented
+   body. Reveal state is view-local; original content is never deleted or replaced.
+
+   Focused verification (Rust/Xcode commands run only in an authorized remote build
+   environment; do not run local typechecks or Cargo builds/tests):
+   `cargo test -p comet-doc schema::tests`,
+   `cargo test -p comet-doc transcript_delta::tests`,
+   `cargo test -p comet-engine --test peer_messages`,
+   `cargo test -p comet-ui peer_`,
+   `cargo test -p comet-ui imported_session_preview_skips_peer_turns_and_evicts_stale_body`,
+   `cargo test -p comet-ui rail::tests`, and
+   `cd edge && npm test -- src/session-doc/messages.test.ts`.
+   Authorized macOS CI uses `CREW_MOBILE_ENVIRONMENT=staging node scripts/mobile-ci.mjs`
+   and the same command with `production`. Its existing `verifySimulator` launches
+   `-visibility-e2e` and now requires six regression markers, including
+   `OK Crew peer message visibility` from the actual Loro/row/disclosure scenario.
+   This runs before archive creation; an unsigned archive alone is not UI proof.
+   With newly built desktop/iOS apps, verify idle/send/reply, live waiter, active
+   step/turn-boundary steering, timeout/late reply, disconnect/restart, legacy and
+   lookalike text, collapse/reveal/copy, and long-message readback after newer output
+   consumes the transcript budget. Collapsed text must not appear in pixels,
+   accessibility descendants, selection/copy, or previews; ordinary conversation and
+   agent delivery must remain intact. Old installed binaries are not verification.
+
 2. **Workspace doc** (per org — NEW; replaces comet's residual entity sync) — **spaces**
    registry (id, deviceId, path, name?, gitDetected, checkoutId — a space is a synced
    device+folder pair, the app's unit of organization; the owning device's SpacesSync stamps git

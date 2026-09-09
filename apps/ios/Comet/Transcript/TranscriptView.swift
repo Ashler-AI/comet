@@ -31,6 +31,7 @@ struct TranscriptView: View {
     private var builder: TranscriptBuilderCache { store.transcriptBuilder }
     @State private var veils = VeilStore()
     @State private var folds: [String: Bool] = [:]
+    @State private var peerVisibility = PeerMessageVisibility()
     @State private var pinned = true
     /// Gates the reveal: false until the transcript has landed at the bottom.
     @State private var settled = false
@@ -42,6 +43,7 @@ struct TranscriptView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private enum Anchor: Hashable { case bottom }
+
 
     var body: some View {
         let rows = builder.rows
@@ -70,7 +72,9 @@ struct TranscriptView: View {
                 await builder.update(
                     revision: store.revision, entries: store.entries,
                     pendingSends: store.pendingSends)
+                peerVisibility.retain(rows: builder.rows, chatId: chatId)
             }
+            .onChange(of: chatId) { peerVisibility.clear() }
             .task(id: rows.isEmpty) {
                 // Recreated lazy stacks need bottom correction even with warm rows;
                 // only a never-revealed transcript waits invisibly for that layout.
@@ -214,9 +218,9 @@ struct TranscriptView: View {
                 UserBubble(text: text, pending: row.timestamp == nil)
 
             case .peerMessage(let text):
-                PeerMessageView(text: text, open: folds[row.id] ?? false) {
+                PeerMessageView(text: text, open: peerVisibility.body(for: row, chatId: chatId) != nil) {
                     withAnimation(reduceMotion ? nil : Motion.resize) {
-                        folds[row.id] = !(folds[row.id] ?? false)
+                        peerVisibility.toggle(row, chatId: chatId)
                     }
                 }
 

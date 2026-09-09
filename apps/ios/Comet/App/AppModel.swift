@@ -93,6 +93,7 @@ final class AppModel {
             E2ERunner.runAttentionTransitions()
             Task {
                 await E2ERunner.runMobileParity()
+                await E2ERunner.runPeerMessageVisibility()
                 await E2ERunner.runStoreEviction()
             }
             #if DEBUG

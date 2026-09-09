@@ -268,6 +268,7 @@ pub enum RowKind {
     /// or attachments. Only an explicit reveal mounts this body.
     PeerMessage {
         text: SharedString,
+        truncated: bool,
     },
     /// One top-level markdown block of a completed message.
     Markdown {
@@ -437,7 +438,10 @@ pub fn rows_for_entry(
                 id: entry_id.clone(),
                 version: entry_fingerprint(entry, pending),
                 turn_start: true,
-                kind: RowKind::PeerMessage { text: raw.into() },
+                kind: RowKind::PeerMessage {
+                    text: raw.into(),
+                    truncated: entry.parts.iter().any(|part| matches!(part, MessagePart::TextWindow { .. })),
+                },
                 entry_id,
                 timestamp: Some(entry.created_at),
             }];
@@ -1044,7 +1048,7 @@ struct PeerMessageVisibility {
 impl PeerMessageVisibility {
     fn body<'a>(&self, row: &'a Row) -> Option<&'a SharedString> {
         match &row.kind {
-            RowKind::PeerMessage { text }
+            RowKind::PeerMessage { text, .. }
                 if self.revealed.get(&row.id) == Some(&row.version) => Some(text),
             _ => None,
         }
@@ -1150,6 +1154,8 @@ pub struct Transcript {
     render_window_lru: Vec<String>,
     folds: HashMap<SharedString, FoldState>,
     peer_visibility: PeerMessageVisibility,
+    peer_message_details: HashMap<SharedString, Result<SharedString, ()>>,
+    peer_message_loads: HashMap<SharedString, Task<()>>,
     /// Expanded chips (tool part ids) — pane state, cleared on chat switch
     /// like `folds`.
     expanded_tools: std::collections::HashSet<SharedString>,
@@ -1258,6 +1264,8 @@ impl Transcript {
             render_window_lru: Vec::new(),
             folds: HashMap::new(),
             peer_visibility: PeerMessageVisibility::default(),
+            peer_message_details: HashMap::new(),
+            peer_message_loads: HashMap::new(),
             expanded_tools: std::collections::HashSet::new(),
             tool_details: HashMap::new(),
             tool_detail_loads: HashMap::new(),
@@ -1743,6 +1751,8 @@ impl Transcript {
             self.live_parsers.clear();
             self.folds.clear();
             self.peer_visibility.clear();
+            self.peer_message_details.clear();
+            self.peer_message_loads.clear();
             crate::markdown::selection::clear();
             self.expanded_tools.clear();
             self.tool_details.clear();
@@ -1778,6 +1788,8 @@ impl Transcript {
             || !echo_shape_valid;
         if matches!(&change.entries, TranscriptEntriesChange::Reset) {
             self.peer_visibility.clear();
+            self.peer_message_details.clear();
+            self.peer_message_loads.clear();
             crate::markdown::selection::clear();
         }
         let was_empty = self.rows.is_empty();
@@ -1854,6 +1866,8 @@ impl Transcript {
         }
 
         self.peer_visibility.retain_rows(&self.rows);
+        self.peer_message_details.retain(|id, _| self.peer_visibility.revealed.contains_key(id));
+        self.peer_message_loads.retain(|id, _| self.peer_visibility.revealed.contains_key(id));
         let visibility_changed = self.peer_visibility.revealed.len() != revealed_before;
         if visibility_changed {
             crate::markdown::selection::clear();
@@ -2883,14 +2897,69 @@ impl Transcript {
         )
     }
 
+    fn load_peer_message(&mut self, row: &Row, cx: &mut Context<Self>) {
+        let Some(chat_id) = self.chat_id.clone() else { return; };
+        let state = self.state.read(cx);
+        let Some(engine) = state.engine().cloned() else {
+            self.peer_message_details.insert(row.id.clone(), Err(()));
+            return;
+        };
+        let projection = state.transcript_room_projection(&chat_id);
+        let id = row.id.clone();
+        let version = row.version;
+        let message_id = row.entry_id.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let reply = crate::attachments::call_with_timeout(
+                &engine,
+                cx.background_executor(),
+                comet_rpc::methods::READ_DOC_MESSAGE,
+                serde_json::json!({
+                    "chatId": chat_id,
+                    "messageId": message_id.as_ref(),
+                    "roomProjection": projection,
+                }),
+                Duration::from_secs(20),
+            ).await;
+            let text = reply.ok()
+                .and_then(|value| serde_json::from_value::<SessionMessageEntry>(value).ok())
+                .filter(|entry| entry.is_peer_message() && entry.id == message_id.as_ref())
+                .map(|entry| SharedString::from(entry.parts.into_iter().filter_map(|part| {
+                    if let MessagePart::Text { text, .. } = part { Some(text) } else { None }
+                }).collect::<Vec<_>>().join("\n\n")))
+                .ok_or(());
+            this.update(cx, |transcript, cx| {
+                if transcript.chat_id.as_deref() != Some(chat_id.as_str())
+                    || transcript.peer_visibility.revealed.get(&id) != Some(&version)
+                { return; }
+                transcript.peer_message_loads.remove(&id);
+                transcript.peer_message_details.insert(id.clone(), text);
+                if let Some(ix) = transcript.rows.iter().position(|row| row.id == id) {
+                    transcript.list.remeasure_items(ix..ix + 1);
+                }
+                cx.notify();
+            }).ok();
+        });
+        self.peer_message_loads.insert(row.id.clone(), task);
+    }
+
     fn render_peer_message(
         &mut self,
         row: &Row,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let body = self.peer_visibility.body(row).cloned();
-        let open = body.is_some();
+        let revealed = self.peer_visibility.body(row).cloned();
+        let open = revealed.is_some();
+        let truncated = matches!(&row.kind, RowKind::PeerMessage { truncated: true, .. });
+        let (body, feedback) = if open && truncated {
+            match self.peer_message_details.get(&row.id) {
+                Some(Ok(text)) => (Some(text.clone()), None),
+                Some(Err(())) => (None, Some("Original message unavailable. Collapse and reveal to retry.")),
+                None => (None, Some("Loading original message…")),
+            }
+        } else {
+            (revealed, None)
+        };
         let toggle_id = row.id.clone();
         let header = div()
             .id(SharedString::from(format!("{}-peer-hdr", row.id)))
@@ -2906,6 +2975,15 @@ impl Transcript {
             .on_click(cx.listener(move |this, _, _, cx| {
                 if let Some(ix) = this.rows.iter().position(|row| row.id == toggle_id) {
                     this.peer_visibility.toggle(&this.rows[ix]);
+                    if this.peer_visibility.body(&this.rows[ix]).is_some() {
+                        if matches!(&this.rows[ix].kind, RowKind::PeerMessage { truncated: true, .. }) {
+                            let row = this.rows[ix].clone();
+                            this.load_peer_message(&row, cx);
+                        }
+                    } else {
+                        this.peer_message_details.remove(&toggle_id);
+                        this.peer_message_loads.remove(&toggle_id);
+                    }
                     this.list.remeasure_items(ix..ix + 1);
                     crate::markdown::selection::clear();
                     cx.notify();
@@ -2935,6 +3013,9 @@ impl Transcript {
             .flex()
             .flex_col()
             .child(header)
+            .when_some(feedback, |el, feedback| {
+                el.child(div().text_size(px(12.0)).text_color(theme.text_muted).child(feedback))
+            })
             .when_some(body, |el, text| {
                 el.child(
                     div()

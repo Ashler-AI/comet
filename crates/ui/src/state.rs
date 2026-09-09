@@ -2985,6 +2985,10 @@ impl AppState {
         .detach();
     }
 
+    pub(crate) fn transcript_room_projection(&self, chat_id: &str) -> Option<SessionRoomProjection> {
+        self.room_projections.get(chat_id).cloned()
+    }
+
     pub fn load_older_transcript(&mut self, cx: &mut Context<Self>) {
         if self.transcript_history_loading {
             return;

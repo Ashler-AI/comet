@@ -148,6 +148,15 @@ struct ReadDocMessagesParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ReadDocMessageParams {
+    chat_id: String,
+    message_id: String,
+    #[serde(default)]
+    room_projection: Option<SessionRoomProjection>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ListModelsParams {
     harness: HarnessId,
 }
@@ -1192,6 +1201,7 @@ fn forwardable(method: &str) -> bool {
             | methods::TAKE_OVER_OMP_SESSION
             | methods::WATCH_DOC_MESSAGES
             | methods::READ_DOC_MESSAGES
+            | methods::READ_DOC_MESSAGE
             | "WatchCollaboration"
             // Repos/worktrees/folders are device-local filesystem state.
             | methods::LIST_REPOS
@@ -1979,6 +1989,19 @@ impl RpcService for EngineRpc {
                 .map_err(|e| RpcError::Failed(format!("transcript read task failed: {e}")))?
                 .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&page)
+            }
+            methods::READ_DOC_MESSAGE => {
+                let p: ReadDocMessageParams = parse_params(params)?;
+                let doc_host = self.doc_host.clone();
+                let entry = tokio::task::spawn_blocking(move || {
+                    let handle = doc_host.open_projection(&p.chat_id, p.room_projection.as_ref())?;
+                    handle.doc().read_message(&p.message_id).map_err(crate::EngineError::from)
+                })
+                .await
+                .map_err(|e| RpcError::Failed(format!("message read task failed: {e}")))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .ok_or_else(|| RpcError::Failed("message_not_found".into()))?;
+                RpcReply::value(&entry)
             }
             methods::WATCH_DOC_MESSAGES => {
                 let p: ChatParams = parse_params(params)?;
