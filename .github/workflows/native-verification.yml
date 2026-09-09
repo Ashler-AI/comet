@@ -1,0 +1,228 @@
+name: native-verification
+
+on:
+  push:
+    branches: ["verify/native-lifecycle-*", "verify/native-startup-*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-verification-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  ASHLER_INCREMENTAL_TSC_CHECKS: "false"
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install Linux native dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcb1-dev libx11-xcb-dev \
+            libfontconfig1-dev libfreetype-dev libasound2-dev \
+            libvulkan-dev pkg-config cmake
+      - name: Select checked-in Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Record exact source
+        run: |
+          mkdir -p native-evidence
+          git rev-parse HEAD | tee native-evidence/source-sha.txt
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          rustc --version | tee native-evidence/rust-version.txt
+      - name: Verify shared native contracts
+        timeout-minutes: 35
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p comet-rpc --lib 2>&1 | tee native-evidence/rpc.log
+          cargo test --locked -p comet-engine --lib rpc::scaffold_session::tests 2>&1 | tee native-evidence/handoff.log
+          cargo test --locked -p comet-engine --lib scaffold::tests 2>&1 | tee native-evidence/scaffold.log
+          cargo test --locked -p comet-engine --lib doc_host::tests 2>&1 | tee native-evidence/doc-host.log
+          cargo test --locked -p comet-engine --lib historical_attachments 2>&1 | tee native-evidence/attachments.log
+          cargo test --locked -p comet-engine --test peer_messages --test restart_resume --test workspace_sync --test remote_sync 2>&1 | tee native-evidence/native-integration.log
+          cargo test --locked -p comet-engine --test e2e queued_run_command_executes_end_to_end 2>&1 | tee native-evidence/queued-run.log
+          cargo test --locked -p comet --bin comet session 2>&1 | tee native-evidence/cli.log
+      - name: Verify worker lifecycle and asynchronous admission
+        if: startsWith(github.ref_name, 'verify/native-lifecycle-')
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p comet-engine --test worker_sessions -- --nocapture 2>&1 | tee native-evidence/workers.log
+          cargo test --locked -p comet-engine --lib repos::tests::worker_ 2>&1 | tee native-evidence/worker-checkouts.log
+      - name: Verify startup generation fence
+        if: startsWith(github.ref_name, 'verify/native-startup-')
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p comet-engine --lib workspace_host::tests::stale_preparation_cannot_replace_admission_or_a_new_generation -- --exact 2>&1 | tee native-evidence/startup-generation.log
+          python3 -c 'from pathlib import Path; text = Path("native-evidence/startup-generation.log").read_text(); assert "1 passed" in text and "0 failed" in text, "required startup regression did not execute"'
+      - name: Verify macOS desktop behavior
+        if: runner.os == 'macOS'
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p comet-ui --lib 2>&1 | tee native-evidence/desktop.log
+      - name: Build exact source native executable
+        timeout-minutes: 15
+        run: cargo build --locked -p comet --bin comet
+      - name: Exercise native CLI against isolated headless engine
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE' 2>&1 | tee native-evidence/native-cli-smoke.log
+          import assert from 'node:assert/strict';
+          import { spawn, execFile } from 'node:child_process';
+          import { once } from 'node:events';
+          import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+          import { createServer } from 'node:net';
+          import { tmpdir } from 'node:os';
+          import path from 'node:path';
+          import { promisify } from 'node:util';
+          import { randomUUID } from 'node:crypto';
+          const exec = promisify(execFile);
+          const root = await mkdtemp(path.join(tmpdir(), 'crew-native-smoke-'));
+          const binary = path.resolve('target/debug/comet');
+          const reserve = createServer();
+          reserve.listen(0, '127.0.0.1');
+          await once(reserve, 'listening');
+          const port = reserve.address().port;
+          await new Promise(resolve => reserve.close(resolve));
+          const env = {
+            PATH: process.env.PATH, HOME: root, TMPDIR: root,
+            COMET_DATA_DIR: path.join(root, 'data'), COMET_IPC_PORT: String(port),
+            COMET_HARNESS: 'mock', COMET_EDGE_URL: 'http://127.0.0.1:1',
+            COMET_EDGE_TOKEN: 'native-smoke-fixture-not-a-credential',
+            COMET_PROJECT_SCOPE: 'native-smoke', ASHLER_INCREMENTAL_TSC_CHECKS: 'false',
+          };
+          await mkdir(env.COMET_DATA_DIR);
+          let engine, socket, engineExit;
+          let log = '';
+          let sequence = 0;
+          const pending = new Map();
+          async function start() {
+            engine = spawn(binary, ['headless'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+            engineExit = once(engine, 'exit');
+            engine.stdout.on('data', bytes => { log += bytes; });
+            engine.stderr.on('data', bytes => { log += bytes; });
+            for (let attempt = 0; attempt < 200; attempt++) {
+              assert.equal(engine.exitCode, null, `engine exited: ${log}`);
+              const candidate = new WebSocket(`ws://127.0.0.1:${port}`);
+              const opened = await new Promise(resolve => {
+                candidate.addEventListener('open', () => resolve(true), { once: true });
+                candidate.addEventListener('error', () => resolve(false), { once: true });
+              });
+              if (opened) { socket = candidate; break; }
+              candidate.close();
+              await new Promise(resolve => setTimeout(resolve, 50));
+            }
+            assert(socket, `native IPC never became ready: ${log}`);
+            socket.addEventListener('message', ({ data }) => {
+              const frame = JSON.parse(data);
+              const request = pending.get(frame.id);
+              if (!request) return;
+              pending.delete(frame.id);
+              if (Object.hasOwn(frame, 'err')) request.reject(new Error(JSON.stringify(frame.err)));
+              else request.resolve(frame.ok ?? frame.item);
+            });
+          }
+          async function rpc(method, params = {}) {
+            const id = ++sequence;
+            let timer;
+            try {
+              return await new Promise((resolve, reject) => {
+                pending.set(id, { resolve, reject });
+                timer = setTimeout(() => reject(new Error(`${method} timed out`)), 10000);
+                socket.send(JSON.stringify({ id, method, params }));
+              });
+            } finally {
+              clearTimeout(timer);
+              pending.delete(id);
+              socket.send(JSON.stringify({ id, cancel: true }));
+            }
+          }
+          async function cli(...args) {
+            const { stdout } = await exec(binary, ['session', ...args], { env, timeout: 10000, maxBuffer: 8 * 1024 * 1024 });
+            return JSON.parse(stdout);
+          }
+          async function stop() {
+            socket?.close(); socket = undefined;
+            if (!engine || engine.exitCode !== null) return;
+            engine.kill('SIGINT');
+            const timer = setTimeout(() => engine.kill('SIGKILL'), 5000);
+            try { await engineExit; } finally { clearTimeout(timer); }
+          }
+          try {
+            await start();
+            const devices = await rpc('WatchDevices');
+            assert.equal(devices.length, 1);
+            const spaceId = randomUUID(), source = randomUUID(), target = randomUUID();
+            await rpc('Mutate', { op: 'createSpace', spaceId, deviceId: devices[0].id, path: root });
+            for (const chatId of [source, target]) await rpc('Mutate', { op: 'createChat', chatId, spaceId });
+            const sent = await cli('send', target, 'native-smoke-durable-prompt', '--from', source);
+            assert.equal(sent.commandId, sent.threadId);
+            const retried = await rpc('SendPeerMessage', {
+              sourceChatId: source, targetChatId: target, text: 'native-smoke-durable-prompt', commandId: sent.commandId,
+            });
+            assert.deepEqual(retried, sent);
+            const replied = await cli('reply', '--session', target, '--command', sent.commandId, 'native-smoke-durable-reply');
+            async function readEntry(chatId, commandId) {
+              for (let attempt = 0; attempt < 100; attempt++) {
+                const transcript = await cli('read', chatId);
+                const entries = transcript.reset.filter(entry => entry.id === commandId);
+                if (entries.length) { assert.equal(entries.length, 1); return entries[0]; }
+                await new Promise(resolve => setTimeout(resolve, 50));
+              }
+              assert.fail(`no durable transcript entry ${commandId}`);
+            }
+            // WaitPeerReply is live-only; reconnect recovery reads the durable
+            // transcript instead of registering a waiter after delivery.
+            const reply = await readEntry(source, replied.commandId);
+            assert.equal(replied.threadId, sent.threadId);
+            assert(JSON.stringify(reply.parts).includes('native-smoke-durable-reply'));
+            await stop();
+            await start();
+            const restored = await readEntry(source, replied.commandId);
+            assert.equal(restored.id, reply.id);
+            assert.deepEqual(restored.parts, reply.parts);
+            const transcript = await readEntry(target, sent.commandId);
+            assert(JSON.stringify(transcript.parts).includes('native-smoke-durable-prompt'));
+            console.log(JSON.stringify({ sourceSha: process.env.GITHUB_SHA, source, target, commandId: sent.commandId,
+              checks: ['native-cli-admission', 'immutable-retry', 'correlated-reply', 'restart-recovery'],
+              harness: 'built-in deterministic mock; no real provider inference' }));
+          } finally {
+            await stop();
+            await writeFile('native-evidence/headless.log', log);
+            await rm(root, { recursive: true, force: true });
+          }
+          NODE
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-verification-${{ matrix.os }}-${{ github.sha }}
+          path: native-evidence/
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0

@@ -842,6 +842,41 @@ where
     .await
 }
 
+/// Reports abandoned client-side startup without changing provider readiness.
+/// Ownership moves with the admission future, not with the composer entity.
+pub(crate) struct ScaffoldPreparationGuard {
+    engine: EngineHandle,
+    chat_id: String,
+    generation: String,
+    admitted: bool,
+}
+
+impl ScaffoldPreparationGuard {
+    pub(crate) fn generation(&self) -> &str {
+        &self.generation
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.admitted = true;
+    }
+}
+
+impl Drop for ScaffoldPreparationGuard {
+    fn drop(&mut self) {
+        if !self.admitted
+            && let Err(error) = self.engine.client().notify(
+                methods::REPORT_SCAFFOLD_PREPARATION_FAILURE,
+                serde_json::json!({
+                    "chatId": self.chat_id,
+                    "generation": self.generation,
+                }),
+            )
+        {
+            tracing::warn!(%error, "could not report abandoned Scaffold preparation");
+        }
+    }
+}
+
 /// The engine owns creation, bootstrap/readiness, and native history transfer.
 pub(crate) async fn prepare_scaffold_session(
     handle: &EngineHandle,
@@ -851,10 +886,10 @@ pub(crate) async fn prepare_scaffold_session(
     database_environment: ScaffoldDatabaseEnvironment,
     agent_route: &AgentRoute,
     omp_handoff: Option<&ScaffoldOmpHandoffDraft>,
-) -> Result<(ScaffoldSessionAttachment, Option<String>, Option<String>), RpcError> {
+) -> Result<(ScaffoldSessionAttachment, Option<String>, Option<String>, ScaffoldPreparationGuard), RpcError> {
     let value = handle
         .client()
-        .call(
+        .call_cancellable(
             methods::PREPARE_SCAFFOLD_SESSION,
             serde_json::json!({
                 "scope": scope,
@@ -869,6 +904,19 @@ pub(crate) async fn prepare_scaffold_session(
             }),
         )
         .await?;
+    // Capture the receipt before decoding/validating the remaining response:
+    // malformed attachment or handoff metadata still abandons this generation.
+    let generation = value.get("preparationGeneration")
+        .and_then(serde_json::Value::as_str)
+        .filter(|generation| !generation.is_empty())
+        .ok_or_else(|| RpcError::Failed("Scaffold preparation returned no generation".into()))?;
+    let preparation = ScaffoldPreparationGuard {
+        engine: handle.clone(),
+        chat_id: scope.session_id.clone()
+            .ok_or_else(|| RpcError::Failed("Scaffold preparation has no session identity".into()))?,
+        generation: generation.to_string(),
+        admitted: false,
+    };
     let result: ScaffoldEnvironmentControlResult =
         serde_json::from_value(value).map_err(|error| RpcError::Failed(error.to_string()))?;
     let native_session_id = result.handoff_native_session_id.clone();
@@ -893,6 +941,7 @@ pub(crate) async fn prepare_scaffold_session(
         scaffold_session_attachment(result, &sandbox_id, scope.clone())?,
         native_session_id,
         cwd,
+        preparation,
     ))
 }
 /// Pause exactly the sandbox attached to a chat. The response must preserve
@@ -3711,6 +3760,108 @@ mod tests {
         }
     }
 
+    struct PreparedScaffoldRpc {
+        ready: ReadyScaffoldRpc,
+        generation: AtomicU16,
+        malformed_attachment: bool,
+        reports: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    }
+
+    #[async_trait::async_trait]
+    impl RpcService for PreparedScaffoldRpc {
+        async fn handle(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<RpcReply, RpcError> {
+            match method {
+                methods::PREPARE_SCAFFOLD_SESSION => {
+                    let RpcReply::Value(mut result) = self.ready.handle(
+                        methods::CONTROL_SCAFFOLD_ENVIRONMENT,
+                        serde_json::json!({ "operation": "attach", "scope": params["scope"] }),
+                    ).await? else { panic!("unary attachment") };
+                    let generation = self.generation.fetch_add(1, Ordering::SeqCst);
+                    result["preparationGeneration"] = format!("generation-{generation}").into();
+                    if self.malformed_attachment {
+                        result["environment"] = serde_json::Value::Null;
+                    }
+                    Ok(RpcReply::Value(result))
+                }
+                methods::REPORT_SCAFFOLD_PREPARATION_FAILURE => {
+                    self.reports.send(params).unwrap();
+                    RpcReply::value(&serde_json::json!({ "reported": true }))
+                }
+                _ => Err(RpcError::UnknownMethod(method.to_string())),
+            }
+        }
+    }
+
+    fn preparation_client(
+        malformed_attachment: bool,
+    ) -> (EngineHandle, tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>) {
+        let (reports, received) = tokio::sync::mpsc::unbounded_channel();
+        let handle = EngineHandle::for_test(Arc::new(PreparedScaffoldRpc {
+            ready: ReadyScaffoldRpc {
+                operations: Arc::new(StdMutex::new(Vec::new())),
+                attach_failures_remaining: AtomicU16::new(0),
+                update_route_failures_remaining: AtomicU16::new(0),
+                inspect_lifecycle: "ready",
+                archive_fails: false,
+            },
+            generation: AtomicU16::new(1),
+            malformed_attachment,
+            reports,
+        }));
+        (handle, received)
+    }
+
+    async fn prepare_test_session(
+        handle: &EngineHandle,
+    ) -> Result<(ScaffoldSessionAttachment, Option<String>, Option<String>, ScaffoldPreparationGuard), RpcError> {
+        let scope = CollaborationScope {
+            project_id: "ashler-staging".into(),
+            deployment_id: Some("ashler-staging".into()),
+            session_id: Some("session-ready".into()),
+            unknown: Default::default(),
+        };
+        let route = serde_json::from_value(serde_json::json!({
+            "provider": "openai-codex", "model": "gpt-6-astra",
+            "fallback": "disabled", "routingMode": "automatic",
+        })).unwrap();
+        prepare_scaffold_session(
+            handle, &scope, None, None, ScaffoldDatabaseEnvironment::Local, &route, None,
+        ).await
+    }
+
+    #[tokio::test]
+    async fn malformed_prepare_attachment_reports_the_returned_generation() {
+        let (handle, mut reports) = preparation_client(true);
+        assert!(prepare_test_session(&handle).await.is_err());
+        let report = tokio::time::timeout(std::time::Duration::from_secs(3), reports.recv())
+            .await.unwrap().unwrap();
+        assert_eq!(report, serde_json::json!({
+            "chatId": "session-ready", "generation": "generation-1",
+        }));
+    }
+
+    #[tokio::test]
+    async fn abandoned_preparation_reports_origin_not_newer_attempt_and_admission_disarms() {
+        let (handle, mut reports) = preparation_client(false);
+        let (_, _, _, first) = prepare_test_session(&handle).await.unwrap();
+        let (_, _, _, mut second) = prepare_test_session(&handle).await.unwrap();
+        // Dropping the owning future after preparation (for example during an
+        // upload) must report the old receipt, even after a newer Prepare.
+        drop(first);
+        let report = tokio::time::timeout(std::time::Duration::from_secs(3), reports.recv())
+            .await.unwrap().unwrap();
+        assert_eq!(report, serde_json::json!({
+            "chatId": "session-ready", "generation": "generation-1",
+        }));
+        second.disarm();
+        drop(second);
+        assert!(matches!(reports.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)));
+    }
+
     /// A localhost port that was just free — picked OUTSIDE the OS ephemeral
     /// range (macOS: 49152+), which `:0` allocations and outbound sockets in
     /// parallel test processes draw from. Binding `:0` and re-using the port
@@ -4437,6 +4588,7 @@ mod tests {
                 chat_id: "chat-a".into(),
                 added_at: Utc::now(),
                 environment: Some(accepted),
+                startup: None,
             }]);
             state.clear_scaffold_chat_starting("chat-a", cx);
             assert!(state.transcript_task.is_none());
@@ -5529,6 +5681,7 @@ mod tests {
             chat_id: chat_id.into(),
             added_at: Utc::now(),
             environment: Some(environment.clone()),
+            startup: None,
         }]);
         assert!(state.chat_is_scaffold(chat_id));
         assert_eq!(
@@ -5550,6 +5703,7 @@ mod tests {
             chat_id: chat_id.into(),
             added_at: Utc::now(),
             environment: Some(environment),
+            startup: None,
         }]);
         assert!(!other_deployment.chat_is_scaffold(chat_id));
     }
@@ -5564,11 +5718,8 @@ mod tests {
             "ownerPrincipal": "owner@example.com",
             "scope": { "projectId": "project-a", "deploymentId": "deployment-a", "sessionId": chat_id },
         })).unwrap();
-        let session_ref = SessionRef {
-            chat_id: chat_id.into(),
-            added_at: Utc::now(),
-            environment: Some(persisted.clone()),
-        };
+        let session_ref = SessionRef { chat_id: chat_id.into(),
+        added_at: Utc::now(), environment: Some(persisted.clone()), startup: None };
         state.apply_session_refs(vec![session_ref.clone()]);
         let mut live = persisted;
         if let SessionEnvironmentSource::Scaffold {
@@ -5590,6 +5741,7 @@ mod tests {
                 chat_id: "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee".into(),
                 added_at: Utc::now(),
                 environment: None,
+                startup: None,
             },
         ]);
         assert_eq!(
@@ -5608,6 +5760,7 @@ mod tests {
             chat_id: chat_id.into(),
             added_at: Utc::now(),
             environment: None,
+            startup: None,
         }]);
 
         state.apply_chats(Vec::new());
@@ -5631,11 +5784,8 @@ mod tests {
             "scope": { "projectId": "project", "deploymentId": "deployment", "sessionId": "chat" }
         }))
         .unwrap();
-        state.session_refs.push(SessionRef {
-            chat_id: chat.id.clone(),
-            added_at: Utc::now(),
-            environment: Some(environment.clone()),
-        });
+        state.session_refs.push(SessionRef { chat_id: chat.id.clone(),
+        added_at: Utc::now(), environment: Some(environment.clone()), startup: None });
         environment.name = Some("  Canonical name  ".into());
         state
             .scaffold_environments
@@ -5658,6 +5808,7 @@ mod tests {
             chat_id: chat_id.into(),
             added_at: Utc::now(),
             environment: None,
+            startup: None,
         }]);
         assert_eq!(state.shared_session_title(chat_id), "Session aaaaaaaa");
 
@@ -5723,6 +5874,7 @@ mod tests {
             chat_id: chat_id.into(),
             added_at: Utc::now(),
             environment: None,
+            startup: None,
         }]);
         state.apply_chats(vec![chat(chat_id, 1, None)]);
 

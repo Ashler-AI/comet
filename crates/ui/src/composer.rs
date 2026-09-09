@@ -3674,7 +3674,7 @@ fn mention_error_message(err: &RpcError) -> SharedString {
             "The session's device runs an older comet — update it to search its files".into()
         }
         RpcError::Transport(_) | RpcError::Closed => "The session's device is unreachable".into(),
-        RpcError::BadParams(_) | RpcError::Failed(_) => "File search failed".into(),
+        RpcError::BadParams(_) | RpcError::Failed(_) | RpcError::ScaffoldAuthUnavailable => "File search failed".into(),
     }
 }
 
@@ -3703,6 +3703,7 @@ pub struct Composer {
     agent_target: Option<String>,
     start_agent: bool,
     sending_chats: HashMap<String, usize>,
+    scaffold_preparations: HashMap<String, futures::channel::oneshot::Sender<()>>,
     failure: Option<SharedString>,
     wizard: Option<Wizard>,
     wizard_focus: FocusHandle,
@@ -3802,6 +3803,7 @@ impl Composer {
             agent_target: None,
             start_agent: false,
             sending_chats: HashMap::new(),
+            scaffold_preparations: HashMap::new(),
             failure: None,
             wizard: None,
             wizard_focus: cx.focus_handle(),
@@ -4833,6 +4835,9 @@ impl Composer {
     }
 
     fn button_mode(&self, cx: &App) -> SendButtonMode {
+        if self.state.read(cx).selected_chat.as_ref().is_some_and(|id| self.scaffold_preparations.contains_key(id)) {
+            return SendButtonMode::Stop;
+        }
         let startup_in_progress = {
             let state = self.state.read(cx);
             state.selected_chat.as_deref().is_some_and(|chat_id| {
@@ -5120,6 +5125,11 @@ impl Composer {
         self.drafts.remove(&self.current_key);
         self.failure = None;
         begin_send(&mut self.sending_chats, &chat_id);
+        let preparation_cancel = if scaffold_demo {
+            let (sender, receiver) = futures::channel::oneshot::channel();
+            self.scaffold_preparations.insert(chat_id.clone(), sender);
+            Some(receiver)
+        } else { None };
         cx.emit(ComposerEvent::Sent {
             chat_id: chat_id.clone(),
         });
@@ -5176,6 +5186,7 @@ impl Composer {
                 let mut attached_scaffold_source_ref = requested_scaffold_source_ref.clone();
                 let mut scaffold_resume_session_id = None;
                 let mut scaffold_resume_cwd = None;
+                let mut scaffold_preparation = None;
                 if local_startup {
                     let space_id = space_id
                         .as_ref()
@@ -5218,8 +5229,7 @@ impl Composer {
                     .ok();
                 }
                 if let Some(scope) = scaffold_scope {
-                    let (attachment, native_session_id, remote_cwd) =
-                        crate::state::prepare_scaffold_session(
+                    let prepared = crate::state::prepare_scaffold_session(
                             &engine,
                             &scope,
                             scaffold_title.as_deref(),
@@ -5230,9 +5240,10 @@ impl Composer {
                                 .expect("Scaffold route is resolved before launch")
                                 .route,
                             scaffold_omp_handoff.as_ref(),
-                        )
-                        .await
+                        ).await;
+                    let (attachment, native_session_id, remote_cwd, preparation) = prepared
                         .map_err(|error| format!("Could not start Scaffold session: {error}"))?;
+                    scaffold_preparation = Some(preparation);
                     scaffold_resume_session_id = native_session_id;
                     scaffold_resume_cwd = remote_cwd;
                     let actor_device_id = local_device_id.clone()
@@ -5667,6 +5678,7 @@ impl Composer {
                     "chatId": chat_id,
                     "commandId": command_id,
                     "command": command,
+                    "preparationGeneration": scaffold_preparation.as_ref().map(|guard| guard.generation()),
                 });
                 admission_started.set(true);
                 *admission_retry.borrow_mut() = Some(params.clone());
@@ -5675,6 +5687,9 @@ impl Composer {
                     .call(methods::QUEUE_COMMAND, params)
                     .await
                     .map_err(|error| format!("Send failed: {error}"))?;
+                if let Some(preparation) = scaffold_preparation.as_mut() {
+                    preparation.disarm();
+                }
                 admission_retry.borrow_mut().take();
                 Ok(())
             };
@@ -5700,6 +5715,20 @@ impl Composer {
                         Err("Could not start this session in time".into())
                     }
                 }
+            } else if let Some(cancel) = preparation_cancel {
+                futures::pin_mut!(admission);
+                futures::pin_mut!(cancel);
+                match futures::future::select(admission, cancel).await {
+                    futures::future::Either::Left((result, _)) => result,
+                    futures::future::Either::Right((_, admission)) => {
+                        if command_admission_started.get() {
+                            // Durable admission is no longer owned by UI cancellation.
+                            admission.await
+                        } else {
+                            Err("Scaffold preparation cancelled; accepted sandbox retained".into())
+                        }
+                    }
+                }
             } else {
                 admission.await
             };
@@ -5709,6 +5738,7 @@ impl Composer {
             }
             this.update(cx, |composer, cx| {
                 finish_send(&mut composer.sending_chats, &err_chat_id);
+                composer.scaffold_preparations.remove(&err_chat_id);
                 if let Err(message) = &result {
                     // Failure: red banner, echo removed, submitted prompt kept
                     // visible, and staged files returned to the chat's stash.
@@ -5776,6 +5806,11 @@ impl Composer {
         let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
             return;
         };
+        if let Some(cancel) = self.scaffold_preparations.remove(&chat_id) {
+            let _ = cancel.send(());
+            cx.notify();
+            return;
+        }
         let action = Box::new(SessionControlAction::Stop {});
         let params = match self.control_route(action.required_capability(), cx) {
             Ok(Some(route)) => serde_json::json!({

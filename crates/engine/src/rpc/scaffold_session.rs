@@ -8,7 +8,7 @@ use comet_proto::{
 };
 use comet_rpc::{HandoffSessionToScaffoldParams, HandoffSessionToScaffoldResult};
 
-const PREPARE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const TRANSIENT_FAULT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const RETRY_DELAY: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Deserialize)]
@@ -43,7 +43,7 @@ impl EngineRpc {
         let result = scaffold
             .control(control, cancellation)
             .await
-            .map_err(|error| RpcError::Failed(error.to_string()))?;
+            .map_err(scaffold_control_error)?;
         if let Some(projection) = result.room_projection.as_ref() {
             if result.environment.scope.project_id != projection.project_id
                 || result.environment.scope.deployment_id.as_deref()
@@ -111,27 +111,57 @@ impl EngineRpc {
             .try_lock_owned().map_err(|_| RpcError::Failed(
                 "Scaffold session preparation already in progress; wait for the existing request".into()
             ))?;
-        let accepted = self
+        params.agent_route.validate().map_err(|error| RpcError::Failed(error.into()))?;
+        let reference = self
             .workspace
             .doc()
             .session_ref(&actor.id, session_id)
-            .map_err(|error| RpcError::Failed(error.to_string()))?
-            .and_then(|reference| reference.environment)
-            .filter(|environment| {
+            .map_err(|error| RpcError::Failed(error.to_string()))?;
+        if reference.as_ref().is_some_and(|reference| {
+            reference.environment.is_none() && reference.startup.as_ref().is_some_and(|startup|
+                startup.status == comet_proto::SessionStartupStatus::CreationUncertain)
+        }) {
+            return Err(RpcError::Failed(
+                "Sandbox creation outcome is unknown; inspect the existing request before retrying creation".into(),
+            ));
+        }
+        let accepted = reference.and_then(|reference| reference.environment).filter(|environment| {
                 matches!(
                     &environment.source,
                     SessionEnvironmentSource::Scaffold { .. }
                 ) && environment.scope == params.scope
             });
+        let mut startup = PreparationOutcome::begin(self.workspace.clone(), session_id)?;
         let expected_scope = params.scope.clone();
         let cancellation = CancellationToken::new();
         let _cancel_on_drop = cancellation.clone().drop_guard();
-        let result = prepare_scaffold_session_with(params, accepted, |control| {
+        let startup_state = &startup.startup;
+        let mut result = prepare_scaffold_session_with(params, accepted, |control| {
             let expected_scope = &expected_scope;
             let cancellation = &cancellation;
             async move {
                 let creating = matches!(&control, ScaffoldEnvironmentControl::Create { .. });
-                let result = self.control_scaffold_environment(control, cancellation).await?;
+                if creating {
+                    let mut uncertain = startup_state.clone();
+                    uncertain.status = comet_proto::SessionStartupStatus::CreationUncertain;
+                    self.workspace.update_session_startup(
+                        expected_scope.session_id.as_deref().unwrap(),
+                        Some(&uncertain.generation.clone()), uncertain,
+                    ).map_err(|error| RpcError::Failed(error.to_string()))?;
+                }
+                let result = match self.control_scaffold_environment(control, cancellation).await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        // This error is raised before HTTP dispatch, unlike a lost response.
+                        if creating && matches!(&error, RpcError::ScaffoldAuthUnavailable) {
+                            self.workspace.update_session_startup(
+                                expected_scope.session_id.as_deref().unwrap(),
+                                Some(&startup_state.generation), startup_state.clone(),
+                            ).map_err(|error| RpcError::Failed(error.to_string()))?;
+                        }
+                        return Err(error);
+                    }
+                };
                 if creating {
                     let SessionEnvironmentSource::Scaffold { sandbox_id, .. } = &result.environment.source else {
                         return Err(RpcError::Failed("Scaffold returned a local environment".into()));
@@ -143,6 +173,10 @@ impl EngineRpc {
                     // Repeated preparation for this session must recover, not create.
                     self.workspace.upsert_session_ref(expected_scope.session_id.as_deref().unwrap(), Some(result.environment.clone()))
                         .map_err(|error| RpcError::Failed(format!("{error}; sandbox {sandbox_id}; do not retry creation blindly")))?;
+                    self.workspace.update_session_startup(
+                        expected_scope.session_id.as_deref().unwrap(),
+                        Some(&startup_state.generation), startup_state.clone(),
+                    ).map_err(|error| RpcError::Failed(error.to_string()))?;
                 }
                 Ok(result)
             }
@@ -159,6 +193,8 @@ impl EngineRpc {
                 Some(result.environment.clone()),
             )
             .map_err(|error| RpcError::Failed(error.to_string()))?;
+        result.preparation_generation = Some(startup.startup.generation.clone());
+        startup.armed = false;
         Ok(result)
     }
 
@@ -284,6 +320,9 @@ impl EngineRpc {
             .as_ref()
             .ok_or_else(|| RpcError::Failed("native_handoff_target_identity_missing".into()))?
             .clone();
+        let mut outcome = PreparationOutcome::for_command(
+            self, &chat_id, attached.preparation_generation.as_deref(),
+        )?;
         let config = source
             .config
             .as_ref()
@@ -382,12 +421,91 @@ impl EngineRpc {
                     "{error}; sandbox {sandbox_id}; session {chat_id}; initial command not admitted"
                 ))
             })?;
+        if let Some(outcome) = outcome.as_mut() { outcome.admitted(&command_id)?; }
         Ok(HandoffSessionToScaffoldResult {
             chat_id,
             sandbox_id: sandbox_id.clone(),
             command_id,
             environment: attached.environment,
         })
+    }
+}
+
+pub(super) struct PreparationOutcome {
+    workspace: WorkspaceHost,
+    session_id: String,
+    startup: comet_proto::SessionStartup,
+    pub(super) armed: bool,
+}
+
+impl PreparationOutcome {
+    pub(super) fn admitted(&mut self, command_id: &str) -> Result<(), RpcError> {
+        // Admission already happened. Never downgrade it if metadata persistence fails.
+        self.armed = false;
+        self.startup.status = comet_proto::SessionStartupStatus::Admitted;
+        self.startup.updated_at = chrono::Utc::now();
+        self.startup.command_id = Some(command_id.to_string());
+        self.workspace.update_session_startup(
+            &self.session_id, Some(&self.startup.generation), self.startup.clone(),
+        ).map_err(|error| RpcError::Failed(format!("{error}; command {command_id} was admitted")))
+    }
+    pub(super) fn for_command(
+        rpc: &EngineRpc,
+        session_id: &str,
+        generation: Option<&str>,
+    ) -> Result<Option<Self>, RpcError> {
+        let startup = rpc.workspace.session_startup(session_id)
+            .map_err(|error| RpcError::Failed(error.to_string()))?;
+        let Some(startup) = startup else {
+            return if generation.is_some() {
+                Err(RpcError::Failed("Scaffold preparation is no longer tracked".into()))
+            } else {
+                Ok(None)
+            };
+        };
+        if generation.is_some_and(|generation| generation != startup.generation)
+            || (generation.is_none() && startup.status != comet_proto::SessionStartupStatus::Admitted)
+        {
+            return Err(RpcError::Failed("Scaffold preparation generation mismatch".into()));
+        }
+        if startup.status == comet_proto::SessionStartupStatus::Admitted {
+            return Ok(None);
+        }
+        if startup.status == comet_proto::SessionStartupStatus::CreationUncertain {
+            return Err(RpcError::Failed("Scaffold creation outcome is unknown".into()));
+        }
+        Ok(Some(Self {
+            workspace: rpc.workspace.clone(), session_id: session_id.to_string(), startup, armed: true,
+        }))
+    }
+    fn begin(workspace: WorkspaceHost, session_id: &str) -> Result<Self, RpcError> {
+        let startup = comet_proto::SessionStartup {
+            generation: crate::new_id(),
+            status: comet_proto::SessionStartupStatus::Preparing,
+            updated_at: chrono::Utc::now(),
+            command_id: None,
+        };
+        workspace.update_session_startup(session_id, None, startup.clone())
+            .map_err(|error| RpcError::Failed(error.to_string()))?;
+        Ok(Self { workspace, session_id: session_id.to_string(), startup, armed: true })
+    }
+}
+
+impl Drop for PreparationOutcome {
+    fn drop(&mut self) {
+        if !self.armed { return; }
+        if let Err(error) = self.workspace.report_scaffold_preparation_failure(
+            &self.session_id, &self.startup.generation,
+        ) {
+            tracing::warn!(session_id = %self.session_id, %error, "could not retain interrupted preparation outcome");
+        }
+    }
+}
+
+fn scaffold_control_error(error: crate::scaffold::ScaffoldError) -> RpcError {
+    match error {
+        crate::scaffold::ScaffoldError::AuthUnavailable => RpcError::ScaffoldAuthUnavailable,
+        error => RpcError::Failed(error.to_string()),
     }
 }
 
@@ -517,6 +635,9 @@ where
             ));
         }
         // Attachment boots the remote Crew host: waiting for Ready first deadlocks.
+        // Preserve the existing fault tolerance, but do not expire healthy startup.
+        // This window only bounds consecutive retryable control failures.
+        let mut fault_started = None;
         let mut attached = loop {
             match control(ScaffoldEnvironmentControl::Attach {
                 sandbox_id: created_id.clone(),
@@ -526,12 +647,17 @@ where
             {
                 Ok(result) => break result,
                 Err(error) if crate::scaffold::is_retryable_scaffold_control_error(&error) => {
+                    let started = fault_started.get_or_insert_with(tokio::time::Instant::now);
+                    if started.elapsed() >= TRANSIENT_FAULT_TIMEOUT {
+                        return Err(error);
+                    }
                     tokio::time::sleep(RETRY_DELAY).await;
                 }
                 Err(error) => return Err(error),
             }
         };
         validate_attachment(&attached, created_id, &scope)?;
+        fault_started = None;
         loop {
             let inspected = control(ScaffoldEnvironmentControl::Inspect {
                 sandbox_id: created_id.clone(),
@@ -541,6 +667,23 @@ where
             match inspected {
                 Ok(result) => {
                     let lifecycle = checked_lifecycle(&result, created_id, &scope)?;
+                    let SessionEnvironmentSource::Scaffold { lifecycle_epoch, .. } =
+                        &result.environment.source
+                    else {
+                        unreachable!()
+                    };
+                    let SessionEnvironmentSource::Scaffold { lifecycle_epoch: attached_epoch, .. } =
+                        &attached.environment.source
+                    else {
+                        unreachable!()
+                    };
+                    if lifecycle_epoch != attached_epoch
+                        || result.environment.owner_principal != attached.environment.owner_principal
+                    {
+                        return Err(RpcError::Failed(
+                            "Scaffold lifecycle authority changed while waiting for readiness".into(),
+                        ));
+                    }
                     match lifecycle {
                         ScaffoldLifecycle::Ready | ScaffoldLifecycle::AgentRunning => {
                             attached.environment = result.environment;
@@ -553,10 +696,19 @@ where
                                 "Scaffold entered terminal lifecycle {lifecycle:?}"
                             )));
                         }
-                        _ => {}
+                        ScaffoldLifecycle::Creating
+                        | ScaffoldLifecycle::RestoringSnapshot
+                        | ScaffoldLifecycle::Starting
+                        | ScaffoldLifecycle::Resuming => {}
+                    }
+                    fault_started = None;
+                }
+                Err(error) if crate::scaffold::is_retryable_scaffold_control_error(&error) => {
+                    let started = fault_started.get_or_insert_with(tokio::time::Instant::now);
+                    if started.elapsed() >= TRANSIENT_FAULT_TIMEOUT {
+                        return Err(error);
                     }
                 }
-                Err(error) if crate::scaffold::is_retryable_scaffold_control_error(&error) => {}
                 Err(error) => return Err(error),
             }
             tokio::time::sleep(RETRY_DELAY).await;
@@ -590,13 +742,7 @@ where
         }
         Ok(attached)
     };
-    let result = tokio::time::timeout(PREPARE_TIMEOUT, prepare)
-        .await
-        .unwrap_or_else(|_| {
-            Err(RpcError::Failed(
-                "Scaffold session preparation exceeded the ten-minute deadline".into(),
-            ))
-        });
+    let result = prepare.await;
     result.map_err(|error| {
             if let Some(sandbox_id) = sandbox_id {
                 RpcError::Failed(format!("{error}; sandbox {sandbox_id}; session {target_session_id}; do not retry creation blindly"))

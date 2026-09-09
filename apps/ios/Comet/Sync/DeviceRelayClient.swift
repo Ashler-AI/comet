@@ -115,17 +115,20 @@ actor DeviceRelayClient {
     /// One unary ControlRpc call. Ordinary device operations use a 10-second
     /// deadline; Scaffold control can opt into its longer bootstrap window.
     func call<Response: Decodable>(method: String, params: [String: Any],
-                                   timeoutNanoseconds: UInt64 = 10_000_000_000) async throws -> Response {
+                                   timeoutNanoseconds: UInt64? = 10_000_000_000,
+                                   preserveSuccessfulResponseOnCancellation: Bool = false) async throws -> Response {
         for attempt in 0..<3 {
+            try Task.checkCancellation()
             do {
                 return try await callOnce(method: method, params: params,
-                                          timeoutNanoseconds: timeoutNanoseconds)
+                                          timeoutNanoseconds: timeoutNanoseconds,
+                                          preserveSuccessfulResponseOnCancellation: preserveSuccessfulResponseOnCancellation)
             } catch let error as RelayError {
                 guard attempt < 2 else { throw error }
                 switch error {
                 case .hostOffline, .notConnected:
                     teardown(error: error)
-                    try? await Task.sleep(nanoseconds: UInt64(attempt + 1) * 250_000_000)
+                    try await Task.sleep(nanoseconds: UInt64(attempt + 1) * 250_000_000)
                 case .rpc, .timeout:
                     throw error
                 }
@@ -137,7 +140,8 @@ actor DeviceRelayClient {
     private func callOnce<Response: Decodable>(
         method: String,
         params: [String: Any],
-        timeoutNanoseconds: UInt64
+        timeoutNanoseconds: UInt64?,
+        preserveSuccessfulResponseOnCancellation: Bool
     ) async throws -> Response {
         try await connect()
         let id = nextId
@@ -151,18 +155,31 @@ actor DeviceRelayClient {
         // Install the waiter before sending. URLSession's async send may yield
         // long enough for a fast host reply to reach handleInbound; registering
         // afterward loses that reply and turns a successful call into a timeout.
-        let result: Result<Data, RelayError> = await withCheckedContinuation { continuation in
-            pending[id] = continuation
-            Task {
-                await self.send(data, for: id)
+        let result: Result<Data, RelayError> = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                pending[id] = continuation
+                Task {
+                    guard self.pending[id] != nil else { return }
+                    await self.send(data, for: id)
+                }
+                if let timeoutNanoseconds {
+                    Task {
+                        try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                        self.timeoutCall(id: id)
+                    }
+                }
+                if Task.isCancelled { self.cancelCall(id: id) }
             }
-            Task {
-                try? await Task.sleep(nanoseconds: timeoutNanoseconds)
-                self.timeoutCall(id: id)
-            }
+        } onCancel: {
+            Task { await self.cancelCall(id: id) }
+        }
+        if !preserveSuccessfulResponseOnCancellation {
+            try Task.checkCancellation()
         }
         switch result {
-        case .failure(let error): throw error
+        case .failure(let error):
+            try Task.checkCancellation()
+            throw error
         case .success(let ok):
             return try JSONDecoder().decode(Response.self, from: ok)
         }
@@ -189,6 +206,15 @@ actor DeviceRelayClient {
 
     private func timeoutCall(id: UInt64) {
         failCall(id: id, error: .timeout)
+    }
+
+    private func cancelCall(id: UInt64) {
+        guard pending[id] != nil else { return }
+        failCall(id: id, error: .timeout)
+        let frame: [String: Any] = ["id": id, "cancel": true, "params": [:]]
+        guard let payload = try? JSONSerialization.data(withJSONObject: frame) else { return }
+        let data = Self.encodeFrame(header: #"{"s":"rpc","k":"rpc"}"#, payload: payload)
+        Task { try? await socket?.send(.data(data)) }
     }
 
     // MARK: Inbound

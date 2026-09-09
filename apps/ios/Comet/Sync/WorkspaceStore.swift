@@ -7,6 +7,32 @@ import Foundation
 import Loro
 import Observation
 
+/// A first send owns this receipt until durable admission, independently of
+/// navigation and cancellation of the task that prepared its attachments.
+@MainActor
+final class ScaffoldPreparationReceipt {
+    let generation: String
+    private(set) var admitted = false
+    private var reported = false
+    private let report: (String) async -> Void
+
+    init(generation: String, report: @escaping (String) async -> Void) {
+        self.generation = generation
+        self.report = report
+    }
+
+    func markAdmitted() { admitted = true }
+
+    func reportFailure() {
+        guard !admitted, !reported else { return }
+        reported = true
+        // An unstructured task does not inherit the cancelled sender's state.
+        let report = report
+        let generation = generation
+        Task { await report(generation) }
+    }
+}
+
 @MainActor
 @Observable
 final class WorkspaceStore {
@@ -30,7 +56,6 @@ final class WorkspaceStore {
     }
 
     @ObservationIgnored private var saver: DocSaver?
-    @ObservationIgnored private var createdScaffoldEnvironments: [String: ScaffoldEnvironmentControlResult] = [:]
 
     func start() {
         guard room == nil else { return }
@@ -291,8 +316,12 @@ final class WorkspaceStore {
                 }
                 return try? JSONDecoder().decode(SessionEnvironment.self, from: data)
             }
+            let startup: SessionStartup? = row["startup"].flatMap { value in
+                guard let data = try? JSONSerialization.data(withJSONObject: value.jsonObject) else { return nil }
+                return try? JSONDecoder().decode(SessionStartup.self, from: data)
+            }
             return SessionRef(chatId: chatId, addedAt: addedAt,
-                              environment: environment)
+                              environment: environment, startup: startup)
         }.sorted {
             if $0.addedAt != $1.addedAt { return $0.addedAt > $1.addedAt }
             return $0.chatId < $1.chatId
@@ -470,7 +499,7 @@ final class WorkspaceStore {
     /// Prepare a Scaffold route before uploading attachments or admitting the
     /// first run. A failed attach/upload retry retains the created environment.
     func prepareScaffoldSession(space: Space, chatId: String,
-                                launch: ScaffoldLaunchConfig) async throws -> ScaffoldControlRoute {
+                                launch: ScaffoldLaunchConfig) async throws -> (ScaffoldControlRoute, ScaffoldPreparationReceipt) {
         let requestedScope: [String: Any] = [
             "projectId": config.projectScope,
             "deploymentId": config.projectScope,
@@ -482,32 +511,50 @@ final class WorkspaceStore {
             "fallback": "disabled",
             "routingMode": "automatic",
         ]
-        let create: ScaffoldEnvironmentControlResult
-        if let existing = createdScaffoldEnvironments[chatId] {
-            create = existing
-        } else {
-            create = try await relay(for: space.deviceId).call(
-                method: "ControlScaffoldEnvironment",
-                params: [
-                    "operation": "create",
-                    "scope": requestedScope,
-                    "source_ref": launch.sourceRef,
-                    "database_environment": launch.databaseEnvironment.rawValue,
-                    "agentRoute": agentRoute,
-                ],
-                timeoutNanoseconds: 30_000_000_000
-            )
-            createdScaffoldEnvironments[chatId] = create
+        try Task.checkCancellation()
+        // Decode the receipt even when the rest of the response is malformed.
+        struct PreparedReply: Decodable {
+            var generation: String?
+            var attachment: Result<ScaffoldEnvironmentControlResult, Error>
+            enum CodingKeys: String, CodingKey { case preparationGeneration }
+            init(from decoder: Decoder) throws {
+                let fields = try decoder.container(keyedBy: CodingKeys.self)
+                generation = try fields.decodeIfPresent(String.self, forKey: .preparationGeneration)
+                attachment = Result { try ScaffoldEnvironmentControlResult(from: decoder) }
+            }
         }
-        guard create.environment.source.kind == "scaffold",
-              let sandboxId = create.environment.source.sandboxId else {
-            throw MobileSessionError.unavailable("Scaffold returned an invalid environment")
-        }
-
-        let scope = encodableDictionary(create.environment.scope)
-        let attachment = try await attachScaffoldEnvironment(
-            controllerDeviceId: space.deviceId, sandboxId: sandboxId, scope: scope
+        let reply: PreparedReply = try await relay(for: space.deviceId).call(
+            method: "PrepareScaffoldSession",
+            params: [
+                "scope": requestedScope,
+                "name": NSNull(),
+                "ompHandoff": NSNull(),
+                "sourceRef": launch.sourceRef,
+                "databaseEnvironment": launch.databaseEnvironment.rawValue,
+                "agentRoute": agentRoute,
+            ],
+            timeoutNanoseconds: nil,
+            preserveSuccessfulResponseOnCancellation: true
         )
+        guard let generation = reply.generation, !generation.isEmpty else {
+            throw MobileSessionError.unavailable("Scaffold returned no preparation generation")
+        }
+        let receipt = ScaffoldPreparationReceipt(generation: generation) { [self] generation in
+            await reportScaffoldPreparationFailure(
+                controllerDeviceId: space.deviceId, chatId: chatId, generation: generation
+            )
+        }
+        var transferred = false
+        defer { if !transferred { receipt.reportFailure() } }
+        let attachment = try reply.attachment.get()
+        try Task.checkCancellation()
+        guard attachment.environment.source.kind == "scaffold",
+              attachment.environment.source.sandboxId != nil,
+              attachment.environment.scope.projectId == config.projectScope,
+              attachment.environment.scope.deploymentId == config.projectScope,
+              attachment.environment.scope.sessionId == chatId else {
+            throw MobileSessionError.unavailable("Scaffold returned a different session identity")
+        }
         guard let ownerDeviceId = attachment.attachedDeviceId,
               let projection = attachment.roomProjection,
               let grant = attachment.controlGrant,
@@ -515,9 +562,6 @@ final class WorkspaceStore {
             throw MobileSessionError.unavailable("Scaffold returned no chat authority")
         }
 
-        try await waitForScaffoldReadiness(
-            controllerDeviceId: space.deviceId, sandboxId: sandboxId, scope: scope
-        )
 
         let chatConfig = ChatConfig(harness: "omp", model: launch.persistedModel,
                                     reasoning: launch.reasoning, sandbox: "workspace-write")
@@ -543,9 +587,20 @@ final class WorkspaceStore {
             actorSubject: attachment.environment.ownerPrincipal,
             grantId: grant.id,
             projection: projection,
-            environment: attachment.environment
+            environment: attachment.environment,
+            preparationGeneration: generation
         )
-        return route
+        transferred = true
+        return (route, receipt)
+    }
+
+    private func reportScaffoldPreparationFailure(controllerDeviceId: String,
+                                                   chatId: String, generation: String) async {
+        struct Reply: Decodable { var reported: Bool }
+        let _: Reply? = try? await relay(for: controllerDeviceId).call(
+            method: "ReportScaffoldPreparationFailure",
+            params: ["chatId": chatId, "generation": generation]
+        )
     }
 
     /// Ordinary commands must be admitted on their actual host. A different
@@ -582,9 +637,11 @@ final class WorkspaceStore {
 
     func sendScaffoldCommand(controllerDeviceId: String,
                              environment: SessionEnvironment,
-                             payload: SessionCommandPayload) async throws {
+                             payload: SessionCommandPayload,
+                             preparationGeneration: String? = nil) async throws {
         let route = try await scaffoldRoute(controllerDeviceId: controllerDeviceId, environment: environment)
-        try await queueScaffoldCommand(route: route, payload: payload)
+        try await queueScaffoldCommand(route: route, payload: payload,
+                                       preparationGeneration: preparationGeneration)
     }
 
     func scaffoldRoute(controllerDeviceId: String, environment: SessionEnvironment) async throws -> ScaffoldControlRoute {
@@ -644,45 +701,20 @@ final class WorkspaceStore {
 
     private func attachScaffoldEnvironment(controllerDeviceId: String, sandboxId: String,
                                            scope: [String: Any]) async throws -> ScaffoldEnvironmentControlResult {
-        let deadline = Date().addingTimeInterval(90)
-        var lastError: Error?
-        repeat {
-            do {
-                return try await relay(for: controllerDeviceId).call(
-                    method: "ControlScaffoldEnvironment",
-                    params: ["operation": "attach", "sandbox_id": sandboxId, "scope": scope],
-                    timeoutNanoseconds: 30_000_000_000
-                )
-            } catch {
-                lastError = error
-                try? await Task.sleep(nanoseconds: 500_000_000)
-            }
-        } while Date() < deadline
-        throw lastError ?? RelayError.timeout
+        try Task.checkCancellation()
+        // The engine owns authoritative provisioning and bounds each HTTP request.
+        // A second mobile deadline must not abandon a healthy remote startup.
+        return try await relay(for: controllerDeviceId).call(
+            method: "ControlScaffoldEnvironment",
+            params: ["operation": "attach", "sandbox_id": sandboxId, "scope": scope],
+            timeoutNanoseconds: nil
+        )
     }
 
-    private func waitForScaffoldReadiness(controllerDeviceId: String, sandboxId: String,
-                                          scope: [String: Any]) async throws {
-        let deadline = Date().addingTimeInterval(120)
-        var lastLifecycle = "unknown"
-        repeat {
-            let inspected: ScaffoldEnvironmentControlResult = try await relay(for: controllerDeviceId).call(
-                method: "ControlScaffoldEnvironment",
-                params: ["operation": "inspect", "sandbox_id": sandboxId, "scope": scope],
-                timeoutNanoseconds: 30_000_000_000
-            )
-            lastLifecycle = inspected.environment.source.lifecycle ?? "unknown"
-            if lastLifecycle == "ready" || lastLifecycle == "agent_running" { return }
-            if lastLifecycle == "failed" || lastLifecycle == "stopped" {
-                throw MobileSessionError.unavailable("Scaffold session became \(lastLifecycle)")
-            }
-            try? await Task.sleep(nanoseconds: 500_000_000)
-        } while Date() < deadline
-        throw MobileSessionError.unavailable("Scaffold session remained \(lastLifecycle)")
-    }
 
     private func queueScaffoldCommand(route: ScaffoldControlRoute,
-                                      payload: SessionCommandPayload) async throws {
+                                      payload: SessionCommandPayload,
+                                      preparationGeneration: String?) async throws {
         let actionPayload: [String: Any]
         switch payload {
         case .run(let request, let messageId):
@@ -715,15 +747,24 @@ final class WorkspaceStore {
             "action": actionPayload,
         ]
         struct Reply: Decodable { var commandId: String }
-        let _: Reply = try await relay(for: route.controllerDeviceId).call(
-            method: "QueueCommand",
-            params: [
-                "chatId": route.projection.sessionId,
-                "commandId": payload.messageId ?? UUID().uuidString.lowercased(),
-                "command": command,
-            ],
-            timeoutNanoseconds: 30_000_000_000
-        )
+        var params: [String: Any] = [
+            "chatId": route.projection.sessionId,
+            "commandId": payload.messageId ?? UUID().uuidString.lowercased(),
+            "command": command,
+        ]
+        if case .run = payload, let preparationGeneration {
+            params["preparationGeneration"] = preparationGeneration
+        }
+        try Task.checkCancellation()
+        // Once dispatched, admission must finish even if its view disappears.
+        // Awaiting this unstructured task does not propagate sender cancellation.
+        let admission = Task { @MainActor [self] in
+            let _: Reply = try await relay(for: route.controllerDeviceId).call(
+                method: "QueueCommand", params: params,
+                timeoutNanoseconds: 30_000_000_000
+            )
+        }
+        try await admission.value
     }
 
     private func encodableDictionary<T: Encodable>(_ value: T) -> [String: Any] {
