@@ -98,6 +98,19 @@ rollout. The original grant rejection's HTTP response was unavailable; subsequen
 grant rejections now preserve bounded HTTP status and machine-code diagnostics
 without exposing bearer tokens or response details.
 
+The correction shipped to the desktop staging channel as **0.1.85** from
+`e771970915b4b10565a825dca6140e13703b682f` in
+[release run 34387642609](https://github.com/Ashler-AI/comet/actions/runs/34387642609).
+CI passed **537 UI tests**, the existing fork/gateway checks, and the native
+preparation, worktree, materializer, grant-diagnostic, and CLI checks before
+packaging. The downloaded release archive and desktop artifacts passed SHA-256
+verification; the packaged app passed strict code-signature verification and
+reported **0.1.85**. Live staging manifest readback matched the candidate's exact
+source and hashes. The installed **0.1.84** app's read-only update check reported
+**0.1.85 available**; it was not replaced during publication. Desktop production
+remained **0.1.83**, both Scaffold channels remained **0.1.81**, and mobile was
+unchanged. OpenCode reviewed the final release changes with no actionable findings.
+
 Missing runtime values or an unsupported CLI/RPC require updating Crew's binary
 and running engine together, then starting a fresh local agent run. Never guess
 an executable, retry creation blindly, or fall back to OpenCode. After an error,
