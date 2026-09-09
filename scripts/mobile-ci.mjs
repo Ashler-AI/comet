@@ -34,6 +34,8 @@ const markers = [
   "OK Crew APNs lifecycle",
   "OK Crew mobile parity",
   "OK Crew store eviction",
+  "OK Crew live list projection",
+  "OK Crew repeated room recovery",
 ];
 const project = "apps/ios/Comet.xcodeproj";
 const lockfile = path.join(project, "project.xcworkspace/xcshareddata/swiftpm/Package.resolved");

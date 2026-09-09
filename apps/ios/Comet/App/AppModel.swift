@@ -94,6 +94,8 @@ final class AppModel {
             Task {
                 await E2ERunner.runMobileParity()
                 await E2ERunner.runStoreEviction()
+                await E2ERunner.runLiveListProjection()
+                await E2ERunner.runRepeatedRoomRecovery()
             }
             #if DEBUG
             Task { await SessionNotifications.runLifecycleRegression() }

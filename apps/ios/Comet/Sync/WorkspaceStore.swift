@@ -189,24 +189,34 @@ final class WorkspaceStore {
 
     @ObservationIgnored private var projectionTask: Task<Void, Never>?
     @ObservationIgnored private var projectionGeneration: UInt64 = 0
+    @ObservationIgnored private var localProjectionGeneration: UInt64 = 0
     @ObservationIgnored private var previousProjection: Projection?
+    #if DEBUG
+    // Regression barrier: inject an event after a real decode, before its result
+    // reaches the list. No timing assumptions or network/user data are involved.
+    @ObservationIgnored private var projectionReadDidFinish: (() -> Void)?
+    #endif
 
     /// Local writes retain their synchronous read-after-write contract. Invalidating
-    /// the generation prevents an older background read undoing an optimistic edit.
+    /// the local generation prevents an older background read undoing an optimistic edit.
     private func project() {
         projectionGeneration &+= 1
+        localProjectionGeneration &+= 1
         if let decoded = Self.decodeProjection(from: doc, userId: config.userId, previous: previousProjection) {
             applyProjection(decoded)
         }
     }
 
     /// A burst has at most one conversion in flight and one trailing conversion.
+    /// Remote updates request a trailing read, not rejection of the current read:
+    /// otherwise continuous room traffic can starve every list/status publication.
     private func scheduleProjection() {
         projectionGeneration &+= 1
         guard projectionTask == nil else { return }
         projectionTask = Task { @MainActor [weak self] in
             while let self, !Task.isCancelled {
                 let generation = self.projectionGeneration
+                let localGeneration = self.localProjectionGeneration
                 let epoch = self.roomEpoch
                 let document = self.doc
                 let userId = self.config.userId
@@ -214,9 +224,12 @@ final class WorkspaceStore {
                 let decoded = await Task.detached(priority: .userInitiated) {
                     Self.decodeProjection(from: document, userId: userId, previous: previous)
                 }.value
+                #if DEBUG
+                self.projectionReadDidFinish?()
+                #endif
                 guard !Task.isCancelled else { return }
                 if self.roomEpoch == epoch, self.doc === document,
-                   self.projectionGeneration == generation, let decoded {
+                   self.localProjectionGeneration == localGeneration, let decoded {
                     self.purgeLegacyMobileDevices(decoded.legacyMobileIds)
                     self.applyProjection(decoded)
                 }
@@ -227,6 +240,60 @@ final class WorkspaceStore {
             }
         }
     }
+
+    #if DEBUG
+    static func runLiveListProjectionRegression() async -> Bool {
+        let config = AppConfig(edgeURL: URL(string: "http://127.0.0.1:1")!, mode: .dev,
+                               userId: "list-regression", projectScope: "list-regression",
+                               deviceId: "viewer", deviceName: "Crew regression")
+        let store = WorkspaceStore(config: config)
+        defer { store.stop() }
+        do {
+            let row = try store.doc.getMap(id: "chats").getOrCreateContainer(key: "row", child: LoroMap())
+            try row.insert(key: "id", v: "row")
+            try row.insert(key: "deviceId", v: "host")
+            try row.insert(key: "title", v: "Remote 0")
+            let ref = try store.doc.getMap(id: "sessionRefs").getOrCreateContainer(key: "membership", child: LoroMap())
+            try ref.insert(key: "chatId", v: "row")
+            try ref.insert(key: "userId", v: config.userId)
+            try ref.insert(key: "addedAt", v: Int64(1))
+            store.doc.commit()
+            var reads = 0
+            var titles: [String] = []
+            var mutationFailed = false
+            store.onProjection = { titles.append(store.overviewChats.first?.title ?? "missing") }
+            defer { store.onProjection = nil; store.projectionReadDidFinish = nil }
+            store.projectionReadDidFinish = {
+                reads += 1
+                guard reads <= 5 else { return }
+                do {
+                    try row.insert(key: "title", v: "Remote \(reads)")
+                    store.doc.commit()
+                    store.handle(.remoteUpdate)
+                } catch { mutationFailed = true }
+            }
+            store.scheduleProjection()
+            guard await E2ERunner.poll(timeout: 5, label: "live list projection burst", {
+                store.projectionTask == nil ? true : nil
+            }) != nil else { return false }
+            guard !mutationFailed,
+                  titles == (0...5).map({ "Remote \($0)" }) else { return false }
+
+            // A synchronous optimistic rename must still fence an older read.
+            titles.removeAll()
+            store.projectionReadDidFinish = {
+                store.projectionReadDidFinish = nil
+                store.rename(chatId: "row", title: "Local edit")
+            }
+            store.scheduleProjection()
+            guard await E2ERunner.poll(timeout: 5, label: "live list local-write fence", {
+                store.projectionTask == nil ? true : nil
+            }) != nil else { return false }
+            return !titles.isEmpty && titles.allSatisfy { $0 == "Local edit" }
+                && store.overviewChats.first?.title == "Local edit"
+        } catch { return false }
+    }
+    #endif
 
     nonisolated static func decodeProjection(from doc: LoroDoc, userId: String,
                                              previous: Projection? = nil) -> Projection? {

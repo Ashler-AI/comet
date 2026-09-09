@@ -30,6 +30,8 @@ actor RoomClient {
     static let backoffBaseMs = 250
     static let backoffCapMs = 30_000
     static let maxInvalidRejoins = 3
+    // Match room.rs: serialize a bounded number of full heals per connection.
+    static let maxFullResyncs = 3
     static let maxFragmentCount: UInt64 = 4096
     static let maxReassembledBytes = 64 * 1024 * 1024
     // Room-level liveness (room.rs, 2026-07-30 incident): the silence lease
@@ -60,10 +62,13 @@ actor RoomClient {
     private var fragments: [BatchId: FragmentBuffer] = [:]
     private var joinedLor = false
     private var invalidRejoins = 0
-    private var fullResyncRequested = false
+    private var fullResyncs = 0
     private var snapshotRecoveryAttempted = false
     private var serverVersion: VersionVector?
     private var backoffMs = RoomClient.backoffBaseMs
+    // Survives recovery redials: a join answer alone does not prove a healed doc.
+    private var recovering = false
+    private var deferredFullResync = false
     private var lastInbound = DispatchTime.now()
     private var closed = false
     private var generation = 0
@@ -124,9 +129,10 @@ actor RoomClient {
         generation += 1
         let gen = generation
         joinedLor = false
-        fullResyncRequested = false
+        fullResyncs = 0
         snapshotRecoveryAttempted = false
         serverVersion = nil
+        deferredFullResync = false
         // Batch ids belong to the old socket. Rejoin exports all missing
         // operations from the durable doc's VV under fresh ids; keeping the
         // old payloads here would retain them forever when their acks were lost.
@@ -334,6 +340,7 @@ actor RoomClient {
             roomLog.error("room \(self.roomId, privacy: .public): join error \(String(describing: code), privacy: .public): \(message, privacy: .public)")
             if crdt == .loro {
                 if code == .versionUnknown {
+                    joinSentAt = nil  // The rejected join has been answered.
                     // Server can't diff from our VV — full snapshot backfill.
                     await requestFullSnapshot()
                 } else {
@@ -392,7 +399,7 @@ actor RoomClient {
             let wasProbe = joinIsProbe
             joinIsProbe = false
             joinedLor = true
-            backoffMs = RoomClient.backoffBaseMs
+            if !recovering { backoffMs = RoomClient.backoffBaseMs }
             // Resubmit-from-VV: push everything the server lacks. Gated on
             // the VERSION VECTORS, not the export bytes: the export returns a
             // non-empty envelope even when there is nothing to say, so a
@@ -402,6 +409,8 @@ actor RoomClient {
                 : try? VersionVector.decode(bytes: Data(version))
             await resubmitMissingUpdates()
             if wasProbe {
+                finishRecoveryIfCaughtUp()
+                if recovering, deferredFullResync { await requestFullSnapshot() }
                 // A probe answer on an established session proves the room is
                 // alive — that is ALL it is for. Re-running the side effects
                 // below would re-join %EPH (re-uploading full presence) and
@@ -411,7 +420,8 @@ actor RoomClient {
             roomLog.info("room \(self.roomId, privacy: .public): joined")
             // Join presence once the doc room is up.
             await send(.joinRequest(crdt: .loroEphemeral, roomId: roomId, auth: [], version: []))
-            events(.connected)
+            if recovering { finishRecoveryIfCaughtUp() } else { events(.connected) }
+            if recovering, deferredFullResync { await requestFullSnapshot() }
         case .loroEphemeral:
             let all = eph.encodeAll()
             if !all.isEmpty {
@@ -431,6 +441,7 @@ actor RoomClient {
                 let complete = status.map { ($0.pending?.isEmpty ?? true) } ?? false
                 if complete, !doc.isDetached(), doc.stateVv() == doc.oplogVv() {
                     imported = imported || !(status?.success.isEmpty ?? true)
+                    finishRecoveryIfCaughtUp()
                     continue
                 }
                 // Pending is NOT success: a warm replica can have equal state
@@ -442,6 +453,7 @@ actor RoomClient {
                     if await adoptSnapshot(previous, replacement) {
                         doc = replacement
                         imported = true
+                        finishRecoveryIfCaughtUp()
                         roomLog.info("room \(self.roomId, privacy: .public): adopted complete snapshot and retained local operations")
                         await resubmitMissingUpdates()
                         continue
@@ -461,12 +473,37 @@ actor RoomClient {
     }
 
     private func requestFullSnapshot() async {
-        // Coalesce incomplete batches/fragments and version-unknown replies.
-        // A failed recovery retains the cache; it must not spin on empty joins.
-        guard !fullResyncRequested else { return }
-        fullResyncRequested = true
+        if !recovering {
+            recovering = true
+            events(.disconnected)
+        }
+        // Coalesce failures behind the outstanding join. Exhausted attempts
+        // redial through existing backoff, which only a verified heal resets.
+        guard reconnectTask == nil else { return }
+        guard joinSentAt == nil else {
+            deferredFullResync = true
+            return
+        }
+        deferredFullResync = false
+        guard fullResyncs < RoomClient.maxFullResyncs else {
+            onSocketError(gen: generation)
+            return
+        }
+        fullResyncs += 1
+        serverVersion = nil
+        snapshotRecoveryAttempted = false
         roomLog.warning("room \(self.roomId, privacy: .public): incomplete import; requesting full snapshot")
         await sendJoinLoro(version: [])
+    }
+    private func finishRecoveryIfCaughtUp() {
+        guard recovering, let serverVersion, !doc.isDetached(),
+              doc.stateVv() == doc.oplogVv(),
+              doc.oplogVv().includesVv(other: serverVersion) else { return }
+        recovering = false
+        deferredFullResync = false
+        fullResyncs = 0
+        backoffMs = RoomClient.backoffBaseMs
+        if joinedLor { events(.connected) }
     }
 
     private func resubmitMissingUpdates() async {
@@ -599,9 +636,83 @@ actor RoomClient {
     }
 
     private func send(_ message: ProtocolMessage) async {
+        #if DEBUG
+        if let regressionSend { regressionSend(message); return }
+        #endif
         guard let socket, let data = LoroWire.encode(message) else { return }
         try? await socket.send(.data(data))
     }
+
+    #if DEBUG
+    private var regressionSend: ((ProtocolMessage) -> Void)?
+
+    static func runRepeatedRecoveryRegression() async -> Bool {
+        let client = RoomClient(roomId: "regression", doc: LoroDoc(),
+                                urlProvider: { nil }, events: { _ in },
+                                adoptSnapshot: { _, _ in false })
+        return await client.exerciseRepeatedRecovery()
+    }
+
+    private func exerciseRepeatedRecovery() async -> Bool {
+        var requests = 0
+        regressionSend = { message in
+            if case .joinRequest(let crdt, _, _, let version) = message,
+               crdt == .loro, version.isEmpty { requests += 1 }
+        }
+        defer { regressionSend = nil; stop() }
+        do {
+            let source = LoroDoc()
+            for turn in 1...5 {
+                let before = requests
+                // Omit a real dependency, then deliver only the following delta.
+                // The server supplies the gap only after a full-snapshot request.
+                try source.getMap(id: "meta").insert(key: "title", v: "Missing \(turn)")
+                source.commit()
+                let missingVersion = source.oplogVv()
+                try source.getMap(id: "meta").insert(key: "title", v: "Recovered \(turn)")
+                source.commit()
+                let delta = try source.export(mode: .updates(from: missingVersion))
+                await applyRemote(crdt: .loro, updates: [[UInt8](delta)])
+                await applyRemote(crdt: .loro, updates: [[UInt8](delta)])
+                guard requests == before + 1 else { return false }
+                let snapshot = try source.export(mode: .snapshot)
+                if turn.isMultiple(of: 2) {
+                    await applyRemote(crdt: .loro, updates: [[UInt8](snapshot)])
+                    await onJoinOk(crdt: .loro, version: [UInt8](source.oplogVv().encode()))
+                } else {
+                    await onJoinOk(crdt: .loro, version: [UInt8](source.oplogVv().encode()))
+                    // The failed backfill coalesced before the reply must now
+                    // have issued its deferred heal, without another event.
+                    guard requests == before + 2 else { return false }
+                    await applyRemote(crdt: .loro, updates: [[UInt8](snapshot)])
+                    await onJoinOk(crdt: .loro, version: [UInt8](source.oplogVv().encode()))
+                }
+                guard doc.getMap(id: "meta").get(key: "title")?.asValue()?.stringValue
+                    == "Recovered \(turn)", !recovering else { return false }
+            }
+            // An authoritative caught-up reply needs no additional backfill.
+            await requestFullSnapshot()
+            await onJoinOk(crdt: .loro, version: [UInt8](source.oplogVv().encode()))
+            guard !recovering, fullResyncs == 0 else { return false }
+            try source.getMap(id: "meta").insert(key: "title", v: "Still missing")
+            source.commit()
+            // Successful heals above must not consume a lifetime allowance.
+            // Failed replies below must not reset backoff just by answering joins.
+            let beforeFailures = requests
+            for _ in 0..<RoomClient.maxFullResyncs {
+                await applyRemote(crdt: .loro, updates: [[0]])
+                await onJoinOk(crdt: .loro, version: [UInt8](source.oplogVv().encode()))
+            }
+            await applyRemote(crdt: .loro, updates: [[0]])
+            guard requests == beforeFailures + RoomClient.maxFullResyncs,
+                  reconnectTask != nil, recovering else { return false }
+            reconnectTask?.cancel()
+            let recoveryBackoff = backoffMs
+            await onJoinOk(crdt: .loro, version: [UInt8](source.oplogVv().encode()))
+            return backoffMs == recoveryBackoff && backoffMs > RoomClient.backoffBaseMs
+        } catch { return false }
+    }
+    #endif
 
     private func localVersionBytes() -> [UInt8] {
         let vv = doc.oplogVv()
