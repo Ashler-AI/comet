@@ -201,7 +201,8 @@ async fn rejected_active_worker_recovery_preserves_pending_commands() {
     assert!(error.to_string().contains("worker_still_active"));
     assert_eq!(core.doc_host.command_entry(WORKER, &pending.id).await.unwrap(), Some(pending));
     assert_eq!(core.workspace.doc().worker_binding(WORKER).unwrap(), Some(paused));
-    assert!(core.sessions.worker_active(WORKER), "rejected recovery must not stop the active run");
+    let still_active = client.call(methods::READ_WORKER_SESSION, identity()).await.unwrap();
+    assert_eq!(still_active["state"], "busy", "rejected recovery must not stop the active run");
     assert_eq!(requests.lock().len(), 1, "rejected recovery must not start another run");
     control(&client, "interrupt").await;
     core.shutdown().await;
