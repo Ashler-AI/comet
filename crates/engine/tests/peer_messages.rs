@@ -690,6 +690,30 @@ async fn peer_visibility_preserves_active_steering_and_turn_boundary_delivery() 
         let preview = chat.last_message_preview.unwrap();
         assert!(!preview.contains("private-peer-body"));
         assert!(chat.last_message_at.is_some(), "peer activity freshness remains intact");
+        // A later large output can consume the bounded window's entire budget.
+        // Explicit reveal must still retrieve the unchanged original peer prompt.
+        core.doc_host.open(TARGET).unwrap().doc().push_message(&SessionMessageEntry {
+            id: "large-output".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Text { id: "t0".into(), text: "x".repeat(comet_doc::TAIL_TEXT_BYTE_BUDGET) }],
+            created_at: 2,
+            device_id: core.device_id.clone(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+            peer_message: None,
+        }).unwrap();
+        let handle = core.doc_host.open(TARGET).unwrap();
+        let window = handle.doc().read_entry_window(None, 64).unwrap();
+        let projected = window.entries.iter().find(|entry| entry.id == COMMAND).unwrap();
+        assert!(projected.parts.iter().any(|part| matches!(part, MessagePart::TextWindow { .. })));
+        let original: SessionMessageEntry = serde_json::from_value(client.call(
+            methods::READ_DOC_MESSAGE,
+            serde_json::json!({ "chatId": TARGET, "messageId": COMMAND }),
+        ).await.unwrap()).unwrap();
+        assert_eq!(original, peer);
+        assert!(client.call(methods::READ_DOC_MESSAGE,
+            serde_json::json!({ "chatId": TARGET, "messageId": "missing" }),
+        ).await.is_err());
         core.shutdown().await;
     }
 }

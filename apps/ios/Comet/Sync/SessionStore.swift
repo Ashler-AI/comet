@@ -443,7 +443,7 @@ final class SessionStore {
     }
 
     nonisolated private static func titlePreview(in entries: [MessageEntry]) -> String? {
-        guard let first = entries.first(where: { $0.role == .user }) else { return nil }
+        guard let first = entries.first(where: { $0.role == .user && !$0.isPeerMessage && $0.continuationOf == nil }) else { return nil }
         let text = first.parts.compactMap { part -> String? in
             if case .text(_, let text) = part { return text }
             return nil
@@ -462,7 +462,7 @@ final class SessionStore {
             let value = item.asValue()
             let role = value?.mapValue?["role"]?.stringValue ?? map?.get(key: "role")?.asValue()?.stringValue
             guard role == "user", let value = value ?? map?.getDeepValue(),
-                  let entry = entryFrom(value) else { continue }
+                  let entry = entryFrom(value), !entry.isPeerMessage, entry.continuationOf == nil else { continue }
             decoded.previewTitle = titlePreview(in: [entry])
             break
         }

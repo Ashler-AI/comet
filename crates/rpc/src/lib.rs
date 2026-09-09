@@ -43,6 +43,8 @@ pub mod methods {
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
     /// Read one older transcript page before an opaque raw-list cursor.
     pub const READ_DOC_MESSAGES: &str = "ReadDocMessages";
+    /// Read one full message on explicit reveal, without expanding the transcript window.
+    pub const READ_DOC_MESSAGE: &str = "ReadDocMessage";
     pub const SEND_PEER_MESSAGE: &str = "SendPeerMessage";
     pub const REPLY_PEER_MESSAGE: &str = "ReplyPeerMessage";
     pub const WAIT_PEER_REPLY: &str = "WaitPeerReply";

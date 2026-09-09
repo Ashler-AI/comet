@@ -459,6 +459,104 @@ enum E2ERunner {
         log("OK Crew mobile parity: uncertain retry identity/payload, late materialization dedupe, metadata-only title, transcript activation, deployment isolation")
     }
 
+    /// Uses the actual Loro decoder, asynchronous row cache and disclosure state.
+    /// No account, network, native agent run or signed-in workspace is touched.
+    static func runPeerMessageVisibility() async {
+        do {
+            let source = LoroDoc()
+            let original = "Message from Crew session sender (thread peer):\n\n" + String(repeating: "original peer line\n", count: 128)
+            func append(_ id: String, role: String, text: String, peer: Bool) throws {
+                let row = try source.getList(id: "messages").pushContainer(child: LoroMap())
+                try row.insert(key: "id", v: id)
+                try row.insert(key: "role", v: role)
+                try row.insert(key: "createdAt", v: Int64(1))
+                try row.insert(key: "deviceId", v: "host")
+                try row.insert(key: "status", v: "complete")
+                try row.insert(key: "parts", v: LoroValue.fromJSON([["id": "t0", "kind": "text", "text": text]]))
+                if peer {
+                    try row.insert(key: "peerMessage", v: LoroValue.fromJSON([
+                        "commandId": id, "sourceChatId": "sender", "threadId": "thread", "replyTo": "previous"
+                    ]))
+                }
+            }
+            try append("peer", role: "user", text: original, peer: true)
+            source.commit()
+            let restored = LoroDoc()
+            _ = try restored.importWith(bytes: source.export(mode: .snapshot), origin: "peer-regression")
+            let config = AppConfig(edgeURL: URL(string: "http://127.0.0.1:1")!, mode: .dev,
+                                   userId: "peer-regression", projectScope: "peer-regression",
+                                   deviceId: "viewer", deviceName: "Crew regression")
+            let metadata = SessionStore(chatId: "peer-regression", config: config, metadataOnly: true)
+            defer { metadata.stop() }
+            _ = try metadata.doc.importWith(bytes: source.export(mode: .snapshot), origin: "peer-regression")
+            metadata.start()
+            let peerOnly = SessionStore.decodeProjection(from: restored, chatId: "peer-regression", observedAt: nil)
+            guard peerOnly.entries.first?.isPeerMessage == true, peerOnly.previewTitle == nil else {
+                log("FAIL Crew peer message visibility: snapshot provenance or full-projection preview")
+                return
+            }
+            let from = restored.oplogVv()
+            let ordinary = "Message from Crew session user-typed historical text"
+            try append("ordinary", role: "user", text: ordinary, peer: false)
+            try append("assistant", role: "assistant", text: "Assistant stays visible", peer: true)
+            let command = try source.getList(id: "commands").pushContainer(child: LoroMap())
+            try command.insert(key: "id", v: "ordinary")
+            try command.insert(key: "kind", v: "peerMessage")
+            try command.insert(key: "status", v: "applied")
+            source.commit()
+            let update = try source.export(mode: .updates(from: from))
+            _ = try restored.importWith(bytes: update, origin: "peer-regression-reconnect")
+            _ = try metadata.doc.importWith(bytes: update, origin: "peer-regression-reconnect")
+            guard await poll(timeout: 5, label: "peer-free metadata preview", {
+                metadata.previewTitle?.hasPrefix("Message from Crew session user-typed") == true ? true : nil
+            }) != nil else {
+                log("FAIL Crew peer message visibility: metadata-only preview leaked peer body")
+                return
+            }
+            let decoded = SessionStore.decodeProjection(from: restored, chatId: "peer-regression", observedAt: nil)
+            guard decoded.entries.map(\.isPeerMessage) == [true, false, false],
+                  decoded.entries[0].peerMessage?.replyTo == "previous",
+                  decoded.previewTitle == metadata.previewTitle else {
+                log("FAIL Crew peer message visibility: reconnect, historical identity or assistant visibility")
+                return
+            }
+            let cache = TranscriptBuilderCache()
+            await cache.update(revision: 1, entries: decoded.entries, pendingSends: [])
+            guard let row = cache.rows.first(where: { $0.id == "peer" }),
+                  let user = cache.rows.first(where: { $0.id == "ordinary" }),
+                  case .user(let ordinaryBody) = user.kind, ordinaryBody == ordinary,
+                  cache.rows.contains(where: { $0.entryId == "assistant" }) else {
+                log("FAIL Crew peer message visibility: conversation row projection")
+                return
+            }
+            var visibility = PeerMessageVisibility()
+            guard visibility.body(for: row, chatId: "chat") == nil else {
+                log("FAIL Crew peer message visibility: body visible before reveal")
+                return
+            }
+            visibility.toggle(row, chatId: "chat")
+            guard visibility.body(for: row, chatId: "chat") == original,
+                  visibility.body(for: row, chatId: "other-chat") == nil else {
+                log("FAIL Crew peer message visibility: full-original reveal or chat isolation")
+                return
+            }
+            visibility.toggle(row, chatId: "chat")
+            guard visibility.body(for: row, chatId: "chat") == nil else {
+                log("FAIL Crew peer message visibility: collapse retained visible body")
+                return
+            }
+            visibility.toggle(row, chatId: "chat")
+            visibility.retain(rows: [], chatId: "chat")
+            guard visibility.body(for: row, chatId: "chat") == nil else {
+                log("FAIL Crew peer message visibility: removed row retained disclosure")
+                return
+            }
+            log("OK Crew peer message visibility: typed snapshot/reconnect, full-original reveal/collapse, legacy user and assistant visibility, metadata previews")
+        } catch {
+            log("FAIL Crew peer message visibility: \(error.localizedDescription)")
+        }
+    }
+
     static func runStoreEviction() async {
         guard await AppModel.runStoreEvictionRegression() else { return }
         log("OK Crew store eviction")

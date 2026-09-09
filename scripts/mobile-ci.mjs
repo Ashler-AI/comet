@@ -34,6 +34,7 @@ const markers = [
   "OK Crew APNs lifecycle",
   "OK Crew mobile parity",
   "OK Crew store eviction",
+  "OK Crew peer message visibility",
 ];
 const project = "apps/ios/Comet.xcodeproj";
 const lockfile = path.join(project, "project.xcworkspace/xcshareddata/swiftpm/Package.resolved");
@@ -125,7 +126,7 @@ async function verifySimulator(app) {
     }
     await sleep(1_000);
   }
-  throw new Error(`Mobile regression timed out waiting for all five markers; see e2e.log:\n${snapshotE2ELog()}`);
+  throw new Error(`Mobile regression timed out waiting for all ${markers.length} markers; see e2e.log:\n${snapshotE2ELog()}`);
 }
 
 function signArchiveApp(app, settings) {
