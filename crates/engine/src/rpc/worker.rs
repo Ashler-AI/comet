@@ -209,6 +209,7 @@ impl EngineRpc {
             if binding.worktree.is_some() && self.workspace.doc().chat(&p.chat_id).map_err(failed)?.is_none() {
                 return Err(failed("worker_chat_missing"));
             }
+            if self.sessions.worker_active(&p.chat_id) { return Err(failed("worker_still_active")); }
             if binding.paused || binding.closed {
                 self.doc_host.cancel_worker_commands(&p.chat_id).await.map_err(failed)?;
             }

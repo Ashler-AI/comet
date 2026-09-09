@@ -165,6 +165,49 @@ async fn worker_terminal_state_is_not_text_and_close_cannot_replay_or_discard_wo
 }
 
 #[tokio::test]
+async fn rejected_active_worker_recovery_preserves_pending_commands() {
+    use comet_doc::{SessionCommandEntry, SessionCommandPayload, SessionCommandStatus, SessionControlAction};
+
+    let root = tempfile::tempdir().unwrap();
+    let project = init_repo(root.path());
+    let (core, requests) = engine(root.path());
+    owners(&core, &project);
+    let client = comet_rpc::memory_client(core.rpc_service());
+    client.call(methods::ENSURE_WORKER_SESSION, spec(&project)).await.unwrap();
+    send(&client, "active-during-recover", "[hold]").await.unwrap();
+    state(&client, "busy").await;
+
+    // A remote-owned command remains pending on this host, so the local
+    // executor cannot settle this queued work while recovery is being tested.
+    let pending = SessionCommandEntry {
+        id: "retained-pending-command".into(),
+        payload: SessionCommandPayload::Control {
+            session_id: WORKER.into(), owner_device_id: "remote-owner".into(),
+            actor_device_id: core.device_id.clone(), actor_subject: "test-actor".into(),
+            grant_id: "remote-queue-grant".into(), source: comet_proto::AgentSessionSource::Scaffold,
+            action: Box::new(SessionControlAction::Queue {
+                prompt: "retain queued work".into(), message_id: Some("retained-message".into()),
+            }),
+        },
+        issued_by: core.device_id.clone(), issued_at: chrono::Utc::now().timestamp_millis(),
+        based_on: None, expires_at: None, status: SessionCommandStatus::Pending, resolution: None,
+    };
+    core.doc_host.open(WORKER).unwrap().doc().queue_command(&pending).unwrap();
+    let mut paused = core.workspace.doc().worker_binding(WORKER).unwrap().unwrap();
+    paused.paused = true;
+    core.workspace.doc().set_worker_binding(&paused).unwrap();
+    let error = client.call(methods::CONTROL_WORKER_SESSION,
+        json!({"chatId":WORKER,"ownerChatId":OWNER,"action":"recover"})).await.unwrap_err();
+    assert!(error.to_string().contains("worker_still_active"));
+    assert_eq!(core.doc_host.command_entry(WORKER, &pending.id).await.unwrap(), Some(pending));
+    assert_eq!(core.workspace.doc().worker_binding(WORKER).unwrap(), Some(paused));
+    assert!(core.sessions.worker_active(WORKER), "rejected recovery must not stop the active run");
+    assert_eq!(requests.lock().len(), 1, "rejected recovery must not start another run");
+    control(&client, "interrupt").await;
+    core.shutdown().await;
+}
+
+#[tokio::test]
 async fn worker_waiting_and_durable_reply_survive_waiter_disconnect() {
     let root = tempfile::tempdir().unwrap();
     let project = init_repo(root.path());
