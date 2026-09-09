@@ -36,6 +36,7 @@ enum Theme {
     static let danger = oklch(0.704, 0.191, 22.216)         // red-400
     static let dangerSoft = oklch(0.808, 0.114, 19.571)     // red-300
     static let warning = oklch(0.828, 0.189, 84.429)        // amber-400
+    static let attention = oklch(0.707, 0.165, 254.624)    // blue-400
 
     // ---- paint: status dots (shell/spaces.rs status_dot_color) ----
     static let statusWorking = oklch(0.718, 0.202, 349.761)   // pink-400

@@ -36,6 +36,120 @@ This installs the official [oh-my-pi v17.2.9](https://github.com/can1357/oh-my-p
 
 To use a remote OMP auth broker, launch Comet with `OMP_AUTH_BROKER_URL` and either `OMP_AUTH_BROKER_TOKEN` or `OMP_AUTH_BROKER_TOKEN_FILE`. The token-file form is preferred for service managers: it must be mode `0600`, is removed before parsing/spawn on every outcome, and Comet passes the bearer only in the OMP child environment, never argv or logs. Do not print or interpolate the token in shell commands. Scaffold-host OMP launches remain isolated with `--profile scaffold-host --no-extensions --no-skills --no-rules`.
 
+### Desktop gateway extension discovery
+
+Crew 0.1.83 installs a credential-free, Crew-owned discovery adapter at
+`extensions/crew-auth-gateway.ts` in the selected OMP agent directory. Ordinary
+cold-revived subagents discover the same gateway provider as their parent instead
+of removing its authentication registration. The adapter is inert unless both
+`COMET_SESSION_ID` and `COMET_INFERENCE_TOKEN` are present; bare OMP sessions do not
+gain Crew providers merely because the file exists.
+
+An existing user-owned `extensions/omp-auth-gateway.ts` keeps precedence, including
+when added after Crew's adapter was installed. Crew does not overwrite unrelated
+extensions. Symlinked extension directories and conflicting managed-path files
+are rejected rather than overwritten or silently falling back to the broken
+explicit-only revival path. Scaffold's no-discovery policy and Prime's explicit
+adapter remain separate. This desktop-only release does not replace the installed
+OMP executable or advance the Scaffold release channel.
+
+The isolated installed-runtime regression can be run without provider credentials:
+
+```bash
+node scripts/omp-gateway-revival-smoke.mjs ~/.local/bin/omp --compare-explicit
+```
+
+## Native OMP handoff to Scaffold
+
+For an explicitly requested remote task, local OMP runs inside Crew use the
+native handoff action instead of creating a standalone OpenCode task:
+
+```bash
+"$COMET_EXECUTABLE" session handoff "$COMET_SESSION_ID" --prompt-file "$PROMPT_FILE" --database-environment local
+```
+
+Crew supplies `COMET_LOCAL_AGENT_RUNTIME=1`, `COMET_EXECUTABLE`, the source Crew
+chat ID in `COMET_SESSION_ID`, and `COMET_IPC_PORT`. Preserve those values. The
+prompt file must contain nonblank UTF-8 text of at most 1 MiB; create it privately
+with mode `0600` and remove it afterward. Database snapshots require an explicit
+request; the configured Scaffold deployment remains unchanged.
+
+The CLI and composer share native preparation: create or recover the target,
+attach its host, transfer OMP history and the worktree, then queue the task in a
+distinct Crew chat. The receipt contains `chatId`, `sandboxId`, `commandId`, and
+`environment`; it confirms command admission, not remote task completion.
+Monitor the returned chat in Crew, not standalone `handoff.*` lifecycle tools.
+
+Native transfer captures the source repository's HEAD and reachable Git history,
+plus its dirty and untracked files, into a bounded, verified archive. Scaffold
+reconstructs it at `/workspace/crew-handoff`, preserving a nested source cwd;
+the provisioned `/workspace/ashler-platform` checkout is left untouched. The two
+repositories do not need a shared commit. OMP context is rebased to the imported
+cwd. Capture/import fail closed on archive, expanded-object, checkout-size, path,
+or symlink safety violations; Git submodules are not reconstructed.
+
+Starting with **0.1.86**, native handoff prepares only the captured **prior
+conversation** for attachment replay. Recognized image, file/document, and audio
+blocks keep inline base64 content; local content-addressed blobs are hydrated
+only after regular-file, size, stable-read, and SHA-256 verification. Missing,
+unreadable, corrupt, nonregular, or over-budget attachment blobs become explicit
+historical-unavailable text markers. Path/URL attachment references that cannot
+be carried as bytes also become markers; Crew does not fetch arbitrary URLs.
+Ordinary text links, tool arguments, and unrelated session metadata are unchanged.
+The original journal remains intact, and the prepared snapshot is rehashed for
+the existing archive verification. The separately queued **current prompt** does
+not pass through this fallback: current attachment/input errors remain errors.
+This is a handoff preparation policy, not a global OMP provider retry policy.
+
+**0.1.87** extends that boundary to actual OMP compaction archives at
+`preserveData.snapcompact.frames`: available frames retain their metadata and
+receive verified inline bytes; unavailable frames are removed with an explicit
+warning prepended to the compaction summary. **0.1.86 did not cover this shape**,
+and its installed-app retest still failed. A local smoke using the original
+incident journal prepared all **15 frames across three archives**, with each
+decoded SHA-256 matching its source blob and no unresolved frame/data blob
+references remaining. This is local preparation proof, not remote execution proof.
+
+The subsequent **installed 0.1.87** retest completed successfully in remote Crew
+chat `c2a70e4f-bd3a-4244-8968-7c5b0619e06f`, sandbox
+`rcs_a656652b49f3e396e7294643` (staging, local database), from the original
+image-containing conversation. The remote model recovered native context and
+verified source/platform repository isolation. Independent inspection of the
+remote journal decoded all **15 original frames**, including the latest five,
+and matched every SHA-256 to the saved local blob baseline; no replacement
+markers substituted for those images. Desktop staging and production published
+the same verified candidate from `4491b119c0de7ee8de3613979d34f971b5c767b8`:
+[build/staging](https://github.com/Ashler-AI/comet/actions/runs/34398401078),
+[production promotion](https://github.com/Ashler-AI/comet/actions/runs/34399706707).
+
+The September 9 development-build smoke completed through the native CLI and
+remote Crew chat `030e3ef6-57c4-4749-bd17-cf3ec7435eda` in sandbox
+`rcs_cc61f7c6b3c3a63e04a6d5d5` (staging, local database). The remote agent recovered
+the prior conversation marker, source HEAD, committed file, and uncommitted file,
+and confirmed the platform repository remained separate. This verifies the
+correction in the development controller, not an installed-app or release-channel
+rollout. The original grant rejection's HTTP response was unavailable; subsequent
+grant rejections now preserve bounded HTTP status and machine-code diagnostics
+without exposing bearer tokens or response details.
+
+The correction shipped to the desktop staging channel as **0.1.85** from
+`e771970915b4b10565a825dca6140e13703b682f` in
+[release run 34387642609](https://github.com/Ashler-AI/comet/actions/runs/34387642609).
+CI passed **537 UI tests**, the existing fork/gateway checks, and the native
+preparation, worktree, materializer, grant-diagnostic, and CLI checks before
+packaging. The downloaded release archive and desktop artifacts passed SHA-256
+verification; the packaged app passed strict code-signature verification and
+reported **0.1.85**. Live staging manifest readback matched the candidate's exact
+source and hashes. The installed **0.1.84** app's read-only update check reported
+**0.1.85 available**; it was not replaced during publication. Desktop production
+remained **0.1.83**, both Scaffold channels remained **0.1.81**, and mobile was
+unchanged. OpenCode reviewed the final release changes with no actionable findings.
+
+Missing runtime values or an unsupported CLI/RPC require updating Crew's binary
+and running engine together, then starting a fresh local agent run. Never guess
+an executable, retry creation blindly, or fall back to OpenCode. After an error,
+inspect Crew for an accepted sandbox before retrying. Standalone handoff recovery
+remains separate and unchanged.
 ## Local collaboration smoke
 
 The deterministic smoke uses two in-memory headless devices and needs no cloud credentials, agent CLI, network, or persistent state:
@@ -47,6 +161,26 @@ npm --prefix edge run smoke:collaboration
 ```
 
 It covers a scope-bound invite and join, two concurrent agent sessions, shared transcript provenance, owner-only teammate command execution and audit, reconnect replay, stable annotations, and attachment metadata without embedding blob bytes.
+
+## Session attention notifications
+
+Crew 0.1.72 adds opt-in native desktop alerts for fresh session input requests,
+errors, and working-to-idle completion. Enable them in **Settings → Notifications**;
+use **Send test notification** to check OS delivery. Existing chime preferences
+remain independent. Initial/reconnected snapshots, stale or reordered updates,
+archived sessions, and the actively viewed session do not produce banners.
+Notification actions open the corresponding session, including reopening a
+closed main window. On macOS, launch the installed Crew app bundle rather than
+the bare executable; OS permission and Focus settings still control delivery.
+
+Mobile attention alerts use the same factual transition policy. Production iOS
+1.0 (5) was uploaded with the missing-session visibility fixes and verified
+production APNs entitlement. Its preceding simulator crash was confined to the
+Debug regression harness, not Release. App Store Connect reports processing
+complete and assignment to Ashler Internal; the tester remains Invited. Background
+delivery remains blocked on production Worker credentials; see
+[iOS release evidence](apps/ios/README.md#crew-0172--production-ios-10-5) and
+[notification setup](apps/ios/README.md#session-attention-notifications).
 
 ## GitHub deployment setup
 
@@ -60,6 +194,13 @@ Create these GitHub environments:
 - `comet-release-staging`
 - `comet-release-production`, with required reviewers and deployment-branch protection for release tags
 
+Required reviewers and deployment-branch protection are recommended setup, not
+properties supplied by this workflow. As inspected on 2026-09-07,
+`comet-release-production` has `protection_rules: []` and
+`deployment_branch_policy: null`. It currently provides **no required-reviewer
+approval or branch restriction**. An authorized production dispatch can proceed
+without a review after its prerequisite jobs succeed.
+
 Add these environment-scoped deployment secrets to `comet-staging`:
 
 - `CLOUDFLARE_API_TOKEN`: token limited to the Crew staging and production Worker, Durable Object, and R2 resources
@@ -71,8 +212,16 @@ Add `GCP_PROJECT_ID` and `GCP_IAP_AUDIENCE` as variables. The staging job
 uses this environment directly. The current production deploy reuses the same
 platform-scoped credentials only after the staged candidate digest and GCP
 project/provider assertions pass. Release-feed synchronization does not reuse
-that boundary: it enters the matching protected `comet-release-*` environment
+that boundary: it enters the matching `comet-release-*` environment
 before either edge deployment.
+
+The candidate job requires its TypeScript check on both push and manual triggers;
+there is no supported input to skip it. Builds, tests, staging verification and
+candidate-digest checks are also required.
+The notification release was integrated directly into main and deployed by
+[34141398021](https://github.com/Ashler-AI/comet/actions/runs/34141398021), with
+the existing desktop candidate promoted from main by
+[34141507706](https://github.com/Ashler-AI/comet/actions/runs/34141507706).
 
 Add these environment-scoped secrets to `comet-release-staging` and `comet-release-production`:
 
@@ -104,19 +253,19 @@ gh workflow run deploy.yml -f target=staging
 gh workflow run deploy.yml -f target=production
 ```
 
-The production command still deploys staging first. Every production edge
-deploy then requires one approval through the protected
-`comet-release-production` synchronization job. That approval authorizes the
-production deployment, so the gate intentionally remains when the reader pair
-is absent and secret synchronization is a no-op. Production starts only after
-the gate succeeds.
-For an authenticated local deployment, use the checked-in environment contract and environment-specific Cloudflare credentials:
+The production command deploys staging first, then waits for the
+`comet-release-production` synchronization job and verifies the same candidate
+digest. A manual review is required **only when** the GitHub environment has
+required reviewers configured. With the current empty protection rules, this is
+job ordering and credential scoping, not an approval gate. Synchronization remains
+a prerequisite even when the reader credential pair is absent and it is a no-op.
+Do not deploy production locally; use `workflow_dispatch target=production`.
+For an authenticated local **staging** deployment:
 
 ```bash
 cd edge
 npm ci
 CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... npx wrangler deploy --env staging
-CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... npx wrangler deploy --env production
 ```
 
 Never reuse production credentials for the staging command.
@@ -147,6 +296,17 @@ contract cannot ship as a desktop-only release. An unacknowledged bump,
 including one introduced by a tag push, fails with the required deployment
 sequence.
 
+Crew preserves the accepted Scaffold sandbox and room while attachment is pending.
+An exact `503 sandbox_runtime_starting` response (including the provider's nested
+`body.error` envelope) keeps one native Attach operation waiting, bounded to two
+minutes and cancellable. Each wait rechecks the sandbox, owner, room, and lifecycle
+epoch; unrelated 404s and terminal states still fail. Manual retry uses the same
+accepted sandbox. A failed launch without an accepted remote target discards its
+pending draft; confirmed deletion discards an accepted pending draft. Deleting a
+persisted chat keeps the ordinary chat-deletion behavior.
+Deleting a chat during its first send also removes the pending sidebar entry, so
+later workspace updates cannot restore a deleted session as still starting.
+
 ```bash
 version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
 
@@ -167,7 +327,7 @@ git tag "v$version"
 git push origin "v$version"
 ```
 
-Manual production publication still requires both private release environments and the production approval. It does not create a GitHub Release or public object. Cargo workspace packages keep `publish = false`, so the workflow cannot publish crates.
+Manual production publication uses both private release environments. Reviewer approval depends on their actual GitHub protection rules; environment names alone do not require it. It does not create a GitHub Release or public object. Cargo workspace packages keep `publish = false`, so the workflow cannot publish crates.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the runtime design.
 The required local/Scaffold cutover and multi-client acceptance contract is in [docs/ASHLER-SCAFFOLD-END-STATE.md](docs/ASHLER-SCAFFOLD-END-STATE.md).

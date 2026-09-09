@@ -94,7 +94,7 @@ struct CheckoutEntry {
     /// Latest bounded snapshot. Kept engine-side so the patch can be read for
     /// one exact checksum without placing patch bytes in the watch channel.
     latest: Mutex<Option<Arc<DiffSnapshot>>>,
-    kick_tx: mpsc::UnboundedSender<()>,
+    kick_tx: mpsc::Sender<()>,
     /// Keeps the recursive fs watchers alive; dropped on entry close.
     _watchers: Vec<notify::RecommendedWatcher>,
 }
@@ -183,7 +183,7 @@ impl CheckoutDiffSync {
     /// Kick an immediate sync of every tracked checkout (repair-tick path).
     pub fn sync_all(&self) {
         for entry in lock(&self.inner.entries).values() {
-            let _ = entry.kick_tx.send(());
+            let _ = entry.kick_tx.try_send(());
         }
     }
 }
@@ -279,7 +279,7 @@ async fn reconcile(inner: &Arc<DiffSyncInner>, chats: Vec<Chat>) {
                     has_new
                 };
                 if has_new {
-                    let _ = entry.kick_tx.send(()); // new chat needs a sidecar now
+                    let _ = entry.kick_tx.try_send(()); // new chat needs a sidecar now
                 }
             }
             None => add_entry(inner, identity, chats).await,
@@ -317,7 +317,8 @@ fn exceeds_watch_budget(root: &Path) -> bool {
 }
 
 async fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats: Vec<Chat>) {
-    let (kick_tx, kick_rx) = mpsc::unbounded_channel();
+    // Kicks carry no data: one pending capture covers every event while busy.
+    let (kick_tx, kick_rx) = mpsc::channel(1);
     let watcher_identity = identity.clone();
     let watcher_kick_tx = kick_tx.clone();
     let watchers = match tokio::task::spawn_blocking(move || {
@@ -346,7 +347,7 @@ async fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats
         Arc::downgrade(&entry),
         kick_rx,
     ));
-    let _ = kick_tx.send(()); // initial snapshot
+    let _ = kick_tx.try_send(()); // initial snapshot
 }
 
 fn build_ignore_matcher(root: &Path) -> ignore::gitignore::Gitignore {
@@ -390,6 +391,14 @@ fn event_needs_capture(
     ignored: &ignore::gitignore::Gitignore,
     event: &notify::Event,
 ) -> bool {
+    // Git capture opens the watched index and worktree files itself. Access
+    // notifications must not feed another capture forever on inotify.
+    // Keep close-after-write as a signal for backends that coalesce writes.
+    if matches!(event.kind, notify::EventKind::Access(kind)
+        if kind != notify::event::AccessKind::Close(notify::event::AccessMode::Write))
+    {
+        return false;
+    }
     event.paths.is_empty()
         || event
             .paths
@@ -403,7 +412,7 @@ fn event_needs_capture(
 /// readiness for minutes on machines with many historical worktrees.
 fn build_watchers(
     identity: &CheckoutIdentity,
-    kick_tx: &mpsc::UnboundedSender<()>,
+    kick_tx: &mpsc::Sender<()>,
 ) -> Vec<notify::RecommendedWatcher> {
     let mut watchers = Vec::new();
     let mut targets: Vec<&PathBuf> = vec![&identity.root];
@@ -432,7 +441,7 @@ fn build_watchers(
                     .as_ref()
                     .is_ok_and(|event| event_needs_capture(&filter_identity, &ignored, event))
                 {
-                    let _ = tx.send(());
+                    let _ = tx.try_send(());
                 }
             });
         match watcher {
@@ -452,11 +461,11 @@ fn build_watchers(
 }
 
 /// Per-checkout task: trailing-debounce fs kicks, then compute + publish. Runs
-/// syncs sequentially — kicks during a sync accumulate and trigger another pass.
+/// syncs sequentially — kicks during a sync coalesce into one subsequent pass.
 async fn entry_task(
     inner: Weak<DiffSyncInner>,
     entry: Weak<CheckoutEntry>,
-    mut kick_rx: mpsc::UnboundedReceiver<()>,
+    mut kick_rx: mpsc::Receiver<()>,
 ) {
     while kick_rx.recv().await.is_some() {
         // Trailing debounce: wait for the burst to settle.
@@ -628,7 +637,7 @@ async fn diff_sync_task(inner: Weak<DiffSyncInner>, mut chats_rx: watch::Receive
                 let chats = chats_rx.borrow().clone();
                 reconcile(&inner, chats).await;
                 for entry in lock(&inner.entries).values() {
-                    let _ = entry.kick_tx.send(());
+                    let _ = entry.kick_tx.try_send(());
                 }
             }
         }
@@ -1042,6 +1051,16 @@ mod watch_budget_tests {
         assert!(!event_needs_capture(&identity, &ignored, &generated));
         assert!(event_needs_capture(&identity, &ignored, &source));
         assert!(event_needs_capture(&identity, &ignored, &outside));
+        let read_open = notify::Event::new(notify::EventKind::Access(
+            notify::event::AccessKind::Open(notify::event::AccessMode::Any),
+        ))
+        .add_path(identity.git_dir.join("index"));
+        let write_close = notify::Event::new(notify::EventKind::Access(
+            notify::event::AccessKind::Close(notify::event::AccessMode::Write),
+        ))
+        .add_path(tmp.path().join("src/lib.rs"));
+        assert!(!event_needs_capture(&identity, &ignored, &read_open));
+        assert!(event_needs_capture(&identity, &ignored, &write_close));
 
         let tracked_root = tempfile::tempdir().unwrap();
         let tracked_identity = CheckoutIdentity {

@@ -1162,12 +1162,13 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "comet"
-version = "0.1.63"
+version = "0.1.87"
 dependencies = [
  "anyhow",
  "clap",
  "comet-engine",
  "comet-harness",
+ "comet-proto",
  "comet-rpc",
  "comet-ui",
  "comet-update",
@@ -1184,7 +1185,7 @@ dependencies = [
 
 [[package]]
 name = "comet-doc"
-version = "0.1.63"
+version = "0.1.87"
 dependencies = [
  "chrono",
  "comet-proto",
@@ -1197,7 +1198,7 @@ dependencies = [
 
 [[package]]
 name = "comet-engine"
-version = "0.1.63"
+version = "0.1.87"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1238,7 +1239,7 @@ dependencies = [
 
 [[package]]
 name = "comet-harness"
-version = "0.1.63"
+version = "0.1.87"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1259,7 +1260,7 @@ dependencies = [
 
 [[package]]
 name = "comet-proto"
-version = "0.1.63"
+version = "0.1.87"
 dependencies = [
  "chrono",
  "serde",
@@ -1269,7 +1270,7 @@ dependencies = [
 
 [[package]]
 name = "comet-rpc"
-version = "0.1.63"
+version = "0.1.87"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1287,7 +1288,7 @@ dependencies = [
 
 [[package]]
 name = "comet-sync"
-version = "0.1.63"
+version = "0.1.87"
 dependencies = [
  "comet-doc",
  "futures",
@@ -1301,11 +1302,12 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "uuid",
+ "xxhash-rust",
 ]
 
 [[package]]
 name = "comet-ui"
-version = "0.1.63"
+version = "0.1.87"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -1334,7 +1336,7 @@ dependencies = [
 
 [[package]]
 name = "comet-update"
-version = "0.1.63"
+version = "0.1.87"
 dependencies = [
  "anyhow",
  "futures",
@@ -3935,9 +3937,9 @@ dependencies = [
 
 [[package]]
 name = "loro"
-version = "1.13.7"
+version = "1.13.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bec673c3332ede11cc58d5d88de55a01ba17cf28b0bd0feb66ca1c66fb757ad"
+checksum = "09ea00f70c1acad4b7a05aaf72c1d9a671426021a1999ee821c77b56f0a15900"
 dependencies = [
  "enum-as-inner 0.6.1",
  "generic-btree",
@@ -3981,9 +3983,9 @@ dependencies = [
 
 [[package]]
 name = "loro-internal"
-version = "1.13.7"
+version = "1.13.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b635801310e2047f74be15f58988f2f78e7874e77aa08643fe9e6eec356f6848"
+checksum = "6fec47acf8db115b7146da5e1d5b18d0cf58032e6012c0c1ee3ec3442d1e936f"
 dependencies = [
  "append-only-bytes",
  "arref",
@@ -4028,9 +4030,9 @@ dependencies = [
 
 [[package]]
 name = "loro-kv-store"
-version = "1.13.7"
+version = "1.13.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b42b8d6d2c95abf67d7f50a60171759d693206796d7f8f03f3fe68e531c88794"
+checksum = "937f88e4a3d80d5853f5119753f5e5f68d4375726db7e9b3d6dac9db8167e8bf"
 dependencies = [
  "bytes",
  "ensure-cov",

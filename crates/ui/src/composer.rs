@@ -29,17 +29,21 @@ use comet_doc::{
     MessagePart, MessageRole, MessageStatus, SessionCommandPayload, SessionControlAction,
     SessionMessageEntry,
 };
+#[cfg(test)]
+use comet_proto::AgentProvider;
 use comet_proto::{
-    AgentProvider, AgentRoute, AgentSessionSource, Chat, ChatConfig, FileSearchMatch,
-    HarnessCommand, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, ScaffoldLifecycle,
-    SteeringMode, UserInputAnswer, UserInputQuestion,
+    AgentRoute, AgentSessionSource, Chat, ChatConfig, FileSearchMatch, HarnessCommand, HarnessId,
+    ReasoningLevel, RunRequest, SandboxLevel, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 use comet_rpc::{RpcError, methods};
 
 use crate::attachments::{self, StagedAttachment};
 use crate::motion;
 use crate::pickers::{CheckoutPlan, Pickers};
-use crate::state::{AppState, ChatStartupPhase, EngineHandle, Indicator, latest_active_omp_goal};
+use crate::state::{
+    AppState, ChatStartupPhase, EngineHandle, Indicator, ScaffoldControlTarget,
+    latest_active_omp_goal,
+};
 use crate::theme::Theme;
 
 // ---------------------------------------------------------------------------
@@ -78,9 +82,6 @@ pub const INPUT_TEXT_SIZE: f32 = 14.0;
 pub const AUTO_ADVANCE_MS: u64 = 220;
 /// Drag-selection autoscroll runs at the display-friendly 60fps cadence.
 pub const DRAG_SCROLL_FRAME_MS: u64 = 16;
-/// Maximum time the first prompt waits for its Scaffold sandbox and remote
-/// Comet host. Failure is surfaced; the prompt never falls back to local.
-const SCAFFOLD_DEMO_WAIT: Duration = Duration::from_secs(10 * 60);
 /// First sends must either reach the durable command ledger or roll back.
 const LOCAL_SESSION_ADMISSION_WAIT: Duration = Duration::from_secs(2 * 60);
 
@@ -166,22 +167,8 @@ fn scaffold_agent_binding(
     if harness? != HarnessId::Omp {
         return None;
     }
-    let selected = selected_model
-        .map(str::trim)
-        .filter(|model| !model.is_empty() && *model != "default")?;
-    let lower = selected.to_ascii_lowercase();
-    let (_, model) = selected.rsplit_once('/')?;
-    if model.is_empty() {
-        return None;
-    }
-    let (provider, model_id) = if lower.starts_with("anthropic/") {
-        (AgentProvider::Anthropic, format!("anthropic/{model}"))
-    } else if lower.starts_with("openai/") || lower.starts_with("openai-codex/") {
-        (AgentProvider::OpenAi, format!("openai-codex/{model}"))
-    } else {
-        return None;
-    };
-    let route = AgentRoute::automatic(provider, model);
+    let route = AgentRoute::from_omp_model(selected_model?)?;
+    let model_id = route.omp_model();
     Some(ScaffoldAgentBinding { route, model_id })
 }
 fn scaffold_send_requires_binding(
@@ -597,6 +584,26 @@ pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
 
 fn should_queue_steer(requested_steer: bool, is_new: bool, is_shared: bool) -> bool {
     !is_new && (requested_steer || is_shared)
+}
+
+fn begin_send(sending_chats: &mut HashMap<String, usize>, chat_id: &str) {
+    *sending_chats.entry(chat_id.to_owned()).or_default() += 1;
+}
+
+fn finish_send(sending_chats: &mut HashMap<String, usize>, chat_id: &str) {
+    let remove = if let Some(count) = sending_chats.get_mut(chat_id) {
+        debug_assert!(
+            *count > 0,
+            "pending send counts never reach zero in the map"
+        );
+        *count = count.saturating_sub(1);
+        *count == 0
+    } else {
+        false
+    };
+    if remove {
+        sending_chats.remove(chat_id);
+    }
 }
 
 /// Find the unresolved input request the panel should serve, if any: an
@@ -3411,12 +3418,6 @@ struct ControlRoute {
     scaffold: Option<ScaffoldControlTarget>,
 }
 
-#[derive(Debug, Clone)]
-struct ScaffoldControlTarget {
-    sandbox_id: String,
-    scope: comet_proto::CollaborationScope,
-}
-
 fn control_route_grant_id(
     snapshot: &comet_proto::CollaborationSnapshot,
     session: &comet_proto::AgentSessionRecord,
@@ -3701,7 +3702,7 @@ pub struct Composer {
     /// composer in start mode even while a teammate's session is working.
     agent_target: Option<String>,
     start_agent: bool,
-    sending_chats: HashSet<String>,
+    sending_chats: HashMap<String, usize>,
     failure: Option<SharedString>,
     wizard: Option<Wizard>,
     wizard_focus: FocusHandle,
@@ -3709,7 +3710,6 @@ pub struct Composer {
     /// frame marks them resolved).
     answered_requests: HashSet<String>,
     advance_task: Option<Task<()>>,
-    send_task: Option<Task<()>>,
     // -- compact/expanded flip state (hysteresis; see `composer_flip`) --
     /// Current layout mode (persisted across frames — never derived fresh).
     expanded_mode: bool,
@@ -3801,13 +3801,12 @@ impl Composer {
             current_key,
             agent_target: None,
             start_agent: false,
-            sending_chats: HashSet::new(),
+            sending_chats: HashMap::new(),
             failure: None,
             wizard: None,
             wizard_focus: cx.focus_handle(),
             answered_requests: HashSet::new(),
             advance_task: None,
-            send_task: None,
             expanded_mode: false,
             flip_epoch: 0,
             compact_capacity: 0.0,
@@ -3896,7 +3895,7 @@ impl Composer {
     }
 
     pub fn is_sending(&self, chat_id: &str) -> bool {
-        self.sending_chats.contains(chat_id)
+        self.sending_chats.contains_key(chat_id)
     }
 
     // ---- attachment staging (use-attachments.ts) ----
@@ -4691,10 +4690,7 @@ impl Composer {
             state
                 .scaffold_control_target(&session_id)
                 .filter(|target| principal_can_control && principal.authorizes_scope(&target.scope))
-                .map(|target| ScaffoldControlTarget {
-                    sandbox_id: target.sandbox_id.clone(),
-                    scope: target.scope.clone(),
-                })
+                .cloned()
                 .or_else(|| {
                     persisted_scaffold_reconnect_target(
                         &state.session_refs,
@@ -5122,7 +5118,7 @@ impl Composer {
         self.input.update(cx, |input, cx| input.set_text("", cx));
         self.drafts.remove(&self.current_key);
         self.failure = None;
-        self.sending_chats.insert(chat_id.clone());
+        begin_send(&mut self.sending_chats, &chat_id);
         cx.emit(ComposerEvent::Sent {
             chat_id: chat_id.clone(),
         });
@@ -5150,8 +5146,9 @@ impl Composer {
                 )
             });
         }
-        let durable_startup = local_startup;
-        let send_task = cx.spawn(async move |this, cx| {
+        // User-submitted commands are durable intent: a later send, stop, or
+        // question answer must not cancel this admission task by replacing it.
+        cx.spawn(async move |this, cx| {
         let creates_managed_worktree =
             local_startup && matches!(&plan, CheckoutPlan::NewWorktree { .. });
             let command_admission_started = Rc::new(Cell::new(false));
@@ -5220,173 +5217,45 @@ impl Composer {
                     .ok();
                 }
                 if let Some(scope) = scaffold_scope {
-                    let wait_started = Instant::now();
-                    let mut sandbox_id = None;
-                    let mut pending_attachment = None;
-                    let mut last_error = None;
-                    let scaffold_retry_executor = cx.background_executor().clone();
-                    let scaffold_retry_delay =
-                        move |delay| scaffold_retry_executor.timer(delay);
-                    let launch = crate::state::create_and_attach_scaffold_session(
-                        &engine,
-                        &scope,
-                        scaffold_title.as_deref(),
-                        requested_scaffold_source_ref.as_deref(),
-                        scaffold_database_environment,
-                        &scaffold_agent_binding
-                            .as_ref()
-                            .expect("Scaffold route is resolved before launch")
-                            .route,
-                        &scaffold_retry_delay,
-                    );
-                    let deadline = cx.background_executor().timer(SCAFFOLD_DEMO_WAIT);
-                    futures::pin_mut!(launch);
-                    match futures::future::select(launch, deadline).await {
-                        futures::future::Either::Left((
-                            Ok((created_id, attachment)),
-                            _,
-                        )) => {
-                            tracing::info!(
-                                sandbox_id = %created_id,
-                                "Scaffold sandbox launched; waiting for remote Comet"
-                            );
-                            sandbox_id = Some(created_id);
-                            pending_attachment = Some(attachment);
-                        }
-                        futures::future::Either::Left((Err(error), _)) => {
-                            last_error = Some(error.to_string());
-                        }
-                        futures::future::Either::Right(_) => {
-                            last_error =
-                                Some("Scaffold sandbox creation exceeded the deadline".into());
-                        }
-                    }
-
-                    if let (Some(created_id), Some(attachment)) =
-                        (sandbox_id.as_deref(), pending_attachment.as_ref())
-                    {
-                        let authoritative_scope = comet_proto::CollaborationScope {
-                            project_id: attachment.projection.project_id.clone(),
-                            deployment_id: Some(attachment.projection.deployment_id.clone()),
-                            session_id: Some(attachment.projection.session_id.clone()),
-                            unknown: Default::default(),
-                        };
-                        loop {
-                            let remaining =
-                                SCAFFOLD_DEMO_WAIT.saturating_sub(wait_started.elapsed());
-                            if remaining.is_zero() {
-                                break;
-                            }
-                            let inspect = crate::state::inspect_scaffold_session(
-                                &engine, created_id, &authoritative_scope,
-                            );
-                            let deadline = cx.background_executor().timer(remaining);
-                            futures::pin_mut!(inspect);
-                            let ready =
-                                match futures::future::select(inspect, deadline).await {
-                                    futures::future::Either::Left((Ok(lifecycle), _)) => {
-                                        if matches!(
-                                            lifecycle,
-                                            ScaffoldLifecycle::Ready
-                                                | ScaffoldLifecycle::AgentRunning
-                                        ) {
-                                            true
-                                        } else {
-                                            last_error = Some(format!(
-                                                "sandbox lifecycle remained {lifecycle:?}"
-                                            ));
-                                            false
-                                        }
-                                    }
-                                    futures::future::Either::Left((Err(error), _)) => {
-                                        last_error = Some(error.to_string());
-                                        false
-                                    }
-                                    futures::future::Either::Right(_) => {
-                                        last_error = Some(
-                                            "Scaffold sandbox did not become ready before the deadline"
-                                                .into(),
-                                        );
-                                        break;
-                                    }
-                                };
-                            if ready {
-                                if let Some(handoff) = scaffold_omp_handoff.as_ref() {
-                                    match crate::state::handoff_omp_session(
-                                        &engine,
-                                        created_id,
-                                        &authoritative_scope,
-                                        &handoff.native_session_id,
-                                        &handoff.cwd,
-                                    )
-                                    .await
-                                    {
-                                        Ok((native_session_id, remote_cwd)) => {
-                                            scaffold_resume_session_id = Some(native_session_id);
-                                            scaffold_resume_cwd = Some(remote_cwd);
-                                        }
-                                        Err(error) => {
-                                            last_error = Some(format!(
-                                                "could not hand off the OMP session: {error}"
-                                            ));
-                                            break;
-                                        }
-                                    }
-                                }
-                                let Some(actor_device_id) = local_device_id.clone() else {
-                                    last_error = Some("Local device unavailable".into());
-                                    break;
-                                };
-                                host_device_id = Some(attachment.owner_device_id.clone());
-                                attached_scaffold_source_ref = attachment
-                                    .source_ref
-                                    .clone()
-                                    .or(attached_scaffold_source_ref);
-                                control_route = Some(ControlRoute {
-                                    session_id: attachment.projection.session_id.clone(),
-                                    owner_device_id: attachment.owner_device_id.clone(),
-                                    actor_device_id,
-                                    actor_subject: attachment.actor_subject.clone(),
-                                    grant_id: attachment.grant_id.clone(),
-                                    source: AgentSessionSource::Scaffold,
-                                    scaffold: Some(ScaffoldControlTarget {
-                                        sandbox_id: created_id.to_string(),
-                                        scope: authoritative_scope.clone(),
-                                    }),
-                                });
-                                this.update(cx, |composer, cx| {
-                                    composer.state.update(cx, |state, cx| {
-                                        state.install_scaffold_session(attachment, cx);
-                                    });
-                                })
-                                .ok();
-                                scaffold_attached = true;
-                                tracing::info!(
-                                    sandbox_id = %created_id,
-                                    "Scaffold sandbox ready; routing prompt remotely"
-                                );
-                                break;
-                            }
-                            let remaining =
-                                SCAFFOLD_DEMO_WAIT.saturating_sub(wait_started.elapsed());
-                            if remaining.is_zero() {
-                                break;
-                            }
-                            cx.background_executor()
-                                .timer(remaining.min(Duration::from_millis(500)))
-                                .await;
-                        }
-                    }
-
-                    if !scaffold_attached {
-                        let reason = last_error.unwrap_or_else(|| "sandbox not ready".into());
-                        tracing::warn!(
-                            sandbox_id = sandbox_id.as_deref().unwrap_or("unavailable"),
-                            error = %reason,
-                            "Scaffold readiness deadline reached"
-                        );
-                        return Err("Could not start Scaffold session".into());
-                    }
+                    let (attachment, native_session_id, remote_cwd) =
+                        crate::state::prepare_scaffold_session(
+                            &engine,
+                            &scope,
+                            scaffold_title.as_deref(),
+                            requested_scaffold_source_ref.as_deref(),
+                            scaffold_database_environment,
+                            &scaffold_agent_binding
+                                .as_ref()
+                                .expect("Scaffold route is resolved before launch")
+                                .route,
+                            scaffold_omp_handoff.as_ref(),
+                        )
+                        .await
+                        .map_err(|error| format!("Could not start Scaffold session: {error}"))?;
+                    scaffold_resume_session_id = native_session_id;
+                    scaffold_resume_cwd = remote_cwd;
+                    let actor_device_id = local_device_id.clone()
+                        .ok_or_else(|| "Local device unavailable".to_string())?;
+                    host_device_id = Some(attachment.owner_device_id.clone());
+                    attached_scaffold_source_ref = attachment
+                        .source_ref
+                        .clone()
+                        .or(attached_scaffold_source_ref);
+                    control_route = Some(ControlRoute {
+                        session_id: attachment.projection.session_id.clone(),
+                        owner_device_id: attachment.owner_device_id.clone(),
+                        actor_device_id,
+                        actor_subject: attachment.actor_subject.clone(),
+                        grant_id: attachment.grant_id.clone(),
+                        source: AgentSessionSource::Scaffold,
+                        scaffold: Some(attachment.control_target.clone()),
+                    });
+                    this.update(cx, |composer, cx| {
+                        composer.state.update(cx, |state, cx| {
+                            state.install_scaffold_session(&attachment, cx);
+                        });
+                    }).ok();
+                    scaffold_attached = true;
                     this.update(cx, |composer, cx| {
                         composer.state.update(cx, |state, cx| {
                             state.clear_scaffold_chat_starting(&err_chat_id, cx);
@@ -5652,6 +5521,7 @@ impl Composer {
                             &engine,
                             cx.background_executor(),
                             host_device_id.as_deref(),
+                            &chat_id,
                             att,
                         )
                         .await
@@ -5836,16 +5706,24 @@ impl Composer {
                 rollback.disarm();
             }
             this.update(cx, |composer, cx| {
-                composer.sending_chats.remove(&err_chat_id);
+                finish_send(&mut composer.sending_chats, &err_chat_id);
                 if let Err(message) = &result {
                     // Failure: red banner, echo removed, submitted prompt kept
                     // visible, and staged files returned to the chat's stash.
                     composer.failure = Some(message.clone().into());
                     composer.state.update(cx, |s, cx| {
                         s.remove_echo(&err_chat_id, &err_message_id);
+                        if scaffold_demo
+                            && s.scaffold_session_draft_for_chat(&err_chat_id).is_some()
+                        {
+                            s.scaffold_session_error = Some(message.clone());
+                        }
                         s.clear_scaffold_chat_starting(&err_chat_id, cx);
-                        if is_new && !(scaffold_demo && scaffold_attached) {
-                            s.cancel_pending_chat(&err_chat_id, cx);
+                        // Preparation may have persisted an accepted sandbox
+                        // before its ref notification reaches this UI. Keep the
+                        // same draft so retry asks the engine to recover it.
+                        if is_new && !scaffold_demo {
+                            s.cancel_unaccepted_chat(&err_chat_id, cx);
                         }
                         cx.notify();
                     });
@@ -5876,12 +5754,8 @@ impl Composer {
                 cx.notify();
             })
             .ok();
-        });
-        if durable_startup {
-            send_task.detach();
-        } else {
-            self.send_task = Some(send_task);
-        }
+        })
+        .detach();
     }
 
     /// Stop the selected session when it is actively running.
@@ -5924,7 +5798,7 @@ impl Composer {
                 return;
             }
         };
-        self.send_task = Some(cx.spawn(async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
             if let Err(err) = result {
                 this.update(cx, |composer, cx| {
@@ -5933,7 +5807,8 @@ impl Composer {
                 })
                 .ok();
             }
-        }));
+        })
+        .detach();
     }
 
     // ---- wizard glue ----
@@ -6042,7 +5917,7 @@ impl Composer {
                 return;
             }
         };
-        self.send_task = Some(cx.spawn(async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
             if let Err(err) = result {
                 this.update(cx, |composer, cx| {
@@ -6070,7 +5945,8 @@ impl Composer {
                 }
             })
             .ok();
-        }));
+        })
+        .detach();
         cx.notify();
     }
 
@@ -6860,12 +6736,207 @@ impl Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    struct RejectedScaffoldCreateRpc;
+
+    #[async_trait::async_trait]
+    impl comet_rpc::RpcService for RejectedScaffoldCreateRpc {
+        async fn handle(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<comet_rpc::RpcReply, RpcError> {
+            match method {
+                methods::LIST_HARNESSES | methods::LIST_HARNESS_COMMANDS => {
+                    comet_rpc::RpcReply::value(&Vec::<serde_json::Value>::new())
+                }
+                methods::PREPARE_SCAFFOLD_SESSION => Err(RpcError::Failed(format!(
+                    "preparation interrupted for {}",
+                    params["scope"]["sessionId"]
+                ))),
+                _ => Err(RpcError::UnknownMethod(method.to_owned())),
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn failed_scaffold_preparation_retains_draft_until_explicit_cancel(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _runtime_guard = runtime.enter();
+        let state = cx.new(|_| AppState::new());
+        let chat_id = state.update(cx, |state, cx| {
+            state.local_device_id = Some("local".into());
+            state.set_scaffold_scope_for_test("project", "deployment");
+            state.spaces = vec![comet_proto::Space {
+                id: "folder".into(),
+                device_id: "local".into(),
+                path: "/repo".into(),
+                name: None,
+                git_detected: false,
+                git_checked_at: None,
+                checkout_id: None,
+                created_at: chrono::Utc::now(),
+            }];
+            state.selected_space = Some("folder".into());
+            state.start_scaffold_session(comet_proto::ScaffoldDatabaseEnvironment::Local, cx);
+            let chat_id = state.selected_chat.clone().unwrap();
+            state
+                .chats
+                .iter_mut()
+                .find(|chat| chat.id == chat_id)
+                .unwrap()
+                .config = Some(comet_proto::ChatConfig {
+                harness: HarnessId::Omp,
+                model: Some("openai-codex/gpt-6-astra".into()),
+                reasoning: None,
+                agent_account_id: None,
+                model_options: Default::default(),
+                sandbox: SandboxLevel::WorkspaceWrite,
+            });
+            state.set_engine_for_test(EngineHandle::for_test(Arc::new(RejectedScaffoldCreateRpc)));
+            chat_id
+        });
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        composer.update(cx, |composer, cx| {
+            composer.submit_command("start a fresh session", cx)
+        });
+        cx.condition(&composer, |composer, _| !composer.is_sending(&chat_id))
+            .await;
+        state.update(cx, |state, cx| {
+            assert!(!state.can_start_scaffold_session());
+            state.apply_chats(Vec::new());
+            assert!(state.chats.iter().any(|chat| chat.id == chat_id));
+            assert_eq!(state.selected_chat.as_deref(), Some(chat_id.as_str()));
+            state.cancel_pending_chat(&chat_id, cx);
+            assert!(state.can_start_scaffold_session());
+            assert!(!state.chats.iter().any(|chat| chat.id == chat_id));
+            assert!(state.selected_chat.is_none());
+        });
+    }
 
     fn tooltip_target(range: Range<usize>, path: &str) -> MentionTooltipTarget {
         MentionTooltipTarget {
             range,
             path: path.into(),
         }
+    }
+
+    #[test]
+    fn overlapping_send_state_clears_after_every_send_finishes() {
+        let mut sending = HashMap::new();
+        begin_send(&mut sending, "chat-a");
+        begin_send(&mut sending, "chat-a");
+
+        finish_send(&mut sending, "chat-a");
+        assert_eq!(sending.get("chat-a"), Some(&1));
+
+        finish_send(&mut sending, "chat-a");
+        assert!(!sending.contains_key("chat-a"));
+    }
+
+    struct OverlappingSendRpc {
+        started: std::sync::mpsc::Sender<String>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl comet_rpc::RpcService for OverlappingSendRpc {
+        async fn handle(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<comet_rpc::RpcReply, RpcError> {
+            match method {
+                methods::LIST_HARNESSES | methods::LIST_HARNESS_COMMANDS => {
+                    comet_rpc::RpcReply::value(&Vec::<serde_json::Value>::new())
+                }
+                methods::QUEUE_COMMAND => {
+                    let prompt = params
+                        .pointer("/command/request/prompt")
+                        .and_then(serde_json::Value::as_str)
+                        .expect("Run command prompt")
+                        .to_owned();
+                    self.started
+                        .send(prompt)
+                        .map_err(|error| RpcError::Failed(error.to_string()))?;
+                    self.release
+                        .acquire()
+                        .await
+                        .map_err(|error| RpcError::Failed(error.to_string()))?
+                        .forget();
+                    comet_rpc::RpcReply::value(&serde_json::json!({ "accepted": true }))
+                }
+                _ => Err(RpcError::UnknownMethod(method.to_owned())),
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn overlapping_composer_sends_both_reach_queue_command(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().expect("Tokio RPC server runtime");
+        let _runtime_guard = runtime.enter();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let engine = EngineHandle::for_test(Arc::new(OverlappingSendRpc {
+            started: started_tx,
+            release: release.clone(),
+        }));
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            state.apply_chats(vec![Chat {
+                id: "chat-a".into(),
+                device_id: "local".into(),
+                title: None,
+                archived: false,
+                cwd: Some("/repo".into()),
+                branch: None,
+                checkout_id: None,
+                config: None,
+                last_message_preview: None,
+                last_message_at: None,
+                created_at: chrono::Utc::now(),
+                harness_session_id: None,
+                harness_session_cwd: None,
+                fork_from: None,
+                space_id: None,
+                last_seen_at: None,
+            }]);
+            state.select_chat(Some("chat-a".into()), cx);
+            state.set_engine_for_test(engine);
+        });
+        let composer = cx.new(|cx| Composer::new(state, cx));
+
+        composer.update(cx, |composer, cx| composer.submit_command("first", cx));
+        composer.update(cx, |composer, cx| composer.submit_command("second", cx));
+        cx.run_until_parked();
+
+        let mut prompts = vec![
+            started_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("first QueueCommand"),
+            started_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("second QueueCommand"),
+        ];
+        prompts.sort();
+        assert_eq!(prompts, ["first", "second"]);
+        assert!(composer.read_with(cx, |composer, _| composer.is_sending("chat-a")));
+        assert_eq!(
+            composer.read_with(cx, |composer, _| composer
+                .sending_chats
+                .get("chat-a")
+                .copied()),
+            Some(2)
+        );
+
+        release.add_permits(2);
+        cx.condition(&composer, |composer, _| !composer.is_sending("chat-a"))
+            .await;
     }
 
     #[test]

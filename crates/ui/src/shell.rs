@@ -170,16 +170,18 @@ pub enum SettingsSection {
     Agents,
     Advisor,
     Appearance,
+    Notifications,
     Shortcuts,
     Archived,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 6] = [
+    pub const ALL: [SettingsSection; 7] = [
         SettingsSection::Devices,
         SettingsSection::Agents,
         SettingsSection::Advisor,
         SettingsSection::Appearance,
+        SettingsSection::Notifications,
         SettingsSection::Shortcuts,
         SettingsSection::Archived,
     ];
@@ -192,6 +194,7 @@ impl SettingsSection {
             SettingsSection::Agents => "Accounts",
             SettingsSection::Advisor => "Advisor",
             SettingsSection::Appearance => "Appearance",
+            SettingsSection::Notifications => "Crew notifications",
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Archived => "Settled sessions",
         }
@@ -360,12 +363,12 @@ pub fn resort_offsets(
     offsets
 }
 
-/// Rich rows keep four compact information bands. Density changes surrounding
-/// chrome only, never the type scale or the information shown.
+/// Three single-line information bands plus density-specific gaps and padding.
+/// This exact height also sizes offscreen sidebar cards without building them.
 fn chat_row_height(density: Density) -> f32 {
     match density {
         Density::Compact => 57.0,
-        Density::Comfortable => 66.0,
+        Density::Comfortable => 67.0,
     }
 }
 
@@ -555,6 +558,7 @@ fn local_session_age(updated_at: i64, now: chrono::DateTime<Utc>) -> String {
 #[derive(Debug, Clone)]
 struct SidebarSessionMeta {
     source: comet_proto::AgentSessionSource,
+    history_source: Option<&'static str>,
     runtime_model: SharedString,
     scaffold_web: Option<SharedString>,
     scaffold_session: Option<SharedString>,
@@ -1535,9 +1539,6 @@ pub struct Shell {
     space_boot_applied: bool,
     /// `settings.last_room_id` applied once after the first chat frame.
     room_boot_applied: bool,
-    /// Last seen session status per chat — the chime trigger compares against
-    /// it (a row's FIRST appearance never chimes, so boot stays silent).
-    sound_prev: std::collections::HashMap<String, comet_proto::SessionStatus>,
     user_menu_open: bool,
     /// Session-scoped multiplayer surfaces.
     command_palette_open: bool,
@@ -1664,12 +1665,6 @@ impl Shell {
         let now = Utc::now();
         let state_projection = ShellStateProjection::capture(state.read(cx), now);
         let transcript_chrome = TranscriptChromeCache::new(state.read(cx), now);
-        let sound_prev = state
-            .read(cx)
-            .sessions
-            .iter()
-            .map(|session| (session.chat_id.clone(), session.status))
-            .collect();
         let observation = cx.observe(&state, |this: &mut Shell, state, cx| {
             this.on_app_state_notification(&state, cx);
         });
@@ -1718,6 +1713,7 @@ impl Shell {
             }
             Some("settings/agents") => Route::Settings(SettingsSection::Agents),
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
+            Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
             Some("settings/advisor") => Route::Settings(SettingsSection::Advisor),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
@@ -1776,7 +1772,6 @@ impl Shell {
             sidebar_scroll: gpui::ScrollHandle::new(),
             space_boot_applied: false,
             room_boot_applied: false,
-            sound_prev,
             user_menu_open: false,
             command_palette_open: false,
             activity_open: false,
@@ -1902,7 +1897,7 @@ impl Shell {
         };
         if state_changed {
             self.state_projection = ShellStateProjection::capture(state.read(cx), now);
-            // Chimes, optimistic audit reconciliation, navigation/panel switching,
+            // Optimistic audit reconciliation, navigation/panel switching,
             // and splash transitions only depend on non-transcript state.
             self.on_state_changed(state, cx);
         }
@@ -1943,37 +1938,6 @@ impl Shell {
                     self.delete_confirm = Some(first);
                 }
                 _ => {}
-            }
-        }
-        // Session chimes follow factual session-row updates, never the
-        // time-derived display indicator. `effective_indicator` intentionally
-        // turns a 45s-old Working row into `None`; treating that visual expiry
-        // as Idle produced a phantom Working→Idle completion chime even when no
-        // session had updated. Fresh raw transitions still ring for ANY session
-        // on any device. A row's first appearance only seeds the baseline, and
-        // delayed/backfilled transitions older than the freshness window stay
-        // silent.
-        {
-            let now = Utc::now();
-            let app_state = state.read(cx);
-            for session in &app_state.sessions {
-                let prev = match self.sound_prev.get_mut(session.chat_id.as_str()) {
-                    Some(prev) => {
-                        let old = *prev;
-                        *prev = session.status;
-                        old
-                    }
-                    None => {
-                        self.sound_prev
-                            .insert(session.chat_id.clone(), session.status);
-                        continue;
-                    }
-                };
-                if self.settings.sound_enabled
-                    && let Some(sound) = crate::sound::sound_for_session_update(prev, session, now)
-                {
-                    crate::sound::play(sound);
-                }
             }
         }
         // Reconcile optimistic controls with immutable audit publications.
@@ -3176,6 +3140,80 @@ impl Shell {
         cx.notify();
     }
 
+    pub(crate) fn is_viewing_session(&self, chat_id: &str, cx: &App) -> bool {
+        matches!(self.route, Route::Chat)
+            && self.state.read(cx).selected_chat.as_deref() == Some(chat_id)
+    }
+
+    pub(crate) fn open_notified_session(
+        &mut self,
+        chat_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_nav(NavEntry::Chat(chat_id), cx);
+        self.nav.push(NavEntry::Chat(
+            self.state
+                .read(cx)
+                .selected_chat
+                .clone()
+                .unwrap_or_default(),
+        ));
+        window.activate_window();
+        window.focus(&self.composer.focus_handle(cx), cx);
+    }
+
+    fn render_notification_settings(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        use crate::settings::widgets;
+        let theme = Theme::of(cx).clone();
+        let enabled = self.settings.notifications_enabled;
+        let sound = self.settings.sound_enabled;
+        let unavailable = crate::notifications::unavailable_reason();
+        let platform_copy = if cfg!(target_os = "macos") {
+            "Crew asks macOS for permission on the first alert. Send a Crew test alert to request permission, then send another after allowing Crew. System Settings → Notifications and Focus control delivery; Crew cannot read delivery or permission status."
+        } else {
+            "Crew requires a running desktop notification service. Your desktop controls delivery, sound, and click actions. Crew cannot read delivery status; Linux alerts age out in the notification center."
+        };
+        widgets::page_column()
+            .child(widgets::page_header(&theme, "Crew notifications", None))
+            .child(widgets::page_subtitle(&theme, "Get Crew alerts when a session needs input, encounters an error, or finishes working. Session names may appear on your lock screen; transcript content is not included. Alerts are hidden for the Crew session you are viewing."))
+            .child(widgets::section_card(&theme)
+                .child(widgets::card_row(&theme, true)
+                    .child(widgets::row_title(&theme, "Crew desktop alerts"))
+                    .child(widgets::ghost_action(&theme)
+                        .id("crew-notifications-toggle")
+                        .child(if enabled { "Turn off Crew alerts" } else { "Turn on Crew alerts" })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !enabled && crate::notifications::unavailable_reason().is_some() {
+                                return;
+                            }
+                            this.settings.notifications_enabled = !enabled;
+                            crate::notifications::set_preferences(&this.settings, cx);
+                            this.schedule_save(cx);
+                            cx.notify();
+                        }))))
+                .child(widgets::card_row(&theme, false)
+                    .child(widgets::row_title(&theme, "Crew attention chimes"))
+                    .child(widgets::ghost_action(&theme)
+                        .id("crew-sound-toggle")
+                        .child(if sound { "Mute Crew chimes" } else { "Enable Crew chimes" })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.settings.sound_enabled = !sound;
+                            crate::notifications::set_preferences(&this.settings, cx);
+                            this.schedule_save(cx);
+                            cx.notify();
+                        })))))
+            .when(enabled && unavailable.is_none(), |page| {
+                page.child(widgets::ghost_action(&theme)
+                    .id("crew-test-notification")
+                    .child("Send Crew test alert")
+                    .on_click(cx.listener(|_, _, _, cx| crate::notifications::send_test(cx))))
+            })
+            .child(widgets::page_subtitle(&theme, platform_copy))
+            .when_some(unavailable, |page, reason| page.child(widgets::warning_strip(&theme, reason)))
+            .into_any_element()
+    }
+
     /// Lazily create the entity for a settings section and return it renderable.
     fn settings_outlet(&mut self, section: SettingsSection, cx: &mut Context<Self>) -> AnyElement {
         match section {
@@ -3218,6 +3256,7 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
+            SettingsSection::Notifications => self.render_notification_settings(cx),
             SettingsSection::Shortcuts => {
                 if self.shortcuts_page.is_none() {
                     let state = self.state.clone();
@@ -3398,9 +3437,13 @@ impl Shell {
 
     fn delete_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.delete_confirm = None;
-        if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
-            self.state.update(cx, |s, cx| s.select_chat(None, cx));
-        }
+        self.state.update(cx, |state, cx| {
+            if state.chat_is_pending(&chat_id) {
+                state.cancel_pending_chat(&chat_id, cx);
+            } else if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
+                state.select_chat(None, cx);
+            }
+        });
         self.composer
             .update(cx, |composer, _| composer.purge_chat(&chat_id));
         self.mutate(
@@ -3731,6 +3774,7 @@ impl Shell {
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
             SettingsSection::Advisor => icons::CHAT_ROUND_LINE,
             SettingsSection::Appearance => icons::TUNING,
+            SettingsSection::Notifications => icons::CHAT_ROUND_LINE,
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
         };
@@ -3848,17 +3892,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let subline = theme.text_muted.opacity(0.66);
-        let history_source = self
-            .state
-            .read(cx)
-            .chats
-            .iter()
-            .find(|chat| chat.id == id)
-            .and_then(|chat| {
-                imported_chat_history_source(&chat.id, chat.harness_session_id.as_deref())
-            });
-        let source_label =
-            history_source.unwrap_or_else(|| crate::multiplayer::source_label(meta.source));
+        let source_label = meta
+            .history_source
+            .unwrap_or_else(|| crate::multiplayer::source_label(meta.source));
         let compact = self.settings.density == Density::Compact;
         let (hover, text) = (theme.glass_hover(), theme.text);
         let selected_wash = crate::theme::glass_selected_bg();
@@ -4018,6 +4054,9 @@ impl Shell {
         });
         div()
             .id(SharedString::from(format!("chat-{id}")))
+            .w_full()
+            .h(px(chat_row_height(self.settings.density)))
+            .flex_none()
             .flex()
             .flex_col()
             .gap(px(if compact { 1.0 } else { 2.0 }))
@@ -4076,17 +4115,17 @@ impl Shell {
                             .child(space_name),
                     )
                     .child(
-                        // Fixed to the header line's 13px so dot/spinner/label
-                        // all center on the same baseline band. The button
-                        // rides an absolute overlay pinned to the band's right
-                        // edge: the read-out keeps owning the slot's width, so
-                        // the swap costs no reflow at any indicator width.
+                        // Keep status and settle affordances in one trailing
+                        // slot. Reserve the button's 18px width so its hover
+                        // overlay cannot overlap the folder label or reflow it.
                         div()
                             .flex_none()
+                            .min_w(px(18.0))
                             .h(px(13.0))
                             .relative()
                             .flex()
                             .items_center()
+                            .justify_center()
                             .child(div().opacity(1.0 - reveal).child(status_slot))
                             .when_some(settle_button, |el, button| {
                                 el.child(
@@ -4112,6 +4151,8 @@ impl Shell {
             .child(
                 div()
                     .w_full()
+                    .h(px(17.0))
+                    .line_height(px(17.0))
                     .min_w_0()
                     .flex()
                     .items_center()
@@ -8595,6 +8636,87 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::rc::Rc;
+
+    #[gpui::test]
+    fn deleting_first_send_chats_does_not_resurrect_optimistic_rows(cx: &mut gpui::TestAppContext) {
+        let data_dir = tempfile::tempdir().unwrap();
+        let state = cx.new(|_| AppState::new());
+        let shell = cx.new(|cx| {
+            Shell::new(
+                state.clone(),
+                EngineBootConfig {
+                    data_dir: data_dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:0".into(),
+                    edge_token: None,
+                    project_scope: "test".into(),
+                    deployment_id: None,
+                    scaffold_url: None,
+                    default_harness: comet_proto::HarnessId::Mock,
+                    runtime_profile: comet_proto::RuntimeProfile::LocalController,
+                },
+                cx,
+            )
+        });
+        let row = |id: &str| comet_proto::Chat {
+            id: id.into(),
+            device_id: "local".into(),
+            title: None,
+            archived: false,
+            cwd: None,
+            branch: None,
+            checkout_id: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            fork_from: None,
+            space_id: None,
+            last_seen_at: None,
+        };
+        let persisted = row("persisted");
+        state.update(cx, |state, cx| {
+            state.apply_chats(vec![persisted.clone()]);
+            for id in ["selected-pending", "background-pending"] {
+                state.stage_pending_chat(row(id));
+                state.set_chat_startup_phase(id, ChatStartupPhase::PreparingCheckout);
+            }
+            state.select_chat(Some("selected-pending".into()), cx);
+        });
+
+        shell.update(cx, |shell, cx| {
+            shell.delete_chat("selected-pending".into(), cx)
+        });
+        state.update(cx, |state, _| {
+            state.apply_chats(vec![persisted.clone()]);
+            assert!(!state.chats.iter().any(|chat| chat.id == "selected-pending"));
+            assert_eq!(state.chat_startup_phase("selected-pending"), None);
+            assert!(state.selected_chat.is_none());
+            assert!(
+                state
+                    .chats
+                    .iter()
+                    .any(|chat| chat.id == "background-pending")
+            );
+        });
+
+        shell.update(cx, |shell, cx| {
+            shell.delete_chat("background-pending".into(), cx)
+        });
+        state.update(cx, |state, _| {
+            state.apply_chats(vec![persisted.clone()]);
+            assert_eq!(state.chats, vec![persisted]);
+            assert_eq!(state.chat_startup_phase("background-pending"), None);
+        });
+
+        // A disconnected engine cannot confirm deletion of a persisted row.
+        shell.update(cx, |shell, cx| shell.delete_chat("persisted".into(), cx));
+        state.read_with(cx, |state, _| {
+            assert!(state.chats.iter().any(|chat| chat.id == "persisted"));
+        });
+    }
 
     #[test]
     fn ready_before_shell_observation_cannot_leave_boot_splash_visible() {

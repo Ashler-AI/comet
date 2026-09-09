@@ -14,8 +14,9 @@ enum Motion {
     static let resort = Animation.timingCurve(0.22, 1, 0.36, 1, duration: 0.26)
     static let hoverFade = Animation.timingCurve(0.4, 0, 0.2, 1, duration: 0.15)
 
-    // WorkingIndicator wave period (GRADIENT_SPIN) and loader pulse.
+    // WorkingIndicator wave, session-row arc, and loader pulse periods.
     static let gradientSpinPeriod: Double = 0.75
+    static let arcSpinPeriod: Double = 0.9
     static let cometPulsePeriod: Double = 2.4
 
     /// WorkingIndicator flavour words (transcript.rs:795), rotated every 7s,

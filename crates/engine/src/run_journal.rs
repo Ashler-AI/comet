@@ -193,6 +193,24 @@ impl RunJournal {
         Ok(stale)
     }
 
+    /// Chat ids with a journal in this identity-scoped store. A shared room can
+    /// replicate chat documents, but it cannot create these local files.
+    pub fn session_ids(&self) -> Result<Vec<String>, JournalError> {
+        let mut ids = Vec::new();
+        for entry in std::fs::read_dir(&self.dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if let Some(chat_id) = path.file_stem().and_then(|stem| stem.to_str()) {
+                ids.push(chat_id.to_string());
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
     /// Remove a chat's journal file entirely (tests / future compaction).
     pub fn discard(&self, chat_id: &str) -> Result<(), JournalError> {
         self.lock().remove(chat_id);
@@ -314,6 +332,18 @@ mod tests {
         // Closing the stale journal with a Done clears the flag.
         journal.append("dead", &done()).unwrap();
         assert!(journal.stale_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn session_ids_list_identity_local_journals() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal.append("chat-b", &text("b")).unwrap();
+        journal.append("chat-a", &text("a")).unwrap();
+        journal.append("chat-a", &done()).unwrap();
+        std::fs::write(dir.path().join("ignored.resume"), "1").unwrap();
+
+        assert_eq!(journal.session_ids().unwrap(), vec!["chat-a", "chat-b"]);
     }
 
     #[test]

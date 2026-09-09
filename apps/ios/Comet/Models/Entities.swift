@@ -14,14 +14,120 @@ struct DeviceRow: Identifiable, Hashable {
     var lastSeenAt: Int64?
     var createdAt: Int64?
 }
-/// Imported global-session membership. This is deliberately not a Chat: it
-/// carries no owner, host device, space, or cached public metadata.
+struct CollaborationScope: Codable, Hashable {
+    var projectId: String
+    var deploymentId: String?
+    var sessionId: String?
+}
+
+struct SessionEnvironmentLinks: Codable, Hashable {
+    var session: String?
+    var web: String?
+    var opencode: String?
+    var tilt: String?
+    var terminal: String?
+
+    var health: String?
+}
+enum SessionLaunchTarget: String, CaseIterable, Identifiable {
+    case local
+    case scaffold
+
+    var id: String { rawValue }
+    var label: String { self == .local ? "This device" : "Scaffold" }
+}
+
+struct SessionEnvironmentSource: Codable, Hashable {
+    var kind: String
+    var sandboxId: String?
+    var region: String?
+    var lifecycle: String?
+    var lifecycleEpoch: UInt64?
+    var links: SessionEnvironmentLinks?
+    enum CodingKeys: String, CodingKey {
+        case kind
+        case sandboxId = "sandbox_id"
+        case region
+        case lifecycle
+        case lifecycleEpoch = "lifecycle_epoch"
+        case links
+    }
+}
+
+enum ScaffoldDatabaseEnvironment: String, Codable, CaseIterable, Identifiable {
+    case local
+    case stagingSnapshot = "staging_snapshot"
+    case productionSnapshot = "production_snapshot"
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .local: return "Local database"
+        case .stagingSnapshot: return "Staging snapshot"
+        case .productionSnapshot: return "Production snapshot"
+        }
+    }
+}
+
+struct SessionEnvironment: Codable, Hashable {
+    var source: SessionEnvironmentSource
+    var name: String?
+    var ownerPrincipal: String
+    var scope: CollaborationScope
+    var sourceRef: String?
+    var lastActivityAt: Int64?
+    var databaseEnvironment: ScaffoldDatabaseEnvironment?
+}
+
+struct SessionRoomProjection: Codable, Hashable {
+    var projectId: String
+    var deploymentId: String
+    var sessionId: String
+}
+
+struct ScaffoldControlGrant: Codable, Hashable {
+    var id: String
+    var expiresAt: Int64
+    var capabilities: [String]
+}
+
+struct ScaffoldEnvironmentControlResult: Codable, Hashable {
+    var environment: SessionEnvironment
+    var attachedDeviceId: String?
+    var runId: String?
+    var roomProjection: SessionRoomProjection?
+    var controlGrant: ScaffoldControlGrant?
+}
+
+struct ScaffoldControlRoute: Hashable {
+    var controllerDeviceId: String
+    var ownerDeviceId: String
+    var actorSubject: String
+    var grantId: String
+    var projection: SessionRoomProjection
+    var environment: SessionEnvironment
+}
+
+struct ScaffoldLaunchConfig: Hashable {
+    var provider: String
+    var providerModel: String
+    var persistedModel: String
+    var reasoning: String?
+    var databaseEnvironment: ScaffoldDatabaseEnvironment
+    var sourceRef: String
+}
+
+/// Imported global-session membership. Scaffold refs retain their verified
+/// deployment route; capability grant ids remain short-lived and are never
+/// persisted in the workspace document.
 struct SessionRef: Identifiable, Hashable {
     var chatId: String
     var addedAt: Int64
+    var environment: SessionEnvironment?
 
     var id: String { chatId }
     var fallbackTitle: String { "Session \(chatId.prefix(8))" }
+    var deploymentId: String? { environment?.scope.deploymentId }
 }
 
 
@@ -61,11 +167,13 @@ struct Chat: Identifiable, Hashable {
     var lastMessagePreview: String?
     var lastMessageAt: Int64?
     var createdAt: Int64
+    var harnessSessionId: String?
+    var harnessSessionCwd: String?
     var spaceId: String?
     var lastSeenAt: Int64?
 
     var displayTitle: String {
-        if let title, !title.isEmpty { return title }
+        if let title = normalizedSessionTitle(title) { return title }
         return "New session"
     }
 
@@ -75,6 +183,14 @@ struct Chat: Identifiable, Hashable {
         guard let lastSeenAt else { return true }
         return lastMessageAt > lastSeenAt
     }
+}
+
+/// Titles use the same single-line whitespace treatment for local rows,
+/// Scaffold environment names, and imported-session previews.
+func normalizedSessionTitle(_ title: String?) -> String? {
+    guard let title else { return nil }
+    let oneLine = title.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    return oneLine.isEmpty ? nil : oneLine
 }
 
 enum SessionStatus: String {
@@ -109,12 +225,55 @@ func effectiveStatus(_ row: SessionRow?, now: Int64) -> SessionStatus? {
     guard let row else { return nil }
     switch row.status {
     case .working, .awaitingInput:
-        let age = now - row.updatedAt
-        // Negative ages (clock skew) are fresh.
-        return age > sessionStaleMs ? nil : row.status
+        // Negative ages (clock skew) are fresh. A malformed legacy extreme
+        // timestamp must expire rather than overflow during subtraction.
+        guard row.updatedAt < now else { return row.status }
+        let age = now.subtractingReportingOverflow(row.updatedAt)
+        return age.overflow || age.partialValue > sessionStaleMs ? nil : row.status
     case .errored, .idle:
         return row.status
     }
+}
+
+struct SessionActivity {
+    var row: SessionRow?
+    var status: SessionStatus?
+}
+
+/// Workspace rows describe local runs; collaboration publications describe
+/// remote owners. A current-turn transcript bridges delayed status delivery.
+func sessionActivity(
+    workspace: SessionRow?, published: SessionRow?, transcript: SessionRow?, now: Int64
+) -> SessionActivity {
+    let usesPublication = published.map { $0.updatedAt >= (workspace?.updatedAt ?? Int64.min) } ?? false
+    let row = usesPublication ? published : workspace
+    let base = SessionActivity(row: row, status: effectiveStatus(row, now: now))
+    guard var transcript, let entryAt = transcript.startedAt else { return base }
+    if let row {
+        guard transcript.deviceId == row.deviceId else { return base }
+        switch row.status {
+        case .working:
+            if !usesPublication, base.status == .working { return base }
+            guard entryAt >= (row.startedAt ?? row.updatedAt) else { return base }
+        case .awaitingInput:
+            if base.status == .awaitingInput { return base }
+            guard entryAt >= (row.startedAt ?? row.updatedAt) else { return base }
+        case .idle, .errored:
+            guard entryAt > row.updatedAt else { return base }
+        }
+    }
+    var status = effectiveStatus(transcript, now: now)
+    if transcript.status == .working, status != .working {
+        // Match desktop agent_indicator_with_transcript for remote owners:
+        // the current streaming turn outlives a one-shot working publication.
+        // Local fallback still expires when neither room delivers activity.
+        guard usesPublication, row?.status == .working else { return base }
+        status = .working
+    }
+    if let row, row.status == .working || row.status == .awaitingInput {
+        transcript.startedAt = row.startedAt ?? row.updatedAt
+    }
+    return SessionActivity(row: transcript, status: status)
 }
 
 /// entities.rs:147 — live Working/AwaitingInput win; Errored only if unseen;
@@ -141,6 +300,19 @@ func sortActive(_ chats: [Chat]) -> [Chat] {
         if ta != tb { return ta > tb }
         return a.id < b.id
     }
+}
+
+/// Workspace rows remain reachable even without a current space. Archiving
+/// changes their section, never their membership or persisted state.
+func sessionListChats(_ chats: [Chat], archived: Bool) -> [Chat] {
+    sortActive(chats.filter { $0.archived == archived })
+}
+
+/// Every row is shown in either Sessions or Archived sessions, so row-backed
+/// memberships must not also render as context-free shared-session rows.
+func foreignSessionRefs(_ refs: [SessionRef], chats: [Chat]) -> [SessionRef] {
+    let rowIds = Set(chats.map(\.id))
+    return refs.filter { !rowIds.contains($0.chatId) }
 }
 
 // MARK: - Session doc entries
@@ -243,9 +415,7 @@ struct RepoRef: Codable, Hashable, Identifiable {
     var id: String { name }
 }
 
-// MARK: - Command ledger (commands.rs port)
-
-let commandDefaultTtlMs: Int64 = 86_400_000
+// MARK: - Command requests (commands.rs port)
 
 /// comet-proto RunRequest (agent.rs:81). `reasoning` is lowercase
 /// ("high"/"xhigh"/…), `sandbox` kebab-case ("workspace-write"), harness ids
@@ -259,6 +429,7 @@ struct RunRequest: Codable {
     var sandbox: String = "workspace-write"
     var autoApprove: Bool = true
     var resume: String?
+    var attachments: [String] = []
 }
 
 enum SessionCommandPayload {
@@ -273,6 +444,14 @@ enum SessionCommandPayload {
         case .steer: return "steer"
         case .interrupt: return "interrupt"
         case .respondInput: return "respondInput"
+        }
+    }
+
+    var messageId: String? {
+        switch self {
+        case .run(_, let messageId): return messageId
+        case .steer(_, let messageId): return messageId
+        case .interrupt, .respondInput: return nil
         }
     }
 }

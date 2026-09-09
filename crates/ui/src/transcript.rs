@@ -910,6 +910,7 @@ impl HighlightStore {
         block_ix: usize,
         lang: Lang,
         code: &str,
+        chat_id: Option<String>,
         cx: &mut Context<Transcript>,
     ) -> Option<Arc<Vec<Vec<Token>>>> {
         let key = (row_id.clone(), block_ix);
@@ -941,11 +942,22 @@ impl HighlightStore {
                 })
                 .await;
             this.update(cx, |transcript, cx| {
-                if let Some(entry) = transcript.highlights.entries.get_mut(&key)
+                let selected = transcript.chat_id == chat_id;
+                let highlights = if selected {
+                    Some(&mut transcript.highlights)
+                } else {
+                    chat_id
+                        .as_deref()
+                        .and_then(|id| transcript.render_windows.get_mut(id))
+                        .map(|cached| &mut cached.highlights)
+                };
+                if let Some(entry) = highlights.and_then(|store| store.entries.get_mut(&key))
                     && entry.code_len == code_len
                 {
                     entry.lines = Some(Arc::new(lines));
-                    cx.notify();
+                    if selected {
+                        cx.notify();
+                    }
                 }
             })
             .ok();
@@ -1015,6 +1027,8 @@ struct CachedTranscriptRender {
     echo_row_counts: Vec<usize>,
     row_cache: HashMap<String, CachedRows>,
     tree_cache: HashMap<String, (usize, Arc<BlockTree>)>,
+    render_cache: Rc<RefCell<RenderCache>>,
+    highlights: HighlightStore,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -1079,6 +1093,7 @@ pub struct Transcript {
     row_cache: HashMap<String, CachedRows>,
     live_parsers: HashMap<String, IncrementalParser>,
     tree_cache: HashMap<String, (usize, Arc<BlockTree>)>,
+    cache_prune_needed: bool,
     render_windows: HashMap<String, CachedTranscriptRender>,
     render_window_lru: Vec<String>,
     folds: HashMap<SharedString, FoldState>,
@@ -1136,6 +1151,8 @@ pub struct Transcript {
     rail_enabled: bool,
     /// Hovered rail tick (grows + shows the preview card).
     rail_hover: Option<usize>,
+    /// Revision-keyed message-rail projection, reused by scroll and fade frames.
+    pub(crate) rail_cache: crate::rail::RailCache,
     /// `(row id, entry id)` under the pointer — reveals the entry's timestamp
     /// strip (comet chat-view.tsx `group-hover`; the rows report hover
     /// themselves). Keyed by ROW so a row→row move within one entry can't
@@ -1183,6 +1200,7 @@ impl Transcript {
             row_cache: HashMap::new(),
             live_parsers: HashMap::new(),
             tree_cache: HashMap::new(),
+            cache_prune_needed: false,
             render_windows: HashMap::new(),
             render_window_lru: Vec::new(),
             folds: HashMap::new(),
@@ -1208,6 +1226,7 @@ impl Transcript {
             selection_drag_scroll_active: false,
             rail_enabled: true,
             rail_hover: None,
+            rail_cache: crate::rail::RailCache::default(),
             hovered_entry: None,
             copied_code: None,
             copied_clear: None,
@@ -1562,6 +1581,7 @@ impl Transcript {
             ) {
                 self.list.remeasure_items(changed);
             } else {
+                self.cache_prune_needed = true;
                 self.list.splice(changed, new_count);
             }
         }
@@ -1606,7 +1626,7 @@ impl Transcript {
         let missed_revision = !attached
             && (change.revision != revision || revision != self.state_revision.wrapping_add(1));
         self.state_revision = revision;
-        let echoes = state.pending_echoes().to_vec();
+        let echoes = state.pending_echoes();
         let entries = &state.transcript;
         if attached {
             if let Some(previous) = self.chat_id.take()
@@ -1621,6 +1641,8 @@ impl Transcript {
                         echo_row_counts: std::mem::take(&mut self.echo_row_counts),
                         row_cache: std::mem::take(&mut self.row_cache),
                         tree_cache: std::mem::take(&mut self.tree_cache),
+                        render_cache: std::mem::take(&mut self.render_cache),
+                        highlights: std::mem::take(&mut self.highlights),
                     },
                 );
                 self.render_window_lru.retain(|id| id != &previous);
@@ -1651,6 +1673,8 @@ impl Transcript {
                 self.echo_row_counts = cached.echo_row_counts;
                 self.row_cache = cached.row_cache;
                 self.tree_cache = cached.tree_cache;
+                self.render_cache = cached.render_cache;
+                self.highlights = cached.highlights;
             } else {
                 self.rows.clear();
                 self.entry_row_counts.clear();
@@ -1658,6 +1682,8 @@ impl Transcript {
                 self.echo_row_counts.clear();
                 self.row_cache.clear();
                 self.tree_cache.clear();
+                self.render_cache.borrow_mut().clear();
+                self.highlights.entries.clear();
             }
             self.live_parsers.clear();
             self.folds.clear();
@@ -1665,8 +1691,6 @@ impl Transcript {
             self.tool_details.clear();
             self.tool_detail_loads.clear();
             self.veils.clear();
-            self.render_cache.borrow_mut().clear();
-            self.highlights.entries.clear();
             self.list.reset(self.rows.len());
             self.pinned = true;
             self.spring.reset();
@@ -1697,10 +1721,11 @@ impl Transcript {
             || !echo_shape_valid;
         let was_empty = self.rows.is_empty();
         let changed = if full_rebuild {
+            self.cache_prune_needed = true;
             let real_rows_by_entry = self.build_entry_rows(entries, false);
             let new_entry_counts: Vec<usize> = real_rows_by_entry.iter().map(Vec::len).collect();
             let new_entry_row_count: usize = new_entry_counts.iter().sum();
-            let echo_rows_by_entry = self.build_entry_rows(&echoes, true);
+            let echo_rows_by_entry = self.build_entry_rows(echoes, true);
             let new_echo_counts: Vec<usize> = echo_rows_by_entry.iter().map(Vec::len).collect();
             let mut new_rows: Vec<Row> = real_rows_by_entry.into_iter().flatten().collect();
             new_rows.extend(echo_rows_by_entry.into_iter().flatten());
@@ -1748,7 +1773,7 @@ impl Transcript {
             }
             if change.echoes_changed {
                 let old_echoes = 0..self.echo_row_counts.len();
-                let replacement = self.build_entry_rows(&echoes, true);
+                let replacement = self.build_entry_rows(echoes, true);
                 changed |= self.reconcile_entry_range(old_echoes, replacement, false);
             }
             if self.veil_attach_pending && !entries.is_empty() {
@@ -1762,6 +1787,11 @@ impl Transcript {
             changed
         };
 
+        if self.cache_prune_needed {
+            self.prune_retired_caches(entries, echoes);
+            self.cache_prune_needed = false;
+        }
+
         if !changed {
             return;
         }
@@ -1774,6 +1804,39 @@ impl Transcript {
             self.spring_kick = true;
         }
         cx.notify();
+    }
+
+    /// Structural row changes can retire entries/parts when the live tail rolls
+    /// over or history is replaced. Keep only loaded history, including pages
+    /// the user explicitly opened; ordinary token updates skip this sweep.
+    fn prune_retired_caches(
+        &mut self,
+        entries: &[SessionMessageEntry],
+        echoes: &[SessionMessageEntry],
+    ) {
+        let mut entry_ids = std::collections::HashSet::new();
+        let mut part_keys = std::collections::HashSet::new();
+        let mut live_keys = std::collections::HashSet::new();
+        for entry in entries.iter().chain(echoes) {
+            entry_ids.insert(entry.id.as_str());
+            for part in &entry.parts {
+                if let MessagePart::Text { id, .. } | MessagePart::TextWindow { id, .. } = part {
+                    let key = format!("{}#{id}", entry.id);
+                    if entry.status == Some(MessageStatus::Streaming) {
+                        live_keys.insert(key.clone());
+                    }
+                    part_keys.insert(key);
+                }
+            }
+        }
+        self.row_cache
+            .retain(|id, _| entry_ids.contains(id.as_str()));
+        self.tree_cache.retain(|key, _| part_keys.contains(key));
+        self.live_parsers.retain(|key, _| live_keys.contains(key));
+        let row_ids: std::collections::HashSet<_> = self.rows.iter().map(|row| &row.id).collect();
+        self.highlights
+            .entries
+            .retain(|(id, _), _| row_ids.contains(id));
     }
 
     /// Cached row build for one entry (streaming entries bypass the cache).
@@ -2411,7 +2474,7 @@ impl Transcript {
                         .and_then(|chat| chat.cwd.clone())
                         .map(SharedString::from),
                 };
-                let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
+                let highlight = self.code_highlight_for(&row.id, *block_ix, &top.block, cx);
                 render::render_block(
                     &top.block,
                     *block_ix,
@@ -2419,10 +2482,7 @@ impl Transcript {
                     &opts,
                     &theme,
                     window,
-                    highlight
-                        .get(block_ix)
-                        .and_then(|o| o.as_deref())
-                        .map(|v| v.as_slice()),
+                    highlight.as_deref().map(|v| v.as_slice()),
                 )
             }
             RowKind::LiveMarkdown { tree, block_ix } => {
@@ -2461,7 +2521,7 @@ impl Transcript {
                         .and_then(|chat| chat.cwd.clone())
                         .map(SharedString::from),
                 };
-                let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
+                let highlight = self.code_highlight_for(&row.id, *block_ix, &top.block, cx);
                 let timer = frame_stats_enabled().then(Instant::now);
                 let el = render::render_block(
                     &top.block,
@@ -2470,10 +2530,7 @@ impl Transcript {
                     &opts,
                     &theme,
                     window,
-                    highlight
-                        .get(block_ix)
-                        .and_then(|o| o.as_deref())
-                        .map(|v| v.as_slice()),
+                    highlight.as_deref().map(|v| v.as_slice()),
                 );
                 if let Some(start) = timer {
                     record_live_frame_us(start.elapsed().as_micros() as u64);
@@ -2734,30 +2791,26 @@ impl Transcript {
         render::CopyUi { handler, copied_ix }
     }
 
-    /// Request highlights for the code blocks of a tree. `only` limits to one
-    /// block index (split rows); `None` covers the whole tree (live rows).
+    /// Request highlights for the visible block without scanning its whole reply.
     fn code_highlight_for(
         &mut self,
         row_id: &SharedString,
-        tree: &Arc<BlockTree>,
-        only: Option<usize>,
+        block_ix: usize,
+        block: &Block,
         cx: &mut Context<Self>,
-    ) -> HashMap<usize, Option<Arc<Vec<Vec<Token>>>>> {
-        let mut out = HashMap::new();
-        for (ix, top) in tree.blocks.iter().enumerate() {
-            if only.is_some_and(|o| o != ix) {
-                continue;
-            }
-            if let Block::CodeBlock { language, code } = &top.block
-                && let Some(lang) = language.as_deref().and_then(lang_for_tag)
-            {
-                out.insert(
-                    ix,
-                    self.highlights.request(row_id.clone(), ix, lang, code, cx),
-                );
-            }
-        }
-        out
+    ) -> Option<Arc<Vec<Vec<Token>>>> {
+        let Block::CodeBlock { language, code } = block else {
+            return None;
+        };
+        let lang = language.as_deref().and_then(lang_for_tag)?;
+        self.highlights.request(
+            row_id.clone(),
+            block_ix,
+            lang,
+            code,
+            self.chat_id.clone(),
+            cx,
+        )
     }
 
     fn render_tool_group(

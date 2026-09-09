@@ -207,12 +207,20 @@ export const joinContinuations = (
   if (!entries.some((e) => e.continuationOf)) return entries;
   const rootIndex = new Map<string, number>();
   const order: SessionMessageEntry[] = [];
+  // Only joined roots own mutable part arrays; leave input entries untouched.
+  const joinedParts = new Map<number, DocMessagePart[]>();
   for (const entry of entries) {
     if (entry.continuationOf) {
       const at = rootIndex.get(entry.continuationOf);
       if (at !== undefined) {
         const root = order[at]!;
-        order[at] = { ...root, parts: [...root.parts, ...entry.parts] };
+        let parts = joinedParts.get(at);
+        if (!parts) {
+          parts = [...root.parts];
+          joinedParts.set(at, parts);
+          order[at] = { ...root, parts };
+        }
+        for (const part of entry.parts) parts.push(part);
         continue;
       }
       // Orphan continuation (root trimmed or not yet synced): surface as-is

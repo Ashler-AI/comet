@@ -10,6 +10,11 @@ struct SessionView: View {
     @State private var showConfig = false
     @State private var refs: [RepoRef] = []
     @State private var catalogs: [String: [ModelInfo]] = [:]
+    @State private var modelsLoading = false
+    @State private var modelsError: String?
+    @State private var modelsRetry = 0
+    @State private var forking = false
+    @State private var forkError: String?
 
     /// Width the nav bar's own controls need either side of the title — the
     /// back button leading, breathing room trailing.
@@ -29,7 +34,7 @@ struct SessionView: View {
     }
 
     private var displayTitle: String {
-        if let chat { return chat.displayTitle }
+        if let chat { return model.sessionTitle(for: chat) }
         if let sessionRef { return model.sessionTitle(for: sessionRef) }
         return "Session"
     }
@@ -73,7 +78,7 @@ struct SessionView: View {
                                 // The badge and chevron are fixed; only the
                                 // title gives way, so a long name truncates
                                 // instead of pushing the chevron off-screen.
-                                Text(chat.displayTitle)
+                                Text(displayTitle)
                                     .font(Theme.sans(13, weight: .medium))
                                     .foregroundStyle(Theme.text)
                                     .lineLimit(1)
@@ -121,6 +126,37 @@ struct SessionView: View {
                     .frame(maxWidth: max(140, viewWidth - Self.headerChromeInset))
                 }
             }
+            if let chat, canFork(chat) {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        fork(chat)
+                    } label: {
+                        if forking {
+                            ProgressView().controlSize(.mini)
+                        } else {
+                            Image(systemName: "rectangle.stack.badge.plus")
+                        }
+                    }
+                    .disabled(forking)
+                    .accessibilityLabel("Fork session")
+                }
+            }
+        }
+        .alert("Couldn’t fork session", isPresented: Binding(
+            get: { forkError != nil },
+            set: { if !$0 { forkError = nil } }
+        )) {
+            Button("OK", role: .cancel) { forkError = nil }
+        } message: {
+            Text(forkError ?? "Unknown error")
+        }
+        .alert("Couldn’t send", isPresented: Binding(
+            get: { store?.sendFailure != nil },
+            set: { if !$0 { store?.clearSendFailure() } }
+        )) {
+            Button("OK", role: .cancel) { store?.clearSendFailure() }
+        } message: {
+            Text(store?.sendFailure ?? "Unknown error")
         }
         .sheet(isPresented: $showConfig) {
             if let chat {
@@ -130,7 +166,7 @@ struct SessionView: View {
                     modelId: Binding(
                         get: {
                             chat.config?.model
-                                ?? HarnessCatalog.defaultModel(for: harness).id
+                                ?? HarnessCatalog.defaultModel(for: harness)?.id ?? ""
                         },
                         set: { newModel in
                             writeConfig(model: newModel, reasoning: chat.config?.reasoning)
@@ -144,20 +180,25 @@ struct SessionView: View {
                     ),
                     lockedHarness: true,
                     catalogs: catalogs,
+                    modelsLoading: modelsLoading,
+                    modelsError: modelsError,
+                    onRetryModels: { modelsRetry += 1 },
                     checkout: checkoutContext(chat: chat)
                 )
             }
         }
         .task(id: chatId) {
             guard let space = chatSpace else { return }
-            let harness = chat?.config?.harness ?? "claude-code"
-            catalogs[harness] = await model.listModels(space: space, harness: harness)
             guard space.gitDetected else { return }
             if let loaded = await model.listRefs(space: space) {
                 refs = loaded
             }
         }
+        .task(id: "\(chatId)/\(chatSpace?.deviceId ?? "")/\(chat?.config?.harness ?? "")/\(modelsRetry)") {
+            await loadModels()
+        }
         .onAppear {
+            model.notifications.visibleChatId = chatId
             if chat != nil {
                 model.markSeen(chatId: chatId)
             }
@@ -167,10 +208,51 @@ struct SessionView: View {
             }
         }
         .onDisappear {
+            if model.notifications.visibleChatId == chatId {
+                model.notifications.visibleChatId = nil
+            }
             if chat != nil {
                 model.markSeen(chatId: chatId)
             }
             model.releaseSessionStore(chatId: chatId)
+        }
+    }
+
+    private func loadModels() async {
+        guard let space = chatSpace else { return }
+        let harness = chat?.config?.harness ?? "claude-code"
+        modelsLoading = true
+        modelsError = nil
+        do {
+            let loaded = try await model.listModelsDetailed(space: space, harness: harness)
+            guard !Task.isCancelled else { return }
+            catalogs[harness] = loaded
+            if loaded.isEmpty {
+                modelsError = "This harness did not return any models. Check its setup on the host, then retry."
+            }
+        } catch {
+            guard !Task.isCancelled else { return }
+            catalogs[harness] = []
+            modelsError = error.localizedDescription
+        }
+        modelsLoading = false
+    }
+
+    private func canFork(_ chat: Chat) -> Bool {
+        chat.config != nil && chat.harnessSessionId?.isEmpty == false
+    }
+
+    private func fork(_ chat: Chat) {
+        guard !forking else { return }
+        forking = true
+        Task { @MainActor in
+            defer { forking = false }
+            do {
+                let chatId = try await model.forkSession(chat)
+                model.launchRoute = .chat(chatId)
+            } catch {
+                forkError = error.localizedDescription
+            }
         }
     }
 
@@ -214,50 +296,50 @@ struct SessionView: View {
     }
 
     private func content(chat: Chat?, store: SessionStore) -> some View {
-        let status = liveStatus(chatId: chatId)
-        return VStack(spacing: 0) {
-            // The status strip floats over the transcript's faded bottom edge
-            // instead of stacking below it — the loader sits on the
-            // transparent zone and content is never pushed around.
-            TranscriptView(store: store, chatId: chatId)
-                .overlay(alignment: .bottom) {
-                    statusStrip(chatId: chatId, status: status)
-                        .allowsHitTesting(false)
-                }
+        TimelineView(.periodic(from: .now, by: 1)) { timeline in
+            let now = Int64(timeline.date.timeIntervalSince1970 * 1000)
+            let activity = model.activity(chatId: chatId, now: now)
+            VStack(spacing: 0) {
+                // The status strip floats over the transcript's faded bottom edge
+                // instead of stacking below it — the loader sits on the
+                // transparent zone and content is never pushed around.
+                TranscriptView(store: store, chatId: chatId)
+                    .overlay(alignment: .bottom) {
+                        statusStrip(store: store, activity: activity, now: now)
+                            .allowsHitTesting(false)
+                    }
 
-            if let request = store.openInputRequest {
-                QuestionPanel(requestId: request.requestId, questions: request.questions) { requestId, answers in
-                    store.respondInput(requestId: requestId, answers: answers)
-                }
-                .padding(.bottom, 8)
-            } else {
-                ComposerView(store: store, chat: chat, runLive: status == .working)
+                if let request = store.openInputRequest {
+                    QuestionPanel(requestId: request.requestId, questions: request.questions) { requestId, answers in
+                        store.respondInput(requestId: requestId, answers: answers)
+                    }
                     .padding(.bottom, 8)
+                } else {
+                    ComposerView(store: store, chat: chat, runLive: activity.status == .working)
+                        .padding(.bottom, 8)
+                }
             }
+            .background(Theme.bg.ignoresSafeArea())
+            .motionAnimation(Motion.fadeQuick, value: store.openInputRequest?.requestId)
         }
-        .background(Theme.bg.ignoresSafeArea())
-        .motionAnimation(Motion.fadeQuick, value: store.openInputRequest?.requestId)
     }
 
-    private func liveStatus(chatId: String) -> SessionStatus? {
-        if let demo = model.demo {
-            return effectiveStatus(demo.sessions[chatId], now: nowMs())
-        }
-        return effectiveStatus(model.workspace?.sessions[chatId], now: nowMs())
-    }
 
-    /// Reserved 24pt status strip (shell.rs render_status_strip) — Working
-    /// shows the sunrise spinner + rotating flavour word + elapsed; Errored
-    /// shows "Run failed"; the strip always reserves its height so the
-    /// composer never shifts.
-    private func statusStrip(chatId: String, status: SessionStatus?) -> some View {
-        TimelineView(.periodic(from: .now, by: 1)) { _ in
-            HStack(spacing: 6) {
-                switch status {
+    /// Reserve the strip's height across sending, processing, and terminal
+    /// transitions so status feedback never moves the composer.
+    private func statusStrip(store: SessionStore, activity: SessionActivity, now: Int64) -> some View {
+        HStack(spacing: 6) {
+            if !store.pendingSends.isEmpty {
+                WorkingSpinner()
+                Text("Sending\u{2026}")
+                    .font(Theme.sans(12))
+                    .foregroundStyle(Theme.textMuted)
+            } else {
+                switch activity.status {
                 case .working:
                     WorkingSpinner()
-                    let startedAt = sessionStartedAt(chatId: chatId)
-                    let elapsed = (nowMs() - startedAt) / 1000
+                    let elapsedMs = now.subtractingReportingOverflow(activity.row?.startedAt ?? activity.row?.updatedAt ?? now)
+                    let elapsed = max(0, elapsedMs.overflow ? 0 : elapsedMs.partialValue / 1000)
                     Text("\(Motion.flavourWord(seed: Motion.flavourSeed(chatId), elapsedSecs: elapsed))\u{2026}")
                         .font(Theme.sans(12))
                         .foregroundStyle(Theme.textMuted)
@@ -265,6 +347,10 @@ struct SessionView: View {
                         .font(Theme.sans(11))
                         .foregroundStyle(Theme.textFaint)
                         .monospacedDigit()
+                case .awaitingInput:
+                    Text("Awaiting input")
+                        .font(Theme.sans(11))
+                        .foregroundStyle(Theme.attention)
                 case .errored:
                     Text("Run failed")
                         .font(Theme.sans(11))
@@ -273,14 +359,10 @@ struct SessionView: View {
                     EmptyView()
                 }
             }
-            .frame(height: 24)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.leading, 26)  // aligns with the composer's text start
         }
+        .frame(height: 24)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.leading, 26)  // aligns with the composer's text start
     }
 
-    private func sessionStartedAt(chatId: String) -> Int64 {
-        let row = model.demo?.sessions[chatId] ?? model.workspace?.sessions[chatId]
-        return row?.startedAt ?? row?.updatedAt ?? nowMs()
-    }
 }

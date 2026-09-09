@@ -76,7 +76,7 @@ computer:
   maxHeight: 896
 "#;
 pub const OMP_SUPERVISOR_MARKER: &str = "__comet-omp-supervisor";
-const OMP_SESSION_FORK_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const OMP_SESSION_FORK_RECORD_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Run the hidden OMP supervisor command when this process was invoked for it.
 ///
@@ -1103,6 +1103,7 @@ fn configure_inference_gateway(
     command: &mut Command,
     agent_dir: &Path,
     inference: &InferenceRoute,
+    scaffold_host: bool,
 ) -> Result<(), HarnessError> {
     let provider = crate::auth_gateway::provider(&inference.provider).ok_or_else(|| {
         HarnessError::Protocol(format!(
@@ -1110,8 +1111,14 @@ fn configure_inference_gateway(
             inference.provider
         ))
     })?;
-    if let Some(extension) = crate::auth_gateway::install_extension(agent_dir)? {
-        command.arg("--extension").arg(extension);
+    if scaffold_host {
+        // Scaffold disables extension discovery; preserve its explicit adapter.
+        if !agent_dir.join("extensions/omp-auth-gateway.ts").is_file() {
+            let extension = crate::auth_gateway::install_prime_extension(agent_dir)?;
+            command.arg("--extension").arg(extension);
+        }
+    } else {
+        crate::auth_gateway::install_extension(agent_dir)?;
     }
     let model = inference
         .model
@@ -1263,8 +1270,6 @@ fn fork_session_file(
     session_dirs: &[PathBuf],
     source_session_id: &str,
 ) -> Result<String, HarnessError> {
-    const RECORD_MAX_BYTES: usize = OMP_SESSION_FORK_MAX_BYTES as usize;
-
     let (matches, exhaustive) = matching_session_files(session_dirs, source_session_id);
     if !exhaustive || matches.len() != 1 {
         return Err(HarnessError::Protocol(
@@ -1274,9 +1279,9 @@ fn fork_session_file(
     let source_path = &matches[0];
     let source = std::fs::File::open(source_path)?;
     let byte_count = source.metadata()?.len();
-    if byte_count == 0 || byte_count > OMP_SESSION_FORK_MAX_BYTES {
+    if byte_count == 0 {
         return Err(HarnessError::Protocol(
-            "OMP session journal is empty or exceeds the fork limit".into(),
+            "OMP session journal is empty".into(),
         ));
     }
     let active = match session_writer_state(source_path) {
@@ -1312,12 +1317,17 @@ fn fork_session_file(
 
         loop {
             line.clear();
-            let read = reader.read_until(b'\n', &mut line)?;
+            // Journals grow across turns. Bound the buffered record, not the
+            // whole history, and stop reading before an oversized allocation.
+            let read = reader
+                .by_ref()
+                .take(OMP_SESSION_FORK_RECORD_MAX_BYTES + 1)
+                .read_until(b'\n', &mut line)?;
             if read == 0 {
                 break;
             }
             source_bytes += read as u64;
-            if line.len() > RECORD_MAX_BYTES {
+            if line.len() as u64 > OMP_SESSION_FORK_RECORD_MAX_BYTES {
                 return Err(HarnessError::Protocol(
                     "OMP session journal record exceeds the fork limit".into(),
                 ));
@@ -1693,12 +1703,16 @@ impl OmpHarness {
     }
 
     fn configure_rpc_mode(&self, command: &mut Command) {
+        command.env_remove("COMET_EXECUTABLE");
         if self.scaffold_host {
             command.env("CI", "true");
             command.env_remove(LOCAL_RUNTIME_ENV);
         } else {
             command.env("CI", "false");
             command.env(LOCAL_RUNTIME_ENV, "1");
+            if let Some(executable) = &self.supervisor_executable {
+                command.env("COMET_EXECUTABLE", executable);
+            }
         }
         command.args(["--mode", "rpc", "--approval-mode", "yolo"]);
         if self.scaffold_host {
@@ -2060,6 +2074,7 @@ impl Harness for OmpHarness {
                 &mut command,
                 &omp_agent_dir(self.scaffold_host),
                 inference,
+                self.scaffold_host,
             )?;
         } else if self.scaffold_host {
             configure_scaffold_inference_profile(&mut command, request.model.as_deref())?;
@@ -3229,6 +3244,77 @@ mod tests {
     }
 
     #[test]
+    fn fork_session_file_preserves_history_larger_than_64_mib() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.jsonl");
+        let header = b"{\"type\":\"session\",\"id\":\"native-source\",\"cwd\":\"/repo\"}\n";
+        let record = format!(
+            "{{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":\"{}\"}}}}\n",
+            "x".repeat(1024)
+        );
+        let record_count = (64 * 1024 * 1024) / record.len() + 1;
+        {
+            let mut output = std::io::BufWriter::new(std::fs::File::create(&source).unwrap());
+            output.write_all(header).unwrap();
+            for _ in 0..record_count {
+                output.write_all(record.as_bytes()).unwrap();
+            }
+            output.flush().unwrap();
+        }
+
+        let fork_id = fork_session_file(&[temp.path().to_path_buf()], "native-source").unwrap();
+        let fork = temp.path().join(format!("crew-fork-{fork_id}.jsonl"));
+        let mut original = BufReader::new(std::fs::File::open(&source).unwrap());
+        let mut forked = BufReader::new(std::fs::File::open(&fork).unwrap());
+        let mut line = String::new();
+        original.read_line(&mut line).unwrap();
+        assert_eq!(line.as_bytes(), header);
+        line.clear();
+        forked.read_line(&mut line).unwrap();
+        let fork_header: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(fork_header["id"], fork_id);
+        assert_eq!(fork_header["cwd"], "/repo");
+        for _ in 0..record_count {
+            for reader in [&mut original, &mut forked] {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line, record);
+            }
+        }
+        assert!(original.fill_buf().unwrap().is_empty());
+        assert!(forked.fill_buf().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fork_session_file_rejects_oversized_record_without_leaving_a_fork() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.jsonl");
+        {
+            let mut output = std::fs::File::create(&source).unwrap();
+            output
+                .write_all(b"{\"type\":\"session\",\"id\":\"native-source\"}\n")
+                .unwrap();
+            // A valid JSON record whose whitespace alone crosses the bound.
+            std::io::copy(
+                &mut std::io::repeat(b' ').take(OMP_SESSION_FORK_RECORD_MAX_BYTES),
+                &mut output,
+            )
+            .unwrap();
+            output.write_all(b"{}\n").unwrap();
+        }
+
+        assert!(matches!(
+            fork_session_file(&[temp.path().to_path_buf()], "native-source"),
+            Err(HarnessError::Protocol(_))
+        ));
+        let remaining = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, [source]);
+    }
+
+    #[test]
     fn resumed_acp_runs_use_distinct_assistant_message_ids() {
         let session_id = "same-durable-session";
         let first_run = uuid::Uuid::from_u128(1);
@@ -3288,6 +3374,46 @@ mod tests {
             configured_env(&scaffold, LOCAL_RUNTIME_ENV),
             None,
             "Scaffold must not mark commands as local"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_handoff_executable_reaches_local_child_but_not_scaffold() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let probe = temp.path().join("omp-probe");
+        std::fs::write(&probe, "#!/bin/sh\nprintf '%s\\n' \"${COMET_EXECUTABLE-unset}\" \"${COMET_LOCAL_AGENT_RUNTIME-unset}\"\n").unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let supervisor = temp
+            .path()
+            .join("Crew With Spaces.app/Contents/MacOS/comet");
+        let cwd = temp.path().to_str().unwrap();
+        let local = OmpHarness::new()
+            .with_supervisor_executable(&supervisor)
+            .with_auth_broker_environment(AuthBrokerEnvironment::default())
+            .rpc_mode_command(&probe, cwd, false)
+            .output()
+            .await
+            .unwrap();
+        assert!(local.status.success());
+        assert_eq!(
+            String::from_utf8(local.stdout).unwrap(),
+            format!("{}\n1\n", supervisor.display())
+        );
+
+        let scaffold = OmpHarness::scaffold_host()
+            .with_supervisor_executable(&supervisor)
+            .with_auth_broker_environment(AuthBrokerEnvironment::default())
+            .rpc_mode_command(&probe, cwd, false)
+            .output()
+            .await
+            .unwrap();
+        assert!(scaffold.status.success());
+        assert_eq!(
+            String::from_utf8(scaffold.stdout).unwrap(),
+            "unset\nunset\n"
         );
     }
 
@@ -3394,6 +3520,7 @@ mod tests {
                 provider: "openai".into(),
                 model: "gpt-5.6-sol".into(),
             },
+            true,
         )
         .unwrap();
         let args: Vec<String> = command
@@ -3413,6 +3540,37 @@ mod tests {
             &args[args.len() - 2..],
             ["--model", "comet-openai/gpt-5.6-sol"]
         );
+    }
+
+    #[test]
+    fn shared_inference_desktop_installs_discoverable_gateway_without_duplicate_flag() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut command =
+            OmpHarness::new().run_command(Path::new("/usr/local/bin/omp"), &run_request(None));
+        configure_inference_gateway(
+            &mut command,
+            temp.path(),
+            &InferenceRoute {
+                base_url: "http://127.0.0.1:41234".into(),
+                token: "local-inference-token".into(),
+                provider: "openai".into(),
+                model: "gpt-6-astra".into(),
+            },
+            false,
+        )
+        .unwrap();
+        assert!(
+            temp.path()
+                .join("extensions/crew-auth-gateway.ts")
+                .is_file()
+        );
+        assert!(
+            temp.path()
+                .join("comet-runtime/agent-auth-gateway.ts")
+                .is_file()
+        );
+        assert!(!temp.path().join("extensions/omp-auth-gateway.ts").exists());
+        assert!(!command.as_std().get_args().any(|arg| arg == "--extension"));
     }
 
     #[test]

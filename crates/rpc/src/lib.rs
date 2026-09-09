@@ -48,6 +48,10 @@ pub mod methods {
     pub const WAIT_PEER_REPLY: &str = "WaitPeerReply";
     /// Create a distinct Crew chat from an existing session's native context.
     pub const FORK_SESSION: &str = "ForkSession";
+    /// Transfer native context to Scaffold and queue its initial remote command.
+    pub const HANDOFF_SESSION_TO_SCAFFOLD: &str = "HandoffSessionToScaffold";
+    /// Create and attach a Scaffold environment, transferring native session context.
+    pub const PREPARE_SCAFFOLD_SESSION: &str = "PrepareScaffoldSession";
     /// Metadata-only harness-native session candidates stored on this device.
     pub const LIST_LOCAL_SESSIONS: &str = "ListLocalSessions";
     /// Re-resolve and import one local candidate into a Comet chat.
@@ -196,6 +200,26 @@ pub struct ForkSessionParams {
 #[serde(rename_all = "camelCase")]
 pub struct ForkSessionResult {
     pub chat_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandoffSessionToScaffoldParams {
+    pub source_chat_id: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub database_environment: comet_proto::ScaffoldDatabaseEnvironment,
+}
+
+/// Receipt for a transferred native session with its initial remote command queued.
+/// This does not indicate that the remote task has completed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandoffSessionToScaffoldResult {
+    pub chat_id: String,
+    pub sandbox_id: String,
+    pub command_id: String,
+    pub environment: comet_proto::SessionEnvironment,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

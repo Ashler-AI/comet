@@ -91,13 +91,11 @@ pub struct UiSettings {
     /// are skipped; new spaces append in creation order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub space_order: Vec<String>,
-    /// Spaces explicitly added through the folder picker. Unlike `space_order`,
-    /// these remain visible when they have no sessions.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pinned_space_ids: Vec<String>,
-    /// Session notification chimes (done / awaiting-input). `COMET_DISABLE_SOUND`
+    /// Session attention chimes (done / input / error). `COMET_DISABLE_SOUND`
     /// overrides.
     pub sound_enabled: bool,
+    /// Opt-in native alerts include session names, but no transcript content.
+    pub notifications_enabled: bool,
     /// Hides secondary chrome while keeping the transcript and composer live.
     pub focus_mode: bool,
     /// Global worktree/account/goals card visibility across every session.
@@ -128,8 +126,8 @@ impl Default for UiSettings {
             last_room_id: None,
             tab_order: std::collections::HashMap::new(),
             space_order: Vec::new(),
-            pinned_space_ids: Vec::new(),
             sound_enabled: true,
+            notifications_enabled: false,
             focus_mode: false,
             workspace_status_visible: true,
             density: Density::default(),
@@ -389,8 +387,8 @@ mod tests {
                 vec!["b".to_string(), "a".to_string()],
             )]),
             space_order: vec!["space-2".to_string(), "space-1".to_string()],
-            pinned_space_ids: vec!["space-2".to_string()],
             sound_enabled: false,
+            notifications_enabled: true,
             focus_mode: true,
             density: Density::Compact,
             workspace_status_visible: false,

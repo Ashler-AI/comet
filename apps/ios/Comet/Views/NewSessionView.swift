@@ -16,33 +16,59 @@ struct NewSessionView: View {
     @AppStorage("newSessionHarness") private var harness = "claude-code"
     @AppStorage("newSessionModel") private var storedModel = ""
     @AppStorage("newSessionReasoning") private var storedReasoning = ""
+    @AppStorage("newSessionTarget") private var launchTargetRaw = SessionLaunchTarget.scaffold.rawValue
+    @AppStorage("newSessionDatabase") private var databaseEnvironmentRaw = ScaffoldDatabaseEnvironment.local.rawValue
 
     @State private var draft = ""
+    @State private var images = MobileImageDraft()
+    @State private var creationId = UUID().uuidString.lowercased()
+    @State private var createdChatId: String?
     @State private var showPicker = false
     @State private var showRefPicker = false
     @State private var showCheckoutPicker = false
-    /// Live per-harness catalogs from the space's device (static fallback).
+    @State private var harnesses: [HarnessInfo] = []
+    @State private var harnessesLoading = true
+    @State private var harnessesError: String?
+    @State private var harnessesRetry = 0
     @State private var catalogs: [String: [ModelInfo]] = [:]
+    @State private var catalogErrors: [String: String] = [:]
+    @State private var loadingHarness: String?
+    @State private var catalogRetry = 0
     @State private var refs: [RepoRef] = []
     @State private var selectedRef: String?
     @State private var checkoutKind: CheckoutKind = .local
     @State private var busy = false
+    @State private var launchError: String?
     @FocusState private var focused: Bool
 
     private var space: Space? {
         model.spaces.first { $0.id == spaceId }
     }
 
-    private var models: [ModelInfo] {
-        catalogs[harness] ?? HarnessCatalog.models(for: harness)
+    private var selectedHarness: String {
+        launchTarget == .scaffold ? "omp" : harness
     }
 
-    private var selectedModel: ModelInfo {
-        models.first { $0.id == storedModel } ?? models[0]
+    private var availableHarnesses: [HarnessInfo] {
+        launchTarget == .scaffold ? [HarnessInfo(id: "omp", label: "OMP")] : harnesses
+    }
+
+    private var models: [ModelInfo] {
+        let loaded = catalogs[selectedHarness] ?? []
+        guard launchTarget == .scaffold else { return loaded }
+        // Scaffold runs OMP with its supported OAuth providers, not arbitrary
+        // local harnesses or providers advertised by the source host.
+        return loaded.filter {
+            $0.id.hasPrefix("anthropic/") || $0.id.hasPrefix("openai-codex/")
+        }
+    }
+
+    private var selectedModel: ModelInfo? {
+        models.first { $0.id == storedModel } ?? models.first
     }
 
     private var reasoning: String? {
-        if selectedModel.reasoningLevels.isEmpty { return nil }
+        guard let selectedModel else { return nil }
         if selectedModel.reasoningLevels.contains(storedReasoning) { return storedReasoning }
         return HarnessCatalog.defaultReasoning(for: selectedModel)
     }
@@ -68,8 +94,10 @@ struct NewSessionView: View {
                 offlineNotice(space: space)
             }
 
+            MobileImageDraftView(draft: images, busy: busy)
             composer
                 .padding(.bottom, 8)
+                .disabled(busy)
         }
         .background(Theme.bg.ignoresSafeArea())
         .navigationTitle("New session")  // feeds the back menu
@@ -88,6 +116,14 @@ struct NewSessionView: View {
                     }
                 }
             }
+        }
+        .alert("Couldn’t start session", isPresented: Binding(
+            get: { launchError != nil },
+            set: { if !$0 { launchError = nil } }
+        )) {
+            Button("OK", role: .cancel) { launchError = nil }
+        } message: {
+            Text(launchError ?? "Unknown error")
         }
         .sheet(isPresented: $showRefPicker) {
             RefPickerSheet(refs: refs, selected: selectedRef) { ref in
@@ -110,19 +146,33 @@ struct NewSessionView: View {
                 }
             }
         }
-        .task(id: "\(spaceId)/\(harness)") {
-            // Live model catalog from the device that will run the session.
-            guard let space else { return }
-            catalogs[harness] = await model.listModels(space: space, harness: harness)
+        .task(id: "\(spaceId)/\(harnessesRetry)") {
+            await loadHarnesses()
+        }
+        .task(id: "\(spaceId)/\(selectedHarness)/\(catalogRetry)") {
+            await loadModels()
         }
         .sheet(isPresented: $showPicker) {
-            ModelPickerSheet(harness: $harness, modelId: Binding(
-                get: { selectedModel.id },
+            ModelPickerSheet(harness: Binding(
+                get: { selectedHarness },
+                set: { harness = $0 }
+            ), modelId: Binding(
+                get: { selectedModel?.id ?? "" },
                 set: { storedModel = $0 }
             ), reasoning: Binding(
                 get: { reasoning },
                 set: { storedReasoning = $0 ?? "" }
-            ), catalogs: catalogs)
+            ), catalogs: [selectedHarness: models],
+               harnesses: availableHarnesses,
+               harnessesLoading: launchTarget == .local && harnessesLoading,
+               harnessesError: launchTarget == .local ? harnessesError : nil,
+               modelsLoading: loadingHarness == selectedHarness,
+               modelsError: catalogErrors[selectedHarness],
+               catalogNote: launchTarget == .scaffold
+                   ? "Scaffold runs OMP with Anthropic or OpenAI Codex OAuth models. Other harnesses and providers run on the host."
+                   : nil,
+               onRetryHarnesses: { harnessesRetry += 1 },
+               onRetryModels: { catalogRetry += 1 })
         }
         .onAppear {
             focused = true
@@ -135,6 +185,48 @@ struct NewSessionView: View {
                 }
             }
         }
+        .onDisappear { images.cancelImport() }
+    }
+
+    private func loadHarnesses() async {
+        guard let space else { return }
+        harnessesLoading = true
+        harnessesError = nil
+        do {
+            let loaded = try await model.listHarnesses(space: space)
+            guard !Task.isCancelled else { return }
+            harnesses = loaded
+            if !loaded.contains(where: { $0.id == harness }), let first = loaded.first {
+                harness = first.id
+                storedModel = ""
+                storedReasoning = ""
+            }
+            if loaded.isEmpty { harnessesError = "This host did not advertise any harnesses." }
+        } catch {
+            guard !Task.isCancelled else { return }
+            harnessesError = error.localizedDescription
+        }
+        harnessesLoading = false
+    }
+
+    private func loadModels() async {
+        guard let space else { return }
+        let requestedHarness = selectedHarness
+        loadingHarness = requestedHarness
+        catalogErrors[requestedHarness] = nil
+        do {
+            let loaded = try await model.listModelsDetailed(space: space, harness: requestedHarness)
+            guard !Task.isCancelled else { return }
+            catalogs[requestedHarness] = loaded
+            if loaded.isEmpty {
+                catalogErrors[requestedHarness] = "This harness did not return any models. Check its setup on the host, then retry."
+            }
+        } catch {
+            guard !Task.isCancelled else { return }
+            catalogs[requestedHarness] = []
+            catalogErrors[requestedHarness] = error.localizedDescription
+        }
+        loadingHarness = nil
     }
 
     // MARK: Composer
@@ -143,11 +235,13 @@ struct NewSessionView: View {
         ComposerShell(
             draft: $draft,
             placeholder: "Do anything…",
-            sendEnabled: space != nil,
+            sendEnabled: !images.loading && selectedModel != nil && availableHarnesses.contains { $0.id == selectedHarness },
             showStop: false,
-            busy: busy,
+            busy: busy || images.loading,
+            hasAttachments: !images.images.isEmpty,
             onSend: send
         ) {
+            MobileImagePicker(draft: images, disabled: busy)
             // Agent chip — brand mark + model, opens the picker sheet
             // (desktop's in-pill HarnessModel trigger chip).
             Button {
@@ -155,8 +249,8 @@ struct NewSessionView: View {
                 showPicker = true
             } label: {
                 HStack(spacing: 6) {
-                    HarnessBadge(harness: harness, size: 15)
-                    Text(selectedModel.label)
+                    HarnessBadge(harness: selectedHarness, size: 15)
+                    Text(selectedModel?.label ?? (loadingHarness == selectedHarness ? "Loading models…" : "Select model"))
                         .font(Theme.sans(13, weight: .medium))
                         .foregroundStyle(Theme.text.opacity(0.9))
                         .lineLimit(1)
@@ -175,6 +269,64 @@ struct NewSessionView: View {
             }
             .buttonStyle(ChipPressButtonStyle())
 
+
+            Menu {
+                ForEach(availableLaunchTargets) { target in
+                    Button {
+                        launchTargetRaw = target.rawValue
+                    } label: {
+                        if target == launchTarget {
+                            Label(target.label, systemImage: "checkmark")
+                        } else {
+                            Text(target.label)
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: launchTarget == .scaffold ? "cloud" : "desktopcomputer")
+                        .font(.system(size: 12, weight: .medium))
+                    Text(launchTarget.label)
+                        .font(Theme.sans(13, weight: .medium))
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(Theme.textFaint)
+                }
+                .foregroundStyle(Theme.text.opacity(0.9))
+                .padding(.horizontal, 12)
+                .frame(height: 36)
+                .background(whiteAlpha(0.10), in: Capsule())
+            }
+            .buttonStyle(ChipPressButtonStyle())
+
+            if launchTarget == .scaffold {
+                Menu {
+                    ForEach(ScaffoldDatabaseEnvironment.allCases) { environment in
+                        Button {
+                            databaseEnvironmentRaw = environment.rawValue
+                        } label: {
+                            if environment == databaseEnvironment {
+                                Label(environment.label, systemImage: "checkmark")
+                            } else {
+                                Text(environment.label)
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "cylinder")
+                            .font(.system(size: 12, weight: .medium))
+                        Text(databaseEnvironment.label)
+                            .font(Theme.sans(13, weight: .medium))
+                            .lineLimit(1)
+                    }
+                    .foregroundStyle(Theme.text.opacity(0.9))
+                    .padding(.horizontal, 12)
+                    .frame(height: 36)
+                    .background(whiteAlpha(0.10), in: Capsule())
+                }
+                .buttonStyle(ChipPressButtonStyle())
+            }
             // Checkout + ref chips — the desktop footer (git spaces only).
             if space?.gitDetected == true {
                 chip(icon: checkoutIcon, label: checkoutLabel) {
@@ -205,6 +357,19 @@ struct NewSessionView: View {
             .background(whiteAlpha(0.10), in: Capsule())
         }
         .buttonStyle(ChipPressButtonStyle())
+    }
+
+    private var launchTarget: SessionLaunchTarget {
+        guard model.launchesScaffoldSessions else { return .local }
+        return SessionLaunchTarget(rawValue: launchTargetRaw) ?? .scaffold
+    }
+
+    private var availableLaunchTargets: [SessionLaunchTarget] {
+        model.launchesScaffoldSessions ? SessionLaunchTarget.allCases : [.local]
+    }
+
+    private var databaseEnvironment: ScaffoldDatabaseEnvironment {
+        ScaffoldDatabaseEnvironment(rawValue: databaseEnvironmentRaw) ?? .local
     }
 
     // MARK: Checkout model (pickers.rs port)
@@ -266,8 +431,9 @@ struct NewSessionView: View {
     }
 
     private var canSend: Bool {
-        guard !busy, space != nil else { return false }
-        return !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard !busy, !images.loading, space != nil, selectedModel != nil,
+              availableHarnesses.contains(where: { $0.id == selectedHarness }) else { return false }
+        return !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !images.images.isEmpty
     }
 
     private func offlineNotice(space: Space) -> some View {
@@ -286,47 +452,90 @@ struct NewSessionView: View {
     /// live session (composer.rs on-send: current checkout as-is, reuse the
     /// picked ref's worktree, or CreateWorktree off the base first).
     private func send() {
-        guard let space, canSend else { return }
+        guard let space, canSend, let selectedModel else { return }
+        let harness = selectedHarness
+        let reasoning = reasoning
+        let launchTarget = launchTarget
         let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let submittedImages = images.images
+        let databaseEnvironment = databaseEnvironment
+        let selectedRef = selectedRef
+        let selectedWorktree = selectedRefRow?.worktreePath
+        let checkoutKind = checkoutKind
         busy = true
-        let config = ChatConfig(harness: harness, model: selectedModel.id,
-                                reasoning: reasoning, sandbox: "workspace-write")
         Task { @MainActor in
+            if launchTarget == .scaffold {
+                do {
+                    let chatId = try await model.launchScaffoldSession(
+                        space: space,
+                        prompt: prompt,
+                        harness: harness,
+                        model: selectedModel.id,
+                        reasoning: reasoning,
+                        databaseEnvironment: databaseEnvironment,
+                        sourceRef: selectedRef,
+                        creationId: creationId,
+                        images: submittedImages
+                    )
+                    finishLaunch(chatId: chatId, submittedImages: submittedImages)
+                } catch {
+                    busy = false
+                    launchError = error.localizedDescription
+                }
+                return
+            }
+
+            let config = ChatConfig(harness: harness, model: selectedModel.id,
+                                    reasoning: reasoning, sandbox: "workspace-write")
             var cwd: String?
             var branch = selectedRef
-            switch checkoutKind {
+            if createdChatId == nil {
+                switch checkoutKind {
             case .newWorktree:
                 if let base = selectedRef {
                     guard let worktreePath = await model.createWorktree(space: space, base: base) else {
                         busy = false
+                        launchError = "Crew couldn’t create the worktree. Your draft is still here."
                         return
                     }
                     cwd = worktreePath
                     branch = base
                 }
             case .local:
-                if let worktree = selectedRefRow?.worktreePath {
-                    cwd = worktree  // reuse the ref's existing checkout
+                if let worktree = selectedWorktree { cwd = worktree }
+            }
+            }
+            do {
+                let chatId: String
+                if let existing = createdChatId {
+                    chatId = existing
+                } else {
+                    chatId = try await model.createChat(space: space, config: config,
+                                                        branch: branch, cwd: cwd)
+                    createdChatId = chatId
                 }
-            }
-            guard let chatId = model.createChat(space: space, config: config,
-                                                branch: branch, cwd: cwd),
-                  let chat = model.chat(id: chatId),
-                  let store = model.sessionStore(for: chat) else {
+                guard let chat = model.chat(id: chatId),
+                      let store = model.sessionStore(for: chat) else {
+                    throw MobileSessionError.unavailable("The created session is not available")
+                }
+                guard await store.sendRun(prompt: prompt, chat: chat, images: submittedImages) else {
+                    throw MobileSessionError.unavailable(store.sendFailure ?? "Crew couldn’t send this message. Your draft is still here.")
+                }
+                finishLaunch(chatId: chatId, submittedImages: submittedImages)
+            } catch {
                 busy = false
-                return
+                launchError = error.localizedDescription
             }
-            store.sendRun(prompt: prompt, chat: chat)
-            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            draft = ""
-            busy = false
-            // Replace the canvas with the live session (in-place swap, no
-            // back-through-canvas).
-            if path.last == .newSession(spaceId: spaceId) {
-                path.removeLast()
-            }
-            path.append(.chat(chatId))
         }
+    }
+
+    private func finishLaunch(chatId: String, submittedImages: [MobileImageAttachment]) {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        draft = ""
+        images.removeSubmitted(submittedImages)
+        busy = false
+        if path.last == .newSession(spaceId: spaceId) { path.removeLast() }
+        path.append(.chat(chatId))
     }
 }
 
@@ -355,11 +564,32 @@ struct ModelPickerSheet: View {
     var lockedHarness = false
     /// Live per-harness catalogs from the device (static fallback when absent).
     var catalogs: [String: [ModelInfo]] = [:]
+    var harnesses: [HarnessInfo] = []
+    var harnessesLoading = false
+    var harnessesError: String?
+    var modelsLoading = false
+    var modelsError: String?
+    var catalogNote: String?
+    var onRetryHarnesses: (() -> Void)?
+    var onRetryModels: (() -> Void)?
     /// Present on live git chats: checkout label + switchable refs.
     var checkout: SessionCheckoutContext?
 
     private func models(for harness: String) -> [ModelInfo] {
         catalogs[harness] ?? HarnessCatalog.models(for: harness)
+    }
+
+    @State private var modelQuery = ""
+
+    private var matchingModels: [ModelInfo] {
+        let available = models(for: harness)
+        let query = modelQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return available }
+        return available.filter {
+            $0.label.localizedStandardContains(query)
+                || $0.id.localizedStandardContains(query)
+                || ($0.description?.localizedStandardContains(query) ?? false)
+        }
     }
 
     @State private var switching: String?
@@ -370,30 +600,54 @@ struct ModelPickerSheet: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 22) {
                     if !lockedHarness {
-                        HStack(spacing: 8) {
-                            ForEach(HarnessCatalog.harnesses) { h in
-                                harnessTab(h)
+                        VStack(alignment: .leading, spacing: 8) {
+                            SheetLabel("Harness")
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: 8) {
+                                    ForEach(harnesses) { h in
+                                        harnessTab(h)
+                                    }
+                                }
                             }
-                            Spacer(minLength: 0)
+                            catalogStatus(loading: harnessesLoading, error: harnessesError,
+                                          empty: harnesses.isEmpty, label: "harnesses",
+                                          retry: onRetryHarnesses)
                         }
+                    }
+                    if let catalogNote {
+                        Text(catalogNote)
+                            .font(Theme.sans(12.5))
+                            .foregroundStyle(Theme.textMuted)
                     }
 
                     VStack(alignment: .leading, spacing: 8) {
                         SheetLabel("Model")
                         SheetCard {
-                            let models = models(for: harness)
-                            ForEach(Array(models.enumerated()), id: \.element.id) { ix, m in
-                                SheetSelectRow(title: m.label,
-                                               subtitle: m.description,
-                                               selected: m.id == modelId,
-                                               leading: nil) {
-                                    select(model: m)
+                            let models = matchingModels
+                            LazyVStack(spacing: 0) {
+                                ForEach(models) { m in
+                                    SheetSelectRow(title: m.label,
+                                                   subtitle: m.description ?? m.id,
+                                                   selected: m.id == modelId,
+                                                   leading: nil) {
+                                        select(model: m)
+                                    }
+                                    if m.id != models.last?.id {
+                                        SheetSeparator()
+                                    }
                                 }
-                                if ix < models.count - 1 {
-                                    SheetSeparator()
+                                if models.isEmpty, !modelQuery.isEmpty, !modelsLoading {
+                                    Text("No matching models")
+                                        .font(Theme.sans(13))
+                                        .foregroundStyle(Theme.textMuted)
+                                        .padding(16)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
                                 }
                             }
                         }
+                        catalogStatus(loading: modelsLoading, error: modelsError,
+                                      empty: models(for: harness).isEmpty, label: "models",
+                                      retry: onRetryModels)
                     }
 
                     if let m = selectedModel, !m.reasoningLevels.isEmpty {
@@ -425,6 +679,7 @@ struct ModelPickerSheet: View {
             .background(SheetStyle.panel)
             .navigationTitle("Select model")
             .navigationBarTitleDisplayMode(.inline)
+            .searchable(text: $modelQuery, prompt: "Search models")
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button {
@@ -441,6 +696,30 @@ struct ModelPickerSheet: View {
         .presentationDragIndicator(.visible)
         .presentationCornerRadius(32)
         .preferredColorScheme(.dark)
+        .onChange(of: harness) { _, _ in modelQuery = "" }
+    }
+
+    @ViewBuilder
+    private func catalogStatus(loading: Bool, error: String?, empty: Bool,
+                               label: String, retry: (() -> Void)?) -> some View {
+        if loading {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Loading \(label) from the host…")
+                    .font(Theme.sans(13))
+                    .foregroundStyle(Theme.textMuted)
+            }
+        } else if error != nil || empty {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(error ?? "No \(label) are available for this launch target.")
+                    .font(Theme.sans(12.5))
+                    .foregroundStyle(Theme.danger)
+                if let retry {
+                    Button("Retry", action: retry)
+                        .font(Theme.sans(13, weight: .medium))
+                }
+            }
+        }
     }
 
     private var selectedModel: ModelInfo? {
@@ -453,9 +732,9 @@ struct ModelPickerSheet: View {
             guard harness != h.id else { return }
             UISelectionFeedbackGenerator().selectionChanged()
             harness = h.id
-            let fallback = HarnessCatalog.defaultModel(for: h.id)
-            modelId = fallback.id
-            reasoning = HarnessCatalog.defaultReasoning(for: fallback)
+            let first = models(for: h.id).first
+            modelId = first?.id ?? ""
+            reasoning = first.flatMap { HarnessCatalog.defaultReasoning(for: $0) }
         } label: {
             HStack(spacing: 7) {
                 HarnessBadge(harness: h.id, size: 15, dimmed: !selected)

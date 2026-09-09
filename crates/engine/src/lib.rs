@@ -248,7 +248,7 @@ impl EngineCore {
         let journal = Arc::new(RunJournal::open(project_dir.join("journals"))?);
         let sessions = SessionsEngine::new(
             device_id.clone(),
-            journal,
+            journal.clone(),
             registry.clone(),
             context.ipc_port,
         );
@@ -260,7 +260,7 @@ impl EngineCore {
                 edge: edge.clone(),
             },
         );
-        let workspace = WorkspaceHost::open(
+        let workspace = WorkspaceHost::open_with_journal(
             store,
             WorkspaceHostConfig {
                 device_id: device_id.clone(),
@@ -274,6 +274,7 @@ impl EngineCore {
                     .then(|| edge.clone())
                     .flatten(),
             },
+            &journal,
         )?;
         doc_host.set_workspace(workspace.clone());
         doc_host.set_sessions(sessions.clone());
@@ -620,11 +621,14 @@ impl Engine {
             core.sessions
                 .set_inference_relay(inference_relay::InferenceRelay::start(client.clone())?);
             let grants = Arc::new(EdgeDeviceJoinGrantClient::new(&config.edge_url, bearer)?);
-            core.set_scaffold_runtime(ScaffoldRuntime::new(
-                client,
-                config.edge_url.clone(),
-                grants,
-            ));
+            core.set_scaffold_runtime(
+                ScaffoldRuntime::new(client, config.edge_url.clone(), grants).with_deployment_id(
+                    config
+                        .deployment_id
+                        .clone()
+                        .unwrap_or_else(|| project_scope.clone()),
+                ),
+            );
         }
         // Release checker: polls {edge}/releases on a 6h cadence; headless
         // installs with COMET_AUTO_UPDATE=1 apply + restart themselves — gated

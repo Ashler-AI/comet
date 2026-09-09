@@ -671,13 +671,13 @@ impl IncrementalParser {
     /// Set the source: appends take the incremental path, anything else resets.
     pub fn set_text(&mut self, text: &str) {
         if text.len() >= self.source.len() && text.starts_with(self.source.as_str()) {
-            let delta = text[self.source.len()..].to_string();
+            let delta = &text[self.source.len()..];
             if delta.is_empty() {
                 self.last_parse_bytes = 0;
                 self.stable_prefix_blocks = self.tree.blocks.len();
                 return;
             }
-            self.append(&delta);
+            self.append(delta);
         } else {
             self.reset(text);
         }
@@ -733,7 +733,11 @@ impl IncrementalParser {
 
         let tail = parse_full(&self.source[boundary..]);
         self.last_parse_bytes = self.source.len() - boundary;
-        self.tree.blocks.retain(|b| b.range.start < boundary);
+        let stable = self
+            .tree
+            .blocks
+            .partition_point(|b| b.range.start < boundary);
+        self.tree.blocks.truncate(stable);
         self.stable_prefix_blocks = self.tree.blocks.len();
         for mut top in tail.blocks {
             top.range.start += boundary;

@@ -24,7 +24,8 @@
  * (which only exists while traffic keeps the DO awake anyway); scheduled work
  * (checkpoints, history trim, R2 backup §3.3) rides the durable alarm.
  */
-import { LoroDoc, EphemeralStore, VersionVector } from "loro-crdt";
+import { LoroDoc, EphemeralStore, VersionVector, decodeImportBlobMeta } from "loro-crdt";
+import type { PeerID } from "loro-crdt";
 import {
   CrdtType,
   JoinErrorCode,
@@ -46,16 +47,18 @@ import {
   RETAIN_DAYS,
   materializeTail
 } from "./session-doc";
-import { createBlobStore, getJsonBlob, putJsonBlob, type BlobStore } from "./blobs";
+import { CHUNK_BYTES, createBlobStore, getJsonBlob, putJsonBlob, type BlobStore } from "./blobs";
 import {
   AUTH_GRANT_HEADER,
   AUTH_USER_HEADER,
   GRANT_EVENT_HEADER,
   ROOM_KIND_HEADER,
   SESSION_OWNER_AUTH_HEADER,
+  NOTIFICATION_BEARER_HEADER,
   type Env
 } from "./env";
 import { parseTrustedDeviceGrant } from "./device-room";
+import { WorkspaceNotifications } from "./notifications";
 
 const AUTH_PROJECT_HEADER = "x-comet-auth-project";
 const AUTH_CAPABILITIES_HEADER = "x-comet-auth-capabilities";
@@ -97,6 +100,10 @@ const RETAIN_MS = RETAIN_DAYS * DAY_MS;
 const REPLAY_CRASH_LIMIT = 3;
 /** Payload bytes per outbound fragment (leaves room for the envelope). */
 const FRAGMENT_BYTES = 200_000;
+/** Match the sync client's healthy-snapshot limits, shared across each
+ * socket's in-flight batches so incomplete headers cannot accumulate forever. */
+const MAX_REASSEMBLED_BYTES = 64 * 1024 * 1024;
+const MAX_FRAGMENT_COUNT = 1024;
 const MAX_PRESENCE_UPDATE_BYTES = 16 * 1024;
 const WORKSPACE_PRESENCE_TTL_MS = 30_000;
 const MAX_WORKSPACE_PRESENCE_PEERS = 128;
@@ -233,8 +240,9 @@ interface SocketState extends SocketGrantState {
 }
 
 interface FragmentBatch {
-  parts: Uint8Array[];
+  parts: Array<Uint8Array | undefined>;
   received: number;
+  receivedBytes: number;
   totalSize: number;
   header: DocUpdateFragmentHeader;
 }
@@ -252,8 +260,10 @@ export class SessionRoom implements DurableObject {
   private readonly ctx: DurableObjectState;
   private readonly env: Env;
   private readonly blobs: BlobStore;
+  private notifications: WorkspaceNotifications | undefined;
   /** Lazily materialized doc — the log is authoritative; this is a cache. */
   private doc: LoroDoc | undefined;
+  private docLoad: Promise<LoroDoc> | undefined;
   private eph: EphemeralStore | undefined;
   /** Bounded byte snapshots for workspace presence. Avoids another Loro WASM
    * allocation while letting fresh joiners observe peers before the next
@@ -262,6 +272,7 @@ export class SessionRoom implements DurableObject {
   private pending: Uint8Array[] = [];
   private pendingBytes = 0;
   private flushTimer: ReturnType<typeof setTimeout> | undefined;
+  private flushInFlight: Promise<void> | undefined;
   /** In-memory fragment reassembly. Lost on hibernation → the sender gets a
    * FragmentTimeout ack for the unknown batch and resends — self-healing. */
   private readonly fragments = new Map<WebSocket, Map<string, FragmentBatch>>();
@@ -363,6 +374,12 @@ export class SessionRoom implements DurableObject {
     // Workspace routing was scope-checked by the Worker; this DO independently
     // binds the same verified project scope above.
     const workspace = request.headers.get(ROOM_KIND_HEADER) === "workspace";
+    if (url.pathname === "/notifications/device") {
+      if (!workspace || request.headers.has(AUTH_GRANT_HEADER)) return json({ error: "forbidden" }, 403);
+      const bearer = request.headers.get(NOTIFICATION_BEARER_HEADER);
+      if (!bearer) return json({ error: "forbidden" }, 403);
+      return this.workspaceNotifications().register(request, userId, bearer);
+    }
 
     if (url.pathname === "/ws") {
       const chatId = url.searchParams.get("chatId") ?? "";
@@ -432,13 +449,12 @@ export class SessionRoom implements DurableObject {
       await this.flush();
       const updateRows = [...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM updates")][0]
         ?.n as number;
-      const snapshot = this.blobs.get("snapshot");
       return json({
         chatId: this.getMeta("chatId") ?? null,
         connectedSockets: this.ctx.getWebSockets().length,
         updateRows,
         updateLogBytes: Number(this.getMeta("updateBytes") ?? "0"),
-        snapshotBytes: snapshot?.length ?? 0,
+        snapshotBytes: this.blobs.byteLength("snapshot") ?? 0,
         // Cold-start cost of the LAST materialization — the wedge-risk gauge
         // (2026-07-30: this creeping toward the CPU limit was invisible).
         lastReplayMs: Number(this.getMeta("lastReplayMs") ?? "0"),
@@ -446,8 +462,8 @@ export class SessionRoom implements DurableObject {
         // True between a wedge-break log drop and the first re-uploaded state
         // (the nightly backup is paused in that window).
         postReset: this.getMeta("postReset") === "1",
-        tailCached: this.getMeta("tailDirty") !== "1" && this.blobs.get("tail") !== undefined,
-        diffPublished: this.blobs.get("diff") !== undefined,
+        tailCached: this.getMeta("tailDirty") !== "1" && this.blobs.byteLength("tail") !== undefined,
+        diffPublished: this.blobs.byteLength("diff") !== undefined,
         checkpoints: (JSON.parse(this.getMeta("checkpoints") ?? "[]") as unknown[]).length,
         lastTrimAt: this.getMeta("lastTrimAt") ?? null,
         backupDirty: this.getMeta("backupDirty") === "1",
@@ -507,13 +523,14 @@ export class SessionRoom implements DurableObject {
         if (owner !== projectScope) return json({ error: "forbidden" }, 403);
       }
       const body = new Uint8Array(await request.arrayBuffer());
-      const doc = await this.ensureDoc();
+      let doc = await this.ensureDoc();
+      if (workspace) this.notifyWorkspace(doc, projectScope, true);
       try {
-        if (body.length > 0) doc.import(body);
+        doc = this.importLoroUpdates(doc, [body]);
       } catch {
         return json({ error: "invalid_update" }, 400);
       }
-      this.recordLoroUpdates([body]);
+      if (workspace) this.notifyWorkspace(doc, projectScope);
       // Converge live peers: relay the update to connected %LOR sockets.
       const roomId = this.getMeta("chatId") ?? "";
       for (const ws of this.ctx.getWebSockets()) {
@@ -547,15 +564,7 @@ export class SessionRoom implements DurableObject {
       this.dropLog();
       this.doc?.free(); // release the wasm memory, don't wait on GC finalizers
       this.doc = undefined; // force a fresh (empty) materialization next join
-      // Boot any currently-attached %LOR/%EPH sockets so their hung/half-cold
-      // sessions bail and reconnect into the now-empty doc.
-      for (const sock of this.ctx.getWebSockets()) {
-        try {
-          sock.close(4410, "room reset");
-        } catch {
-          /* already gone */
-        }
-      }
+      this.closeSocketsForRoomReset();
       return json({ ok: true, clearedUpdateRows: before ?? 0 });
     }
     return new Response("not found", { status: 404 });
@@ -729,8 +738,22 @@ export class SessionRoom implements DurableObject {
     if (!this.getMeta("chatId") && message.roomId) this.setMeta("chatId", message.roomId);
 
     if (message.crdt === CrdtType.Loro) {
-      const doc = await this.ensureDoc();
+      await this.ensureDoc();
       if (!(await this.authorizeSocket(ws, state))) return;
+      if (ws.readyState !== WebSocket.OPEN) return;
+      // Trimming frees the old doc while authority lookup yields; idle release
+      // may remove it entirely. Do not retain the materialization result.
+      const doc = this.doc;
+      if (!doc) {
+        this.send(ws, {
+          type: MessageType.JoinError,
+          crdt: message.crdt,
+          roomId: message.roomId,
+          code: JoinErrorCode.AppError,
+          message: "document released; rejoin"
+        });
+        return;
+      }
       if (!state.rooms.includes(message.crdt)) state.rooms.push(message.crdt);
       ws.serializeAttachment(state);
       // Wasm-bindgen objects (VersionVector here and below) free their wasm
@@ -753,14 +776,23 @@ export class SessionRoom implements DurableObject {
       let backfill: Uint8Array;
       if (message.version.length > 0) {
         let from: VersionVector | undefined;
+        let retainedSince: VersionVector | undefined;
         try {
           from = VersionVector.decode(message.version);
-          backfill = doc.export({ mode: "update", from });
+          retainedSince = doc.shallowSinceVV();
+          const coverage = from.compare(retainedSince);
+          // Exporting from before retained history can succeed with missing
+          // dependencies. Only a client covering the retained-history boundary
+          // can use deltas; older or concurrent clients need the full state.
+          backfill = coverage !== undefined && coverage >= 0
+            ? doc.export({ mode: "update", from })
+            : doc.export({ mode: "snapshot" });
         } catch {
           // Unknown/garbled client version — fall back to a full snapshot.
           backfill = doc.export({ mode: "snapshot" });
         } finally {
           from?.free();
+          retainedSince?.free();
         }
       } else {
         backfill = doc.export({ mode: "snapshot" });
@@ -850,17 +882,28 @@ export class SessionRoom implements DurableObject {
       return;
     }
     if (crdt === CrdtType.Loro) {
-      const doc = await this.ensureDoc();
+      await this.ensureDoc();
       if (!(await this.authorizeSocket(ws, state))) return;
+      // A reset closes the old socket even if another request has already
+      // materialized a replacement. Never admit that socket's in-flight write.
+      if (ws.readyState !== WebSocket.OPEN) return;
+      // Authority lookup may yield to a trim (which frees/replaces the doc)
+      // or idle release. Use only the current live doc, with no further await.
+      let doc = this.doc;
+      if (!doc) {
+        this.ack(ws, { crdt, roomId }, UpdateStatusCode.InvalidUpdate, batchId);
+        return;
+      }
+      if (state.workspace) this.notifyWorkspace(doc, state.projectScope, true);
       try {
-        for (const update of updates) if (update.length > 0) doc.import(update);
+        doc = this.importLoroUpdates(doc, updates);
       } catch {
         // Includes imports concurrent to a shallow-snapshot start (§3.1 stale
         // peer) — the client resyncs fresh and re-submits at the app layer.
         this.ack(ws, { crdt, roomId }, UpdateStatusCode.InvalidUpdate, batchId);
         return;
       }
-      this.recordLoroUpdates(updates);
+      if (state.workspace) this.notifyWorkspace(doc, state.projectScope);
       this.ack(ws, { crdt, roomId }, UpdateStatusCode.Ok, batchId);
       await this.relay(ws, crdt, roomId, updates);
       return;
@@ -889,13 +932,131 @@ export class SessionRoom implements DurableObject {
     this.ack(ws, { crdt, roomId }, UpdateStatusCode.Unknown, batchId);
   }
 
+  private importLoroUpdates(doc: LoroDoc, updates: Uint8Array[]): LoroDoc {
+    const snapshotIndex = updates.findIndex((update) => {
+        if (update.length === 0) return false;
+        const metadata = decodeImportBlobMeta(update, false);
+        try {
+          return metadata.mode === "snapshot" || metadata.mode === "shallow-snapshot" || metadata.mode === "outdated-snapshot";
+        } finally {
+          metadata.partialStartVersionVector.free();
+          metadata.partialEndVersionVector.free();
+        }
+      });
+    if (snapshotIndex < 0) {
+      for (const update of updates) if (update.length > 0) doc.import(update);
+      this.recordLoroUpdates(updates);
+      return doc;
+    }
+
+    // Pending deltas make snapshot import take the eager history-replay path.
+    // Load state first, then merge EVERY retained delta into a fresh candidate.
+    // Neither accepted bytes nor the live doc change until validation succeeds.
+    const snapshot = updates[snapshotIndex];
+    const candidate = new LoroDoc();
+    let ownsCandidate = true;
+    let previousVersion: VersionVector | undefined;
+    try {
+      const initial = candidate.import(snapshot);
+      if (initial.pending?.size) throw new Error("incomplete bootstrap snapshot");
+      previousVersion = doc.oplogVersion();
+      const candidateVersion = candidate.oplogVersion();
+      try {
+        const coverage = candidateVersion.compare(previousVersion);
+        if (coverage === undefined) {
+          throw new Error("concurrent bootstrap snapshot requires resync");
+        }
+        if (coverage <= 0) {
+          // This snapshot adds no operations. Do not replay it into warm state.
+          candidate.free();
+          ownsCandidate = false;
+          return this.importLoroUpdates(doc, updates.filter((_, i) => i !== snapshotIndex));
+        }
+      } finally {
+        candidateVersion.free();
+      }
+      // importBatch detaches and checks out the whole history after replay.
+      // Single imports retain the incremental state path and release each SQL
+      // row before reading the next. Track earlier pending spans explicitly:
+      // a later import with no pending entries does not prove they resolved.
+      let pendingEnds: Map<PeerID, number> | undefined;
+      const replay = (update: Uint8Array): void => {
+        if (update.length === 0) return;
+        const imported = candidate.import(update);
+        for (const [peer, span] of imported.pending ?? []) {
+          pendingEnds ??= new Map();
+          pendingEnds.set(peer, Math.max(pendingEnds.get(peer) ?? 0, span.end));
+        }
+      };
+      for (const row of this.ctx.storage.sql.exec("SELECT bytes FROM updates ORDER BY seq")) {
+        replay(new Uint8Array(row.bytes as ArrayBuffer));
+      }
+      for (const update of this.pending) replay(update);
+      for (let i = 0; i < updates.length; i++) {
+        if (i !== snapshotIndex) replay(updates[i]);
+      }
+      const mergedVersion = candidate.oplogVersion();
+      try {
+        const coverage = mergedVersion.compare(previousVersion);
+        if (coverage === undefined || coverage < 0) throw new Error("bootstrap lost retained operations");
+        for (const [peer, end] of pendingEnds ?? []) {
+          if ((mergedVersion.get(peer) ?? 0) < end) throw new Error("bootstrap snapshot does not cover retained dependencies");
+        }
+      } finally { mergedVersion.free(); }
+      // Equivalent frontiers prove state/oplog agreement without walking the
+      // causal DAG to reconstruct state.version() on a large lazy snapshot.
+      const state = candidate.frontiers();
+      const oplog = candidate.oplogFrontiers();
+      if (candidate.isDetached() || state.length !== oplog.length ||
+          !state.every((head) => oplog.some((other) => head.peer === other.peer && head.counter === other.counter))) {
+        throw new Error("incomplete bootstrap state");
+      }
+      // The incoming snapshot already covers all previously applied operations.
+      // Retain the delta log and buffered updates for the candidate's additions;
+      // cold replay imports this baseline before those deltas in the same order.
+      this.ctx.storage.transactionSync(() => this.blobs.put("snapshot", snapshot));
+      this.doc = candidate;
+      ownsCandidate = false;
+      doc.free();
+      this.recordLoroUpdates(updates, snapshotIndex);
+      return candidate;
+    } finally {
+      previousVersion?.free();
+      if (ownsCandidate) candidate.free();
+    }
+  }
+
+  private workspaceNotifications(): WorkspaceNotifications {
+    return this.notifications ??= new WorkspaceNotifications(this.ctx.storage, this.env);
+  }
+
+  private notifyWorkspace(doc: LoroDoc, projectScope: string, baseline = false): void {
+    let phase = "workspace_notifications_construct";
+    try {
+      const notifications = this.workspaceNotifications();
+      phase = "observe";
+      const events = notifications.observe(doc, baseline);
+      phase = "schedule_delivery";
+      if (events.length) {
+        this.ctx.waitUntil(notifications.deliver(events, projectScope).catch(() => {
+          console.warn("Crew push delivery failed");
+        }));
+      }
+    } catch (error) {
+      if (this.env.ENVIRONMENT === "staging") console.warn("Crew push observation failed", phase, (error instanceof Error ? error.message : String(error)).slice(0, 512));
+      else console.warn("Crew push observation failed");
+    }
+  }
+
   /** Durability bookkeeping for accepted %LOR updates: buffer for the flush
    * batch, dirty the tail/backup caches, keep the daily alarm armed. */
-  private recordLoroUpdates(updates: Uint8Array[]): void {
+  private recordLoroUpdates(updates: Uint8Array[], persistedSnapshotIndex = -1): void {
     let real = false;
-    for (const update of updates) {
+    for (let i = 0; i < updates.length; i++) {
+      const update = updates[i];
       if (update.length === 0) continue;
       real = true;
+      if (i === persistedSnapshotIndex) continue;
       this.pending.push(update);
       this.pendingBytes += update.length;
     }
@@ -923,13 +1084,36 @@ export class SessionRoom implements DurableObject {
       return;
     }
     let batches = this.fragments.get(ws);
+    if (
+      !Number.isSafeInteger(message.fragmentCount) ||
+      message.fragmentCount <= 0 ||
+      message.fragmentCount > MAX_FRAGMENT_COUNT ||
+      !Number.isSafeInteger(message.totalSizeBytes) ||
+      message.totalSizeBytes < 0 ||
+      message.totalSizeBytes > MAX_REASSEMBLED_BYTES
+    ) {
+      this.ack(ws, message, UpdateStatusCode.PayloadTooLarge, message.batchId);
+      return;
+    }
+    let reservedBytes = message.totalSizeBytes;
+    let reservedParts = message.fragmentCount;
+    for (const [id, batch] of batches ?? []) {
+      if (id === message.batchId) continue;
+      reservedBytes += batch.totalSize;
+      reservedParts += batch.parts.length;
+    }
+    if (reservedBytes > MAX_REASSEMBLED_BYTES || reservedParts > MAX_FRAGMENT_COUNT) {
+      this.ack(ws, message, UpdateStatusCode.PayloadTooLarge, message.batchId);
+      return;
+    }
     if (!batches) {
       batches = new Map();
       this.fragments.set(ws, batches);
     }
     batches.set(message.batchId, {
-      parts: Array.from({ length: message.fragmentCount }, () => new Uint8Array()),
+      parts: new Array<Uint8Array | undefined>(message.fragmentCount),
       received: 0,
+      receivedBytes: 0,
       totalSize: message.totalSizeBytes,
       header: message
     });
@@ -947,13 +1131,38 @@ export class SessionRoom implements DurableObject {
       this.ack(ws, message, UpdateStatusCode.FragmentTimeout, message.batchId);
       return;
     }
+    if (
+      message.crdt !== batch.header.crdt ||
+      message.roomId !== batch.header.roomId ||
+      !Number.isSafeInteger(message.index) ||
+      message.index < 0 ||
+      message.index >= batch.parts.length
+    ) {
+      this.fragments.get(ws)?.delete(message.batchId);
+      this.ack(ws, message, UpdateStatusCode.InvalidUpdate, message.batchId);
+      return;
+    }
+    // Retransmission must not count a part twice or complete a sparse batch.
+    if (batch.parts[message.index] !== undefined) return;
+    if (message.fragment.length > batch.totalSize - batch.receivedBytes) {
+      this.fragments.get(ws)?.delete(message.batchId);
+      this.ack(ws, message, UpdateStatusCode.PayloadTooLarge, message.batchId);
+      return;
+    }
     batch.parts[message.index] = message.fragment;
     batch.received++;
+    batch.receivedBytes += message.fragment.length;
     if (batch.received < batch.parts.length) return;
     this.fragments.get(ws)?.delete(message.batchId);
+    if (batch.receivedBytes !== batch.totalSize) {
+      this.ack(ws, message, UpdateStatusCode.InvalidUpdate, message.batchId);
+      return;
+    }
     const total = new Uint8Array(batch.totalSize);
     let off = 0;
     for (const part of batch.parts) {
+      // Every index was received exactly once before reaching this loop.
+      if (part === undefined) throw new Error("incomplete fragment batch");
       total.set(part, off);
       off += part.length;
     }
@@ -964,7 +1173,17 @@ export class SessionRoom implements DurableObject {
 
   private async ensureDoc(): Promise<LoroDoc> {
     this.touchDoc();
+    if (this.docLoad) return this.docLoad;
     if (this.doc) return this.doc;
+    this.docLoad = this.materializeDoc();
+    try {
+      return await this.docLoad;
+    } finally {
+      this.docLoad = undefined;
+    }
+  }
+
+  private async materializeDoc(): Promise<LoroDoc> {
     // AUTOMATED WEDGE BREAK: a cold replay that exceeds the DO CPU limit kills
     // the invocation before `replayAttempts` is cleared below — and every
     // reconnecting client cold-starts the room into the same death, forever
@@ -972,7 +1191,7 @@ export class SessionRoom implements DurableObject {
     // past the limit, drop the log+snapshot exactly like /reset-log does.
     // Recovery is by design lossless-enough: every engine holds the full doc
     // locally and re-uploads whatever the server lacks on its next join.
-    const attempts = Number(this.getMeta("replayAttempts") ?? "0");
+    let attempts = Number(this.getMeta("replayAttempts") ?? "0");
     if (attempts >= REPLAY_CRASH_LIMIT) {
       this.dropLog();
       // Boot every attached socket, exactly like POST /reset-log. The
@@ -983,13 +1202,8 @@ export class SessionRoom implements DurableObject {
       // (2026-08-04: work-metal's workspace status never updated again
       // after the 20:16Z wedge-break while its chat rooms streamed fine).
       // A close → redial → empty-VV join re-uploads full state instead.
-      for (const sock of this.ctx.getWebSockets()) {
-        try {
-          sock.close(4410, "room reset");
-        } catch {
-          /* already gone */
-        }
-      }
+      this.closeSocketsForRoomReset();
+      attempts = 0;
     }
     this.setMeta("replayAttempts", String(attempts + 1));
     // INCIDENT (2026-07-30): a CPU-limit kill ROLLS BACK the event's
@@ -1005,21 +1219,27 @@ export class SessionRoom implements DurableObject {
     const started = Date.now();
     const doc = new LoroDoc();
     const snapshot = this.blobs.get("snapshot");
-    if (snapshot && snapshot.length > 0) doc.import(snapshot);
+    if (snapshot && snapshot.length > 0) {
+      try {
+        doc.import(snapshot);
+      } catch (error) {
+        return await this.rejectPersistedLoroState(doc, "snapshot", error);
+      }
+    }
     let rows = 0;
     for (const row of this.ctx.storage.sql.exec("SELECT bytes FROM updates ORDER BY seq")) {
       rows++;
       try {
         doc.import(new Uint8Array(row.bytes as ArrayBuffer));
-      } catch {
-        // A poisoned row cannot be applied; skip it rather than brick the room.
+      } catch (error) {
+        return await this.rejectPersistedLoroState(doc, `update row ${rows}`, error);
       }
     }
     for (const update of this.pending) {
       try {
         doc.import(update);
-      } catch {
-        /* same */
+      } catch (error) {
+        return await this.rejectPersistedLoroState(doc, "buffered update", error);
       }
     }
     this.setMeta("replayAttempts", "0");
@@ -1095,6 +1315,44 @@ export class SessionRoom implements DurableObject {
     this.doc = undefined;
   }
 
+  private closeSocketsForRoomReset(): void {
+    for (const sock of this.ctx.getWebSockets()) {
+      try {
+        sock.close(4410, "room reset");
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+
+  /** A validated Loro import failure means the persisted replay cannot be a
+   * source of truth. Discard the whole baseline+log atomically: later rows may
+   * depend on the rejected bytes, so skipping only one row would persist a
+   * silently incomplete document at the next fold. Engines reconnect against
+   * an empty VV and re-upload their full local histories. */
+  private async rejectPersistedLoroState(
+    doc: LoroDoc,
+    source: string,
+    error: unknown
+  ): Promise<never> {
+    console.error(
+      "persisted Loro replay rejected; resetting room",
+      `room=${this.getMeta("chatId") ?? "?"}`,
+      `source=${source}`,
+      String(error)
+    );
+    try {
+      doc.free();
+    } catch {
+      /* a wasm panic may already have invalidated the handle */
+    }
+    this.doc = undefined;
+    this.dropLog();
+    await this.ctx.storage.sync();
+    this.closeSocketsForRoomReset();
+    throw error;
+  }
+
   /** Drop the persisted update log + snapshot (the /reset-log storage clear):
    * the next materialization starts empty and engines re-upload state on
    * rejoin. Preserves owner/chatId meta. */
@@ -1114,6 +1372,7 @@ export class SessionRoom implements DurableObject {
     // destroying the one copy that exists for the engine-never-returns case
     // (adversarial-review finding). Cleared by recordLoroUpdates.
     this.setMeta("postReset", "1");
+    this.setMeta("replayAttempts", "0");
   }
 
   private ensureEph(): EphemeralStore {
@@ -1168,11 +1427,37 @@ export class SessionRoom implements DurableObject {
   }
 
   private async flush(): Promise<void> {
+    if (this.flushInFlight) {
+      await this.flushInFlight;
+      return this.flush();
+    }
+    this.flushInFlight = this.flushPending();
+    try {
+      await this.flushInFlight;
+    } finally {
+      this.flushInFlight = undefined;
+    }
+  }
+
+  private async flushPending(): Promise<void> {
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = undefined;
     }
     if (this.pending.length === 0) return;
+    // A full backfill can exceed SQLite's per-value limit before the normal
+    // post-insert fold runs. Persist it through the existing chunked snapshot
+    // store instead; never split a Loro update into independently imported rows.
+    if (this.pending.some((update) => update.byteLength > CHUNK_BYTES)) {
+      const count = this.pending.length;
+      const bytes = this.pendingBytes;
+      await this.foldLog();
+      // Compaction yields for durability. Keep later arrivals buffered; the
+      // serialized flush boundary prevents another flush from draining them.
+      this.pending.splice(0, count);
+      this.pendingBytes -= bytes;
+      return;
+    }
     const now = Date.now();
     for (const update of this.pending) {
       this.ctx.storage.sql.exec(
@@ -1224,22 +1509,20 @@ export class SessionRoom implements DurableObject {
     const checkpoints = JSON.parse(this.getMeta("checkpoints") ?? "[]") as FrontierCheckpoint[];
     const cutoff = checkpoints.filter((c) => now - c.at >= RETAIN_MS).pop();
     let frontiers: { peer: `${number}`; counter: number }[];
-    // lastTrimAt alone gates the cutoff trim: the trim is durable (sync()
-    // below), and requiring doc.isShallow() re-fired it on EVERY cold start
-    // once a log fold re-exported the once-shallow doc as a regular
-    // snapshot (isShallow reads false after rematerializing from it) —
-    // observed as the same rooms "trimming" every few minutes all evening.
+    // The durable lastTrimAt marker identifies the cutoff already applied.
+    // A cold start or regular snapshot re-export must not re-trim that cutoff,
+    // regardless of the materialized document's shallow status.
     if (cutoff && this.getMeta("lastTrimAt") !== String(cutoff.at)) {
       frontiers = cutoff.frontiers.map((f) => ({ peer: f.peer as `${number}`, counter: f.counter }));
     } else if (
-      (this.blobs.get("snapshot")?.length ?? 0) + Number(this.getMeta("updateBytes") ?? "0") >
+      (this.blobs.byteLength("snapshot") ?? 0) +
+        Number(this.getMeta("updateBytes") ?? "0") +
+        this.pendingBytes >
       TRIM_FORCE_BYTES
     ) {
-      // Snapshot AND log bytes: after a wedge-break reset the re-uploaded
-      // full histories live as LOG ROWS against an empty snapshot (observed
-      // live: 0B snapshot + 119 rows replaying for 7 SECONDS), so a
-      // snapshot-only gate never fired while every cold start ballooned the
-      // heap with the same megabytes.
+      // Include buffered backfills: oversized updates fold without first
+      // becoming log rows. Otherwise their history misses the force-trim
+      // budget until a later flush or cold start.
       // No aged checkpoint but the full history is already a heap hazard:
       // trim at the current frontier (see TRIM_FORCE_BYTES).
       frontiers = doc.frontiers().map((f) => ({ peer: String(f.peer) as `${number}`, counter: f.counter }));
@@ -1255,11 +1538,6 @@ export class SessionRoom implements DurableObject {
       this.ctx.storage.sql.exec("DELETE FROM updates");
       this.setMeta("updateBytes", "0");
       this.setMeta("lastTrimAt", String(cutoff?.at ?? now));
-      // Make the trim durable NOW: a later kill in the same event (a join's
-      // backfill export on a pressed isolate — observed live 2026-08-04)
-      // rolls back uncommitted storage writes, silently resurrecting the
-      // full-history snapshot the trim just replaced.
-      await this.ctx.storage.sync();
       const fresh = new LoroDoc();
       fresh.import(shallow);
       this.doc = fresh;
@@ -1267,10 +1545,14 @@ export class SessionRoom implements DurableObject {
       // leaks it into the shared wasm heap exactly when trimming was
       // supposed to relieve it (see handleJoin).
       if (doc !== fresh) doc.free();
-      return true;
     } catch {
       return false;
     }
+    // The live document is already replaced before yielding, so accepted writes
+    // cannot land in the discarded pre-trim doc. A durability failure must
+    // propagate, not fall back to exporting that now-freed document.
+    await this.ctx.storage.sync();
+    return true;
   }
 
   private closeExpiredGrantSockets(now: number): void {

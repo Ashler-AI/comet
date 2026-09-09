@@ -20,7 +20,7 @@ enum RoomEvent {
 /// Sync must never fail silently (2026-07-31: a send that never left the
 /// device was indistinguishable from a working one — `try?` all the way
 /// down). Visible in Console.app / `log stream` under this subsystem.
-let roomLog = Logger(subsystem: "dev.cometnative.Comet", category: "sync")
+let roomLog = Logger(subsystem: Bundle.main.bundleIdentifier ?? "ai.ashler.crew", category: "sync")
 
 actor RoomClient {
     // Constants mirrored from room.rs.
@@ -45,20 +45,24 @@ actor RoomClient {
     static let livenessTickNs: UInt64 = 5_000_000_000
 
     let roomId: String
-    let doc: LoroDoc
+    private(set) var doc: LoroDoc
     let eph: EphemeralStore
     private let urlProvider: @Sendable () async -> URL?
     private let events: @Sendable (RoomEvent) -> Void
+    private let adoptSnapshot: @MainActor @Sendable (LoroDoc, LoroDoc) -> Bool
 
     private var socket: URLSessionWebSocketTask?
     private var receiveTask: Task<Void, Never>?
     private var pingTask: Task<Void, Never>?
     private var livenessTask: Task<Void, Never>?
+    private var reconnectTask: Task<Void, Never>?
     private var pending: [BatchId: [[UInt8]]] = [:]
     private var fragments: [BatchId: FragmentBuffer] = [:]
     private var joinedLor = false
     private var invalidRejoins = 0
     private var fullResyncRequested = false
+    private var snapshotRecoveryAttempted = false
+    private var serverVersion: VersionVector?
     private var backoffMs = RoomClient.backoffBaseMs
     private var lastInbound = DispatchTime.now()
     private var closed = false
@@ -85,12 +89,14 @@ actor RoomClient {
          doc: LoroDoc,
          ephTimeoutMs: Int64 = 30_000,
          urlProvider: @escaping @Sendable () async -> URL?,
-         events: @escaping @Sendable (RoomEvent) -> Void) {
+         events: @escaping @Sendable (RoomEvent) -> Void,
+         adoptSnapshot: @escaping @MainActor @Sendable (LoroDoc, LoroDoc) -> Bool) {
         self.roomId = roomId
         self.doc = doc
         self.eph = EphemeralStore(timeout: ephTimeoutMs)
         self.urlProvider = urlProvider
         self.events = events
+        self.adoptSnapshot = adoptSnapshot
     }
 
     // MARK: Lifecycle
@@ -106,6 +112,8 @@ actor RoomClient {
         receiveTask?.cancel()
         pingTask?.cancel()
         livenessTask?.cancel()
+        reconnectTask?.cancel()
+        reconnectTask = nil
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
         joinedLor = false
@@ -117,6 +125,12 @@ actor RoomClient {
         let gen = generation
         joinedLor = false
         fullResyncRequested = false
+        snapshotRecoveryAttempted = false
+        serverVersion = nil
+        // Batch ids belong to the old socket. Rejoin exports all missing
+        // operations from the durable doc's VV under fresh ids; keeping the
+        // old payloads here would retain them forever when their acks were lost.
+        pending.removeAll()
         fragments.removeAll()
         joinSentAt = nil
         joinIsProbe = false
@@ -160,7 +174,11 @@ actor RoomClient {
 
         pingTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: RoomClient.pingIntervalNs)
+                do {
+                    try await Task.sleep(nanoseconds: RoomClient.pingIntervalNs)
+                } catch {
+                    return
+                }
                 guard let self else { return }
                 await self.pingTick(gen: gen)
             }
@@ -168,7 +186,11 @@ actor RoomClient {
 
         livenessTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: RoomClient.livenessTickNs)
+                do {
+                    try await Task.sleep(nanoseconds: RoomClient.livenessTickNs)
+                } catch {
+                    return
+                }
                 guard let self else { return }
                 await self.livenessTick(gen: gen)
             }
@@ -191,17 +213,34 @@ actor RoomClient {
 
     private func scheduleReconnect(gen: Int) {
         guard gen == generation, !closed else { return }
+        // Invalidate callbacks before cancelling the socket. Its receive
+        // failure can otherwise schedule a second redial for this generation,
+        // leaving duplicate sockets and periodic tasks after both connect.
+        generation += 1
+        let reconnectGeneration = generation
+        reconnectTask?.cancel()
         socket?.cancel(with: .abnormalClosure, reason: nil)
         socket = nil
+        joinedLor = false
         receiveTask?.cancel()
         pingTask?.cancel()
         livenessTask?.cancel()
         let delay = backoffMs
         backoffMs = min(backoffMs * 2, RoomClient.backoffCapMs)
-        Task {
-            try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000)
-            await self.connect()
+        reconnectTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000)
+            } catch {
+                return
+            }
+            await self?.reconnectIfCurrent(gen: reconnectGeneration)
         }
+    }
+
+    private func reconnectIfCurrent(gen: Int) {
+        guard gen == generation, !closed else { return }
+        reconnectTask = nil
+        connect()
     }
 
     private func pingTick(gen: Int) async {
@@ -296,7 +335,7 @@ actor RoomClient {
             if crdt == .loro {
                 if code == .versionUnknown {
                     // Server can't diff from our VV — full snapshot backfill.
-                    await sendJoinLoro(version: [])
+                    await requestFullSnapshot()
                 } else {
                     // AuthFailed / AppError: back off and retry (token refresh
                     // may fix it on the next dial).
@@ -305,7 +344,7 @@ actor RoomClient {
             }
 
         case .docUpdate(let crdt, _, let updates, _):
-            applyRemote(crdt: crdt, updates: updates)
+            await applyRemote(crdt: crdt, updates: updates)
 
         case .docUpdateFragmentHeader(let crdt, _, let batchId, let count, let total):
             guard count > 0, count <= RoomClient.maxFragmentCount,
@@ -314,7 +353,7 @@ actor RoomClient {
                                                 received: 0, totalSize: Int(total))
 
         case .docUpdateFragment(_, _, let batchId, let index, let fragment):
-            onFragment(batchId: batchId, index: Int(index), fragment: fragment)
+            await onFragment(batchId: batchId, index: Int(index), fragment: fragment)
 
         case .ack(let crdt, _, let refId, let status):
             await onAck(crdt: crdt, refId: refId, status: status)
@@ -359,18 +398,9 @@ actor RoomClient {
             // non-empty envelope even when there is nothing to say, so a
             // byte-length gate made every liveness probe upload a no-op
             // DocUpdate that dirtied the room's caches (room.rs finding).
-            if !doc.oplogVv().isEmpty(), invalidRejoins < RoomClient.maxInvalidRejoins {
-                let serverVv: VersionVector
-                if version.isEmpty {
-                    serverVv = VersionVector()
-                } else {
-                    serverVv = (try? VersionVector.decode(bytes: Data(version))) ?? VersionVector()
-                }
-                if !serverVv.includesVv(other: doc.oplogVv()),
-                   let missing = try? doc.export(mode: .updates(from: serverVv)), !missing.isEmpty {
-                    await sendLoroUpdates([[UInt8](missing)])
-                }
-            }
+            serverVersion = version.isEmpty ? VersionVector()
+                : try? VersionVector.decode(bytes: Data(version))
+            await resubmitMissingUpdates()
             if wasProbe {
                 // A probe answer on an established session proves the room is
                 // alive — that is ALL it is for. Re-running the side effects
@@ -391,18 +421,34 @@ actor RoomClient {
         }
     }
 
-    private func applyRemote(crdt: CrdtType, updates: [[UInt8]]) {
+    private func applyRemote(crdt: CrdtType, updates: [[UInt8]]) async {
         switch crdt {
         case .loro:
             var imported = false
             for update in updates where !update.isEmpty {
-                if let _ = try? doc.importWith(bytes: Data(update), origin: "remote") {
-                    imported = true
-                } else if !fullResyncRequested {
-                    fullResyncRequested = true
-                    roomLog.error("room \(self.roomId, privacy: .public): remote update failed to import; requesting full snapshot resync")
-                    Task { await self.sendJoinLoro(version: []) }
+                let bytes = Data(update)
+                let status = try? doc.importWith(bytes: bytes, origin: "remote")
+                let complete = status.map { ($0.pending?.isEmpty ?? true) } ?? false
+                if complete, !doc.isDetached(), doc.stateVv() == doc.oplogVv() {
+                    imported = imported || !(status?.success.isEmpty ?? true)
+                    continue
                 }
+                // Pending is NOT success: a warm replica can have equal state
+                // and oplog VVs while the entire server backfill stays pending.
+                if !snapshotRecoveryAttempted,
+                   let replacement = DocDisk.replacementSnapshot(bytes: bytes) {
+                    snapshotRecoveryAttempted = true
+                    let previous = doc
+                    if await adoptSnapshot(previous, replacement) {
+                        doc = replacement
+                        imported = true
+                        roomLog.info("room \(self.roomId, privacy: .public): adopted complete snapshot and retained local operations")
+                        await resubmitMissingUpdates()
+                        continue
+                    }
+                    roomLog.error("room \(self.roomId, privacy: .public): snapshot handoff rejected; retaining current replica")
+                }
+                await requestFullSnapshot()
             }
             if imported { events(.remoteUpdate) }
         case .loroEphemeral:
@@ -414,7 +460,32 @@ actor RoomClient {
         }
     }
 
-    private func onFragment(batchId: BatchId, index: Int, fragment: [UInt8]) {
+    private func requestFullSnapshot() async {
+        // Coalesce incomplete batches/fragments and version-unknown replies.
+        // A failed recovery retains the cache; it must not spin on empty joins.
+        guard !fullResyncRequested else { return }
+        fullResyncRequested = true
+        roomLog.warning("room \(self.roomId, privacy: .public): incomplete import; requesting full snapshot")
+        await sendJoinLoro(version: [])
+    }
+
+    private func resubmitMissingUpdates() async {
+        guard joinedLor, invalidRejoins < RoomClient.maxInvalidRejoins,
+              let serverVersion, !serverVersion.includesVv(other: doc.oplogVv())
+        else { return }
+        // Bootstrap an empty peer with state; replaying all operations can
+        // exhaust the edge's bounded WASM heap before the first snapshot fold.
+        let mode: ExportMode = serverVersion.isEmpty() ? .snapshot
+            : .updates(from: serverVersion)
+        guard var missing = try? doc.export(mode: mode), !missing.isEmpty else { return }
+        if !serverVersion.isEmpty(), missing.count > RoomClient.fragmentBytes,
+           let snapshot = try? doc.export(mode: .snapshot), snapshot.count < missing.count {
+            missing = snapshot
+        }
+        await sendLoroUpdates([[UInt8](missing)])
+    }
+
+    private func onFragment(batchId: BatchId, index: Int, fragment: [UInt8]) async {
         guard var buffer = fragments[batchId] else { return }
         guard index < buffer.parts.count else {
             fragments.removeValue(forKey: batchId)
@@ -430,7 +501,7 @@ actor RoomClient {
         var total: [UInt8] = []
         total.reserveCapacity(buffer.totalSize)
         for part in buffer.parts { total.append(contentsOf: part ?? []) }
-        applyRemote(crdt: buffer.crdt, updates: [total])
+        await applyRemote(crdt: buffer.crdt, updates: [total])
     }
 
     private func onAck(crdt: CrdtType, refId: BatchId, status: UpdateStatusCode) async {
