@@ -213,6 +213,13 @@ struct TranscriptView: View {
             case .user(let text):
                 UserBubble(text: text, pending: row.timestamp == nil)
 
+            case .peerMessage(let text):
+                PeerMessageView(text: text, open: folds[row.id] ?? false) {
+                    withAnimation(reduceMotion ? nil : Motion.resize) {
+                        folds[row.id] = !(folds[row.id] ?? false)
+                    }
+                }
+
             case .markdown(let block, let streaming):
                 MarkdownRowView(row: row, block: block, streaming: streaming, veils: veils)
 
@@ -327,6 +334,46 @@ struct UserBubble: View {
                 }
         }
         .frame(maxWidth: .infinity, alignment: .trailing)
+    }
+}
+
+// MARK: - Inter-session message disclosure
+
+struct PeerMessageView: View {
+    let text: String
+    let open: Bool
+    let toggle: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button(action: toggle) {
+                HStack(spacing: 8) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(Theme.textMuted)
+                        .rotationEffect(.degrees(open ? 90 : 0))
+                        .frame(width: 18, height: 18)
+                        .background(whiteAlpha(0.06), in: RoundedRectangle(cornerRadius: 5))
+                    Text("Inter-session message")
+                        .font(Theme.sans(12))
+                        .foregroundStyle(Theme.textMuted)
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                }
+                .frame(height: 26)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(PressWashButtonStyle(cornerRadius: 6))
+            .accessibilityLabel("Inter-session message")
+            .accessibilityValue(open ? "Expanded" : "Collapsed")
+            .accessibilityHint(open ? "Collapse message" : "Reveal message")
+
+            // Do not instantiate the body or its copy menu while collapsed.
+            if open {
+                UserBubble(text: text)
+                    .padding(.top, 2)
+            }
+        }
     }
 }
 

@@ -349,6 +349,7 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
             device_id: "dev-crash".into(),
             status: Some(MessageStatus::Complete),
             continuation_of: None,
+            peer_message: None,
         })
         .unwrap();
         doc.push_message(&SessionMessageEntry {
@@ -362,6 +363,7 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
             device_id: "dev-crash".into(),
             status: Some(MessageStatus::Streaming),
             continuation_of: None,
+            peer_message: None,
         })
         .unwrap();
         store
@@ -595,6 +597,7 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
             device_id: "dev-crash".into(),
             status: Some(MessageStatus::Complete),
             continuation_of: None,
+            peer_message: None,
         })
         .unwrap();
         doc.push_message(&SessionMessageEntry {
@@ -608,6 +611,7 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
             device_id: "dev-crash".into(),
             status: Some(MessageStatus::Streaming),
             continuation_of: None,
+            peer_message: None,
         })
         .unwrap();
         store

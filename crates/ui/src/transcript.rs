@@ -264,6 +264,11 @@ pub enum RowKind {
         pending: bool,
         delivery: UserDelivery,
     },
+    /// Native peer transport text, kept verbatim and never projected as mentions
+    /// or attachments. Only an explicit reveal mounts this body.
+    PeerMessage {
+        text: SharedString,
+    },
     /// One top-level markdown block of a completed message.
     Markdown {
         tree: Arc<BlockTree>,
@@ -427,12 +432,21 @@ pub fn rows_for_entry(
             })
             .collect::<Vec<_>>()
             .join("\n\n");
+        if entry.is_peer_message() {
+            return vec![Row {
+                id: entry_id.clone(),
+                version: entry_fingerprint(entry, pending),
+                turn_start: true,
+                kind: RowKind::PeerMessage { text: raw.into() },
+                entry_id,
+                timestamp: Some(entry.created_at),
+            }];
+        }
         // Attachment refs ride the plain text transport; split them back out
         // for the image thumbnail and file-card strips.
         let parsed = crate::attachments::parse_user_message_attachments(&raw);
         // File mentions render as chips here too, not just in the composer.
-        // The projection is pure over the text, so the raw-length row version
-        // below stays a valid cache/diff key.
+        // The row version hashes the original transport text.
         let (text, mentions) = match crate::composer::sent_mention_display(&parsed.text) {
             Some((display, spans)) => (display, spans),
             None => (parsed.text, Vec::new()),
@@ -444,7 +458,7 @@ pub fn rows_for_entry(
         };
         return vec![Row {
             id: entry.id.clone().into(),
-            version: (raw.len() as u64) << 3 | (delivery as u64) << 1 | pending as u64,
+            version: entry_fingerprint(entry, pending),
             turn_start: true,
             kind: RowKind::User {
                 text: text.into(),
@@ -1020,6 +1034,44 @@ fn splice_entry_rows<T>(
 const RENDER_WINDOW_CHAT_LIMIT: usize = 8;
 const RENDER_WINDOW_ROW_LIMIT: usize = 4096;
 
+/// Reveal state is local to this attachment, not part of cached transcript rows.
+/// A changed body must be explicitly revealed again, even under the same id.
+#[derive(Default)]
+struct PeerMessageVisibility {
+    revealed: HashMap<SharedString, u64>,
+}
+
+impl PeerMessageVisibility {
+    fn body<'a>(&self, row: &'a Row) -> Option<&'a SharedString> {
+        match &row.kind {
+            RowKind::PeerMessage { text }
+                if self.revealed.get(&row.id) == Some(&row.version) => Some(text),
+            _ => None,
+        }
+    }
+
+    fn toggle(&mut self, row: &Row) {
+        if self.body(row).is_some() {
+            self.revealed.remove(&row.id);
+        } else if matches!(&row.kind, RowKind::PeerMessage { .. }) {
+            self.revealed.insert(row.id.clone(), row.version);
+        }
+    }
+
+    fn retain_rows(&mut self, rows: &[Row]) {
+        self.revealed.retain(|id, version| {
+            rows.iter().any(|row| {
+                &row.id == id && row.version == *version
+                    && matches!(&row.kind, RowKind::PeerMessage { .. })
+            })
+        });
+    }
+
+    fn clear(&mut self) {
+        self.revealed.clear();
+    }
+}
+
 struct CachedTranscriptRender {
     rows: Vec<Row>,
     entry_row_counts: Vec<usize>,
@@ -1097,6 +1149,7 @@ pub struct Transcript {
     render_windows: HashMap<String, CachedTranscriptRender>,
     render_window_lru: Vec<String>,
     folds: HashMap<SharedString, FoldState>,
+    peer_visibility: PeerMessageVisibility,
     /// Expanded chips (tool part ids) — pane state, cleared on chat switch
     /// like `folds`.
     expanded_tools: std::collections::HashSet<SharedString>,
@@ -1204,6 +1257,7 @@ impl Transcript {
             render_windows: HashMap::new(),
             render_window_lru: Vec::new(),
             folds: HashMap::new(),
+            peer_visibility: PeerMessageVisibility::default(),
             expanded_tools: std::collections::HashSet::new(),
             tool_details: HashMap::new(),
             tool_detail_loads: HashMap::new(),
@@ -1626,6 +1680,7 @@ impl Transcript {
         let missed_revision = !attached
             && (change.revision != revision || revision != self.state_revision.wrapping_add(1));
         self.state_revision = revision;
+        let revealed_before = self.peer_visibility.revealed.len();
         let echoes = state.pending_echoes();
         let entries = &state.transcript;
         if attached {
@@ -1687,6 +1742,8 @@ impl Transcript {
             }
             self.live_parsers.clear();
             self.folds.clear();
+            self.peer_visibility.clear();
+            crate::markdown::selection::clear();
             self.expanded_tools.clear();
             self.tool_details.clear();
             self.tool_detail_loads.clear();
@@ -1719,6 +1776,10 @@ impl Transcript {
             || matches!(&change.entries, TranscriptEntriesChange::Reset)
             || !splice_valid
             || !echo_shape_valid;
+        if matches!(&change.entries, TranscriptEntriesChange::Reset) {
+            self.peer_visibility.clear();
+            crate::markdown::selection::clear();
+        }
         let was_empty = self.rows.is_empty();
         let changed = if full_rebuild {
             self.cache_prune_needed = true;
@@ -1792,7 +1853,13 @@ impl Transcript {
             self.cache_prune_needed = false;
         }
 
-        if !changed {
+        self.peer_visibility.retain_rows(&self.rows);
+        let visibility_changed = self.peer_visibility.revealed.len() != revealed_before;
+        if visibility_changed {
+            crate::markdown::selection::clear();
+            self.list.remeasure_items(0..self.rows.len());
+        }
+        if !changed && !visibility_changed {
             return;
         }
         if self.pinned {
@@ -2455,6 +2522,9 @@ impl Transcript {
                 }
                 column.into_any_element()
             }
+            RowKind::PeerMessage { .. } => {
+                self.render_peer_message(&row, &theme, cx)
+            }
             RowKind::Markdown { tree, block_ix } => {
                 let Some(top) = tree.blocks.get(*block_ix) else {
                     return gpui::Empty.into_any_element();
@@ -2811,6 +2881,80 @@ impl Transcript {
             self.chat_id.clone(),
             cx,
         )
+    }
+
+    fn render_peer_message(
+        &mut self,
+        row: &Row,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let body = self.peer_visibility.body(row).cloned();
+        let open = body.is_some();
+        let toggle_id = row.id.clone();
+        let header = div()
+            .id(SharedString::from(format!("{}-peer-hdr", row.id)))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(4.0))
+            .h(px(26.0))
+            .cursor_pointer()
+            .text_size(px(12.0))
+            .text_color(theme.text_muted)
+            .hover(|s| s.text_color(theme.text))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(ix) = this.rows.iter().position(|row| row.id == toggle_id) {
+                    this.peer_visibility.toggle(&this.rows[ix]);
+                    this.list.remeasure_items(ix..ix + 1);
+                    crate::markdown::selection::clear();
+                    cx.notify();
+                }
+            }))
+            .child(
+                div()
+                    .size(px(18.0))
+                    .flex_none()
+                    .rounded(px(5.0))
+                    .bg(crate::theme::ink(0.06))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(10.0))
+                    .text_color(theme.text_muted.opacity(0.7))
+                    .child(if open { "▾" } else { "▸" }),
+            )
+            .child(if open {
+                "Inter-session message · Hide"
+            } else {
+                "Inter-session message · Show"
+            });
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(header)
+            .when_some(body, |el, text| {
+                el.child(
+                    div()
+                        .min_w_0()
+                        .px(px(16.0))
+                        .py(px(10.0))
+                        .rounded(px(Theme::BUBBLE_RADIUS))
+                        .bg(theme.surface_raised)
+                        .text_size(px(14.0))
+                        .line_height(px(22.0))
+                        .text_color(theme.text)
+                        .child(render::selectable_styled_text(
+                            format!("{}#peer:0", row.id).into(),
+                            text.clone(),
+                            StyledText::new(text),
+                            theme,
+                        )),
+                )
+            })
+            .into_any_element()
     }
 
     fn render_tool_group(
@@ -3464,6 +3608,13 @@ fn tool_detail_pane(
 fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
     let mut acc: Vec<u8> = Vec::with_capacity(entry.parts.len() * 8 + 16);
     acc.extend_from_slice(entry.id.as_bytes());
+    acc.push(match entry.role {
+        MessageRole::User => 0,
+        MessageRole::Assistant => 1,
+        MessageRole::System => 2,
+    });
+    acc.push(entry.is_peer_message() as u8);
+    acc.extend_from_slice(&entry.created_at.to_le_bytes());
     acc.push(match entry.status {
         None => 0,
         Some(MessageStatus::Streaming) => 1,
@@ -3476,6 +3627,18 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
     for part in &entry.parts {
         acc.extend_from_slice(part.id().as_bytes());
         acc.extend_from_slice(&(part.byte_len() as u64).to_le_bytes());
+        if entry.role == MessageRole::User {
+            match part {
+                MessagePart::Text { text, .. } => {
+                    acc.extend_from_slice(&fnv1a(text.as_bytes()).to_le_bytes());
+                }
+                MessagePart::TextWindow { text, omitted_prefix_bytes, .. } => {
+                    acc.extend_from_slice(&fnv1a(text.as_bytes()).to_le_bytes());
+                    acc.extend_from_slice(&omitted_prefix_bytes.to_le_bytes());
+                }
+                _ => {}
+            }
+        }
         if let MessagePart::Tool {
             is_error, resolved, ..
         } = part
@@ -3927,6 +4090,7 @@ mod tests {
             device_id: "dev".into(),
             status: Some(status),
             continuation_of: None,
+            peer_message: None,
         }
     }
 
@@ -4166,6 +4330,77 @@ mod tests {
             &echoed[0].kind,
             RowKind::User { pending: true, .. }
         ));
+    }
+
+    fn peer_entry(text: &str) -> SessionMessageEntry {
+        let mut entry = assistant("peer-command", MessageStatus::Complete, vec![text_part("t0", text)]);
+        entry.role = MessageRole::User;
+        entry.peer_message = Some(comet_proto::PeerMessageProvenance {
+            command_id: entry.id.clone(),
+            source_chat_id: "source".into(),
+            thread_id: "thread".into(),
+            reply_to: None,
+        });
+        entry
+    }
+
+    #[test]
+    fn peer_rows_reveal_exact_transport_and_collapse() {
+        let raw = crate::attachments::with_attachment_files(
+            "  [src/lib.rs](file:///repo/src/lib.rs)\n\nPeer message from another session  ",
+            &["/data/uploads/image.png".into()],
+            &["/data/uploads/source.txt".into()],
+        );
+        let mut entry = peer_entry(&raw);
+        entry.status = Some(MessageStatus::Streaming);
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(&rows[0].kind, RowKind::PeerMessage { .. }));
+        let mut visibility = PeerMessageVisibility::default();
+        assert!(visibility.body(&rows[0]).is_none());
+        visibility.toggle(&rows[0]);
+        assert_eq!(visibility.body(&rows[0]).map(|text| text.as_ref()), Some(raw.as_str()));
+        visibility.toggle(&rows[0]);
+        assert!(visibility.body(&rows[0]).is_none());
+    }
+
+    #[test]
+    fn peer_reveal_does_not_survive_replacement_removal_or_reattachment() {
+        let mut entry = peer_entry("first");
+        let first = rows_for_entry(&entry, false, &mut parse);
+        let mut visibility = PeerMessageVisibility::default();
+        visibility.toggle(&first[0]);
+        entry.parts = vec![text_part("t0", "other")];
+        let replacement = rows_for_entry(&entry, false, &mut parse);
+        visibility.retain_rows(&replacement);
+        assert!(visibility.body(&replacement[0]).is_none());
+        assert!(visibility.body(&first[0]).is_none());
+        visibility.toggle(&replacement[0]);
+        visibility.clear();
+        assert!(visibility.body(&replacement[0]).is_none());
+        visibility.toggle(&replacement[0]);
+        visibility.retain_rows(&[]);
+        assert!(visibility.body(&replacement[0]).is_none());
+    }
+
+    #[test]
+    fn peer_lookalikes_invalid_metadata_and_assistants_stay_visible() {
+        let text = "[Peer message from worker] keep this ordinary prompt visible";
+        let mut entry = peer_entry(text);
+        entry.peer_message = None;
+        let ordinary = rows_for_entry(&entry, false, &mut parse);
+        assert!(matches!(&ordinary[0].kind, RowKind::User { text: body, .. } if body.as_ref() == text));
+        entry = peer_entry(text);
+        entry.peer_message.as_mut().unwrap().command_id = "different".into();
+        let invalid = rows_for_entry(&entry, false, &mut parse);
+        assert!(matches!(&invalid[0].kind, RowKind::User { text: body, .. } if body.as_ref() == text));
+        entry = peer_entry(text);
+        let peer = rows_for_entry(&entry, false, &mut parse);
+        assert!(diff_rows(&ordinary, &peer).is_some());
+        assert!(diff_rows(&peer, &invalid).is_some());
+        entry.role = MessageRole::Assistant;
+        let assistant = rows_for_entry(&entry, false, &mut parse);
+        assert!(matches!(&assistant[0].kind, RowKind::Markdown { .. }));
     }
 
     #[test]
@@ -4505,6 +4740,7 @@ mod tests {
             device_id: "dev".into(),
             status: None,
             continuation_of: None,
+            peer_message: None,
         };
         let rows = rows_for_entry(&user, true, &mut parse);
         assert_eq!(rows.len(), 1);

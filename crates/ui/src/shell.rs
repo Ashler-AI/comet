@@ -8992,6 +8992,7 @@ mod tests {
             device_id: "device".into(),
             status: Some(comet_doc::MessageStatus::Streaming),
             continuation_of: None,
+            peer_message: None,
         }
     }
 
@@ -9114,6 +9115,7 @@ mod tests {
             device_id: "device".into(),
             status: Some(comet_doc::MessageStatus::Complete),
             continuation_of: None,
+            peer_message: None,
         };
         let active = goal_entry(
             "active",
@@ -9151,6 +9153,7 @@ mod tests {
                 device_id: "device".into(),
                 status: Some(comet_doc::MessageStatus::Complete),
                 continuation_of: None,
+                peer_message: None,
             };
         let entries = vec![
             todo_entry(
@@ -9214,6 +9217,7 @@ mod tests {
             device_id: "device".into(),
             status: Some(comet_doc::MessageStatus::Complete),
             continuation_of: None,
+            peer_message: None,
         };
         let entries = vec![
             tool_entry(

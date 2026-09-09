@@ -7,14 +7,15 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 
 use comet_doc::{
-    MessagePart, SessionCommandEntry, SessionCommandPayload, SessionCommandStatus,
-    SessionMessageEntry,
+    MessagePart, MessageRole, MessageStatus, SessionCommandEntry, SessionCommandPayload,
+    SessionCommandStatus, SessionMessageEntry,
 };
 use comet_engine::{EngineCore, HarnessRegistry};
-use comet_harness::{Harness, HarnessError, RunControls};
+use comet_harness::{Harness, HarnessError, RunControls, SteerMessage};
+use comet_engine::doc_host::peer_message_prompt;
 use comet_proto::{
-    AgentEvent, ChatConfig, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest,
-    RuntimeProfile, SandboxLevel, SteeringMode,
+    AgentEvent, ChatConfig, DoneStatus, HarnessId, Model, PeerMessageProvenance, ReasoningLevel,
+    RunRequest, RuntimeProfile, SandboxLevel, SteeringMode,
 };
 use comet_rpc::methods;
 use tokio::sync::Mutex;
@@ -31,6 +32,7 @@ type RequestLog = Arc<Mutex<Vec<RunRequest>>>;
 struct RecordingHarness {
     requests: RequestLog,
     run_number: AtomicU64,
+    steering: Option<(SteeringMode, tokio::sync::mpsc::UnboundedSender<SteerMessage>)>,
 }
 
 #[async_trait]
@@ -44,11 +46,11 @@ impl Harness for RecordingHarness {
     }
 
     fn supports_steering(&self) -> bool {
-        false
+        self.steering.is_some()
     }
 
     fn steering_mode(&self) -> SteeringMode {
-        SteeringMode::TurnBoundary
+        self.steering.as_ref().map_or(SteeringMode::TurnBoundary, |(mode, _)| *mode)
     }
 
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
@@ -62,11 +64,43 @@ impl Harness for RecordingHarness {
     async fn run(
         &self,
         request: RunRequest,
-        _controls: RunControls,
+        mut controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         self.requests.lock().await.push(request.clone());
         let number = self.run_number.fetch_add(1, Ordering::Relaxed);
         let session_id = format!("peer-session-{number}");
+        if let Some((_, received)) = &self.steering {
+            let received = received.clone();
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                let _ = tx.send(Ok(AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-peer".into(),
+                    tools: Vec::new(),
+                    cwd: request.cwd,
+                    session_id: session_id.clone(),
+                    assistant_message_id: format!("peer-assistant-{number}"),
+                }));
+                loop {
+                    tokio::select! {
+                        _ = controls.interrupt.cancelled() => break,
+                        message = controls.steering.recv() => {
+                            let Some(message) = message else { break; };
+                            if received.send(message).is_err() { break; }
+                        }
+                    }
+                }
+                let _ = tx.send(Ok(AgentEvent::Done {
+                    status: DoneStatus::Interrupted,
+                    result: None,
+                    error: None,
+                    session_id: Some(session_id),
+                }));
+            });
+            return Ok(futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|event| (event, rx))
+            }).boxed());
+        }
         let events = vec![
             Ok(AgentEvent::SessionStarted {
                 harness: HarnessId::Mock,
@@ -89,6 +123,13 @@ impl Harness for RecordingHarness {
 }
 
 fn assemble(dir: &std::path::Path) -> (EngineCore, RequestLog) {
+    assemble_with_steering(dir, None)
+}
+
+fn assemble_with_steering(
+    dir: &std::path::Path,
+    steering: Option<(SteeringMode, tokio::sync::mpsc::UnboundedSender<SteerMessage>)>,
+) -> (EngineCore, RequestLog) {
     std::fs::create_dir_all(dir).expect("create data dir");
     std::fs::write(dir.join("device-id"), "peer-test-device").expect("write device id");
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -96,6 +137,7 @@ fn assemble(dir: &std::path::Path) -> (EngineCore, RequestLog) {
     registry.register(Arc::new(RecordingHarness {
         requests: requests.clone(),
         run_number: AtomicU64::new(1),
+        steering,
     }));
     let core = EngineCore::assemble(dir, Arc::new(registry), HarnessId::Mock, None)
         .expect("engine core assembles");
@@ -163,21 +205,6 @@ fn message_text(core: &EngineCore, chat_id: &str, message_id: &str) -> Option<St
                 _ => None,
             })
         })
-}
-
-fn expected_prompt(
-    source_chat_id: &str,
-    thread_id: &str,
-    target_chat_id: &str,
-    command_id: &str,
-    text: &str,
-) -> String {
-    format!(
-        "Message from Crew session {source_chat_id} (thread {thread_id}):\n\n\
-         {text}\n\n\
-         To reply through Crew, run:\n\
-         comet session reply --session {target_chat_id} --command {command_id} \"<reply>\""
-    )
 }
 
 #[tokio::test]
@@ -255,7 +282,7 @@ async fn send_auto_refs_foreign_target_and_dedupes_caller_command_id() {
 }
 
 #[tokio::test]
-async fn peer_message_delivers_the_visible_prompt_and_reply_uses_stored_source() {
+async fn peer_message_provenance_preserves_delivery_reply_correlation_and_restart() {
     let dir = tempfile::tempdir().unwrap();
     let (core, requests) = assemble(dir.path());
     host_chats(&core, &[SOURCE, TARGET]);
@@ -273,7 +300,7 @@ async fn peer_message_delivers_the_visible_prompt_and_reply_uses_stored_source()
         )
         .await
         .expect("send peer message");
-    let delivered = expected_prompt(SOURCE, COMMAND, TARGET, COMMAND, "review the patch");
+    let delivered = peer_message_prompt(SOURCE, COMMAND, TARGET, COMMAND, "review the patch");
     wait_for(
         || {
             command(&core, TARGET, COMMAND)
@@ -292,8 +319,16 @@ async fn peer_message_delivers_the_visible_prompt_and_reply_uses_stored_source()
             .await
             .iter()
             .any(|request| request.prompt == delivered),
-        "the harness and transcript must receive the same visible prompt"
+        "the harness and transcript must receive the same original prompt"
     );
+    let target_entry = entries(&core, TARGET).into_iter().find(|e| e.id == COMMAND).unwrap();
+    assert!(target_entry.is_peer_message());
+    assert_eq!(target_entry.peer_message, Some(PeerMessageProvenance {
+        command_id: COMMAND.into(),
+        source_chat_id: SOURCE.into(),
+        thread_id: COMMAND.into(),
+        reply_to: None,
+    }));
 
     let reply = client
         .call(
@@ -331,7 +366,7 @@ async fn peer_message_delivers_the_visible_prompt_and_reply_uses_stored_source()
             && thread_id == COMMAND
             && reply_to == COMMAND
     ));
-    let reply_prompt = expected_prompt(TARGET, COMMAND, SOURCE, reply_id, "the patch is clean");
+    let reply_prompt = peer_message_prompt(TARGET, COMMAND, SOURCE, reply_id, "the patch is clean");
     assert_eq!(
         message_text(&core, SOURCE, reply_id).as_deref(),
         Some(reply_prompt.as_str())
@@ -343,8 +378,27 @@ async fn peer_message_delivers_the_visible_prompt_and_reply_uses_stored_source()
             .iter()
             .any(|request| request.prompt == reply_prompt)
     );
+    let source_entry = entries(&core, SOURCE).into_iter().find(|e| e.id == reply_id).unwrap();
+    assert!(source_entry.is_peer_message());
+    assert_eq!(source_entry.peer_message, Some(PeerMessageProvenance {
+        command_id: reply_id.into(),
+        source_chat_id: TARGET.into(),
+        thread_id: COMMAND.into(),
+        reply_to: Some(COMMAND.into()),
+    }));
 
     core.shutdown().await;
+    drop(client);
+    drop(core);
+    let (restarted, restart_requests) = assemble(dir.path());
+    for (chat_id, expected) in [(TARGET, target_entry), (SOURCE, source_entry)] {
+        let restored = entries(&restarted, chat_id).into_iter().find(|e| e.id == expected.id).unwrap();
+        assert_eq!(restored, expected);
+        assert!(restored.is_peer_message());
+        assert_eq!(command(&restarted, chat_id, &restored.id).unwrap().status, SessionCommandStatus::Applied);
+    }
+    assert!(restart_requests.lock().await.is_empty(), "restart must not redeliver settled peer commands");
+    restarted.shutdown().await;
 }
 
 #[tokio::test]
@@ -365,7 +419,7 @@ async fn peer_reply_rejects_a_delivered_hop_eight_command() {
             },
         )
         .expect("queue hop-eight command");
-    let delivered = expected_prompt(SOURCE, COMMAND, TARGET, HOP_COMMAND, "final hop");
+    let delivered = peer_message_prompt(SOURCE, COMMAND, TARGET, HOP_COMMAND, "final hop");
     wait_for(
         || {
             command(&core, TARGET, HOP_COMMAND)
@@ -422,7 +476,7 @@ async fn live_waiter_returns_reply_without_double_delivering_to_harness() {
     let send_client = comet_rpc::memory_client(core.rpc_service());
     let reply_client = comet_rpc::memory_client(core.rpc_service());
     let target_prompt =
-        expected_prompt(SOURCE, WAIT_COMMAND, TARGET, WAIT_COMMAND, "please answer");
+        peer_message_prompt(SOURCE, WAIT_COMMAND, TARGET, WAIT_COMMAND, "please answer");
 
     let send = tokio::spawn(async move {
         send_client
@@ -483,7 +537,7 @@ async fn live_waiter_returns_reply_without_double_delivering_to_harness() {
         "waiter reply status",
     )
     .await;
-    let reply_prompt = expected_prompt(TARGET, WAIT_COMMAND, SOURCE, &reply_id, "waiter answer");
+    let reply_prompt = peer_message_prompt(TARGET, WAIT_COMMAND, SOURCE, &reply_id, "waiter answer");
     let transcript = entries(&core, SOURCE);
     assert_eq!(
         transcript
@@ -491,12 +545,15 @@ async fn live_waiter_returns_reply_without_double_delivering_to_harness() {
             .filter(|entry| entry.id == reply_id)
             .count(),
         1,
-        "the waiter path still records one visible transcript entry"
+        "the waiter path still records exactly one inspectable transcript entry"
     );
     assert_eq!(
         message_text(&core, SOURCE, &reply_id).as_deref(),
         Some(reply_prompt.as_str())
     );
+    let peer = transcript.iter().find(|entry| entry.id == reply_id).unwrap();
+    assert!(peer.is_peer_message());
+    assert_eq!(peer.peer_message.as_ref().unwrap().reply_to.as_deref(), Some(WAIT_COMMAND));
     {
         let logged = requests.lock().await;
         assert_eq!(
@@ -516,13 +573,11 @@ async fn timed_out_waiter_allows_a_late_reply_to_deliver_normally() {
     let (core, requests) = assemble(dir.path());
     host_chats(&core, &[SOURCE, TARGET]);
     let client = comet_rpc::memory_client(core.rpc_service());
-    let target_prompt = expected_prompt(
-        SOURCE,
-        LATE_COMMAND,
-        TARGET,
-        LATE_COMMAND,
-        "answer after timeout",
-    );
+    let target_prompt = peer_message_prompt(SOURCE,
+    LATE_COMMAND,
+    TARGET,
+    LATE_COMMAND,
+    "answer after timeout",);
 
     let timed_out = client
         .call(
@@ -558,7 +613,7 @@ async fn timed_out_waiter_allows_a_late_reply_to_deliver_normally() {
         .as_str()
         .expect("late reply command id")
         .to_owned();
-    let reply_prompt = expected_prompt(TARGET, LATE_COMMAND, SOURCE, &reply_id, "late answer");
+    let reply_prompt = peer_message_prompt(TARGET, LATE_COMMAND, SOURCE, &reply_id, "late answer");
     wait_for(
         || {
             command(&core, SOURCE, &reply_id)
@@ -580,6 +635,100 @@ async fn timed_out_waiter_allows_a_late_reply_to_deliver_normally() {
         2,
         "target delivery plus the post-timeout source delivery"
     );
+    assert!(entries(&core, SOURCE).iter().find(|entry| entry.id == reply_id).unwrap().is_peer_message());
 
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn peer_visibility_preserves_active_steering_and_turn_boundary_delivery() {
+    for (mode, expected_status) in [
+        (SteeringMode::StepBoundary, MessageStatus::Steered),
+        (SteeringMode::TurnBoundary, MessageStatus::Queued),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (received, mut steering) = tokio::sync::mpsc::unbounded_channel();
+        let (core, requests) = assemble_with_steering(dir.path(), Some((mode, received)));
+        host_chats(&core, &[SOURCE, TARGET]);
+        let lookalike = peer_message_prompt(SOURCE, COMMAND, TARGET, COMMAND, "ordinary typed message");
+        core.sessions.dispatch(TARGET, HarnessId::Mock, RunRequest {
+            prompt: lookalike.clone(),
+            model: None,
+            agent_account_id: None,
+            reasoning: None,
+            model_options: Default::default(),
+            cwd: "/tmp/peer".into(),
+            sandbox: SandboxLevel::WorkspaceWrite,
+            auto_approve: true,
+            attachments: Vec::new(),
+            resume: None,
+        }, Some("ordinary-user".into())).await.unwrap();
+        let ordinary = entries(&core, TARGET).into_iter().find(|e| e.id == "ordinary-user").unwrap();
+        assert!(!ordinary.is_peer_message());
+        assert!(ordinary.peer_message.is_none());
+        assert_eq!(message_text(&core, TARGET, "ordinary-user"), Some(lookalike.clone()));
+        assert_eq!(requests.lock().await[0].prompt, lookalike);
+
+        let client = comet_rpc::memory_client(core.rpc_service());
+        client.call(methods::SEND_PEER_MESSAGE, serde_json::json!({
+            "sourceChatId": SOURCE,
+            "targetChatId": TARGET,
+            "text": "private-peer-body",
+            "commandId": COMMAND,
+        })).await.unwrap();
+        let delivered = tokio::time::timeout(Duration::from_secs(5), steering.recv())
+            .await.unwrap().unwrap();
+        wait_for(|| command(&core, TARGET, COMMAND)
+            .is_some_and(|entry| entry.status == SessionCommandStatus::Applied), "active peer delivery").await;
+        let peer = entries(&core, TARGET).into_iter().find(|e| e.id == COMMAND).unwrap();
+        assert!(peer.is_peer_message());
+        assert_eq!(peer.status, Some(expected_status));
+        assert_eq!(delivered.message_id.as_deref(), Some(COMMAND));
+        assert_eq!(Some(delivered.prompt), message_text(&core, TARGET, COMMAND));
+        assert_eq!(requests.lock().await.len(), 1, "steering must not dispatch a replacement run");
+        let chat = core.workspace.doc().chat(TARGET).unwrap().unwrap();
+        let preview = chat.last_message_preview.unwrap();
+        assert!(!preview.contains("private-peer-body"));
+        assert!(chat.last_message_at.is_some(), "peer activity freshness remains intact");
+        core.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn historical_peer_command_identity_never_retrofits_unmarked_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, _) = assemble(dir.path());
+    host_chats(&core, &[SOURCE, TARGET]);
+    let handle = core.doc_host.open(TARGET).unwrap();
+    let prompt = peer_message_prompt(SOURCE, COMMAND, TARGET, COMMAND, "retained historical context");
+    let original = SessionMessageEntry {
+        id: COMMAND.into(),
+        role: MessageRole::User,
+        parts: vec![MessagePart::Text { id: "t0".into(), text: prompt.clone() }],
+        created_at: 1,
+        device_id: core.device_id.clone(),
+        status: Some(MessageStatus::Complete),
+        continuation_of: None,
+        peer_message: None,
+    };
+    handle.doc().push_message(&original).unwrap();
+    handle.doc().queue_command(&SessionCommandEntry {
+        id: COMMAND.into(),
+        payload: SessionCommandPayload::PeerMessage {
+            text: "retained historical context".into(),
+            source_chat_id: SOURCE.into(),
+            thread_id: COMMAND.into(),
+            reply_to: None,
+            hop_count: 0,
+        },
+        issued_by: core.device_id.clone(),
+        issued_at: 1,
+        based_on: None,
+        expires_at: None,
+        status: SessionCommandStatus::Applied,
+        resolution: None,
+    }).unwrap();
+    assert!(!handle.write_user_message(COMMAND, &prompt, 2).unwrap());
+    assert_eq!(entries(&core, TARGET), vec![original]);
     core.shutdown().await;
 }
