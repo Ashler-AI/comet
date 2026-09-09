@@ -80,6 +80,24 @@ distinct Crew chat. The receipt contains `chatId`, `sandboxId`, `commandId`, and
 `environment`; it confirms command admission, not remote task completion.
 Monitor the returned chat in Crew, not standalone `handoff.*` lifecycle tools.
 
+Native transfer captures the source repository's HEAD and reachable Git history,
+plus its dirty and untracked files, into a bounded, verified archive. Scaffold
+reconstructs it at `/workspace/crew-handoff`, preserving a nested source cwd;
+the provisioned `/workspace/ashler-platform` checkout is left untouched. The two
+repositories do not need a shared commit. OMP context is rebased to the imported
+cwd. Capture/import fail closed on archive, expanded-object, checkout-size, path,
+or symlink safety violations; Git submodules are not reconstructed.
+
+The September 9 development-build smoke completed through the native CLI and
+remote Crew chat `030e3ef6-57c4-4749-bd17-cf3ec7435eda` in sandbox
+`rcs_cc61f7c6b3c3a63e04a6d5d5` (staging, local database). The remote agent recovered
+the prior conversation marker, source HEAD, committed file, and uncommitted file,
+and confirmed the platform repository remained separate. This verifies the
+correction in the development controller, not an installed-app or release-channel
+rollout. The original grant rejection's HTTP response was unavailable; subsequent
+grant rejections now preserve bounded HTTP status and machine-code diagnostics
+without exposing bearer tokens or response details.
+
 Missing runtime values or an unsupported CLI/RPC require updating Crew's binary
 and running engine together, then starting a fresh local agent run. Never guess
 an executable, retry creation blindly, or fall back to OpenCode. After an error,

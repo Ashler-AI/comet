@@ -39,7 +39,7 @@ const RUNTIME_START_WAIT: Duration = Duration::from_secs(120);
 const RUNTIME_START_POLL: Duration = Duration::from_millis(500);
 const JOIN_GRANT_TTL_SECONDS: u32 = 15 * 60;
 const DEVICE_ACCESS_TTL_MS: i64 = 12 * 60 * 60 * 1000;
-const SCAFFOLD_WORKSPACE_CWD: &str = "/workspace/ashler-platform";
+const SCAFFOLD_HANDOFF_CWD: &str = "/workspace/crew-handoff";
 
 pub(crate) const SCAFFOLD_COMET_RUNTIME_VERSION: &str =
     include_str!("../../../scaffold-runtime-version.txt");
@@ -134,6 +134,8 @@ pub enum ScaffoldError {
     CometNotInstalled,
     #[error("omp_session_handoff_failed")]
     OmpSessionHandoffFailed,
+    #[error("omp_session_handoff_failed:{0}")]
+    HandoffStage(&'static str),
 }
 
 /// Separate display wrapper prevents an upstream body from accidentally entering
@@ -648,6 +650,7 @@ impl ScaffoldClient {
         &self,
         sandbox_id: &str,
         artifact: &OmpHandoffArchive,
+        remote_cwd: &str,
         cancellation: &CancellationToken,
     ) -> Result<String, ScaffoldError> {
         const DESTINATION: &str = ".scaffold/omp-handoff-staging";
@@ -690,6 +693,7 @@ impl ScaffoldClient {
             artifact.byte_count.to_string(),
             artifact.native_session_id.clone(),
             artifact.cwd.clone(),
+            remote_cwd.to_string(),
         ];
         let verified = self
             .exec(
@@ -706,9 +710,9 @@ impl ScaffoldClient {
             || verified.exit_code != Some(0)
             || verified.stdout.as_deref().map(str::trim) != Some("verified")
         {
-            return Err(ScaffoldError::OmpSessionHandoffFailed);
+            return Err(ScaffoldError::HandoffStage("omp_session_import"));
         }
-        Ok(SCAFFOLD_WORKSPACE_CWD.to_string())
+        Ok(remote_cwd.to_string())
     }
 
     async fn exec(
@@ -858,46 +862,13 @@ impl ScaffoldClient {
         drop(segments);
         Ok(url)
     }
-    async fn resolved_worktree_sha(
-        &self,
-        sandbox_id: &str,
-        cancellation: &CancellationToken,
-    ) -> Result<String, ScaffoldError> {
-        let argv = vec![
-            "git".to_string(),
-            "-C".to_string(),
-            SCAFFOLD_WORKSPACE_CWD.to_string(),
-            "rev-parse".to_string(),
-            "HEAD".to_string(),
-        ];
-        let result = self
-            .exec(
-                sandbox_id,
-                &ExecBody {
-                    argv: &argv,
-                    mode: "inline",
-                    timeout_ms: 10_000,
-                },
-                cancellation,
-            )
-            .await?;
-        let sha = result.stdout.as_deref().map(str::trim).unwrap_or("");
-        if !result.ok
-            || result.exit_code != Some(0)
-            || !(sha.len() == 40 || sha.len() == 64)
-            || !sha.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err(ScaffoldError::OmpSessionHandoffFailed);
-        }
-        Ok(sha.to_ascii_lowercase())
-    }
 
     async fn handoff_worktree(
         &self,
         sandbox_id: &str,
         snapshot: &WorktreeHandoffArchive,
         cancellation: &CancellationToken,
-    ) -> Result<(), ScaffoldError> {
+    ) -> Result<String, ScaffoldError> {
         const DESTINATION: &str = ".scaffold/crew-handoff-staging";
         self.clear_handoff_staging(sandbox_id, DESTINATION, cancellation)
             .await?;
@@ -941,6 +912,8 @@ impl ScaffoldClient {
             snapshot.manifest_sha256.clone(),
             snapshot.base_sha.clone(),
             snapshot.entry_count.to_string(),
+            serde_json::to_string(&snapshot.cwd_relative_path)
+                .map_err(|_| ScaffoldError::HandoffStage("source_repository_cwd"))?,
         ];
         let verified = self
             .exec(
@@ -953,7 +926,12 @@ impl ScaffoldClient {
                 cancellation,
             )
             .await?;
-        let expected = format!("verified:{}", snapshot.manifest_sha256);
+        let remote_cwd = if snapshot.cwd_relative_path.is_empty() {
+            SCAFFOLD_HANDOFF_CWD.to_string()
+        } else {
+            format!("{SCAFFOLD_HANDOFF_CWD}/{}", snapshot.cwd_relative_path)
+        };
+        let expected = format!("verified:{}:{remote_cwd}", snapshot.manifest_sha256);
         if !verified.ok
             || verified.exit_code != Some(0)
             || verified.stdout.as_deref().map(str::trim) != Some(expected.as_str())
@@ -961,13 +939,19 @@ impl ScaffoldClient {
             tracing::warn!(
                 ok = verified.ok,
                 exit_code = ?verified.exit_code,
-                stdout = ?verified.stdout,
-                error = ?verified.error,
                 "Scaffold worktree handoff verification failed"
             );
-            return Err(ScaffoldError::OmpSessionHandoffFailed);
+            let stage = match verified.exit_code {
+                Some(40 | 41 | 42) => "source_import_manifest",
+                Some(43 | 44) => "source_import_archive",
+                Some(45 | 47) => "source_import_repository",
+                Some(46 | 48) => "source_import_overlay",
+                Some(49) => "source_import_destination",
+                _ => "source_repository_import",
+            };
+            return Err(ScaffoldError::HandoffStage(stage));
         }
-        Ok(())
+        Ok(remote_cwd)
     }
     async fn upload_granted_file(
         &self,
@@ -1516,64 +1500,73 @@ struct UploadGrant {
     _command: String,
 }
 
-const VERIFY_WORKTREE_HANDOFF_PYTHON: &str = r#"import hashlib, json, os, pathlib, posixpath, shutil, stat, subprocess, sys
-workspace = pathlib.Path("/workspace/ashler-platform").resolve(strict=True)
+const VERIFY_WORKTREE_HANDOFF_PYTHON: &str = r#"import hashlib, json, os, pathlib, posixpath, resource, shutil, signal, stat, struct, subprocess, sys, tempfile, time
+platform = pathlib.Path("/workspace/ashler-platform").resolve(strict=True)
+destination = pathlib.Path("/workspace/crew-handoff")
 staging = pathlib.Path(sys.argv[1]).resolve(strict=True)
 expected_manifest_sha, expected_base, expected_count = sys.argv[2], sys.argv[3].lower(), int(sys.argv[4])
-if workspace not in staging.parents or staging.relative_to(workspace).as_posix() != ".scaffold/crew-handoff-staging":
+expected_cwd = json.loads(sys.argv[5])
+if platform not in staging.parents or staging.relative_to(platform).as_posix() != ".scaffold/crew-handoff-staging":
     raise SystemExit(40)
-if len(expected_manifest_sha) != 64 or any(c not in "0123456789abcdef" for c in expected_manifest_sha):
-    raise SystemExit(41)
-if len(expected_base) not in (40, 64) or any(c not in "0123456789abcdef" for c in expected_base):
-    raise SystemExit(41)
-if expected_count < 0 or expected_count > 25000:
-    raise SystemExit(41)
+MAX_TOTAL = 256 * 1024 * 1024
+MAX_HISTORY_BYTES = 4 * 1024 * 1024 * 1024
+MAX_OBJECTS = 250000
+MAX_FILES = 25000
+MAX_MEMORY = 512 * 1024 * 1024
+deadline = time.monotonic() + 50
 
-def bounded_file(path, limit):
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    with os.fdopen(fd, "rb") as source:
-        info = os.fstat(source.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
-            raise SystemExit(42)
-        data = source.read(limit + 1)
-    if len(data) != info.st_size:
-        raise SystemExit(42)
-    return data
+def sha(value):
+    return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+
+if not sha(expected_manifest_sha) or len(expected_base) not in (40, 64) or any(c not in "0123456789abcdef" for c in expected_base) or not 0 <= expected_count <= 25000:
+    raise SystemExit(41)
 
 def safe_path(value):
     if not isinstance(value, str) or not value or len(value) > 4096 or "\\" in value or any(ord(c) < 32 or ord(c) == 127 for c in value):
         raise SystemExit(43)
-    path = pathlib.PurePosixPath(value)
-    if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts) or path.parts[0] in (".git", ".scaffold"):
+    parts = value.split("/")
+    if any(part in ("", ".", "..") for part in parts) or parts[0] in (".git", ".scaffold"):
         raise SystemExit(43)
-    return path
+    return pathlib.PurePosixPath(value)
 
-def digest_file(path, limit):
+def digest_file(path, limit, contents=False):
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     with os.fdopen(fd, "rb") as source:
         info = os.fstat(source.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > limit:
             raise SystemExit(44)
-        digest, count = hashlib.sha256(), 0
+        digest, count, data = hashlib.sha256(), 0, bytearray()
         while True:
-            block = source.read(1024 * 1024)
+            block = source.read(min(1024 * 1024, limit - count + 1))
             if not block: break
-            count += len(block); digest.update(block)
-    if count != info.st_size:
-        raise SystemExit(44)
-    return digest.hexdigest(), count, stat.S_IMODE(info.st_mode)
+            count += len(block)
+            if count > limit: raise SystemExit(44)
+            digest.update(block)
+            if contents: data.extend(block)
+    if count != info.st_size: raise SystemExit(44)
+    return digest.hexdigest(), count, stat.S_IMODE(info.st_mode), data
 
-def git_paths(args):
-    process = subprocess.Popen(["git", "-C", str(workspace), *args], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    output = process.stdout.read(32 * 1024 * 1024 + 1)
-    if len(output) > 32 * 1024 * 1024:
-        process.kill(); process.wait(); raise SystemExit(45)
-    if process.wait() != 0:
-        raise SystemExit(45)
-    try:
-        return {entry.decode("utf-8") for entry in output.split(b"\0") if entry}
-    except UnicodeDecodeError:
-        raise SystemExit(45)
+def git(cwd, args, output=False):
+    # No inherited repository overrides, configuration, hooks, prompts or filters.
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null", GIT_TERMINAL_PROMPT="0")
+    def limits():
+        resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_TOTAL, MAX_TOTAL))
+        if sys.platform == "linux":
+            resource.setrlimit(resource.RLIMIT_AS, (MAX_MEMORY, MAX_MEMORY))
+    with tempfile.TemporaryFile(dir=cwd) as stdout:
+        process = subprocess.Popen(["git", "-c", "core.hooksPath=/dev/null", "-c", "pack.threads=1", "-C", str(cwd), *args], stdout=stdout if output else subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=environment, preexec_fn=limits, start_new_session=True)
+        try:
+            if process.wait(timeout=max(0.01, deadline - time.monotonic())) != 0: raise SystemExit(45)
+            if output:
+                stdout.seek(0)
+                result = stdout.read(32 * 1024 * 1024 + 1)
+                if len(result) > 32 * 1024 * 1024: raise SystemExit(45)
+                return result
+        finally:
+            try: os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError: pass
+            process.wait()
 
 def remove_path(path):
     try: info = path.lstat()
@@ -1581,33 +1574,103 @@ def remove_path(path):
     if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode): shutil.rmtree(path)
     else: path.unlink()
 
-def secure_parent(path):
+def secure_parent(workspace, rel, create):
     current = workspace
-    for part in path.relative_to(workspace).parts[:-1]:
+    for part in rel.parts[:-1]:
         current = current / part
-        try: current.mkdir(mode=0o755)
-        except FileExistsError:
-            info = current.lstat()
-            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
-                raise SystemExit(46)
+        try: info = current.lstat()
+        except FileNotFoundError:
+            if not create: return False
+            current.mkdir(mode=0o755)
+            continue
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode): raise SystemExit(46)
+    return True
 
+def inspect_bundle(path):
+    # Reject excessive object counts before index-pack allocates its object table.
+    with path.open("rb") as source:
+        header_bytes = 0
+        while True:
+            line = source.readline(65537)
+            header_bytes += len(line)
+            if not line or header_bytes > 65536: raise SystemExit(45)
+            if line == b"\n": break
+        header = source.read(12)
+        if len(header) != 12: raise SystemExit(45)
+        signature, version, count = struct.unpack(">4sII", header)
+        if signature != b"PACK" or version not in (2, 3) or not 0 < count <= MAX_OBJECTS:
+            raise SystemExit(45)
+
+def inspect_objects(workspace):
+    # index-pack retains compressed data; inspect expanded sizes before checkout.
+    listing = git(workspace, ["cat-file", "--batch-all-objects", "--batch-check=%(objectsize)"], True)
+    count, expanded = 0, 0
+    for line in listing.splitlines():
+        size = int(line)
+        if size < 0: raise SystemExit(45)
+        count += 1; expanded += size
+        if size > MAX_TOTAL or count > MAX_OBJECTS or expanded > MAX_HISTORY_BYTES: raise SystemExit(45)
+    listing = git(workspace, ["ls-tree", "-r", "-t", "-l", "-z", expected_base], True)
+    count, expanded = 0, 0
+    for entry in listing.split(b"\0"):
+        if not entry: continue
+        metadata, path = entry.split(b"\t", 1)
+        mode, kind, oid, size = metadata.split()
+        safe_path(path.decode("utf-8"))
+        count += 1
+        if count > MAX_FILES: raise SystemExit(45)
+        if kind == b"tree" and mode == b"040000": continue
+        # Gitlinks cannot be reconstructed from the source repository's bundle.
+        if kind != b"blob" or mode not in (b"100644", b"100755", b"120000"): raise SystemExit(45)
+        size = int(size)
+        expanded += size
+        if size < 0 or count > MAX_FILES or expanded > MAX_TOTAL: raise SystemExit(45)
+
+def inspect_materialized_tree(workspace):
+    count, expanded = 0, 0
+    for root, dirs, files in os.walk(workspace, followlinks=False):
+        if pathlib.Path(root) == workspace: dirs.remove(".git")
+        for name in [*dirs, *files]:
+            candidate = pathlib.Path(root) / name
+            rel = candidate.relative_to(workspace)
+            safe_path(rel.as_posix())
+            info = candidate.lstat()
+            count += 1
+            if stat.S_ISLNK(info.st_mode):
+                target = os.readlink(candidate)
+                if not target or target.startswith("/") or "\\" in target or len(target) > 4096 or any(ord(c) < 32 or ord(c) == 127 for c in target): raise SystemExit(46)
+                normalized = posixpath.normpath(posixpath.join(rel.parent.as_posix(), target))
+                if normalized == ".." or normalized.startswith("../") or normalized.split("/")[0] in (".git", ".scaffold"): raise SystemExit(46)
+                # Resolve chains as well as the immediate lexical target. Loops,
+                # absolute indirection and links into metadata fail closed.
+                try: resolved = candidate.resolve(strict=False)
+                except (OSError, RuntimeError): raise SystemExit(46)
+                if resolved != workspace and workspace not in resolved.parents: raise SystemExit(46)
+                resolved_parts = resolved.relative_to(workspace).parts
+                if resolved_parts and resolved_parts[0] in (".git", ".scaffold"): raise SystemExit(46)
+                expanded += info.st_size
+            elif stat.S_ISREG(info.st_mode): expanded += info.st_size
+            elif not stat.S_ISDIR(info.st_mode): raise SystemExit(46)
+            if count > MAX_FILES or expanded > MAX_TOTAL: raise SystemExit(46)
+
+temporary = None
+published = False
 try:
-    manifest_path = staging / ".crew-handoff-manifest.json"
-    manifest_bytes = bounded_file(manifest_path, 16 * 1024 * 1024)
-    if hashlib.sha256(manifest_bytes).hexdigest() != expected_manifest_sha:
-        raise SystemExit(42)
+    manifest_sha, total, _, manifest_bytes = digest_file(staging / ".crew-handoff-manifest.json", 16 * 1024 * 1024, True)
+    if manifest_sha != expected_manifest_sha: raise SystemExit(42)
     try: manifest = json.loads(manifest_bytes)
     except (UnicodeDecodeError, ValueError): raise SystemExit(42)
-    entries = manifest.get("entries") if isinstance(manifest, dict) else None
-    if manifest.get("version") != "crew.scaffold.worktree.v1" or str(manifest.get("baseSha", "")).lower() != expected_base or not isinstance(entries, list) or len(entries) != expected_count:
+    if not isinstance(manifest, dict) or manifest.get("version") != "crew.scaffold.worktree.v2" or manifest.get("baseSha") != expected_base or manifest.get("cwdRelativePath") != expected_cwd:
         raise SystemExit(42)
-
-    head = subprocess.run(["git", "-C", str(workspace), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10, check=True).stdout.strip().lower()
-    if head != expected_base:
-        raise SystemExit(47)
-
+    cwd_parts = safe_path(expected_cwd).parts if expected_cwd else ()
+    entries, repository = manifest.get("entries"), manifest.get("repository")
+    if not isinstance(entries, list) or len(entries) != expected_count or not isinstance(repository, dict) or repository.get("path") != "source.bundle" or not sha(repository.get("sha256")) or type(repository.get("byteCount")) is not int or not 0 < repository["byteCount"] <= MAX_TOTAL:
+        raise SystemExit(42)
+    bundle = staging / "source.bundle"
+    bundle_sha, bundle_bytes, _, _ = digest_file(bundle, MAX_TOTAL)
+    if (bundle_sha, bundle_bytes) != (repository["sha256"], repository["byteCount"]): raise SystemExit(44)
+    total += bundle_bytes
     by_path, regular_paths = {}, set()
-    files_root = staging / "files"
     for entry in entries:
         if not isinstance(entry, dict): raise SystemExit(43)
         rel = safe_path(entry.get("path"))
@@ -1616,73 +1679,95 @@ try:
         by_path[key] = (rel, entry)
         if kind == "regular": regular_paths.add(key)
     paths = set(by_path)
-    for key in paths:
-        parts = pathlib.PurePosixPath(key).parts
-        if any(pathlib.PurePosixPath(*parts[:i]).as_posix() in paths for i in range(1, len(parts))):
-            raise SystemExit(43)
-
-    staged_paths = set()
-    if files_root.exists():
-        for root, dirs, files in os.walk(files_root, followlinks=False):
-            for name in [*dirs, *files]:
-                candidate = pathlib.Path(root) / name
-                if candidate.is_symlink(): raise SystemExit(44)
-            for name in files:
-                staged_paths.add((pathlib.Path(root) / name).relative_to(files_root).as_posix())
-    if staged_paths != regular_paths:
-        raise SystemExit(44)
-
     for key, (rel, entry) in by_path.items():
-        kind = entry["kind"]
-        if kind == "regular":
-            expected_sha, expected_bytes = entry.get("sha256"), entry.get("byteCount")
-            executable = entry.get("executable")
-            if not isinstance(expected_sha, str) or len(expected_sha) != 64 or not isinstance(expected_bytes, int) or expected_bytes < 0 or expected_bytes > 64 * 1024 * 1024 or not isinstance(executable, bool):
-                raise SystemExit(44)
-            actual_sha, actual_bytes, _ = digest_file(files_root.joinpath(*rel.parts), 64 * 1024 * 1024)
-            if (actual_sha, actual_bytes) != (expected_sha, expected_bytes): raise SystemExit(44)
-        elif kind == "symlink":
-            target = entry.get("target")
-            if not isinstance(target, str) or not target or len(target) > 4096 or target.startswith("/") or "\\" in target:
-                raise SystemExit(43)
-            normalized = posixpath.normpath(posixpath.join(posixpath.dirname(key), target))
-            if normalized == ".." or normalized.startswith("../") or normalized.startswith("/"):
-                raise SystemExit(43)
-
-    for key in sorted(by_path, key=lambda value: (-len(pathlib.PurePosixPath(value).parts), value)):
-        remove_path(workspace.joinpath(*by_path[key][0].parts))
-    for key in sorted(by_path, key=lambda value: (len(pathlib.PurePosixPath(value).parts), value)):
-        rel, entry = by_path[key]
-        target = workspace.joinpath(*rel.parts); secure_parent(target)
+        if any(pathlib.PurePosixPath(*rel.parts[:i]).as_posix() in paths for i in range(1, len(rel.parts))): raise SystemExit(43)
         if entry["kind"] == "regular":
-            shutil.copyfile(files_root.joinpath(*rel.parts), target, follow_symlinks=False)
-            os.chmod(target, 0o755 if entry["executable"] else 0o644, follow_symlinks=False)
+            if not sha(entry.get("sha256")) or type(entry.get("byteCount")) is not int or not 0 <= entry["byteCount"] <= 64 * 1024 * 1024 or not isinstance(entry.get("executable"), bool): raise SystemExit(44)
         elif entry["kind"] == "symlink":
-            os.symlink(entry["target"], target)
+            target = entry.get("target")
+            if not isinstance(target, str) or not target or len(target) > 4096 or target.startswith("/") or "\\" in target or any(ord(c) < 32 or ord(c) == 127 for c in target): raise SystemExit(43)
+            normalized = posixpath.normpath(posixpath.join(posixpath.dirname(key), target))
+            if normalized == ".." or normalized.startswith("../") or normalized.startswith("/") or normalized.split("/")[0] in (".git", ".scaffold"): raise SystemExit(43)
 
-    shutil.rmtree(staging)
-    visible = git_paths(["diff", "--name-only", "--no-renames", "-z", expected_base, "--"]) | git_paths(["ls-files", "--others", "--exclude-standard", "-z"]) | git_paths(["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", ".omx/specs", ".omx/interviews", ".omx/plans"])
-    if not visible.issubset(paths):
-        print(json.dumps({"extra": sorted(visible - paths)[:20]}, separators=(",", ":")))
-        raise SystemExit(48)
+    expected_files = {".crew-handoff-manifest.json", "source.bundle"} | {"files/" + key for key in regular_paths}
+    expected_dirs = {parent.as_posix() for name in expected_files for parent in pathlib.PurePosixPath(name).parents if parent.as_posix() != "."}
+    found = set()
+    for root, dirs, files in os.walk(staging, followlinks=False):
+        for name in [*dirs, *files]:
+            candidate = pathlib.Path(root) / name
+            key = candidate.relative_to(staging).as_posix()
+            info = candidate.lstat()
+            if stat.S_ISDIR(info.st_mode):
+                if key not in expected_dirs: raise SystemExit(44)
+            elif stat.S_ISREG(info.st_mode):
+                if key not in expected_files: raise SystemExit(44)
+                found.add(key)
+            else: raise SystemExit(44)
+    if found != expected_files: raise SystemExit(44)
+    for key in regular_paths:
+        entry = by_path[key][1]
+        actual_sha, count, _, _ = digest_file(staging / "files" / key, 64 * 1024 * 1024)
+        if (actual_sha, count) != (entry["sha256"], entry["byteCount"]): raise SystemExit(44)
+        total += count
+    if total > MAX_TOTAL: raise SystemExit(44)
+
+    # Materialize in isolation: no command is ever run in the platform checkout.
+    temporary = pathlib.Path(tempfile.mkdtemp(prefix=".crew-handoff-", dir=destination.parent))
+    workspace = temporary / "checkout"
+    workspace.mkdir()
+    git(workspace, ["init", "-q", "--template=", "--object-format=" + ("sha256" if len(expected_base) == 64 else "sha1")])
+    git(workspace, ["bundle", "verify", str(bundle)])
+    inspect_bundle(bundle)
+    git(workspace, ["bundle", "unbundle", str(bundle)])
+    inspect_objects(workspace)
+    git(workspace, ["cat-file", "-e", expected_base + "^{commit}"])
+    git(workspace, ["fsck", "--full", "--strict"])
+    git(workspace, ["checkout", "-q", "--detach", expected_base])
+    if git(workspace, ["rev-parse", "HEAD"], True).strip().decode("ascii") != expected_base: raise SystemExit(47)
+    inspect_materialized_tree(workspace)
+    for key, (rel, entry) in by_path.items():
+        if secure_parent(workspace, rel, False): remove_path(workspace.joinpath(*rel.parts))
+    for key, (rel, entry) in by_path.items():
+        if entry["kind"] == "delete": continue
+        secure_parent(workspace, rel, True)
+        target = workspace.joinpath(*rel.parts)
+        if entry["kind"] == "regular":
+            shutil.copyfile(staging / "files" / key, target, follow_symlinks=False)
+            os.chmod(target, 0o755 if entry["executable"] else 0o644, follow_symlinks=False)
+        else: os.symlink(entry["target"], target)
     for key, (rel, entry) in by_path.items():
         target = workspace.joinpath(*rel.parts)
         if entry["kind"] == "delete":
-            if target.exists() or target.is_symlink():
-                print(json.dumps({"path": key, "mismatch": "delete"}, separators=(",", ":")))
-                raise SystemExit(48)
+            if target.exists() or target.is_symlink(): raise SystemExit(48)
         elif entry["kind"] == "symlink":
-            if not target.is_symlink() or os.readlink(target) != entry["target"]:
-                print(json.dumps({"path": key, "mismatch": "symlink"}, separators=(",", ":")))
-                raise SystemExit(48)
+            if not target.is_symlink() or os.readlink(target) != entry["target"]: raise SystemExit(48)
         else:
-            actual_sha, actual_bytes, actual_mode = digest_file(target, 64 * 1024 * 1024)
-            expected_mode = 0o755 if entry["executable"] else 0o644
-            if (actual_sha, actual_bytes, actual_mode) != (entry["sha256"], entry["byteCount"], expected_mode):
-                print(json.dumps({"path": key, "mismatch": "regular"}, separators=(",", ":")))
-                raise SystemExit(48)
-    print("verified:" + expected_manifest_sha)
+            actual_sha, count, mode, _ = digest_file(target, 64 * 1024 * 1024)
+            if (actual_sha, count, mode) != (entry["sha256"], entry["byteCount"], 0o755 if entry["executable"] else 0o644): raise SystemExit(48)
+    def git_paths(args):
+        return {entry.decode("utf-8") for entry in git(workspace, args, True).split(b"\0") if entry}
+    visible = git_paths(["diff", "--name-only", "--no-renames", "-z", expected_base, "--"]) | git_paths(["ls-files", "--others", "--exclude-standard", "-z"]) | git_paths(["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", ".omx/specs", ".omx/interviews", ".omx/plans"])
+    if not visible.issubset(paths): raise SystemExit(48)
+    if cwd_parts:
+        secure_parent(workspace, pathlib.PurePosixPath(*cwd_parts, ".cwd-check"), True)
+    inspect_materialized_tree(workspace)
+    remote_cwd = workspace.joinpath(*cwd_parts)
+    if not remote_cwd.is_dir() or remote_cwd.resolve(strict=True) != remote_cwd: raise SystemExit(49)
+    backup = temporary / "previous"
+    if destination.exists() or destination.is_symlink():
+        if destination.is_symlink() or not destination.is_dir(): raise SystemExit(49)
+        os.replace(destination, backup)
+    try: os.replace(workspace, destination)
+    except BaseException:
+        if backup.exists(): os.replace(backup, destination)
+        raise
+    published = True
+    print("verified:" + expected_manifest_sha + ":" + str(destination.joinpath(*cwd_parts)))
+except (OSError, ValueError, subprocess.SubprocessError):
+    raise SystemExit(50)
 finally:
+    if temporary is not None and (published or not (temporary / "previous").exists()):
+        shutil.rmtree(temporary, ignore_errors=True)
     shutil.rmtree(staging, ignore_errors=True)
 "#;
 
@@ -1691,6 +1776,10 @@ staging_root = pathlib.Path(sys.argv[1]).resolve(strict=True)
 workspace = pathlib.Path("/workspace/ashler-platform").resolve(strict=True)
 if workspace not in staging_root.parents or staging_root.relative_to(workspace).as_posix() != ".scaffold/omp-handoff-staging":
     raise SystemExit(20)
+handoff_root = pathlib.Path("/workspace/crew-handoff")
+workspace = pathlib.Path(sys.argv[7])
+if workspace != workspace.resolve(strict=True) or not workspace.is_dir() or (workspace != handoff_root and handoff_root not in workspace.parents):
+    raise SystemExit(29)
 rel = pathlib.PurePosixPath(sys.argv[2])
 if rel.is_absolute() or not rel.parts or any(p in ("", ".", "..") for p in rel.parts):
     raise SystemExit(21)
@@ -2035,7 +2124,51 @@ impl DeviceJoinGrantProvider for EdgeDeviceJoinGrantClient {
         };
         drop(bearer);
         if !response.status().is_success() {
-            return Err(ScaffoldError::DeviceJoinGrantUnavailable);
+            let status = response.status();
+            let mut response = response;
+            let mut bytes = Vec::new();
+            loop {
+                let chunk = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return Err(ScaffoldError::Cancelled),
+                    chunk = response.chunk() => chunk,
+                };
+                match chunk {
+                    Ok(Some(chunk)) if bytes.len() + chunk.len() <= 16 * 1024 => {
+                        bytes.extend_from_slice(&chunk)
+                    }
+                    Ok(None) => break,
+                    _ => {
+                        bytes.clear();
+                        break;
+                    }
+                }
+            }
+            let decoded = serde_json::from_slice::<Value>(&bytes).ok();
+            let code = decoded
+                .as_ref()
+                .and_then(|value| {
+                    value
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .or_else(|| value.pointer("/error/code").and_then(Value::as_str))
+                        .or_else(|| value.get("code").and_then(Value::as_str))
+                })
+                .filter(|code| {
+                    !code.is_empty()
+                        && code.len() <= 128
+                        && code.bytes().all(|byte| {
+                            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                        })
+                })
+                .unwrap_or("device_join_grant_rejected");
+            return Err(ScaffoldError::Api(ScaffoldApiErrorDisplay(
+                ScaffoldApiError {
+                    status: status.as_u16(),
+                    code: code.to_string(),
+                    message: None,
+                },
+            )));
         }
         let response: Response = response
             .json()
@@ -2287,11 +2420,6 @@ impl ScaffoldRuntime {
                 ) {
                     return Err(ScaffoldError::OmpSessionHandoffFailed);
                 }
-                let base_sha = self
-                    .inner
-                    .client
-                    .resolved_worktree_sha(&sandbox_id, cancellation)
-                    .await?;
                 let handoff_permit = tokio::select! {
                     biased;
                     _ = cancellation.cancelled() => return Err(ScaffoldError::Cancelled),
@@ -2301,7 +2429,6 @@ impl ScaffoldRuntime {
                 };
                 let capture_native_session_id = native_session_id.clone();
                 let capture_cwd = cwd.clone();
-                let capture_base_sha = base_sha.clone();
                 let capture_cancellation = cancellation.clone();
                 let (handoff_permit, artifact, worktree) = tokio::task::spawn_blocking(move || {
                     let captured = crate::local_sessions::capture_omp_file_for_session(
@@ -2314,13 +2441,12 @@ impl ScaffoldRuntime {
                         if capture_cancellation.is_cancelled() {
                             ScaffoldError::Cancelled
                         } else {
-                            ScaffoldError::OmpSessionHandoffFailed
+                            ScaffoldError::HandoffStage("omp_session_capture")
                         }
                     })?;
                     let artifact = prepare_omp_handoff_archive(captured, &capture_cancellation)?;
                     let worktree = crate::worktree_handoff::capture_worktree_handoff_cancellable(
                         std::path::Path::new(&capture_cwd),
-                        &capture_base_sha,
                         &capture_cancellation,
                     )
                     .map_err(|error| {
@@ -2328,7 +2454,7 @@ impl ScaffoldRuntime {
                         if capture_cancellation.is_cancelled() {
                             ScaffoldError::Cancelled
                         } else {
-                            ScaffoldError::OmpSessionHandoffFailed
+                            ScaffoldError::HandoffStage("source_repository_capture")
                         }
                     })?;
                     Ok::<_, ScaffoldError>((handoff_permit, artifact, worktree))
@@ -2339,7 +2465,8 @@ impl ScaffoldRuntime {
                     ScaffoldError::OmpSessionHandoffFailed
                 })??;
                 let _handoff_permit = handoff_permit;
-                self.inner
+                let remote_cwd = self
+                    .inner
                     .client
                     .handoff_worktree(&sandbox_id, &worktree, cancellation)
                     .await
@@ -2349,7 +2476,7 @@ impl ScaffoldRuntime {
                 let remote_cwd = self
                     .inner
                     .client
-                    .handoff_omp_session(&sandbox_id, &artifact, cancellation)
+                    .handoff_omp_session(&sandbox_id, &artifact, &remote_cwd, cancellation)
                     .await
                     .inspect_err(|error| {
                         tracing::warn!(error = %error, "Scaffold OMP handoff upload failed");
@@ -2734,6 +2861,65 @@ mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn join_grant_rejection_preserves_safe_status_and_code_without_details() {
+        for (body, expected_code) in [
+            (
+                r#"{"error":"device_join_forbidden","message":"bearer secret","grant":"private"}"#,
+                "device_join_forbidden",
+            ),
+            (
+                r#"{"error":"Bearer private-token","message":"secret"}"#,
+                "device_join_grant_rejected",
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 8192];
+                stream.read(&mut request).await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+            let client = EdgeDeviceJoinGrantClient::new(
+                &origin,
+                Arc::new(StaticToken("control-secret".into())),
+            )
+            .unwrap();
+            let error = client
+                .mint(
+                    &DeviceJoinGrantRequest {
+                        principal_subject: "subject".into(),
+                        scope: scope(),
+                        sandbox_id: "sandbox-a".into(),
+                        device_id: "device-a".into(),
+                        lifecycle_epoch: 1,
+                        capabilities: vec![],
+                        expires_in_seconds: 900,
+                    },
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            server.await.unwrap();
+            assert_eq!(
+                error.api_error(),
+                Some(&ScaffoldApiError {
+                    status: 403,
+                    code: expected_code.into(),
+                    message: None,
+                })
+            );
+            assert!(!error.is_runtime_starting());
+            assert!(!error.to_string().contains("secret"));
+            assert!(!error.to_string().contains("private"));
+        }
+    }
 
     #[test]
     fn scaffold_startup_retry_requires_exact_provider_state() {
@@ -3680,10 +3866,15 @@ mod tests {
         )
         .unwrap();
         let remote_cwd = client
-            .handoff_omp_session("sandbox-a", &artifact, &CancellationToken::new())
+            .handoff_omp_session(
+                "sandbox-a",
+                &artifact,
+                SCAFFOLD_HANDOFF_CWD,
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
-        assert_eq!(remote_cwd, SCAFFOLD_WORKSPACE_CWD);
+        assert_eq!(remote_cwd, SCAFFOLD_HANDOFF_CWD);
 
         let requests = captured.await.unwrap();
         assert_eq!(requests.len(), 4);
@@ -3774,27 +3965,18 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        let base_sha = String::from_utf8(
-            std::process::Command::new("git")
-                .args(["rev-parse", "HEAD"])
-                .current_dir(repo.path())
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .unwrap()
-        .trim()
-        .to_string();
         std::fs::write(repo.path().join("tracked.txt"), "changed\n").unwrap();
-        let snapshot =
-            crate::worktree_handoff::capture_worktree_handoff(repo.path(), &base_sha).unwrap();
+        let snapshot = crate::worktree_handoff::capture_worktree_handoff(repo.path()).unwrap();
         let mut expected_archive = Vec::new();
         std::io::Read::read_to_end(&mut snapshot.reopen().unwrap(), &mut expected_archive).unwrap();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let upload_url = format!("{origin}/worktree-upload");
-        let verified_stdout = format!("verified:{}\n", snapshot.manifest_sha256);
+        let verified_stdout = format!(
+            "verified:{}:{SCAFFOLD_HANDOFF_CWD}\n",
+            snapshot.manifest_sha256
+        );
         let responses = [
             r#"{"ok":true,"exitCode":0}"#.to_string(),
             serde_json::json!({
@@ -3841,6 +4023,28 @@ mod tests {
                         }
                     }
                 }
+                // Match the real provider contract that rejected root-cwd handoffs.
+                let header_end = bytes
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .unwrap();
+                let payload = serde_json::from_slice::<Value>(&bytes[header_end + 4..]);
+                if payload
+                    .as_ref()
+                    .ok()
+                    .and_then(|value| value.get("argv"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|argv| {
+                        argv.is_empty()
+                            || argv.len() > 64
+                            || argv
+                                .iter()
+                                .any(|arg| arg.as_str().is_none_or(str::is_empty))
+                    })
+                {
+                    stream.write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await.unwrap();
+                    panic!("Scaffold requires 1–64 nonempty exec arguments");
+                }
                 requests.push(bytes);
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -3880,18 +4084,20 @@ mod tests {
         let verify = String::from_utf8_lossy(&requests[3]);
         assert!(verify.contains(&snapshot.manifest_sha256));
         assert!(verify.contains(&snapshot.base_sha));
-        assert!(verify.contains("crew.scaffold.worktree.v1"));
         assert!(!verify.contains("worktree_upload_secret"));
     }
 
     #[cfg(unix)]
     #[test]
-    fn worktree_materializer_reproduces_files_deletions_and_symlinks() {
+    fn worktree_materializer_preserves_unrelated_platform_and_rejects_corruption() {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("source");
-        let remote = temp.path().join("remote");
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("source");
+        let remote = root.join("remote");
+        let platform = root.join("platform");
+        std::fs::create_dir(&platform).unwrap();
         std::fs::create_dir(&source).unwrap();
         let git = |cwd: &std::path::Path, args: &[&str]| {
             let output = std::process::Command::new("git")
@@ -3918,31 +4124,26 @@ mod tests {
             .unwrap()
             .trim()
             .to_string();
-        let clone = std::process::Command::new("git")
-            .args([
-                "clone",
-                "-q",
-                source.to_str().unwrap(),
-                remote.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap();
-        assert!(
-            clone.status.success(),
-            "{}",
-            String::from_utf8_lossy(&clone.stderr)
-        );
-        git(&remote, &["update-index", "--skip-worktree", "tracked.txt"]);
+        git(&platform, &["init", "-q"]);
+        git(&platform, &["config", "user.email", "platform@example.com"]);
+        git(&platform, &["config", "user.name", "Platform"]);
+        std::fs::write(platform.join("platform.txt"), "platform base\n").unwrap();
+        git(&platform, &["add", "."]);
+        git(&platform, &["commit", "-qm", "unrelated platform"]);
+        let platform_head = git(&platform, &["rev-parse", "HEAD"]);
+        std::fs::write(platform.join("platform.txt"), "platform dirty\n").unwrap();
 
         std::fs::create_dir_all(source.join(".omx/plans")).unwrap();
         std::fs::write(source.join(".omx/plans/plan.md"), "plan\n").unwrap();
         std::fs::write(source.join("tracked.txt"), "changed\n").unwrap();
         std::fs::write(source.join("new.txt"), "new\n").unwrap();
+        std::fs::create_dir(source.join("nested")).unwrap();
+        std::fs::write(source.join("nested/file.txt"), "nested\n").unwrap();
         std::fs::remove_file(source.join("deleted.txt")).unwrap();
         symlink("tracked.txt", source.join("tracked-link")).unwrap();
         let snapshot =
-            crate::worktree_handoff::capture_worktree_handoff(&source, &base_sha).unwrap();
-        let staging = remote.join(".scaffold/crew-handoff-staging");
+            crate::worktree_handoff::capture_worktree_handoff(&source.join("nested")).unwrap();
+        let staging = platform.join(".scaffold/crew-handoff-staging");
         std::fs::create_dir_all(&staging).unwrap();
         let archive = tempfile::NamedTempFile::new().unwrap();
         let mut archive_file = archive.reopen().unwrap();
@@ -3962,7 +4163,8 @@ mod tests {
             String::from_utf8_lossy(&extracted.stderr)
         );
         let script = VERIFY_WORKTREE_HANDOFF_PYTHON
-            .replace("/workspace/ashler-platform", remote.to_str().unwrap());
+            .replace("/workspace/ashler-platform", platform.to_str().unwrap())
+            .replace("/workspace/crew-handoff", remote.to_str().unwrap());
         let applied = std::process::Command::new("python3")
             .args([
                 "-c",
@@ -3971,6 +4173,7 @@ mod tests {
                 &snapshot.manifest_sha256,
                 &snapshot.base_sha,
                 &snapshot.entry_count.to_string(),
+                &serde_json::to_string(&snapshot.cwd_relative_path).unwrap(),
             ])
             .output()
             .unwrap();
@@ -3982,17 +4185,33 @@ mod tests {
         );
         assert_eq!(
             String::from_utf8_lossy(&applied.stdout).trim(),
-            format!("verified:{}", snapshot.manifest_sha256)
+            format!(
+                "verified:{}:{}",
+                snapshot.manifest_sha256,
+                remote.join("nested").display()
+            )
         );
         assert_eq!(
             std::fs::read(remote.join("tracked.txt")).unwrap(),
             b"changed\n"
         );
-        assert!(
-            !String::from_utf8(git(&remote, &["diff", "--name-only", &base_sha, "--"]))
-                .unwrap()
-                .lines()
-                .any(|path| path == "tracked.txt")
+        assert_eq!(
+            git(&remote, &["rev-parse", "HEAD"]),
+            format!("{base_sha}\n").as_bytes()
+        );
+        assert_eq!(
+            git(&remote, &["log", "--format=%H:%an:%ae:%s"]),
+            git(&source, &["log", "--format=%H:%an:%ae:%s"])
+        );
+        assert_eq!(git(&platform, &["rev-parse", "HEAD"]), platform_head);
+        assert_eq!(
+            std::fs::read(platform.join("platform.txt")).unwrap(),
+            b"platform dirty\n"
+        );
+        assert!(!platform.join("tracked.txt").exists());
+        assert_eq!(
+            std::fs::read(remote.join("nested/file.txt")).unwrap(),
+            b"nested\n"
         );
         assert_eq!(std::fs::read(remote.join("new.txt")).unwrap(), b"new\n");
         assert_eq!(
@@ -4005,6 +4224,217 @@ mod tests {
             std::path::Path::new("tracked.txt")
         );
         assert!(!staging.exists());
+
+        // A corrupt bundle is rejected before replacing the existing destination.
+        std::fs::write(remote.join("local-marker"), "preserve\n").unwrap();
+        std::fs::create_dir_all(&staging).unwrap();
+        assert!(
+            std::process::Command::new("tar")
+                .args([
+                    "-xf",
+                    archive.path().to_str().unwrap(),
+                    "-C",
+                    staging.to_str().unwrap()
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(staging.join("source.bundle"), "corrupt").unwrap();
+        let rejected = std::process::Command::new("python3")
+            .args([
+                "-c",
+                &script,
+                staging.to_str().unwrap(),
+                &snapshot.manifest_sha256,
+                &snapshot.base_sha,
+                &snapshot.entry_count.to_string(),
+                &serde_json::to_string(&snapshot.cwd_relative_path).unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success());
+        assert_eq!(
+            std::fs::read(remote.join("local-marker")).unwrap(),
+            b"preserve\n"
+        );
+        assert_eq!(
+            git(&remote, &["rev-parse", "HEAD"]),
+            format!("{base_sha}\n").as_bytes()
+        );
+        assert_eq!(git(&platform, &["rev-parse", "HEAD"]), platform_head);
+        assert_eq!(
+            std::fs::read(platform.join("platform.txt")).unwrap(),
+            b"platform dirty\n"
+        );
+        assert!(!staging.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_materializer_enforces_containment_and_separate_expansion_budgets() {
+        use std::os::unix::fs::symlink;
+        for scenario in [
+            "absolute",
+            "chain",
+            "object_expansion",
+            "tree_expansion",
+            "object_count",
+            "history_fits",
+            "history_overflow",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let source = root.join("source");
+            let platform = root.join("platform");
+            let remote = root.join("remote");
+            for directory in [&source, &platform, &remote] {
+                std::fs::create_dir(directory).unwrap();
+            }
+            std::fs::write(platform.join("sentinel"), "platform\n").unwrap();
+            std::fs::write(remote.join("sentinel"), "destination\n").unwrap();
+            let git = |args: &[&str]| {
+                assert!(
+                    std::process::Command::new("git")
+                        .args(args)
+                        .current_dir(&source)
+                        .env("ASHLER_INCREMENTAL_TSC_CHECKS", "false")
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            };
+            git(&["init", "-q"]);
+            git(&["config", "user.email", "crew@example.com"]);
+            git(&["config", "user.name", "Crew"]);
+            match scenario {
+                "absolute" => symlink(platform.join("sentinel"), source.join("escape")).unwrap(),
+                "chain" => {
+                    std::fs::create_dir(source.join("nested")).unwrap();
+                    symlink("../../platform", source.join("nested/escape")).unwrap();
+                    symlink("nested/escape/sentinel", source.join("chain")).unwrap();
+                }
+                "object_expansion" => {
+                    std::fs::write(source.join("large"), vec![b'x'; 2 * 1024 * 1024]).unwrap()
+                }
+                "tree_expansion" => {
+                    let bytes = vec![b'x'; 600 * 1024];
+                    std::fs::write(source.join("one"), &bytes).unwrap();
+                    std::fs::write(source.join("two"), &bytes).unwrap();
+                }
+                "object_count" => std::fs::write(source.join("file"), "one\n").unwrap(),
+                "history_fits" | "history_overflow" => {
+                    for value in [b'a', b'b', b'c'] {
+                        std::fs::write(source.join("revision"), vec![value; 600 * 1024]).unwrap();
+                        git(&["add", "."]);
+                        git(&["commit", "-qm", "historical revision"]);
+                    }
+                    std::fs::remove_file(source.join("revision")).unwrap();
+                    std::fs::write(source.join("current"), "small checkout\n").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            git(&["add", "."]);
+            git(&["commit", "-qm", "source"]);
+            let snapshot = crate::worktree_handoff::capture_worktree_handoff(&source).unwrap();
+            assert_eq!(
+                snapshot.entry_count, 0,
+                "the rejected content is committed, not overlay"
+            );
+            let staging = platform.join(".scaffold/crew-handoff-staging");
+            std::fs::create_dir_all(&staging).unwrap();
+            let archive = tempfile::NamedTempFile::new().unwrap();
+            std::io::copy(
+                &mut snapshot.reopen().unwrap(),
+                &mut archive.reopen().unwrap(),
+            )
+            .unwrap();
+            assert!(
+                std::process::Command::new("tar")
+                    .args([
+                        "-xf",
+                        archive.path().to_str().unwrap(),
+                        "-C",
+                        staging.to_str().unwrap()
+                    ])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let script = VERIFY_WORKTREE_HANDOFF_PYTHON
+                .replace("/workspace/ashler-platform", platform.to_str().unwrap())
+                .replace("/workspace/crew-handoff", remote.to_str().unwrap())
+                .replace("MAX_TOTAL = 256 * 1024 * 1024", "MAX_TOTAL = 1024 * 1024");
+            let script = if scenario == "history_overflow" {
+                script.replace(
+                    "MAX_HISTORY_BYTES = 4 * 1024 * 1024 * 1024",
+                    "MAX_HISTORY_BYTES = 1024 * 1024",
+                )
+            } else {
+                script
+            };
+            let script = if scenario == "object_count" {
+                script.replace("MAX_OBJECTS = 250000", "MAX_OBJECTS = 1")
+            } else {
+                script
+            };
+            let result = std::process::Command::new("python3")
+                .args([
+                    "-c",
+                    &script,
+                    staging.to_str().unwrap(),
+                    &snapshot.manifest_sha256,
+                    &snapshot.base_sha,
+                    &snapshot.entry_count.to_string(),
+                    &serde_json::to_string(&snapshot.cwd_relative_path).unwrap(),
+                ])
+                .output()
+                .unwrap();
+            if scenario == "history_fits" {
+                assert!(
+                    result.status.success(),
+                    "historical revisions must not consume checkout budget: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                assert_eq!(
+                    std::fs::read(remote.join("current")).unwrap(),
+                    b"small checkout\n"
+                );
+                assert!(!remote.join("revision").exists());
+                let history = std::process::Command::new("git")
+                    .args(["rev-list", "--count", "HEAD"])
+                    .current_dir(&remote)
+                    .env("ASHLER_INCREMENTAL_TSC_CHECKS", "false")
+                    .output()
+                    .unwrap();
+                assert!(history.status.success());
+                assert_eq!(String::from_utf8_lossy(&history.stdout).trim(), "4");
+                assert_eq!(
+                    std::fs::read(platform.join("sentinel")).unwrap(),
+                    b"platform\n"
+                );
+                continue;
+            }
+            assert_eq!(
+                result.status.code(),
+                Some(if matches!(scenario, "absolute" | "chain") {
+                    46
+                } else {
+                    45
+                }),
+                "{scenario} must fail at the safety bound before publication: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(
+                std::fs::read(platform.join("sentinel")).unwrap(),
+                b"platform\n"
+            );
+            assert_eq!(
+                std::fs::read(remote.join("sentinel")).unwrap(),
+                b"destination\n"
+            );
+            assert!(!remote.join(".git").exists());
+        }
     }
 
     #[test]
@@ -4042,10 +4472,12 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         use std::process::Command;
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("workspace");
+        let root = temp.path().canonicalize().unwrap().join("workspace");
         let workspace = root.join("ashler-platform");
         let staging = workspace.join(".scaffold/omp-handoff-staging/by-cwd");
         std::fs::create_dir_all(&staging).unwrap();
+        let remote_cwd = root.join("crew-handoff/nested");
+        std::fs::create_dir_all(&remote_cwd).unwrap();
         let staged = staging.join("native-1.jsonl");
         let bytes = b"{\"type\":\"session\",\"version\":3,\"id\":\"native-1\",\"timestamp\":\"2026-08-16T00:00:00.000Z\",\"cwd\":\"/repo\"}\n{\"type\":\"message\",\"id\":\"message-1\"}\n";
         let sha = format!("{:x}", sha2::Sha256::digest(bytes));
@@ -4087,6 +4519,7 @@ mod tests {
                     &bytes.len().to_string(),
                     "native-1",
                     "/repo",
+                    remote_cwd.to_str().unwrap(),
                 ])
                 .output()
                 .unwrap()
@@ -4122,7 +4555,11 @@ mod tests {
         assert_eq!(session["id"], "native-1");
         assert_eq!(
             session["cwd"],
-            workspace.canonicalize().unwrap().to_string_lossy().as_ref()
+            remote_cwd
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
         );
         assert!(transformed.ends_with(b"{\"type\":\"message\",\"id\":\"message-1\"}\n"));
         assert_eq!(

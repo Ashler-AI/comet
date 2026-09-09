@@ -1,9 +1,8 @@
-//! Bounded, content-addressed capture of one Git worktree relative to the exact
-//! commit Scaffold checked out.
+//! Bounded, content-addressed capture of a source Git repository and its worktree.
 
 use std::collections::BTreeSet;
 use std::fs::{File, Metadata};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -25,6 +24,7 @@ const MAX_GIT_PATH_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_MANIFEST_VARIABLE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 const MANIFEST_PATH: &str = ".crew-handoff-manifest.json";
+const REPOSITORY_PATH: &str = "source.bundle";
 
 #[derive(Debug)]
 pub(crate) struct WorktreeHandoffArchive {
@@ -32,6 +32,7 @@ pub(crate) struct WorktreeHandoffArchive {
     pub byte_count: u64,
     pub manifest_sha256: String,
     pub base_sha: String,
+    pub cwd_relative_path: String,
     pub entry_count: usize,
 }
 
@@ -46,7 +47,17 @@ impl WorktreeHandoffArchive {
 struct Manifest {
     version: &'static str,
     base_sha: String,
+    cwd_relative_path: String,
+    repository: Repository,
     entries: Vec<ManifestEntry>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Repository {
+    path: &'static str,
+    sha256: String,
+    byte_count: u64,
 }
 
 #[derive(Serialize)]
@@ -76,20 +87,20 @@ impl ManifestEntry {
     }
 }
 #[cfg(test)]
-pub(crate) fn capture_worktree_handoff(
-    cwd: &Path,
-    expected_base_sha: &str,
-) -> Result<WorktreeHandoffArchive, EngineError> {
-    capture_worktree_handoff_cancellable(cwd, expected_base_sha, &CancellationToken::new())
+pub(crate) fn capture_worktree_handoff(cwd: &Path) -> Result<WorktreeHandoffArchive, EngineError> {
+    capture_worktree_handoff_cancellable(cwd, &CancellationToken::new())
 }
 
 pub(crate) fn capture_worktree_handoff_cancellable(
     cwd: &Path,
-    expected_base_sha: &str,
     cancellation: &CancellationToken,
 ) -> Result<WorktreeHandoffArchive, EngineError> {
     check_cancelled(cancellation)?;
-    let expected_base_sha = validate_base_sha(expected_base_sha)?;
+    if !cfg!(unix) {
+        return Err(invalid(
+            "Source repository handoff requires Unix process-group cancellation",
+        ));
+    }
     let root_output = run_git_bounded(
         cwd,
         &["rev-parse", "--show-toplevel"],
@@ -105,31 +116,30 @@ pub(crate) fn capture_worktree_handoff_cancellable(
         return Err(invalid("OMP session cwd is outside its Git worktree"));
     }
 
-    let verify_arg = format!("{expected_base_sha}^{{commit}}");
+    let cwd_relative_path = canonical_cwd
+        .strip_prefix(&canonical_root)
+        .map_err(|_| invalid("OMP session cwd is outside its Git worktree"))?
+        .to_str()
+        .ok_or_else(|| invalid("OMP session cwd is not UTF-8"))?
+        .to_string();
+    if !cwd_relative_path.is_empty() {
+        validate_repo_path(&cwd_relative_path)?;
+    }
     let resolved = run_git_bounded(
         &canonical_root,
-        &["rev-parse", "--verify", &verify_arg],
+        &["rev-parse", "--verify", "HEAD^{commit}"],
         1024,
         cancellation,
     )?;
     let resolved = std::str::from_utf8(trim_ascii(&resolved))
         .map_err(|_| invalid("Git base commit is not UTF-8"))?;
-    if !resolved.eq_ignore_ascii_case(expected_base_sha) {
-        return Err(invalid("Scaffold checkout commit is unavailable locally"));
-    }
+    let base_sha = validate_base_sha(resolved)?.to_string();
 
     let mut paths = BTreeSet::new();
     let mut listing_bytes = 0_usize;
     let changed = run_git_bounded(
         &canonical_root,
-        &[
-            "diff",
-            "--name-only",
-            "--no-renames",
-            "-z",
-            expected_base_sha,
-            "--",
-        ],
+        &["diff", "--name-only", "--no-renames", "-z", &base_sha, "--"],
         MAX_GIT_PATH_OUTPUT_BYTES,
         cancellation,
     )?;
@@ -166,6 +176,17 @@ pub(crate) fn capture_worktree_handoff_cancellable(
     }
 
     let mut archive = NamedTempFile::new()?;
+    if archive.path().canonicalize()?.starts_with(&canonical_root) {
+        return Err(invalid(
+            "Worktree capture temporary files must be outside the source repository",
+        ));
+    }
+    let repository = append_repository(
+        archive.as_file_mut(),
+        &canonical_root,
+        &base_sha,
+        cancellation,
+    )?;
     let mut manifest_variable_bytes = listing_bytes;
     let mut entries = Vec::with_capacity(paths.len());
     for path in paths {
@@ -208,8 +229,10 @@ pub(crate) fn capture_worktree_handoff_cancellable(
     let entry_count = entries.len();
 
     let manifest = serde_json::to_vec(&Manifest {
-        version: "crew.scaffold.worktree.v1",
-        base_sha: expected_base_sha.to_string(),
+        version: "crew.scaffold.worktree.v2",
+        base_sha: base_sha.clone(),
+        cwd_relative_path: cwd_relative_path.clone(),
+        repository,
         entries,
     })
     .map_err(|error| invalid(&format!("Could not encode worktree manifest: {error}")))?;
@@ -228,7 +251,8 @@ pub(crate) fn capture_worktree_handoff_cancellable(
         file: archive,
         byte_count,
         manifest_sha256,
-        base_sha: expected_base_sha.to_string(),
+        base_sha,
+        cwd_relative_path,
         entry_count,
     })
 }
@@ -238,9 +262,113 @@ fn validate_base_sha(value: &str) -> Result<&str, EngineError> {
     if !(value.len() == 40 || value.len() == 64)
         || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
-        return Err(invalid("Scaffold did not return an exact checkout commit"));
+        return Err(invalid("Source HEAD did not resolve to an exact commit"));
     }
     Ok(value)
+}
+
+fn append_repository(
+    archive: &mut File,
+    root: &Path,
+    base_sha: &str,
+    cancellation: &CancellationToken,
+) -> Result<Repository, EngineError> {
+    // A detached HEAD in a private bare repository pins the bundle without
+    // racing or changing any source refs, including a linked worktree's HEAD.
+    let repository = tempfile::tempdir()?;
+    if repository.path().canonicalize()?.starts_with(root) {
+        return Err(invalid(
+            "Worktree capture temporary files must be outside the source repository",
+        ));
+    }
+    let objects = run_git_bounded(
+        root,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+        ],
+        16 * 1024,
+        cancellation,
+    )?;
+    let objects = std::str::from_utf8(trim_ascii(&objects))
+        .map_err(|_| invalid("Source Git object path is not UTF-8"))?;
+    if objects.contains(['\n', '\r']) {
+        return Err(invalid("Source Git object path contains a newline"));
+    }
+    run_git_bounded(
+        repository.path(),
+        &[
+            "init",
+            "--bare",
+            "--quiet",
+            "--template=",
+            if base_sha.len() == 64 {
+                "--object-format=sha256"
+            } else {
+                "--object-format=sha1"
+            },
+            ".",
+        ],
+        1024,
+        cancellation,
+    )?;
+    std::fs::write(repository.path().join("HEAD"), format!("{base_sha}\n"))?;
+    std::fs::write(
+        repository.path().join("objects/info/alternates"),
+        format!("{objects}\n"),
+    )?;
+
+    let header_offset = archive.stream_position()?;
+    append_tar_header(archive, REPOSITORY_PATH, 0, 0o600)?;
+    let output = archive.try_clone()?;
+    // Reserve padding/end markers; later entries and manifest have independent
+    // pre-write capacity checks. No bundle-sized buffer or temporary pack on disk.
+    let limit = MAX_HANDOFF_ARCHIVE_BYTES.saturating_sub(output.metadata()?.len() + 1535);
+    let cancel_reader = cancellation.clone();
+    let (sha256, byte_count) = run_git_with_reader(
+        repository.path(),
+        &["-c", "pack.threads=1", "bundle", "create", "-", "HEAD"],
+        cancellation,
+        move |input| copy_bundle_bounded(input, output, limit, &cancel_reader),
+    )?;
+    let end = archive.stream_position()?;
+    archive.seek(SeekFrom::Start(header_offset))?;
+    append_tar_header(archive, REPOSITORY_PATH, byte_count, 0o600)?;
+    archive.seek(SeekFrom::Start(end))?;
+    pad_tar_entry(archive, byte_count)?;
+    Ok(Repository {
+        path: REPOSITORY_PATH,
+        sha256,
+        byte_count,
+    })
+}
+
+fn copy_bundle_bounded(
+    mut input: impl Read,
+    mut output: impl Write,
+    limit: u64,
+    cancellation: &CancellationToken,
+) -> Result<(String, u64), EngineError> {
+    let mut digest = Sha256::new();
+    let mut byte_count = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        check_cancelled(cancellation)?;
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            return Ok((format!("{:x}", digest.finalize()), byte_count));
+        }
+        if read as u64 > limit.saturating_sub(byte_count) {
+            return Err(invalid(
+                "Source Git bundle exceeds the handoff archive limit",
+            ));
+        }
+        output.write_all(&buffer[..read])?;
+        digest.update(&buffer[..read]);
+        byte_count += read as u64;
+    }
 }
 
 fn insert_git_paths(
@@ -363,6 +491,7 @@ fn append_regular_file(
             return Err(invalid("Worktree handoff rejects hard-linked files"));
         }
     }
+    ensure_archive_capacity(archive, 512 + before.len().div_ceil(512) * 512)?;
     append_tar_header(
         archive,
         archive_path,
@@ -403,6 +532,7 @@ fn append_bytes(
     mode: u32,
 ) -> Result<(), EngineError> {
     append_tar_header(archive, path, bytes.len() as u64, mode)?;
+    ensure_archive_capacity(archive, (bytes.len() as u64).div_ceil(512) * 512)?;
     archive.write_all(bytes)?;
     pad_tar_entry(archive, bytes.len() as u64)?;
     Ok(())
@@ -437,6 +567,7 @@ fn append_tar_header(
     let checksum: u64 = header.iter().map(|byte| u64::from(*byte)).sum();
     let checksum_field = format!("{checksum:06o}\0 ");
     header[148..156].copy_from_slice(checksum_field.as_bytes());
+    ensure_archive_capacity(archive, 512)?;
     archive.write_all(&header)?;
     Ok(())
 }
@@ -477,6 +608,7 @@ fn put_tar_octal(field: &mut [u8], value: u64) -> Result<(), EngineError> {
 
 fn pad_tar_entry(archive: &mut File, byte_count: u64) -> Result<(), EngineError> {
     let padding = (512 - byte_count % 512) % 512;
+    ensure_archive_capacity(archive, padding)?;
     if padding > 0 {
         archive.write_all(&[0_u8; 512][..padding as usize])?;
     }
@@ -484,6 +616,7 @@ fn pad_tar_entry(archive: &mut File, byte_count: u64) -> Result<(), EngineError>
 }
 
 fn append_tar_end(archive: &mut File) -> Result<(), EngineError> {
+    ensure_archive_capacity(archive, 1024)?;
     archive.write_all(&[0_u8; 1024])?;
     Ok(())
 }
@@ -495,102 +628,109 @@ fn enforce_archive_limit(file: &File) -> Result<(), EngineError> {
     Ok(())
 }
 
+fn ensure_archive_capacity(file: &File, additional: u64) -> Result<(), EngineError> {
+    if additional > MAX_HANDOFF_ARCHIVE_BYTES.saturating_sub(file.metadata()?.len()) {
+        return Err(invalid("Worktree handoff archive exceeds its limit"));
+    }
+    Ok(())
+}
+
 fn run_git_bounded(
     cwd: &Path,
     args: &[&str],
     limit: usize,
     cancellation: &CancellationToken,
 ) -> Result<Vec<u8>, EngineError> {
-    check_cancelled(cancellation)?;
-    let mut child = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| invalid(&format!("Could not start Git: {error}")))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| invalid("Could not capture Git output"))?;
-    enum ReadOutcome {
-        Output(Vec<u8>),
-        LimitExceeded,
-        Failed(io::Error),
-    }
-    let (read_tx, read_rx) = mpsc::sync_channel(1);
-    let reader = thread::spawn(move || {
-        let mut stdout = stdout;
+    run_git_with_reader(cwd, args, cancellation, move |mut stdout| {
         let mut output = Vec::with_capacity(limit.min(64 * 1024));
         let mut buffer = [0_u8; 64 * 1024];
         loop {
-            match stdout.read(&mut buffer) {
-                Ok(0) => {
-                    let _ = read_tx.send(ReadOutcome::Output(output));
-                    return;
-                }
-                Ok(read) => {
-                    let remaining = limit.saturating_add(1).saturating_sub(output.len());
-                    output.extend_from_slice(&buffer[..read.min(remaining)]);
-                    if output.len() > limit {
-                        let _ = read_tx.send(ReadOutcome::LimitExceeded);
-                        return;
-                    }
-                }
-                Err(error) => {
-                    let _ = read_tx.send(ReadOutcome::Failed(error));
-                    return;
-                }
+            let read = stdout.read(&mut buffer)?;
+            if read == 0 {
+                return Ok(output);
             }
-        }
-    });
-    let mut output = None;
-    let mut status = None;
-    loop {
-        if cancellation.is_cancelled() {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = reader.join();
-            return Err(invalid("Worktree handoff capture was cancelled"));
-        }
-        match read_rx.try_recv() {
-            Ok(ReadOutcome::Output(bytes)) => output = Some(bytes),
-            Ok(ReadOutcome::LimitExceeded) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
+            if read > limit.saturating_sub(output.len()) {
                 return Err(invalid("Git path output exceeds the handoff limit"));
             }
-            Ok(ReadOutcome::Failed(error)) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                return Err(error.into());
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) if output.is_none() => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                return Err(invalid("Could not capture Git output"));
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {}
+            output.extend_from_slice(&buffer[..read]);
         }
-        if status.is_none() {
-            status = child.try_wait()?;
-        }
-        if let Some(status) = status.as_ref()
-            && let Some(output) = output.take()
-        {
-            let _ = reader.join();
-            if !status.success() {
-                return Err(invalid("Git could not capture the worktree handoff"));
-            }
-            return Ok(output);
-        }
-        thread::sleep(Duration::from_millis(10));
+    })
+}
+
+fn run_git_with_reader<T: Send + 'static>(
+    cwd: &Path,
+    args: &[&str],
+    cancellation: &CancellationToken,
+    consume: impl FnOnce(std::process::ChildStdout) -> Result<T, EngineError> + Send + 'static,
+) -> Result<T, EngineError> {
+    check_cancelled(cancellation)?;
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .env("ASHLER_INCREMENTAL_TSC_CHECKS", "false")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
     }
+    let mut child = command
+        .spawn()
+        .map_err(|error| invalid(&format!("Could not start Git: {error}")))?;
+    let stdout = child.stdout.take().expect("Git stdout is piped");
+    let (read_tx, read_rx) = mpsc::sync_channel(1);
+    let reader = thread::spawn(move || {
+        let _ = read_tx.send(consume(stdout));
+    });
+    let result = (|| {
+        let mut output = None;
+        let mut status = None;
+        loop {
+            check_cancelled(cancellation)?;
+            match read_rx.try_recv() {
+                Ok(result) => output = Some(result?),
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) if output.is_none() => {
+                    return Err(invalid("Could not capture Git output"));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {}
+            }
+            if status.is_none() {
+                status = child.try_wait()?;
+            }
+            if let Some(status) = status.as_ref() {
+                if !status.success() {
+                    return Err(invalid("Git could not capture the worktree handoff"));
+                }
+                if let Some(output) = output.take() {
+                    return Ok(output);
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    })();
+    if result.is_err() {
+        // Git bundle spawns pack-objects; killing only Git leaves the packer
+        // alive with our stdout pipe open and can hang the reader join.
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let _ = reader.join();
+    result
 }
 
 fn check_cancelled(cancellation: &CancellationToken) -> Result<(), EngineError> {
@@ -679,6 +819,7 @@ mod tests {
         assert!(
             Command::new("git")
                 .args(args)
+                .env("ASHLER_INCREMENTAL_TSC_CHECKS", "false")
                 .current_dir(cwd)
                 .status()
                 .unwrap()
@@ -698,6 +839,7 @@ mod tests {
         let sha = String::from_utf8(
             Command::new("git")
                 .args(["rev-parse", "HEAD"])
+                .env("ASHLER_INCREMENTAL_TSC_CHECKS", "false")
                 .current_dir(temp.path())
                 .output()
                 .unwrap()
@@ -716,11 +858,10 @@ mod tests {
         std::fs::write(temp.path().join("new.txt"), "new\n").unwrap();
         std::fs::remove_file(temp.path().join("deleted.txt")).unwrap();
 
-        let snapshot = capture_worktree_handoff(temp.path(), &base).unwrap();
+        let snapshot = capture_worktree_handoff(temp.path()).unwrap();
         assert_eq!(snapshot.base_sha, base);
         assert_eq!(snapshot.entry_count, 3);
         assert!(snapshot.byte_count <= MAX_HANDOFF_ARCHIVE_BYTES);
-        assert_eq!(snapshot.manifest_sha256.len(), 64);
 
         let listing = Command::new("tar")
             .arg("-tf")
@@ -730,6 +871,7 @@ mod tests {
         assert!(listing.status.success());
         let listing = String::from_utf8(listing.stdout).unwrap();
         assert!(listing.contains("files/kept.txt"));
+        assert!(listing.contains(REPOSITORY_PATH));
         assert!(listing.contains("files/new.txt"));
         assert!(listing.contains(MANIFEST_PATH));
         assert!(!listing.contains("files/deleted.txt"));
@@ -741,12 +883,11 @@ mod tests {
         std::fs::write(temp.path().join(".gitignore"), ".omx/\nignored.bin\n").unwrap();
         git(temp.path(), &["add", ".gitignore"]);
         git(temp.path(), &["commit", "-qm", "ignore context"]);
-        let base = run_head(temp.path());
         std::fs::create_dir_all(temp.path().join(".omx/plans")).unwrap();
         std::fs::write(temp.path().join(".omx/plans/plan.md"), "plan\n").unwrap();
         std::fs::write(temp.path().join("ignored.bin"), "ignored\n").unwrap();
 
-        let snapshot = capture_worktree_handoff(temp.path(), &base).unwrap();
+        let snapshot = capture_worktree_handoff(temp.path()).unwrap();
         assert_eq!(snapshot.entry_count, 1);
         let listing = Command::new("tar")
             .arg("-tf")
@@ -761,20 +902,20 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn rejects_hard_links_and_files_over_the_per_file_limit() {
-        let (temp, base) = fixture();
+        let (temp, _) = fixture();
         std::fs::write(temp.path().join("linked.txt"), "linked\n").unwrap();
         std::fs::hard_link(
             temp.path().join("linked.txt"),
             temp.path().join("linked-again.txt"),
         )
         .unwrap();
-        assert!(capture_worktree_handoff(temp.path(), &base).is_err());
+        assert!(capture_worktree_handoff(temp.path()).is_err());
         std::fs::remove_file(temp.path().join("linked.txt")).unwrap();
         std::fs::remove_file(temp.path().join("linked-again.txt")).unwrap();
 
         let oversized = File::create(temp.path().join("oversized.bin")).unwrap();
         oversized.set_len(MAX_HANDOFF_FILE_BYTES + 1).unwrap();
-        assert!(capture_worktree_handoff(temp.path(), &base).is_err());
+        assert!(capture_worktree_handoff(temp.path()).is_err());
     }
     #[test]
     fn rejects_path_bytes_before_retaining_the_full_git_output() {
@@ -793,23 +934,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_commit_bases_and_escaping_symlinks() {
+    fn rejects_unborn_head() {
+        let temp = tempfile::tempdir().unwrap();
+        git(temp.path(), &["init", "-q"]);
+        assert!(capture_worktree_handoff(temp.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_escaping_symlinks() {
         let (temp, _) = fixture();
-        assert!(capture_worktree_handoff(temp.path(), "master").is_err());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::symlink;
-            symlink("../../outside", temp.path().join("escape")).unwrap();
-            assert!(capture_worktree_handoff(temp.path(), &run_head(temp.path())).is_err());
-        }
+        std::os::unix::fs::symlink("../../outside", temp.path().join("escape")).unwrap();
+        assert!(capture_worktree_handoff(temp.path()).is_err());
     }
 
     #[test]
     fn rejects_a_cancelled_capture_before_allocating_archive_state() {
-        let (temp, base) = fixture();
+        let (temp, _) = fixture();
         let cancellation = CancellationToken::new();
         cancellation.cancel();
-        assert!(capture_worktree_handoff_cancellable(temp.path(), &base, &cancellation).is_err());
+        assert!(capture_worktree_handoff_cancellable(temp.path(), &cancellation).is_err());
     }
 
     #[cfg(unix)]
@@ -843,10 +987,210 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_terminates_git_descendants_holding_stdout_open() {
+        let (temp, _) = fixture();
+        let cancellation = CancellationToken::new();
+        let cancel_from_thread = cancellation.clone();
+        let cancel = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            cancel_from_thread.cancel();
+        });
+        let started = std::time::Instant::now();
+        assert!(
+            run_git_bounded(
+                temp.path(),
+                &["-c", "alias.handoff-block=!sleep 30", "handoff-block"],
+                1024,
+                &cancellation,
+            )
+            .is_err()
+        );
+        cancel.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn captures_linked_worktree_head_instead_of_main_checkout_head() {
+        let (source, main_head) = fixture();
+        let directory = tempfile::tempdir().unwrap();
+        let worktree = directory.path().join("linked");
+        git(
+            source.path(),
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                "-q",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(worktree.join("only-linked.txt"), "linked\n").unwrap();
+        git(&worktree, &["add", "."]);
+        git(&worktree, &["commit", "-qm", "linked only"]);
+        let linked_head = run_head(&worktree);
+        let snapshot = capture_worktree_handoff(&worktree).unwrap();
+        assert_eq!(snapshot.base_sha, linked_head);
+        assert_ne!(snapshot.base_sha, main_head);
+        assert!(snapshot.cwd_relative_path.is_empty());
+        assert_eq!(snapshot.entry_count, 0);
+        assert_eq!(run_head(source.path()), main_head);
+        let unpacked = tempfile::tempdir().unwrap();
+        assert!(
+            Command::new("tar")
+                .arg("-xf")
+                .arg(snapshot.file.path())
+                .arg("-C")
+                .arg(unpacked.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        git(
+            unpacked.path(),
+            &["clone", "-q", "source.bundle", "restored"],
+        );
+        assert_eq!(run_head(&unpacked.path().join("restored")), linked_head);
+    }
+
+    #[test]
+    fn transfers_source_history_and_nested_dirty_worktree_without_destination_base() {
+        let (source, first_commit) = fixture();
+        let (platform, _) = fixture();
+        std::fs::write(platform.path().join("platform.txt"), "unrelated platform\n").unwrap();
+        git(platform.path(), &["add", "."]);
+        git(platform.path(), &["commit", "-qm", "platform only"]);
+        let platform_head = run_head(platform.path());
+        let nested = source.path().join("packages/app");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("tracked.txt"), "source commit\n").unwrap();
+        git(source.path(), &["add", "."]);
+        git(source.path(), &["commit", "-qm", "source only"]);
+        let source_head = run_head(source.path());
+        git(source.path(), &["checkout", "--detach", "-q"]);
+        std::fs::write(nested.join("tracked.txt"), "staged change\n").unwrap();
+        git(source.path(), &["add", "."]);
+        std::fs::write(nested.join("tracked.txt"), "dirty source\n").unwrap();
+        std::fs::write(nested.join("new.txt"), "untracked source\n").unwrap();
+        std::fs::remove_file(source.path().join("deleted.txt")).unwrap();
+        let refs_before = git_output(source.path(), &["show-ref"]);
+        let index_before = std::fs::read(source.path().join(".git/index")).unwrap();
+        let snapshot = capture_worktree_handoff(&nested).unwrap();
+        assert_eq!(snapshot.base_sha, source_head);
+        assert_ne!(snapshot.base_sha, platform_head);
+        assert_eq!(snapshot.cwd_relative_path, "packages/app");
+        assert_eq!(snapshot.entry_count, 3);
+        assert_eq!(git_output(source.path(), &["show-ref"]), refs_before);
+        assert_eq!(
+            std::fs::read(source.path().join(".git/index")).unwrap(),
+            index_before
+        );
+        assert_eq!(run_head(source.path()), source_head);
+
+        let unpacked = tempfile::tempdir().unwrap();
+        assert!(
+            Command::new("tar")
+                .arg("-xf")
+                .arg(snapshot.file.path())
+                .arg("-C")
+                .arg(unpacked.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let manifest_bytes = std::fs::read(unpacked.path().join(MANIFEST_PATH)).unwrap();
+        assert_eq!(hex_sha256(&manifest_bytes), snapshot.manifest_sha256);
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+        assert_eq!(manifest["version"], "crew.scaffold.worktree.v2");
+        assert_eq!(manifest["baseSha"], source_head);
+        assert_eq!(manifest["cwdRelativePath"], "packages/app");
+        let bundle = std::fs::read(unpacked.path().join(REPOSITORY_PATH)).unwrap();
+        assert_eq!(manifest["repository"]["sha256"], hex_sha256(&bundle));
+        assert_eq!(manifest["repository"]["byteCount"], bundle.len() as u64);
+        // Delete the actual source to prove all reachable Git objects are in
+        // the archive, rather than accidentally resolving through alternates.
+        source.close().unwrap();
+        git(
+            unpacked.path(),
+            &["clone", "-q", "source.bundle", "restored"],
+        );
+        let restored = unpacked.path().join("restored");
+        assert_eq!(run_head(&restored), source_head);
+        git(
+            &restored,
+            &["merge-base", "--is-ancestor", &first_commit, "HEAD"],
+        );
+        assert_eq!(
+            std::fs::read_to_string(restored.join("packages/app/tracked.txt")).unwrap(),
+            "source commit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(unpacked.path().join("files/packages/app/tracked.txt"))
+                .unwrap(),
+            "dirty source\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(unpacked.path().join("files/packages/app/new.txt")).unwrap(),
+            "untracked source\n"
+        );
+        assert!(
+            manifest["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| { entry["kind"] == "delete" && entry["path"] == "deleted.txt" })
+        );
+        assert_eq!(run_head(platform.path()), platform_head);
+    }
+
+    #[test]
+    fn rejects_bundle_overflow_before_writing_beyond_the_budget() {
+        let cancellation = CancellationToken::new();
+        let input = vec![0_u8; 64 * 1024 + 1];
+        let mut output = Vec::new();
+        assert!(copy_bundle_bounded(&input[..], &mut output, 64 * 1024, &cancellation).is_err());
+        assert_eq!(output.len(), 64 * 1024);
+        let mut exact = Vec::new();
+        let (digest, count) =
+            copy_bundle_bounded(&input[..], &mut exact, input.len() as u64, &cancellation).unwrap();
+        assert_eq!(exact, input);
+        assert_eq!(count, input.len() as u64);
+        assert_eq!(digest, hex_sha256(&input));
+        cancellation.cancel();
+        let mut cancelled_output = Vec::new();
+        assert!(
+            copy_bundle_bounded(&input[..], &mut cancelled_output, u64::MAX, &cancellation)
+                .is_err()
+        );
+        assert!(cancelled_output.is_empty());
+    }
+
+    #[test]
+    fn archive_limit_includes_tar_headers_and_padding_before_writes() {
+        let mut file = tempfile::tempfile().unwrap();
+        file.set_len(MAX_HANDOFF_ARCHIVE_BYTES - 512).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        assert!(append_bytes(&mut file, "files/overflow", b"x", 0o600).is_err());
+        assert!(file.metadata().unwrap().len() <= MAX_HANDOFF_ARCHIVE_BYTES);
+    }
+
+    fn git_output(cwd: &Path, args: &[&str]) -> Vec<u8> {
+        let output = Command::new("git")
+            .args(args)
+            .env("ASHLER_INCREMENTAL_TSC_CHECKS", "false")
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        output.stdout
+    }
+
     fn run_head(cwd: &Path) -> String {
         String::from_utf8(
             Command::new("git")
                 .args(["rev-parse", "HEAD"])
+                .env("ASHLER_INCREMENTAL_TSC_CHECKS", "false")
                 .current_dir(cwd)
                 .output()
                 .unwrap()
