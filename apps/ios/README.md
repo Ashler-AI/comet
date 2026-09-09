@@ -145,6 +145,36 @@ Both builds subsequently showed **Testing** in their existing **Ashler Internal*
 groups. This is internal TestFlight distribution, not public App Store submission;
 physical-iPhone installation, notification display, and tap routing are unverified.
 
+The September 9 release shipped staging **1.0 (15)** and production **1.0 (9)**
+from `1bd7174a0bbc4ae8084128e94460bc3a2e6a51c5` on `main`.
+[Staging CI](https://github.com/Ashler-AI/comet/actions/runs/34372373257) and
+[production CI](https://github.com/Ashler-AI/comet/actions/runs/34372375741)
+passed all five mobile scenarios. Staging's first attempt compiled, then exceeded
+the five-minute simulator boot timeout; its unchanged-source retry passed.
+Downloaded artifacts passed SHA-256 verification. Both distribution-signed
+inspection apps and the exact uploaded apps passed strict signature verification
+with their expected bundle identifiers and `aps-environment = production`.
+Export and upload performed no local compilation or typechecks. Uploaded IPA
+SHA-256 values:
+
+- Staging 15: `1d96ff6bed24cddc03a0cd3e774e59c2bd2baecfdc66af65c726f5e23841962c`
+- Production 9: `cac6b22568564769bb242deba34445ff620cb2f3b6ba4c7f0dd7fb795e470a1f`
+
+Apple accepted production at **16:00 UTC** and staging at **16:10 UTC** on
+September 9. Both builds were subsequently confirmed **Testing** in their
+existing **Ashler Internal** groups in App Store Connect. This is internal
+TestFlight distribution, not public App Store submission. Physical-device
+installation, notification display, and tap routing remain unverified.
+
+[Desktop staging promotion](https://github.com/Ashler-AI/comet/actions/runs/34372479807)
+reused the exact **0.1.84** candidate from
+[34317581431](https://github.com/Ashler-AI/comet/actions/runs/34317581431), preserving
+source `dcbc5bc5a682af544c985bdd0d16bd28467f761e` without rebuilding. Live channel
+readback confirmed staging **0.1.84**, desktop production unchanged at **0.1.83**,
+and both Scaffold manifests byte-identical to their pre-promotion **0.1.81**
+versions. OpenCode reviewed the publication changes with no actionable findings;
+all **23 release-workflow checks** passed before publication.
+
 Desktop **0.1.82** passed **536 UI tests** and **3 large-journal fork regressions**
 in [candidate CI](https://github.com/Ashler-AI/comet/actions/runs/34277731362).
 [Promotion](https://github.com/Ashler-AI/comet/actions/runs/34279604790) reused
