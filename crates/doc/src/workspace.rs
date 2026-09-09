@@ -257,13 +257,17 @@ impl WorkspaceDoc {
             unreachable!("worker binding serializes as an object");
         };
         for (key, value) in fields {
-            row.insert(&key, LoroValue::from(value))?;
+            row.insert(key.as_str(), LoroValue::from(value))?;
         }
         self.doc.commit();
         Ok(())
     }
     pub fn read_worker_bindings(&self) -> Result<Vec<WorkerBinding>, DocError> {
-        self.read_rows::<WorkerBinding>("workerBindings")
+        // Cleanup must fail closed on malformed retention metadata rather than
+        // silently skipping the row as ordinary display projections do.
+        let value = self.doc.get_map("workerBindings").get_deep_value().to_json_value();
+        let rows: std::collections::BTreeMap<String, WorkerBinding> = serde_json::from_value(value)?;
+        Ok(rows.into_values().collect())
     }
 
 

@@ -132,7 +132,16 @@ async fn worker_terminal_state_is_not_text_and_close_cannot_replay_or_discard_wo
     let path = Path::new(created["chat"]["cwd"].as_str().unwrap());
     std::fs::write(path.join("unlanded"), "retain me").unwrap();
     send(&client, "hold-command", "[hold]").await.unwrap();
-    state(&client, "busy").await; // transcript says completed, runtime has not emitted Done
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let snapshot = client.call(methods::READ_WORKER_SESSION, identity()).await.unwrap();
+            if snapshot["latestEvent"]["event"]["text"] == "completed successfully" {
+                assert_eq!(snapshot["state"], "busy", "agent prose is not a terminal outcome");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("live misleading completion text");
     assert!(client.call(methods::CANCEL_CHAT_STARTUP, json!({"chatId":WORKER,"createdWorktree":true,"worktreePath":path})).await.is_err());
     let closed = control(&client, "close").await;
     assert_eq!(closed["state"], "closed");
