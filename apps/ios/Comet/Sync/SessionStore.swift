@@ -494,7 +494,24 @@ final class SessionStore {
                             createdAt: m["createdAt"]?.i64Value ?? 0,
                             deviceId: m["deviceId"]?.stringValue ?? "",
                             status: m["status"]?.stringValue.flatMap(MessageStatus.init(rawValue:)),
-                            continuationOf: m["continuationOf"]?.stringValue)
+                            continuationOf: m["continuationOf"]?.stringValue,
+                            peerMessage: peerMessageFrom(m["peerMessage"]))
+    }
+
+    nonisolated private static func peerMessageFrom(_ value: LoroValue?) -> PeerMessageProvenance? {
+        guard let map = value?.mapValue,
+              let commandId = map["commandId"]?.stringValue,
+              let sourceChatId = map["sourceChatId"]?.stringValue,
+              let threadId = map["threadId"]?.stringValue else { return nil }
+        let replyTo: String?
+        switch map["replyTo"] {
+        case nil, .some(.null): replyTo = nil
+        case .some(.string(let value)): replyTo = value
+        default: return nil
+        }
+        let provenance = PeerMessageProvenance(commandId: commandId, sourceChatId: sourceChatId,
+                                               threadId: threadId, replyTo: replyTo)
+        return provenance.isValid ? provenance : nil
     }
 
     nonisolated private static func partFrom(_ value: LoroValue) -> MessagePart? {
@@ -543,7 +560,9 @@ final class SessionStore {
         var roots: [MessageEntry] = []
         var index: [String: Int] = [:]
         for entry in raw {
-            if let rootId = entry.continuationOf, let ix = index[rootId] {
+            if let rootId = entry.continuationOf, let ix = index[rootId],
+               roots[ix].role == entry.role,
+               !roots[ix].isPeerMessage || entry.peerMessage == roots[ix].peerMessage {
                 roots[ix].parts.append(contentsOf: entry.parts)
             } else {
                 index[entry.id] = roots.count

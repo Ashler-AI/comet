@@ -1430,6 +1430,7 @@ fn load_transcript(
             device_id: device_id.to_string(),
             status: Some(MessageStatus::Complete),
             continuation_of: None,
+            peer_message: None,
         });
     }
     entries.sort_by_key(|entry| entry.created_at);
@@ -1560,6 +1561,7 @@ fn load_opencode_transcript(
                 device_id: device_id.to_string(),
                 status: Some(MessageStatus::Complete),
                 continuation_of: None,
+                peer_message: None,
             });
             last_source_id = Some(source_id);
         }
@@ -2820,6 +2822,7 @@ mod tests {
                 device_id: "device-a".into(),
                 status: Some(MessageStatus::Complete),
                 continuation_of: None,
+                peer_message: None,
             },
             SessionMessageEntry {
                 id: "comet-owned-reply".into(),
@@ -2832,6 +2835,7 @@ mod tests {
                 device_id: "device-a".into(),
                 status: Some(MessageStatus::Complete),
                 continuation_of: None,
+                peer_message: None,
             },
         ] {
             session_doc.push_message(&entry).unwrap();

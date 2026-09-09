@@ -75,7 +75,7 @@ fn first_reply_text(entry: &SessionMessageEntry) -> Option<String> {
     })
 }
 
-/// Extract rail ticks from the transcript: one per user entry (doc entries
+/// Extract rail ticks from the transcript: one per non-peer user entry (doc entries
 /// first, then unconfirmed echoes — matching transcript row order). Each tick
 /// carries the opening of the assistant reply that followed it, for the hover
 /// preview card.
@@ -89,7 +89,7 @@ pub fn rail_ticks(
         if entry.role == MessageRole::Assistant {
             next_assistant = Some(entry);
         }
-        if entry.role != MessageRole::User {
+        if entry.role != MessageRole::User || entry.is_peer_message() {
             continue;
         }
         ticks.push(RailTick {
@@ -105,7 +105,10 @@ pub fn rail_ticks(
         .map(|entry| entry.id.as_str())
         .collect();
     for echo in echoes {
-        if echo.role == MessageRole::User && seen.insert(echo.id.as_str()) {
+        if echo.role == MessageRole::User
+            && !echo.is_peer_message()
+            && seen.insert(echo.id.as_str())
+        {
             ticks.push(RailTick {
                 message_id: echo.id.clone(),
                 prompt: user_text(echo),
@@ -595,7 +598,31 @@ mod tests {
             device_id: "d".into(),
             status: Some(MessageStatus::Complete),
             continuation_of: None,
+            peer_message: None,
         }
+    }
+
+    #[test]
+    fn peer_messages_never_create_prompt_previews_even_as_echoes() {
+        let mut peer = entry("peer", MessageRole::User, "private transport body");
+        peer.peer_message = Some(comet_proto::PeerMessageProvenance {
+            command_id: peer.id.clone(),
+            source_chat_id: "source".into(),
+            thread_id: "thread".into(),
+            reply_to: None,
+        });
+        let ordinary = entry("ordinary", MessageRole::User, "[Peer message] ordinary prompt");
+        let reply = entry("reply", MessageRole::Assistant, "visible answer");
+        let ticks = rail_ticks(&[peer.clone(), ordinary.clone(), reply], &[peer.clone()]);
+        assert_eq!(ticks, vec![RailTick {
+            message_id: ordinary.id.clone(),
+            prompt: "[Peer message] ordinary prompt".into(),
+            reply: Some("visible answer".into()),
+        }]);
+        assert!(rail_ticks(&[peer.clone()], &[peer.clone()]).is_empty());
+        peer.peer_message.as_mut().unwrap().command_id = "mismatch".into();
+        let ticks = rail_ticks(&[peer], &[]);
+        assert_eq!(ticks[0].prompt, "private transport body");
     }
 
     #[test]

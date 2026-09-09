@@ -365,6 +365,21 @@ enum MessagePart: Hashable, Identifiable {
     }
 }
 
+/// Native peer-command identity; message text never determines provenance.
+struct PeerMessageProvenance: Hashable, Codable {
+    var commandId: String
+    var sourceChatId: String
+    var threadId: String
+    var replyTo: String?
+
+    var isValid: Bool {
+        !commandId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !sourceChatId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !threadId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && (replyTo.map { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } ?? true)
+    }
+}
+
 struct MessageEntry: Identifiable, Hashable {
     var id: String
     var role: MessageRole
@@ -373,6 +388,12 @@ struct MessageEntry: Identifiable, Hashable {
     var deviceId: String
     var status: MessageStatus?
     var continuationOf: String?
+    var peerMessage: PeerMessageProvenance? = nil
+
+    var isPeerMessage: Bool {
+        role == .user && continuationOf == nil
+            && peerMessage?.isValid == true && peerMessage?.commandId == id
+    }
 }
 
 // MARK: - Folder browsing (add-space palette data)

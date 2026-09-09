@@ -11,6 +11,7 @@ import Foundation
 
 enum RowKind {
     case user(text: String)
+    case peerMessage(text: String)
     case markdown(block: MDBlock, streaming: Bool)
     case toolGroup(tools: [ToolItem], autoOpen: Bool)
     case inputChip(header: String, resolved: Bool)
@@ -110,14 +111,17 @@ enum TranscriptRowBuilder {
         let settled = entry.status != nil && !streaming
 
         if entry.role == .user {
-            // One bubble row per user message.
+            // One bubble or collapsed disclosure per user message.
+            let isPeerMessage = entry.isPeerMessage
             let text = entry.parts.compactMap { part -> String? in
                 if case .text(_, let t) = part { return t }
                 return nil
             }.joined(separator: "\n")
-            guard !text.isEmpty else { return }
-            rows.append(TranscriptRow(id: entry.id, version: fnv1a(text),
-                                      turnStart: true, kind: .user(text: text),
+            guard !text.isEmpty || isPeerMessage else { return }
+            rows.append(TranscriptRow(id: entry.id,
+                                      version: fnv1a(text) | (isPeerMessage ? 1 : 0),
+                                      turnStart: true,
+                                      kind: isPeerMessage ? .peerMessage(text: text) : .user(text: text),
                                       entryId: entry.id, timestamp: entry.createdAt,
                                       partKey: nil))
             return

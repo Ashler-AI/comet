@@ -679,6 +679,18 @@ pub struct AgentSessionRecord {
     pub unknown: UnknownFields,
 }
 
+/// Identity of the native peer command that first wrote a Crew transcript message.
+/// This is separate from collaboration publications and is never inferred from text.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerMessageProvenance {
+    pub command_id: String,
+    pub source_chat_id: String,
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+}
+
 /// Additive provenance for a legacy transcript entry. Keeping this append-only avoids
 /// rewriting streamed message maps while allowing multiple sessions to merge in one thread.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

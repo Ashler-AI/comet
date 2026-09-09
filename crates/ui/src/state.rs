@@ -397,13 +397,14 @@ pub enum ChatStartupPhase {
     Admitting,
 }
 
-/// A compact transcript-derived label for an imported session. The first user
-/// turn is stable as the conversation grows; blank/tool-only turns keep the
+/// A compact transcript-derived label for an imported session. Peer turns are
+/// never eligible; blank/tool-only ordinary turns keep the
 /// exact-id fallback.
-fn shared_session_preview(entries: &[SessionMessageEntry]) -> Option<String> {
-    let text = entries
+fn shared_session_preview(entries: &[SessionMessageEntry]) -> Option<(String, String)> {
+    let entry = entries
         .iter()
-        .find(|entry| entry.role == MessageRole::User)?
+        .find(|entry| entry.role == MessageRole::User && !entry.is_peer_message())?;
+    let text = entry
         .parts
         .iter()
         .filter_map(|part| match part {
@@ -420,11 +421,12 @@ fn shared_session_preview(entries: &[SessionMessageEntry]) -> Option<String> {
     }
     let mut chars = one_line.chars();
     let preview: String = chars.by_ref().take(48).collect();
-    Some(if chars.next().is_some() {
+    let preview = if chars.next().is_some() {
         format!("{preview}\u{2026}")
     } else {
         preview
-    })
+    };
+    Some((entry.id.clone(), preview))
 }
 
 fn agent_indicator_with_transcript(
@@ -1037,8 +1039,8 @@ pub struct AppState {
     pub sessions_epoch: u64,
     /// Imported session memberships from the workspace `sessionRefs` map.
     pub session_refs: Vec<SessionRef>,
-    /// Transcript-derived labels learned after an imported room has opened.
-    shared_session_previews: HashMap<String, String>,
+    /// Source entry id and label learned after an imported room has opened.
+    shared_session_previews: HashMap<String, (String, String)>,
     /// The space whose tabs fill the main area. Healed by [`Self::apply_spaces`]
     /// when the row vanishes; selecting a chat implies its space.
     pub selected_space: Option<String>,
@@ -1923,14 +1925,25 @@ impl AppState {
         let Some(chat_id) = self.selected_chat.as_deref() else {
             return;
         };
-        if self.chats.iter().any(|chat| chat.id == chat_id)
-            || self.shared_session_previews.contains_key(chat_id)
-        {
+        if self.chats.iter().any(|chat| chat.id == chat_id) || self.transcript.is_empty() {
             return;
+        }
+        if let Some((entry_id, _)) = self.shared_session_previews.get(chat_id) {
+            // A bounded replay may not include the original title's source.
+            // Keep that stable label, but never retain it when its source is
+            // now known to be a peer entry.
+            let Some(entry) = self.transcript.iter().find(|entry| &entry.id == entry_id) else {
+                return;
+            };
+            if !entry.is_peer_message() {
+                return;
+            }
         }
         if let Some(preview) = shared_session_preview(&self.transcript) {
             self.shared_session_previews
                 .insert(chat_id.to_string(), preview);
+        } else {
+            self.shared_session_previews.remove(chat_id);
         }
     }
 
@@ -2150,7 +2163,7 @@ impl AppState {
         self.scaffold_session_name(chat_id).or_else(|| {
             self.shared_session_previews
                 .get(chat_id)
-                .map(String::as_str)
+                .map(|(_, preview)| preview.as_str())
         })
     }
 
@@ -5096,6 +5109,7 @@ mod tests {
             device_id: "local".into(),
             status: None,
             continuation_of: None,
+            peer_message: None,
         };
         state.push_echo("c1", echo.clone());
         // Duplicate pushes dedupe.
@@ -5143,6 +5157,7 @@ mod tests {
             device_id: "device".into(),
             status: None,
             continuation_of: None,
+            peer_message: None,
         }
     }
 
@@ -5653,11 +5668,47 @@ mod tests {
             device_id: "remote".into(),
             status: None,
             continuation_of: None,
+            peer_message: None,
         }]);
         assert_eq!(
             state.shared_session_title(chat_id),
             "Explain the shared transcript"
         );
+    }
+
+    #[test]
+    fn imported_session_preview_skips_peer_turns_and_evicts_stale_body() {
+        let chat_id = "shared-peer";
+        let mut state = AppState::new();
+        state.selected_chat = Some(chat_id.into());
+        let mut peer = transcript_entry("peer");
+        peer.role = MessageRole::User;
+        peer.parts = vec![MessagePart::Text {
+            id: "text".into(),
+            text: "private peer payload".into(),
+        }];
+        state.apply_transcript(vec![peer.clone()]);
+        assert_eq!(state.shared_session_preview(chat_id), Some("private peer payload"));
+        peer.peer_message = Some(comet_proto::PeerMessageProvenance {
+            command_id: peer.id.clone(),
+            source_chat_id: "source".into(),
+            thread_id: "thread".into(),
+            reply_to: None,
+        });
+        state.apply_transcript(vec![peer.clone()]);
+        assert!(state.shared_session_preview(chat_id).is_none());
+        let mut ordinary = transcript_entry("ordinary");
+        ordinary.role = MessageRole::User;
+        ordinary.parts = vec![MessagePart::Text {
+            id: "text".into(),
+            text: "[Peer message] ordinary prompt".into(),
+        }];
+        state.apply_transcript(vec![peer.clone(), ordinary]);
+        assert_eq!(state.shared_session_preview(chat_id), Some("[Peer message] ordinary prompt"));
+        peer.peer_message.as_mut().unwrap().command_id = "mismatch".into();
+        assert_eq!(shared_session_preview(&[peer]), Some(("peer".into(), "private peer payload".into())));
+        state.apply_transcript(vec![transcript_entry("later-window")]);
+        assert_eq!(state.shared_session_preview(chat_id), Some("[Peer message] ordinary prompt"));
     }
 
     #[test]

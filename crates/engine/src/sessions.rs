@@ -97,6 +97,12 @@ fn harness_run_request(request: &RunRequest, harness_id: HarnessId) -> RunReques
     prepared
 }
 
+/// Sidebar/tabs/mobile previews are presentation, not harness input. Keep their
+/// activity timestamps without copying hidden peer content into workspace rows.
+fn user_message_preview(prompt: &str, peer_message: bool) -> &str {
+    if peer_message { "Inter-session message" } else { prompt }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerReply {
     pub command_id: String,
@@ -804,7 +810,8 @@ impl SessionsEngine {
         if let ExistingRunDecision::Routed { run_id, status } = &existing {
             lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
             let handle = self.doc_handle(chat_id)?;
-            handle.write_user_message_with_status(&user_id, &request.prompt, now_ms(), *status)?;
+            let peer_message =
+                handle.write_user_message_with_status(&user_id, &request.prompt, now_ms(), *status)?;
             // The optimistic echo may already exist with a composer-guessed
             // steer status. Stamp the engine-authoritative state over it.
             handle.doc_arc().set_message_status(&user_id, *status)?;
@@ -814,7 +821,7 @@ impl SessionsEngine {
             // — that gap read as unseen-with-no-live-run = a phantom
             // "completed" flash on every remote send (2026-07-31).
             self.set_status(chat_id, SessionStatus::Working, false);
-            self.inner.note_message(chat_id, &request.prompt);
+            self.inner.note_message(chat_id, user_message_preview(&request.prompt, peer_message));
             return Ok(run_id.clone());
         }
 
@@ -869,7 +876,7 @@ impl SessionsEngine {
         }
         let inference_token = inference.as_ref().map(|route| route.token.clone());
         let handle = self.doc_handle(chat_id)?;
-        handle.write_user_message(&user_id, &request.prompt, now_ms())?;
+        let peer_message = handle.write_user_message(&user_id, &request.prompt, now_ms())?;
 
         // Engine-owned continuation/fork lookup. A pending fork is distinct
         // from resume: adapters must create a new native identity, and failure
@@ -961,11 +968,11 @@ impl SessionsEngine {
         self.set_status(chat_id, SessionStatus::Working, true);
         // AFTER Working (same causal-order guarantee as the steer path): the
         // lastMessageAt bump must never be observable ahead of the live run.
-        self.inner.note_message(chat_id, &request.prompt);
+        self.inner.note_message(chat_id, user_message_preview(&request.prompt, peer_message));
 
         // Name the chat immediately from its first prompt. This is entirely
         // local and never starts an auxiliary harness/model session.
-        if let Some(titles) = self.inner.titles.get() {
+        if !peer_message && let Some(titles) = self.inner.titles.get() {
             titles.maybe_generate(chat_id, &request.prompt);
         }
         // Starting the harness is part of dispatch, not background run
@@ -1086,7 +1093,7 @@ impl SessionsEngine {
             handle.mailbox_message_status(was_turn_active, message)
         };
         let handle = self.doc_handle(chat_id)?;
-        handle.write_user_message_with_status(&user_id, prompt, now_ms(), status)?;
+        let peer_message = handle.write_user_message_with_status(&user_id, prompt, now_ms(), status)?;
         // The optimistic echo may already exist with a generic steer status.
         // Stamp the harness-authoritative state instead of preserving that guess.
         handle.doc_arc().set_message_status(&user_id, status)?;
@@ -1096,7 +1103,7 @@ impl SessionsEngine {
             // dispatch — no phantom "completed" flash for remote observers).
             self.set_status(chat_id, SessionStatus::Working, false);
         }
-        self.inner.note_message(chat_id, prompt);
+        self.inner.note_message(chat_id, user_message_preview(prompt, peer_message));
         Ok(SteerOutcome::Accepted(status))
     }
 
@@ -1131,7 +1138,7 @@ impl SessionsEngine {
             }
         };
         let handle = self.doc_handle(chat_id)?;
-        handle.write_user_message_with_status(
+        let peer_message = handle.write_user_message_with_status(
             &user_id,
             prompt,
             now_ms(),
@@ -1147,7 +1154,7 @@ impl SessionsEngine {
                 .set_message_status(&user_id, MessageStatus::Complete)?;
             self.set_status(chat_id, SessionStatus::Working, false);
         }
-        self.inner.note_message(chat_id, prompt);
+        self.inner.note_message(chat_id, user_message_preview(prompt, peer_message));
         Ok(outcome)
     }
 

@@ -22,7 +22,7 @@ use comet_doc::{
 };
 use comet_proto::{
     AgentSessionRecord, AuditEvent, AuditResult, COLLABORATION_SCHEMA_VERSION, CapabilityGrant,
-    FileTargetReference, HarnessId, MessageProvenance, ModelHandoff, PublicationRecord,
+    FileTargetReference, HarnessId, MessageProvenance, ModelHandoff, PeerMessageProvenance, PublicationRecord,
     PublicationValue, SemanticAnchor, SemanticAnnotation, SessionRoomProjection, SessionStatus,
     UserInputAnswer, UserInputQuestion, VerifiedCapabilityGrantEnvelope,
 };
@@ -468,14 +468,14 @@ impl ChatDocHandle {
         lock(&self.room).is_some()
     }
 
-    /// Write a complete user message entry, idempotent by id (the client-minted message
-    /// id — a re-executed command or optimistic echo never duplicates the entry).
+    /// Write a complete user message, idempotent by durable message id. Returns whether
+    /// the persisted entry has peer provenance, for content-free UI previews.
     pub fn write_user_message(
         &self,
         message_id: &str,
         text: &str,
         created_at: i64,
-    ) -> Result<(), DocError> {
+    ) -> Result<bool, DocError> {
         self.write_user_message_with_status(message_id, text, created_at, MessageStatus::Complete)
     }
 
@@ -487,11 +487,32 @@ impl ChatDocHandle {
         text: &str,
         created_at: i64,
         status: MessageStatus,
-    ) -> Result<(), DocError> {
-        if self.doc.contains_message(message_id) {
-            return Ok(());
+    ) -> Result<bool, DocError> {
+        if let Some(entry) = self.doc.read_entry(message_id)? {
+            // Never infer or retrofit provenance onto an existing historical entry.
+            return Ok(entry.is_peer_message());
         }
-        self.doc.push_message(&SessionMessageEntry {
+        // Native peer delivery uses the immutable command id as its message id in
+        // all three paths: live waiter, active steering, and queued/new turn.
+        // Text (including a user-typed peer prompt lookalike) is never consulted.
+        let peer_message = self.doc.read_command(message_id)?.and_then(|entry| {
+            if !matches!(entry.status, SessionCommandStatus::Pending | SessionCommandStatus::Applied)
+            {
+                return None;
+            }
+            match entry.payload {
+                SessionCommandPayload::PeerMessage {
+                    source_chat_id, thread_id, reply_to, ..
+                } => Some(PeerMessageProvenance {
+                    command_id: entry.id,
+                    source_chat_id,
+                    thread_id,
+                    reply_to,
+                }),
+                _ => None,
+            }
+        });
+        let entry = SessionMessageEntry {
             id: message_id.to_string(),
             role: MessageRole::User,
             parts: vec![MessagePart::Text {
@@ -502,7 +523,11 @@ impl ChatDocHandle {
             device_id: self.device_id.clone(),
             status: Some(status),
             continuation_of: None,
-        })
+            peer_message,
+        };
+        let is_peer_message = entry.is_peer_message();
+        self.doc.push_message(&entry)?;
+        Ok(is_peer_message)
     }
 
     /// Recovery sweep: stamp this device's abandoned `streaming` entries `aborted`, appending
@@ -2689,9 +2714,9 @@ impl DocHost {
     }
 }
 
-/// The exact user-visible prompt delivered to a peer session's transcript and
-/// harness. Keeping one string prevents the recorded and executed instructions
-/// from diverging.
+/// The exact prompt delivered to a peer session's transcript and harness. The
+/// transcript UI collapses typed peer messages, never rewrites their content.
+/// Keeping one string prevents recorded and executed instructions from diverging.
 pub fn peer_message_prompt(
     source_chat_id: &str,
     thread_id: &str,
