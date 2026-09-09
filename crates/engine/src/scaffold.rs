@@ -35,7 +35,6 @@ use crate::omp_session_artifact::CapturedOmpSessionFile;
 use crate::worktree_handoff::{MAX_HANDOFF_ARCHIVE_BYTES, WorktreeHandoffArchive};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const RUNTIME_START_WAIT: Duration = Duration::from_secs(120);
 const RUNTIME_START_POLL: Duration = Duration::from_millis(500);
 const JOIN_GRANT_TTL_SECONDS: u32 = 15 * 60;
 const DEVICE_ACCESS_TTL_MS: i64 = 12 * 60 * 60 * 1000;
@@ -2502,6 +2501,7 @@ impl ScaffoldRuntime {
             .unwrap_or((None, None));
         Ok(ScaffoldEnvironmentControlResult {
             environment,
+            preparation_generation: None,
             attached_device_id,
             run_id,
             room_projection,
@@ -2521,25 +2521,23 @@ impl ScaffoldRuntime {
         argv: &[String],
         cancellation: &CancellationToken,
     ) -> Result<ExecResponse, ScaffoldError> {
-        let deadline = tokio::time::Instant::now() + RUNTIME_START_WAIT;
         loop {
             let body = ExecBody {
                 argv,
                 mode: "inline",
                 timeout_ms: 10_000,
             };
-            let result = tokio::time::timeout_at(
-                deadline,
-                self.inner.client.exec(sandbox_id, &body, cancellation),
-            )
-            .await
-            .map_err(|_| {
-                ScaffoldError::InvalidResponse("sandbox runtime startup deadline exceeded".into())
-            })?;
-            let error = match result {
-                Err(error) if error.is_runtime_starting() => error,
-                result => return result,
+            let result = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(ScaffoldError::Cancelled),
+                result = self.inner.client.exec(sandbox_id, &body, cancellation) => result,
             };
+            match result {
+                Err(error) if error.is_runtime_starting() => {}
+                result => return result,
+            }
+            // Only authoritative startup for this same lifecycle can extend the
+            // wait. Transport, authorization, and unreadable Inspect errors exit.
             let pending = async {
                 let current = self
                     .inner
@@ -2571,7 +2569,6 @@ impl ScaffoldRuntime {
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return Err(ScaffoldError::Cancelled),
-                _ = tokio::time::sleep_until(deadline) => return Err(error),
                 result = pending => result?,
             }
         }
@@ -3621,6 +3618,52 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn authority_probe_outlives_the_old_startup_deadline() {
+        let mut responses = Vec::new();
+        for _ in 0..241 {
+            responses.push((503, r#"{"error":"sandbox_runtime_starting"}"#.into()));
+            responses.push((200, comet_sandbox("starting")));
+        }
+        responses.push((200, r#"{"ok":true,"exitCode":0}"#.into()));
+        let (origin, captured) = mock_server_with_status(responses).await;
+        let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("token".into()));
+        let runtime = ScaffoldRuntime::new(
+            ScaffoldClient::new(&origin, "project-a", bearer).unwrap(),
+            "https://comet-edge.example",
+            Arc::new(UnavailableDeviceJoinGrantProvider),
+        );
+        let envelope: SandboxEnvelope = serde_json::from_str(&comet_sandbox("starting")).unwrap();
+        let environment = envelope.sandbox.into_environment(scope()).unwrap();
+        // Keep yielding for loopback I/O instead of letting paused time jump
+        // straight to an in-flight request's 30-second HTTP timeout.
+        let clock = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+                tokio::time::advance(Duration::from_millis(1)).await;
+            }
+        });
+        let started = tokio::time::Instant::now();
+        let result = runtime.probe_attach_authority(
+            "sandbox-a",
+            &scope(),
+            &environment,
+            &["comet".into(), "scaffold-authority".into()],
+            &CancellationToken::new(),
+        ).await;
+        clock.abort();
+        let _ = clock.await;
+        let authority = result.unwrap();
+        assert!(authority.ok);
+        assert!(started.elapsed() > Duration::from_secs(120));
+        let requests = captured.await.unwrap();
+        assert!(!requests.iter().any(|request| {
+            request.contains("/auth/device-grants")
+                || request.starts_with("POST /api/code-sandboxes HTTP")
+                || request.contains("--device-bootstrap-file")
+        }));
+    }
+
     #[tokio::test]
     async fn attach_runtime_wait_fails_closed_on_missing_and_terminal_lifecycle() {
         for (status, code, terminal) in [
@@ -3630,6 +3673,8 @@ mod tests {
             (503, "scaffold_request_rejected", None),
             (503, "sandbox_runtime_starting", Some("failed")),
             (503, "sandbox_runtime_starting", Some("paused")),
+            (503, "sandbox_runtime_starting", Some("stopped")),
+            (503, "sandbox_runtime_starting", Some("unknown_future_state")),
         ] {
             let mut responses = vec![
                 (200, comet_sandbox("starting")),
@@ -3663,6 +3708,43 @@ mod tests {
                 assert_eq!((api.status, api.code.as_str()), (status, code));
             }
             assert_eq!(captured.await.unwrap().len(), expected_requests);
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_starting_cannot_extend_a_different_lifecycle_authority() {
+        for (field, value) in [
+            ("id", serde_json::json!("another-sandbox")),
+            ("lifecycleEpoch", serde_json::json!(2)),
+            ("ownerEmail", serde_json::json!("another-owner@example.com")),
+        ] {
+            let original: Value = serde_json::from_str(&comet_sandbox("starting")).unwrap();
+            let mut changed = original.clone();
+            changed["sandbox"][field] = value;
+            let (origin, captured) = mock_server_with_status(vec![
+                (503, r#"{"error":"sandbox_runtime_starting"}"#.into()),
+                (200, changed.to_string()),
+            ]).await;
+            let runtime = ScaffoldRuntime::new(
+                ScaffoldClient::new(&origin, "project-a", Arc::new(StaticToken("token".into()))).unwrap(),
+                "https://comet-edge.example",
+                Arc::new(UnavailableDeviceJoinGrantProvider),
+            );
+            let envelope: SandboxEnvelope = serde_json::from_value(original).unwrap();
+            let environment = envelope.sandbox.into_environment(scope()).unwrap();
+            let error = runtime.probe_attach_authority(
+                "sandbox-a",
+                &scope(),
+                &environment,
+                &["comet".into(), "scaffold-authority".into()],
+                &CancellationToken::new(),
+            ).await.unwrap_err();
+            assert!(matches!(error, ScaffoldError::InvalidResponse(_)));
+            let requests = captured.await.unwrap();
+            assert!(!requests.iter().any(|request| {
+                request.contains("/auth/device-grants")
+                    || request.starts_with("POST /api/code-sandboxes HTTP")
+            }));
         }
     }
 

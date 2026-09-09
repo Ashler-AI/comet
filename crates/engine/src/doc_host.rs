@@ -384,6 +384,11 @@ pub struct DocHost {
     inner: Arc<DocHostInner>,
 }
 
+struct PreparedCommandAdmission<'a> {
+    generation: Option<&'a str>,
+    admitted: &'a mut bool,
+}
+
 /// One open chat doc: the `SessionDoc`, its change plumbing, and the room client.
 pub struct ChatDocHandle {
     chat_id: String,
@@ -1499,6 +1504,33 @@ impl DocHost {
         Ok(id)
     }
 
+    pub(crate) async fn queue_prepared_command(
+        &self,
+        chat_id: &str,
+        command_id: &str,
+        payload: SessionCommandPayload,
+        generation: Option<&str>,
+        admitted: &mut bool,
+    ) -> Result<SessionCommandEntry, EngineError> {
+        self.queue_command_inner(chat_id, command_id, payload,
+            Some(PreparedCommandAdmission { generation, admitted })).await
+    }
+
+    fn commit_command(
+        &self,
+        chat_id: &str,
+        preparation: Option<PreparedCommandAdmission<'_>>,
+        append: impl FnOnce() -> Result<SessionCommandEntry, EngineError>,
+    ) -> Result<SessionCommandEntry, EngineError> {
+        if let Some(preparation) = preparation {
+            let workspace = self.workspace()
+                .ok_or_else(|| EngineError::Other("workspace unavailable for command admission".into()))?;
+            workspace.admit_prepared_command(chat_id, preparation.generation, preparation.admitted, append)
+        } else {
+            append()
+        }
+    }
+
     async fn authorize_worker_peer(
         &self,
         chat_id: &str,
@@ -1574,6 +1606,16 @@ impl DocHost {
         command_id: &str,
         payload: SessionCommandPayload,
     ) -> Result<SessionCommandEntry, EngineError> {
+        self.queue_command_inner(chat_id, command_id, payload, None).await
+    }
+
+    async fn queue_command_inner(
+        &self,
+        chat_id: &str,
+        command_id: &str,
+        payload: SessionCommandPayload,
+        preparation: Option<PreparedCommandAdmission<'_>>,
+    ) -> Result<SessionCommandEntry, EngineError> {
         let existing = { lock(&self.inner.handles).get(chat_id).cloned() };
         let handle = match existing {
             Some(handle) => {
@@ -1605,8 +1647,10 @@ impl DocHost {
             {
                 return Err(EngineError::Other("worker_peer_provenance_missing".into()));
             }
-            self.persist_handle(&handle)?;
-            return Ok(existing);
+            return self.commit_command(chat_id, preparation, || {
+                self.persist_handle(&handle)?;
+                Ok(existing)
+            });
         }
         let binding = match self.workspace() {
             Some(workspace) => {
@@ -1667,6 +1711,7 @@ impl DocHost {
         } else {
             Some(command_id.to_string())
         };
+        self.commit_command(chat_id, preparation, || {
         if let Some(trust_key) = trust_key.as_deref() {
             self.inner.store.trust_local_command(trust_key)?;
         }
@@ -1694,6 +1739,7 @@ impl DocHost {
         };
         self.nudge_remote_host(chat_id, explicit_host.as_deref());
         Ok(entry)
+        })
     }
 
     pub async fn command_entry(
@@ -3000,6 +3046,82 @@ mod authority_tests {
     use comet_proto::AgentSessionSource;
     use loro::LoroMap;
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn preparation_generation_is_rechecked_after_command_lock_contention() {
+        use comet_proto::{RunRequest, RuntimeProfile, SandboxLevel, SessionStartup, SessionStartupStatus};
+        use comet_rpc::{RpcService, methods};
+
+        for change in ["replace", "remove", "unchanged"] {
+            let dir = tempfile::tempdir().unwrap();
+            let core = crate::EngineCore::assemble_with_identity(
+                dir.path(), Arc::new(crate::HarnessRegistry::new()), HarnessId::Omp,
+                None, "project-a", "owner@example.com", RuntimeProfile::LocalController,
+            ).unwrap();
+            let chat_id = "prepared-chat";
+            core.workspace.create_space("space", &core.device_id, "/workspace", None, false).unwrap();
+            core.workspace.create_chat(chat_id, "space", None, None).unwrap();
+            let original = SessionStartup {
+                generation: "generation-a".into(), status: SessionStartupStatus::Preparing,
+                updated_at: chrono::Utc::now(), command_id: None,
+            };
+            core.workspace.update_session_startup(chat_id, None, original.clone()).unwrap();
+            let command = SessionCommandPayload::Run {
+                request: RunRequest {
+                    prompt: "Start exactly once".into(), model: None, agent_account_id: None,
+                    reasoning: None, model_options: Default::default(), cwd: "/workspace".into(),
+                    sandbox: SandboxLevel::WorkspaceWrite, auto_approve: true,
+                    attachments: Vec::new(), resume: None,
+                },
+                message_id: "prepared-message".into(),
+            };
+            let parameters = serde_json::json!({
+                "chatId": chat_id, "commandId": "prepared-command", "command": command,
+                "preparationGeneration": original.generation,
+            });
+            let handle = core.doc_host.open(chat_id).unwrap();
+            let lock = handle.command_lock.lock().await;
+            let rpc = core.rpc_service();
+            let pending = rpc.handle(methods::QUEUE_COMMAND, parameters.clone());
+            tokio::pin!(pending);
+            // Poll through the RPC's early receipt check to the held real lock;
+            // no sleep, artificial async seam, or request scheduling assumption.
+            assert!(futures::poll!(pending.as_mut()).is_pending());
+            let expected = match change {
+                "replace" => {
+                    let mut replacement = original.clone();
+                    replacement.generation = "generation-b".into();
+                    core.workspace.update_session_startup(chat_id, None, replacement.clone()).unwrap();
+                    Some(replacement)
+                }
+                "remove" => {
+                    assert!(core.workspace.remove_session_ref(chat_id).unwrap());
+                    None
+                }
+                _ => Some(original.clone()),
+            };
+            drop(lock);
+            let result = pending.await;
+            if change == "unchanged" {
+                assert!(result.is_ok());
+                rpc.handle(methods::QUEUE_COMMAND, parameters).await.unwrap();
+                let commands = handle.doc.read_commands().unwrap();
+                assert_eq!(commands.iter().filter(|entry| entry.id == "prepared-command").count(), 1);
+                let startup = core.workspace.session_startup(chat_id).unwrap().unwrap();
+                assert_eq!(startup.generation, original.generation);
+                assert_eq!(startup.status, SessionStartupStatus::Admitted);
+                assert_eq!(startup.command_id.as_deref(), Some("prepared-command"));
+            } else {
+                assert!(result.is_err());
+                assert!(handle.doc.read_commands().unwrap().is_empty());
+                assert_eq!(core.workspace.session_startup(chat_id).unwrap(), expected);
+                if change == "remove" {
+                    assert!(core.workspace.doc().read_session_refs_for("owner@example.com").unwrap().is_empty());
+                }
+            }
+            core.shutdown().await;
+        }
+    }
+
     #[tokio::test]
     async fn shared_session_aliases_do_not_survive_document_purge() {
         let dir = tempfile::tempdir().unwrap();
@@ -3156,11 +3278,8 @@ mod authority_tests {
             .doc()
             .upsert_session_ref(
                 "accounts.google.com:bob@example.com",
-                &comet_proto::SessionRef {
-                    chat_id: "session-a".into(),
-                    added_at: chrono::Utc::now(),
-                    environment: None,
-                },
+                &comet_proto::SessionRef { chat_id: "session-a".into(),
+                added_at: chrono::Utc::now(), environment: None, startup: None },
             )
             .unwrap();
         let shared_chat = SessionCommandEntry {

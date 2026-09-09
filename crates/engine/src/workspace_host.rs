@@ -133,6 +133,7 @@ struct WorkspaceHostInner {
     worker_operations: tokio::sync::Mutex<()>,
     snapshot_lock: Mutex<()>,
     room: Mutex<Option<RoomClient>>,
+    session_ref_updates: Mutex<()>,
     /// Freshest presence heartbeat (ms) we have EVER observed per device. The
     /// ephemeral store forgets entries after its 30s TTL and starts empty on a
     /// room (re)join, so without this cache a receive-side hiccup snaps a
@@ -239,11 +240,8 @@ fn backfill_local_session_refs(
         {
             doc.upsert_session_ref(
                 &config.user_id,
-                &SessionRef {
-                    chat_id: chat.id,
-                    added_at: chat.created_at,
-                    environment: None,
-                },
+                &SessionRef { chat_id: chat.id,
+                added_at: chat.created_at, environment: None, startup: None },
             )?;
             changed = true;
         }
@@ -352,6 +350,7 @@ impl WorkspaceHost {
                 worker_operations: tokio::sync::Mutex::new(()),
                 snapshot_lock: Mutex::new(()),
                 room: Mutex::new(None),
+                session_ref_updates: Mutex::new(()),
                 presence_seen: Mutex::new(std::collections::HashMap::new()),
                 peer_alive: Mutex::new(None),
                 presence_watch: Mutex::new(PresenceWatch::default()),
@@ -516,16 +515,14 @@ impl WorkspaceHost {
         chat_id: &str,
         environment: Option<SessionEnvironment>,
     ) -> Result<SessionRef, EngineError> {
+        let _update = lock(&self.inner.session_ref_updates);
         let user_id = &self.inner.config.user_id;
         let mut session_ref = self
             .inner
             .doc
             .session_ref(user_id, chat_id)?
-            .unwrap_or_else(|| SessionRef {
-                chat_id: chat_id.to_string(),
-                added_at: Utc::now(),
-                environment: None,
-            });
+            .unwrap_or_else(|| SessionRef { chat_id: chat_id.to_string(),
+            added_at: Utc::now(), environment: None, startup: None });
         if let Some(environment) = environment {
             session_ref.environment = Some(environment);
         }
@@ -533,7 +530,112 @@ impl WorkspaceHost {
         Ok(session_ref)
     }
 
+    pub(crate) fn update_session_startup(
+        &self,
+        chat_id: &str,
+        expected_generation: Option<&str>,
+        startup: comet_proto::SessionStartup,
+    ) -> Result<(), EngineError> {
+        let user_id = &self.inner.config.user_id;
+        let _update = lock(&self.inner.session_ref_updates);
+        let mut reference = match self.inner.doc.session_ref(user_id, chat_id)? {
+            Some(reference) => reference,
+            None if expected_generation.is_some() => return Ok(()),
+            None => SessionRef {
+                chat_id: chat_id.to_string(), added_at: Utc::now(), environment: None, startup: None,
+            },
+        };
+        if reference.startup.as_ref().is_some_and(|current| {
+            current.status == comet_proto::SessionStartupStatus::Admitted
+                || (current.status == comet_proto::SessionStartupStatus::CreationUncertain
+                    && startup.status == comet_proto::SessionStartupStatus::AttentionNeeded)
+                || expected_generation.is_some_and(|expected| current.generation != expected)
+        }) || (expected_generation.is_some() && reference.startup.is_none()) {
+            return Ok(());
+        }
+        reference.startup = Some(startup);
+        self.inner.doc.upsert_session_ref(user_id, &reference)?;
+        Ok(())
+    }
+
+    pub(crate) fn session_startup(&self, chat_id: &str) -> Result<Option<comet_proto::SessionStartup>, EngineError> {
+        Ok(self.inner.doc.session_ref(&self.inner.config.user_id, chat_id)?
+            .and_then(|reference| reference.startup))
+    }
+
+    /// All asynchronous admission work precedes this short existing-ref lock.
+    /// The command and workspace snapshots are separate stores: `admitted` is
+    /// set immediately after the durable append, even if the metadata write fails.
+    pub(crate) fn admit_prepared_command(
+        &self,
+        chat_id: &str,
+        generation: Option<&str>,
+        admitted: &mut bool,
+        append: impl FnOnce() -> Result<comet_doc::SessionCommandEntry, EngineError>,
+    ) -> Result<comet_doc::SessionCommandEntry, EngineError> {
+        let _update = lock(&self.inner.session_ref_updates);
+        let user_id = &self.inner.config.user_id;
+        let mut reference = self.inner.doc.session_ref(user_id, chat_id)?;
+        match reference.as_ref().and_then(|reference| reference.startup.as_ref()) {
+            None if generation.is_some() => {
+                return Err(EngineError::Other("Scaffold preparation is no longer tracked".into()));
+            }
+            Some(startup) => {
+                if generation.is_some_and(|generation| generation != startup.generation)
+                    || (generation.is_none() && startup.status != comet_proto::SessionStartupStatus::Admitted)
+                {
+                    return Err(EngineError::Other("Scaffold preparation generation mismatch".into()));
+                }
+                if startup.status == comet_proto::SessionStartupStatus::CreationUncertain {
+                    return Err(EngineError::Other("Scaffold creation outcome is unknown".into()));
+                }
+            }
+            None => {}
+        }
+        let command = append()?;
+        *admitted = true;
+        if let Some(reference) = reference.as_mut()
+            && let Some(startup) = reference.startup.as_mut()
+            && startup.status != comet_proto::SessionStartupStatus::Admitted
+        {
+            startup.status = comet_proto::SessionStartupStatus::Admitted;
+            startup.updated_at = Utc::now();
+            startup.command_id = Some(command.id.clone());
+            self.inner.doc.upsert_session_ref(user_id, reference).map_err(|error| {
+                EngineError::Other(format!("{error}; command {} was admitted", command.id))
+            })?;
+        }
+        Ok(command)
+    }
+
+    pub(crate) fn report_scaffold_preparation_failure(
+        &self,
+        chat_id: &str,
+        generation: &str,
+    ) -> Result<(), EngineError> {
+        let user_id = &self.inner.config.user_id;
+        let _update = lock(&self.inner.session_ref_updates);
+        let Some(mut reference) = self.inner.doc.session_ref(user_id, chat_id)? else {
+            return Ok(());
+        };
+        let Some(startup) = reference.startup.as_mut() else {
+            return Ok(());
+        };
+        if startup.generation != generation
+            || matches!(startup.status, comet_proto::SessionStartupStatus::Admitted
+                | comet_proto::SessionStartupStatus::CreationUncertain)
+        {
+            return Ok(());
+        }
+        startup.status = comet_proto::SessionStartupStatus::AttentionNeeded;
+        startup.updated_at = Utc::now();
+        self.inner.doc.upsert_session_ref(user_id, &reference)?;
+        Ok(())
+    }
+
+
     pub fn remove_session_ref(&self, chat_id: &str) -> Result<bool, EngineError> {
+        let _update = lock(&self.inner.session_ref_updates);
         Ok(self
             .inner
             .doc
@@ -1550,11 +1652,13 @@ mod tests {
                 chat_id: "owned".into(),
                 added_at: Utc.timestamp_millis_opt(1).unwrap(),
                 environment: None,
+                startup: None,
             },
             SessionRef {
                 chat_id: "pinned".into(),
                 added_at: Utc.timestamp_millis_opt(1).unwrap(),
                 environment: None,
+                startup: None,
             },
         ];
 
@@ -1607,6 +1711,45 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["owned"]
         );
+    }
+
+    #[tokio::test]
+    async fn stale_preparation_cannot_replace_admission_or_a_new_generation() {
+        use comet_proto::{SessionStartup, SessionStartupStatus};
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = WorkspaceHost::open(
+            std::sync::Arc::new(comet_sync::DocsStore::open(temp.path()).unwrap()),
+            WorkspaceHostConfig {
+                device_id: "device-a".into(), device_name: "Test".into(),
+                platform: "test".into(), project_scope: "project-a".into(),
+                user_id: "user-a".into(), edge: None,
+            },
+        ).unwrap();
+        let outcome = |generation: &str, status, command_id: Option<&str>| SessionStartup {
+            generation: generation.into(), status, updated_at: Utc::now(),
+            command_id: command_id.map(str::to_string),
+        };
+        workspace.update_session_startup("accepted", None,
+            outcome("first", SessionStartupStatus::Preparing, None)).unwrap();
+        workspace.update_session_startup("accepted", None,
+            outcome("second", SessionStartupStatus::Preparing, None)).unwrap();
+        workspace.update_session_startup("accepted", Some("first"),
+            outcome("first", SessionStartupStatus::AttentionNeeded, None)).unwrap();
+        assert_eq!(workspace.session_startup("accepted").unwrap().unwrap().generation, "second");
+        let admitted = outcome("second", SessionStartupStatus::Admitted, Some("command-a"));
+        workspace.update_session_startup("accepted", Some("second"), admitted.clone()).unwrap();
+        workspace.update_session_startup("accepted", Some("second"),
+            outcome("second", SessionStartupStatus::AttentionNeeded, None)).unwrap();
+        workspace.upsert_session_ref("accepted", None).unwrap();
+        assert_eq!(workspace.session_startup("accepted").unwrap(), Some(admitted));
+        assert!(workspace.doc().chat("accepted").unwrap().is_none());
+        assert_eq!(workspace.doc().read_session_refs_for("user-a").unwrap().len(), 1);
+        assert!(workspace.doc().read_session_refs_for("user-b").unwrap().is_empty());
+        let uncertain = outcome("unknown-create", SessionStartupStatus::CreationUncertain, None);
+        workspace.update_session_startup("uncertain", None, uncertain.clone()).unwrap();
+        workspace.update_session_startup("uncertain", Some("unknown-create"),
+            outcome("unknown-create", SessionStartupStatus::AttentionNeeded, None)).unwrap();
+        assert_eq!(workspace.session_startup("uncertain").unwrap(), Some(uncertain));
     }
 
     #[tokio::test]

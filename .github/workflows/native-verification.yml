@@ -70,7 +70,6 @@ jobs:
           cargo test --locked -p comet-engine --test worker_sessions -- --nocapture 2>&1 | tee native-evidence/workers.log
           cargo test --locked -p comet-engine --lib repos::tests::worker_ 2>&1 | tee native-evidence/worker-checkouts.log
       - name: Verify startup generation fence
-        if: startsWith(github.ref_name, 'verify/native-startup-')
         timeout-minutes: 5
         shell: bash
         run: |

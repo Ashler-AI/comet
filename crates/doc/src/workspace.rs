@@ -616,6 +616,13 @@ impl WorkspaceDoc {
             )?,
             None => row.delete("environment")?,
         }
+        match &session_ref.startup {
+            Some(startup) => row.insert(
+                "startup",
+                LoroValue::from(serde_json::to_value(startup)?),
+            )?,
+            None => row.delete("startup")?,
+        }
         self.doc.commit();
         Ok(())
     }
@@ -954,6 +961,8 @@ struct RawSessionRef {
     added_at: i64,
     #[serde(default)]
     environment: Option<comet_proto::SessionEnvironment>,
+    #[serde(default)]
+    startup: Option<comet_proto::SessionStartup>,
 }
 
 impl From<RawSessionRef> for SessionRef {
@@ -962,6 +971,7 @@ impl From<RawSessionRef> for SessionRef {
             chat_id: raw.chat_id,
             added_at: dt(raw.added_at),
             environment: raw.environment,
+            startup: raw.startup,
         }
     }
 }
@@ -1038,11 +1048,8 @@ mod tests {
     }
 
     fn session_ref(chat_id: &str, added_at: i64) -> SessionRef {
-        SessionRef {
-            chat_id: chat_id.into(),
-            added_at: ts(added_at),
-            environment: None,
-        }
+        SessionRef { chat_id: chat_id.into(),
+        added_at: ts(added_at), environment: None, startup: None }
     }
 
     fn cross_sync(a: &WorkspaceDoc, b: &WorkspaceDoc) {

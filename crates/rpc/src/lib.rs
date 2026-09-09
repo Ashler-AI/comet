@@ -61,6 +61,8 @@ pub mod methods {
     pub const HANDOFF_SESSION_TO_SCAFFOLD: &str = "HandoffSessionToScaffold";
     /// Create and attach a Scaffold environment, transferring native session context.
     pub const PREPARE_SCAFFOLD_SESSION: &str = "PrepareScaffoldSession";
+    /// Retain an interrupted preparation without changing newer attempts or admission.
+    pub const REPORT_SCAFFOLD_PREPARATION_FAILURE: &str = "ReportScaffoldPreparationFailure";
     /// Metadata-only harness-native session candidates stored on this device.
     pub const LIST_LOCAL_SESSIONS: &str = "ListLocalSessions";
     /// Re-resolve and import one local candidate into a Comet chat.
@@ -199,6 +201,13 @@ pub struct ReadCheckoutDiffResult {
 pub struct SessionRefParams {
     pub chat_id: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReportScaffoldPreparationFailureParams {
+    pub chat_id: String,
+    pub generation: String,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ForkSessionParams {
@@ -326,6 +335,9 @@ pub enum RpcError {
     BadParams(String),
     #[error("{0}")]
     Failed(String),
+    /// Locally classified before Scaffold HTTP dispatch; never reconstructed from wire text.
+    #[error("scaffold_auth_unavailable")]
+    ScaffoldAuthUnavailable,
     #[error("transport: {0}")]
     Transport(String),
     #[error("connection closed")]

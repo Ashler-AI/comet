@@ -25,6 +25,7 @@ fn response(
     lifecycle: ScaffoldLifecycle,
 ) -> ScaffoldEnvironmentControlResult {
     ScaffoldEnvironmentControlResult {
+        preparation_generation: None,
         environment: comet_proto::SessionEnvironment {
             source: SessionEnvironmentSource::Scaffold {
                 sandbox_id: "sandbox-a".into(),
@@ -270,6 +271,132 @@ async fn accepted_preparation_recovers_without_allocating_another_sandbox() {
         result.handoff_native_session_id.as_deref(),
         Some("native-source")
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn healthy_preparation_outlives_the_old_deadline_and_resets_transient_faults() {
+    let mut parameters = params();
+    parameters.omp_handoff = None;
+    let scope = parameters.scope.clone();
+    let created = Cell::new(false);
+    let inspections = Cell::new(0);
+    let started = tokio::time::Instant::now();
+    let result = prepare_scaffold_session_with(parameters, None, |operation| {
+        let scope = &scope;
+        let created = &created;
+        let inspections = &inspections;
+        async move {
+            match operation {
+                ScaffoldEnvironmentControl::Create { .. } => {
+                    assert!(!created.replace(true), "startup must never recreate");
+                    Ok(response(scope, ScaffoldLifecycle::Starting))
+                }
+                ScaffoldEnvironmentControl::Attach { .. } => {
+                    Ok(response(scope, ScaffoldLifecycle::Starting))
+                }
+                ScaffoldEnvironmentControl::Inspect { .. } => {
+                    let attempt = inspections.get();
+                    inspections.set(attempt + 1);
+                    // All requests stay below the unchanged HTTP timeout. Valid
+                    // Starting between transient failures resets only fault time.
+                    tokio::time::sleep(Duration::from_secs(20)).await;
+                    if attempt == 64 {
+                        Ok(response(scope, ScaffoldLifecycle::Ready))
+                    } else if attempt % 2 == 0 {
+                        Err(RpcError::Failed(
+                            "scaffold_api_error:503:scaffold_request_rejected".into(),
+                        ))
+                    } else {
+                        Ok(response(scope, ScaffoldLifecycle::Starting))
+                    }
+                }
+                _ => panic!("startup must not change lifecycle or send a first command"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(started.elapsed() > Duration::from_secs(10 * 60));
+    assert!(matches!(result.environment.source, SessionEnvironmentSource::Scaffold {
+        lifecycle: ScaffoldLifecycle::Ready, ..
+    }));
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeated_transient_faults_end_without_recreation_or_lifecycle_failure() {
+    for failing_attach in [true, false] {
+        let parameters = params();
+        let scope = parameters.scope.clone();
+        let created = Cell::new(false);
+        let started = tokio::time::Instant::now();
+        let error = prepare_scaffold_session_with(parameters, None, |operation| {
+            let result = match operation {
+                ScaffoldEnvironmentControl::Create { .. } => {
+                    assert!(!created.replace(true));
+                    Ok(response(&scope, ScaffoldLifecycle::Starting))
+                }
+                ScaffoldEnvironmentControl::Attach { .. } if !failing_attach => {
+                    Ok(response(&scope, ScaffoldLifecycle::Starting))
+                }
+                ScaffoldEnvironmentControl::Attach { .. }
+                | ScaffoldEnvironmentControl::Inspect { .. } => Err(RpcError::Failed(
+                    "scaffold_api_error:503:scaffold_request_rejected".into(),
+                )),
+                _ => panic!("faults must not transfer, recreate, or change lifecycle"),
+            };
+            std::future::ready(result)
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(started.elapsed() >= Duration::from_secs(10 * 60));
+        assert!(started.elapsed() < Duration::from_secs(10 * 60 + 1));
+        assert!(error.contains("scaffold_api_error:503:scaffold_request_rejected"));
+        assert!(error.contains("sandbox-a"));
+        assert!(!error.contains("terminal lifecycle"));
+    }
+}
+
+#[tokio::test]
+async fn preparation_returns_nonretryable_errors_and_cancellation_without_recreation() {
+    for failure in [
+        "scaffold_auth_unavailable",
+        "scaffold_request_failed: connection closed",
+        "scaffold_response_invalid: unknown lifecycle variant",
+        "scaffold_request_cancelled",
+    ] {
+        for failing_attach in [true, false] {
+            let parameters = params();
+            let scope = parameters.scope.clone();
+            let failed = Cell::new(false);
+            let created = Cell::new(false);
+            let error = prepare_scaffold_session_with(parameters, None, |operation| {
+                assert!(!failed.get(), "nonretryable errors must end the wait");
+                let result = match operation {
+                    ScaffoldEnvironmentControl::Create { .. } => {
+                        assert!(!created.replace(true));
+                        Ok(response(&scope, ScaffoldLifecycle::Starting))
+                    }
+                    ScaffoldEnvironmentControl::Attach { .. } if !failing_attach => {
+                        Ok(response(&scope, ScaffoldLifecycle::Starting))
+                    }
+                    ScaffoldEnvironmentControl::Attach { .. }
+                    | ScaffoldEnvironmentControl::Inspect { .. } => {
+                        failed.set(true);
+                        Err(RpcError::Failed(failure.into()))
+                    }
+                    _ => panic!("failed preparation must not send commands or change lifecycle"),
+                };
+                std::future::ready(result)
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(failure));
+            assert!(error.contains("sandbox-a"));
+            assert!(!error.contains("terminal lifecycle"));
+        }
+    }
 }
 
 #[tokio::test]
@@ -584,6 +711,17 @@ async fn prepared_handoff_persists_a_distinct_chat_and_remote_resume_command() {
     core.workspace
         .upsert_session_ref(&target_id, Some(prepared.environment.clone()))
         .unwrap();
+    let mut startup = PreparationOutcome::begin(core.workspace.clone(), &target_id).unwrap();
+    startup.armed = false;
+    prepared.preparation_generation = Some(startup.startup.generation.clone());
+    let mut stale = prepared.clone();
+    stale.preparation_generation = Some("older-preparation".into());
+    assert!(core.rpc_service().admit_scaffold_handoff(
+        source.clone(), "Stale task".into(), "openai-codex/gpt-6-astra".into(),
+        "owner@example.com".into(), stale,
+    ).await.is_err());
+    assert!(core.workspace.doc().chat(&target_id).unwrap().is_none());
+    assert!(!core.doc_host.chat_has_commands(&target_id).await.unwrap());
 
     let receipt = core
         .rpc_service()
@@ -629,5 +767,193 @@ async fn prepared_handoff_persists_a_distinct_chat_and_remote_resume_command() {
     assert_eq!(request.resume.as_deref(), Some("native-source"));
     assert_eq!(request.cwd, "/workspace/ashler-platform");
     assert_eq!(request.prompt, "Continue the exact task");
+    let admitted = core.workspace.session_startup(&receipt.chat_id).unwrap().unwrap();
+    assert_eq!(admitted.generation, startup.startup.generation);
+    assert_eq!(admitted.status, comet_proto::SessionStartupStatus::Admitted);
+    assert_eq!(admitted.command_id.as_deref(), Some(receipt.command_id.as_str()));
     core.shutdown().await;
+}
+
+#[tokio::test]
+async fn initial_queue_requires_exact_preparation_but_admitted_followups_do_not() {
+    use comet_proto::{SessionStartup, SessionStartupStatus};
+    let dir = tempfile::tempdir().unwrap();
+    let core = crate::EngineCore::assemble_with_identity(
+        dir.path(), std::sync::Arc::new(crate::HarnessRegistry::new()), HarnessId::Omp,
+        None, "project-a", "owner@example.com", RuntimeProfile::LocalController,
+    ).unwrap();
+    let chat_id = params().scope.session_id.unwrap();
+    core.workspace.create_space("space", &core.device_id, "/workspace", None, false).unwrap();
+    core.workspace.create_chat(&chat_id, "space", None, None).unwrap();
+    let preparing = SessionStartup {
+        generation: "new-attempt".into(), status: SessionStartupStatus::Preparing,
+        updated_at: chrono::Utc::now(), command_id: None,
+    };
+    core.workspace.update_session_startup(&chat_id, None, preparing.clone()).unwrap();
+    let request = RunRequest {
+        prompt: "Start once".into(), model: None, agent_account_id: None, reasoning: None,
+        model_options: Default::default(), cwd: "/workspace".into(),
+        sandbox: SandboxLevel::WorkspaceWrite, auto_approve: true, resume: None,
+        attachments: Vec::new(),
+    };
+    let run = SessionCommandPayload::Run { request: request.clone(), message_id: "message".into() };
+    let control = SessionCommandPayload::Control {
+        session_id: chat_id.clone(), owner_device_id: "remote-owner".into(),
+        actor_device_id: core.device_id.clone(), actor_subject: "owner@example.com".into(),
+        grant_id: "grant".into(), source: AgentSessionSource::Scaffold,
+        action: Box::new(comet_doc::SessionControlAction::Start {
+            request, message_id: "remote-message".into(),
+        }),
+    };
+    let rpc = core.rpc_service();
+    for command in [&run, &control] {
+        for generation in [None, Some("old-attempt")] {
+            assert!(rpc.handle(methods::QUEUE_COMMAND, serde_json::json!({
+                "chatId": chat_id, "commandId": "rejected", "command": command,
+                "preparationGeneration": generation,
+            })).await.is_err());
+            assert!(!core.doc_host.chat_has_commands(&chat_id).await.unwrap());
+            assert_eq!(core.workspace.session_startup(&chat_id).unwrap(), Some(preparing.clone()));
+        }
+    }
+    rpc.handle(methods::QUEUE_COMMAND, serde_json::json!({
+        "chatId": chat_id, "commandId": "first", "command": run,
+        "preparationGeneration": "new-attempt",
+    })).await.unwrap();
+    assert!(core.doc_host.command_entry(&chat_id, "first").await.unwrap().is_some());
+    let admitted = core.workspace.session_startup(&chat_id).unwrap().unwrap();
+    assert_eq!(admitted.status, SessionStartupStatus::Admitted);
+    assert_eq!(admitted.command_id.as_deref(), Some("first"));
+    rpc.handle(methods::QUEUE_COMMAND, serde_json::json!({
+        "chatId": chat_id, "commandId": "followup", "command": run,
+    })).await.unwrap();
+    assert!(core.doc_host.command_entry(&chat_id, "followup").await.unwrap().is_some());
+    assert!(rpc.handle(methods::QUEUE_COMMAND, serde_json::json!({
+        "chatId": chat_id, "commandId": "late-stale", "command": run,
+        "preparationGeneration": "old-attempt",
+    })).await.is_err());
+    assert!(core.doc_host.command_entry(&chat_id, "late-stale").await.unwrap().is_none());
+    assert_eq!(core.workspace.session_startup(&chat_id).unwrap(), Some(admitted));
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn failure_reports_only_mark_the_matching_existing_unadmitted_preparation() {
+    use comet_proto::{SessionStartup, SessionStartupStatus};
+    let dir = tempfile::tempdir().unwrap();
+    let core = crate::EngineCore::assemble_with_identity(
+        dir.path(), std::sync::Arc::new(crate::HarnessRegistry::new()), HarnessId::Omp,
+        None, "project-a", "owner@example.com", RuntimeProfile::LocalController,
+    ).unwrap();
+    let rpc = core.rpc_service();
+    for (chat_id, status, reported_generation, changes) in [
+        ("matched", SessionStartupStatus::Preparing, "current", true),
+        ("stale", SessionStartupStatus::Preparing, "old", false),
+        ("admitted", SessionStartupStatus::Admitted, "current", false),
+        ("uncertain", SessionStartupStatus::CreationUncertain, "current", false),
+    ] {
+        let original = SessionStartup {
+            generation: "current".into(), status, updated_at: chrono::Utc::now(),
+            command_id: (status == SessionStartupStatus::Admitted).then(|| "first".into()),
+        };
+        core.workspace.update_session_startup(chat_id, None, original.clone()).unwrap();
+        rpc.handle(methods::REPORT_SCAFFOLD_PREPARATION_FAILURE, serde_json::json!({
+            "chatId": chat_id, "generation": reported_generation,
+        })).await.unwrap();
+        let actual = core.workspace.session_startup(chat_id).unwrap().unwrap();
+        if changes {
+            assert_eq!(actual.status, SessionStartupStatus::AttentionNeeded);
+            assert_eq!(actual.generation, original.generation);
+        } else {
+            assert_eq!(actual, original);
+        }
+    }
+    core.workspace.upsert_session_ref("untracked", None).unwrap();
+    let untracked = core.workspace.doc().session_ref("owner@example.com", "untracked").unwrap();
+    core.workspace.remove_session_ref("matched").unwrap();
+    for chat_id in ["missing", "matched", "untracked"] {
+        rpc.handle(methods::REPORT_SCAFFOLD_PREPARATION_FAILURE, serde_json::json!({
+            "chatId": chat_id, "generation": "current",
+        })).await.unwrap();
+    }
+    for chat_id in ["missing", "matched"] {
+        assert!(core.workspace.doc().session_ref("owner@example.com", chat_id).unwrap().is_none());
+        assert!(core.workspace.doc().chat(chat_id).unwrap().is_none());
+    }
+    assert_eq!(core.workspace.doc().session_ref("owner@example.com", "untracked").unwrap(), untracked);
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn provider_auth_text_cannot_make_uncertain_creation_retryable() {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use comet_proto::SessionStartupStatus;
+    for pre_dispatch in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let core = crate::EngineCore::assemble_with_identity(
+            dir.path(), std::sync::Arc::new(crate::HarnessRegistry::new()), HarnessId::Omp,
+            None, "project-a", "owner@example.com", RuntimeProfile::LocalController,
+        ).unwrap();
+        let mut auth_config = crate::AuthConfig::new(&origin, dir.path());
+        auth_config.project_scope = "project-a".into();
+        auth_config.dev_user_id = "owner@example.com".into();
+        core.set_auth(crate::Auth::new(auth_config));
+        core.set_scaffold_runtime(crate::ScaffoldRuntime::new(
+            crate::ScaffoldClient::new(
+                &origin, "project-a",
+                std::sync::Arc::new(comet_rpc::StaticToken(
+                    if pre_dispatch { "" } else { "test" }.into(),
+                )),
+            ).unwrap(),
+            &origin, std::sync::Arc::new(crate::UnavailableDeviceJoinGrantProvider),
+        ).with_deployment_id("deployment-a".into()));
+        let provider = async {
+            let (connection, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(connection);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "POST /api/code-sandboxes HTTP/1.1\r\n");
+            let mut content_length = 0;
+            loop {
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+                if line == "\r\n" { break; }
+                if let Some(length) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = length.trim().parse::<usize>().unwrap();
+                }
+            }
+            reader.read_exact(&mut vec![0; content_length]).await.unwrap();
+            let body = r#"{"error":"scaffold_auth_unavailable","message":"scaffold_auth_unavailable"}"#;
+            reader.get_mut().write_all(format!(
+                "HTTP/1.1 500 Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len(),
+            ).as_bytes()).await.unwrap();
+        };
+        let rpc = core.rpc_service();
+        let error = if pre_dispatch {
+            rpc.prepare_scaffold_session(params()).await.unwrap_err()
+        } else {
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(rpc.prepare_scaffold_session(params()), provider)
+            }).await.unwrap();
+            result.unwrap_err()
+        };
+        assert!(error.to_string().contains("scaffold_auth_unavailable"));
+        assert_eq!(matches!(error, RpcError::ScaffoldAuthUnavailable), pre_dispatch);
+        let startup = core.workspace.session_startup(
+            params().scope.session_id.as_deref().unwrap(),
+        ).unwrap().unwrap();
+        assert_eq!(startup.status, if pre_dispatch {
+            SessionStartupStatus::AttentionNeeded
+        } else {
+            SessionStartupStatus::CreationUncertain
+        });
+        if !pre_dispatch {
+            assert!(rpc.prepare_scaffold_session(params()).await.is_err());
+        }
+        assert!(tokio::time::timeout(Duration::from_millis(10), listener.accept()).await.is_err());
+        core.shutdown().await;
+    }
 }

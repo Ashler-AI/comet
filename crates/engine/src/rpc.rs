@@ -223,6 +223,8 @@ struct QueueCommandParams {
     command: SessionCommandPayload,
     #[serde(default)]
     command_id: Option<String>,
+    #[serde(default)]
+    preparation_generation: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1768,6 +1770,14 @@ impl RpcService for EngineRpc {
             }
             methods::QUEUE_COMMAND => {
                 let p: QueueCommandParams = parse_params(params)?;
+                let starts_session = matches!(&p.command, SessionCommandPayload::Run { .. })
+                    || matches!(&p.command, SessionCommandPayload::Control { action, .. }
+                        if matches!(action.as_ref(), comet_doc::SessionControlAction::Start { .. }));
+                let mut startup = if starts_session {
+                    scaffold_session::PreparationOutcome::for_command(
+                        self, &p.chat_id, p.preparation_generation.as_deref(),
+                    )?
+                } else { None };
                 let activates_chat = match &p.command {
                     SessionCommandPayload::Run { .. }
                     | SessionCommandPayload::Steer { .. }
@@ -1781,15 +1791,19 @@ impl RpcService for EngineRpc {
                     _ => false,
                 };
                 self.install_local_owner_grant(&p.command)?;
-                let command_id = if let Some(command_id) = p.command_id {
-                    self.doc_host
-                        .queue_command_with_id(&p.chat_id, &command_id, p.command)
-                        .await
-                        .map(|entry| entry.id)
+                let command_id = p.command_id.unwrap_or_else(crate::new_id);
+                let mut admitted = false;
+                let queued = if starts_session {
+                    self.doc_host.queue_prepared_command(
+                        &p.chat_id, &command_id, p.command,
+                        p.preparation_generation.as_deref(), &mut admitted,
+                    ).await
                 } else {
-                    self.doc_host.queue_command(&p.chat_id, p.command).await
-                }
-                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    self.doc_host.queue_command_with_id(&p.chat_id, &command_id, p.command).await
+                };
+                if admitted && let Some(startup) = startup.as_mut() { startup.armed = false; }
+                let command_id = queued.map(|entry| entry.id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
                 if activates_chat {
                     self.workspace
                         .set_chat_archived(&p.chat_id, false)
@@ -2157,6 +2171,12 @@ impl RpcService for EngineRpc {
             methods::PREPARE_SCAFFOLD_SESSION => {
                 let p = parse_params(params)?;
                 RpcReply::value(&self.prepare_scaffold_session(p).await?)
+            }
+            methods::REPORT_SCAFFOLD_PREPARATION_FAILURE => {
+                let p: comet_rpc::ReportScaffoldPreparationFailureParams = parse_params(params)?;
+                self.workspace.report_scaffold_preparation_failure(&p.chat_id, &p.generation)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "reported": true }))
             }
             methods::CONTROL_SCAFFOLD_ENVIRONMENT => {
                 let control: ScaffoldEnvironmentControl = parse_params(params)?;

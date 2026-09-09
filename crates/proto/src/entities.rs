@@ -281,6 +281,28 @@ pub struct SessionRef {
     /// after Crew restarts. Capability grant ids are intentionally not stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<SessionEnvironment>,
+    /// Local preparation/admission outcome, independent of provider readiness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup: Option<SessionStartup>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStartup {
+    pub generation: String,
+    pub status: SessionStartupStatus,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionStartupStatus {
+    Preparing,
+    CreationUncertain,
+    AttentionNeeded,
+    Admitted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
