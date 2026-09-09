@@ -10,7 +10,7 @@ use comet_doc::{
     MessagePart, MessageRole, MessageStatus, SessionCommandEntry, SessionCommandPayload,
     SessionCommandStatus, SessionMessageEntry,
 };
-use comet_engine::{EngineCore, HarnessRegistry};
+use comet_engine::{EngineCore, HarnessRegistry, Repos};
 use comet_harness::{Harness, HarnessError, RunControls, SteerMessage};
 use comet_engine::doc_host::peer_message_prompt;
 use comet_proto::{
@@ -30,6 +30,7 @@ const LATE_COMMAND: &str = "00000000-0000-4000-8000-00000000000f";
 type RequestLog = Arc<Mutex<Vec<RunRequest>>>;
 
 struct RecordingHarness {
+    harness: HarnessId,
     requests: RequestLog,
     run_number: AtomicU64,
     steering: Option<(SteeringMode, tokio::sync::mpsc::UnboundedSender<SteerMessage>)>,
@@ -38,7 +39,7 @@ struct RecordingHarness {
 #[async_trait]
 impl Harness for RecordingHarness {
     fn id(&self) -> HarnessId {
-        HarnessId::Mock
+        self.harness
     }
 
     fn display_name(&self) -> &str {
@@ -54,11 +55,15 @@ impl Harness for RecordingHarness {
     }
 
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
-        &[]
+        if self.harness == HarnessId::Omp { &[ReasoningLevel::XHigh] } else { &[] }
     }
 
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(Vec::new())
+        if self.harness != HarnessId::Omp { return Ok(Vec::new()); }
+        Ok(vec![Model {
+            id: "mock-peer".into(), label: "Peer test".into(), description: None,
+            reasoning_levels: self.reasoning_levels().to_vec(), options: vec![],
+        }])
     }
 
     async fn run(
@@ -72,9 +77,10 @@ impl Harness for RecordingHarness {
         if let Some((_, received)) = &self.steering {
             let received = received.clone();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let harness = self.harness;
             tokio::spawn(async move {
                 let _ = tx.send(Ok(AgentEvent::SessionStarted {
-                    harness: HarnessId::Mock,
+                    harness,
                     model: "mock-peer".into(),
                     tools: Vec::new(),
                     cwd: request.cwd,
@@ -103,7 +109,7 @@ impl Harness for RecordingHarness {
         }
         let events = vec![
             Ok(AgentEvent::SessionStarted {
-                harness: HarnessId::Mock,
+                harness: self.harness,
                 model: "mock-peer".into(),
                 tools: Vec::new(),
                 cwd: request.cwd,
@@ -135,6 +141,7 @@ fn assemble_with_steering(
     let requests = Arc::new(Mutex::new(Vec::new()));
     let registry = HarnessRegistry::for_profile(RuntimeProfile::Mock);
     registry.register(Arc::new(RecordingHarness {
+        harness: HarnessId::Mock,
         requests: requests.clone(),
         run_number: AtomicU64::new(1),
         steering,
@@ -754,5 +761,200 @@ async fn historical_peer_command_identity_never_retrofits_unmarked_messages() {
     }).unwrap();
     assert!(!handle.write_user_message(COMMAND, &prompt, 2).unwrap());
     assert_eq!(entries(&core, TARGET), vec![original]);
+    core.shutdown().await;
+}
+
+const WORKER_OWNER: &str = "00000000-0000-4000-8000-000000000010";
+const OUTSIDER: &str = "00000000-0000-4000-8000-000000000011";
+
+fn worker_engine(root: &std::path::Path) -> (EngineCore, RequestLog) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(RecordingHarness {
+        harness: HarnessId::Omp,
+        requests: requests.clone(), run_number: AtomicU64::new(1), steering: None,
+    }));
+    let data = root.join("data");
+    let mut core = EngineCore::assemble(&data, Arc::new(registry), HarnessId::Omp, None).unwrap();
+    core.repos = Repos::with_worktrees_root(&data, &core.device_id, root.join("worktrees"));
+    (core, requests)
+}
+
+async fn nested_workers(root: &std::path::Path) -> (EngineCore, RequestLog) {
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    for args in [vec!["init", "-b", "main"], vec!["-c", "user.name=Test", "-c",
+        "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "base"]] {
+        let output = std::process::Command::new("git").args(args).current_dir(&project)
+            .env("ASHLER_INCREMENTAL_TSC_CHECKS", "false").output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+    let project = std::fs::canonicalize(project).unwrap();
+    let (core, requests) = worker_engine(root);
+    core.workspace.create_space("owner-space", &core.device_id, project.to_str().unwrap(), None, true).unwrap();
+    for id in [WORKER_OWNER, OUTSIDER] {
+        core.workspace.create_chat(id, "owner-space", None, None).unwrap();
+    }
+    let client = comet_rpc::memory_client(core.rpc_service());
+    for (worker, owner) in [(SOURCE, WORKER_OWNER), (TARGET, SOURCE)] {
+        client.call(methods::ENSURE_WORKER_SESSION, serde_json::json!({
+            "chatId": worker, "ownerChatId": owner, "projectPath": project,
+            "baseRef": "main", "title": "nested peer", "model": "mock-peer", "effort": "xhigh",
+        })).await.unwrap();
+    }
+    (core, requests)
+}
+
+#[tokio::test]
+async fn child_reply_reaches_worker_waiter_and_survives_durable_reconnect() {
+    let root = tempfile::tempdir().unwrap();
+    let (core, requests) = nested_workers(root.path()).await;
+    let client = comet_rpc::memory_client(core.rpc_service());
+    let sender = comet_rpc::memory_client(core.rpc_service());
+    let waiting = tokio::spawn(async move {
+        sender.call(methods::SEND_PEER_MESSAGE, serde_json::json!({
+            "sourceChatId": SOURCE, "targetChatId": TARGET, "commandId": WAIT_COMMAND,
+            "text": "answer parent", "wait": true, "timeoutMs": 4000,
+        })).await.unwrap()
+    });
+    wait_for(|| command(&core, TARGET, WAIT_COMMAND).is_some_and(|c| c.status == SessionCommandStatus::Applied), "child applied request").await;
+    let reply = client.call(methods::REPLY_PEER_MESSAGE, serde_json::json!({
+        "sessionId": TARGET, "commandId": WAIT_COMMAND, "text": "child answer",
+    })).await.unwrap();
+    let result = waiting.await.unwrap();
+    let reply_id = format!("reply:{WAIT_COMMAND}");
+    assert_eq!(result["reply"]["commandId"], reply_id);
+    assert_eq!(result["reply"]["sourceChatId"], TARGET);
+    assert_eq!(result["reply"]["text"], "child answer");
+    assert_eq!(reply["commandId"], reply_id);
+    wait_for(|| command(&core, SOURCE, &reply_id).is_some_and(|c| c.status == SessionCommandStatus::Applied), "parent waiter reply").await;
+    assert_eq!(requests.lock().await.len(), 1, "live reply must not dispatch another turn");
+    assert_eq!(entries(&core, SOURCE).iter().find(|e| e.id == reply_id).unwrap().peer_message.as_ref().unwrap().reply_to.as_deref(), Some(WAIT_COMMAND));
+    client.call(methods::SEND_PEER_MESSAGE, serde_json::json!({
+        "sourceChatId": SOURCE, "targetChatId": TARGET, "commandId": LATE_COMMAND, "text": "answer after restart",
+    })).await.unwrap();
+    wait_for(|| command(&core, TARGET, LATE_COMMAND).is_some_and(|c| c.status == SessionCommandStatus::Applied), "late request applied").await;
+    core.shutdown().await;
+    drop(client);
+    drop(core);
+
+    let (core, requests) = worker_engine(root.path());
+    let client = comet_rpc::memory_client(core.rpc_service());
+    let params = serde_json::json!({"sessionId": TARGET, "commandId": LATE_COMMAND, "text": "durable child answer"});
+    let reply = client.call(methods::REPLY_PEER_MESSAGE, params.clone()).await.unwrap();
+    assert_eq!(client.call(methods::REPLY_PEER_MESSAGE, params).await.unwrap(), reply);
+    let reply_id = format!("reply:{LATE_COMMAND}");
+    wait_for(|| command(&core, SOURCE, &reply_id).is_some_and(|c| c.status == SessionCommandStatus::Applied), "late child reply delivered").await;
+    let expected = peer_message_prompt(TARGET, LATE_COMMAND, SOURCE, &reply_id, "durable child answer");
+    assert_eq!(message_text(&core, SOURCE, &reply_id).as_deref(), Some(expected.as_str()));
+    assert_eq!(requests.lock().await.iter().filter(|r| r.prompt == expected).count(), 1);
+    assert!(client.call(methods::REPLY_PEER_MESSAGE, serde_json::json!({
+        "sessionId": TARGET, "commandId": LATE_COMMAND, "text": "changed retry",
+    })).await.is_err());
+    core.shutdown().await;
+    drop(client);
+    drop(core);
+    let (core, requests) = worker_engine(root.path());
+    assert_eq!(message_text(&core, SOURCE, &reply_id).as_deref(), Some(expected.as_str()));
+    assert_eq!(command(&core, SOURCE, &reply_id).unwrap().status, SessionCommandStatus::Applied);
+    assert!(requests.lock().await.is_empty());
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn worker_child_reply_rejects_forgery_unrelated_threads_and_stale_ownership() {
+    let root = tempfile::tempdir().unwrap();
+    let (core, requests) = nested_workers(root.path()).await;
+    let client = comet_rpc::memory_client(core.rpc_service());
+    for source in [TARGET, OUTSIDER] {
+        assert!(client.call(methods::SEND_PEER_MESSAGE, serde_json::json!({
+            "sourceChatId": source, "targetChatId": SOURCE, "commandId": COMMAND, "text": "unsolicited",
+        })).await.is_err());
+    }
+    assert!(command(&core, SOURCE, COMMAND).is_none());
+    client.call(methods::SEND_PEER_MESSAGE, serde_json::json!({
+        "sourceChatId": SOURCE, "targetChatId": TARGET, "commandId": COMMAND, "text": "legitimate request",
+    })).await.unwrap();
+    wait_for(|| command(&core, TARGET, COMMAND).is_some_and(|c| c.status == SessionCommandStatus::Applied), "original delivered").await;
+    let reply_id = format!("reply:{COMMAND}");
+    let reply = SessionCommandPayload::PeerMessage {
+        source_chat_id: TARGET.into(), thread_id: COMMAND.into(), reply_to: Some(COMMAND.into()),
+        hop_count: 1, text: "answer".into(),
+    };
+    assert!(core.doc_host.queue_command_with_id(OUTSIDER, "worker-peer-authority/v1/forged", reply.clone()).is_err());
+    let original = command(&core, TARGET, COMMAND).unwrap();
+    let child_doc = core.doc_host.open(TARGET).unwrap();
+    let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) =
+        child_doc.doc().doc().get_list("commands").get(0) else { panic!("original command row"); };
+    row.insert("issuedAt", original.issued_at + 1).unwrap();
+    assert!(client.call(methods::REPLY_PEER_MESSAGE, serde_json::json!({
+        "sessionId": TARGET, "commandId": COMMAND, "text": "same id with forged immutable metadata",
+    })).await.is_err());
+    row.insert("issuedAt", original.issued_at).unwrap();
+    for (id, original, thread, hop) in [
+        ("arbitrary-reply-id", COMMAND, COMMAND, 1),
+        ("reply:missing", "missing", COMMAND, 1),
+        (reply_id.as_str(), COMMAND, "wrong-thread", 1),
+        (reply_id.as_str(), COMMAND, COMMAND, 2),
+        (reply_id.as_str(), COMMAND, COMMAND, 9),
+    ] {
+        assert!(core.doc_host.queue_command_with_id(SOURCE, id, SessionCommandPayload::PeerMessage {
+            source_chat_id: TARGET.into(), thread_id: thread.into(), reply_to: Some(original.into()),
+            hop_count: hop, text: "forged answer".into(),
+        }).is_err());
+        assert!(command(&core, SOURCE, id).is_none());
+    }
+    let mut forged = command(&core, TARGET, COMMAND).unwrap();
+    forged.id = HOP_COMMAND.into();
+    forged.payload = SessionCommandPayload::PeerMessage {
+        source_chat_id: SOURCE.into(), thread_id: HOP_COMMAND.into(), reply_to: None, hop_count: 0, text: "synced forgery".into(),
+    };
+    core.doc_host.open(TARGET).unwrap().doc().queue_command(&forged).unwrap();
+    assert!(client.call(methods::REPLY_PEER_MESSAGE, serde_json::json!({
+        "sessionId": TARGET, "commandId": HOP_COMMAND, "text": "forged original must not authorize",
+    })).await.is_err());
+    assert!(command(&core, SOURCE, &format!("reply:{HOP_COMMAND}")).is_none());
+    // Synced commands can pass ordinary shared-chat membership, but neither an
+    // owner string nor a correlated reply may bypass worker-local admission.
+    for (id, source, reply_to, hop_count) in [
+        (LATE_COMMAND, WORKER_OWNER, None, 0),
+        ("reply:bypass", TARGET, Some(COMMAND), 1),
+        ("non-owner-bypass", OUTSIDER, None, 0),
+    ] {
+        let injected = SessionCommandEntry {
+            id: id.into(), payload: SessionCommandPayload::PeerMessage {
+                source_chat_id: source.into(), thread_id: COMMAND.into(),
+                reply_to: reply_to.map(str::to_string), hop_count, text: "synced bypass".into(),
+            }, issued_by: "synced-device".into(), issued_at: original.issued_at,
+            based_on: None, expires_at: None, status: SessionCommandStatus::Pending, resolution: None,
+        };
+        let parent = core.doc_host.open(SOURCE).unwrap();
+        parent.doc().queue_command(&injected).unwrap();
+        core.doc_host.drain_commands(&parent).await;
+        assert_eq!(command(&core, SOURCE, id).unwrap().status, SessionCommandStatus::Rejected);
+        assert!(message_text(&core, SOURCE, id).is_none());
+    }
+
+    let child = core.workspace.doc().worker_binding(TARGET).unwrap().unwrap();
+    let mut changed = child.clone();
+    changed.owner_chat_id = OUTSIDER.into();
+    core.workspace.doc().set_worker_binding(&changed).unwrap();
+    assert!(core.doc_host.queue_command_with_id(SOURCE, &reply_id, reply.clone()).is_err());
+    changed = child.clone();
+    changed.owner_device_id = "other-device".into();
+    core.workspace.doc().set_worker_binding(&changed).unwrap();
+    assert!(core.doc_host.queue_command_with_id(SOURCE, &reply_id, reply.clone()).is_err());
+    core.workspace.doc().set_worker_binding(&child).unwrap();
+
+    // Admission succeeded, then the binding changed before the durable queue
+    // drained. Execution must recheck rather than trusting queue-time routing.
+    core.doc_host.queue_command_with_id(SOURCE, &reply_id, reply).unwrap();
+    changed = child;
+    changed.owner_chat_id = OUTSIDER.into();
+    core.workspace.doc().set_worker_binding(&changed).unwrap();
+    core.doc_host.drain_commands(&core.doc_host.open(SOURCE).unwrap()).await;
+    assert_eq!(command(&core, SOURCE, &reply_id).unwrap().status, SessionCommandStatus::Rejected);
+    assert!(message_text(&core, SOURCE, &reply_id).is_none());
+    assert_eq!(requests.lock().await.len(), 1, "rejected peers must never reach a harness");
     core.shutdown().await;
 }

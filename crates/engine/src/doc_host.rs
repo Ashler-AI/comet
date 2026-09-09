@@ -41,6 +41,7 @@ const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
 pub(crate) const LOCAL_OWNER_GRANT_TTL_MS: i64 = 5 * 60 * 1_000;
 
 const LOCAL_OWNER_AUTHORITY_KEY_PREFIX: &str = "local-control-authority/v1/";
+const WORKER_PEER_AUTHORITY_KEY_PREFIX: &str = "worker-peer-authority/v1/";
 const EDGE_GRANT_CAPABILITIES: &[&str] = &[
     comet_proto::CAPABILITY_SESSION_READ,
     comet_proto::CAPABILITY_SESSION_CHAT,
@@ -265,6 +266,23 @@ fn local_owner_authority_key(entry: &SessionCommandEntry) -> Result<String, serd
         "{LOCAL_OWNER_AUTHORITY_KEY_PREFIX}{}",
         crate::repos::hex(&digest)
     ))
+}
+
+/// Retained after application so a child can answer after a disconnect. Bind
+/// the destination and immutable worker identity, not merely a synced id.
+fn worker_peer_authority_key(
+    binding: &comet_proto::WorkerBinding,
+    entry: &SessionCommandEntry,
+) -> Result<String, EngineError> {
+    let immutable = (
+        &binding.chat_id, &binding.owner_chat_id, &binding.owner_device_id,
+        &binding.project_path, &binding.base_ref, &binding.worktree, &binding.config,
+        &entry.id, &entry.payload, &entry.issued_by, entry.issued_at,
+        &entry.based_on, entry.expires_at,
+    );
+    let bytes = serde_json::to_vec(&immutable)
+        .map_err(|error| EngineError::Other(format!("worker peer authority serialize: {error}")))?;
+    Ok(format!("{WORKER_PEER_AUTHORITY_KEY_PREFIX}{}", crate::repos::hex(&Sha256::digest(bytes))))
 }
 
 fn grant_authorizes_control_scope(
@@ -1481,6 +1499,61 @@ impl DocHost {
         Ok(id)
     }
 
+    fn authorize_worker_peer(
+        &self,
+        chat_id: &str,
+        command_id: &str,
+        payload: &SessionCommandPayload,
+    ) -> Result<Option<comet_proto::WorkerBinding>, EngineError> {
+        let SessionCommandPayload::PeerMessage { source_chat_id, thread_id, reply_to, hop_count, .. } = payload else {
+            return Ok(None);
+        };
+        let Some(workspace) = self.workspace() else { return Ok(None); };
+        let Some(binding) = workspace.doc().worker_binding(chat_id)? else { return Ok(None); };
+        let denied = || EngineError::Other("worker_owner_mismatch".into());
+        if binding.owner_device_id != self.device_id()
+            || !workspace.doc().chat(&binding.owner_chat_id)?
+                .is_some_and(|owner| owner.device_id == binding.owner_device_id)
+        {
+            return Err(denied());
+        }
+        if source_chat_id == &binding.owner_chat_id {
+            return Ok(Some(binding));
+        }
+        let Some(original_id) = reply_to else { return Err(denied()); };
+        let Some(child) = workspace.doc().worker_binding(source_chat_id)? else { return Err(denied()); };
+        if source_chat_id == chat_id
+            || child.owner_chat_id != chat_id
+            || child.owner_device_id != binding.owner_device_id
+            || command_id != format!("reply:{original_id}")
+            || thread_id.trim().is_empty()
+        {
+            return Err(denied());
+        }
+        workspace.worker_ready(source_chat_id)?;
+        // Avoid nesting command mutexes for concurrent opposite-direction
+        // replies. Atomic document reads plus the immutable local proof suffice.
+        let source = self.open(source_chat_id)?;
+        let original = source.doc.read_commands()?.into_iter()
+            .find(|entry| entry.id == *original_id).ok_or_else(denied)?;
+        let SessionCommandPayload::PeerMessage {
+            source_chat_id: original_source, thread_id: original_thread,
+            hop_count: original_hop, ..
+        } = &original.payload else { return Err(denied()); };
+        if original_source != chat_id
+            || original_thread != thread_id
+            || *original_hop >= 8
+            || *hop_count != original_hop + 1
+            || !matches!(original.status, SessionCommandStatus::Pending | SessionCommandStatus::Applied)
+            || original.issued_by != binding.owner_device_id
+            || !self.inner.store.is_trusted_local_command(&worker_peer_authority_key(&child, &original)?)?
+        {
+            return Err(denied());
+        }
+        self.persist_handle(&source)?;
+        Ok(Some(binding))
+    }
+
     /// Append using a caller-supplied durable id. Retries return the immutable
     /// existing command instead of adding or replacing a ledger entry.
     pub fn queue_command_with_id(
@@ -1497,6 +1570,11 @@ impl DocHost {
             }
             None => self.open(chat_id)?,
         };
+        // Command ids are caller-controlled; they must never mint a provenance
+        // fingerprint by colliding with the device-local trust-key namespace.
+        if command_id.starts_with(WORKER_PEER_AUTHORITY_KEY_PREFIX) {
+            return Err(EngineError::Other("invalid_command_id".into()));
+        }
         let _guard = lock(&handle.command_lock);
         if let Some(existing) = handle
             .doc
@@ -1510,18 +1588,18 @@ impl DocHost {
             {
                 return Err(EngineError::Other("command_id_conflict".into()));
             }
+            if let Some(binding) = self.authorize_worker_peer(chat_id, command_id, &payload)?
+                && !self.inner.store.is_trusted_local_command(&worker_peer_authority_key(&binding, &existing)?)?
+            {
+                return Err(EngineError::Other("worker_peer_provenance_missing".into()));
+            }
             self.persist_handle(&handle)?;
             return Ok(existing);
         }
         if let Some(workspace) = self.workspace() {
             workspace.worker_ready(chat_id)?;
-            if let Some(binding) = workspace.doc().worker_binding(chat_id)?
-                && let SessionCommandPayload::PeerMessage { source_chat_id, .. } = &payload
-                && source_chat_id != &binding.owner_chat_id
-            {
-                return Err(EngineError::Other("worker_owner_mismatch".into()));
-            }
         }
+        let worker_peer = self.authorize_worker_peer(chat_id, command_id, &payload)?;
         let now = now_ms();
         let based_on = handle.doc.last_message_id().map(|id| CommandBasedOn {
             turn_id: Some(id),
@@ -1570,9 +1648,17 @@ impl DocHost {
         if let Some(trust_key) = trust_key.as_deref() {
             self.inner.store.trust_local_command(trust_key)?;
         }
+        let peer_key = worker_peer.as_ref()
+            .map(|binding| worker_peer_authority_key(binding, &entry)).transpose()?;
+        if let Some(key) = &peer_key {
+            self.inner.store.trust_local_command(key)?;
+        }
         if let Err(err) = handle.doc.queue_command(&entry) {
             if let Some(trust_key) = trust_key.as_deref() {
                 let _ = self.inner.store.forget_local_command(trust_key);
+            }
+            if let Some(key) = &peer_key {
+                let _ = self.inner.store.forget_local_command(key);
             }
             return Err(err.into());
         }
@@ -1932,7 +2018,10 @@ impl DocHost {
                     self.resolve_command(handle, &entry, status, resolution.as_deref());
                 }
             }
-            if let Err(err) = self.inner.store.forget_local_command(&entry.id) {
+            // Synced command ids must not erase retained exchange proofs either.
+            if !entry.id.starts_with(WORKER_PEER_AUTHORITY_KEY_PREFIX)
+                && let Err(err) = self.inner.store.forget_local_command(&entry.id)
+            {
                 tracing::debug!(command = %entry.id, error = %err, "local command trust cleanup failed");
             }
             if matches!(&entry.payload, SessionCommandPayload::Control { .. })
@@ -2063,6 +2152,12 @@ impl DocHost {
         }
         if let Some(workspace) = self.workspace() {
             workspace.worker_ready(chat_id)?;
+        }
+        if let Some(binding) = self.authorize_worker_peer(chat_id, &entry.id, &entry.payload)?
+            && (entry.issued_by != self.device_id()
+                || !self.inner.store.is_trusted_local_command(&worker_peer_authority_key(&binding, entry)?)?)
+        {
+            return Err(EngineError::Other("worker_peer_provenance_missing".into()));
         }
         let carries_user_input = match &entry.payload {
             SessionCommandPayload::Run { .. }

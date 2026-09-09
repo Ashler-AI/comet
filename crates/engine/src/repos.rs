@@ -8,7 +8,8 @@
 //! dir — worktrees are user-facing working checkouts), with an auto-generated name +
 //! matching `comet/<name>` branch. `COMET_WORKTREES_DIR` overrides the root.
 //!
-//! All git access is via subprocess (`tokio::process`) — never libgit2.
+//! Git commands use subprocesses — never libgit2. Worker admission also checks
+//! Git's effective root so includes/worktree configuration cannot redirect it.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -52,6 +53,106 @@ pub struct CheckoutIdentity {
     pub root: PathBuf,
     /// Canonical git dir (worktree-specific for linked worktrees).
     pub git_dir: PathBuf,
+}
+
+fn checkout_id(device_id: &str, canonical_git_dir: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(device_id.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(canonical_git_dir.to_string_lossy().as_bytes());
+    hex(&hasher.finalize())
+}
+
+// Resolve Git's relative metadata paths, rejecting symlinks even in components
+// preceding `..`. Canonicalization alone would silently adopt redirected paths.
+fn exact_git_path(path: &Path) -> Result<PathBuf, EngineError> {
+    if !path.is_absolute() {
+        return Err(EngineError::Other("worker_git_path_not_absolute".into()));
+    }
+    let mut exact = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => { exact.pop(); }
+            _ => {
+                exact.push(component.as_os_str());
+                if std::fs::symlink_metadata(&exact)?.file_type().is_symlink() {
+                    return Err(EngineError::Other("worker_git_path_is_symlink".into()));
+                }
+            }
+        }
+    }
+    if std::fs::canonicalize(&exact)? != exact {
+        return Err(EngineError::Other("worker_git_path_not_canonical".into()));
+    }
+    Ok(exact)
+}
+
+fn git_path_file(file: &Path, prefix: &str) -> Result<PathBuf, EngineError> {
+    let file = exact_git_path(file)?;
+    let metadata = std::fs::symlink_metadata(&file)?;
+    if !metadata.is_file() || metadata.len() > 65536 {
+        return Err(EngineError::Other("worker_git_path_file_invalid".into()));
+    }
+    let contents = std::fs::read_to_string(&file)?;
+    // Git writes one LF. Reject ambiguous trailing control/space characters
+    // rather than resolve a different path than Git's whitespace trimming.
+    let path = contents.strip_suffix('\n').unwrap_or(&contents)
+        .strip_prefix(prefix).filter(|path| !path.is_empty() && !path.contains('\0')
+            && !path.as_bytes().last().is_some_and(u8::is_ascii_whitespace))
+        .ok_or_else(|| EngineError::Other("worker_git_path_file_invalid".into()))?;
+    exact_git_path(&file.parent().expect("absolute file path").join(path))
+}
+
+fn checkout_git_dirs(root: &Path) -> Result<(PathBuf, PathBuf), EngineError> {
+    if exact_git_path(root)? != root || !std::fs::metadata(root)?.is_dir() {
+        return Err(EngineError::Other("worker_checkout_root_changed".into()));
+    }
+    let dot_git = exact_git_path(&root.join(".git"))?;
+    let git_dir = if std::fs::metadata(&dot_git)?.is_dir() {
+        dot_git.clone()
+    } else {
+        git_path_file(&dot_git, "gitdir: ")?
+    };
+    if !std::fs::metadata(&git_dir)?.is_dir()
+        || !std::fs::metadata(exact_git_path(&git_dir.join("HEAD"))?)?.is_file()
+    {
+        return Err(EngineError::Other("worker_git_directory_invalid".into()));
+    }
+    let common_file = git_dir.join("commondir");
+    let common_dir = match std::fs::symlink_metadata(&common_file) {
+        Ok(_) => {
+            let common = git_path_file(&common_file, "")?;
+            if !std::fs::metadata(&dot_git)?.is_file()
+                || git_dir.parent() != Some(common.join("worktrees").as_path())
+                || git_path_file(&git_dir.join("gitdir"), "")? != dot_git
+            {
+                return Err(EngineError::Other("worker_git_backlink_changed".into()));
+            }
+            common
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => git_dir.clone(),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in ["objects", "refs"] {
+        if !std::fs::metadata(exact_git_path(&common_dir.join(entry))?)?.is_dir() {
+            return Err(EngineError::Other("worker_git_common_directory_invalid".into()));
+        }
+    }
+    // Git owns configuration semantics (including includes and config.worktree).
+    // Matching pointer files alone does not prove where Git commands will act.
+    // Compare the complete output rather than splitting newline-bearing paths.
+    let effective = std::process::Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-dir", "--git-common-dir"])
+        .current_dir(root)
+        .env("ASHLER_INCREMENTAL_TSC_CHECKS", "false")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()?;
+    let expected = format!("{}\n{}\n{}\n", root.display(), git_dir.display(), common_dir.display());
+    if !effective.status.success() || effective.stdout != expected.as_bytes() {
+        return Err(EngineError::Other("worker_effective_git_checkout_changed".into()));
+    }
+    Ok((git_dir, common_dir))
 }
 
 /// Best-effort home directory (the `ListFolders` default and worktree root base).
@@ -259,15 +360,30 @@ impl Repos {
         let canonical_root = std::fs::canonicalize(&root).unwrap_or_else(|_| PathBuf::from(&root));
         let canonical_git_dir =
             std::fs::canonicalize(&git_dir).unwrap_or_else(|_| PathBuf::from(&git_dir));
-        let mut hasher = Sha256::new();
-        hasher.update(self.inner.device_id.as_bytes());
-        hasher.update([0u8]);
-        hasher.update(canonical_git_dir.to_string_lossy().as_bytes());
-        let id = hex(&hasher.finalize());
         Ok(CheckoutIdentity {
-            id,
+            id: checkout_id(&self.inner.device_id, &canonical_git_dir),
             root: canonical_root,
             git_dir: canonical_git_dir,
+        })
+    }
+
+    /// Current linked-checkout identity for the synchronous worker fence. This
+    /// checks Git-managed paths and effective root/common-dir configuration.
+    /// Branch names and working changes are free to evolve; identity is not.
+    pub(crate) fn worker_checkout_identity(
+        device_id: &str,
+        project: &Path,
+        path: &Path,
+    ) -> Result<CheckoutIdentity, EngineError> {
+        let (_, project_common) = checkout_git_dirs(project)?;
+        let (git_dir, common_dir) = checkout_git_dirs(path)?;
+        if path == project || git_dir == common_dir || common_dir != project_common {
+            return Err(EngineError::Other("worker_checkout_repository_changed".into()));
+        }
+        Ok(CheckoutIdentity {
+            id: checkout_id(device_id, &git_dir),
+            root: path.to_path_buf(),
+            git_dir,
         })
     }
 
@@ -699,21 +815,7 @@ impl Repos {
         {
             return Err(EngineError::Other("worker path is not a linked checkout of this project".into()));
         }
-        let checkout = self.checkout_identity(&path).await?;
-        let common_dir = self.git(
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-            Some(&repo_path),
-        ).await?;
-        let common_dir = std::fs::canonicalize(common_dir)?;
-        // Check the linked checkout's own backlink as well as the inventory:
-        // replacing its .git file must not adopt a different checkout.
-        let backlink = std::fs::read_to_string(checkout.git_dir.join("gitdir"))?;
-        if checkout.root != path
-            || checkout.git_dir.parent() != Some(common_dir.join("worktrees").as_path())
-            || std::fs::canonicalize(backlink.trim_end_matches('\n'))? != path.join(".git")
-        {
-            return Err(EngineError::Other("worker checkout identity does not match this project".into()));
-        }
+        let checkout = Self::worker_checkout_identity(&self.inner.device_id, &repo_path, &path)?;
         let branch = self.current_branch(&path).await?;
         Ok(Worktree {
             repo_path: repo_path.to_string_lossy().to_string(),

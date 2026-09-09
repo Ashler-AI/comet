@@ -110,7 +110,6 @@ impl EngineRpc {
             binding
         };
         if binding.worktree.is_some() {
-            self.verify_worker_checkout(&binding).await?;
             self.workspace.worker_ready(&p.chat_id).map_err(failed)?;
             self.workspace.persist().map_err(failed)?;
             return self.worker_snapshot(binding);
@@ -143,26 +142,13 @@ impl EngineRpc {
         self.worker_snapshot(binding)
     }
 
-    async fn verify_worker_checkout(&self, binding: &WorkerBinding) -> Result<(), RpcError> {
-        let Some(worktree) = &binding.worktree else { return Ok(()); };
-        let identity = self.repos.checkout_identity(Path::new(&worktree.path)).await.map_err(failed)?;
-        let member = self.repos.workspace_checkout(Path::new(&binding.project_path), Path::new(&worktree.path)).await;
-        if identity.root != Path::new(&worktree.path) || worktree.checkout_id.as_deref() != Some(identity.id.as_str())
-            || member.as_deref() != Some(Path::new(&worktree.path)) || identity.root == Path::new(&binding.project_path)
-        {
-            return Err(failed("worker_checkout_identity_changed"));
-        }
-        Ok(())
+    fn verify_worker_checkout(&self, binding: &WorkerBinding) -> Result<(), RpcError> {
+        self.workspace.validate_worker_binding(binding).map_err(failed)
     }
 
     pub(super) async fn read_worker_session(&self, p: WorkerSessionParams) -> Result<serde_json::Value, RpcError> {
         let binding = self.owned_worker(&p)?;
-        if !binding.closed && !binding.paused && binding.worktree.is_some()
-            && self.workspace.doc().chat(&p.chat_id).map_err(failed)?.is_some()
-        {
-            self.workspace.worker_ready(&p.chat_id).map_err(failed)?;
-        }
-        self.verify_worker_checkout(&binding).await?;
+        self.verify_worker_checkout(&binding)?;
         self.worker_snapshot(binding)
     }
 
@@ -216,21 +202,14 @@ impl EngineRpc {
         let _operation = self.workspace.worker_operation().await;
         let identity = WorkerSessionParams { chat_id: p.chat_id.clone(), owner_chat_id: p.owner_chat_id };
         let mut binding = self.owned_worker(&identity)?;
-        // Interrupt and close remain usable if the checkout was moved/missing;
-        // they never touch the filesystem. Recover must prove it still exists.
+        // Interrupt/close never touch the filesystem. Recovery of an unbound
+        // reservation clears only its fence; identical ensure must finish it.
         if p.action == WorkerSessionAction::Recover {
-            self.verify_worker_checkout(&binding).await?;
-            if binding.worktree.is_none() { return Err(failed("worker_provisioning_retry_ensure")); }
-            if self.workspace.doc().chat(&p.chat_id).map_err(failed)?.is_none() { return Err(failed("worker_chat_missing")); }
-            if self.sessions.worker_active(&p.chat_id) { return Err(failed("worker_still_active")); }
-            // Validate the full immutable binding before opening the fence.
-            let chat = self.workspace.doc().chat(&p.chat_id).map_err(failed)?.ok_or_else(|| failed("worker_chat_missing"))?;
-            let worktree = binding.worktree.as_ref().expect("checked above");
-            if chat.cwd.as_deref() != Some(worktree.path.as_str())
-                || chat.checkout_id != worktree.checkout_id || chat.config.as_ref() != Some(&binding.config)
-            {
-                return Err(failed("worker_binding_changed"));
+            self.verify_worker_checkout(&binding)?;
+            if binding.worktree.is_some() && self.workspace.doc().chat(&p.chat_id).map_err(failed)?.is_none() {
+                return Err(failed("worker_chat_missing"));
             }
+            if self.sessions.worker_active(&p.chat_id) { return Err(failed("worker_still_active")); }
             if binding.paused || binding.closed {
                 self.doc_host.cancel_worker_commands(&p.chat_id).map_err(failed)?;
             }

@@ -4,13 +4,16 @@
 
 This change adds Crew-side source APIs; it does **not** add a Firstmate backend.
 The new endpoints and Rust regressions have **not been compiled or executed**.
-Local Cargo build/test/typechecks are prohibited for this task; remote verification
-requires separate authorization. Do not install this branch over the running app.
+Local Cargo build/test/typechecks are prohibited for this task. Authorized remote
+verification is blocked by the uncertain accepted handoff recorded below. Do not
+install this branch over the running app or treat a source review as runtime proof.
 
 The assigned branch started at `82639e3eb9691da9bddce08c2879eb912686df0b`
 (workspace version 0.1.63). The installed app reports 0.1.85. The authoritative
-upstream reference inspected is `origin/main` at
-`99710db28eb3d71342a37e03dcbea3c4d66176d5`; its release record identifies
+current upstream reference is `origin/main` at
+`c0195945b6a7dcce0c3319ffa1e00157c939afbe` (0.1.86), including installed OMP
+historical attachment capture from `<OMP root>/blobs`. The earlier inspected
+`99710db28eb3d71342a37e03dcbea3c4d66176d5` release record identifies
 `e771970915b4b10565a825dca6140e13703b682f` as the 0.1.85 staging source and
 [release run 34387642609](https://github.com/Ashler-AI/comet/actions/runs/34387642609).
 Native session handoff entered in `dcbc5bc5a682af544c985bdd0d16bd28467f761e`
@@ -32,6 +35,14 @@ running services and credentials remain unchanged. No installation is authorized
 as `origin/main`; it is not an additional branch that must be merged. The
 `e771970` release commit is an ancestor of that ref. Also coordinate additive transcript
 provenance work in `doc_host.rs`; peer command/message IDs remain unchanged here.
+
+The combined visibility-first checkpoint is
+`a77ba6e508a67c77e864ce4d8146041450ee1ae7`, containing visibility final
+`3764beeb7457aab75cdad28e8235acf9dc039250` followed by worker integration.
+Non-rewriting merge `af4f0261e737445791a29b049cb570b41eb0eca9` retains that
+checkpoint as its first parent and `c019594` as its second parent. Both upstream
+historical attachment changes and the existing native handoff/auth flow are
+retained; no active worktree or running service was replaced.
 
 ## Boundary and transport
 
@@ -117,6 +128,17 @@ Dirty files, untracked files, commits and branch renames are retained. A missing
 path with an existing branch or Git worktree registration is ambiguous and
 refuses; no reset, force-add, prune or deletion is attempted.
 
+The same synchronous identity guard runs before ordinary command admission and
+native execution, not only ensure/status/recover. It reads the current `.git`,
+`commondir` and `gitdir` backlink, requires the exact linked Git directory under
+the project's common directory, and recomputes Crew's existing device-scoped
+checkout ID. It rejects redirected/symlinked/moved metadata, a sibling or foreign
+checkout, and changed local owner/device/configuration bindings without queuing
+or starting a turn. Branch renames and working-tree changes do not change identity.
+Git's own `rev-parse` must also report the exact root, Git directory and common
+directory. This honors effective Git configuration instead of assuming pointer
+files capture `core.worktree` semantics. Readback failure refuses admission.
+
 Initial configuration is immutable for this worker identity. Generic config/cwd
 changes are detected and execution fails closed rather than silently running at a
 different model, effort or project. `binding.config` is the requested contract;
@@ -156,6 +178,18 @@ worker snapshot instead; each is a typed owner-ledger command from this exact
 worker, including `payload.text`, `replyTo`, `threadId`, status and resolution.
 Replies may be rejected for execution at an idle owner without run configuration
 but still remain durably readable. A reply saying “done” is not a terminal event.
+
+A worker can own a child worker. The child's reply is a narrow exception to the
+initial-send owner restriction, not general non-owner send authority. Admission
+and execution require the current same-device parent/child binding, a ready
+child, and the exact durable original peer command in that child. Its source
+must be this parent, thread must match, hop must increment within the limit, and
+the reply ID must be `reply:<original command ID>`. A device-local immutable
+fingerprint binds the original command and worker identity; synced command IDs
+or copied owner strings alone cannot authorize a reply. That fingerprint remains
+after `Applied`, enabling later replies after reconnect. Rejected/cancelled
+exchanges do not authorize new child replies. The internal
+`worker-peer-authority/v1/` command-ID prefix is reserved; adapters must not use it.
 
 The existing command ledger marks processed before side effects: a crash in that
 window can leave uncertain delivery. The snapshot reports `unknown`, not success
@@ -233,6 +267,10 @@ RPC `ControlWorkerSession` accepts `{chatId,ownerChatId,action}` where action is
   Native session continuity on the next explicit message uses existing Crew
   resume rules. Engine crash recovery keeps its existing bounded resume policy;
   worker dispatch fences are checked there too.
+  An interrupted/closed reservation without a bound checkout can recover to
+  `provisioning`; this only clears the lifecycle fence. It remains unrunnable
+  until identical ensure validates/reuses any retained partial checkout and
+  finishes the original binding. Recovery never resets or deletes that checkout.
 - These operations never merge, commit, discard, delete or land code. Firstmate
   must make its own explicit landing/cleanup decision. There is no worker API
   for deleting retained work. Do not compose generic delete calls as “close”.
@@ -298,8 +336,50 @@ changes, not only installing Crew:
   `unknown method: ReadWorkerSession`. This is **not** validation of new code.
 
 No local Cargo builds/tests/typechecks, lint, formatters, project-wide suites,
-remote delegation, deployment, service replacement, Git push/PR/merge or
-OpenCode publication review ran. No new endpoint has been exercised.
+deployment, service replacement or Git push/PR/merge to the upstream repository
+ran for this combined source. No new worker endpoint has been exercised.
+
+### Combined-source verification blocked
+
+The authorized single native verification handoff used source checkpoint
+`a77ba6e508a67c77e864ce4d8146041450ee1ae7`, a saved pre-handoff source-config
+readback of `openai-codex/gpt-6-astra` at `medium`, and database environment `local`.
+Source configuration was restored and read back as `xhigh` after the attempt.
+The upload request failed after the native controller accepted these identities:
+
+- Sandbox: `rcs_2fb634f12de0472c2181609a`.
+- Native session: `682cbfda-05ee-489e-90c0-18d06d38ba93`.
+- Upload: `rcup_044d4f1a-ecc9-4a03-a700-f50adb1e37cc`.
+
+Bounded native inspection reported `ready`, lifecycle epoch 1, database `local`,
+and retained the exact session reference/grant. The exact room returned an empty
+transcript and session list; that is **not** proof that no remote side effects
+occurred. Missing/partial/completed upload and initial-command admission versus
+lost receipt remain unknown. Initial remote model/effort execution is unverified.
+`Inspect` exposes no upload state; exact-scope `PrepareScaffoldSession` does not
+recover final chat creation plus initial command admission. Re-running CLI
+`session handoff` allocates another identity, not an idempotent retry. Recovery
+inspection stopped at the parent's instruction: no Prepare recovery, retry,
+fallback, new command or sandbox deletion was performed. Operator inspection of
+the preserved accepted identity is required before any further remote work.
+
+The required local OpenCode read-only review of combined `a77ba6e` against its
+confirmed `origin/main` merge base `99710db` found two worker defects: current Git
+identity was not checked at ordinary execution admission, and the owner-only
+peer guard rejected legitimate child replies. It reported no additional original
+peer-message visibility findings. The review ran no tests/builds or handoff
+operations. Corrections require a further OpenCode review and authorized native
+behavioral verification; the preliminary review is not PR readiness.
+
+A subsequent static OpenCode review against `c019594` confirmed the child-reply
+correction but found effective Git root overrides and a stopped-provisioning
+recovery dead end. Both have source corrections and prepared regressions. A
+disposable Git-only experiment confirmed that direct `config.worktree`
+`core.worktree` redirects the root while leaving the Git-directory identity
+unchanged, and that the exact effective-root query detects the redirect. This
+did not compile or execute Crew. Included configuration did not redirect the
+effective root in that experiment; no rejected-include claim is made. A final
+unchanging source checkpoint must undergo OpenCode review before publication.
 
 ### Commands for an authorized remote verification environment
 
@@ -324,6 +404,9 @@ Also run upstream's native Scaffold session/handoff focused regressions from
 `crates/engine/src/rpc/scaffold_session_tests.rs`, plus source-preserving worktree
 handoff tests, after resolving the overlapping engine/CLI changes. Preserve all
 upstream checks; the old-base test list is not a substitute for handoff coverage.
+The reconciled 0.1.86 source also requires the existing
+`cargo test --locked -p comet-engine --lib historical_attachments` lane, including
+the installed-layout capture test; no handoff upload retry is part of that test.
 
 New regressions defend:
 
@@ -331,12 +414,20 @@ New regressions defend:
   owner/colliding identity refuses;
 - existing commits, edits, untracked files and renamed branches survive recovery;
 - orphan branch, unrelated repository checkout and symlink escape refuse;
+- ordinary send and direct native dispatch reject sibling/foreign `.git`, moved
+  backlinks/Git directories, altered common directories and symlinked metadata;
+  restoring original metadata retains renamed branches, commits, dirty and
+  untracked files; changed owner-device bindings reject before harness admission;
 - transcript text claiming completion while live stays busy; native errored vs
   completed Done remains distinct;
 - close during a live run retains unlanded files, fences new sends, and recovery
   does not replay instructions;
 - message ID retry does not launch twice; changed payload rejects;
 - input wait and durable reply correlation survive a lost live connection.
+- legitimate nested-child replies reach live waiters and survive restart with
+  same-ID retry; forged immutable metadata, missing/wrong command or thread,
+  invalid reply ID/hop, cross-owner/device senders, raw synced queue bypass and
+  changed child ownership before dispatch reject without reaching a harness.
 
 Then build a dedicated test binary remotely (`cargo build -p comet --bin comet`),
 without replacing any installed binary/service. Linux UI build prerequisites are
