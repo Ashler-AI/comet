@@ -29,6 +29,13 @@ if not async_api and "pub fn queue_command_with_id(" not in api:
 if async_api:
     source = seed
 else:
+    # b36895e has an unrelated Arc borrow compile error. Preserve semantics
+    # while making the reference explicit; record the exact disposable patch.
+    old_borrow = "self.persist_handle(&self.open(chat_id)?)"
+    new_borrow = "self.persist_handle(self.open(chat_id)?.as_ref())"
+    assert api.count(old_borrow) == 1
+    (checkout / "crates/engine/src/doc_host.rs").write_text(api.replace(old_borrow, new_borrow))
+    (evidence / "baseline-compile-adaptation.txt").write_text(old_borrow + "\n=>\n" + new_borrow + "\n")
     prefix = seed.split("#[tokio::test]\nasync fn worker_creation_retries_preserve_checkout_config_and_ownership_across_restart()", 1)[0]
     module = seed[seed.index("#[cfg(unix)]\nmod async_admission {"):]
     module = module.split('    #[tokio::test(flavor = "current_thread")]\n    async fn git_config_failure_rejects_admission_without_append_or_harness()', 1)[0]
@@ -52,8 +59,24 @@ observer = r'''
         let text = String::from_utf8_lossy(&listing.stdout);
         eprintln!("GIT_DIAGNOSTIC label={label} at_ms={at} test_pid={} fifo={} lsof_status={}\n{}\n{}",
             std::process::id(), fifo.display(), listing.status, text, String::from_utf8_lossy(&listing.stderr));
+        let census = std::process::Command::new("ps").args(["-axo", "pid=,ppid=,stat=,args="])
+            .output().expect("ps process census available on CI runner");
+        let census_text = String::from_utf8_lossy(&census.stdout);
         let pids = {
             let mut known = OBSERVED_PIDS.lock().unwrap();
+            for line in census_text.lines() {
+                let mut fields = line.split_whitespace();
+                let pid = fields.next().and_then(|value| value.parse::<u32>().ok());
+                let parent = fields.next().and_then(|value| value.parse::<u32>().ok());
+                let _state = fields.next();
+                let executable = fields.next().unwrap_or("");
+                if parent == Some(std::process::id()) {
+                    eprintln!("GIT_DIAGNOSTIC direct_child label={label} {line}");
+                    if executable.rsplit('/').next() == Some("git") {
+                        if let Some(pid) = pid && !known.contains(&pid) { known.push(pid); }
+                    }
+                }
+            }
             for line in text.lines() {
                 if let Some(pid) = line.strip_prefix('p').and_then(|pid| pid.parse::<u32>().ok()) {
                     if pid != std::process::id() && !known.contains(&pid) { known.push(pid); }
@@ -62,7 +85,7 @@ observer = r'''
             known.clone()
         };
         for pid in pids {
-            let state = std::process::Command::new("ps").args(["-p", &pid.to_string(), "-o", "pid=,ppid=,stat=,comm="])
+            let state = std::process::Command::new("ps").args(["-p", &pid.to_string(), "-o", "pid=,ppid=,stat=,args="])
                 .output().expect("ps available on CI runner");
             eprintln!("GIT_DIAGNOSTIC known_pid={pid} label={label} ps_status={} {}",
                 state.status, String::from_utf8_lossy(&state.stdout));
@@ -88,7 +111,7 @@ replace_once("            assert!(!self.expired.load(Ordering::SeqCst), \"runtim
 (evidence / "source.json").write_text(json.dumps({
     "revision": revision, "asyncApi": async_api,
     "diagnosticSource": os.environ["GITHUB_SHA"],
-    "adaptation": "none" if async_api else "Synchronous APIs wrapped in directly polled async blocks, not spawn_blocking. Blocking before cancellation is not a comparable cancellation pass.",
+    "adaptation": "none" if async_api else "Synchronous APIs wrapped in directly polled async blocks, not spawn_blocking. Existing doc_host Arc borrow compile error adapted with .as_ref(); exact change recorded separately. Blocking before cancellation is not a comparable cancellation pass.",
     "assertions": "Original scheduler, no-admission, deadline, and FIFO closure assertions retained. Added lsof PID/FD and ps state observations only."
 }, indent=2))
 
