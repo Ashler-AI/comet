@@ -122,8 +122,9 @@ remains separate and unchanged.
 The [native worker adapter contract](docs/reference/native-workers.md) describes
 owned isolated Crew sessions, durable messaging/outcomes, retention-only lifecycle
 controls, and the separate Firstmate cutover requirements. This branch's new
-endpoints are uncompiled/unverified; reconcile onto the current upstream handoff
-implementation and complete authorized remote verification before installation.
+endpoints are uncompiled/unverified. The source is reconciled onto current
+upstream handoff; complete authorized remote verification before installation.
+
 ## Local collaboration smoke
 
 The deterministic smoke uses two in-memory headless devices and needs no cloud credentials, agent CLI, network, or persistent state:

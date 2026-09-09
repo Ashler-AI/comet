@@ -14,16 +14,20 @@ upstream reference inspected is `origin/main` at
 `e771970915b4b10565a825dca6140e13703b682f` as the 0.1.85 staging source and
 [release run 34387642609](https://github.com/Ashler-AI/comet/actions/runs/34387642609).
 Native session handoff entered in `dcbc5bc5a682af544c985bdd0d16bd28467f761e`
-(0.1.84); 0.1.85 corrects source-preserving handoff. This older base lacks that
-CLI variant. Its absence is an **integration blocker**, not handoff compatibility
-proof. The existing installed app, handoff, auth services and credentials were
-not changed.
+(0.1.84); 0.1.85 corrects source-preserving handoff. The older starting base
+lacked that CLI variant. The parent subsequently authorized reconciliation in
+this isolated copy: checkpoint `e983dad5281a582448cd2b2a8640fa870db6ee9f`
+was replayed onto verified canonical `origin/main` (`99710db`) as
+`b7d299aadd0e4645f89fafea71237ea8b1517127`, whose direct parent is that main.
+Only this implementation commit was replayed; an initial plain-rebase attempt
+that touched unrelated historical UI work was aborted without resolving it.
 
-Before release: apply these changes onto the authoritative upstream in an
-explicitly authorized integration copy, retaining upstream handoff implementation
-and tests. Resolve overlapping `apps/comet/src/{session_cli,main}.rs`,
-`crates/rpc/src/lib.rs`, and `crates/engine/src/{rpc,doc_host,workspace_host}.rs`.
-Do not replace upstream files wholesale with this branch's older versions.
+Bounded conflicts were README additions and CLI imports/variants/dispatch.
+Both upstream handoff and worker paths were retained. Upstream native handoff
+preparation/tests, source worktree transfer, OMP integration, inference relay and
+auth files compare byte-identically with the new base. This resolves the source
+divergence blocker, **not** runtime compatibility verification. The installed app,
+running services and credentials remain unchanged. No installation is authorized.
 `fix/native-handoff-source-repo` resolves to the same inspected `99710db` commit
 as `origin/main`; it is not an additional branch that must be merged. The
 `e771970` release commit is an ancestor of that ref. Also coordinate additive transcript
@@ -249,7 +253,7 @@ RPC `ControlWorkerSession` accepts `{chatId,ownerChatId,action}` where action is
 | `ForkSession` | Existing context fork, not isolated worker provisioning and not an idempotent recover operation. It does not establish Firstmate ownership and can share the source checkout. Do not use it to recover a worker. |
 | `TakeOverOmpSession` | Existing explicit verified writer takeover, not automatic worker recovery. Provider/ownership approval boundaries remain intact. |
 | `Mutate setChatArchived` / `deleteChat`, `DeleteWorktree` | Not safe Firstmate teardown primitives. Worker deleteChat is rejected; worker archive never stages deletion. Direct filesystem deletion remains outside worker lifecycle scope. |
-| Native Crew-to-Scaffold handoff | No worker call invokes it, changes its payload, replaces its auth path, or synthesizes provider markers. Reconcile onto upstream containing landed handoff before claiming compatibility. |
+| Native Crew-to-Scaffold handoff | Upstream landed CLI/preparation/transfer are preserved after reconciliation. No worker call invokes it, changes its payload, replaces its auth path, or synthesizes provider markers. Behavioral compatibility remains unverified until authorized regression execution. |
 
 ## Required Firstmate cutover (separate repository)
 
@@ -299,8 +303,8 @@ OpenCode publication review ran. No new endpoint has been exercised.
 
 ### Commands for an authorized remote verification environment
 
-After upstream reconciliation, use a separate disposable checkout/data directory
-and stable Rust toolchain, Git, C compiler/linker and Cargo dependency access.
+Use the reconciled source in a separate disposable checkout/data directory
+with stable Rust toolchain, Git, C compiler/linker and Cargo dependency access.
 The focused engine fixtures use a deterministic in-process test harness and
 local temporary repositories; they need no OMP credentials, quota or desktop.
 
@@ -312,6 +316,8 @@ cargo test -p comet-engine --test peer_messages -- --nocapture
 cargo test -p comet-engine --test restart_resume -- --nocapture
 cargo test -p comet --bin comet session_parser_tests -- --nocapture
 cargo test -p comet --bin comet session_cli::tests -- --nocapture
+cargo test -p comet-engine --lib rpc::scaffold_session::tests -- --nocapture
+cargo test -p comet-engine --lib worktree_handoff::tests -- --nocapture
 ```
 
 Also run upstream's native Scaffold session/handoff focused regressions from
