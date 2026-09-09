@@ -612,7 +612,27 @@ enum E2ERunner {
         log("OK Crew store eviction")
     }
 
-    private static func poll<T>(timeout: TimeInterval, label: String,
+    static func runLiveListProjection() async {
+        #if DEBUG
+        guard await WorkspaceStore.runLiveListProjectionRegression() else {
+            log("FAIL Crew live list projection: sustained updates or local-write fence")
+            return
+        }
+        log("OK Crew live list projection")
+        #endif
+    }
+
+    static func runRepeatedRoomRecovery() async {
+        #if DEBUG
+        guard await RoomClient.runRepeatedRecoveryRegression() else {
+            log("FAIL Crew repeated room recovery")
+            return
+        }
+        log("OK Crew repeated room recovery")
+        #endif
+    }
+
+    static func poll<T>(timeout: TimeInterval, label: String,
                                 _ probe: @MainActor () -> T?) async -> T? {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
