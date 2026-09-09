@@ -2862,7 +2862,8 @@ impl DocHost {
     }
 
     pub(crate) fn persist_chat(&self, chat_id: &str) -> Result<(), EngineError> {
-        self.persist_handle(&self.open(chat_id)?)
+        let handle = self.open(chat_id)?;
+        self.persist_handle(&handle)
     }
 
     pub(crate) async fn cancel_worker_commands(&self, chat_id: &str) -> Result<(), EngineError> {
