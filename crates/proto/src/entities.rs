@@ -94,6 +94,23 @@ pub struct ChatConfig {
     pub sandbox: SandboxLevel,
 }
 
+/// Durable native-worker identity. This is an execution binding, not Firstmate policy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerBinding {
+    pub chat_id: String,
+    pub owner_chat_id: String,
+    pub owner_device_id: String,
+    pub project_path: String,
+    pub base_ref: String,
+    pub title: String,
+    pub config: ChatConfig,
+    pub worktree: Option<Worktree>,
+    pub closed: bool,
+    #[serde(default)]
+    pub paused: bool,
+}
+
 /// A harness-native session found in this device's local CLI stores.
 ///
 /// The source path stays engine-private. The opaque `id` is passed back to

@@ -93,8 +93,21 @@ impl WorktreeCleanup {
     ) {
         let active = self.active_checkout_ids(&chats).await;
         let mut groups: HashMap<String, CleanupGroup> = HashMap::new();
+            // Worker retention survives ordinary archive/delete on another
+            // chat or fork sharing the same checkout. No worker lifecycle op
+            // licenses garbage collection of unlanded work.
+            let bindings = match self.inner.workspace.doc().read_worker_bindings() {
+                Ok(bindings) => bindings,
+                Err(error) => {
+                    tracing::warn!(%error, "worktree cleanup: worker retention unreadable");
+                    return;
+                }
+            };
 
         for stage in stages {
+            if bindings.iter().any(|binding| binding.worktree.as_ref().is_some_and(|worktree| worktree.path == stage.path)) {
+                continue;
+            }
             if stage.owner_device_id != self.inner.device_id {
                 continue;
             }
@@ -155,6 +168,14 @@ impl WorktreeCleanup {
             // Re-read immediately before the destructive step. A chat-watch
             // frame can race this repair pass; the latest document state wins.
             let latest = self.inner.workspace.doc().read_chats().unwrap_or_default();
+            let retained = match self.inner.workspace.doc().read_worker_bindings() {
+                Ok(bindings) => bindings.iter().any(|binding| binding.worktree.as_ref()
+                    .is_some_and(|worktree| worktree.checkout_id.as_deref() == Some(checkout_id.as_str()))),
+                Err(_) => true,
+            };
+            if retained {
+                continue;
+            }
             if self
                 .active_checkout_ids(&latest)
                 .await

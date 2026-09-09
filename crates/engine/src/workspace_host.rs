@@ -130,6 +130,8 @@ struct WorkspaceHostInner {
     spaces_tx: watch::Sender<Vec<Space>>,
     session_refs_tx: watch::Sender<Vec<SessionRef>>,
     worktree_deletions_tx: watch::Sender<Vec<WorktreeDeletionStage>>,
+    worker_operations: tokio::sync::Mutex<()>,
+    snapshot_lock: Mutex<()>,
     room: Mutex<Option<RoomClient>>,
     /// Freshest presence heartbeat (ms) we have EVER observed per device. The
     /// ephemeral store forgets entries after its 30s TTL and starts empty on a
@@ -347,6 +349,8 @@ impl WorkspaceHost {
                 spaces_tx,
                 session_refs_tx,
                 worktree_deletions_tx,
+                worker_operations: tokio::sync::Mutex::new(()),
+                snapshot_lock: Mutex::new(()),
                 room: Mutex::new(None),
                 presence_seen: Mutex::new(std::collections::HashMap::new()),
                 peer_alive: Mutex::new(None),
@@ -1081,6 +1085,46 @@ impl WorkspaceHost {
         Ok(self.inner.doc.set_chat_checkout(chat_id, checkout_id)?)
     }
 
+    pub(crate) async fn worker_operation(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.inner.worker_operations.lock().await
+    }
+
+    /// Fallible acknowledgement boundary; unlike the background debounce a
+    /// caller must not report durable admission when storage failed.
+    pub(crate) fn persist(&self) -> Result<(), EngineError> {
+        let _guard = lock(&self.inner.snapshot_lock);
+        let bytes = self.inner.doc.export_snapshot()?;
+        self.inner.store.save_snapshot(WORKSPACE_DOC_ID, &bytes)?;
+        Ok(())
+    }
+
+    pub(crate) fn worker_ready(&self, chat_id: &str) -> Result<(), EngineError> {
+        if let Some(binding) = self.inner.doc.worker_binding(chat_id)? {
+            if binding.closed {
+                return Err(EngineError::Other("worker_closed".into()));
+            }
+            if binding.paused {
+                return Err(EngineError::Other("worker_paused".into()));
+            }
+            let worktree = binding.worktree.ok_or_else(|| EngineError::Other("worker_provisioning".into()))?;
+            let path = std::path::Path::new(&worktree.path);
+            if std::fs::canonicalize(path)? != path
+                || !std::fs::symlink_metadata(path.join(".git"))?.file_type().is_file()
+            {
+                return Err(EngineError::Other("worker_checkout_identity_changed".into()));
+            }
+            let chat = self.inner.doc.chat(chat_id)?.ok_or_else(|| EngineError::Other("worker_chat_missing".into()))?;
+            if chat.cwd.as_deref() != Some(worktree.path.as_str())
+                || chat.checkout_id != worktree.checkout_id
+                || chat.device_id != binding.owner_device_id
+                || chat.config.as_ref() != Some(&binding.config)
+            {
+                return Err(EngineError::Other("worker_binding_changed".into()));
+            }
+        }
+        Ok(())
+    }
+
     // ── persistence / teardown ──────────────────────────────────────────────
 
     /// Persist the snapshot now (shutdown path; bypasses the debounce).
@@ -1205,6 +1249,7 @@ impl WorkspaceHostInner {
     }
 
     fn save_snapshot(&self) {
+        let _guard = lock(&self.snapshot_lock);
         match self.doc.export_snapshot() {
             Ok(bytes) => {
                 if let Err(err) = self.store.save_snapshot(WORKSPACE_DOC_ID, &bytes) {

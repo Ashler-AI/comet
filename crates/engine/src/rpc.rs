@@ -94,6 +94,7 @@ const FILE_SEARCH_FEATURED_PATHS: usize = 32;
 const DEFAULT_PEER_WAIT_MS: u64 = 30_000;
 const MAX_PEER_WAIT_MS: u64 = 120_000;
 const WORKTREE_DELETION_GRACE_DAYS: i64 = 7;
+mod worker;
 
 fn peer_timeout(timeout_ms: Option<u64>) -> Duration {
     Duration::from_millis(
@@ -521,6 +522,7 @@ enum MutateParams {
     MarkChatUnread { chat_id: String },
 }
 
+#[derive(Clone)]
 pub struct EngineRpc {
     sessions: SessionsEngine,
     doc_host: DocHost,
@@ -997,6 +999,10 @@ impl EngineRpc {
     }
 
     fn worktree_deletion_stage(&self, chat_id: &str) -> Option<WorktreeDeletionStage> {
+        // Worker close is retention-only, including later ordinary UI archives.
+        if self.workspace.doc().worker_binding(chat_id).ok()?.is_some() {
+            return None;
+        }
         let chat = self.workspace.doc().chat(chat_id).ok()??;
         let cwd = chat.cwd.as_deref()?;
         let path = self
@@ -1141,6 +1147,9 @@ impl EngineRpc {
                 .map_err(failed)
                 .map(drop),
             MutateParams::DeleteChat { chat_id } => {
+                if self.workspace.doc().worker_binding(&chat_id).map_err(|error| RpcError::Failed(error.to_string()))?.is_some() {
+                    return Err(RpcError::Failed("owned_worker_use_close".into()));
+                }
                 if let Some(stage) = self.worktree_deletion_stage(&chat_id) {
                     self.workspace
                         .set_chat_archived_with_worktree_deletion(&chat_id, true, Some(&stage))
@@ -1564,6 +1573,24 @@ impl RpcService for EngineRpc {
                 .await;
         }
         match method {
+            methods::ENSURE_WORKER_SESSION => {
+                let p = parse_params(params)?;
+                let service = self.clone();
+                let operation = tokio::spawn(async move { service.ensure_worker_session(p).await });
+                let value = operation.await.map_err(|error| RpcError::Failed(error.to_string()))??;
+                RpcReply::value(&value)
+            }
+            methods::READ_WORKER_SESSION => {
+                let p = parse_params(params)?;
+                RpcReply::value(&self.read_worker_session(p).await?)
+            }
+            methods::CONTROL_WORKER_SESSION => {
+                let p = parse_params(params)?;
+                let service = self.clone();
+                let operation = tokio::spawn(async move { service.control_worker_session(p).await });
+                let value = operation.await.map_err(|error| RpcError::Failed(error.to_string()))??;
+                RpcReply::value(&value)
+            }
             methods::LIST_HARNESSES if !generic_catalog_allowed(self.runtime_profile, method) => {
                 Err(RpcError::Failed(
                     "generic_harness_discovery_disabled_by_runtime_profile".into(),
@@ -2337,6 +2364,11 @@ impl RpcService for EngineRpc {
             }
             methods::CANCEL_CHAT_STARTUP => {
                 let p: CancelChatStartupParams = parse_params(params)?;
+                if self.workspace.doc().worker_binding(&p.chat_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?.is_some()
+                {
+                    return Err(RpcError::Failed("owned_worker_use_close".into()));
+                }
                 let chat = self
                     .workspace
                     .doc()

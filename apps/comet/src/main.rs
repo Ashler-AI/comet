@@ -836,6 +836,8 @@ mod session_parser_tests {
             "hello",
             "--from",
             "source-chat",
+            "--command-id",
+            "retry-command",
             "--wait",
             "--timeout",
             "4500",
@@ -847,6 +849,7 @@ mod session_parser_tests {
                     chat_id,
                     text,
                     from,
+                    command_id,
                     wait,
                     timeout,
                 },
@@ -857,6 +860,7 @@ mod session_parser_tests {
         assert_eq!(chat_id, "target-chat");
         assert_eq!(text, "hello");
         assert_eq!(from.as_deref(), Some("source-chat"));
+        assert_eq!(command_id.as_deref(), Some("retry-command"));
         assert!(wait);
         assert_eq!(timeout, Some(4500));
     }

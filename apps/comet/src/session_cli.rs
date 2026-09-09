@@ -1,5 +1,5 @@
 use anyhow::{Context, anyhow};
-use clap::Subcommand;
+use clap::{Args, Subcommand};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -26,6 +26,11 @@ pub enum SessionCommand {
         #[arg(long, default_value = "local", value_parser = parse_database_environment)]
         database_environment: comet_proto::ScaffoldDatabaseEnvironment,
     },
+    /// Provision and manage owned native worker sessions without starting inference.
+    Worker {
+        #[command(subcommand)]
+        command: WorkerCommand,
+    },
     /// Send a message to another session.
     Send {
         chat_id: String,
@@ -33,6 +38,9 @@ pub enum SessionCommand {
         /// Source session; defaults to COMET_SESSION_ID inside an agent run.
         #[arg(long, value_name = "CHAT_ID")]
         from: Option<String>,
+        /// Stable command id reused when retrying the same message.
+        #[arg(long, value_name = "COMMAND_ID")]
+        command_id: Option<String>,
         /// Wait atomically for the target session's reply.
         #[arg(long)]
         wait: bool,
@@ -61,6 +69,117 @@ pub enum SessionCommand {
         #[arg(long, value_name = "MS")]
         timeout: Option<u64>,
     },
+}
+
+#[derive(Debug, Args)]
+pub struct WorkerSessionArgs {
+    /// Persistent worker UUID; reuse it for retries and lifecycle operations.
+    #[arg(long, value_name = "UUID")]
+    session: String,
+    /// Owning session UUID; defaults to COMET_SESSION_ID inside an agent run.
+    #[arg(long, value_name = "UUID")]
+    owner: Option<String>,
+}
+
+impl WorkerSessionArgs {
+    fn into_params(self) -> anyhow::Result<comet_rpc::WorkerSessionParams> {
+        Ok(comet_rpc::WorkerSessionParams {
+            chat_id: self.session,
+            owner_chat_id: current_session_id(self.owner)
+                .context("worker owner required: pass --owner or run inside a Crew agent session")?,
+        })
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkerCommand {
+    /// Ensure an idle worker exists; retries with the same UUID reuse it.
+    Ensure {
+        #[command(flatten)]
+        target: WorkerSessionArgs,
+        #[arg(long, value_name = "ABSOLUTE_PATH", value_parser = absolute_project_path)]
+        project: String,
+        #[arg(long, value_name = "REF")]
+        base: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        model: String,
+        /// Serialized ReasoningLevel (for example: minimal, medium, high, xhigh).
+        #[arg(long, value_name = "LEVEL")]
+        effort: String,
+    },
+    /// Read the worker binding, lifecycle, latest event, and commands.
+    Status(WorkerSessionArgs),
+    /// Interrupt the owned worker's current inference.
+    Interrupt(WorkerSessionArgs),
+    /// Reopen the same worker session without starting inference.
+    Recover(WorkerSessionArgs),
+    /// Close the worker while retaining its checkout, branch, and documents.
+    Close(WorkerSessionArgs),
+}
+
+impl WorkerCommand {
+    fn into_request(self) -> anyhow::Result<(&'static str, serde_json::Value)> {
+        use comet_rpc::WorkerSessionAction;
+
+        match self {
+            Self::Ensure {
+                target,
+                project,
+                base,
+                title,
+                model,
+                effort,
+            } => {
+                let target = target.into_params()?;
+                let params = comet_rpc::EnsureWorkerSessionParams {
+                    chat_id: target.chat_id,
+                    owner_chat_id: target.owner_chat_id,
+                    project_path: project,
+                    base_ref: base,
+                    title,
+                    model,
+                    effort: serde_json::from_value(serde_json::Value::String(effort))
+                        .context("invalid --effort: expected a serialized ReasoningLevel")?,
+                };
+                Ok((
+                    comet_rpc::methods::ENSURE_WORKER_SESSION,
+                    serde_json::to_value(params)?,
+                ))
+            }
+            Self::Status(target) => Ok((
+                comet_rpc::methods::READ_WORKER_SESSION,
+                serde_json::to_value(target.into_params()?)?,
+            )),
+            Self::Interrupt(target) => worker_control_request(target, WorkerSessionAction::Interrupt),
+            Self::Recover(target) => worker_control_request(target, WorkerSessionAction::Recover),
+            Self::Close(target) => worker_control_request(target, WorkerSessionAction::Close),
+        }
+    }
+}
+
+fn worker_control_request(
+    target: WorkerSessionArgs,
+    action: comet_rpc::WorkerSessionAction,
+) -> anyhow::Result<(&'static str, serde_json::Value)> {
+    let target = target.into_params()?;
+    Ok((
+        comet_rpc::methods::CONTROL_WORKER_SESSION,
+        serde_json::to_value(comet_rpc::ControlWorkerSessionParams {
+            chat_id: target.chat_id,
+            owner_chat_id: target.owner_chat_id,
+            action,
+        })?,
+    ))
+}
+
+fn absolute_project_path(value: &str) -> Result<String, String> {
+    if std::path::Path::new(value).is_absolute() {
+        Ok(value.to_owned())
+    } else {
+        Err("--project must be an absolute path".to_string())
+    }
 }
 
 pub async fn run(command: SessionCommand, ipc_port: u16) -> anyhow::Result<()> {
@@ -99,6 +218,14 @@ pub async fn run(command: SessionCommand, ipc_port: u16) -> anyhow::Result<()> {
     match command {
         SessionCommand::Current | SessionCommand::Handoff { .. } => {
             unreachable!("handled before connecting")
+        }
+        SessionCommand::Worker { command } => {
+            let (method, params) = command.into_request()?;
+            let value = client
+                .call(method, params)
+                .await
+                .with_context(|| format!("{method} failed"))?;
+            print_json(&value)?;
         }
         SessionCommand::Add { chat_id } => {
             let value = client
@@ -149,6 +276,7 @@ pub async fn run(command: SessionCommand, ipc_port: u16) -> anyhow::Result<()> {
             chat_id,
             text,
             from,
+            command_id,
             wait,
             timeout,
         } => {
@@ -157,7 +285,7 @@ pub async fn run(command: SessionCommand, ipc_port: u16) -> anyhow::Result<()> {
                 source_chat_id,
                 target_chat_id: chat_id,
                 text,
-                command_id: None,
+                command_id,
                 wait,
                 timeout_ms: timeout,
             };

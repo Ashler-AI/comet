@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 mod client;
 pub mod device_room;
 mod server;
+pub mod worker;
 
 pub use client::{RpcClient, connect_ws};
 pub use device_room::{
@@ -29,6 +30,9 @@ pub use device_room::{
     decode_device_frame, device_room_ws_url, encode_device_frame,
 };
 pub use server::{serve_connection, serve_ws_listener};
+pub use worker::{
+    ControlWorkerSessionParams, EnsureWorkerSessionParams, WorkerSessionAction, WorkerSessionParams,
+};
 
 /// RPC method names — single source of truth for both ends.
 /// Full surface: docs/research/feature-inventory.md §2.
@@ -48,6 +52,9 @@ pub mod methods {
     pub const SEND_PEER_MESSAGE: &str = "SendPeerMessage";
     pub const REPLY_PEER_MESSAGE: &str = "ReplyPeerMessage";
     pub const WAIT_PEER_REPLY: &str = "WaitPeerReply";
+    pub const ENSURE_WORKER_SESSION: &str = "EnsureWorkerSession";
+    pub const READ_WORKER_SESSION: &str = "ReadWorkerSession";
+    pub const CONTROL_WORKER_SESSION: &str = "ControlWorkerSession";
     /// Create a distinct Crew chat from an existing session's native context.
     pub const FORK_SESSION: &str = "ForkSession";
     /// Transfer native context to Scaffold and queue its initial remote command.

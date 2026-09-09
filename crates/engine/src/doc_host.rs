@@ -386,6 +386,7 @@ pub struct ChatDocHandle {
     room_generation: AtomicU64,
     /// Serializes idempotent command-id checks with appends for this doc.
     command_lock: Mutex<()>,
+    snapshot_lock: Mutex<()>,
     room_join_started: AtomicBool,
     /// Doc subscription (drop = unsubscribe) — bumps the change watch on every commit.
     _sub: loro::Subscription,
@@ -1176,6 +1177,7 @@ impl DocHost {
             room: Mutex::new(None),
             room_generation: AtomicU64::new(0),
             command_lock: Mutex::new(()),
+            snapshot_lock: Mutex::new(()),
             room_join_started: AtomicBool::new(false),
             _sub: sub,
         });
@@ -1502,7 +1504,23 @@ impl DocHost {
             .into_iter()
             .find(|entry| entry.id == command_id)
         {
+            if existing.payload != payload
+                && (matches!(&payload, SessionCommandPayload::PeerMessage { .. })
+                    || self.workspace().is_some_and(|workspace| workspace.doc().worker_binding(chat_id).ok().flatten().is_some()))
+            {
+                return Err(EngineError::Other("command_id_conflict".into()));
+            }
+            self.persist_handle(&handle)?;
             return Ok(existing);
+        }
+        if let Some(workspace) = self.workspace() {
+            workspace.worker_ready(chat_id)?;
+            if let Some(binding) = workspace.doc().worker_binding(chat_id)?
+                && let SessionCommandPayload::PeerMessage { source_chat_id, .. } = &payload
+                && source_chat_id != &binding.owner_chat_id
+            {
+                return Err(EngineError::Other("worker_owner_mismatch".into()));
+            }
         }
         let now = now_ms();
         let based_on = handle.doc.last_message_id().map(|id| CommandBasedOn {
@@ -1558,6 +1576,9 @@ impl DocHost {
             }
             return Err(err.into());
         }
+        // Native message acknowledgement must survive an immediate reconnect,
+        // not merely the one-second background snapshot debounce.
+        self.persist_handle(&handle)?;
         let explicit_host = match nudge_route {
             CommandNudgeRoute::None => None,
             CommandNudgeRoute::WorkspaceHost => None,
@@ -2023,6 +2044,9 @@ impl DocHost {
                     "session state publication failed");
             }
         }
+        if let Err(error) = self.persist_handle(handle) {
+            tracing::error!(chat = %handle.chat_id, %error, "command outcome persistence failed");
+        }
     }
     async fn execute(
         &self,
@@ -2031,6 +2055,15 @@ impl DocHost {
         entry: &SessionCommandEntry,
     ) -> Result<(SessionCommandStatus, Option<String>), EngineError> {
         let chat_id = &handle.chat_id;
+        if self.workspace().is_some_and(|workspace| workspace.doc().worker_binding(chat_id).ok().flatten().is_some())
+            && let Some(current) = self.command_entry(chat_id, &entry.id)?
+            && current.status != SessionCommandStatus::Pending
+        {
+            return Ok((current.status, current.resolution));
+        }
+        if let Some(workspace) = self.workspace() {
+            workspace.worker_ready(chat_id)?;
+        }
         let carries_user_input = match &entry.payload {
             SessionCommandPayload::Run { .. }
             | SessionCommandPayload::Steer { .. }
@@ -2687,7 +2720,34 @@ impl DocHost {
         })
     }
 
+    pub(crate) fn command_processed(&self, id: &str) -> Result<bool, EngineError> {
+        Ok(self.inner.store.is_processed(id)?)
+    }
+
+    fn persist_handle(&self, handle: &ChatDocHandle) -> Result<(), EngineError> {
+        let _guard = lock(&handle.snapshot_lock);
+        let bytes = handle.doc.export_snapshot()?;
+        self.inner.store.save_snapshot(&handle.chat_id, &bytes)?;
+        Ok(())
+    }
+
+    pub(crate) fn persist_chat(&self, chat_id: &str) -> Result<(), EngineError> {
+        self.persist_handle(&self.open(chat_id)?)
+    }
+
+    pub(crate) fn cancel_worker_commands(&self, chat_id: &str) -> Result<(), EngineError> {
+        let handle = self.open(chat_id)?;
+        let _guard = lock(&handle.command_lock);
+        for entry in handle.doc.read_commands()? {
+            if entry.status == SessionCommandStatus::Pending {
+                self.resolve_command(&handle, &entry, SessionCommandStatus::Cancelled, Some("worker stopped"));
+            }
+        }
+        self.persist_handle(&handle)
+    }
+
     fn save_snapshot(&self, handle: &ChatDocHandle) {
+        let _guard = lock(&handle.snapshot_lock);
         match handle.doc.export_snapshot() {
             Ok(bytes) => {
                 handle.snapshot_bytes.store(bytes.len(), Ordering::Relaxed);

@@ -164,6 +164,7 @@ impl Repos {
     async fn git(&self, args: &[&str], cwd: Option<&Path>) -> Result<String, EngineError> {
         let mut cmd = tokio::process::Command::new("git");
         cmd.args(args);
+        cmd.env("ASHLER_INCREMENTAL_TSC_CHECKS", "false");
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
         }
@@ -596,6 +597,128 @@ impl Repos {
             repo_path: repo_path.to_string_lossy().to_string(),
             path: checkout.root.to_string_lossy().to_string(),
             branch: branch_name,
+            name,
+            checkout_id: Some(checkout.id),
+        })
+    }
+
+    /// Provision or recover one worker checkout without resetting its branch or
+    /// removing anything on failure. The caller holds the workspace worker lock.
+    pub(crate) async fn ensure_worker_worktree(
+        &self,
+        repo_path: &Path,
+        base_ref: &str,
+        chat_id: &str,
+    ) -> Result<Worktree, EngineError> {
+        let chat_id = uuid::Uuid::parse_str(chat_id)
+            .map_err(|_| EngineError::Other("worker chat id must be a UUID".into()))?;
+        if base_ref.trim().is_empty() || base_ref.starts_with('-') || base_ref.contains('\0') {
+            return Err(EngineError::Other("invalid worker base ref".into()));
+        }
+        let repo_path = std::fs::canonicalize(repo_path)?;
+        if self.checkout_identity(&repo_path).await?.root != repo_path {
+            return Err(EngineError::Other("worker project must be a checkout root".into()));
+        }
+        let repo_name = repo_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| EngineError::Other("invalid worker project folder name".into()))?;
+        std::fs::create_dir_all(&self.inner.worktrees_root)?;
+        let root = std::fs::canonicalize(&self.inner.worktrees_root)?;
+        let base = root.join(repo_name);
+        match std::fs::create_dir(&base) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        if !std::fs::symlink_metadata(&base)?.file_type().is_dir()
+            || std::fs::canonicalize(&base)? != base
+        {
+            return Err(EngineError::Other("worker repository folder is not an exact directory".into()));
+        }
+        let name = format!("worker-{chat_id}");
+        let path = base.join(&name);
+        let branch_name = format!("comet/{name}");
+        // NUL-delimited porcelain preserves spaces, newlines and quoted paths.
+        let mut inventory = self
+            .git(&["worktree", "list", "--porcelain", "-z"], Some(&repo_path))
+            .await?;
+        let exists = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_dir() => true,
+            Ok(_) => {
+                return Err(EngineError::Other("worker path is not an exact directory".into()));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        if !exists {
+            // A vanished checkout or an orphaned branch is ambiguous. Neither
+            // is permission to recreate, force-add, prune, or reset anything.
+            if inventory.split('\0').filter_map(|field| field.strip_prefix("worktree "))
+                .any(|entry| Path::new(entry) == path)
+            {
+                return Err(EngineError::Other("worker checkout is missing but still registered".into()));
+            }
+            let branches = self.git(
+                &["for-each-ref", "--format=%(refname)", &format!("refs/heads/{branch_name}")],
+                Some(&repo_path),
+            ).await?;
+            if !branches.is_empty() {
+                return Err(EngineError::Other("worker branch exists without its checkout".into()));
+            }
+            let commit = self.git(
+                &["rev-parse", "--verify", "--end-of-options", &format!("{base_ref}^{{commit}}")],
+                Some(&repo_path),
+            ).await?;
+            let path_arg = path.to_str()
+                .ok_or_else(|| EngineError::Other("worker path is not UTF-8".into()))?;
+            self.git(
+                &["-c", "checkout.workers=1", "worktree", "add", "-b", &branch_name, "--", path_arg, &commit],
+                Some(&repo_path),
+            ).await?;
+            inventory = self
+                .git(&["worktree", "list", "--porcelain", "-z"], Some(&repo_path))
+                .await?;
+        }
+        if std::fs::canonicalize(&base)? != base
+            || std::fs::canonicalize(&path)? != path
+            || self.managed_worktree_path(&path).as_ref() != Some(&path)
+            || !std::fs::symlink_metadata(path.join(".git"))?.file_type().is_file()
+        {
+            return Err(EngineError::Other("worker checkout path is not an exact managed directory".into()));
+        }
+        let mut registered = inventory.split('\0')
+            .filter_map(|field| field.strip_prefix("worktree "));
+        let main = registered.next()
+            .ok_or_else(|| EngineError::Other("git worktree registry has no main checkout".into()))?;
+        if std::fs::canonicalize(main)? == path
+            || !registered.any(|entry| {
+                Path::new(entry) == path
+                    && std::fs::canonicalize(entry).ok().as_ref() == Some(&path)
+            })
+        {
+            return Err(EngineError::Other("worker path is not a linked checkout of this project".into()));
+        }
+        let checkout = self.checkout_identity(&path).await?;
+        let common_dir = self.git(
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            Some(&repo_path),
+        ).await?;
+        let common_dir = std::fs::canonicalize(common_dir)?;
+        // Check the linked checkout's own backlink as well as the inventory:
+        // replacing its .git file must not adopt a different checkout.
+        let backlink = std::fs::read_to_string(checkout.git_dir.join("gitdir"))?;
+        if checkout.root != path
+            || checkout.git_dir.parent() != Some(common_dir.join("worktrees").as_path())
+            || std::fs::canonicalize(backlink.trim_end_matches('\n'))? != path.join(".git")
+        {
+            return Err(EngineError::Other("worker checkout identity does not match this project".into()));
+        }
+        let branch = self.current_branch(&path).await?;
+        Ok(Worktree {
+            repo_path: repo_path.to_string_lossy().to_string(),
+            path: path.to_string_lossy().to_string(),
+            branch,
             name,
             checkout_id: Some(checkout.id),
         })
@@ -1088,6 +1211,105 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn init_worker_test_repo(repos: &Repos, path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+        repos.git(&["init", "-b", "main"], Some(path)).await.unwrap();
+        repos.git(&["config", "user.name", "Worker Test"], Some(path)).await.unwrap();
+        repos.git(&["config", "user.email", "worker@example.invalid"], Some(path)).await.unwrap();
+        repos.git(&["commit", "--allow-empty", "-m", "base"], Some(path)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_restart_preserves_commits_edits_and_renamed_branch() {
+        let data = tempfile::tempdir().unwrap();
+        let project = data.path().join("project");
+        let root = data.path().join("worktrees");
+        let repos = Repos::with_worktrees_root(data.path(), "device", root.clone());
+        init_worker_test_repo(&repos, &project).await;
+        let chat_id = uuid::Uuid::new_v4().to_string();
+        let first = repos.ensure_worker_worktree(&project, "main", &chat_id).await.unwrap();
+        let path = Path::new(&first.path);
+        repos.git(&["branch", "-m", "worker-progress"], Some(path)).await.unwrap();
+        std::fs::write(path.join("progress.txt"), "committed").unwrap();
+        repos.git(&["add", "progress.txt"], Some(path)).await.unwrap();
+        repos.git(&["commit", "-m", "progress"], Some(path)).await.unwrap();
+        let committed_head = repos.git(&["rev-parse", "HEAD"], Some(path)).await.unwrap();
+        std::fs::write(path.join("progress.txt"), "unlanded edit").unwrap();
+        std::fs::write(path.join("untracked.txt"), "untracked").unwrap();
+        drop(repos);
+
+        let repos = Repos::with_worktrees_root(data.path(), "device", root);
+        let recovered = repos.ensure_worker_worktree(&project, "main", &chat_id).await.unwrap();
+        assert_eq!(recovered.path, first.path);
+        assert_eq!(recovered.checkout_id, first.checkout_id);
+        assert_eq!(recovered.branch, "worker-progress");
+        assert_eq!(repos.git(&["rev-parse", "HEAD"], Some(path)).await.unwrap(), committed_head);
+        assert_eq!(std::fs::read_to_string(path.join("progress.txt")).unwrap(), "unlanded edit");
+        assert_eq!(std::fs::read_to_string(path.join("untracked.txt")).unwrap(), "untracked");
+        assert!(!project.join("progress.txt").exists());
+        assert_eq!(repos.current_branch(&project).await.unwrap(), "main");
+    }
+
+    #[tokio::test]
+    async fn worker_missing_checkout_does_not_reuse_existing_branch() {
+        let data = tempfile::tempdir().unwrap();
+        let project = data.path().join("project");
+        let repos = Repos::with_worktrees_root(data.path(), "device", data.path().join("worktrees"));
+        init_worker_test_repo(&repos, &project).await;
+        let chat_id = uuid::Uuid::new_v4().to_string();
+        let branch = format!("comet/worker-{chat_id}");
+        repos.git(&["branch", &branch, "main"], Some(&project)).await.unwrap();
+        let head = repos.git(&["rev-parse", &branch], Some(&project)).await.unwrap();
+
+        assert!(repos.ensure_worker_worktree(&project, "main", &chat_id).await.is_err());
+        assert_eq!(repos.git(&["rev-parse", &branch], Some(&project)).await.unwrap(), head);
+        assert!(!data.path().join("worktrees/project").join(format!("worker-{chat_id}")).exists());
+    }
+
+    #[tokio::test]
+    async fn worker_rejects_unrelated_linked_checkout_without_mutation() {
+        let data = tempfile::tempdir().unwrap();
+        let project = data.path().join("project");
+        let unrelated = data.path().join("unrelated");
+        let root = data.path().join("worktrees");
+        let repos = Repos::with_worktrees_root(data.path(), "device", root.clone());
+        init_worker_test_repo(&repos, &project).await;
+        init_worker_test_repo(&repos, &unrelated).await;
+        let chat_id = uuid::Uuid::new_v4().to_string();
+        let path = root.join("project").join(format!("worker-{chat_id}"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        repos.git(
+            &["-c", "checkout.workers=1", "worktree", "add", "-b", "unrelated-progress", path.to_str().unwrap(), "main"],
+            Some(&unrelated),
+        ).await.unwrap();
+        std::fs::write(path.join("unlanded.txt"), "keep").unwrap();
+
+        assert!(repos.ensure_worker_worktree(&project, "main", &chat_id).await.is_err());
+        assert_eq!(std::fs::read_to_string(path.join("unlanded.txt")).unwrap(), "keep");
+        assert_eq!(repos.current_branch(&path).await.unwrap(), "unrelated-progress");
+        assert!(!repos.branch_exists(&project, &format!("comet/worker-{chat_id}")).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_rejects_symlink_escape_to_primary_checkout() {
+        let data = tempfile::tempdir().unwrap();
+        let project = data.path().join("project");
+        let root = data.path().join("worktrees");
+        let repos = Repos::with_worktrees_root(data.path(), "device", root.clone());
+        init_worker_test_repo(&repos, &project).await;
+        let chat_id = uuid::Uuid::new_v4().to_string();
+        let path = root.join("project").join(format!("worker-{chat_id}"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&project, &path).unwrap();
+        std::fs::write(project.join("unlanded.txt"), "keep primary").unwrap();
+
+        assert!(repos.ensure_worker_worktree(&project, "main", &chat_id).await.is_err());
+        assert_eq!(std::fs::read_to_string(project.join("unlanded.txt")).unwrap(), "keep primary");
+        assert_eq!(repos.current_branch(&project).await.unwrap(), "main");
+        assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+    }
 
     #[test]
     fn fuzzy_score_matches_a_path_subsequence() {

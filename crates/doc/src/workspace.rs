@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use comet_proto::{
     Chat, ChatConfig, Device, Session, SessionRef, SessionStatus, Space, WorktreeDeletionStage,
 };
+use comet_proto::WorkerBinding;
 
 use crate::schema::DocError;
 
@@ -241,6 +242,30 @@ impl WorkspaceDoc {
         self.doc.commit();
         Ok(DeletedSpace { existed, chat_ids })
     }
+
+    /// Immutable worker identity is reserved before any filesystem operation.
+    /// Only the owning engine's serialized worker operations update this row.
+    pub fn worker_binding(&self, chat_id: &str) -> Result<Option<WorkerBinding>, DocError> {
+        self.existing_row("workerBindings", chat_id)
+            .map(|row| serde_json::from_value(row.get_deep_value().to_json_value()).map_err(DocError::from))
+            .transpose()
+    }
+
+    pub fn set_worker_binding(&self, binding: &WorkerBinding) -> Result<(), DocError> {
+        let row = self.row("workerBindings", &binding.chat_id)?;
+        let serde_json::Value::Object(fields) = serde_json::to_value(binding)? else {
+            unreachable!("worker binding serializes as an object");
+        };
+        for (key, value) in fields {
+            row.insert(&key, LoroValue::from(value))?;
+        }
+        self.doc.commit();
+        Ok(())
+    }
+    pub fn read_worker_bindings(&self) -> Result<Vec<WorkerBinding>, DocError> {
+        self.read_rows::<WorkerBinding>("workerBindings")
+    }
+
 
     // ── chats ───────────────────────────────────────────────────────────────
 
