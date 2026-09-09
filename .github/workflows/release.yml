@@ -37,7 +37,7 @@ on:
           - staging-deployed
           - production-deployed
       candidate_run_id:
-        description: "Successful release run whose exact candidate should be reused for production promotion; empty rebuilds"
+        description: "Successful release run whose exact candidate should be reused for staging or production promotion; empty rebuilds"
         required: false
         default: ""
         type: string
@@ -112,8 +112,8 @@ jobs:
               echo "::error::candidate_run_id must be a positive GitHub Actions run id"
               exit 1
             fi
-            if [[ "$promotion_target" != "production" ]]; then
-              echo "::error::candidate_run_id is only supported for production promotion"
+            if [[ "$promotion_target" != "staging" && "$promotion_target" != "production" ]]; then
+              echo "::error::candidate_run_id is only supported for staging or production promotion"
               exit 1
             fi
           fi

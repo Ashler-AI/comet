@@ -206,7 +206,7 @@ function runReuse(script, { dir }, overrides = {}) {
   return { ...result, output: readFileSync(output, "utf8") };
 }
 
-describe("executable production release gates", () => {
+describe("executable release gates", () => {
   it("accepts a merged release checkout without an origin/main tracking ref", async (t) => {
     const checkout = releaseCheckout(t, true);
     const script = shellStep(await read(".github/workflows/release.yml"), "version", "version");
@@ -229,12 +229,31 @@ describe("executable production release gates", () => {
     assert.ok(privateCandidate.output.includes("promotion_target=none\n"));
   });
 
-  it("rejects invalid reuse identifiers and nonproduction reuse dispatches", async (t) => {
+  it("accepts desktop staging reuse of a full candidate without changing its archive digest", async (t) => {
+    const workflow = await read(".github/workflows/release.yml");
+    const version = runVersion(shellStep(workflow, "version", "version"), releaseCheckout(t, true), {
+      REQUESTED_PROMOTION_TARGET: "staging",
+    });
+    assert.equal(version.status, 0, version.stderr);
+    const outputs = Object.fromEntries(version.output.trim().split("\n").map((line) => line.split("=")));
+    const fixture = candidateArchive(t);
+    const reused = runReuse(shellStep(workflow, "candidate", "reuse"), fixture, {
+      VERSION: outputs.version,
+      RELEASE_SURFACE: outputs.release_surface,
+      CANDIDATE_RUN_ID: outputs.candidate_run_id,
+    });
+    assert.equal(reused.status, 0, reused.stderr);
+    assert.equal(reused.output, `digest=${fixture.sha}\n`);
+    assert.equal(digest(readFileSync(path.join(fixture.dir, "release-candidate.tar.gz"))), fixture.sha);
+  });
+
+  it("rejects invalid reuse identifiers and dispatches without channel promotion", async (t) => {
     const checkout = releaseCheckout(t, true);
     const script = shellStep(await read(".github/workflows/release.yml"), "version", "version");
     for (const overrides of [
       { REQUESTED_CANDIDATE_RUN_ID: "not-a-run-id" },
-      { REQUESTED_PROMOTION_TARGET: "staging" },
+      { REQUESTED_PROMOTION_TARGET: "none" },
+      { REQUESTED_PROMOTION_TARGET: "staging-candidate" },
     ]) {
       const result = runVersion(script, checkout, overrides);
       assert.notEqual(result.status, 0);
