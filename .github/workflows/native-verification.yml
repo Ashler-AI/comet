@@ -15,42 +15,7 @@ env:
   ASHLER_INCREMENTAL_TSC_CHECKS: "false"
 
 jobs:
-  git-cancellation-diagnostics:
-    if: startsWith(github.ref_name, 'verify/native-lifecycle-fifo-')
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, macos-14]
-        revision: [328562979504ea8ef5ce498892fb14bb74807601, b36895e39e0230e27d183f060b09cb441b040504]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    env:
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Install Linux process observer
-        if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq lsof
-      - name: Select checked-in Rust toolchain
-        run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-      - name: Characterize actual Git child lifetime without weakening assertions
-        timeout-minutes: 40
-        run: python3 scripts/worker-git-diagnostics.py --revision '${{ matrix.revision }}'
-      - name: Upload exact source PID FIFO and test exit evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: git-cancellation-${{ matrix.os }}-${{ matrix.revision }}-${{ github.run_id }}
-          path: git-diagnostics/
-          if-no-files-found: error
-          retention-days: 14
-
   native:
-    if: ${{ !startsWith(github.ref_name, 'verify/native-lifecycle-fifo-') }}
     strategy:
       fail-fast: false
       matrix:

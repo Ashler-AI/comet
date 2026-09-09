@@ -422,11 +422,28 @@ mod async_admission {
     // An independent watchdog closes it even if a regressed synchronous Git
     // call blocks the current-thread runtime. Drop also joins that thread, so
     // setup errors and cancelled tests cannot strand a writer/blocking task.
+    fn admission_child_pids() -> Vec<libc::pid_t> {
+        let output = std::process::Command::new("ps")
+            .args(["-axo", "pid=,ppid=,args="]).output().expect("inspect owned Git children");
+        assert!(output.status.success(), "ps failed: {}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).unwrap().lines().filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse::<libc::pid_t>().ok()?;
+            let parent = fields.next()?.parse::<u32>().ok()?;
+            let executable = fields.next()?;
+            (parent == std::process::id()
+                && executable.rsplit('/').next() == Some("git")
+                && fields.eq(["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-dir", "--git-common-dir"]))
+                .then_some(pid)
+        }).collect()
+    }
+
     struct GitStall {
         config: PathBuf,
         original_config: Option<Vec<u8>>,
         fifo: PathBuf,
         writer: Arc<Mutex<Option<std::fs::File>>>,
+        admission_pids: Arc<Mutex<Vec<libc::pid_t>>>,
         reached: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
         stop: mpsc::Sender<()>,
         watchdog: Option<std::thread::JoinHandle<()>>,
@@ -453,6 +470,7 @@ mod async_admission {
             let (stop_tx, stop_rx) = mpsc::channel();
             let mut stall = Self {
                 config, original_config, fifo, writer, reached: Some(ready_rx),
+                admission_pids: Arc::new(Mutex::new(Vec::new())),
                 stop: stop_tx, watchdog: None, expired,
             };
             let mut contents = stall.original_config.clone().unwrap_or_default();
@@ -461,6 +479,7 @@ mod async_admission {
             std::fs::write(&stall.config, contents).unwrap();
             let fifo = stall.fifo.clone();
             let writer = stall.writer.clone();
+            let admission_pids = stall.admission_pids.clone();
             let expired = stall.expired.clone();
             let config = stall.config.clone();
             let original_config = stall.original_config.clone();
@@ -476,6 +495,7 @@ mod async_admission {
                     match std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(&fifo) {
                         Ok(file) => {
                             *writer.lock() = Some(file);
+                            *admission_pids.lock() = admission_child_pids();
                             let _ = ready_tx.send(Ok(()));
                             if matches!(stop_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())),
                                 Err(mpsc::RecvTimeoutError::Timeout)) {
@@ -519,20 +539,24 @@ mod async_admission {
             self.writer.lock().take();
         }
 
-        async fn assert_reader_killed(&self) {
+        async fn assert_admission_reaped(&self) {
+            // Diff/space observers may also read this checkout's config. An
+            // open FIFO does not identify the cancelled admission's child.
+            // These cases run in isolated test processes, so this exact Git
+            // invocation belongs only to their directly polled admission.
+            let pids = self.admission_pids.lock().clone();
+            assert!(!pids.is_empty(), "must observe the actual admission Git child before cancellation");
             tokio::time::timeout(Duration::from_secs(3), async {
-                loop {
-                    let result = self.writer.lock().as_mut().expect("watchdog released writer")
-                        .write_all(b"#\n");
-                    match result {
-                        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => break,
-                        Ok(()) => {},
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {},
-                        Err(error) => panic!("FIFO write: {error}"),
-                    }
+                while !pids.iter().all(|pid| {
+                    // Signal zero only observes existence; it never kills a
+                    // reused PID or steals Tokio's child-reaping responsibility.
+                    (unsafe { libc::kill(*pid, 0) }) == -1
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                }) {
                     tokio::time::sleep(Duration::from_millis(2)).await;
                 }
-            }).await.expect("cancelled Git must close its FIFO reader, not survive in the background");
+            }).await.expect("cancelled admission Git must exit and be reaped while the FIFO remains held");
+            assert!(self.writer.lock().is_some(), "watchdog must not release Git to make cancellation pass");
             assert!(!self.expired.load(Ordering::SeqCst));
         }
     }
@@ -610,6 +634,7 @@ mod async_admission {
 
     #[tokio::test(flavor = "current_thread")]
     async fn stalled_git_yields_and_dropped_admission_kills_child_without_append() {
+        if supervise_contention("stalled_git_yields_and_dropped_admission_kills_child_without_append") { return; }
         let root = tempfile::tempdir().unwrap();
         let project = init_repo(root.path());
         let (core, requests) = engine(root.path());
@@ -625,7 +650,7 @@ mod async_admission {
             assert!(futures::poll!(admission.as_mut()).is_pending(), "Git must remain stalled while scheduler progresses");
             assert_not_admitted(&core, &requests);
         }
-        stall.assert_reader_killed().await;
+        stall.assert_admission_reaped().await;
         assert!(tokio::time::timeout(Duration::from_secs(1), core.doc_host.command_entry(WORKER, "dropped"))
             .await.unwrap().unwrap().is_none(), "cancelled admission must release the command lock");
         assert_not_admitted(&core, &requests);
@@ -635,6 +660,7 @@ mod async_admission {
 
     #[tokio::test(flavor = "current_thread")]
     async fn stalled_git_deadline_kills_child_and_fails_admission_closed() {
+        if supervise_contention("stalled_git_deadline_kills_child_and_fails_admission_closed") { return; }
         let root = tempfile::tempdir().unwrap();
         let project = init_repo(root.path());
         let (core, requests) = engine(root.path());
@@ -647,7 +673,7 @@ mod async_admission {
         // deadline. An Err returned by admission proves its timeout, not ours.
         assert!(tokio::time::timeout(Duration::from_secs(5), admission.as_mut()).await
             .expect("Git path-probe deadline must be enforced").is_err());
-        stall.assert_reader_killed().await;
+        stall.assert_admission_reaped().await;
         assert_not_admitted(&core, &requests);
         drop(stall);
         core.shutdown().await;
