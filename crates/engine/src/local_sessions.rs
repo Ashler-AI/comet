@@ -162,7 +162,8 @@ pub(crate) fn capture_omp_file_for_session(
         &session.candidate.session_id,
         &session.candidate.cwd,
         cancellation,
-    )
+    )?
+    .prepare_historical_attachments(&roots.omp.join("blobs/data"), cancellation)
 }
 
 fn find_omp_session_for_capture(

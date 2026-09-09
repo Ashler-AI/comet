@@ -204,6 +204,7 @@ jobs:
           cargo test --locked -p comet-engine --lib worktree
           cargo test --locked -p comet-engine --lib materializer
           cargo test --locked -p comet-engine --lib join_grant_rejection
+          cargo test --locked -p comet-engine --lib historical_attachments
           cargo test --locked -p comet-harness native_handoff_executable_
           cargo test --locked -p comet --bin comet session
       - name: Package

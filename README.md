@@ -88,6 +88,19 @@ repositories do not need a shared commit. OMP context is rebased to the imported
 cwd. Capture/import fail closed on archive, expanded-object, checkout-size, path,
 or symlink safety violations; Git submodules are not reconstructed.
 
+Starting with **0.1.86**, native handoff prepares only the captured **prior
+conversation** for attachment replay. Recognized image, file/document, and audio
+blocks keep inline base64 content; local content-addressed blobs are hydrated
+only after regular-file, size, stable-read, and SHA-256 verification. Missing,
+unreadable, corrupt, nonregular, or over-budget attachment blobs become explicit
+historical-unavailable text markers. Path/URL attachment references that cannot
+be carried as bytes also become markers; Crew does not fetch arbitrary URLs.
+Ordinary text links, tool arguments, and unrelated session metadata are unchanged.
+The original journal remains intact, and the prepared snapshot is rehashed for
+the existing archive verification. The separately queued **current prompt** does
+not pass through this fallback: current attachment/input errors remain errors.
+This is a handoff preparation policy, not a global OMP provider retry policy.
+
 The September 9 development-build smoke completed through the native CLI and
 remote Crew chat `030e3ef6-57c4-4749-bd17-cf3ec7435eda` in sandbox
 `rcs_cc61f7c6b3c3a63e04a6d5d5` (staging, local database). The remote agent recovered
