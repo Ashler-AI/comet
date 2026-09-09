@@ -22,6 +22,7 @@ final class AppModel {
         case ready
     }
     private var scaffoldRoutes: [String: ScaffoldControlRoute] = [:]
+    private var scaffoldPreparations: [String: ScaffoldPreparationReceipt] = [:]
 
     var phase: Phase = .signedOut
     var workspace: WorkspaceStore?
@@ -225,6 +226,7 @@ final class AppModel {
         recentTranscriptIds.removeAll()
         listMetadata.removeAll()
         scaffoldRoutes.removeAll()
+        scaffoldPreparations.removeAll()
         demoSessionRefs.removeAll()
         config = nil
         demo = nil
@@ -612,14 +614,22 @@ final class AppModel {
         }
         guard let workspace else { throw MobileSessionError.unavailable("Not connected") }
         if scaffoldRoutes[creationId] == nil {
-            scaffoldRoutes[creationId] = try await workspace.prepareScaffoldSession(
+            let (route, receipt) = try await workspace.prepareScaffoldSession(
                 space: space, chatId: creationId, launch: launch
             )
+            scaffoldRoutes[creationId] = route
+            scaffoldPreparations[creationId] = receipt
         }
+        // The receipt outlives view navigation and every fallible first-send
+        // step; only the QueueCommand acknowledgment disarms it.
+        let preparation = scaffoldPreparations[creationId]
+        defer { preparation?.reportFailure() }
+        try Task.checkCancellation()
         guard let chat = chat(id: creationId), let store = sessionStore(for: chat) else {
             throw MobileSessionError.unavailable("The created session is not available yet")
         }
         guard await store.sendRun(prompt: prompt, chat: chat, images: images) else {
+            try Task.checkCancellation()
             throw MobileSessionError.unavailable(store.sendFailure ?? "Could not send the message")
         }
         return creationId
@@ -643,7 +653,10 @@ final class AppModel {
                 ?? scaffoldControllerDeviceId() else {
                 throw MobileSessionError.unavailable("This session has no Scaffold controller")
             }
-            let route = try await workspace.scaffoldRoute(controllerDeviceId: controller, environment: environment)
+            var route = try await workspace.scaffoldRoute(controllerDeviceId: controller, environment: environment)
+            // Reattachment may expose another preparation. The first command
+            // must retain the receipt from its own Prepare response.
+            route.preparationGeneration = scaffoldRoutes[chatId]?.preparationGeneration
             scaffoldRoutes[chatId] = route
             deviceId = route.ownerDeviceId
         } else {
@@ -831,11 +844,19 @@ final class AppModel {
     private func configureSessionTransport(store: SessionStore,
                                            environment: SessionEnvironment?) {
         let chatId = store.chatId
+        let preparation = scaffoldPreparations[chatId]
         store.attachmentUploader = { [weak self] images in
-            guard let self else { throw MobileSessionError.unavailable("Not connected") }
-            return try await self.uploadImages(images, chatId: chatId)
+            do {
+                guard let self else { throw MobileSessionError.unavailable("Not connected") }
+                return try await self.uploadImages(images, chatId: chatId)
+            } catch {
+                preparation?.reportFailure()
+                throw error
+            }
         }
         store.commandSender = { [weak self] payload in
+            var queued = false
+            defer { if !queued { preparation?.reportFailure() } }
             guard let self, let workspace = self.workspace else {
                 throw MobileSessionError.unavailable("Not connected")
             }
@@ -850,11 +871,20 @@ final class AppModel {
                 }
                 try await workspace.sendScaffoldCommand(
                     controllerDeviceId: controllerDeviceId,
-                    environment: environment, payload: payload
+                    environment: environment, payload: payload,
+                    preparationGeneration: preparation.flatMap { $0.admitted ? nil : $0.generation }
                 )
+                if case .run = payload {
+                    preparation?.markAdmitted()
+                    if self.scaffoldPreparations[chatId] === preparation {
+                        self.scaffoldPreparations.removeValue(forKey: chatId)
+                        self.scaffoldRoutes[chatId]?.preparationGeneration = nil
+                    }
+                }
             } else {
                 try await workspace.sendSessionCommand(chatId: chatId, payload: payload)
             }
+            queued = true
         }
     }
 

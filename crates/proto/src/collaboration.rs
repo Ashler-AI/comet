@@ -637,6 +637,9 @@ pub struct ScaffoldControlGrant {
 #[serde(rename_all = "camelCase")]
 pub struct ScaffoldEnvironmentControlResult {
     pub environment: SessionEnvironment,
+    /// Exact preparation attempt to acknowledge when admitting its first command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation_generation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attached_device_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

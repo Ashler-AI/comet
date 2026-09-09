@@ -3892,8 +3892,16 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let subline = theme.text_muted.opacity(0.66);
-        let source_label = meta
-            .history_source
+        let startup_label = self.state.read(cx).session_refs.iter()
+            .find(|reference| reference.chat_id == id)
+            .and_then(|reference| reference.startup.as_ref())
+            .and_then(|startup| match startup.status {
+                comet_proto::SessionStartupStatus::Preparing => Some("Admission pending"),
+                comet_proto::SessionStartupStatus::CreationUncertain => Some("Creation outcome unknown · inspect before retry"),
+                comet_proto::SessionStartupStatus::AttentionNeeded => Some("Startup needs attention"),
+                comet_proto::SessionStartupStatus::Admitted => None,
+            });
+        let source_label = startup_label.or(meta.history_source)
             .unwrap_or_else(|| crate::multiplayer::source_label(meta.source));
         let compact = self.settings.density == Density::Compact;
         let (hover, text) = (theme.glass_hover(), theme.text);
@@ -4214,7 +4222,14 @@ impl Shell {
                     (
                         session_ref.chat_id.clone(),
                         state.shared_session_title(&session_ref.chat_id).into(),
-                        format_time_ago(session_ref.added_at, now).into(),
+                        match session_ref.startup.as_ref().map(|startup| startup.status) {
+                            Some(comet_proto::SessionStartupStatus::Preparing) => format!("Admission pending · {}", format_time_ago(session_ref.added_at, now)),
+                            Some(comet_proto::SessionStartupStatus::CreationUncertain) => format!("Creation outcome unknown · {}", format_time_ago(session_ref.added_at, now)),
+                            Some(comet_proto::SessionStartupStatus::AttentionNeeded) => format!("Startup needs attention · {}", format_time_ago(session_ref.added_at, now)),
+                            Some(comet_proto::SessionStartupStatus::Admitted) => format!("Command admitted · {}", format_time_ago(session_ref.added_at, now)),
+                            None if session_ref.environment.as_ref().is_some_and(|environment| matches!(environment.source, comet_proto::SessionEnvironmentSource::Scaffold { .. })) => format!("Startup status unknown · {}", format_time_ago(session_ref.added_at, now)),
+                            None => format_time_ago(session_ref.added_at, now),
+                        }.into(),
                     )
                 })
                 .collect()

@@ -608,6 +608,10 @@ final class SessionStore {
             draft.steer = steer
         }
         submittedDrafts[draft.messageId] = draft
+        // Keep this send's preparation receipt even if navigation/re-attach
+        // reconfigures the store's transport while attachments are uploading.
+        let attachmentUploader = attachmentUploader
+        let commandSender = commandSender
         do {
             let missing = images.filter { uploadedImages[$0.id] == nil }
             if !missing.isEmpty {

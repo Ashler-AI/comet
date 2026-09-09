@@ -97,6 +97,7 @@ struct ScaffoldEnvironmentControlResult: Codable, Hashable {
     var runId: String?
     var roomProjection: SessionRoomProjection?
     var controlGrant: ScaffoldControlGrant?
+    var preparationGeneration: String? = nil
 }
 
 struct ScaffoldControlRoute: Hashable {
@@ -106,6 +107,7 @@ struct ScaffoldControlRoute: Hashable {
     var grantId: String
     var projection: SessionRoomProjection
     var environment: SessionEnvironment
+    var preparationGeneration: String? = nil
 }
 
 struct ScaffoldLaunchConfig: Hashable {
@@ -124,10 +126,27 @@ struct SessionRef: Identifiable, Hashable {
     var chatId: String
     var addedAt: Int64
     var environment: SessionEnvironment?
+    var startup: SessionStartup? = nil
 
     var id: String { chatId }
     var fallbackTitle: String { "Session \(chatId.prefix(8))" }
     var deploymentId: String? { environment?.scope.deploymentId }
+    var startupLabel: String? {
+        switch startup?.status {
+        case "preparing": return "Admission pending"
+        case "creationUncertain": return "Creation outcome unknown · inspect before retry"
+        case "attentionNeeded": return "Startup needs attention"
+        case "admitted": return "Command admitted"
+        default: return environment?.source.kind == "scaffold" ? "Startup status unknown" : nil
+        }
+    }
+}
+
+struct SessionStartup: Decodable, Hashable {
+    var generation: String
+    var status: String
+    var updatedAt: String
+    var commandId: String?
 }
 
 

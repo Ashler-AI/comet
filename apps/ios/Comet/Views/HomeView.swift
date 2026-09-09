@@ -306,6 +306,14 @@ struct ChatRow: View {
                 .foregroundStyle(Theme.text)
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
+            if let reference = model.workspace?.sessionRef(id: chat.id),
+               reference.startup != nil,
+               reference.startup?.status != "admitted",
+               let label = reference.startupLabel {
+                Text(label)
+                    .font(Theme.sans(11))
+                    .foregroundStyle(Theme.attention)
+            }
 
             // Line 3: harness brand mark, then the branch when the engine
             // stamped one.
@@ -365,11 +373,10 @@ struct SharedSessionRow: View {
                         .foregroundStyle(Theme.text)
                         .lineLimit(1)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                    Text(relativeTime(updatedAt))
+                    Text(sessionRef.startupLabel.map { "\($0) · \(relativeTime(updatedAt))" } ?? relativeTime(updatedAt))
                         .font(Theme.sans(10.5))
                         .foregroundStyle(Theme.textMuted)
-                        .accessibilityLabel("Last updated")
-                        .accessibilityValue(Text(Date(timeIntervalSince1970: Double(updatedAt) / 1000), style: .relative))
+                        .accessibilityLabel(sessionRef.startupLabel ?? "Last updated")
                 }
                 SessionStatusBadge(status: activity.status,
                                    sending: model.hasPendingSend(chatId: sessionRef.chatId))

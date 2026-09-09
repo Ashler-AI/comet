@@ -6,6 +6,7 @@
 
 import Foundation
 import Loro
+import UIKit
 
 @MainActor
 enum E2ERunner {
@@ -399,12 +400,61 @@ enum E2ERunner {
         return true
     }
 
+    /// Post-Prepare cancellation reports the originating receipt from an
+    /// uncancelled task; a later durable admission must never emit failure.
+    private static func runScaffoldPreparationOutcomes() async -> Bool {
+        var unexpectedReports: [String] = []
+        let admitted = ScaffoldPreparationReceipt(generation: "newer-generation") { generation in
+            unexpectedReports.append(generation)
+        }
+        admitted.markAdmitted()
+        admitted.reportFailure()
+        let outcome: (String, Bool) = await withCheckedContinuation { continuation in
+            let abandoned = ScaffoldPreparationReceipt(generation: "originating-generation") { generation in
+                continuation.resume(returning: (generation, Task.isCancelled))
+            }
+            let sender = Task { @MainActor in
+                abandoned.reportFailure()
+                abandoned.reportFailure()
+            }
+            // Main-actor scheduling makes cancellation precede the sender's
+            // first instruction, without sleeps or provider/network access.
+            sender.cancel()
+        }
+        guard outcome.0 == "originating-generation", !outcome.1,
+              unexpectedReports.isEmpty else {
+            log("FAIL Crew Scaffold preparation: cancellation lost origin or relabeled admission")
+            return false
+        }
+        log("OK Crew Scaffold preparation: originating generation, uncancelled failure report, durable admission suppression")
+        return true
+    }
+
     /// Uncertain admission must not duplicate a send when its reply is lost,
     /// even if the session becomes working or the message arrives later.
     static func runMobileParity() async {
+        guard await runScaffoldPreparationOutcomes() else { return }
         let config = AppConfig(edgeURL: URL(string: "http://127.0.0.1:1")!, mode: .dev,
                                userId: "parity-\(UUID().uuidString)", projectScope: "parity",
                                deviceId: "viewer", deviceName: "Crew regression")
+        let firstSend = SessionStore(chatId: "parity-preparation-origin", config: config)
+        let firstChat = Chat(id: firstSend.chatId, deviceId: "host", archived: false, cwd: "/tmp", createdAt: 0)
+        var admittedGenerations: [String] = []
+        firstSend.commandSender = { _ in admittedGenerations.append("originating-generation") }
+        firstSend.attachmentUploader = { _ in
+            // A route refresh during upload must not replace this send's
+            // already-bound first-command receipt with a newer preparation.
+            firstSend.commandSender = { _ in admittedGenerations.append("newer-generation") }
+            return ["/tmp/preparation-image.png"]
+        }
+        let image = MobileImageAttachment(id: UUID(), filename: "preparation.png",
+                                          bytes: Data(), preview: UIImage())
+        guard await firstSend.sendRun(prompt: "originating send", chat: firstChat, images: [image]),
+              admittedGenerations == ["originating-generation"] else {
+            log("FAIL Crew Scaffold first command adopted a newer preparation during upload")
+            return
+        }
+        log("OK Crew Scaffold first command retains originating generation across upload route refresh")
         let store = SessionStore(chatId: "parity-retry", config: config)
         let chat = Chat(id: store.chatId, deviceId: "host", archived: false, cwd: "/tmp", createdAt: 0)
         var attempts: [SessionCommandPayload] = []

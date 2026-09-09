@@ -2940,11 +2940,8 @@ mod authority_tests {
             .doc()
             .upsert_session_ref(
                 "accounts.google.com:bob@example.com",
-                &comet_proto::SessionRef {
-                    chat_id: "session-a".into(),
-                    added_at: chrono::Utc::now(),
-                    environment: None,
-                },
+                &comet_proto::SessionRef { chat_id: "session-a".into(),
+                added_at: chrono::Utc::now(), environment: None, startup: None },
             )
             .unwrap();
         let shared_chat = SessionCommandEntry {
