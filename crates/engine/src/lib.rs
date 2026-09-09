@@ -621,11 +621,14 @@ impl Engine {
             core.sessions
                 .set_inference_relay(inference_relay::InferenceRelay::start(client.clone())?);
             let grants = Arc::new(EdgeDeviceJoinGrantClient::new(&config.edge_url, bearer)?);
-            core.set_scaffold_runtime(ScaffoldRuntime::new(
-                client,
-                config.edge_url.clone(),
-                grants,
-            ));
+            core.set_scaffold_runtime(
+                ScaffoldRuntime::new(client, config.edge_url.clone(), grants).with_deployment_id(
+                    config
+                        .deployment_id
+                        .clone()
+                        .unwrap_or_else(|| project_scope.clone()),
+                ),
+            );
         }
         // Release checker: polls {edge}/releases on a 6h cadence; headless
         // installs with COMET_AUTO_UPDATE=1 apply + restart themselves — gated

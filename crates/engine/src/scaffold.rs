@@ -22,7 +22,7 @@ use comet_proto::{
     ScaffoldEnvironmentLinks, ScaffoldEnvironmentSnapshot, SessionEnvironment,
     SessionEnvironmentSource, SessionRoomProjection,
 };
-use comet_rpc::TokenSource;
+use comet_rpc::{RpcError, TokenSource};
 use reqwest::{Method, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -44,6 +44,33 @@ const SCAFFOLD_WORKSPACE_CWD: &str = "/workspace/ashler-platform";
 pub(crate) const SCAFFOLD_COMET_RUNTIME_VERSION: &str =
     include_str!("../../../scaffold-runtime-version.txt");
 const JOIN_GRANT_PATH: [&str; 2] = ["auth", "device-grants"];
+pub fn is_retryable_scaffold_control_error(error: &RpcError) -> bool {
+    matches!(
+        error,
+        RpcError::Failed(message)
+            if message.contains("scaffold_api_error:500:scaffold_request_rejected")
+                || message.contains("scaffold_api_error:502:scaffold_request_rejected")
+                || message.contains("scaffold_api_error:503:scaffold_request_rejected")
+                || message.contains("scaffold_api_error:504:scaffold_request_rejected")
+                || message.contains(
+                    "scaffold_api_error:404:not_found:Sandbox agent route projection failed",
+                )
+                || message.contains(
+                    "scaffold_api_error:409:sandbox_provider_error:Sandbox lifecycle changed while the operation was in flight",
+                )
+                || message.strip_prefix("scaffold_api_error:503:sandbox_runtime_starting")
+                    .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(':'))
+                || message.contains("scaffold_session_owner_room_unavailable")
+                || message.contains(
+                    "scaffold_api_error:404:sandbox_provider_error:E2B sandbox control channel is unavailable",
+                )
+                || (message.contains("scaffold_response_invalid: sandbox ")
+                    && message.contains(" is not ready"))
+                || message.contains(
+                    "Scaffold agent route update returned unavailable lifecycle",
+                )
+    )
+}
 
 struct OmpHandoffArchive {
     file: NamedTempFile,
@@ -2052,6 +2079,7 @@ impl DeviceJoinGrantProvider for UnavailableDeviceJoinGrantProvider {
 #[derive(Clone)]
 pub struct ScaffoldRuntime {
     inner: Arc<ScaffoldRuntimeInner>,
+    deployment_id: Arc<str>,
 }
 
 struct ScaffoldRuntimeInner {
@@ -2059,6 +2087,8 @@ struct ScaffoldRuntimeInner {
     edge_origin: String,
     grants: Arc<dyn DeviceJoinGrantProvider>,
     handoff_permits: Arc<Semaphore>,
+    preparation_gates:
+        Mutex<BTreeMap<(String, String, String), std::sync::Weak<tokio::sync::Mutex<()>>>>,
     environments: Mutex<BTreeMap<String, SessionEnvironment>>,
     watch_tx: watch::Sender<ScaffoldEnvironmentSnapshot>,
 }
@@ -2075,19 +2105,49 @@ impl ScaffoldRuntime {
         };
         let (watch_tx, _) = watch::channel(snapshot);
         Self {
+            deployment_id: client.project_scope.as_str().into(),
             inner: Arc::new(ScaffoldRuntimeInner {
                 client,
                 edge_origin: edge_origin.into(),
                 grants,
                 handoff_permits: Arc::new(Semaphore::new(1)),
+                preparation_gates: Mutex::new(BTreeMap::new()),
                 environments: Mutex::new(BTreeMap::new()),
                 watch_tx,
             }),
         }
     }
 
+    pub fn with_deployment_id(mut self, deployment_id: String) -> Self {
+        self.deployment_id = deployment_id.into();
+        self
+    }
+
+    pub(crate) fn deployment_id(&self) -> &str {
+        &self.deployment_id
+    }
+
     pub(crate) fn client(&self) -> ScaffoldClient {
         self.inner.client.clone()
+    }
+
+    pub(crate) fn preparation_gate(
+        &self,
+        scope: &CollaborationScope,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let key = (
+            scope.project_id.clone(),
+            scope.deployment_id.clone().unwrap_or_default(),
+            scope.session_id.clone().unwrap_or_default(),
+        );
+        let mut gates = lock(&self.inner.preparation_gates);
+        if let Some(gate) = gates.get(&key).and_then(std::sync::Weak::upgrade) {
+            return gate;
+        }
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        gates.insert(key, Arc::downgrade(&gate));
+        gate
     }
 
     pub fn watch(&self) -> watch::Receiver<ScaffoldEnvironmentSnapshot> {
@@ -2674,6 +2734,26 @@ mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn scaffold_startup_retry_requires_exact_provider_state() {
+        let starting =
+            br#"{"error":"sandbox_provider_error","body":{"error":"sandbox_runtime_starting"}}"#;
+        let error = api_error(StatusCode::SERVICE_UNAVAILABLE, starting);
+        assert!(error.is_runtime_starting());
+        assert!(is_retryable_scaffold_control_error(&RpcError::Failed(
+            error.to_string()
+        )));
+        for (status, body) in [
+            (StatusCode::NOT_FOUND, starting.as_slice()),
+            (StatusCode::SERVICE_UNAVAILABLE, br#"{"error":"sandbox_provider_error","message":"sandbox_runtime_starting"}"#.as_slice()),
+            (StatusCode::SERVICE_UNAVAILABLE, br#"{"error":"sandbox_provider_error","body":{"error":"sandbox_runtime_starting_failed"}}"#.as_slice()),
+        ] {
+            let error = api_error(status, body);
+            assert!(!error.is_runtime_starting());
+            assert!(!is_retryable_scaffold_control_error(&RpcError::Failed(error.to_string())));
+        }
+    }
     #[test]
     fn scaffold_origin_requires_https_except_for_loopback() {
         let token: Arc<dyn TokenSource> = Arc::new(StaticToken("token".into()));

@@ -198,8 +198,15 @@ jobs:
         run: cargo test --locked -p comet-harness auth_gateway::tests
       - name: Verify desktop and Scaffold gateway launch policies
         run: cargo test --locked -p comet-harness shared_inference_
+      - name: Verify native handoff preparation and runtime coordinates
+        run: |
+          cargo test --locked -p comet-engine --lib scaffold_session
+          cargo test --locked -p comet-harness native_handoff_executable_
+          cargo test --locked -p comet --bin comet session
       - name: Package
         run: scripts/package-macos.sh
+      - name: Verify packaged native handoff command
+        run: target/package/Crew.app/Contents/MacOS/comet session handoff --help
       - name: Record artifact checksums
         run: |
           cd target/package

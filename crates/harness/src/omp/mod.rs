@@ -1703,12 +1703,16 @@ impl OmpHarness {
     }
 
     fn configure_rpc_mode(&self, command: &mut Command) {
+        command.env_remove("COMET_EXECUTABLE");
         if self.scaffold_host {
             command.env("CI", "true");
             command.env_remove(LOCAL_RUNTIME_ENV);
         } else {
             command.env("CI", "false");
             command.env(LOCAL_RUNTIME_ENV, "1");
+            if let Some(executable) = &self.supervisor_executable {
+                command.env("COMET_EXECUTABLE", executable);
+            }
         }
         command.args(["--mode", "rpc", "--approval-mode", "yolo"]);
         if self.scaffold_host {
@@ -3370,6 +3374,46 @@ mod tests {
             configured_env(&scaffold, LOCAL_RUNTIME_ENV),
             None,
             "Scaffold must not mark commands as local"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_handoff_executable_reaches_local_child_but_not_scaffold() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let probe = temp.path().join("omp-probe");
+        std::fs::write(&probe, "#!/bin/sh\nprintf '%s\\n' \"${COMET_EXECUTABLE-unset}\" \"${COMET_LOCAL_AGENT_RUNTIME-unset}\"\n").unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let supervisor = temp
+            .path()
+            .join("Crew With Spaces.app/Contents/MacOS/comet");
+        let cwd = temp.path().to_str().unwrap();
+        let local = OmpHarness::new()
+            .with_supervisor_executable(&supervisor)
+            .with_auth_broker_environment(AuthBrokerEnvironment::default())
+            .rpc_mode_command(&probe, cwd, false)
+            .output()
+            .await
+            .unwrap();
+        assert!(local.status.success());
+        assert_eq!(
+            String::from_utf8(local.stdout).unwrap(),
+            format!("{}\n1\n", supervisor.display())
+        );
+
+        let scaffold = OmpHarness::scaffold_host()
+            .with_supervisor_executable(&supervisor)
+            .with_auth_broker_environment(AuthBrokerEnvironment::default())
+            .rpc_mode_command(&probe, cwd, false)
+            .output()
+            .await
+            .unwrap();
+        assert!(scaffold.status.success());
+        assert_eq!(
+            String::from_utf8(scaffold.stdout).unwrap(),
+            "unset\nunset\n"
         );
     }
 

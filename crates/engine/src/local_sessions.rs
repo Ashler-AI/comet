@@ -954,7 +954,7 @@ fn candidate_from_omp(path: &Path) -> Option<DiscoveredSession> {
     candidate_from_omp_with_writer_state(path, comet_harness::omp::session_writer_state(path))
 }
 
-fn canonical_omp_model_selector(model: &str) -> Option<String> {
+pub(crate) fn canonical_omp_model_selector(model: &str) -> Option<String> {
     let model = model.trim();
     if model.is_empty() {
         return None;

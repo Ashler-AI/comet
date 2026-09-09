@@ -29,17 +29,21 @@ use comet_doc::{
     MessagePart, MessageRole, MessageStatus, SessionCommandPayload, SessionControlAction,
     SessionMessageEntry,
 };
+#[cfg(test)]
+use comet_proto::AgentProvider;
 use comet_proto::{
-    AgentProvider, AgentRoute, AgentSessionSource, Chat, ChatConfig, FileSearchMatch,
-    HarnessCommand, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, ScaffoldLifecycle,
-    SteeringMode, UserInputAnswer, UserInputQuestion,
+    AgentRoute, AgentSessionSource, Chat, ChatConfig, FileSearchMatch, HarnessCommand, HarnessId,
+    ReasoningLevel, RunRequest, SandboxLevel, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 use comet_rpc::{RpcError, methods};
 
 use crate::attachments::{self, StagedAttachment};
 use crate::motion;
 use crate::pickers::{CheckoutPlan, Pickers};
-use crate::state::{AppState, ChatStartupPhase, EngineHandle, Indicator, latest_active_omp_goal};
+use crate::state::{
+    AppState, ChatStartupPhase, EngineHandle, Indicator, ScaffoldControlTarget,
+    latest_active_omp_goal,
+};
 use crate::theme::Theme;
 
 // ---------------------------------------------------------------------------
@@ -78,9 +82,6 @@ pub const INPUT_TEXT_SIZE: f32 = 14.0;
 pub const AUTO_ADVANCE_MS: u64 = 220;
 /// Drag-selection autoscroll runs at the display-friendly 60fps cadence.
 pub const DRAG_SCROLL_FRAME_MS: u64 = 16;
-/// Maximum time the first prompt waits for its Scaffold sandbox and remote
-/// Comet host. Failure is surfaced; the prompt never falls back to local.
-const SCAFFOLD_DEMO_WAIT: Duration = Duration::from_secs(10 * 60);
 /// First sends must either reach the durable command ledger or roll back.
 const LOCAL_SESSION_ADMISSION_WAIT: Duration = Duration::from_secs(2 * 60);
 
@@ -166,22 +167,8 @@ fn scaffold_agent_binding(
     if harness? != HarnessId::Omp {
         return None;
     }
-    let selected = selected_model
-        .map(str::trim)
-        .filter(|model| !model.is_empty() && *model != "default")?;
-    let lower = selected.to_ascii_lowercase();
-    let (_, model) = selected.rsplit_once('/')?;
-    if model.is_empty() {
-        return None;
-    }
-    let (provider, model_id) = if lower.starts_with("anthropic/") {
-        (AgentProvider::Anthropic, format!("anthropic/{model}"))
-    } else if lower.starts_with("openai/") || lower.starts_with("openai-codex/") {
-        (AgentProvider::OpenAi, format!("openai-codex/{model}"))
-    } else {
-        return None;
-    };
-    let route = AgentRoute::automatic(provider, model);
+    let route = AgentRoute::from_omp_model(selected_model?)?;
+    let model_id = route.omp_model();
     Some(ScaffoldAgentBinding { route, model_id })
 }
 fn scaffold_send_requires_binding(
@@ -3431,12 +3418,6 @@ struct ControlRoute {
     scaffold: Option<ScaffoldControlTarget>,
 }
 
-#[derive(Debug, Clone)]
-struct ScaffoldControlTarget {
-    sandbox_id: String,
-    scope: comet_proto::CollaborationScope,
-}
-
 fn control_route_grant_id(
     snapshot: &comet_proto::CollaborationSnapshot,
     session: &comet_proto::AgentSessionRecord,
@@ -4709,10 +4690,7 @@ impl Composer {
             state
                 .scaffold_control_target(&session_id)
                 .filter(|target| principal_can_control && principal.authorizes_scope(&target.scope))
-                .map(|target| ScaffoldControlTarget {
-                    sandbox_id: target.sandbox_id.clone(),
-                    scope: target.scope.clone(),
-                })
+                .cloned()
                 .or_else(|| {
                     persisted_scaffold_reconnect_target(
                         &state.session_refs,
@@ -5013,9 +4991,6 @@ impl Composer {
         let scaffold_omp_handoff = scaffold_draft
             .as_ref()
             .and_then(|draft| draft.omp_handoff.clone());
-        let scaffold_target = scaffold_draft
-            .as_ref()
-            .and_then(|draft| draft.target.clone());
         start_agent_mode |= scaffold_demo;
         let local_device_id = self.state.read(cx).local_device_id.clone();
         let device_id = if is_new {
@@ -5242,193 +5217,45 @@ impl Composer {
                     .ok();
                 }
                 if let Some(scope) = scaffold_scope {
-                    let wait_started = Instant::now();
-                    let mut target = scaffold_target;
-                    let mut sandbox_id = target.as_ref().map(|target| target.sandbox_id.clone());
-                    let mut pending_attachment = None;
-                    let mut last_error = None;
-                    let scaffold_retry_executor = cx.background_executor().clone();
-                    let scaffold_retry_delay =
-                        move |delay| scaffold_retry_executor.timer(delay);
-                    {
-                    let deadline = cx.background_executor().timer(SCAFFOLD_DEMO_WAIT);
-                    let launch = crate::state::create_and_attach_scaffold_session(
-                        &engine,
-                        &scope,
-                        scaffold_title.as_deref(),
-                        requested_scaffold_source_ref.as_deref(),
-                        scaffold_database_environment,
-                        &scaffold_agent_binding
-                            .as_ref()
-                            .expect("Scaffold route is resolved before launch")
-                            .route,
-                        &scaffold_retry_delay,
-                        &mut target,
-                        |target| {
-                            this.update(cx, |composer, cx| {
-                                composer.state.update(cx, |state, cx| {
-                                    let result = state.retain_scaffold_target(&chat_id, target);
-                                    cx.notify();
-                                    result
-                                })
-                            }).map_err(|error| comet_rpc::RpcError::Failed(error.to_string()))?
-                        },
-                    );
-                    futures::pin_mut!(launch);
-                    match futures::future::select(launch, deadline).await {
-                        futures::future::Either::Left((
-                            Ok((created_id, attachment)),
-                            _,
-                        )) => {
-                            tracing::info!(
-                                sandbox_id = %created_id,
-                                "Scaffold sandbox launched; waiting for remote Comet"
-                            );
-                            sandbox_id = Some(created_id);
-                            pending_attachment = Some(attachment);
-                        }
-                        futures::future::Either::Left((Err(error), _)) => {
-                            last_error = Some(error.to_string());
-                        }
-                        futures::future::Either::Right(_) => {
-                            last_error =
-                                Some("Scaffold sandbox creation exceeded the deadline".into());
-                        }
-                    }
-                    }
-                    if sandbox_id.is_none() {
-                        sandbox_id = target.as_ref().map(|target| target.sandbox_id.clone());
-                    }
-
-                    if let (Some(created_id), Some(attachment)) =
-                        (sandbox_id.as_deref(), pending_attachment.as_ref())
-                    {
-                        let authoritative_scope = comet_proto::CollaborationScope {
-                            project_id: attachment.projection.project_id.clone(),
-                            deployment_id: Some(attachment.projection.deployment_id.clone()),
-                            session_id: Some(attachment.projection.session_id.clone()),
-                            unknown: Default::default(),
-                        };
-                        loop {
-                            let remaining =
-                                SCAFFOLD_DEMO_WAIT.saturating_sub(wait_started.elapsed());
-                            if remaining.is_zero() {
-                                break;
-                            }
-                            let inspect = crate::state::inspect_scaffold_session(
-                                &engine, created_id, &authoritative_scope,
-                            );
-                            let deadline = cx.background_executor().timer(remaining);
-                            futures::pin_mut!(inspect);
-                            let ready =
-                                match futures::future::select(inspect, deadline).await {
-                                    futures::future::Either::Left((Ok(lifecycle), _)) => {
-                                        if matches!(
-                                            lifecycle,
-                                            ScaffoldLifecycle::Ready
-                                                | ScaffoldLifecycle::AgentRunning
-                                        ) {
-                                            true
-                                        } else {
-                                            if matches!(lifecycle, ScaffoldLifecycle::Stopped | ScaffoldLifecycle::Failed | ScaffoldLifecycle::Paused) {
-                                                last_error = Some(format!("Crew sandbox is {lifecycle:?}"));
-                                                break;
-                                            }
-                                            last_error = Some(format!(
-                                                "sandbox lifecycle remained {lifecycle:?}"
-                                            ));
-                                            false
-                                        }
-                                    }
-                                    futures::future::Either::Left((Err(error), _)) => {
-                                        last_error = Some(error.to_string());
-                                        break;
-                                    }
-                                    futures::future::Either::Right(_) => {
-                                        last_error = Some(
-                                            "Scaffold sandbox did not become ready before the deadline"
-                                                .into(),
-                                        );
-                                        break;
-                                    }
-                                };
-                            if ready {
-                                if let Some(handoff) = scaffold_omp_handoff.as_ref() {
-                                    match crate::state::handoff_omp_session(
-                                        &engine,
-                                        created_id,
-                                        &authoritative_scope,
-                                        &handoff.native_session_id,
-                                        &handoff.cwd,
-                                    )
-                                    .await
-                                    {
-                                        Ok((native_session_id, remote_cwd)) => {
-                                            scaffold_resume_session_id = Some(native_session_id);
-                                            scaffold_resume_cwd = Some(remote_cwd);
-                                        }
-                                        Err(error) => {
-                                            last_error = Some(format!(
-                                                "could not hand off the OMP session: {error}"
-                                            ));
-                                            break;
-                                        }
-                                    }
-                                }
-                                let Some(actor_device_id) = local_device_id.clone() else {
-                                    last_error = Some("Local device unavailable".into());
-                                    break;
-                                };
-                                host_device_id = Some(attachment.owner_device_id.clone());
-                                attached_scaffold_source_ref = attachment
-                                    .source_ref
-                                    .clone()
-                                    .or(attached_scaffold_source_ref);
-                                control_route = Some(ControlRoute {
-                                    session_id: attachment.projection.session_id.clone(),
-                                    owner_device_id: attachment.owner_device_id.clone(),
-                                    actor_device_id,
-                                    actor_subject: attachment.actor_subject.clone(),
-                                    grant_id: attachment.grant_id.clone(),
-                                    source: AgentSessionSource::Scaffold,
-                                    scaffold: Some(ScaffoldControlTarget {
-                                        sandbox_id: created_id.to_string(),
-                                        scope: authoritative_scope.clone(),
-                                    }),
-                                });
-                                this.update(cx, |composer, cx| {
-                                    composer.state.update(cx, |state, cx| {
-                                        state.install_scaffold_session(attachment, cx);
-                                    });
-                                })
-                                .ok();
-                                scaffold_attached = true;
-                                tracing::info!(
-                                    sandbox_id = %created_id,
-                                    "Scaffold sandbox ready; routing prompt remotely"
-                                );
-                                break;
-                            }
-                            let remaining =
-                                SCAFFOLD_DEMO_WAIT.saturating_sub(wait_started.elapsed());
-                            if remaining.is_zero() {
-                                break;
-                            }
-                            cx.background_executor()
-                                .timer(remaining.min(Duration::from_millis(500)))
-                                .await;
-                        }
-                    }
-
-                    if !scaffold_attached {
-                        let reason = last_error.unwrap_or_else(|| "sandbox not ready".into());
-                        tracing::warn!(
-                            sandbox_id = sandbox_id.as_deref().unwrap_or("unavailable"),
-                            error = %reason,
-                            "Scaffold readiness deadline reached"
-                        );
-                        return Err("Could not attach Crew session. Retry to reconnect to the same sandbox.".into());
-                    }
+                    let (attachment, native_session_id, remote_cwd) =
+                        crate::state::prepare_scaffold_session(
+                            &engine,
+                            &scope,
+                            scaffold_title.as_deref(),
+                            requested_scaffold_source_ref.as_deref(),
+                            scaffold_database_environment,
+                            &scaffold_agent_binding
+                                .as_ref()
+                                .expect("Scaffold route is resolved before launch")
+                                .route,
+                            scaffold_omp_handoff.as_ref(),
+                        )
+                        .await
+                        .map_err(|error| format!("Could not start Scaffold session: {error}"))?;
+                    scaffold_resume_session_id = native_session_id;
+                    scaffold_resume_cwd = remote_cwd;
+                    let actor_device_id = local_device_id.clone()
+                        .ok_or_else(|| "Local device unavailable".to_string())?;
+                    host_device_id = Some(attachment.owner_device_id.clone());
+                    attached_scaffold_source_ref = attachment
+                        .source_ref
+                        .clone()
+                        .or(attached_scaffold_source_ref);
+                    control_route = Some(ControlRoute {
+                        session_id: attachment.projection.session_id.clone(),
+                        owner_device_id: attachment.owner_device_id.clone(),
+                        actor_device_id,
+                        actor_subject: attachment.actor_subject.clone(),
+                        grant_id: attachment.grant_id.clone(),
+                        source: AgentSessionSource::Scaffold,
+                        scaffold: Some(attachment.control_target.clone()),
+                    });
+                    this.update(cx, |composer, cx| {
+                        composer.state.update(cx, |state, cx| {
+                            state.install_scaffold_session(&attachment, cx);
+                        });
+                    }).ok();
+                    scaffold_attached = true;
                     this.update(cx, |composer, cx| {
                         composer.state.update(cx, |state, cx| {
                             state.clear_scaffold_chat_starting(&err_chat_id, cx);
@@ -5886,8 +5713,16 @@ impl Composer {
                     composer.failure = Some(message.clone().into());
                     composer.state.update(cx, |s, cx| {
                         s.remove_echo(&err_chat_id, &err_message_id);
+                        if scaffold_demo
+                            && s.scaffold_session_draft_for_chat(&err_chat_id).is_some()
+                        {
+                            s.scaffold_session_error = Some(message.clone());
+                        }
                         s.clear_scaffold_chat_starting(&err_chat_id, cx);
-                        if is_new || scaffold_demo {
+                        // Preparation may have persisted an accepted sandbox
+                        // before its ref notification reaches this UI. Keep the
+                        // same draft so retry asks the engine to recover it.
+                        if is_new && !scaffold_demo {
                             s.cancel_unaccepted_chat(&err_chat_id, cx);
                         }
                         cx.notify();
@@ -6916,16 +6751,19 @@ mod tests {
                 methods::LIST_HARNESSES | methods::LIST_HARNESS_COMMANDS => {
                     comet_rpc::RpcReply::value(&Vec::<serde_json::Value>::new())
                 }
-                methods::CONTROL_SCAFFOLD_ENVIRONMENT if params["operation"] == "create" => {
-                    Err(RpcError::Failed("create rejected before acceptance".into()))
-                }
+                methods::PREPARE_SCAFFOLD_SESSION => Err(RpcError::Failed(format!(
+                    "preparation interrupted for {}",
+                    params["scope"]["sessionId"]
+                ))),
                 _ => Err(RpcError::UnknownMethod(method.to_owned())),
             }
         }
     }
 
     #[gpui::test]
-    async fn failed_scaffold_first_send_releases_unaccepted_draft(cx: &mut gpui::TestAppContext) {
+    async fn failed_scaffold_preparation_retains_draft_until_explicit_cancel(
+        cx: &mut gpui::TestAppContext,
+    ) {
         cx.executor().allow_parking();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _runtime_guard = runtime.enter();
@@ -6968,9 +6806,13 @@ mod tests {
         });
         cx.condition(&composer, |composer, _| !composer.is_sending(&chat_id))
             .await;
-        state.update(cx, |state, _| {
-            assert!(state.can_start_scaffold_session());
+        state.update(cx, |state, cx| {
+            assert!(!state.can_start_scaffold_session());
             state.apply_chats(Vec::new());
+            assert!(state.chats.iter().any(|chat| chat.id == chat_id));
+            assert_eq!(state.selected_chat.as_deref(), Some(chat_id.as_str()));
+            state.cancel_pending_chat(&chat_id, cx);
+            assert!(state.can_start_scaffold_session());
             assert!(!state.chats.iter().any(|chat| chat.id == chat_id));
             assert!(state.selected_chat.is_none());
         });

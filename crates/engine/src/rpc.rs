@@ -86,6 +86,7 @@ use crate::terminals::Terminals;
 use crate::uploads::Uploads;
 use crate::workspace_host::WorkspaceHost;
 
+mod scaffold_session;
 const FILE_SEARCH_RPC_TIMEOUT: Duration = Duration::from_secs(6);
 const WORKTREE_CREATE_RPC_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const SCAFFOLD_OWNER_ROOM_READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -2095,41 +2096,20 @@ impl RpcService for EngineRpc {
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
                 RpcReply::value(&snapshot)
             }
+            methods::HANDOFF_SESSION_TO_SCAFFOLD => {
+                let p = parse_params(params)?;
+                RpcReply::value(&self.handoff_session_to_scaffold(p).await?)
+            }
+            methods::PREPARE_SCAFFOLD_SESSION => {
+                let p = parse_params(params)?;
+                RpcReply::value(&self.prepare_scaffold_session(p).await?)
+            }
             methods::CONTROL_SCAFFOLD_ENVIRONMENT => {
                 let control: ScaffoldEnvironmentControl = parse_params(params)?;
                 let cancellation = comet_harness::CancellationToken::new();
-                let scaffold = self.scaffold()?;
-                let owner_room = self.prepare_scaffold_attach(&control)?;
-                self.await_scaffold_owner_room(owner_room.as_deref(), &cancellation)
+                let result = self
+                    .control_scaffold_environment(control, &cancellation)
                     .await?;
-                let result = scaffold
-                    .control(control, &cancellation)
-                    .await
-                    .map_err(|error| RpcError::Failed(error.to_string()))?;
-                if let Some(projection) = result.room_projection.as_ref() {
-                    if result.environment.scope.project_id != projection.project_id
-                        || result.environment.scope.deployment_id.as_deref()
-                            != Some(projection.deployment_id.as_str())
-                        || result.environment.scope.session_id.as_deref()
-                            != Some(projection.session_id.as_str())
-                    {
-                        return Err(RpcError::Failed(
-                            "Scaffold attachment environment projection mismatch".into(),
-                        ));
-                    }
-                    self.workspace
-                        .upsert_session_ref(
-                            &projection.session_id,
-                            Some(result.environment.clone()),
-                        )
-                        .map_err(|error| RpcError::Failed(error.to_string()))?;
-                }
-                if let Err(error) = self.install_scaffold_control_grant(&result) {
-                    tracing::warn!(
-                        error = %error,
-                        "Scaffold attached without local control grant projection"
-                    );
-                }
                 RpcReply::value(&result)
             }
             methods::WATCH_SESSIONS => {

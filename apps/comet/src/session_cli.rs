@@ -1,5 +1,7 @@
 use anyhow::{Context, anyhow};
 use clap::Subcommand;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Subcommand)]
 pub enum SessionCommand {
@@ -13,6 +15,17 @@ pub enum SessionCommand {
     Read { chat_id: String },
     /// Fork a Crew session, preserving its context and harness/model configuration.
     Fork { chat_id: Option<String> },
+    /// Transfer a session's native context to Scaffold and queue a remote task.
+    Handoff {
+        /// Source session; defaults to COMET_SESSION_ID inside an agent run.
+        chat_id: Option<String>,
+        /// UTF-8 task prompt file, nonempty and at most 1 MiB.
+        #[arg(long, value_name = "FILE")]
+        prompt_file: PathBuf,
+        /// Database environment: local, staging_snapshot, or production_snapshot.
+        #[arg(long, default_value = "local", value_parser = parse_database_environment)]
+        database_environment: comet_proto::ScaffoldDatabaseEnvironment,
+    },
     /// Send a message to another session.
     Send {
         chat_id: String,
@@ -56,14 +69,37 @@ pub async fn run(command: SessionCommand, ipc_port: u16) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let client = comet_rpc::connect_ws(&format!("ws://127.0.0.1:{ipc_port}"))
-        .await
-        .map_err(|error| {
-            anyhow!("no engine listening on 127.0.0.1:{ipc_port} ({error}) — is comet running?")
-        })?;
+    let command = match command {
+        SessionCommand::Handoff {
+            chat_id,
+            prompt_file,
+            database_environment,
+        } => {
+            let params = comet_rpc::HandoffSessionToScaffoldParams {
+                source_chat_id: current_session_id(chat_id)?,
+                prompt: read_handoff_prompt(&prompt_file)?,
+                database_environment,
+            };
+            let client = connect_engine(ipc_port).await?;
+            let receipt: comet_rpc::HandoffSessionToScaffoldResult = client
+                .call_as(
+                    comet_rpc::methods::HANDOFF_SESSION_TO_SCAFFOLD,
+                    serde_json::to_value(params)?,
+                )
+                .await
+                .map_err(handoff_error)?;
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
+            return Ok(());
+        }
+        command => command,
+    };
+
+    let client = connect_engine(ipc_port).await?;
 
     match command {
-        SessionCommand::Current => unreachable!("handled before connecting"),
+        SessionCommand::Current | SessionCommand::Handoff { .. } => {
+            unreachable!("handled before connecting")
+        }
         SessionCommand::Add { chat_id } => {
             let value = client
                 .call(
@@ -179,6 +215,72 @@ pub async fn run(command: SessionCommand, ipc_port: u16) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn connect_engine(ipc_port: u16) -> anyhow::Result<comet_rpc::RpcClient> {
+    comet_rpc::connect_ws(&format!("ws://127.0.0.1:{ipc_port}"))
+        .await
+        .map_err(|error| {
+            anyhow!("no engine listening on 127.0.0.1:{ipc_port} ({error}) — is comet running?")
+        })
+}
+
+fn parse_database_environment(
+    value: &str,
+) -> Result<comet_proto::ScaffoldDatabaseEnvironment, String> {
+    match value {
+        "local" => Ok(comet_proto::ScaffoldDatabaseEnvironment::Local),
+        "staging_snapshot" => Ok(comet_proto::ScaffoldDatabaseEnvironment::StagingSnapshot),
+        "production_snapshot" => Ok(comet_proto::ScaffoldDatabaseEnvironment::ProductionSnapshot),
+        _ => Err("expected local, staging_snapshot, or production_snapshot".into()),
+    }
+}
+
+const MAX_HANDOFF_PROMPT_BYTES: usize = 1024 * 1024;
+
+fn read_handoff_prompt(path: &Path) -> anyhow::Result<String> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("cannot read prompt file {}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(anyhow!(
+            "prompt file must be a regular file: {}",
+            path.display()
+        ));
+    }
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("cannot open prompt file {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take((MAX_HANDOFF_PROMPT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("cannot read prompt file {}", path.display()))?;
+    if bytes.len() > MAX_HANDOFF_PROMPT_BYTES {
+        return Err(anyhow!(
+            "prompt file exceeds the 1 MiB limit: {}",
+            path.display()
+        ));
+    }
+    let prompt = String::from_utf8(bytes)
+        .with_context(|| format!("prompt file must contain UTF-8 text: {}", path.display()))?;
+    if prompt.trim().is_empty() {
+        return Err(anyhow!("prompt file must not be empty: {}", path.display()));
+    }
+    Ok(prompt)
+}
+
+fn handoff_error(error: comet_rpc::RpcError) -> anyhow::Error {
+    // The wire protocol transmits server errors as strings, including UnknownMethod.
+    let unknown_method = matches!(&error, comet_rpc::RpcError::UnknownMethod(_))
+        || matches!(&error, comet_rpc::RpcError::Failed(message)
+            if message.strip_prefix("unknown method: ") == Some(comet_rpc::methods::HANDOFF_SESSION_TO_SCAFFOLD));
+    if unknown_method {
+        anyhow!(
+            "the running Crew engine does not support native Scaffold handoff; update the engine to match this comet binary ({error})"
+        )
+    } else {
+        anyhow!(error).context(
+            "native Scaffold handoff failed; it was not retried automatically. Check Crew for a created remote session before retrying",
+        )
+    }
+}
+
 fn current_session_id(explicit: Option<String>) -> anyhow::Result<String> {
     resolve_session_id(explicit, std::env::var("COMET_SESSION_ID").ok())
 }
@@ -203,7 +305,7 @@ fn print_json(value: &serde_json::Value) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_session_id;
+    use super::{MAX_HANDOFF_PROMPT_BYTES, read_handoff_prompt, resolve_session_id};
 
     #[test]
     fn explicit_source_wins_over_environment_context() {
@@ -228,5 +330,33 @@ mod tests {
     #[test]
     fn empty_explicit_source_is_rejected_instead_of_falling_back() {
         assert!(resolve_session_id(Some("  ".into()), Some("environment-session".into())).is_err());
+    }
+
+    #[test]
+    fn handoff_prompt_preserves_utf8_and_whitespace_at_size_limit() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let prompt = format!("\n{}é\n", "x".repeat(MAX_HANDOFF_PROMPT_BYTES - 4));
+        std::fs::write(file.path(), &prompt).unwrap();
+        assert_eq!(read_handoff_prompt(file.path()).unwrap(), prompt);
+
+        std::fs::write(file.path(), "x".repeat(MAX_HANDOFF_PROMPT_BYTES + 1)).unwrap();
+        assert!(read_handoff_prompt(file.path()).is_err());
+    }
+
+    #[test]
+    fn handoff_prompt_rejects_empty_whitespace_and_invalid_utf8() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        assert!(read_handoff_prompt(file.path()).is_err());
+        std::fs::write(file.path(), " \n\t ").unwrap();
+        assert!(read_handoff_prompt(file.path()).is_err());
+        std::fs::write(file.path(), [0xff]).unwrap();
+        assert!(read_handoff_prompt(file.path()).is_err());
+    }
+
+    #[test]
+    fn handoff_prompt_rejects_missing_and_non_file_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(read_handoff_prompt(directory.path()).is_err());
+        assert!(read_handoff_prompt(&directory.path().join("missing")).is_err());
     }
 }

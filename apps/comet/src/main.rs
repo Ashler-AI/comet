@@ -882,6 +882,78 @@ mod session_parser_tests {
     }
 
     #[test]
+    fn parses_session_handoff_with_current_or_explicit_source() {
+        let current =
+            Cli::try_parse_from(["comet", "session", "handoff", "--prompt-file", "task.txt"])
+                .unwrap();
+        let Some(Command::Session {
+            command:
+                super::session_cli::SessionCommand::Handoff {
+                    chat_id,
+                    prompt_file,
+                    database_environment,
+                },
+        }) = current.command
+        else {
+            panic!("expected session handoff");
+        };
+        assert_eq!(chat_id, None);
+        assert_eq!(prompt_file, std::path::PathBuf::from("task.txt"));
+        assert_eq!(
+            database_environment,
+            comet_proto::ScaffoldDatabaseEnvironment::Local
+        );
+
+        let explicit = Cli::try_parse_from([
+            "comet",
+            "session",
+            "handoff",
+            "source-chat",
+            "--prompt-file",
+            "task.txt",
+            "--database-environment",
+            "production_snapshot",
+        ])
+        .unwrap();
+        let Some(Command::Session {
+            command:
+                super::session_cli::SessionCommand::Handoff {
+                    chat_id,
+                    database_environment,
+                    ..
+                },
+        }) = explicit.command
+        else {
+            panic!("expected explicit session handoff");
+        };
+        assert_eq!(chat_id.as_deref(), Some("source-chat"));
+        assert_eq!(
+            database_environment,
+            comet_proto::ScaffoldDatabaseEnvironment::ProductionSnapshot
+        );
+    }
+
+    #[test]
+    fn session_handoff_requires_prompt_file_and_known_database_environment() {
+        assert!(Cli::try_parse_from(["comet", "session", "handoff"]).is_err());
+        assert!(
+            Cli::try_parse_from(["comet", "session", "handoff", "--prompt-file", "",]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "comet",
+                "session",
+                "handoff",
+                "--prompt-file",
+                "task.txt",
+                "--database-environment",
+                "production",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn parses_session_reply_contract() {
         let cli = Cli::try_parse_from([
             "comet",

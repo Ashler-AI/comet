@@ -59,6 +59,32 @@ The isolated installed-runtime regression can be run without provider credential
 node scripts/omp-gateway-revival-smoke.mjs ~/.local/bin/omp --compare-explicit
 ```
 
+## Native OMP handoff to Scaffold
+
+For an explicitly requested remote task, local OMP runs inside Crew use the
+native handoff action instead of creating a standalone OpenCode task:
+
+```bash
+"$COMET_EXECUTABLE" session handoff "$COMET_SESSION_ID" --prompt-file "$PROMPT_FILE" --database-environment local
+```
+
+Crew supplies `COMET_LOCAL_AGENT_RUNTIME=1`, `COMET_EXECUTABLE`, the source Crew
+chat ID in `COMET_SESSION_ID`, and `COMET_IPC_PORT`. Preserve those values. The
+prompt file must contain nonblank UTF-8 text of at most 1 MiB; create it privately
+with mode `0600` and remove it afterward. Database snapshots require an explicit
+request; the configured Scaffold deployment remains unchanged.
+
+The CLI and composer share native preparation: create or recover the target,
+attach its host, transfer OMP history and the worktree, then queue the task in a
+distinct Crew chat. The receipt contains `chatId`, `sandboxId`, `commandId`, and
+`environment`; it confirms command admission, not remote task completion.
+Monitor the returned chat in Crew, not standalone `handoff.*` lifecycle tools.
+
+Missing runtime values or an unsupported CLI/RPC require updating Crew's binary
+and running engine together, then starting a fresh local agent run. Never guess
+an executable, retry creation blindly, or fall back to OpenCode. After an error,
+inspect Crew for an accepted sandbox before retrying. Standalone handoff recovery
+remains separate and unchanged.
 ## Local collaboration smoke
 
 The deterministic smoke uses two in-memory headless devices and needs no cloud credentials, agent CLI, network, or persistent state:

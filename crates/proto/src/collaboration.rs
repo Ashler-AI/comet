@@ -336,6 +336,32 @@ pub struct AgentRoute {
 }
 
 impl AgentRoute {
+    /// Resolve an OMP provider-qualified model for a native Scaffold session.
+    pub fn from_omp_model(selected: &str) -> Option<Self> {
+        let selected = selected.trim();
+        let lower = selected.to_ascii_lowercase();
+        let (_, model) = selected.rsplit_once('/')?;
+        if model.is_empty() {
+            return None;
+        }
+        let provider = if lower.starts_with("anthropic/") {
+            AgentProvider::Anthropic
+        } else if lower.starts_with("openai/") || lower.starts_with("openai-codex/") {
+            AgentProvider::OpenAi
+        } else {
+            return None;
+        };
+        Some(Self::automatic(provider, model))
+    }
+
+    pub fn omp_model(&self) -> String {
+        let provider = match self.provider {
+            AgentProvider::OpenAi => "openai-codex",
+            AgentProvider::Anthropic => "anthropic",
+        };
+        format!("{provider}/{}", self.model)
+    }
+
     pub fn automatic(provider: AgentProvider, model: impl Into<String>) -> Self {
         Self {
             provider,
