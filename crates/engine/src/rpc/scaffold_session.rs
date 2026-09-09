@@ -266,10 +266,10 @@ impl EngineRpc {
                 }),
             })
             .await?;
-        self.admit_scaffold_handoff(source, params.prompt, remote_model, actor_subject, attached)
+        self.admit_scaffold_handoff(source, params.prompt, remote_model, actor_subject, attached).await
     }
 
-    fn admit_scaffold_handoff(
+    async fn admit_scaffold_handoff(
         &self,
         source: Chat,
         prompt: String,
@@ -377,6 +377,7 @@ impl EngineRpc {
                     }),
                 },
             )
+            .await
             .map_err(|error| {
                 RpcError::Failed(format!(
                     "{error}; sandbox {sandbox_id}; session {chat_id}; initial command not admitted"

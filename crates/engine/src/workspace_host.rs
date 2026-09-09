@@ -1098,7 +1098,7 @@ impl WorkspaceHost {
         Ok(())
     }
 
-    pub(crate) fn worker_ready(&self, chat_id: &str) -> Result<(), EngineError> {
+    pub(crate) async fn worker_ready(&self, chat_id: &str) -> Result<(), EngineError> {
         if let Some(binding) = self.inner.doc.worker_binding(chat_id)? {
             if binding.closed {
                 return Err(EngineError::Other("worker_closed".into()));
@@ -1112,7 +1112,10 @@ impl WorkspaceHost {
             if self.inner.doc.chat(chat_id)?.is_none() {
                 return Err(EngineError::Other("worker_chat_missing".into()));
             }
-            self.validate_worker_binding(&binding)?;
+            self.validate_worker_binding(&binding).await?;
+            if self.inner.doc.chat(chat_id)?.is_none() {
+                return Err(EngineError::Other("worker_chat_missing".into()));
+            }
         }
         Ok(())
     }
@@ -1120,7 +1123,25 @@ impl WorkspaceHost {
     /// Identity checks shared by admission, dispatch, status and recovery.
     /// Lifecycle fences and missing-chat handling remain with the caller so
     /// closed or interrupted workers can still be inspected and recovered.
-    pub(crate) fn validate_worker_binding(&self, binding: &comet_proto::WorkerBinding) -> Result<(), EngineError> {
+    pub(crate) async fn validate_worker_binding(&self, binding: &comet_proto::WorkerBinding) -> Result<(), EngineError> {
+        self.check_worker_binding_current(binding)?;
+        let Some(worktree) = &binding.worktree else { return Ok(()); };
+        let identity = crate::repos::Repos::worker_checkout_identity(
+            &self.inner.config.device_id,
+            std::path::Path::new(&binding.project_path),
+            std::path::Path::new(&worktree.path),
+        ).await?;
+        if worktree.checkout_id.as_deref() != Some(identity.id.as_str()) {
+            return Err(EngineError::Other("worker_checkout_identity_changed".into()));
+        }
+        // No stale lifecycle/owner/config snapshot may cross the Git await.
+        self.check_worker_binding_current(binding)
+    }
+
+    pub(crate) fn check_worker_binding_current(&self, binding: &comet_proto::WorkerBinding) -> Result<(), EngineError> {
+        if self.inner.doc.worker_binding(&binding.chat_id)?.as_ref() != Some(binding) {
+            return Err(EngineError::Other("worker_binding_changed".into()));
+        }
         let owner = self.inner.doc.chat(&binding.owner_chat_id)?
             .ok_or_else(|| EngineError::Other("worker_owner_not_found".into()))?;
         if binding.owner_device_id != self.inner.config.device_id
@@ -1130,14 +1151,7 @@ impl WorkspaceHost {
             return Err(EngineError::Other("worker_owner_mismatch".into()));
         }
         let Some(worktree) = &binding.worktree else { return Ok(()); };
-        let identity = crate::repos::Repos::worker_checkout_identity(
-            &self.inner.config.device_id,
-            std::path::Path::new(&binding.project_path),
-            std::path::Path::new(&worktree.path),
-        ).map_err(|_| EngineError::Other("worker_checkout_identity_changed".into()))?;
-        if worktree.repo_path != binding.project_path
-            || worktree.checkout_id.as_deref() != Some(identity.id.as_str())
-        {
+        if worktree.repo_path != binding.project_path {
             return Err(EngineError::Other("worker_checkout_identity_changed".into()));
         }
         if let Some(chat) = self.inner.doc.chat(&binding.chat_id)?

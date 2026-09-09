@@ -712,6 +712,7 @@ async fn two_authenticated_engines_sync_workspace_streams_and_reconnect_backfill
                 message_id: "user-1".into(),
             },
         )
+        .await
         .expect("queue A prompt");
 
     let mut saw_remote_streaming = false;

@@ -139,20 +139,36 @@ fn checkout_git_dirs(root: &Path) -> Result<(PathBuf, PathBuf), EngineError> {
             return Err(EngineError::Other("worker_git_common_directory_invalid".into()));
         }
     }
+    Ok((git_dir, common_dir))
+}
+
+fn worker_checkout_dirs(project: &Path, path: &Path) -> Result<(PathBuf, PathBuf, PathBuf), EngineError> {
+    let (project_git_dir, project_common) = checkout_git_dirs(project)?;
+    let (git_dir, common_dir) = checkout_git_dirs(path)?;
+    if path == project || git_dir == common_dir || common_dir != project_common {
+        return Err(EngineError::Other("worker_checkout_repository_changed".into()));
+    }
+    Ok((project_git_dir, git_dir, common_dir))
+}
+
+async fn verify_effective_git_checkout(root: &Path, git_dir: &Path, common_dir: &Path) -> Result<(), EngineError> {
     // Git owns configuration semantics (including includes and config.worktree).
     // Matching pointer files alone does not prove where Git commands will act.
     // Compare the complete output rather than splitting newline-bearing paths.
-    let effective = std::process::Command::new("git")
-        .args(["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-dir", "--git-common-dir"])
+    let mut command = tokio::process::Command::new("git");
+    command.args(["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-dir", "--git-common-dir"])
         .current_dir(root)
         .env("ASHLER_INCREMENTAL_TSC_CHECKS", "false")
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .output()?;
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let effective = tokio::time::timeout(PATH_EXISTS_TIMEOUT, command.output()).await
+        .map_err(|_| EngineError::Other("worker_git_verification_timeout".into()))??;
     let expected = format!("{}\n{}\n{}\n", root.display(), git_dir.display(), common_dir.display());
     if !effective.status.success() || effective.stdout != expected.as_bytes() {
         return Err(EngineError::Other("worker_effective_git_checkout_changed".into()));
     }
-    Ok((git_dir, common_dir))
+    Ok(())
 }
 
 /// Best-effort home directory (the `ListFolders` default and worktree root base).
@@ -367,17 +383,23 @@ impl Repos {
         })
     }
 
-    /// Current linked-checkout identity for the synchronous worker fence. This
+    /// Current linked-checkout identity for the asynchronous worker fence. This
     /// checks Git-managed paths and effective root/common-dir configuration.
     /// Branch names and working changes are free to evolve; identity is not.
-    pub(crate) fn worker_checkout_identity(
+    pub(crate) async fn worker_checkout_identity(
         device_id: &str,
         project: &Path,
         path: &Path,
     ) -> Result<CheckoutIdentity, EngineError> {
-        let (_, project_common) = checkout_git_dirs(project)?;
-        let (git_dir, common_dir) = checkout_git_dirs(path)?;
-        if path == project || git_dir == common_dir || common_dir != project_common {
+        let (project_git_dir, git_dir, common_dir) = worker_checkout_dirs(project, path)?;
+        tokio::try_join!(
+            verify_effective_git_checkout(project, &project_git_dir, &common_dir),
+            verify_effective_git_checkout(path, &git_dir, &common_dir),
+        )?;
+        // Awaiting Git must not turn a changed pointer/backlink into a stale
+        // validation result. Re-read both linked layouts before returning.
+        if worker_checkout_dirs(project, path)? != (project_git_dir, git_dir.clone(), common_dir)
+        {
             return Err(EngineError::Other("worker_checkout_repository_changed".into()));
         }
         Ok(CheckoutIdentity {
@@ -385,6 +407,17 @@ impl Repos {
             root: path.to_path_buf(),
             git_dir,
         })
+    }
+
+    /// Recheck pointer/backlink identity without yielding after another worker's
+    /// awaited authorization. Effective Git configuration is checked separately.
+    pub(crate) fn worker_checkout_metadata_identity(
+        device_id: &str,
+        project: &Path,
+        path: &Path,
+    ) -> Result<String, EngineError> {
+        let (_, git_dir, _) = worker_checkout_dirs(project, path)?;
+        Ok(checkout_id(device_id, &git_dir))
     }
 
     async fn to_repo(&self, path: &Path) -> Result<Repo, EngineError> {
@@ -815,7 +848,7 @@ impl Repos {
         {
             return Err(EngineError::Other("worker path is not a linked checkout of this project".into()));
         }
-        let checkout = Self::worker_checkout_identity(&self.inner.device_id, &repo_path, &path)?;
+        let checkout = Self::worker_checkout_identity(&self.inner.device_id, &repo_path, &path).await?;
         let branch = self.current_branch(&path).await?;
         Ok(Worktree {
             repo_path: repo_path.to_string_lossy().to_string(),

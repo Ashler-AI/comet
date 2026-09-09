@@ -188,7 +188,7 @@ fn run_request(prompt: &str) -> RunRequest {
 
 /// Queue a run through the device-local API. This persists local provenance;
 /// remotely authored commands use the grant-bearing `Control::Start` path.
-fn queue_run(core: &EngineCore, chat_id: &str, message_id: &str) {
+async fn queue_run(core: &EngineCore, chat_id: &str, message_id: &str) {
     core.doc_host
         .queue_command(
             chat_id,
@@ -197,6 +197,7 @@ fn queue_run(core: &EngineCore, chat_id: &str, message_id: &str) {
                 message_id: message_id.into(),
             },
         )
+        .await
         .expect("queue command");
 }
 
@@ -280,7 +281,7 @@ async fn two_engines_share_a_workspace() {
     .await;
 
     // Run on A: B's workspace view shows the session Working, then Idle.
-    queue_run(&a, "chat-1", "m-1");
+    queue_run(&a, "chat-1", "m-1").await;
     let b_status = |wanted: SessionStatus| {
         let doc = b.workspace.doc_arc();
         move || {
@@ -435,6 +436,7 @@ async fn imported_session_chat_executes_on_its_remote_host() {
                 message_id: Some("remote-message".into()),
             },
         )
+        .await
         .expect("queue imported session message");
     let target_handle = b.doc_host.open(TARGET).unwrap();
     let target_doc = target_handle.doc();
@@ -473,7 +475,7 @@ async fn claim_on_first_command_creates_the_chat_row() {
     let link = bridge(&a, &b);
 
     // No CreateChat: the first run command claims the chat under A's device id.
-    queue_run(&a, "chat-claimed", "m-1");
+    queue_run(&a, "chat-claimed", "m-1").await;
     wait_for(
         || {
             b.workspace
@@ -530,7 +532,7 @@ async fn imported_session_ref_watches_and_never_claims_host_placement() {
         "imported session must remain non-hosted"
     );
 
-    queue_run(&core, SESSION_ID, "m-imported");
+    queue_run(&core, SESSION_ID, "m-imported").await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     let handle = core.doc_host.open(SESSION_ID).unwrap();
     assert_eq!(
@@ -570,7 +572,7 @@ async fn non_host_engine_leaves_remote_chats_commands_alone() {
     a.workspace
         .create_chat("chat-remote", "space-remote", None, None)
         .expect("create remote-hosted chat row");
-    queue_run(&a, "chat-remote", "m-1");
+    queue_run(&a, "chat-remote", "m-1").await;
 
     tokio::time::sleep(Duration::from_millis(400)).await;
     let handle = a.doc_host.open("chat-remote").expect("open chat");
@@ -614,7 +616,7 @@ async fn chat_config_selects_the_run_harness() {
             None,
         )
         .expect("create configured chat");
-    queue_run(&a, "chat-cfg", "m-1");
+    queue_run(&a, "chat-cfg", "m-1").await;
 
     // The configured harness (Codex, "From codex") ran — not the default Claude Code.
     let handle = a.doc_host.open("chat-cfg").expect("open chat");

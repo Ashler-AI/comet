@@ -4,8 +4,9 @@
 
 This change adds Crew-side source APIs; it does **not** add a Firstmate backend.
 The new endpoints and Rust regressions have **not been compiled or executed**.
-Local Cargo build/test/typechecks are prohibited for this task. Authorized remote
-verification is blocked by the uncertain accepted handoff recorded below. Do not
+Local Cargo build/test/typechecks are prohibited for this task. The captain has
+authorized verification-only GitHub Actions after local OpenCode review of each
+exact candidate. The uncertain accepted Scaffold handoff remains untouched. Do not
 install this branch over the running app or treat a source review as runtime proof.
 
 The assigned branch started at `82639e3eb9691da9bddce08c2879eb912686df0b`
@@ -128,7 +129,7 @@ Dirty files, untracked files, commits and branch renames are retained. A missing
 path with an existing branch or Git worktree registration is ambiguous and
 refuses; no reset, force-add, prune or deletion is attempted.
 
-The same synchronous identity guard runs before ordinary command admission and
+The same asynchronous identity guard runs before ordinary command admission and
 native execution, not only ensure/status/recover. It reads the current `.git`,
 `commondir` and `gitdir` backlink, requires the exact linked Git directory under
 the project's common directory, and recomputes Crew's existing device-scoped
@@ -138,6 +139,17 @@ or starting a turn. Branch renames and working-tree changes do not change identi
 Git's own `rev-parse` must also report the exact root, Git directory and common
 directory. This honors effective Git configuration instead of assuming pointer
 files capture `core.worktree` semantics. Readback failure refuses admission.
+
+Effective Git reads use Tokio subprocesses with `kill_on_drop` and the existing
+repository path-probe deadline. Admission retains the **same one per-chat command
+mutex** across immutable-ID lookup, awaited validation and durable append; readers
+and cancellation await that mutex instead of blocking the runtime. Current
+binding/lifecycle/config and pointer/backlink identity are rechecked after awaits.
+Dropping a pre-append admission future kills its outstanding Git child and releases
+the mutex without appending a command. A timeout/error refuses admission. These are
+engine-future semantics, not a transport guarantee: after a connection disappears,
+the adapter must still treat delivery as uncertain and retry the recorded ID/payload.
+No second lock, alternate control plane or non-cancellable validation task is added.
 
 Initial configuration is immutable for this worker identity. Generic config/cwd
 changes are detected and execution fails closed rather than silently running at a

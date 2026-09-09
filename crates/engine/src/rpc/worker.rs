@@ -110,7 +110,7 @@ impl EngineRpc {
             binding
         };
         if binding.worktree.is_some() {
-            self.workspace.worker_ready(&p.chat_id).map_err(failed)?;
+            self.workspace.worker_ready(&p.chat_id).await.map_err(failed)?;
             self.workspace.persist().map_err(failed)?;
             return self.worker_snapshot(binding);
         }
@@ -142,13 +142,13 @@ impl EngineRpc {
         self.worker_snapshot(binding)
     }
 
-    fn verify_worker_checkout(&self, binding: &WorkerBinding) -> Result<(), RpcError> {
-        self.workspace.validate_worker_binding(binding).map_err(failed)
+    async fn verify_worker_checkout(&self, binding: &WorkerBinding) -> Result<(), RpcError> {
+        self.workspace.validate_worker_binding(binding).await.map_err(failed)
     }
 
     pub(super) async fn read_worker_session(&self, p: WorkerSessionParams) -> Result<serde_json::Value, RpcError> {
         let binding = self.owned_worker(&p)?;
-        self.verify_worker_checkout(&binding)?;
+        self.verify_worker_checkout(&binding).await?;
         self.worker_snapshot(binding)
     }
 
@@ -205,14 +205,15 @@ impl EngineRpc {
         // Interrupt/close never touch the filesystem. Recovery of an unbound
         // reservation clears only its fence; identical ensure must finish it.
         if p.action == WorkerSessionAction::Recover {
-            self.verify_worker_checkout(&binding)?;
+            self.verify_worker_checkout(&binding).await?;
             if binding.worktree.is_some() && self.workspace.doc().chat(&p.chat_id).map_err(failed)?.is_none() {
                 return Err(failed("worker_chat_missing"));
             }
-            if self.sessions.worker_active(&p.chat_id) { return Err(failed("worker_still_active")); }
             if binding.paused || binding.closed {
-                self.doc_host.cancel_worker_commands(&p.chat_id).map_err(failed)?;
+                self.doc_host.cancel_worker_commands(&p.chat_id).await.map_err(failed)?;
             }
+            if self.sessions.worker_active(&p.chat_id) { return Err(failed("worker_still_active")); }
+            self.workspace.check_worker_binding_current(&binding).map_err(failed)?;
             binding.closed = false;
             binding.paused = false;
             self.workspace.set_chat_archived(&p.chat_id, false).map_err(failed)?;
@@ -223,7 +224,10 @@ impl EngineRpc {
             self.workspace.doc().set_worker_binding(&binding).map_err(failed)?;
             self.workspace.persist().map_err(failed)?;
             self.sessions.quiesce_worker(&p.chat_id).await.map_err(failed)?;
-            self.doc_host.cancel_worker_commands(&p.chat_id).map_err(failed)?;
+            self.doc_host.cancel_worker_commands(&p.chat_id).await.map_err(failed)?;
+            if self.workspace.doc().worker_binding(&p.chat_id).map_err(failed)?.as_ref() != Some(&binding) {
+                return Err(failed("worker_binding_changed"));
+            }
             if binding.closed {
                 // Never call Mutate setChatArchived: that may stage deletion.
                 self.workspace.doc().remove_worktree_deletion(&p.chat_id).map_err(failed)?;

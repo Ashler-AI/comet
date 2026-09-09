@@ -403,7 +403,7 @@ pub struct ChatDocHandle {
     /// local handle adopts its trusted Scaffold projection.
     room_generation: AtomicU64,
     /// Serializes idempotent command-id checks with appends for this doc.
-    command_lock: Mutex<()>,
+    command_lock: tokio::sync::Mutex<()>,
     snapshot_lock: Mutex<()>,
     room_join_started: AtomicBool,
     /// Doc subscription (drop = unsubscribe) — bumps the change watch on every commit.
@@ -1194,7 +1194,7 @@ impl DocHost {
             room_projection: Mutex::new(projection.cloned()),
             room: Mutex::new(None),
             room_generation: AtomicU64::new(0),
-            command_lock: Mutex::new(()),
+            command_lock: tokio::sync::Mutex::new(()),
             snapshot_lock: Mutex::new(()),
             room_join_started: AtomicBool::new(false),
             _sub: sub,
@@ -1489,17 +1489,17 @@ impl DocHost {
     /// Composer path: append an immutable pending command entry (rule 1). Durable by
     /// construction — the change subscription kicks the drain, so a local host executes
     /// immediately and an offline doc simply holds the entry until it syncs.
-    pub fn queue_command(
+    pub async fn queue_command(
         &self,
         chat_id: &str,
         payload: SessionCommandPayload,
     ) -> Result<String, EngineError> {
         let id = new_id();
-        self.queue_command_with_id(chat_id, &id, payload)?;
+        self.queue_command_with_id(chat_id, &id, payload).await?;
         Ok(id)
     }
 
-    fn authorize_worker_peer(
+    async fn authorize_worker_peer(
         &self,
         chat_id: &str,
         command_id: &str,
@@ -1530,7 +1530,19 @@ impl DocHost {
         {
             return Err(denied());
         }
-        workspace.worker_ready(source_chat_id)?;
+        workspace.worker_ready(source_chat_id).await?;
+        workspace.check_worker_binding_current(&binding)?;
+        workspace.check_worker_binding_current(&child)?;
+        if let Some(worktree) = &binding.worktree {
+            let checkout_id = crate::repos::Repos::worker_checkout_metadata_identity(
+                self.device_id(),
+                std::path::Path::new(&binding.project_path),
+                std::path::Path::new(&worktree.path),
+            )?;
+            if worktree.checkout_id.as_deref() != Some(checkout_id.as_str()) {
+                return Err(EngineError::Other("worker_checkout_identity_changed".into()));
+            }
+        }
         // Avoid nesting command mutexes for concurrent opposite-direction
         // replies. Atomic document reads plus the immutable local proof suffice.
         let source = self.open(source_chat_id)?;
@@ -1556,7 +1568,7 @@ impl DocHost {
 
     /// Append using a caller-supplied durable id. Retries return the immutable
     /// existing command instead of adding or replacing a ledger entry.
-    pub fn queue_command_with_id(
+    pub async fn queue_command_with_id(
         &self,
         chat_id: &str,
         command_id: &str,
@@ -1575,7 +1587,7 @@ impl DocHost {
         if command_id.starts_with(WORKER_PEER_AUTHORITY_KEY_PREFIX) {
             return Err(EngineError::Other("invalid_command_id".into()));
         }
-        let _guard = lock(&handle.command_lock);
+        let _guard = handle.command_lock.lock().await;
         if let Some(existing) = handle
             .doc
             .read_commands()?
@@ -1588,7 +1600,7 @@ impl DocHost {
             {
                 return Err(EngineError::Other("command_id_conflict".into()));
             }
-            if let Some(binding) = self.authorize_worker_peer(chat_id, command_id, &payload)?
+            if let Some(binding) = self.authorize_worker_peer(chat_id, command_id, &payload).await?
                 && !self.inner.store.is_trusted_local_command(&worker_peer_authority_key(&binding, &existing)?)?
             {
                 return Err(EngineError::Other("worker_peer_provenance_missing".into()));
@@ -1596,10 +1608,20 @@ impl DocHost {
             self.persist_handle(&handle)?;
             return Ok(existing);
         }
-        if let Some(workspace) = self.workspace() {
-            workspace.worker_ready(chat_id)?;
+        let binding = match self.workspace() {
+            Some(workspace) => {
+                let binding = workspace.doc().worker_binding(chat_id)?;
+                workspace.worker_ready(chat_id).await?;
+                binding
+            }
+            None => None,
+        };
+        let worker_peer = self.authorize_worker_peer(chat_id, command_id, &payload).await?;
+        if let Some(binding) = &binding && let Some(workspace) = self.workspace() {
+            // Child authorization may await its own checkout. Recheck the
+            // target fence after the last await, while retaining command_lock.
+            workspace.check_worker_binding_current(binding)?;
         }
-        let worker_peer = self.authorize_worker_peer(chat_id, command_id, &payload)?;
         let now = now_ms();
         let based_on = handle.doc.last_message_id().map(|id| CommandBasedOn {
             turn_id: Some(id),
@@ -1674,13 +1696,13 @@ impl DocHost {
         Ok(entry)
     }
 
-    pub fn command_entry(
+    pub async fn command_entry(
         &self,
         chat_id: &str,
         command_id: &str,
     ) -> Result<Option<SessionCommandEntry>, EngineError> {
         let handle = self.open(chat_id)?;
-        let _guard = lock(&handle.command_lock);
+        let _guard = handle.command_lock.lock().await;
         Ok(handle
             .doc
             .read_commands()?
@@ -1688,9 +1710,9 @@ impl DocHost {
             .find(|entry| entry.id == command_id))
     }
 
-    pub fn chat_has_commands(&self, chat_id: &str) -> Result<bool, EngineError> {
+    pub async fn chat_has_commands(&self, chat_id: &str) -> Result<bool, EngineError> {
         let handle = self.open(chat_id)?;
-        let _guard = lock(&handle.command_lock);
+        let _guard = handle.command_lock.lock().await;
         Ok(!handle.doc.read_commands()?.is_empty())
     }
 
@@ -2145,19 +2167,32 @@ impl DocHost {
     ) -> Result<(SessionCommandStatus, Option<String>), EngineError> {
         let chat_id = &handle.chat_id;
         if self.workspace().is_some_and(|workspace| workspace.doc().worker_binding(chat_id).ok().flatten().is_some())
-            && let Some(current) = self.command_entry(chat_id, &entry.id)?
+            && let Some(current) = self.command_entry(chat_id, &entry.id).await?
             && current.status != SessionCommandStatus::Pending
         {
             return Ok((current.status, current.resolution));
         }
-        if let Some(workspace) = self.workspace() {
-            workspace.worker_ready(chat_id)?;
-        }
-        if let Some(binding) = self.authorize_worker_peer(chat_id, &entry.id, &entry.payload)?
+        let binding = match self.workspace() {
+            Some(workspace) => {
+                let binding = workspace.doc().worker_binding(chat_id)?;
+                workspace.worker_ready(chat_id).await?;
+                binding
+            }
+            None => None,
+        };
+        if let Some(binding) = self.authorize_worker_peer(chat_id, &entry.id, &entry.payload).await?
             && (entry.issued_by != self.device_id()
                 || !self.inner.store.is_trusted_local_command(&worker_peer_authority_key(&binding, entry)?)?)
         {
             return Err(EngineError::Other("worker_peer_provenance_missing".into()));
+        }
+        if let Some(binding) = &binding && let Some(workspace) = self.workspace() {
+            workspace.check_worker_binding_current(binding)?;
+            if let Some(current) = handle.doc.read_commands()?.into_iter().find(|command| command.id == entry.id)
+                && current.status != SessionCommandStatus::Pending
+            {
+                return Ok((current.status, current.resolution));
+            }
         }
         let carries_user_input = match &entry.payload {
             SessionCommandPayload::Run { .. }
@@ -2830,9 +2865,9 @@ impl DocHost {
         self.persist_handle(&self.open(chat_id)?)
     }
 
-    pub(crate) fn cancel_worker_commands(&self, chat_id: &str) -> Result<(), EngineError> {
+    pub(crate) async fn cancel_worker_commands(&self, chat_id: &str) -> Result<(), EngineError> {
         let handle = self.open(chat_id)?;
-        let _guard = lock(&handle.command_lock);
+        let _guard = handle.command_lock.lock().await;
         for entry in handle.doc.read_commands()? {
             if entry.status == SessionCommandStatus::Pending {
                 self.resolve_command(&handle, &entry, SessionCommandStatus::Cancelled, Some("worker stopped"));
@@ -3306,6 +3341,7 @@ mod authority_tests {
         };
         let exact_id = host
             .queue_command("session-a", exact)
+            .await
             .expect("the exact relayed command should execute on its attached host");
         let exact_handle = host
             .open_projection(
@@ -3356,7 +3392,7 @@ mod authority_tests {
             source: AgentSessionSource::Scaffold,
             action: Box::new(SessionControlAction::Pause {}),
         };
-        let error = host.queue_command("session-b", mismatched).unwrap_err();
+        let error = host.queue_command("session-b", mismatched).await.unwrap_err();
         assert!(
             error
                 .to_string()
@@ -3589,6 +3625,7 @@ mod authority_tests {
                     }),
                 },
             )
+            .await
             .unwrap();
         let first_handle = first_host.open("chat-a").unwrap();
         first_host.save_snapshot(&first_handle);

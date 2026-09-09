@@ -1784,9 +1784,10 @@ impl RpcService for EngineRpc {
                 let command_id = if let Some(command_id) = p.command_id {
                     self.doc_host
                         .queue_command_with_id(&p.chat_id, &command_id, p.command)
+                        .await
                         .map(|entry| entry.id)
                 } else {
-                    self.doc_host.queue_command(&p.chat_id, p.command)
+                    self.doc_host.queue_command(&p.chat_id, p.command).await
                 }
                 .map_err(|e| RpcError::Failed(e.to_string()))?;
                 if activates_chat {
@@ -1853,6 +1854,7 @@ impl RpcService for EngineRpc {
                             hop_count: 0,
                         },
                     )
+                    .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 let thread_id = match &existing.payload {
                     SessionCommandPayload::PeerMessage {
@@ -1893,6 +1895,7 @@ impl RpcService for EngineRpc {
                 let original = self
                     .doc_host
                     .command_entry(&session_id, &p.command_id)
+                    .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?
                     .ok_or_else(|| RpcError::Failed("peer_command_not_found".into()))?;
                 let (target_chat_id, thread_id, hop_count) = match original.payload {
@@ -1949,6 +1952,7 @@ impl RpcService for EngineRpc {
                             hop_count: hop_count + 1,
                         },
                     )
+                    .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 match &queued.payload {
                     SessionCommandPayload::PeerMessage {
@@ -2386,6 +2390,7 @@ impl RpcService for EngineRpc {
                 if self
                     .doc_host
                     .chat_has_commands(&p.chat_id)
+                    .await
                     .map_err(|error| RpcError::Failed(error.to_string()))?
                 {
                     return Err(RpcError::Failed(

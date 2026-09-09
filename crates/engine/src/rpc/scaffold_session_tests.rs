@@ -594,6 +594,7 @@ async fn prepared_handoff_persists_a_distinct_chat_and_remote_resume_command() {
             "owner@example.com".into(),
             prepared,
         )
+        .await
         .unwrap();
     assert_ne!(receipt.chat_id, source_id);
     assert_eq!(core.workspace.doc().chat(source_id).unwrap(), Some(source));
@@ -608,6 +609,7 @@ async fn prepared_handoff_persists_a_distinct_chat_and_remote_resume_command() {
     let command = core
         .doc_host
         .command_entry(&receipt.chat_id, &receipt.command_id)
+        .await
         .unwrap()
         .unwrap();
     let SessionCommandPayload::Control {

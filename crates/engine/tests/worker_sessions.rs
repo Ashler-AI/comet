@@ -357,3 +357,394 @@ async fn stopped_provisioning_recovers_same_reservation_without_resetting_partia
         core.shutdown().await;
     }
 }
+
+#[cfg(unix)]
+mod async_admission {
+    use super::*;
+    use comet_doc::SessionCommandPayload;
+    use std::ffi::CString;
+    use std::io::Write;
+    use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+    use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::sync::{atomic::{AtomicBool, Ordering}, mpsc};
+    use std::time::Instant;
+
+    const WAIT: Duration = Duration::from_secs(10);
+
+    // Only this disposable worker's Git config includes the FIFO. No PATH or
+    // process-global environment changes, shell wrappers, or fake Git results.
+    // The writer opens nonblocking: success proves Git reached the config read.
+    // An independent watchdog closes it even if a regressed synchronous Git
+    // call blocks the current-thread runtime. Drop also joins that thread, so
+    // setup errors and cancelled tests cannot strand a writer/blocking task.
+    struct GitStall {
+        config: PathBuf,
+        original_config: Option<Vec<u8>>,
+        fifo: PathBuf,
+        writer: Arc<Mutex<Option<std::fs::File>>>,
+        reached: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+        stop: mpsc::Sender<()>,
+        watchdog: Option<std::thread::JoinHandle<()>>,
+        expired: Arc<AtomicBool>,
+    }
+
+    impl GitStall {
+        async fn install(core: &EngineCore, project: &Path, worker: &Path) -> Self {
+            let git_dir = core.repos.checkout_identity(worker).await.unwrap().git_dir;
+            git(project, &["config", "extensions.worktreeConfig", "true"]);
+            let config = git_dir.join("config.worktree");
+            let original_config = match std::fs::read(&config) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("read worker config: {error}"),
+            };
+            let fifo = git_dir.join("admission-config.fifo");
+            let c_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0,
+                "mkfifo: {}", std::io::Error::last_os_error());
+            let writer = Arc::new(Mutex::new(None));
+            let expired = Arc::new(AtomicBool::new(false));
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (stop_tx, stop_rx) = mpsc::channel();
+            let mut stall = Self {
+                config, original_config, fifo, writer, reached: Some(ready_rx),
+                stop: stop_tx, watchdog: None, expired,
+            };
+            let mut contents = stall.original_config.clone().unwrap_or_default();
+            contents.extend_from_slice(format!("\n[include]\n\tpath = {}\n",
+                serde_json::to_string(stall.fifo.to_str().unwrap()).unwrap()).as_bytes());
+            std::fs::write(&stall.config, contents).unwrap();
+            let fifo = stall.fifo.clone();
+            let writer = stall.writer.clone();
+            let expired = stall.expired.clone();
+            let config = stall.config.clone();
+            let original_config = stall.original_config.clone();
+            stall.watchdog = Some(std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(8);
+                loop {
+                    if stop_rx.try_recv().is_ok() { return; }
+                    if Instant::now() >= deadline {
+                        expired.store(true, Ordering::SeqCst);
+                        let _ = ready_tx.send(Err("Git never opened the FIFO".into()));
+                        return;
+                    }
+                    match std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(&fifo) {
+                        Ok(file) => {
+                            *writer.lock() = Some(file);
+                            let _ = ready_tx.send(Ok(()));
+                            if matches!(stop_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())),
+                                Err(mpsc::RecvTimeoutError::Timeout)) {
+                                expired.store(true, Ordering::SeqCst);
+                            }
+                            // A blocking implementation may run another Git
+                            // probe before the Tokio test can regain control.
+                            restore_config(&config, original_config.as_deref());
+                            writer.lock().take();
+                            return;
+                        }
+                        Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(error.to_string()));
+                            return;
+                        }
+                    }
+                }
+            }));
+            stall
+        }
+
+        async fn reached<F: Future>(&mut self, admission: Pin<&mut F>) {
+            let ready = self.reached.take().unwrap();
+            tokio::select! {
+                result = ready => result.expect("FIFO watchdog disappeared").expect("FIFO reader handshake"),
+                _ = admission => panic!("admission finished before the stalled Git read"),
+            }
+            assert!(!self.expired.load(Ordering::SeqCst), "runtime was blocked until watchdog released Git");
+        }
+
+        fn restore_config(&self) {
+            restore_config(&self.config, self.original_config.as_deref());
+        }
+
+        fn release(&self) {
+            // Future Git probes must not open a FIFO with no remaining writer.
+            self.restore_config();
+            self.writer.lock().take();
+        }
+
+        async fn assert_reader_killed(&self) {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let result = self.writer.lock().as_mut().expect("watchdog released writer")
+                        .write_all(b"#\n");
+                    match result {
+                        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => break,
+                        Ok(()) => {},
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {},
+                        Err(error) => panic!("FIFO write: {error}"),
+                    }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            }).await.expect("cancelled Git must close its FIFO reader, not survive in the background");
+            assert!(!self.expired.load(Ordering::SeqCst));
+        }
+    }
+
+    impl Drop for GitStall {
+        fn drop(&mut self) {
+            self.restore_config();
+            let _ = self.stop.send(());
+            if let Some(watchdog) = self.watchdog.take() { let _ = watchdog.join(); }
+            self.writer.lock().take();
+            let _ = std::fs::remove_file(&self.fifo);
+        }
+    }
+
+    fn restore_config(path: &Path, original: Option<&[u8]>) {
+        match original {
+            Some(bytes) => { let _ = std::fs::write(path, bytes); }
+            None => { let _ = std::fs::remove_file(path); }
+        }
+    }
+
+    // A std mutex held across an await can deadlock the runtime itself; no
+    // Tokio timeout can rescue that regression. Run lock-contention cases in
+    // an exact-filtered child test process with a parent-side wall-clock bound.
+    // TMPDIR is scoped only to that child so its disposable repos are removed
+    // by the parent even if the deadlocked child must be killed.
+    fn supervise_contention(name: &str) -> bool {
+        const MARKER: &str = "COMET_WORKER_ADMISSION_CHILD";
+        if std::env::var(MARKER).ok().as_deref() == Some(name) { return false; }
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut child = Child(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("async_admission::{name}"), "--nocapture"])
+            .env(MARKER, name).env("TMPDIR", root.path())
+            .env("ASHLER_INCREMENTAL_TSC_CHECKS", "false").spawn().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success(), "{name}: child regression failed: {status}");
+                return true;
+            }
+            assert!(Instant::now() < deadline, "{name}: command mutex deadlocked the current-thread runtime");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn payload(id: &str, text: &str) -> SessionCommandPayload {
+        SessionCommandPayload::PeerMessage {
+            source_chat_id: OWNER.into(), thread_id: id.into(), reply_to: None,
+            hop_count: 0, text: text.into(),
+        }
+    }
+
+    async fn create_worker(core: &EngineCore, project: &Path) -> (RpcClient, PathBuf) {
+        owners(core, project);
+        let client = comet_rpc::memory_client(core.rpc_service());
+        let created = client.call(methods::ENSURE_WORKER_SESSION, spec(project)).await.unwrap();
+        let worker = PathBuf::from(created["chat"]["cwd"].as_str().unwrap());
+        (client, worker)
+    }
+
+    fn assert_not_admitted(core: &EngineCore, requests: &Mutex<Vec<RunRequest>>) {
+        let handle = core.doc_host.open(WORKER).unwrap();
+        assert!(handle.doc().read_commands().unwrap().is_empty(), "pre-admission rejection must not append a command");
+        assert!(handle.doc().read_entry_window(None, 64).unwrap().entries.is_empty(),
+            "pre-admission rejection must not append a turn");
+        assert!(requests.lock().is_empty(), "pre-admission rejection must not invoke the harness");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stalled_git_yields_and_dropped_admission_kills_child_without_append() {
+        let root = tempfile::tempdir().unwrap();
+        let project = init_repo(root.path());
+        let (core, requests) = engine(root.path());
+        let (_client, worker) = create_worker(&core, &project).await;
+        let mut stall = GitStall::install(&core, &project, &worker).await;
+        {
+            // Drop the actual DocHost future, not an RPC transport waiter.
+            let admission = core.doc_host.queue_command_with_id(WORKER, "dropped", payload("dropped", "must not run"));
+            tokio::pin!(admission);
+            stall.reached(admission.as_mut()).await;
+            let heartbeat = tokio::spawn(async { tokio::task::yield_now().await; 42 });
+            assert_eq!(tokio::time::timeout(Duration::from_secs(1), heartbeat).await.unwrap().unwrap(), 42);
+            assert!(futures::poll!(admission.as_mut()).is_pending(), "Git must remain stalled while scheduler progresses");
+            assert_not_admitted(&core, &requests);
+        }
+        stall.assert_reader_killed().await;
+        assert!(tokio::time::timeout(Duration::from_secs(1), core.doc_host.command_entry(WORKER, "dropped"))
+            .await.unwrap().unwrap().is_none(), "cancelled admission must release the command lock");
+        assert_not_admitted(&core, &requests);
+        drop(stall);
+        core.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stalled_git_deadline_kills_child_and_fails_admission_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let project = init_repo(root.path());
+        let (core, requests) = engine(root.path());
+        let (_client, worker) = create_worker(&core, &project).await;
+        let mut stall = GitStall::install(&core, &project, &worker).await;
+        let admission = core.doc_host.queue_command_with_id(WORKER, "deadline", payload("deadline", "must not run"));
+        tokio::pin!(admission);
+        stall.reached(admission.as_mut()).await;
+        // The outer bound is deliberately longer than Repos' own path-probe
+        // deadline. An Err returned by admission proves its timeout, not ours.
+        assert!(tokio::time::timeout(Duration::from_secs(5), admission.as_mut()).await
+            .expect("Git path-probe deadline must be enforced").is_err());
+        stall.assert_reader_killed().await;
+        assert_not_admitted(&core, &requests);
+        drop(stall);
+        core.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn git_config_failure_rejects_admission_without_append_or_harness() {
+        let root = tempfile::tempdir().unwrap();
+        let project = init_repo(root.path());
+        let (core, requests) = engine(root.path());
+        let (_client, worker) = create_worker(&core, &project).await;
+        let mut stall = GitStall::install(&core, &project, &worker).await;
+        let admission = core.doc_host.queue_command_with_id(WORKER, "git-failed", payload("git-failed", "must not run"));
+        tokio::pin!(admission);
+        stall.reached(admission.as_mut()).await;
+        stall.writer.lock().as_mut().unwrap().write_all(b"[unterminated section\n").unwrap();
+        stall.release();
+        assert!(tokio::time::timeout(WAIT, admission.as_mut()).await.unwrap().is_err());
+        assert_not_admitted(&core, &requests);
+        drop(stall);
+        core.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_command_retries_share_one_admission_and_reject_conflicting_payload() {
+        if supervise_contention("concurrent_command_retries_share_one_admission_and_reject_conflicting_payload") { return; }
+        let root = tempfile::tempdir().unwrap();
+        let project = init_repo(root.path());
+        let (core, _requests) = engine(root.path());
+        let (_client, worker) = create_worker(&core, &project).await;
+        let mut stall = GitStall::install(&core, &project, &worker).await;
+        let first = core.doc_host.queue_command_with_id(WORKER, "same-id", payload("same-id", "[hold]"));
+        tokio::pin!(first);
+        stall.reached(first.as_mut()).await;
+        let retry = core.doc_host.queue_command_with_id(WORKER, "same-id", payload("same-id", "[hold]"));
+        let conflict = core.doc_host.queue_command_with_id(WORKER, "same-id", payload("same-id", "different"));
+        let lookup = core.doc_host.command_entry(WORKER, "same-id");
+        tokio::pin!(retry, conflict, lookup);
+        assert!(futures::poll!(retry.as_mut()).is_pending());
+        assert!(futures::poll!(conflict.as_mut()).is_pending());
+        assert!(futures::poll!(lookup.as_mut()).is_pending(), "command_entry must share the admission lock");
+        stall.release();
+        let (first, retry, conflict, lookup) = tokio::time::timeout(WAIT, async {
+            tokio::join!(first.as_mut(), retry.as_mut(), conflict.as_mut(), lookup.as_mut())
+        }).await.unwrap();
+        let first = first.unwrap();
+        let retry = retry.unwrap();
+        assert_eq!(first.id, retry.id);
+        assert_eq!(first.payload, retry.payload);
+        assert_eq!(first.issued_at, retry.issued_at);
+        assert!(conflict.unwrap_err().to_string().contains("command_id_conflict"));
+        assert_eq!(lookup.unwrap().unwrap().payload, first.payload);
+        let commands = core.doc_host.open(WORKER).unwrap().doc().read_commands().unwrap();
+        assert_eq!(commands.len(), 1, "concurrent retries must produce one durable admission");
+        assert_eq!(commands[0].payload, first.payload);
+        drop(stall);
+        core.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn awaited_git_rechecks_worker_binding_pause_and_config_before_admission() {
+        for change in ["binding", "paused", "closed", "config", "checkout-pointer"] {
+            let root = tempfile::tempdir().unwrap();
+            let project = init_repo(root.path());
+            let (core, requests) = engine(root.path());
+            let (_client, worker) = create_worker(&core, &project).await;
+            let mut stall = GitStall::install(&core, &project, &worker).await;
+            let admission = core.doc_host.queue_command_with_id(WORKER, "changed", payload("changed", "must not run"));
+            tokio::pin!(admission);
+            stall.reached(admission.as_mut()).await;
+            let mut binding = core.workspace.doc().worker_binding(WORKER).unwrap().unwrap();
+            match change {
+                "binding" => {
+                    binding.owner_chat_id = OTHER.into();
+                    core.workspace.doc().set_worker_binding(&binding).unwrap();
+                }
+                "paused" => {
+                    binding.paused = true;
+                    core.workspace.doc().set_worker_binding(&binding).unwrap();
+                }
+                "config" => {
+                    let mut config = binding.config;
+                    config.reasoning = Some(ReasoningLevel::Low);
+                    core.workspace.set_chat_config(WORKER, &config).unwrap();
+                }
+                "closed" => {
+                    binding.closed = true;
+                    core.workspace.doc().set_worker_binding(&binding).unwrap();
+                }
+                "checkout-pointer" => {
+                    std::fs::write(worker.join(".git"), "gitdir: /missing-worker-checkout\n").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            stall.release();
+            let error = tokio::time::timeout(WAIT, admission.as_mut()).await.unwrap().unwrap_err();
+            if change != "checkout-pointer" {
+                assert!(error.to_string().contains("worker_binding_changed"), "{change}: {error}");
+            }
+            assert_not_admitted(&core, &requests);
+            drop(stall);
+            core.shutdown().await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_interrupt_and_close_fence_admission_while_waiting_for_command_lock() {
+        if supervise_contention("worker_interrupt_and_close_fence_admission_while_waiting_for_command_lock") { return; }
+        for action in ["interrupt", "close"] {
+            let root = tempfile::tempdir().unwrap();
+            let project = init_repo(root.path());
+            let (core, requests) = engine(root.path());
+            let (client, worker) = create_worker(&core, &project).await;
+            let mut stall = GitStall::install(&core, &project, &worker).await;
+            let admission = core.doc_host.queue_command_with_id(WORKER, "stopped", payload("stopped", "must not run"));
+            tokio::pin!(admission);
+            stall.reached(admission.as_mut()).await;
+            let stopping = control(&client, action);
+            tokio::pin!(stopping);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    tokio::select! {
+                        _ = stopping.as_mut() => panic!("lifecycle bypassed the held command lock"),
+                        _ = tokio::task::yield_now() => {},
+                    }
+                    if core.workspace.doc().worker_binding(WORKER).unwrap().unwrap().paused { break; }
+                }
+            }).await.expect("lifecycle must publish its pause fence without blocking the runtime");
+            let lookup = core.doc_host.command_entry(WORKER, "stopped");
+            tokio::pin!(lookup);
+            assert!(futures::poll!(lookup.as_mut()).is_pending());
+            stall.release();
+            let (admission, stopped, lookup) = tokio::time::timeout(WAIT, async {
+                tokio::join!(admission.as_mut(), stopping.as_mut(), lookup.as_mut())
+            }).await.unwrap();
+            assert!(admission.is_err());
+            assert_eq!(stopped["state"], if action == "close" { "closed" } else { "interrupted" });
+            assert!(lookup.unwrap().is_none());
+            assert_not_admitted(&core, &requests);
+            drop(stall);
+            core.shutdown().await;
+        }
+    }
+}

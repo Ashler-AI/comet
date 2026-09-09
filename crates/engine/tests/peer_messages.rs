@@ -173,12 +173,13 @@ fn host_chats(core: &EngineCore, chat_ids: &[&str]) {
     }
 }
 
-async fn wait_for<F>(mut predicate: F, what: &str)
+async fn wait_for<F, Fut>(mut predicate: F, what: &str)
 where
-    F: FnMut() -> bool,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
 {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while !predicate() {
+    while !predicate().await {
         assert!(
             tokio::time::Instant::now() < deadline,
             "timed out waiting for {what}"
@@ -187,9 +188,10 @@ where
     }
 }
 
-fn command(core: &EngineCore, chat_id: &str, command_id: &str) -> Option<SessionCommandEntry> {
+async fn command(core: &EngineCore, chat_id: &str, command_id: &str) -> Option<SessionCommandEntry> {
     core.doc_host
         .command_entry(chat_id, command_id)
+        .await
         .expect("read command entry")
 }
 
@@ -309,8 +311,9 @@ async fn peer_message_provenance_preserves_delivery_reply_correlation_and_restar
         .expect("send peer message");
     let delivered = peer_message_prompt(SOURCE, COMMAND, TARGET, COMMAND, "review the patch");
     wait_for(
-        || {
+        || async {
             command(&core, TARGET, COMMAND)
+                .await
                 .is_some_and(|entry| entry.status == SessionCommandStatus::Applied)
                 && message_text(&core, TARGET, COMMAND).as_deref() == Some(delivered.as_str())
                 && requests
@@ -351,15 +354,16 @@ async fn peer_message_provenance_preserves_delivery_reply_correlation_and_restar
     let reply_id = reply["commandId"].as_str().expect("reply command id");
     assert_eq!(reply["threadId"], COMMAND);
     wait_for(
-        || {
+        || async {
             command(&core, SOURCE, reply_id)
+                .await
                 .is_some_and(|entry| entry.status == SessionCommandStatus::Applied)
         },
         "derived reply delivery",
     )
     .await;
 
-    let reply_entry = command(&core, SOURCE, reply_id).expect("reply on derived source session");
+    let reply_entry = command(&core, SOURCE, reply_id).await.expect("reply on derived source session");
     assert!(matches!(
         &reply_entry.payload,
         SessionCommandPayload::PeerMessage {
@@ -402,7 +406,7 @@ async fn peer_message_provenance_preserves_delivery_reply_correlation_and_restar
         let restored = entries(&restarted, chat_id).into_iter().find(|e| e.id == expected.id).unwrap();
         assert_eq!(restored, expected);
         assert!(restored.is_peer_message());
-        assert_eq!(command(&restarted, chat_id, &restored.id).unwrap().status, SessionCommandStatus::Applied);
+        assert_eq!(command(&restarted, chat_id, &restored.id).await.unwrap().status, SessionCommandStatus::Applied);
     }
     assert!(restart_requests.lock().await.is_empty(), "restart must not redeliver settled peer commands");
     restarted.shutdown().await;
@@ -425,11 +429,13 @@ async fn peer_reply_rejects_a_delivered_hop_eight_command() {
                 hop_count: 8,
             },
         )
+        .await
         .expect("queue hop-eight command");
     let delivered = peer_message_prompt(SOURCE, COMMAND, TARGET, HOP_COMMAND, "final hop");
     wait_for(
-        || {
+        || async {
             command(&core, TARGET, HOP_COMMAND)
+                .await
                 .is_some_and(|entry| entry.status == SessionCommandStatus::Applied)
                 && message_text(&core, TARGET, HOP_COMMAND).as_deref() == Some(delivered.as_str())
                 && requests
@@ -501,8 +507,9 @@ async fn live_waiter_returns_reply_without_double_delivering_to_harness() {
             .await
     });
     wait_for(
-        || {
+        || async {
             command(&core, TARGET, WAIT_COMMAND)
+                .await
                 .is_some_and(|entry| entry.status == SessionCommandStatus::Applied)
                 && requests.try_lock().is_ok_and(|logged| {
                     logged.iter().any(|request| request.prompt == target_prompt)
@@ -537,8 +544,9 @@ async fn live_waiter_returns_reply_without_double_delivering_to_harness() {
     assert_eq!(send_result["reply"]["sourceChatId"], TARGET);
 
     wait_for(
-        || {
+        || async {
             command(&core, SOURCE, &reply_id)
+                .await
                 .is_some_and(|entry| entry.status == SessionCommandStatus::Applied)
         },
         "waiter reply status",
@@ -622,8 +630,9 @@ async fn timed_out_waiter_allows_a_late_reply_to_deliver_normally() {
         .to_owned();
     let reply_prompt = peer_message_prompt(TARGET, LATE_COMMAND, SOURCE, &reply_id, "late answer");
     wait_for(
-        || {
+        || async {
             command(&core, SOURCE, &reply_id)
+                .await
                 .is_some_and(|entry| entry.status == SessionCommandStatus::Applied)
                 && requests.try_lock().is_ok_and(|logged| {
                     logged.iter().any(|request| request.prompt == reply_prompt)
@@ -685,8 +694,8 @@ async fn peer_visibility_preserves_active_steering_and_turn_boundary_delivery() 
         })).await.unwrap();
         let delivered = tokio::time::timeout(Duration::from_secs(5), steering.recv())
             .await.unwrap().unwrap();
-        wait_for(|| command(&core, TARGET, COMMAND)
-            .is_some_and(|entry| entry.status == SessionCommandStatus::Applied), "active peer delivery").await;
+        wait_for(|| async { command(&core, TARGET, COMMAND).await
+            .is_some_and(|entry| entry.status == SessionCommandStatus::Applied) }, "active peer delivery").await;
         let peer = entries(&core, TARGET).into_iter().find(|e| e.id == COMMAND).unwrap();
         assert!(peer.is_peer_message());
         assert_eq!(peer.status, Some(expected_status));
@@ -817,7 +826,7 @@ async fn child_reply_reaches_worker_waiter_and_survives_durable_reconnect() {
             "text": "answer parent", "wait": true, "timeoutMs": 4000,
         })).await.unwrap()
     });
-    wait_for(|| command(&core, TARGET, WAIT_COMMAND).is_some_and(|c| c.status == SessionCommandStatus::Applied), "child applied request").await;
+    wait_for(|| async { command(&core, TARGET, WAIT_COMMAND).await.is_some_and(|c| c.status == SessionCommandStatus::Applied) }, "child applied request").await;
     let reply = client.call(methods::REPLY_PEER_MESSAGE, serde_json::json!({
         "sessionId": TARGET, "commandId": WAIT_COMMAND, "text": "child answer",
     })).await.unwrap();
@@ -827,13 +836,13 @@ async fn child_reply_reaches_worker_waiter_and_survives_durable_reconnect() {
     assert_eq!(result["reply"]["sourceChatId"], TARGET);
     assert_eq!(result["reply"]["text"], "child answer");
     assert_eq!(reply["commandId"], reply_id);
-    wait_for(|| command(&core, SOURCE, &reply_id).is_some_and(|c| c.status == SessionCommandStatus::Applied), "parent waiter reply").await;
+    wait_for(|| async { command(&core, SOURCE, &reply_id).await.is_some_and(|c| c.status == SessionCommandStatus::Applied) }, "parent waiter reply").await;
     assert_eq!(requests.lock().await.len(), 1, "live reply must not dispatch another turn");
     assert_eq!(entries(&core, SOURCE).iter().find(|e| e.id == reply_id).unwrap().peer_message.as_ref().unwrap().reply_to.as_deref(), Some(WAIT_COMMAND));
     client.call(methods::SEND_PEER_MESSAGE, serde_json::json!({
         "sourceChatId": SOURCE, "targetChatId": TARGET, "commandId": LATE_COMMAND, "text": "answer after restart",
     })).await.unwrap();
-    wait_for(|| command(&core, TARGET, LATE_COMMAND).is_some_and(|c| c.status == SessionCommandStatus::Applied), "late request applied").await;
+    wait_for(|| async { command(&core, TARGET, LATE_COMMAND).await.is_some_and(|c| c.status == SessionCommandStatus::Applied) }, "late request applied").await;
     core.shutdown().await;
     drop(client);
     drop(core);
@@ -844,7 +853,7 @@ async fn child_reply_reaches_worker_waiter_and_survives_durable_reconnect() {
     let reply = client.call(methods::REPLY_PEER_MESSAGE, params.clone()).await.unwrap();
     assert_eq!(client.call(methods::REPLY_PEER_MESSAGE, params).await.unwrap(), reply);
     let reply_id = format!("reply:{LATE_COMMAND}");
-    wait_for(|| command(&core, SOURCE, &reply_id).is_some_and(|c| c.status == SessionCommandStatus::Applied), "late child reply delivered").await;
+    wait_for(|| async { command(&core, SOURCE, &reply_id).await.is_some_and(|c| c.status == SessionCommandStatus::Applied) }, "late child reply delivered").await;
     let expected = peer_message_prompt(TARGET, LATE_COMMAND, SOURCE, &reply_id, "durable child answer");
     assert_eq!(message_text(&core, SOURCE, &reply_id).as_deref(), Some(expected.as_str()));
     assert_eq!(requests.lock().await.iter().filter(|r| r.prompt == expected).count(), 1);
@@ -856,7 +865,7 @@ async fn child_reply_reaches_worker_waiter_and_survives_durable_reconnect() {
     drop(core);
     let (core, requests) = worker_engine(root.path());
     assert_eq!(message_text(&core, SOURCE, &reply_id).as_deref(), Some(expected.as_str()));
-    assert_eq!(command(&core, SOURCE, &reply_id).unwrap().status, SessionCommandStatus::Applied);
+    assert_eq!(command(&core, SOURCE, &reply_id).await.unwrap().status, SessionCommandStatus::Applied);
     assert!(requests.lock().await.is_empty());
     core.shutdown().await;
 }
@@ -871,18 +880,18 @@ async fn worker_child_reply_rejects_forgery_unrelated_threads_and_stale_ownershi
             "sourceChatId": source, "targetChatId": SOURCE, "commandId": COMMAND, "text": "unsolicited",
         })).await.is_err());
     }
-    assert!(command(&core, SOURCE, COMMAND).is_none());
+    assert!(command(&core, SOURCE, COMMAND).await.is_none());
     client.call(methods::SEND_PEER_MESSAGE, serde_json::json!({
         "sourceChatId": SOURCE, "targetChatId": TARGET, "commandId": COMMAND, "text": "legitimate request",
     })).await.unwrap();
-    wait_for(|| command(&core, TARGET, COMMAND).is_some_and(|c| c.status == SessionCommandStatus::Applied), "original delivered").await;
+    wait_for(|| async { command(&core, TARGET, COMMAND).await.is_some_and(|c| c.status == SessionCommandStatus::Applied) }, "original delivered").await;
     let reply_id = format!("reply:{COMMAND}");
     let reply = SessionCommandPayload::PeerMessage {
         source_chat_id: TARGET.into(), thread_id: COMMAND.into(), reply_to: Some(COMMAND.into()),
         hop_count: 1, text: "answer".into(),
     };
-    assert!(core.doc_host.queue_command_with_id(OUTSIDER, "worker-peer-authority/v1/forged", reply.clone()).is_err());
-    let original = command(&core, TARGET, COMMAND).unwrap();
+    assert!(core.doc_host.queue_command_with_id(OUTSIDER, "worker-peer-authority/v1/forged", reply.clone()).await.is_err());
+    let original = command(&core, TARGET, COMMAND).await.unwrap();
     let child_doc = core.doc_host.open(TARGET).unwrap();
     let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) =
         child_doc.doc().doc().get_list("commands").get(0) else { panic!("original command row"); };
@@ -901,10 +910,10 @@ async fn worker_child_reply_rejects_forgery_unrelated_threads_and_stale_ownershi
         assert!(core.doc_host.queue_command_with_id(SOURCE, id, SessionCommandPayload::PeerMessage {
             source_chat_id: TARGET.into(), thread_id: thread.into(), reply_to: Some(original.into()),
             hop_count: hop, text: "forged answer".into(),
-        }).is_err());
-        assert!(command(&core, SOURCE, id).is_none());
+        }).await.is_err());
+        assert!(command(&core, SOURCE, id).await.is_none());
     }
-    let mut forged = command(&core, TARGET, COMMAND).unwrap();
+    let mut forged = command(&core, TARGET, COMMAND).await.unwrap();
     forged.id = HOP_COMMAND.into();
     forged.payload = SessionCommandPayload::PeerMessage {
         source_chat_id: SOURCE.into(), thread_id: HOP_COMMAND.into(), reply_to: None, hop_count: 0, text: "synced forgery".into(),
@@ -913,7 +922,7 @@ async fn worker_child_reply_rejects_forgery_unrelated_threads_and_stale_ownershi
     assert!(client.call(methods::REPLY_PEER_MESSAGE, serde_json::json!({
         "sessionId": TARGET, "commandId": HOP_COMMAND, "text": "forged original must not authorize",
     })).await.is_err());
-    assert!(command(&core, SOURCE, &format!("reply:{HOP_COMMAND}")).is_none());
+    assert!(command(&core, SOURCE, &format!("reply:{HOP_COMMAND}")).await.is_none());
     // Synced commands can pass ordinary shared-chat membership, but neither an
     // owner string nor a correlated reply may bypass worker-local admission.
     for (id, source, reply_to, hop_count) in [
@@ -931,7 +940,7 @@ async fn worker_child_reply_rejects_forgery_unrelated_threads_and_stale_ownershi
         let parent = core.doc_host.open(SOURCE).unwrap();
         parent.doc().queue_command(&injected).unwrap();
         core.doc_host.drain_commands(&parent).await;
-        assert_eq!(command(&core, SOURCE, id).unwrap().status, SessionCommandStatus::Rejected);
+        assert_eq!(command(&core, SOURCE, id).await.unwrap().status, SessionCommandStatus::Rejected);
         assert!(message_text(&core, SOURCE, id).is_none());
     }
 
@@ -939,21 +948,21 @@ async fn worker_child_reply_rejects_forgery_unrelated_threads_and_stale_ownershi
     let mut changed = child.clone();
     changed.owner_chat_id = OUTSIDER.into();
     core.workspace.doc().set_worker_binding(&changed).unwrap();
-    assert!(core.doc_host.queue_command_with_id(SOURCE, &reply_id, reply.clone()).is_err());
+    assert!(core.doc_host.queue_command_with_id(SOURCE, &reply_id, reply.clone()).await.is_err());
     changed = child.clone();
     changed.owner_device_id = "other-device".into();
     core.workspace.doc().set_worker_binding(&changed).unwrap();
-    assert!(core.doc_host.queue_command_with_id(SOURCE, &reply_id, reply.clone()).is_err());
+    assert!(core.doc_host.queue_command_with_id(SOURCE, &reply_id, reply.clone()).await.is_err());
     core.workspace.doc().set_worker_binding(&child).unwrap();
 
     // Admission succeeded, then the binding changed before the durable queue
     // drained. Execution must recheck rather than trusting queue-time routing.
-    core.doc_host.queue_command_with_id(SOURCE, &reply_id, reply).unwrap();
+    core.doc_host.queue_command_with_id(SOURCE, &reply_id, reply).await.unwrap();
     changed = child;
     changed.owner_chat_id = OUTSIDER.into();
     core.workspace.doc().set_worker_binding(&changed).unwrap();
     core.doc_host.drain_commands(&core.doc_host.open(SOURCE).unwrap()).await;
-    assert_eq!(command(&core, SOURCE, &reply_id).unwrap().status, SessionCommandStatus::Rejected);
+    assert_eq!(command(&core, SOURCE, &reply_id).await.unwrap().status, SessionCommandStatus::Rejected);
     assert!(message_text(&core, SOURCE, &reply_id).is_none());
     assert_eq!(requests.lock().await.len(), 1, "rejected peers must never reach a harness");
     core.shutdown().await;

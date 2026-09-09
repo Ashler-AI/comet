@@ -597,9 +597,9 @@ impl SessionsEngine {
             || lock(&self.inner.runs).get(chat_id).is_some_and(|run| run.turn_active)
     }
 
-    fn require_worker_ready(&self, chat_id: &str) -> Result<(), EngineError> {
+    async fn require_worker_ready(&self, chat_id: &str) -> Result<(), EngineError> {
         if let Some(workspace) = self.inner.doc_host.get().and_then(DocHost::workspace) {
-            workspace.worker_ready(chat_id)?;
+            workspace.worker_ready(chat_id).await?;
         }
         Ok(())
     }
@@ -787,19 +787,6 @@ impl SessionsEngine {
         message_id: Option<String>,
         inject_resume: bool,
     ) -> Result<String, EngineError> {
-        self.require_worker_ready(chat_id)?;
-        if let Some(workspace) = self.inner.doc_host.get().and_then(DocHost::workspace)
-            && let Some(binding) = workspace.doc().worker_binding(chat_id)?
-        {
-            let config = &binding.config;
-            if harness_id != config.harness || request.model != config.model
-                || request.reasoning != config.reasoning || request.sandbox != config.sandbox
-                || request.agent_account_id != config.agent_account_id || request.model_options != config.model_options
-                || binding.worktree.as_ref().is_none_or(|worktree| worktree.path != request.cwd)
-            {
-                return Err(EngineError::Other("worker_request_config_mismatch".into()));
-            }
-        }
         enum ExistingRunDecision {
             None,
             Routed {
@@ -812,9 +799,24 @@ impl SessionsEngine {
         }
 
         let user_id = message_id.unwrap_or_else(new_id);
+        self.require_worker_ready(chat_id).await?;
+        if let Some(workspace) = self.inner.doc_host.get().and_then(DocHost::workspace)
+            && let Some(binding) = workspace.doc().worker_binding(chat_id)?
+        {
+            let config = &binding.config;
+            if harness_id != config.harness || request.model != config.model
+                || request.reasoning != config.reasoning || request.sandbox != config.sandbox
+                || request.agent_account_id != config.agent_account_id || request.model_options != config.model_options
+                || binding.worktree.as_ref().is_none_or(|worktree| worktree.path != request.cwd)
+            {
+                return Err(EngineError::Other("worker_request_config_mismatch".into()));
+            }
+        }
+        // Admission is durable before dispatch; re-read cancellation after the
+        // last await so interrupt/recover cannot revive a settled command.
         if let Some(host) = self.inner.doc_host.get()
             && host.workspace().is_some_and(|workspace| workspace.doc().worker_binding(chat_id).ok().flatten().is_some())
-            && let Some(command) = host.command_entry(chat_id, &user_id)?
+            && let Some(command) = host.open(chat_id)?.doc().read_commands()?.into_iter().find(|command| command.id == user_id)
             && matches!(command.status, comet_doc::SessionCommandStatus::Cancelled
                 | comet_doc::SessionCommandStatus::Rejected | comet_doc::SessionCommandStatus::Expired
                 | comet_doc::SessionCommandStatus::Superseded)
@@ -1125,7 +1127,7 @@ impl SessionsEngine {
         prompt: &str,
         message_id: Option<String>,
     ) -> Result<SteerOutcome, EngineError> {
-        self.require_worker_ready(chat_id)?;
+        self.require_worker_ready(chat_id).await?;
         let user_id = message_id.unwrap_or_else(new_id);
         let message = SteerMessage {
             prompt: prompt.to_string(),
@@ -1167,7 +1169,7 @@ impl SessionsEngine {
         prompt: &str,
         message_id: Option<String>,
     ) -> Result<QueueOutcome, EngineError> {
-        self.require_worker_ready(chat_id)?;
+        self.require_worker_ready(chat_id).await?;
         let user_id = message_id.unwrap_or_else(new_id);
         let message = SteerMessage {
             prompt: prompt.to_string(),

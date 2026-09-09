@@ -145,7 +145,7 @@ fn assemble_registry(dir: &std::path::Path, registry: Arc<HarnessRegistry>) -> E
     .expect("engine core assembles")
 }
 
-fn queue_run(core: &EngineCore, prompt: &str, cwd: &str, message_id: &str) {
+async fn queue_run(core: &EngineCore, prompt: &str, cwd: &str, message_id: &str) {
     core.doc_host
         .queue_command(
             CHAT,
@@ -154,6 +154,7 @@ fn queue_run(core: &EngineCore, prompt: &str, cwd: &str, message_id: &str) {
                 message_id: message_id.into(),
             },
         )
+        .await
         .expect("queue run command");
 }
 
@@ -236,7 +237,7 @@ async fn run_one_turn_and_shutdown(dir: &std::path::Path, requests: &RequestLog,
         "remember the codeword PINEAPPLE",
         "/tmp",
         "msg-user-1",
-    );
+    ).await;
     wait_for(
         || complete_assistant_count(&core) == 1,
         "first turn to complete",
@@ -299,7 +300,7 @@ async fn restart_roundtrip_restores_chats_transcript_and_resume() {
 
     // The next run resumes the SAME harness conversation: the engine injects
     // the stored session id even though the caller sent `resume: None`.
-    queue_run(&core, "what was the codeword?", "/tmp", "msg-user-2");
+    queue_run(&core, "what was the codeword?", "/tmp", "msg-user-2").await;
     wait_for(
         || complete_assistant_count(&core) == 2,
         "second turn to complete",
@@ -420,7 +421,7 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
     // The next run resumes the crashed conversation: the session id was
     // recovered from the journal (its only surviving home).
     pre_title(&core);
-    queue_run(&core, "keep going", "/tmp", "msg-user-2");
+    queue_run(&core, "keep going", "/tmp", "msg-user-2").await;
     wait_for(
         || complete_assistant_count(&core) == 1,
         "post-crash turn to complete",
@@ -538,7 +539,7 @@ async fn persistent_session_serves_multiple_turns_on_one_child() {
     let core = assemble_registry(&dir, Arc::new(registry));
     pre_title(&core);
 
-    queue_run(&core, "first", "/tmp", "msg-user-1");
+    queue_run(&core, "first", "/tmp", "msg-user-1").await;
     wait_for(
         || complete_assistant_count(&core) == 1,
         "first turn to complete",
@@ -547,7 +548,7 @@ async fn persistent_session_serves_multiple_turns_on_one_child() {
 
     // The session PARKS (comet runsBySession): the second message routes into
     // the live child instead of spawning a new one.
-    queue_run(&core, "second", "/tmp", "msg-user-2");
+    queue_run(&core, "second", "/tmp", "msg-user-2").await;
     wait_for(
         || complete_assistant_count(&core) == 2,
         "second turn to complete on the same child",
@@ -720,7 +721,7 @@ async fn resume_is_cwd_scoped() {
         "now from another project",
         "/elsewhere",
         "msg-user-2",
-    );
+    ).await;
     wait_for(
         || complete_assistant_count(&core) == 2,
         "cross-cwd turn to complete",
@@ -752,7 +753,7 @@ async fn rejected_resume_retries_as_fresh_session() {
             fail_on_resume: true,
         },
     );
-    queue_run(&core, "second turn", "/tmp", "msg-user-2");
+    queue_run(&core, "second turn", "/tmp", "msg-user-2").await;
     wait_for(
         || complete_assistant_count(&core) == 2,
         "retried turn to complete",
@@ -834,6 +835,7 @@ async fn real_claude_remembers_codeword_across_engine_restart() {
                 message_id: "msg-user-1".into(),
             },
         )
+        .await
         .expect("queue first real run");
     wait_for_within(
         || complete_assistant_count(&core) == 1,
@@ -860,6 +862,7 @@ async fn real_claude_remembers_codeword_across_engine_restart() {
                 message_id: "msg-user-2".into(),
             },
         )
+        .await
         .expect("queue second real run");
     wait_for_within(
         || complete_assistant_count(&core) == 2,
@@ -915,6 +918,7 @@ async fn steer_after_restart_dispatches_new_turn_with_resume() {
                 message_id: Some("msg-user-2".into()),
             },
         )
+        .await
         .expect("queue steer command");
     wait_for(
         || complete_assistant_count(&core) == 2,

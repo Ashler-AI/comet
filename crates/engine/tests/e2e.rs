@@ -2458,6 +2458,7 @@ async fn real_claude_sees_uploaded_image_inline() {
                 message_id: "msg-img-1".into(),
             },
         )
+        .await
         .expect("queue real image run");
     wait_for_within_secs(
         || {
