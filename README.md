@@ -110,6 +110,18 @@ incident journal prepared all **15 frames across three archives**, with each
 decoded SHA-256 matching its source blob and no unresolved frame/data blob
 references remaining. This is local preparation proof, not remote execution proof.
 
+The subsequent **installed 0.1.87** retest completed successfully in remote Crew
+chat `c2a70e4f-bd3a-4244-8968-7c5b0619e06f`, sandbox
+`rcs_a656652b49f3e396e7294643` (staging, local database), from the original
+image-containing conversation. The remote model recovered native context and
+verified source/platform repository isolation. Independent inspection of the
+remote journal decoded all **15 original frames**, including the latest five,
+and matched every SHA-256 to the saved local blob baseline; no replacement
+markers substituted for those images. Desktop staging and production published
+the same verified candidate from `4491b119c0de7ee8de3613979d34f971b5c767b8`:
+[build/staging](https://github.com/Ashler-AI/comet/actions/runs/34398401078),
+[production promotion](https://github.com/Ashler-AI/comet/actions/runs/34399706707).
+
 The September 9 development-build smoke completed through the native CLI and
 remote Crew chat `030e3ef6-57c4-4749-bd17-cf3ec7435eda` in sandbox
 `rcs_cc61f7c6b3c3a63e04a6d5d5` (staging, local database). The remote agent recovered
