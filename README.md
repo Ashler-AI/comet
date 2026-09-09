@@ -101,6 +101,15 @@ the existing archive verification. The separately queued **current prompt** does
 not pass through this fallback: current attachment/input errors remain errors.
 This is a handoff preparation policy, not a global OMP provider retry policy.
 
+**0.1.87** extends that boundary to actual OMP compaction archives at
+`preserveData.snapcompact.frames`: available frames retain their metadata and
+receive verified inline bytes; unavailable frames are removed with an explicit
+warning prepended to the compaction summary. **0.1.86 did not cover this shape**,
+and its installed-app retest still failed. A local smoke using the original
+incident journal prepared all **15 frames across three archives**, with each
+decoded SHA-256 matching its source blob and no unresolved frame/data blob
+references remaining. This is local preparation proof, not remote execution proof.
+
 The September 9 development-build smoke completed through the native CLI and
 remote Crew chat `030e3ef6-57c4-4749-bd17-cf3ec7435eda` in sandbox
 `rcs_cc61f7c6b3c3a63e04a6d5d5` (staging, local database). The remote agent recovered

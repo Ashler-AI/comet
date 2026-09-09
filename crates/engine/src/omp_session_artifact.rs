@@ -174,6 +174,55 @@ fn prepare_history_entry(
     missing: &mut usize,
     cancellation: &CancellationToken,
 ) -> Result<bool, EngineError> {
+    if entry.get("type").and_then(Value::as_str) == Some("compaction") {
+        let mut changed = false;
+        let before_missing = *missing;
+        if let Some(frames) = entry
+            .pointer_mut("/preserveData/snapcompact/frames")
+            .and_then(Value::as_array_mut)
+        {
+            for frame in frames.iter_mut() {
+                check_cancelled(cancellation)?;
+                let data = frame.get("data").and_then(Value::as_str).unwrap_or("");
+                if valid_attachment_base64(data) {
+                    continue;
+                }
+                if let Some(hash) = data.strip_prefix("blob:sha256:").filter(|hash| {
+                    hash.len() == 64
+                        && hash
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                }) {
+                    if let Some(bytes) = read_historical_blob(blob_dir, hash, *budget) {
+                        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+                        *budget -= encoded.len() as u64 + 128;
+                        frame["data"] = Value::String(encoded);
+                        changed = true;
+                        continue;
+                    }
+                }
+                let removed = serde_json::to_vec(frame)
+                    .map_err(|_| invalid("Could not size archive frame"))?
+                    .len() as u64;
+                *budget = budget.saturating_add(removed);
+                *frame = Value::Null;
+                *missing += 1;
+                changed = true;
+            }
+            frames.retain(|frame| !frame.is_null());
+        }
+        if *missing > before_missing {
+            let marker =
+                "[Historical archive image unavailable. Do not infer missing archive contents.]\n";
+            if *budget < marker.len() as u64 {
+                return Err(invalid("OMP history has no room for archive warning"));
+            }
+            *budget -= marker.len() as u64;
+            let summary = entry.get("summary").and_then(Value::as_str).unwrap_or("");
+            entry["summary"] = Value::String(format!("{marker}{summary}"));
+        }
+        return Ok(changed);
+    }
     if entry.get("type").and_then(Value::as_str) != Some("message") {
         return Ok(false);
     }
@@ -590,6 +639,56 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn historical_attachments_snapcompact_frames_hydrate_or_disclose_missing_archive() {
+        let temp = TempDir::new().unwrap();
+        let bytes = b"archive image bytes";
+        let hash = hex_sha256(bytes);
+        std::fs::write(temp.path().join(&hash), bytes).unwrap();
+        let mut entry = serde_json::json!({"type":"compaction","summary":"prior context","preserveData":{"snapcompact":{"frames":[
+            {"data":format!("blob:sha256:{hash}"),"mimeType":"image/png","cols":196,"rows":71,"detail":"original"},
+            {"data":"blob:sha256:missing","mimeType":"image/png","cols":196,"rows":71}
+        ]}}});
+        let mut missing = 0;
+        let mut budget = 4096;
+        assert!(
+            prepare_history_entry(
+                &mut entry,
+                temp.path(),
+                &mut budget,
+                &mut missing,
+                &CancellationToken::new()
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            entry["preserveData"]["snapcompact"]["frames"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            entry["preserveData"]["snapcompact"]["frames"][0]["data"],
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        );
+        assert_eq!(
+            entry["preserveData"]["snapcompact"]["frames"][0]["detail"],
+            "original"
+        );
+        assert!(
+            entry["summary"]
+                .as_str()
+                .unwrap()
+                .contains("Historical archive image unavailable")
+        );
+        assert!(
+            !serde_json::to_string(&entry)
+                .unwrap()
+                .contains("blob:sha256:")
+        );
+    }
 
     #[test]
     fn historical_attachments_bound_markers_and_cover_provider_output_arrays() {
