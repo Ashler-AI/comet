@@ -146,6 +146,15 @@ pub(crate) fn capture_omp_file_for_session(
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<crate::omp_session_artifact::CapturedOmpSessionFile, EngineError> {
     let roots = session_roots();
+    capture_omp_file_for_session_with_roots(native_session_id, cwd, cancellation, &roots)
+}
+
+fn capture_omp_file_for_session_with_roots(
+    native_session_id: &str,
+    cwd: &str,
+    cancellation: &tokio_util::sync::CancellationToken,
+    roots: &SessionRoots,
+) -> Result<crate::omp_session_artifact::CapturedOmpSessionFile, EngineError> {
     if cancellation.is_cancelled() {
         return Err(EngineError::Other(
             "OMP session capture was cancelled".into(),
@@ -163,7 +172,7 @@ pub(crate) fn capture_omp_file_for_session(
         &session.candidate.cwd,
         cancellation,
     )?
-    .prepare_historical_attachments(&roots.omp.join("blobs/data"), cancellation)
+    .prepare_historical_attachments(&roots.omp.join("blobs"), cancellation)
 }
 
 fn find_omp_session_for_capture(
@@ -2500,6 +2509,52 @@ mod tests {
             candidate.updated_at,
             false
         ));
+    }
+
+    #[test]
+    fn historical_attachments_capture_uses_installed_blob_layout() {
+        use base64::Engine as _;
+        use sha2::{Digest as _, Sha256};
+        let temp = TempDir::new().unwrap();
+        let roots = SessionRoots {
+            claude: temp.path().join("claude"),
+            codex: temp.path().join("codex"),
+            omp: temp.path().join("omp"),
+            prime: temp.path().join("prime"),
+            prime_sessions: temp.path().join("pi/sessions"),
+            opencode: temp.path().join("opencode.db"),
+        };
+        let bytes = b"source attachment bytes";
+        let hash = format!("{:x}", Sha256::digest(bytes));
+        std::fs::create_dir_all(roots.omp.join("blobs")).unwrap();
+        std::fs::write(roots.omp.join("blobs").join(&hash), bytes).unwrap();
+        fixture(
+            &roots.omp,
+            "sessions/by-cwd/omp-1.jsonl",
+            &[
+                serde_json::json!({"type":"session","id":"omp-1","cwd":"/repo","timestamp":"2026-08-05T12:00:00Z"}),
+                serde_json::json!({"type":"message","id":"m1","message":{"role":"user","content":[{"type":"image","mimeType":"image/png","data":format!("blob:sha256:{hash}")}]}}),
+            ],
+        );
+        let captured = capture_omp_file_for_session_with_roots(
+            "omp-1",
+            "/repo",
+            &tokio_util::sync::CancellationToken::new(),
+            &roots,
+        )
+        .unwrap();
+        let mut content = String::new();
+        captured
+            .reopen()
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        let message: Value = serde_json::from_str(content.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(
+            message["message"]["content"][0]["data"],
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        );
+        assert!(!content.contains("Historical attachment unavailable"));
     }
 
     #[test]
