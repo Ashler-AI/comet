@@ -3807,10 +3807,9 @@ mod tests {
             session_id: Some("session-ready".into()),
             unknown: Default::default(),
         };
-        let route = serde_json::from_value(serde_json::json!({
-            "provider": "openai-codex", "model": "gpt-6-astra",
-            "fallback": "disabled", "routingMode": "automatic",
-        })).unwrap();
+        let route = comet_proto::AgentRoute::automatic(
+            comet_proto::AgentProvider::OpenAi, "gpt-6-astra",
+        );
         prepare_scaffold_session(
             handle, &scope, None, None, ScaffoldDatabaseEnvironment::Local, &route, None,
         ).await

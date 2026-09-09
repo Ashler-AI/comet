@@ -55,7 +55,8 @@ jobs:
           cargo test --locked -p comet-rpc --lib 2>&1 | tee native-evidence/rpc.log
           cargo test --locked -p comet-engine --lib rpc::scaffold_session::tests 2>&1 | tee native-evidence/handoff.log
           cargo test --locked -p comet-engine --lib scaffold::tests 2>&1 | tee native-evidence/scaffold.log
-          cargo test --locked -p comet-engine --lib doc_host::tests 2>&1 | tee native-evidence/doc-host.log
+          cargo test --locked -p comet-engine --lib doc_host:: 2>&1 | tee native-evidence/doc-host.log
+          python3 -c 'import re; from pathlib import Path; text = Path("native-evidence/doc-host.log").read_text(); assert re.search(r"(?m)^test result: ok\. [1-9][0-9]* passed; 0 failed;", text), "required doc-host suite did not execute passing tests"'
           cargo test --locked -p comet-engine --lib historical_attachments 2>&1 | tee native-evidence/attachments.log
           cargo test --locked -p comet-engine --test peer_messages --test restart_resume --test workspace_sync --test remote_sync 2>&1 | tee native-evidence/native-integration.log
           cargo test --locked -p comet-engine --test e2e queued_run_command_executes_end_to_end 2>&1 | tee native-evidence/queued-run.log
