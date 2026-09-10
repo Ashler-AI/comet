@@ -190,7 +190,6 @@ jobs:
       # Public release trust root, independent of notarization credentials.
       COMET_MACOS_SIGNING_TEAM_ID: ${{ vars.MACOS_SIGNING_TEAM_ID }}
       CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
-      CODESIGN_KEYCHAIN: ${{ runner.temp }}/crew-signing.keychain-db
       NOTARYTOOL_KEYCHAIN_PROFILE: crew-distribution
     steps:
       - uses: actions/checkout@v4
@@ -207,6 +206,8 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
+          export CODESIGN_KEYCHAIN="$RUNNER_TEMP/crew-signing.keychain-db"
+          echo "CODESIGN_KEYCHAIN=$CODESIGN_KEYCHAIN" >> "$GITHUB_ENV"
           for name in COMET_MACOS_SIGNING_TEAM_ID CODESIGN_IDENTITY MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
             if [[ -z "${!name}" ]]; then
               echo "::error::Missing required macOS distribution credential: $name (see dist/README.md)"
@@ -292,7 +293,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -f "$CODESIGN_KEYCHAIN" ]]; then
+          if [[ -f "${CODESIGN_KEYCHAIN:-}" ]]; then
             security delete-keychain "$CODESIGN_KEYCHAIN"
           fi
           rm -f "$RUNNER_TEMP/crew-signing.p12"
