@@ -33,8 +33,8 @@ skipped to preserve workstation resources.
 Mobile staging **1.0 (16)** and production **1.0 (10)** passed all ten CI scenarios
 and were accepted by Apple for internal TestFlight processing. Distribution
 signatures, bundle/build identities, and production APNs entitlements verified.
-Final Apple processing and availability in the existing internal groups remain
-unverified pending interactive App Store Connect login; see the
+Authenticated App Store Connect readback confirmed both builds fully processed
+and available in the existing **Ashler Internal** groups; see the
 [mobile release evidence](apps/ios/README.md#crew-0188-upload-evidence).
 Live cold-Scaffold first-send acceptance and Lois's affected-account recovery
 remain manual checks, not established by fixture or local collaboration tests.

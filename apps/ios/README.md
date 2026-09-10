@@ -23,8 +23,8 @@ automatically): [loro-swift 1.13.x](https://github.com/loro-dev/loro-swift)
 desktop's pulldown-cmark config).
 
 Crew 0.1.88 uses mobile staging **1.0 (16)** and production **1.0 (10)**.
-Both uploads were accepted by Apple; final processing and internal-group
-availability remain unverified pending App Store Connect login.
+Both uploads were accepted by Apple, fully processed, and confirmed available
+in their existing **Ashler Internal** TestFlight groups.
 
 Production and staging use the same Swift target with separate checked-in schemes,
 bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
@@ -66,10 +66,13 @@ Exact uploaded IPA SHA-256 values:
 
 Export/upload used the existing Xcode account with internal-TestFlight-only
 distribution; no tester lists changed and no public App Store submission occurred.
-The App Store Connect browser requires interactive Apple login, so processing
-completion and availability in the existing **Ashler Internal** groups are not
-claimed. Physical-phone installation, paired desktop/mobile account recovery,
-and live first-send Scaffold behavior remain manual acceptance checks.
+Authenticated App Store Connect readback at **2026-09-10 01:29–01:30 UTC**
+confirmed both uploads `COMPLETE`, both builds `VALID` and `IN_BETA_TESTING`,
+and explicit access through their existing **Ashler Internal** groups. Apple
+reported no processing errors or warnings. Both remain internal-only builds.
+Tester notification receipt and physical-phone installation are not verified;
+the build records showed `didNotify=false`. Paired desktop/mobile account
+recovery and live first-send Scaffold behavior remain manual acceptance checks.
 
 Performance changes shared by both builds are documented in
 [`docs/memory-plan.md`](../../docs/memory-plan.md#9-crew-0167-performance-audit-2026-09-05):
