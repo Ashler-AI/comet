@@ -187,10 +187,13 @@ importing credentials.
 | `MACOS_NOTARY_TEAM_ID` | Developer team ID matching the signing identity |
 
 The job fails closed when any credential is absent. It imports the certificate
-into a temporary, explicitly selected keychain without changing the runner's
-default keychain or search list, creates a notarization profile there, removes
-the PKCS#12 file after import, and deletes the keychain in an `always()` cleanup
-step. No certificates or credentials are checked into this repository. The
+into a temporary, explicitly selected keychain and appends that keychain to the
+runner's search list so `codesign` can discover its private key and certificate
+chain. Existing search entries and the default keychain are preserved. The job
+authenticates notarization and dry-runs a real signature before compilation,
+removes the PKCS#12 file after import, and deletes the keychain (including its
+search-list entry) in an `always()` cleanup step. No certificates or credentials
+are checked into this repository. The
 workflow must not enable shell tracing around secrets.
 
 Existing `candidate_run_id` promotion still reuses an immutable prior candidate

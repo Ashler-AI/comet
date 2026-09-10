@@ -230,11 +230,21 @@ jobs:
           security create-keychain -p "$keychain_password" "$CODESIGN_KEYCHAIN"
           security set-keychain-settings -lut 21600 "$CODESIGN_KEYCHAIN"
           security unlock-keychain -p "$keychain_password" "$CODESIGN_KEYCHAIN"
+          # codesign still uses the search list for private-key/chain discovery.
+          # Preserve existing entries; delete-keychain removes our entry on cleanup.
+          python3 - "$CODESIGN_KEYCHAIN" <<'PY'
+          import shlex, subprocess, sys
+          keychains = shlex.split(subprocess.check_output(["security", "list-keychains", "-d", "user"], text=True))
+          if sys.argv[1] not in keychains:
+              subprocess.run(["security", "list-keychains", "-d", "user", "-s", *keychains, sys.argv[1]], check=True)
+          PY
           security import "$certificate" -P "$MACOS_CERTIFICATE_PASSWORD" -k "$CODESIGN_KEYCHAIN" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$CODESIGN_KEYCHAIN" >/dev/null
           xcrun notarytool store-credentials "$NOTARYTOOL_KEYCHAIN_PROFILE" \
             --keychain "$CODESIGN_KEYCHAIN" --apple-id "$APPLE_ID" \
             --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID"
+          codesign --dryrun --force --options runtime --timestamp \
+            --sign "$CODESIGN_IDENTITY" --keychain "$CODESIGN_KEYCHAIN" /usr/bin/true
       - name: Select checked-in Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
