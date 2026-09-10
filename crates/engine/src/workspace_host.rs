@@ -38,8 +38,6 @@ const LEGACY_WORKSPACE_DOC_ID: &str = "workspace2";
 pub const DEFAULT_PROJECT_SCOPE: &str = "ashler-local";
 /// User used when none is configured (dev mode without a bearer).
 pub const DEFAULT_USER_ID: &str = "dev-user";
-/// Identity-local migration marker for the membership cutover.
-const SESSION_REFS_BACKFILL: &str = "workspace3-session-refs-v1";
 /// Ephemeral presence refresh cadence.
 const PRESENCE_INTERVAL_MS: u64 = 15_000;
 /// A presence heartbeat younger than this marks the device alive (3 missed
@@ -131,7 +129,14 @@ struct WorkspaceHostInner {
     session_refs_tx: watch::Sender<Vec<SessionRef>>,
     worktree_deletions_tx: watch::Sender<Vec<WorktreeDeletionStage>>,
     room: Mutex<Option<RoomClient>>,
+    join_task: Mutex<Option<tokio::task::AbortHandle>>,
     session_ref_updates: Mutex<()>,
+    /// Ownership evidence is identity-local; inspect each arriving row at most
+    /// once per host lifetime, never every status update or presence heartbeat.
+    /// New local/import/fork paths write explicit refs themselves; this cache
+    /// applies only to legacy ownership recovery, not subsequent membership writes.
+    journal_session_ids: std::collections::HashSet<String>,
+    session_refs_checked: Mutex<std::collections::HashSet<String>>,
     /// Freshest presence heartbeat (ms) we have EVER observed per device. The
     /// ephemeral store forgets entries after its 30s TTL and starts empty on a
     /// room (re)join, so without this cache a receive-side hiccup snaps a
@@ -146,6 +151,14 @@ struct WorkspaceHostInner {
     presence_watch: Mutex<PresenceWatch>,
     /// Doc subscription (drop = unsubscribe) — bumps the change watch on every commit.
     _sub: loro::Subscription,
+}
+
+impl Drop for WorkspaceHostInner {
+    fn drop(&mut self) {
+        if let Some(task) = lock(&self.join_task).take() {
+            task.abort();
+        }
+    }
 }
 
 /// "This peer is alive" callback (device id) — see `WorkspaceHost::set_peer_alive_hook`.
@@ -222,13 +235,17 @@ fn backfill_local_session_refs(
     doc: &WorkspaceDoc,
     config: &WorkspaceHostConfig,
     journal_session_ids: &std::collections::HashSet<String>,
+    chats: &[Chat],
+    checked: &mut std::collections::HashSet<String>,
 ) -> Result<(), EngineError> {
-    if store.is_local_migration_applied(SESSION_REFS_BACKFILL)? {
-        return Ok(());
-    }
     let mut changed = false;
-    for chat in doc.read_chats()? {
-        if doc.session_ref(&config.user_id, &chat.id)?.is_none()
+    for chat in chats {
+        if checked.contains(&chat.id) {
+            continue;
+        }
+        // A deleted membership is an explicit user choice, not a legacy row
+        // awaiting migration. Loro retains its last editor in map tombstones.
+        if !doc.has_session_ref_history(&config.user_id, &chat.id)
             && has_identity_local_session_evidence(
                 store,
                 &chat.id,
@@ -238,16 +255,20 @@ fn backfill_local_session_refs(
         {
             doc.upsert_session_ref(
                 &config.user_id,
-                &SessionRef { chat_id: chat.id,
-                added_at: chat.created_at, environment: None, startup: None },
+                &SessionRef {
+                    chat_id: chat.id.clone(),
+                    added_at: chat.created_at,
+                    environment: None,
+                    startup: None,
+                },
             )?;
             changed = true;
         }
+        checked.insert(chat.id.clone());
     }
     if changed {
         store.save_snapshot(WORKSPACE_DOC_ID, &doc.export_snapshot()?)?;
     }
-    store.mark_local_migration_applied(SESSION_REFS_BACKFILL)?;
     Ok(())
 }
 
@@ -291,10 +312,18 @@ impl WorkspaceHost {
         // stamp the in-band schema version for the NEXT break to detect.
         store.delete_snapshot(LEGACY_WORKSPACE_DOC_ID).ok();
         doc.ensure_schema_version()?;
-        // Upgrade existing identity-local history before joining the shared room.
-        // A fresh user's store has no transcript snapshots or run journals, so
-        // another principal's project rows cannot become memberships.
-        backfill_local_session_refs(&store, &doc, &config, &journal_session_ids)?;
+        // Reconcile cached rows now and newly backfilled rows during publish.
+        // A global migration marker cannot establish that a workspace which
+        // has not joined yet contains every legacy session owned by this user.
+        let mut session_refs_checked = std::collections::HashSet::new();
+        backfill_local_session_refs(
+            &store,
+            &doc,
+            &config,
+            &journal_session_ids,
+            &doc.read_chats()?,
+            &mut session_refs_checked,
+        )?;
 
         // Boot: upsert our own device row. A user-set name (RenameDevice is LWW from
         // any device) survives restarts — only a missing row gets the hostname.
@@ -346,7 +375,10 @@ impl WorkspaceHost {
                 session_refs_tx,
                 worktree_deletions_tx,
                 room: Mutex::new(None),
+                join_task: Mutex::new(None),
                 session_ref_updates: Mutex::new(()),
+                journal_session_ids,
+                session_refs_checked: Mutex::new(session_refs_checked),
                 presence_seen: Mutex::new(std::collections::HashMap::new()),
                 peer_alive: Mutex::new(None),
                 presence_watch: Mutex::new(PresenceWatch::default()),
@@ -378,13 +410,11 @@ impl WorkspaceHost {
         let room_doc = self.inner.doc.doc().clone();
         let device_id = self.inner.config.device_id.clone();
         let weak = Arc::downgrade(&self.inner);
-        tokio::spawn(async move {
-            // `RoomClient` only self-reconnects AFTER a first successful join;
-            // an INITIAL failure (a 500 from an overloaded workspace DO, a token
-            // racing a refresh, an edge deploy) used to end this task and leave
-            // the device offline until an app restart — presence stuck "offline"
-            // while the relay and per-chat rooms worked. Retry the first join on
-            // a capped, jittered backoff so a transient edge blip self-heals.
+        let task = tokio::spawn(async move {
+            // Retry initial transport failures while the host exists. Once a
+            // server advertises backfill, RoomClient retains that obligation
+            // internally until it materializes. The owner aborts this task on
+            // drop, cancelling even a still-pending initial connection.
             let mut backoff = JOIN_RETRY_BASE;
             loop {
                 if weak.upgrade().is_none() {
@@ -435,6 +465,7 @@ impl WorkspaceHost {
                 backoff = (backoff * 2).min(JOIN_RETRY_CAP);
             }
         });
+        *lock(&self.inner.join_task) = Some(task.abort_handle());
     }
 
     /// Wire the "peer is alive" signal (fresh presence heartbeat) to a callback —
@@ -517,8 +548,12 @@ impl WorkspaceHost {
             .inner
             .doc
             .session_ref(user_id, chat_id)?
-            .unwrap_or_else(|| SessionRef { chat_id: chat_id.to_string(),
-            added_at: Utc::now(), environment: None, startup: None });
+            .unwrap_or_else(|| SessionRef {
+                chat_id: chat_id.to_string(),
+                added_at: Utc::now(),
+                environment: None,
+                startup: None,
+            });
         if let Some(environment) = environment {
             session_ref.environment = Some(environment);
         }
@@ -538,7 +573,10 @@ impl WorkspaceHost {
             Some(reference) => reference,
             None if expected_generation.is_some() => return Ok(()),
             None => SessionRef {
-                chat_id: chat_id.to_string(), added_at: Utc::now(), environment: None, startup: None,
+                chat_id: chat_id.to_string(),
+                added_at: Utc::now(),
+                environment: None,
+                startup: None,
             },
         };
         if reference.startup.as_ref().is_some_and(|current| {
@@ -546,7 +584,8 @@ impl WorkspaceHost {
                 || (current.status == comet_proto::SessionStartupStatus::CreationUncertain
                     && startup.status == comet_proto::SessionStartupStatus::AttentionNeeded)
                 || expected_generation.is_some_and(|expected| current.generation != expected)
-        }) || (expected_generation.is_some() && reference.startup.is_none()) {
+        }) || (expected_generation.is_some() && reference.startup.is_none())
+        {
             return Ok(());
         }
         reference.startup = Some(startup);
@@ -554,8 +593,14 @@ impl WorkspaceHost {
         Ok(())
     }
 
-    pub(crate) fn session_startup(&self, chat_id: &str) -> Result<Option<comet_proto::SessionStartup>, EngineError> {
-        Ok(self.inner.doc.session_ref(&self.inner.config.user_id, chat_id)?
+    pub(crate) fn session_startup(
+        &self,
+        chat_id: &str,
+    ) -> Result<Option<comet_proto::SessionStartup>, EngineError> {
+        Ok(self
+            .inner
+            .doc
+            .session_ref(&self.inner.config.user_id, chat_id)?
             .and_then(|reference| reference.startup))
     }
 
@@ -573,8 +618,11 @@ impl WorkspaceHost {
             return Ok(());
         };
         if startup.generation != generation
-            || matches!(startup.status, comet_proto::SessionStartupStatus::Admitted
-                | comet_proto::SessionStartupStatus::CreationUncertain)
+            || matches!(
+                startup.status,
+                comet_proto::SessionStartupStatus::Admitted
+                    | comet_proto::SessionStartupStatus::CreationUncertain
+            )
         {
             return Ok(());
         }
@@ -583,7 +631,6 @@ impl WorkspaceHost {
         self.inner.doc.upsert_session_ref(user_id, &reference)?;
         Ok(())
     }
-
 
     pub fn remove_session_ref(&self, chat_id: &str) -> Result<bool, EngineError> {
         let _update = lock(&self.inner.session_ref_updates);
@@ -1162,11 +1209,21 @@ impl WorkspaceHost {
 
 impl WorkspaceHostInner {
     fn publish(&self) {
-        match self.doc.read_all().and_then(|mut state| {
+        match (|| -> Result<_, EngineError> {
+            let mut state = self.doc.read_all()?;
+            let _updates = lock(&self.session_ref_updates);
+            backfill_local_session_refs(
+                &self.store,
+                &self.doc,
+                &self.config,
+                &self.journal_session_ids,
+                &state.chats,
+                &mut lock(&self.session_refs_checked),
+            )?;
             state.session_refs = self.doc.read_session_refs_for(&self.config.user_id)?;
             retain_visible_sessions(&mut state.chats, &mut state.sessions, &state.session_refs);
             Ok(state)
-        }) {
+        })() {
             Ok(mut state) => {
                 self.overlay_presence(&mut state.devices);
                 // Update the retained watch value even before the first receiver,
@@ -1590,36 +1647,105 @@ mod tests {
         let workspace = WorkspaceHost::open(
             std::sync::Arc::new(comet_sync::DocsStore::open(temp.path()).unwrap()),
             WorkspaceHostConfig {
-                device_id: "device-a".into(), device_name: "Test".into(),
-                platform: "test".into(), project_scope: "project-a".into(),
-                user_id: "user-a".into(), edge: None,
+                device_id: "device-a".into(),
+                device_name: "Test".into(),
+                platform: "test".into(),
+                project_scope: "project-a".into(),
+                user_id: "user-a".into(),
+                edge: None,
             },
-        ).unwrap();
+        )
+        .unwrap();
         let outcome = |generation: &str, status, command_id: Option<&str>| SessionStartup {
-            generation: generation.into(), status, updated_at: Utc::now(),
+            generation: generation.into(),
+            status,
+            updated_at: Utc::now(),
             command_id: command_id.map(str::to_string),
         };
-        workspace.update_session_startup("accepted", None,
-            outcome("first", SessionStartupStatus::Preparing, None)).unwrap();
-        workspace.update_session_startup("accepted", None,
-            outcome("second", SessionStartupStatus::Preparing, None)).unwrap();
-        workspace.update_session_startup("accepted", Some("first"),
-            outcome("first", SessionStartupStatus::AttentionNeeded, None)).unwrap();
-        assert_eq!(workspace.session_startup("accepted").unwrap().unwrap().generation, "second");
+        workspace
+            .update_session_startup(
+                "accepted",
+                None,
+                outcome("first", SessionStartupStatus::Preparing, None),
+            )
+            .unwrap();
+        workspace
+            .update_session_startup(
+                "accepted",
+                None,
+                outcome("second", SessionStartupStatus::Preparing, None),
+            )
+            .unwrap();
+        workspace
+            .update_session_startup(
+                "accepted",
+                Some("first"),
+                outcome("first", SessionStartupStatus::AttentionNeeded, None),
+            )
+            .unwrap();
+        assert_eq!(
+            workspace
+                .session_startup("accepted")
+                .unwrap()
+                .unwrap()
+                .generation,
+            "second"
+        );
         let admitted = outcome("second", SessionStartupStatus::Admitted, Some("command-a"));
-        workspace.update_session_startup("accepted", Some("second"), admitted.clone()).unwrap();
-        workspace.update_session_startup("accepted", Some("second"),
-            outcome("second", SessionStartupStatus::AttentionNeeded, None)).unwrap();
+        workspace
+            .update_session_startup("accepted", Some("second"), admitted.clone())
+            .unwrap();
+        workspace
+            .update_session_startup(
+                "accepted",
+                Some("second"),
+                outcome("second", SessionStartupStatus::AttentionNeeded, None),
+            )
+            .unwrap();
         workspace.upsert_session_ref("accepted", None).unwrap();
-        assert_eq!(workspace.session_startup("accepted").unwrap(), Some(admitted));
+        assert_eq!(
+            workspace.session_startup("accepted").unwrap(),
+            Some(admitted)
+        );
         assert!(workspace.doc().chat("accepted").unwrap().is_none());
-        assert_eq!(workspace.doc().read_session_refs_for("user-a").unwrap().len(), 1);
-        assert!(workspace.doc().read_session_refs_for("user-b").unwrap().is_empty());
-        let uncertain = outcome("unknown-create", SessionStartupStatus::CreationUncertain, None);
-        workspace.update_session_startup("uncertain", None, uncertain.clone()).unwrap();
-        workspace.update_session_startup("uncertain", Some("unknown-create"),
-            outcome("unknown-create", SessionStartupStatus::AttentionNeeded, None)).unwrap();
-        assert_eq!(workspace.session_startup("uncertain").unwrap(), Some(uncertain));
+        assert_eq!(
+            workspace
+                .doc()
+                .read_session_refs_for("user-a")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            workspace
+                .doc()
+                .read_session_refs_for("user-b")
+                .unwrap()
+                .is_empty()
+        );
+        let uncertain = outcome(
+            "unknown-create",
+            SessionStartupStatus::CreationUncertain,
+            None,
+        );
+        workspace
+            .update_session_startup("uncertain", None, uncertain.clone())
+            .unwrap();
+        workspace
+            .update_session_startup(
+                "uncertain",
+                Some("unknown-create"),
+                outcome(
+                    "unknown-create",
+                    SessionStartupStatus::AttentionNeeded,
+                    None,
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            workspace.session_startup("uncertain").unwrap(),
+            Some(uncertain)
+        );
     }
 
     #[tokio::test]
@@ -1758,8 +1884,8 @@ mod tests {
         refs.sort();
         assert_eq!(refs, ["journal-owned", "published-owned"]);
 
-        // User removal after the cutover is durable; the one-time migration
-        // must not resurrect either session on every restart.
+        // User removal survives a shallow snapshot and restart. Recovery must
+        // honor tombstones even though the old global marker is no longer used.
         workspace
             .doc()
             .remove_session_ref("user-a", "journal-owned")
@@ -1771,7 +1897,13 @@ mod tests {
         store
             .save_snapshot(
                 super::WORKSPACE_DOC_ID,
-                &workspace.doc().export_snapshot().unwrap(),
+                &workspace
+                    .doc()
+                    .doc()
+                    .export(loro::ExportMode::shallow_snapshot(
+                        &workspace.doc().doc().state_frontiers(),
+                    ))
+                    .unwrap(),
             )
             .unwrap();
         drop(workspace);
@@ -1790,6 +1922,177 @@ mod tests {
                 .is_empty()
         );
     }
+
+    #[tokio::test]
+    async fn late_workspace_backfill_recovers_only_identity_owned_sessions() {
+        let remote = comet_doc::WorkspaceDoc::new();
+        remote
+            .upsert_chat(&chat("alpha-owned", "shared-device"))
+            .unwrap();
+        remote
+            .upsert_chat(&chat("beta-owned", "shared-device"))
+            .unwrap();
+        remote
+            .upsert_chat(&chat("unclaimed", "shared-device"))
+            .unwrap();
+        let snapshot = remote.export_snapshot().unwrap();
+        for (user_id, owned) in [("alpha:é", "alpha-owned"), ("beta", "beta-owned")] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = std::sync::Arc::new(comet_sync::DocsStore::open(temp.path()).unwrap());
+            // Older builds stamped this before an empty workspace had joined.
+            store
+                .mark_local_migration_applied("workspace3-session-refs-v1")
+                .unwrap();
+            let workspace = WorkspaceHost::open_with_owned_sessions(
+                store,
+                WorkspaceHostConfig {
+                    device_id: "shared-device".into(),
+                    device_name: "Test".into(),
+                    platform: "test".into(),
+                    project_scope: "shared-project".into(),
+                    user_id: user_id.into(),
+                    edge: None,
+                },
+                std::collections::HashSet::from([owned.to_string()]),
+            )
+            .unwrap();
+            assert!(workspace.watch_chats().borrow().is_empty());
+            workspace.doc().doc().import(&snapshot).unwrap();
+            workspace.inner.publish();
+            assert_eq!(
+                workspace
+                    .watch_chats()
+                    .borrow()
+                    .iter()
+                    .map(|row| row.id.clone())
+                    .collect::<Vec<_>>(),
+                [owned]
+            );
+            assert!(
+                workspace
+                    .doc()
+                    .session_ref(user_id, "unclaimed")
+                    .unwrap()
+                    .is_none()
+            );
+            // The repaired ref is part of the synced snapshot, not just a host
+            // watch overlay: a fresh viewport can derive the same membership.
+            let fresh = loro::LoroDoc::new();
+            fresh
+                .import(&workspace.doc().export_snapshot().unwrap())
+                .unwrap();
+            assert_eq!(
+                comet_doc::WorkspaceDoc::from_doc(fresh)
+                    .read_session_refs_for(user_id)
+                    .unwrap()
+                    .iter()
+                    .map(|reference| reference.chat_id.as_str())
+                    .collect::<Vec<_>>(),
+                [owned]
+            );
+            workspace.doc().remove_session_ref(user_id, owned).unwrap();
+            workspace.inner.publish();
+            assert!(workspace.watch_chats().borrow().is_empty());
+            // Explicit writes remain visible after a cached negative result.
+            workspace.upsert_session_ref("unclaimed", None).unwrap();
+            workspace.inner.publish();
+            assert_eq!(
+                workspace
+                    .watch_chats()
+                    .borrow()
+                    .iter()
+                    .map(|row| row.id.clone())
+                    .collect::<Vec<_>>(),
+                ["unclaimed"]
+            );
+        }
+    }
+    #[tokio::test]
+    async fn dropping_host_closes_an_unfinished_initial_backfill() {
+        use futures::{SinkExt, StreamExt};
+        use loro_protocol::{CrdtType, Permission, ProtocolMessage, decode, encode};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let source = loro::LoroDoc::new();
+        source
+            .get_map("chats")
+            .insert("remote", "awaiting backfill")
+            .unwrap();
+        source.commit();
+        let version = source.oplog_vv().encode();
+        let (advertised_tx, advertised_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut advertised_tx = Some(advertised_tx);
+            while let Some(Ok(message)) = socket.next().await {
+                let Message::Binary(bytes) = message else {
+                    continue;
+                };
+                match decode(&bytes).unwrap() {
+                    ProtocolMessage::JoinRequest {
+                        crdt: CrdtType::Loro,
+                        room_id,
+                        ..
+                    } => {
+                        socket
+                            .send(Message::Binary(
+                                encode(&ProtocolMessage::JoinResponseOk {
+                                    crdt: CrdtType::Loro,
+                                    room_id,
+                                    permission: Permission::Write,
+                                    version: version.clone(),
+                                    extra: None,
+                                })
+                                .unwrap(),
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                    ProtocolMessage::JoinRequest {
+                        crdt: CrdtType::LoroEphemeralStore,
+                        ..
+                    } => {
+                        // Receiving this proves the client processed the advertisement.
+                        if let Some(tx) = advertised_tx.take() {
+                            let _ = tx.send(());
+                        }
+                    }
+                    ProtocolMessage::Leave { .. } => return,
+                    _ => {}
+                }
+            }
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = WorkspaceHost::open(
+            std::sync::Arc::new(comet_sync::DocsStore::open(temp.path()).unwrap()),
+            WorkspaceHostConfig {
+                device_id: "host-lifetime".into(),
+                device_name: "Host lifetime".into(),
+                platform: "test".into(),
+                project_scope: "project-lifetime".into(),
+                user_id: "owner-lifetime".into(),
+                edge: Some(crate::EdgeConfig::with_static_token(
+                    format!("http://{address}"),
+                    "test",
+                )),
+            },
+        )
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), advertised_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(workspace);
+        // The detached join must not keep a socket or credential-refresh loop alive.
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     #[test]
     fn unchanged_watch_values_do_not_wake_receivers() {
         let (sender, receiver) = tokio::sync::watch::channel(vec!["chat"]);

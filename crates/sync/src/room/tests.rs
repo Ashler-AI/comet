@@ -1076,3 +1076,361 @@ async fn healthy_session_join_backfill_reconnect_still_works() {
 
     client.shutdown().await.unwrap();
 }
+
+fn readiness_session(doc: LoroDoc) -> (Session, mpsc::Receiver<Vec<u8>>) {
+    let (tx, rx) = mpsc::channel(64);
+    let (events, _) = broadcast::channel(32);
+    (
+        Session {
+            doc,
+            eph: EphemeralStore::new(30_000),
+            room_id: "workspace-readiness".into(),
+            tx,
+            events,
+            stats: Arc::new(RoomStatsShared::default()),
+            pending: HashMap::new(),
+            fragments: HashMap::new(),
+            joined_lor: false,
+            joined_eph: false,
+            invalid_rejoins: 0,
+            full_resyncs: 0,
+            join_sent_at: None,
+            join_is_probe: false,
+            last_lor_rx: tokio::time::Instant::now(),
+            last_pushed_rx: tokio::time::Instant::now(),
+            required_remote: VersionVector::default(),
+            sync_started_at: Some(tokio::time::Instant::now()),
+            synchronized: false,
+            repairing_join: false,
+        },
+        rx,
+    )
+}
+
+#[tokio::test]
+async fn initial_readiness_waits_for_materialized_server_state() {
+    let server = LoroDoc::new();
+    server
+        .get_map("chats")
+        .insert("session-a", "User A session")
+        .unwrap();
+    server.commit();
+    let (mut session, _wire) = readiness_session(LoroDoc::new());
+    let (tx, mut rx) = oneshot::channel();
+    let mut ready = Some(tx);
+    session
+        .on_join_ok(
+            CrdtType::Loro,
+            server.oplog_vv().encode(),
+            Permission::Write,
+            false,
+        )
+        .await
+        .unwrap();
+    session.finish_sync(&mut ready);
+    assert!(matches!(
+        rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(!session.stats.snapshot().connected);
+    session
+        .apply_remote(
+            CrdtType::Loro,
+            vec![server.export(ExportMode::Snapshot).unwrap()],
+        )
+        .await
+        .unwrap();
+    session.finish_sync(&mut ready);
+    rx.try_recv().unwrap().unwrap();
+    assert_eq!(session.doc.get_deep_value(), server.get_deep_value());
+    assert!(session.stats.snapshot().connected);
+}
+
+#[tokio::test]
+async fn pending_remote_operations_survive_stale_join_and_unrelated_import() {
+    let source = LoroDoc::new();
+    source
+        .get_text("t")
+        .insert(0, "missing dependency")
+        .unwrap();
+    source.commit();
+    let missing = source.oplog_vv();
+    source.get_text("t").insert(18, " then completion").unwrap();
+    source.commit();
+    let delta = source.export(ExportMode::updates(&missing)).unwrap();
+    let (mut session, _wire) = readiness_session(LoroDoc::new());
+    session.joined_lor = true;
+    let (tx, mut rx) = oneshot::channel();
+    let mut ready = Some(tx);
+    session
+        .apply_remote(CrdtType::Loro, vec![delta])
+        .await
+        .unwrap();
+    session
+        .on_join_ok(CrdtType::Loro, Vec::new(), Permission::Write, false)
+        .await
+        .unwrap();
+    let unrelated = LoroDoc::new();
+    unrelated
+        .get_map("other")
+        .insert("another-user", "unrelated")
+        .unwrap();
+    unrelated.commit();
+    session
+        .apply_remote(
+            CrdtType::Loro,
+            vec![unrelated.export(ExportMode::Snapshot).unwrap()],
+        )
+        .await
+        .unwrap();
+    session.finish_sync(&mut ready);
+    assert!(matches!(
+        rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(!session.stats.snapshot().connected);
+    // The join triggered by the incomplete unrelated import is still pending.
+    session
+        .on_join_ok(
+            CrdtType::Loro,
+            session.doc.oplog_vv().encode(),
+            Permission::Write,
+            false,
+        )
+        .await
+        .unwrap();
+    session
+        .apply_remote(
+            CrdtType::Loro,
+            vec![source.export(ExportMode::Snapshot).unwrap()],
+        )
+        .await
+        .unwrap();
+    session.finish_sync(&mut ready);
+    rx.try_recv().unwrap().unwrap();
+    assert_eq!(doc_text(&session.doc), "missing dependency then completion");
+    assert_eq!(
+        session.doc.get_map("other").get_deep_value(),
+        unrelated.get_map("other").get_deep_value()
+    );
+}
+
+#[tokio::test]
+async fn incomplete_server_history_recovers_before_join_becomes_ready() {
+    let doc = LoroDoc::new();
+    doc.get_text("t").insert(0, "offline work").unwrap();
+    doc.commit();
+    let (mut session, mut wire) = readiness_session(doc.clone());
+    let (tx, mut rx) = oneshot::channel();
+    let mut ready = Some(tx);
+    let error = ProtocolMessage::JoinError {
+        crdt: CrdtType::Loro,
+        room_id: session.room_id.clone(),
+        code: JoinErrorCode::AppError,
+        message: "incomplete_history".into(),
+        receiver_version: None,
+        app_code: None,
+    };
+    let _ = session
+        .handle_frame(&encode(&error).unwrap(), &mut ready)
+        .await
+        .unwrap();
+    let ProtocolMessage::DocUpdate {
+        updates, batch_id, ..
+    } = decode(&wire.recv().await.unwrap()).unwrap()
+    else {
+        panic!("complete snapshot required for recovery");
+    };
+    let recovered = LoroDoc::new();
+    recovered.import(&updates[0]).unwrap();
+    assert_eq!(doc_text(&recovered), "offline work");
+    assert!(matches!(
+        rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    session
+        .on_ack(CrdtType::Loro, batch_id, UpdateStatusCode::Ok)
+        .await
+        .unwrap();
+    assert!(matches!(
+        decode(&wire.recv().await.unwrap()).unwrap(),
+        ProtocolMessage::JoinRequest { .. }
+    ));
+    session.finish_sync(&mut ready);
+    assert!(matches!(
+        rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    session
+        .on_join_ok(
+            CrdtType::Loro,
+            recovered.oplog_vv().encode(),
+            Permission::Write,
+            false,
+        )
+        .await
+        .unwrap();
+    session.finish_sync(&mut ready);
+    rx.try_recv().unwrap().unwrap();
+    assert!(session.stats.snapshot().connected);
+}
+
+#[tokio::test]
+async fn rejected_initial_upload_is_not_reported_connected() {
+    let doc = LoroDoc::new();
+    doc.get_map("chats")
+        .insert("offline-session", "preserved")
+        .unwrap();
+    doc.commit();
+    let (mut session, _wire) = readiness_session(doc.clone());
+    let (tx, mut rx) = oneshot::channel();
+    let mut ready = Some(tx);
+    session
+        .on_join_ok(CrdtType::Loro, Vec::new(), Permission::Write, false)
+        .await
+        .unwrap();
+    session.finish_sync(&mut ready);
+    assert!(matches!(
+        rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    let batch = *session.pending.keys().next().unwrap();
+    session
+        .on_ack(CrdtType::Loro, batch, UpdateStatusCode::InvalidUpdate)
+        .await
+        .unwrap();
+    session.finish_sync(&mut ready);
+    assert!(!session.stats.snapshot().connected);
+    assert!(matches!(
+        rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    assert_eq!(session.doc.get_deep_value(), doc.get_deep_value());
+}
+
+#[tokio::test]
+async fn shallow_client_sends_complete_state_to_a_nonempty_stale_peer() {
+    let source = LoroDoc::new();
+    source.get_text("t").insert(0, "old").unwrap();
+    source.commit();
+    let stale_version = source.oplog_vv();
+    source.get_text("t").insert(3, " and").unwrap();
+    source.commit();
+    source.get_text("t").insert(7, " retained").unwrap();
+    source.commit();
+    let doc = LoroDoc::new();
+    doc.import(
+        &source
+            .export(ExportMode::shallow_snapshot(&source.state_frontiers()))
+            .unwrap(),
+    )
+    .unwrap();
+    doc.get_map("offline").insert("work", "preserved").unwrap();
+    doc.commit();
+    let (mut session, mut wire) = readiness_session(doc.clone());
+    session
+        .on_join_ok(
+            CrdtType::Loro,
+            stale_version.encode(),
+            Permission::Write,
+            false,
+        )
+        .await
+        .unwrap();
+    let ProtocolMessage::DocUpdate { updates, .. } = decode(&wire.recv().await.unwrap()).unwrap()
+    else {
+        panic!("expected recoverable state backfill");
+    };
+    let recipient = LoroDoc::new();
+    for update in updates {
+        let status = recipient.import(&update).unwrap();
+        assert!(
+            status
+                .pending
+                .as_ref()
+                .is_none_or(|pending| pending.is_empty())
+        );
+    }
+    assert_eq!(recipient.get_deep_value(), doc.get_deep_value());
+    assert_eq!(doc_text(&recipient), "old and retained");
+}
+
+#[tokio::test(start_paused = true)]
+async fn initial_disconnect_cannot_forget_advertised_backfill() {
+    struct AdvertiseThenDisconnect {
+        first: AtomicBool,
+        version: Vec<u8>,
+        fallback: Arc<FakeEdge>,
+    }
+    impl Connector for AdvertiseThenDisconnect {
+        fn connect(&self) -> BoxFuture<'static, Result<Pipe, SyncError>> {
+            if !self.first.swap(false, Ordering::SeqCst) {
+                return self.fallback.connector().connect();
+            }
+            let version = self.version.clone();
+            Box::pin(async move {
+                let (tx, mut requests) = mpsc::channel::<Vec<u8>>(8);
+                let (replies, rx) = mpsc::channel::<Vec<u8>>(8);
+                tokio::spawn(async move {
+                    let request = requests.recv().await.unwrap();
+                    let ProtocolMessage::JoinRequest { room_id, .. } = decode(&request).unwrap()
+                    else {
+                        panic!("expected workspace join");
+                    };
+                    replies
+                        .send(
+                            encode(&ProtocolMessage::JoinResponseOk {
+                                crdt: CrdtType::Loro,
+                                room_id,
+                                permission: Permission::Write,
+                                version,
+                                extra: None,
+                            })
+                            .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    // No backfill: the replacement connection advertises stale state.
+                });
+                Ok(Pipe { tx, rx })
+            })
+        }
+    }
+    let source = LoroDoc::new();
+    source
+        .get_text("t")
+        .insert(0, "advertised session history")
+        .unwrap();
+    source.commit();
+    let fallback = FakeEdge::new();
+    let connector = Arc::new(AdvertiseThenDisconnect {
+        first: AtomicBool::new(true),
+        version: source.oplog_vv().encode(),
+        fallback: fallback.clone(),
+    });
+    let doc = LoroDoc::new();
+    let client_doc = doc.clone();
+    let connecting =
+        tokio::spawn(
+            async move { RoomClient::connect_with(connector, "room-1", client_doc).await },
+        );
+    wait_until(|| fallback.join_requests.load(Ordering::SeqCst) > 0).await;
+    assert!(
+        !connecting.is_finished(),
+        "a stale replacement must not finish initial readiness"
+    );
+    assert!(doc_text(&doc).is_empty());
+    fallback
+        .doc
+        .import(&source.export(ExportMode::Snapshot).unwrap())
+        .unwrap();
+    fallback.kick_all();
+    let client = tokio::time::timeout(TEST_TIMEOUT, connecting)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(doc_text(&doc), "advertised session history");
+    assert!(client.stats().connected);
+    client.shutdown().await.unwrap();
+}

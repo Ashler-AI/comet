@@ -106,7 +106,7 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
    accessibility descendants, selection/copy, or previews; ordinary conversation and
    agent delivery must remain intact. Old installed binaries are not verification.
 
-2. **Workspace doc** (per org — NEW; replaces comet's residual entity sync) — **spaces**
+2. **Workspace doc** (per verified project) — **spaces**
    registry (id, deviceId, path, name?, gitDetected, checkoutId — a space is a synced
    device+folder pair, the app's unit of organization; the owning device's SpacesSync stamps git
    presence so branch pickers / the diff sidebar gate on a synced bool, no RPC), chats index
@@ -115,19 +115,41 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
    status rows (Working indicator; staleness-checked client-side so a crashed backend never shows
    eternal "Working"), checkout-diff summary pointers. `lastSeenAt` is the synced LWW seen marker
    behind the "completed (unseen)" indicator. Lives in its own DO room (same SessionRoom DO
-   class, doc id `ws2/{orgId}` — the `2` is the spaces-overhaul destructive break), with presence
+   class, doc id `ws4/{projectScope}`), with presence
    via Loro `EphemeralStore` (replaces the 15s heartbeat writes). Writer discipline: each device
    writes only its own device/session/chat rows and the git stamps of spaces it owns;
    creates/renames/archives/seen-marks are LWW map sets from any device. `deleteSpace` cascades:
    the space row and every chat/session row in it tombstone in one commit.
-   Per-principal `sessionRefs` rows hold imported global session UUIDs for discovery across that
-   user's Comet clients. They never create a `chats` row or assign host placement, and another
-   principal's refs are filtered from the local watch.
+   Per-principal `sessionRefs` rows determine session discovery across that user's Crew clients.
+   Owned-session creation and explicit imports publish memberships; imports never assign host
+   placement. Legacy membership recovery runs for newly arriving rows, including after initial
+   backfill, using identity-local run journals or owner publications—not shared rows or an
+   arbitrary cached transcript. Removed memberships retain their tombstones and are not restored
+   by migration. Another principal's refs remain excluded from the local watch.
 
    *Why a workspace doc and not N tiny docs:* the sidebar needs one subscription for the whole
    list (grouping, resort animations, unseen markers); one doc = one room connection + one mirror.
-   Volume is tiny (index rows, no transcripts), so oplog growth is negligible and daily compaction
-   applies anyway.
+   Workspace history uses **lossless snapshot folding**, not age- or size-based shallow trimming:
+   disconnected writers may still depend on any retained operation. This trades increasing
+   retained history for correct offline merges; transcript-room retention is separate. Fresh
+   readers receive the persisted baseline followed by ordered accepted deltas, avoiding a
+   whole-history export for every sign-in.
+
+   A join response is not proof of convergence. Native clients retain advertised remote version
+   requirements across reconnects, wait for materialized backfill and catch-up upload ACKs, and
+   stay disconnected on rejection or unresolved dependencies. Pending initial joins are owned
+   by the workspace or session handle and are cancelled when it is dropped; adopting a trusted
+   session projection also cancels the old pending join. The edge acknowledges only complete
+   accepted imports; compatible concurrent snapshots retain both branches. A legacy room with
+   pending history reports `JoinError(AppError, "incomplete_history")` without advertising a
+   partial version. An authorized writer may supply a complete snapshot on that recovery-only
+   socket, then rejoin after its ACK. Fresh empty readers cannot manufacture missing history.
+   Workspace replay failures preserve stored bytes; irreversibly trimmed gaps still require a
+   replica or backup covering their dependencies, never automatic resets or silent loss.
+
+   Rollout: deploy the edge changes before publishing desktop and mobile builds. Older clients
+   cannot perform the new incomplete-history handshake, so both native updates are needed for
+   recovery and membership reconciliation. No account-specific cache migration is required.
 
 3. **Mirror layer** (`comet-doc` crate) — Rust equivalent of loro-mirror: typed structs for the
    schema, **incremental** application of `doc.subscribe` diffs into cached state (no full

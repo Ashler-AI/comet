@@ -625,10 +625,10 @@ enum E2ERunner {
     static func runRepeatedRoomRecovery() async {
         #if DEBUG
         guard await RoomClient.runRepeatedRecoveryRegression() else {
-            log("FAIL Crew repeated room recovery")
+            log("FAIL Crew room convergence: fresh principals, pending imports, shallow resubmit, or history repair")
             return
         }
-        log("OK Crew repeated room recovery")
+        log("OK Crew room convergence: fresh principals, pending imports, shallow resubmit, and bounded history repair")
         #endif
     }
 

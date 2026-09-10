@@ -588,10 +588,9 @@ impl WorkspaceDoc {
             None => row.delete("environment")?,
         }
         match &session_ref.startup {
-            Some(startup) => row.insert(
-                "startup",
-                LoroValue::from(serde_json::to_value(startup)?),
-            )?,
+            Some(startup) => {
+                row.insert("startup", LoroValue::from(serde_json::to_value(startup)?))?
+            }
             None => row.delete("startup")?,
         }
         self.doc.commit();
@@ -619,6 +618,15 @@ impl WorkspaceDoc {
                 Ok(None)
             }
         }
+    }
+
+    /// Includes a removed membership: automatic legacy recovery must not undo
+    /// an explicit unpin. Map tombstones retain editors even in shallow state.
+    pub fn has_session_ref_history(&self, user_id: &str, chat_id: &str) -> bool {
+        self.doc
+            .get_map("sessionRefs")
+            .get_last_editor(&session_ref_key(user_id, chat_id))
+            .is_some()
     }
 
     pub fn read_session_refs(&self) -> Result<Vec<SessionRef>, DocError> {
@@ -1019,8 +1027,12 @@ mod tests {
     }
 
     fn session_ref(chat_id: &str, added_at: i64) -> SessionRef {
-        SessionRef { chat_id: chat_id.into(),
-        added_at: ts(added_at), environment: None, startup: None }
+        SessionRef {
+            chat_id: chat_id.into(),
+            added_at: ts(added_at),
+            environment: None,
+            startup: None,
+        }
     }
 
     fn cross_sync(a: &WorkspaceDoc, b: &WorkspaceDoc) {

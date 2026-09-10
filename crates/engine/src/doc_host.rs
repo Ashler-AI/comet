@@ -22,9 +22,9 @@ use comet_doc::{
 };
 use comet_proto::{
     AgentSessionRecord, AuditEvent, AuditResult, COLLABORATION_SCHEMA_VERSION, CapabilityGrant,
-    FileTargetReference, HarnessId, MessageProvenance, ModelHandoff, PeerMessageProvenance, PublicationRecord,
-    PublicationValue, SemanticAnchor, SemanticAnnotation, SessionRoomProjection, SessionStatus,
-    UserInputAnswer, UserInputQuestion, VerifiedCapabilityGrantEnvelope,
+    FileTargetReference, HarnessId, MessageProvenance, ModelHandoff, PeerMessageProvenance,
+    PublicationRecord, PublicationValue, SemanticAnchor, SemanticAnnotation, SessionRoomProjection,
+    SessionStatus, UserInputAnswer, UserInputQuestion, VerifiedCapabilityGrantEnvelope,
 };
 use comet_sync::{DocsStore, RoomClient};
 
@@ -381,6 +381,7 @@ pub struct ChatDocHandle {
     snapshot_bytes: AtomicUsize,
     room_projection: Mutex<Option<SessionRoomProjection>>,
     room: Mutex<Option<RoomClient>>,
+    room_join_task: Mutex<Option<tokio::task::AbortHandle>>,
     /// Invalidates a room join that was already dialing when an unprojected
     /// local handle adopts its trusted Scaffold projection.
     room_generation: AtomicU64,
@@ -389,6 +390,14 @@ pub struct ChatDocHandle {
     room_join_started: AtomicBool,
     /// Doc subscription (drop = unsubscribe) — bumps the change watch on every commit.
     _sub: loro::Subscription,
+}
+
+impl Drop for ChatDocHandle {
+    fn drop(&mut self) {
+        if let Some(task) = lock(&self.room_join_task).take() {
+            task.abort();
+        }
+    }
 }
 
 impl ChatDocHandle {
@@ -458,7 +467,11 @@ impl ChatDocHandle {
         // A join may already be connected or dialing the legacy room. Bump the
         // generation before dropping the current client so an old dial cannot
         // install itself after the new projected join starts.
+        let mut join_task = lock(&self.room_join_task);
         self.room_generation.fetch_add(1, Ordering::AcqRel);
+        if let Some(task) = join_task.take() {
+            task.abort();
+        }
         drop(lock(&self.room).take());
         self.room_join_started.store(false, Ordering::Release);
         Ok(())
@@ -496,13 +509,18 @@ impl ChatDocHandle {
         // all three paths: live waiter, active steering, and queued/new turn.
         // Text (including a user-typed peer prompt lookalike) is never consulted.
         let peer_message = self.doc.read_command(message_id)?.and_then(|entry| {
-            if !matches!(entry.status, SessionCommandStatus::Pending | SessionCommandStatus::Applied)
-            {
+            if !matches!(
+                entry.status,
+                SessionCommandStatus::Pending | SessionCommandStatus::Applied
+            ) {
                 return None;
             }
             match entry.payload {
                 SessionCommandPayload::PeerMessage {
-                    source_chat_id, thread_id, reply_to, ..
+                    source_chat_id,
+                    thread_id,
+                    reply_to,
+                    ..
                 } => Some(PeerMessageProvenance {
                     command_id: entry.id,
                     source_chat_id,
@@ -983,6 +1001,9 @@ impl DocHost {
         let Some(edge) = &self.inner.config.edge else {
             return;
         };
+        // Serialize task installation with projection invalidation so a stale
+        // pending connection cannot outlive its owner or replace the new task.
+        let mut join_task = lock(&handle.room_join_task);
         if !self.chat_allows_room_join(&handle.chat_id)
             || lock(&handle.room).is_some()
             || handle
@@ -1002,7 +1023,7 @@ impl DocHost {
         let room_doc = handle.doc.doc().clone();
         let chat = handle.chat_id.clone();
         let weak = Arc::downgrade(&handle);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut wake = comet_sync::wake::subscribe();
             let mut backoff = crate::workspace_host::JOIN_RETRY_BASE;
             loop {
@@ -1045,6 +1066,7 @@ impl DocHost {
                 }
             }
         });
+        *join_task = Some(task.abort_handle());
     }
 
     /// Start room supervision for an already-open chat (e.g. once a native run
@@ -1174,6 +1196,7 @@ impl DocHost {
             snapshot_bytes: AtomicUsize::new(snapshot_len),
             room_projection: Mutex::new(projection.cloned()),
             room: Mutex::new(None),
+            room_join_task: Mutex::new(None),
             room_generation: AtomicU64::new(0),
             command_lock: Mutex::new(()),
             room_join_started: AtomicBool::new(false),
@@ -2840,6 +2863,102 @@ mod authority_tests {
     }
 
     #[tokio::test]
+    async fn unfinished_session_backfill_stops_on_purge_or_projection_change() {
+        use futures::{SinkExt, StreamExt};
+        use loro_protocol::{CrdtType, Permission, ProtocolMessage, decode, encode};
+        use tokio_tungstenite::tungstenite::Message;
+
+        for change_projection in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let source = loro::LoroDoc::new();
+            source
+                .get_map("meta")
+                .insert("remote", "awaiting history")
+                .unwrap();
+            source.commit();
+            let version = source.oplog_vv().encode();
+            let (advertised_tx, advertised_rx) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let mut advertised_tx = Some(advertised_tx);
+                while let Some(Ok(message)) = socket.next().await {
+                    let Message::Binary(bytes) = message else {
+                        continue;
+                    };
+                    match decode(&bytes).unwrap() {
+                        ProtocolMessage::JoinRequest {
+                            crdt: CrdtType::Loro,
+                            room_id,
+                            ..
+                        } => {
+                            socket
+                                .send(Message::Binary(
+                                    encode(&ProtocolMessage::JoinResponseOk {
+                                        crdt: CrdtType::Loro,
+                                        room_id,
+                                        permission: Permission::Write,
+                                        version: version.clone(),
+                                        extra: None,
+                                    })
+                                    .unwrap(),
+                                ))
+                                .await
+                                .unwrap();
+                        }
+                        ProtocolMessage::JoinRequest {
+                            crdt: CrdtType::LoroEphemeralStore,
+                            ..
+                        } => {
+                            if let Some(tx) = advertised_tx.take() {
+                                let _ = tx.send(());
+                            }
+                        }
+                        ProtocolMessage::Leave { .. } => return,
+                        _ => {}
+                    }
+                }
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let host = DocHost::new(
+                Arc::new(DocsStore::open(dir.path()).unwrap()),
+                DocHostConfig {
+                    device_id: "session-lifetime".into(),
+                    default_harness: HarnessId::Mock,
+                    edge: Some(EdgeConfig::with_static_token(
+                        format!("http://{address}"),
+                        "test",
+                    )),
+                },
+            );
+            let chat_id = "ac091c7f-3a6c-4ef6-b9aa-57eb89b51f54";
+            let handle = host.open(chat_id).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), advertised_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            if change_projection {
+                handle
+                    .ensure_room_projection(Some(&SessionRoomProjection {
+                        project_id: "project-lifetime".into(),
+                        deployment_id: "deployment-lifetime".into(),
+                        session_id: chat_id.into(),
+                    }))
+                    .unwrap();
+            } else {
+                host.purge_chat(chat_id);
+            }
+            drop(handle);
+            tokio::time::timeout(std::time::Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            host.purge_chat(chat_id);
+        }
+    }
+
+    #[tokio::test]
     async fn imported_local_chats_never_join_edge_rooms() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DocsStore::open(dir.path()).unwrap());
@@ -2965,8 +3084,12 @@ mod authority_tests {
             .doc()
             .upsert_session_ref(
                 "accounts.google.com:bob@example.com",
-                &comet_proto::SessionRef { chat_id: "session-a".into(),
-                added_at: chrono::Utc::now(), environment: None, startup: None },
+                &comet_proto::SessionRef {
+                    chat_id: "session-a".into(),
+                    added_at: chrono::Utc::now(),
+                    environment: None,
+                    startup: None,
+                },
             )
             .unwrap();
         let shared_chat = SessionCommandEntry {
