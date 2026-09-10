@@ -5157,6 +5157,7 @@ impl Composer {
                 )
             });
         }
+        let submission_state = self.state.clone();
         // User-submitted commands are durable intent: a later send, stop, or
         // question answer must not cancel this admission task by replacing it.
         cx.spawn(async move |this, cx| {
@@ -5720,7 +5721,8 @@ impl Composer {
                 futures::pin_mut!(cancel);
                 match futures::future::select(admission, cancel).await {
                     futures::future::Either::Left((result, _)) => result,
-                    futures::future::Either::Right((_, admission)) => {
+                    futures::future::Either::Right((Err(_), admission)) => admission.await,
+                    futures::future::Either::Right((Ok(()), admission)) => {
                         if command_admission_started.get() {
                             // Durable admission is no longer owned by UI cancellation.
                             admission.await
@@ -5735,6 +5737,12 @@ impl Composer {
             let succeeded = result.is_ok();
             if succeeded && let Some(rollback) = startup_rollback.as_mut() {
                 rollback.disarm();
+            }
+            if scaffold_demo && succeeded {
+                submission_state.update(cx, |state, cx| {
+                    state.complete_scaffold_session_startup(&err_chat_id);
+                    state.clear_scaffold_chat_starting(&err_chat_id, cx);
+                });
             }
             this.update(cx, |composer, cx| {
                 finish_send(&mut composer.sending_chats, &err_chat_id);
@@ -5759,7 +5767,13 @@ impl Composer {
                         }
                         cx.notify();
                     });
-                    composer.input.update(cx, |input, cx| input.set_text(restore_text, cx));
+                    if composer.current_key == err_chat_id {
+                        composer.input.update(cx, |input, cx| input.set_text(restore_text, cx));
+                    } else {
+                        // Navigation must not move the failed first prompt into
+                        // another session or replace that session's draft.
+                        composer.drafts.insert(err_chat_id.clone(), restore_text);
+                    }
                     if !staged.is_empty() {
                         // Merge by id (stashAttachments): files the user staged
                         // while the send was in flight survive the hand-back.

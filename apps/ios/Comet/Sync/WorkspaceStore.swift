@@ -48,6 +48,7 @@ final class WorkspaceStore {
     private var room: RoomClient?
     private var subscriptions: [Subscription] = []
     @ObservationIgnored private var roomEpoch: UInt64 = 0
+    @ObservationIgnored private var roomReadyGeneration: UInt64?
     private let config: AppConfig
     @ObservationIgnored var onProjection: (() -> Void)?
 
@@ -125,15 +126,17 @@ final class WorkspaceStore {
             Task { await room.stop() }
         }
         room = nil
+        roomReadyGeneration = nil
         connected = false
     }
 
     private func handle(_ event: RoomEvent) {
         switch event {
         case .connected:
-            connected = true
+            roomReadyGeneration = projectionGeneration &+ 1
             scheduleProjection()
         case .disconnected:
+            roomReadyGeneration = nil
             connected = false
         case .remoteUpdate:
             scheduleProjection()
@@ -257,6 +260,11 @@ final class WorkspaceStore {
                    self.localProjectionGeneration == localGeneration, let decoded {
                     self.purgeLegacyMobileDevices(decoded.legacyMobileIds)
                     self.applyProjection(decoded)
+                    // Do not report initial/reconnect readiness while the UI
+                    // still holds an older cached projection of this replica.
+                    if let readyGeneration = self.roomReadyGeneration, generation >= readyGeneration {
+                        self.connected = true
+                    }
                 }
                 if self.projectionGeneration == generation {
                     self.projectionTask = nil
@@ -297,11 +305,12 @@ final class WorkspaceStore {
                     store.handle(.remoteUpdate)
                 } catch { mutationFailed = true }
             }
-            store.scheduleProjection()
+            store.handle(.connected)
+            guard !store.connected else { return false }
             guard await E2ERunner.poll(timeout: 5, label: "live list projection burst", {
                 store.projectionTask == nil ? true : nil
             }) != nil else { return false }
-            guard !mutationFailed,
+            guard !mutationFailed, store.connected,
                   titles == (0...5).map({ "Remote \($0)" }) else { return false }
 
             // A synchronous optimistic rename must still fence an older read.

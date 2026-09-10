@@ -2758,6 +2758,13 @@ impl AppState {
             .filter(|draft| draft.chat_id == chat_id)
     }
 
+    pub(crate) fn complete_scaffold_session_startup(&mut self, chat_id: &str) {
+        if self.scaffold_session_draft_for_chat(chat_id).is_some() {
+            self.pending_scaffold_session = None;
+            self.scaffold_session_error = None;
+        }
+    }
+
     pub(crate) fn install_scaffold_session(
         &mut self,
         attachment: &ScaffoldSessionAttachment,
@@ -2774,7 +2781,8 @@ impl AppState {
             .insert(chat_id.clone(), attachment.environment.clone());
         self.scaffold_host_devices
             .insert(chat_id.clone(), attachment.owner_device_id.clone());
-        self.pending_scaffold_session = None;
+        // Attachment is not command admission. Keep the original draft so a
+        // checkout/upload/admission failure can prepare the same target again.
         self.scaffold_session_error = None;
         if self.selected_chat.as_deref() != Some(chat_id.as_str()) {
             self.select_chat(Some(chat_id), cx);
@@ -4512,6 +4520,73 @@ mod tests {
             assert!(state.pending_scaffold_session.is_none());
         });
     }
+
+    #[gpui::test]
+    fn attached_scaffold_draft_survives_failure_and_navigation_until_admission(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            let draft = ScaffoldSessionDraft {
+                project_id: "project-a".into(),
+                deployment_id: "deployment-a".into(),
+                space_id: "space-a".into(),
+                chat_id: "chat-a".into(),
+                database_environment: ScaffoldDatabaseEnvironment::Local,
+                source_ref: "master".into(),
+                omp_handoff: None,
+            };
+            let scope = draft.collaboration_scope();
+            state.select_pending_scaffold_chat(draft, cx);
+            state.mark_scaffold_chat_starting("chat-a");
+            let attachment = ScaffoldSessionAttachment {
+                environment: serde_json::from_value(serde_json::json!({
+                    "source": {
+                        "kind": "scaffold", "sandbox_id": "sandbox-a",
+                        "lifecycle": "ready", "lifecycle_epoch": 1, "links": {}
+                    },
+                    "ownerPrincipal": "owner@example.com",
+                    "scope": scope,
+                })).unwrap(),
+                projection: SessionRoomProjection {
+                    project_id: "project-a".into(),
+                    deployment_id: "deployment-a".into(),
+                    session_id: "chat-a".into(),
+                },
+                grant_id: "grant-a".into(),
+                owner_device_id: "comet-scaffold-sandbox-a-e1".into(),
+                actor_subject: "owner@example.com".into(),
+                source_ref: Some("master".into()),
+                control_target: ScaffoldControlTarget {
+                    sandbox_id: "sandbox-a".into(), scope: scope.clone(),
+                },
+            };
+            state.install_scaffold_session(&attachment, cx);
+            assert_eq!(state.scaffold_session_draft().unwrap().collaboration_scope(), scope);
+
+            state.clear_scaffold_chat_starting("chat-a", cx);
+            state.select_chat(None, cx);
+            state.select_space_source("other-space".into(), Vec::new(), cx);
+            state.select_space(None, cx);
+            state.select_chat(Some("chat-a".into()), cx);
+            assert_eq!(state.scaffold_session_draft().unwrap().collaboration_scope(), scope);
+            assert_eq!(state.scaffold_control_target("chat-a"), Some(&attachment.control_target));
+
+            // An upload can fail after Attach has installed the room and grant.
+            state.scaffold_session_error = Some("upload failed".into());
+            state.select_chat(None, cx);
+            state.select_chat(Some("chat-a".into()), cx);
+            assert_eq!(state.scaffold_session_draft().unwrap().collaboration_scope(), scope);
+
+            state.complete_scaffold_session_startup("another-chat");
+            assert!(state.scaffold_session_draft().is_some());
+            state.complete_scaffold_session_startup("chat-a");
+            assert!(state.scaffold_session_draft().is_none());
+            assert!(state.scaffold_session_error.is_none());
+            assert_eq!(state.scaffold_control_target("chat-a"), Some(&attachment.control_target));
+        });
+    }
+
     #[gpui::test]
     fn pending_scaffold_chat_does_not_open_the_unscoped_room(cx: &mut gpui::TestAppContext) {
         let runtime = tokio::runtime::Runtime::new().expect("Tokio test runtime");

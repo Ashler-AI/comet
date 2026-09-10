@@ -298,12 +298,17 @@ sequence.
 
 Crew preserves the accepted Scaffold sandbox and room while attachment is pending.
 An exact `503 sandbox_runtime_starting` response (including the provider's nested
-`body.error` envelope) keeps one native Attach operation waiting, bounded to two
-minutes and cancellable. Each wait rechecks the sandbox, owner, room, and lifecycle
+`body.error` envelope) keeps one native Attach operation waiting while startup
+remains valid and cancellable, without a fixed healthy-start deadline. Each wait
+rechecks the sandbox, owner, room, and lifecycle
 epoch; unrelated 404s and terminal states still fail. Manual retry uses the same
 accepted sandbox. A failed launch without an accepted remote target discards its
 pending draft; confirmed deletion discards an accepted pending draft. Deleting a
 persisted chat keeps the ordinary chat-deletion behavior.
+Attachment alone does not complete startup: Crew retains the accepted draft until
+the first command is admitted, so a checkout or upload failure can retry against
+the same sandbox. Navigating away does not cancel admission; failed prompts return
+to their originating session rather than replacing another session's draft.
 Deleting a chat during its first send also removes the pending sidebar entry, so
 later workspace updates cannot restore a deleted session as still starting.
 

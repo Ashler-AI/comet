@@ -49,7 +49,11 @@ final class AppConfig: @unchecked Sendable {
          tokens: AuthTokens? = nil, devBearer: String? = nil) {
         self.edgeURL = edgeURL
         self.mode = mode
-        self.userId = userId
+        // Match the edge's verified Scaffold subject, including restored logins
+        // written by older clients. Explicit dev identities remain opaque.
+        self.userId = mode == .scaffold
+            ? userId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            : userId
         self.projectScope = projectScope
         self.deviceId = deviceId
         self.deviceName = deviceName

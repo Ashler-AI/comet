@@ -31,6 +31,8 @@ const artifactPrefix = `${name}-1.0-${build}`;
 const markers = [
   "OK Crew session visibility",
   "OK Crew attention transitions",
+  "OK Crew Scaffold preparation",
+  "OK Crew Scaffold first command retains originating generation across upload route refresh",
   "OK Crew APNs lifecycle",
   "OK Crew mobile parity",
   "OK Crew store eviction",

@@ -54,6 +54,13 @@ Only visible rows lease metadata rooms; disposal waits for 300 ms of viewport
 quiet and yields between stores. Snapshot flushes remain synchronous to preserve
 background/sign-out durability and replica-adoption ordering.
 
+Workspace readiness waits for the server's advertised document version to be
+materialized and projected into the retained list, not just a successful socket
+join. Initial login and reconnect keep the connecting indicator until that point;
+a joined room whose backfill stalls is redialed through the existing bounded
+backoff. Scaffold subjects use the edge's trimmed, lowercase identity on both
+new and restored sign-ins; project and principal boundaries remain unchanged.
+
 Session projection reads transcript messages and the latest matching publication,
 not the entire command ledger, and unchanged inputs do not rebuild rows. Cold
 markdown row preparation runs on a worker actor. The three most recently opened

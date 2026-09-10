@@ -814,10 +814,18 @@ async fn initial_queue_requires_exact_preparation_but_admitted_followups_do_not(
             assert_eq!(core.workspace.session_startup(&chat_id).unwrap(), Some(preparing.clone()));
         }
     }
-    rpc.handle(methods::QUEUE_COMMAND, serde_json::json!({
+    let first_request = serde_json::json!({
         "chatId": chat_id, "commandId": "first", "command": run,
         "preparationGeneration": "new-attempt",
-    })).await.unwrap();
+    });
+    let (first, retry) = tokio::join!(
+        rpc.handle(methods::QUEUE_COMMAND, first_request.clone()),
+        rpc.handle(methods::QUEUE_COMMAND, first_request),
+    );
+    first.unwrap();
+    retry.unwrap();
+    let commands = core.doc_host.open(&chat_id).unwrap().doc().read_commands().unwrap();
+    assert_eq!(commands.iter().map(|command| command.id.as_str()).collect::<Vec<_>>(), ["first"]);
     assert!(core.doc_host.command_entry(&chat_id, "first").unwrap().is_some());
     let admitted = core.workspace.session_startup(&chat_id).unwrap().unwrap();
     assert_eq!(admitted.status, SessionStartupStatus::Admitted);

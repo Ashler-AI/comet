@@ -78,6 +78,7 @@ actor RoomClient {
     // session (its answer must not replay join side effects), and the last
     // inbound %LOR frame — the clock feeding both the deadline and the probe.
     private var joinSentAt: DispatchTime?
+    private var backfillStartedAt: DispatchTime?
     private var joinIsProbe = false
     private var lastLorRx = DispatchTime.now()
     private var probeIntervalNs = RoomClient.roomProbeAfterNs
@@ -139,6 +140,7 @@ actor RoomClient {
         pending.removeAll()
         fragments.removeAll()
         joinSentAt = nil
+        backfillStartedAt = nil
         joinIsProbe = false
         lastLorRx = .now()
         probeIntervalNs = RoomClient.roomProbeAfterNs
@@ -282,6 +284,14 @@ actor RoomClient {
             }
             return
         }
+        if let started = backfillStartedAt {
+            let base = max(started.uptimeNanoseconds, lastLorRx.uptimeNanoseconds)
+            if now - base > RoomClient.joinDeadlineNs {
+                roomLog.warning("room \(self.roomId, privacy: .public): joined but backfill did not complete; redialing")
+                onSocketError(gen: gen)
+            }
+            return
+        }
         if now - lastLorRx.uptimeNanoseconds > probeIntervalNs {
             // Quiet room: rejoin as a liveness probe. Consecutive quiet
             // probes back off so a dormant chat costs a handful of DO wakes
@@ -407,6 +417,15 @@ actor RoomClient {
             // DocUpdate that dirtied the room's caches (room.rs finding).
             serverVersion = version.isEmpty ? VersionVector()
                 : try? VersionVector.decode(bytes: Data(version))
+            // The edge answers the join BEFORE sending its snapshot/deltas.
+            // An accepted socket is not a usable replica until that advertised
+            // version has reached materialized state, including on first login.
+            if doc.isDetached() || doc.stateVv() != doc.oplogVv()
+                || serverVersion.map({ doc.oplogVv().includesVv(other: $0) }) != true {
+                if !recovering { events(.disconnected) }
+                recovering = true
+                backfillStartedAt = .now()
+            }
             await resubmitMissingUpdates()
             if wasProbe {
                 finishRecoveryIfCaughtUp()
@@ -501,6 +520,7 @@ actor RoomClient {
               doc.oplogVv().includesVv(other: serverVersion) else { return }
         recovering = false
         deferredFullResync = false
+        backfillStartedAt = nil
         fullResyncs = 0
         backoffMs = RoomClient.backoffBaseMs
         if joinedLor { events(.connected) }
@@ -647,10 +667,42 @@ actor RoomClient {
     private var regressionSend: ((ProtocolMessage) -> Void)?
 
     static func runRepeatedRecoveryRegression() async -> Bool {
+        let connectionEvents = OSAllocatedUnfairLock(initialState: [Bool]())
         let client = RoomClient(roomId: "regression", doc: LoroDoc(),
-                                urlProvider: { nil }, events: { _ in },
-                                adoptSnapshot: { _, _ in false })
-        return await client.exerciseRepeatedRecovery()
+                                urlProvider: { nil }, events: { event in
+                                    switch event {
+                                    case .connected: connectionEvents.withLock { $0.append(true) }
+                                    case .disconnected: connectionEvents.withLock { $0.append(false) }
+                                    default: break
+                                    }
+                                }, adoptSnapshot: { _, _ in false })
+        guard await client.exerciseJoinReadiness(connectionEvents) else { return false }
+        let recoveryClient = RoomClient(roomId: "regression", doc: LoroDoc(),
+                                        urlProvider: { nil }, events: { _ in },
+                                        adoptSnapshot: { _, _ in false })
+        return await recoveryClient.exerciseRepeatedRecovery()
+    }
+
+    private func exerciseJoinReadiness(_ connectionEvents: OSAllocatedUnfairLock<[Bool]>) async -> Bool {
+        regressionSend = { _ in }
+        defer { regressionSend = nil }
+        do {
+            let source = LoroDoc()
+            // A cold login and a warm rejoin both receive JoinResponseOk before
+            // their backfill. Neither may announce a usable stale/empty replica.
+            for turn in 1...2 {
+                try source.getMap(id: "meta").insert(key: "title", v: "Joined \(turn)")
+                source.commit()
+                connectionEvents.withLock { $0.removeAll() }
+                await onJoinOk(crdt: .loro, version: [UInt8](source.oplogVv().encode()))
+                guard connectionEvents.withLock({ $0 == [false] }) else { return false }
+                await applyRemote(crdt: .loro, updates: [[UInt8](try source.export(mode: .snapshot))])
+                guard connectionEvents.withLock({ $0 == [false, true] }),
+                      doc.getMap(id: "meta").get(key: "title")?.asValue()?.stringValue
+                        == "Joined \(turn)" else { return false }
+            }
+            return true
+        } catch { return false }
     }
 
     private func exerciseRepeatedRecovery() async -> Bool {

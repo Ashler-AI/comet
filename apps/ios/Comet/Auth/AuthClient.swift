@@ -183,7 +183,7 @@ struct AuthClient {
               Self.scopes.allSatisfy(sessionScopes.contains) else {
             throw AuthError.invalidContract("Scaffold identity response was not authorized")
         }
-        let subject = session.actor.sub.lowercased()
+        let subject = session.actor.sub.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return (
             AuthUser(id: subject, email: subject, name: session.actor.displayName),
             AuthTokens(accessToken: tokens.accessToken)
