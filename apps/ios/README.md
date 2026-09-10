@@ -22,10 +22,10 @@ automatically): [loro-swift 1.13.x](https://github.com/loro-dev/loro-swift)
 (cmark-gfm: tables/strikethrough/tasklists — the same feature set as the
 desktop's pulldown-cmark config).
 
-Crew 0.1.90 prepares mobile staging **1.0 (18)** and production **1.0 (12)**.
-These are build candidates, not uploaded or available TestFlight releases. The
-previous Crew 0.1.88 release used staging **1.0 (16)** and production **1.0 (10)**;
-its historical upload evidence is recorded below.
+Crew 0.1.90 mobile staging **1.0 (18)** and production **1.0 (12)** are available
+through their existing **Ashler Internal** TestFlight groups. Both are internal-only
+releases, not public App Store submissions. Upload and verification evidence is
+recorded below.
 
 Production and staging use the same Swift target with separate checked-in schemes,
 bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
@@ -91,6 +91,30 @@ produce these build candidates.
 `native-verification.yml` is a separate Rust/desktop verification workflow. It
 has no dispatch inputs and runs only on pushes to `verify/native-lifecycle-*`
 or `verify/native-startup-*`; it neither creates nor signs mobile archives.
+
+### Crew 0.1.90 upload evidence
+
+Both archives use merged source `356ccff31934f5eca6310d7a128345a13daa7456`.
+[Staging CI](https://github.com/Ashler-AI/comet/actions/runs/34517634509) and
+[production CI](https://github.com/Ashler-AI/comet/actions/runs/34517634501)
+passed all ten mobile scenarios with Xcode 26.6 / iOS SDK 26.5 on arm64.
+Downloaded checksums and source provenance matched. Local distribution export and
+upload performed no compilation or typechecks. Both inspection IPAs and the exact
+uploaded IPAs passed strict deep signature verification with their expected
+bundle/build, matching distribution profiles, and `aps-environment = production`.
+
+Exact uploaded IPA SHA-256 values:
+
+- Staging 18: `4a00f6df80a27829bc74f051a98bcb2267106b811c9078b83f857420615c0dd7`
+- Production 12: `4868060167557d674b0cb649232d5cd952047857c265d5ab879a43410d60b53c`
+
+Apple upload records are `9c8983c1-2f7f-4234-98fa-3ccf8caed9d2` (staging) and
+`5dcb0752-b20d-434a-b487-35bbe80d6bc1` (production). Authenticated readback confirmed
+both uploads `COMPLETE`, builds `VALID` and `IN_BETA_TESTING`, internal-only
+audiences, and access through the existing **Ashler Internal** groups, with no
+processing errors or warnings. No tester membership changes or public App Store
+submission occurred. Apple reported `didNotify=false` at readback; notification
+receipt and physical-phone installation are not verified.
 
 ### Crew 0.1.88 upload evidence
 

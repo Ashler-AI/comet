@@ -2,6 +2,30 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Crew 0.1.90 release
+
+Release source `356ccff31934f5eca6310d7a128345a13daa7456` is merged into `main`
+and pinned on `release/crew-0.1.90`. Native handoff now transfers bounded Git
+deltas or exact-HEAD shallow snapshots, with isolated partial-clone hydration
+and safe process-group cleanup instead of bundling all reachable history.
+
+[Staging publication](https://github.com/Ashler-AI/comet/actions/runs/34517634439)
+built the macOS distribution and both Linux Scaffold archives.
+[Production promotion](https://github.com/Ashler-AI/comet/actions/runs/34521123713)
+reused the byte-identical candidate and passed authenticated production channel
+readback. Artifact hashes, macOS signatures, notarization, Gatekeeper acceptance,
+and DMG/updater bundle parity were verified. The Scaffold runtime contract remains
+`scaffold.comet-runtime.v1`; no Edge or Scaffold control-plane deployment occurred.
+
+Mobile staging **1.0 (18)** and production **1.0 (12)** are processed and available
+in their existing **Ashler Internal** TestFlight groups; see the
+[mobile release evidence](apps/ios/README.md#crew-0190-upload-evidence).
+OpenCode pre-push review reported no actionable findings. The focused local gates
+passed 31 Rust tests and 24 release-contract tests; local typechecks were skipped.
+No installed app or engine was replaced or restarted. A live retry of the original
+failed handoff, physical-phone installation, and tester notification receipt remain
+unverified.
+
 ## Crew 0.1.88 release
 
 Source `3d4c161f27bc9a61ff1118710a18c2c9dbc085f9` is merged into `main`.
