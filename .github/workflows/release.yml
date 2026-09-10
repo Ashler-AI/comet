@@ -223,7 +223,8 @@ jobs:
             exit 1
           fi
           certificate="$RUNNER_TEMP/crew-signing.p12"
-          trap 'rm -f "$certificate"' EXIT
+          probe="$RUNNER_TEMP/crew-signing-probe"
+          trap 'rm -f "$certificate" "$probe"' EXIT
           keychain_password="$(uuidgen)"
           echo "::add-mask::$keychain_password"
           printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$certificate"
@@ -243,8 +244,10 @@ jobs:
           xcrun notarytool store-credentials "$NOTARYTOOL_KEYCHAIN_PROFILE" \
             --keychain "$CODESIGN_KEYCHAIN" --apple-id "$APPLE_ID" \
             --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID"
-          codesign --dryrun --force --options runtime --timestamp \
-            --sign "$CODESIGN_IDENTITY" --keychain "$CODESIGN_KEYCHAIN" /usr/bin/true
+          cp /usr/bin/true "$probe"
+          codesign --force --options runtime --timestamp --verbose=4 \
+            --sign "$CODESIGN_IDENTITY" --keychain "$CODESIGN_KEYCHAIN" "$probe"
+          codesign --verify --strict --verbose=2 "$probe"
       - name: Select checked-in Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
