@@ -39,6 +39,11 @@ xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 ```
 
+| Scheme | Edge | Scaffold | Project scope | Invite scheme |
+| --- | --- | --- | --- | --- |
+| `Comet` | `comet.internal.ashler.com` | `scaffold.internal.ashler.com` | `ashler-production` | `comet://` |
+| `Crew Staging` | `comet-staging.internal.ashler.com` | `scaffold-staging.internal.ashler.com` | `ashler-staging` | `comet-staging://` |
+
 ### Crew 0.1.88 upload evidence
 
 Both archives use source `3d4c161f27bc9a61ff1118710a18c2c9dbc085f9` on `main`.
@@ -65,12 +70,6 @@ The App Store Connect browser requires interactive Apple login, so processing
 completion and availability in the existing **Ashler Internal** groups are not
 claimed. Physical-phone installation, paired desktop/mobile account recovery,
 and live first-send Scaffold behavior remain manual acceptance checks.
-
-
-| Scheme | Edge | Scaffold | Project scope | Invite scheme |
-| --- | --- | --- | --- | --- |
-| `Comet` | `comet.internal.ashler.com` | `scaffold.internal.ashler.com` | `ashler-production` | `comet://` |
-| `Crew Staging` | `comet-staging.internal.ashler.com` | `scaffold-staging.internal.ashler.com` | `ashler-staging` | `comet-staging://` |
 
 Performance changes shared by both builds are documented in
 [`docs/memory-plan.md`](../../docs/memory-plan.md#9-crew-0167-performance-audit-2026-09-05):
