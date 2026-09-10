@@ -183,8 +183,8 @@ jobs:
       COMET_RELEASE_VERSION: ${{ needs.version.outputs.version }}
       SOURCE_DATE_EPOCH: ${{ needs.version.outputs.source_epoch }}
       COMET_DEFAULT_ENVIRONMENT: production
-      # Promotion channels all reuse this production-identity bundle. Standalone
-      # Crew Staging.app is a separate local packaging target, not a release feed.
+      # Promotion channels all reuse this production-identity bundle. The separate
+      # standalone staging packaging step overrides both environment selectors.
       COMET_PACKAGE_ENVIRONMENT: production
       COMET_MACOS_SIGNING: distribution
       # Public release trust root, independent of notarization credentials.
@@ -270,6 +270,23 @@ jobs:
             target/package/comet-*.tar.gz
             target/package/SHA256SUMS
           if-no-files-found: error
+      - name: Package standalone Crew Staging.app
+        env:
+          COMET_DEFAULT_ENVIRONMENT: staging
+          COMET_PACKAGE_ENVIRONMENT: staging
+        run: scripts/package-macos.sh
+      - name: Record standalone staging artifact checksums
+        run: |
+          cd target/package/staging
+          shasum -a 256 comet-staging-*.dmg comet-staging-*-app.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-staging-arm64
+          path: |
+            target/package/staging/comet-staging-*.dmg
+            target/package/staging/comet-staging-*-app.tar.gz
+            target/package/staging/SHA256SUMS
+          if-no-files-found: error
       - name: Remove temporary signing credentials
         if: ${{ always() }}
         shell: bash
@@ -314,6 +331,12 @@ jobs:
       - uses: actions/download-artifact@v4
         if: ${{ inputs.candidate_run_id == '' }}
         with:
+          name: macos-arm64
+          path: incoming/macos-arm64
+      - uses: actions/download-artifact@v4
+        if: ${{ inputs.candidate_run_id == '' && needs.version.outputs.release_surface == 'desktop-and-scaffold' }}
+        with:
+          pattern: linux-*
           path: incoming
       - name: Download exact prior release candidate
         if: ${{ inputs.candidate_run_id != '' }}
@@ -335,6 +358,8 @@ jobs:
           set -euo pipefail
           scaffold_runtime_version="$(cat scaffold-runtime-version.txt)"
           mkdir -p candidate
+          # Only release-feed artifacts are downloaded; standalone staging stays
+          # in its own Actions artifact and must never enter this candidate.
           find incoming -type f -name 'comet-*' -exec cp '{}' candidate/ \;
 
           desktop_files=(

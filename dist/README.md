@@ -130,13 +130,26 @@ macOS permission grants. Its bundle deliberately does
 not register the shared `comet://` invitation scheme, which has no environment
 discriminator, so installing it cannot steal production invitation links.
 
-**Standalone staging is not the release staging channel.** The release workflow
-continues to build a production-default, production-identity `Crew.app`; staging
-promotion tests that exact candidate before the same bytes are promoted to
-production. It does not publish `Crew Staging.app` or change updater filenames.
+**Standalone staging is not the release staging channel.** On a fresh build
+(`candidate_run_id` empty), the release workflow's `macos` job packages, signs,
+notarizes, and verifies both the production-default, production-identity
+`Crew.app` and standalone `Crew Staging.app`, using the same CI credentials below.
+Production artifacts remain in `macos-arm64`; standalone staging is uploaded
+separately as the Actions artifact `macos-staging-arm64`, containing:
+
+- `comet-staging-<version>-macos-arm64.dmg`
+- `comet-staging-<version>-macos-arm64-app.tar.gz` (contains `Crew Staging.app`)
+- `SHA256SUMS`
+
+Candidate assembly downloads only production desktop and selected Linux
+artifacts, never standalone staging. Release staging promotion tests the exact
+production candidate before the same bytes are promoted to production; neither
+release feed publishes `Crew Staging.app` or changes updater filenames. Reusing
+`candidate_run_id` skips the entire `macos` job, including standalone staging:
+download that app from the original fresh build's `macos-staging-arm64` artifact.
 The standalone staging executable is unmanaged by the release updater and rejects
 update staging/application, preventing the production bundle from replacing its
-identity. Repackage standalone staging to update it.
+identity. Install a newly packaged standalone staging artifact to update it.
 
 ### Explicit local-only ad-hoc packaging
 

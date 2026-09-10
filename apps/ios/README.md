@@ -22,19 +22,20 @@ automatically): [loro-swift 1.13.x](https://github.com/loro-dev/loro-swift)
 (cmark-gfm: tables/strikethrough/tasklists — the same feature set as the
 desktop's pulldown-cmark config).
 
-Crew 0.1.88 uses mobile staging **1.0 (16)** and production **1.0 (10)**.
-Both uploads were accepted by Apple, fully processed, and confirmed available
-in their existing **Ashler Internal** TestFlight groups.
+Crew 0.1.89 prepares mobile staging **1.0 (17)** and production **1.0 (11)**.
+These are build candidates, not uploaded or available TestFlight releases. The
+previous Crew 0.1.88 release used staging **1.0 (16)** and production **1.0 (10)**;
+its historical upload evidence is recorded below.
 
 Production and staging use the same Swift target with separate checked-in schemes,
 bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
 
 ```sh
-# Production candidate: Crew, ai.ashler.crew, version 1.0 build 10
+# Production candidate: Crew, ai.ashler.crew, version 1.0 build 11
 xcodebuild -project Comet.xcodeproj -scheme Comet \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 
-# Staging candidate: Crew Staging, ai.ashler.crew.staging, version 1.0 build 16
+# Staging candidate: Crew Staging, ai.ashler.crew.staging, version 1.0 build 17
 xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 ```
@@ -43,6 +44,53 @@ xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
 | --- | --- | --- | --- | --- |
 | `Comet` | `comet.internal.ashler.com` | `scaffold.internal.ashler.com` | `ashler-production` | `comet://` |
 | `Crew Staging` | `comet-staging.internal.ashler.com` | `scaffold-staging.internal.ashler.com` | `ashler-staging` | `comet-staging://` |
+
+### Build candidates in CI
+
+After pushing the intended merged source to `main`, dispatch both environments
+from the repository root and confirm each run's source SHA matches that source:
+
+```sh
+gh workflow run mobile.yml --repo Ashler-AI/comet --ref main -f environment=staging
+gh workflow run mobile.yml --repo Ashler-AI/comet --ref main -f environment=production
+```
+
+`environment` is the only workflow input; it defaults to `staging`. The workflow
+also runs on pushes to `release/mobile-*` (staging only). It uses Apple-silicon
+`macos-26`, Node 24, the newest installed stable Xcode 26 and iOS 26 SDK/runtime.
+`node scripts/mobile-ci.mjs` is CI-only and refuses developer-workstation builds.
+It verifies the simulator, then archives the same source without Apple credentials.
+
+The artifact `crew-mobile-<environment>-<source SHA>` contains:
+
+| Environment | Device archive | Simulator app package |
+| --- | --- | --- |
+| staging | `Crew-Staging-1.0-17-unsigned.xcarchive.tar.gz` | `Crew-Staging-1.0-17-simulator-arm64.tar.gz` |
+| production | `Crew-1.0-11-unsigned.xcarchive.tar.gz` | `Crew-1.0-11-simulator-arm64.tar.gz` |
+
+Both also include `SHA256SUMS`, `source-sha.txt`, `provenance.json`, `e2e.log`,
+and `archive-signed.entitlements`. Artifacts originate in
+`mobile-artifacts/release/` and are retained for 14 days; diagnostics are in
+`crew-mobile-logs-<run ID>-<attempt>`. Extracted archives are named
+`Crew-Staging.xcarchive` and `Crew.xcarchive`, respectively, each containing
+`Products/Applications/Comet.app`.
+
+CI's archive signature is **ad-hoc**, with `aps-environment = production`, not
+Apple distribution signing; the archive has no provisioning profile. This is
+sufficient for an archived build deliverable, but not an installable device IPA
+or TestFlight availability. Distribution export is a separate, non-compiling
+step using the existing local Xcode account, team `825LYXGJR6`, and a valid
+distribution certificate/profile for the exact environment's bundle ID. The
+established cloud-managed signing flow requires the account's signing access.
+Preserve the archive's expanded push entitlement during export, inspect the
+exported IPA's bundle/version/profile and `aps-environment = production`, and
+run strict deep signature verification before claiming distribution readiness.
+Do not upload, submit to the App Store, or change TestFlight groups merely to
+produce these build candidates.
+
+`native-verification.yml` is a separate Rust/desktop verification workflow. It
+has no dispatch inputs and runs only on pushes to `verify/native-lifecycle-*`
+or `verify/native-startup-*`; it neither creates nor signs mobile archives.
 
 ### Crew 0.1.88 upload evidence
 
@@ -629,14 +677,16 @@ authorized rollout.
 
 ### Production parity release
 
-Production uses the same session, notification, image-upload, and recovery source
-as staging. The mobile workflow accepts `environment=production` to build the
-`Comet` scheme with `Debug`/`Release`, bundle `ai.ashler.crew`, and build **6**.
-The default remains staging build **12**. Both environments verify all five
-simulator probes and the built app's Edge/Scaffold endpoints, project scope,
-invite scheme, version, architecture, and archive push entitlement. No Apple
-credentials are uploaded to CI: distribution export, signed-IPA inspection,
-and upload use the established local Xcode account flow above.
+For this historical parity release, production used the same session,
+notification, image-upload, and recovery source as staging. The mobile workflow
+used `environment=production` for the `Comet` scheme with `Debug`/`Release`, bundle
+`ai.ashler.crew`, and build **6**; staging was build **12**. Both environments
+verified the then-current five simulator probes and the built app's
+Edge/Scaffold endpoints, project scope, invite scheme, version, architecture,
+and archive push entitlement. Apple credentials were not uploaded to CI;
+distribution export, signed-IPA inspection, and upload used the local Xcode
+account flow above. Current build candidates and dispatch instructions are
+listed at the top of this document.
 
 Desktop **0.1.78** passed 532 UI tests and all three fork regressions in
 [34236389287](https://github.com/Ashler-AI/comet/actions/runs/34236389287), including
