@@ -22,15 +22,19 @@ automatically): [loro-swift 1.13.x](https://github.com/loro-dev/loro-swift)
 (cmark-gfm: tables/strikethrough/tasklists — the same feature set as the
 desktop's pulldown-cmark config).
 
+The Crew 0.1.88 candidate uses mobile staging **1.0 (16)** and production
+**1.0 (10)**. These are source build numbers; upload and TestFlight availability
+must be verified separately before describing either candidate as released.
+
 Production and staging use the same Swift target with separate checked-in schemes,
 bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
 
 ```sh
-# Production: Crew, ai.ashler.crew, version 1.0 build 9
+# Production candidate: Crew, ai.ashler.crew, version 1.0 build 10
 xcodebuild -project Comet.xcodeproj -scheme Comet \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 
-# Staging: Crew Staging, ai.ashler.crew.staging, version 1.0 build 15
+# Staging candidate: Crew Staging, ai.ashler.crew.staging, version 1.0 build 16
 xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 ```
