@@ -2119,6 +2119,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn delta_restores_blob_from_before_shallow_prerequisite() {
+        let (source, _) = fixture();
+        let old_blob = git_output(source.path(), &["rev-parse", "HEAD:kept.txt"]);
+        let old_blob = std::str::from_utf8(&old_blob).unwrap().trim();
+        std::fs::write(source.path().join("kept.txt"), "replacement\n").unwrap();
+        git(source.path(), &["commit", "-qam", "replace old blob"]);
+        let prerequisite = run_head(source.path());
+        let platform = tempfile::tempdir().unwrap();
+        git(
+            platform.path(),
+            &[
+                "clone",
+                "-q",
+                "--depth=1",
+                &format!("file://{}", source.path().display()),
+                "repo",
+            ],
+        );
+        let restored = platform.path().join("repo");
+        assert!(
+            !Command::new("git")
+                .args(["cat-file", "-e", old_blob])
+                .env("ASHLER_INCREMENTAL_TSC_CHECKS", "false")
+                .current_dir(&restored)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        std::fs::write(source.path().join("kept.txt"), "base\n").unwrap();
+        git(
+            source.path(),
+            &["commit", "-qam", "restore historical blob"],
+        );
+        let head = run_head(source.path());
+        let snapshot = capture_worktree_handoff_cancellable(
+            source.path(),
+            Some(&prerequisite),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let (unpacked, manifest) = unpack(&snapshot);
+        assert_eq!(manifest["repository"]["prerequisiteSha"], prerequisite);
+        source.close().unwrap();
+        let bundle = unpacked.path().join(REPOSITORY_PATH);
+        git(&restored, &["bundle", "verify", bundle.to_str().unwrap()]);
+        git(&restored, &["bundle", "unbundle", bundle.to_str().unwrap()]);
+        git(&restored, &["checkout", "--detach", "-q", &head]);
+        git(&restored, &["fsck", "--strict"]);
+        assert_eq!(run_head(&restored), head);
+        assert_eq!(std::fs::read(restored.join("kept.txt")).unwrap(), b"base\n");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn fetch_memory_inspection_ignores_exited_unreaped_children() {

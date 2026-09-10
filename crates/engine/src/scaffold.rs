@@ -3726,13 +3726,15 @@ mod tests {
             }
         });
         let started = tokio::time::Instant::now();
-        let result = runtime.probe_attach_authority(
-            "sandbox-a",
-            &scope(),
-            &environment,
-            &["comet".into(), "scaffold-authority".into()],
-            &CancellationToken::new(),
-        ).await;
+        let result = runtime
+            .probe_attach_authority(
+                "sandbox-a",
+                &scope(),
+                &environment,
+                &["comet".into(), "scaffold-authority".into()],
+                &CancellationToken::new(),
+            )
+            .await;
         clock.abort();
         let _ = clock.await;
         let authority = result.unwrap();
@@ -3756,7 +3758,11 @@ mod tests {
             (503, "sandbox_runtime_starting", Some("failed")),
             (503, "sandbox_runtime_starting", Some("paused")),
             (503, "sandbox_runtime_starting", Some("stopped")),
-            (503, "sandbox_runtime_starting", Some("unknown_future_state")),
+            (
+                503,
+                "sandbox_runtime_starting",
+                Some("unknown_future_state"),
+            ),
         ] {
             let mut responses = vec![
                 (200, comet_sandbox("starting")),
@@ -3806,21 +3812,26 @@ mod tests {
             let (origin, captured) = mock_server_with_status(vec![
                 (503, r#"{"error":"sandbox_runtime_starting"}"#.into()),
                 (200, changed.to_string()),
-            ]).await;
+            ])
+            .await;
             let runtime = ScaffoldRuntime::new(
-                ScaffoldClient::new(&origin, "project-a", Arc::new(StaticToken("token".into()))).unwrap(),
+                ScaffoldClient::new(&origin, "project-a", Arc::new(StaticToken("token".into())))
+                    .unwrap(),
                 "https://comet-edge.example",
                 Arc::new(UnavailableDeviceJoinGrantProvider),
             );
             let envelope: SandboxEnvelope = serde_json::from_value(original).unwrap();
             let environment = envelope.sandbox.into_environment(scope()).unwrap();
-            let error = runtime.probe_attach_authority(
-                "sandbox-a",
-                &scope(),
-                &environment,
-                &["comet".into(), "scaffold-authority".into()],
-                &CancellationToken::new(),
-            ).await.unwrap_err();
+            let error = runtime
+                .probe_attach_authority(
+                    "sandbox-a",
+                    &scope(),
+                    &environment,
+                    &["comet".into(), "scaffold-authority".into()],
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
             assert!(matches!(error, ScaffoldError::InvalidResponse(_)));
             let requests = captured.await.unwrap();
             assert!(!requests.iter().any(|request| {

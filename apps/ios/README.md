@@ -22,7 +22,7 @@ automatically): [loro-swift 1.13.x](https://github.com/loro-dev/loro-swift)
 (cmark-gfm: tables/strikethrough/tasklists — the same feature set as the
 desktop's pulldown-cmark config).
 
-Crew 0.1.89 prepares mobile staging **1.0 (17)** and production **1.0 (11)**.
+Crew 0.1.90 prepares mobile staging **1.0 (18)** and production **1.0 (12)**.
 These are build candidates, not uploaded or available TestFlight releases. The
 previous Crew 0.1.88 release used staging **1.0 (16)** and production **1.0 (10)**;
 its historical upload evidence is recorded below.
@@ -31,11 +31,11 @@ Production and staging use the same Swift target with separate checked-in scheme
 bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
 
 ```sh
-# Production candidate: Crew, ai.ashler.crew, version 1.0 build 11
+# Production candidate: Crew, ai.ashler.crew, version 1.0 build 12
 xcodebuild -project Comet.xcodeproj -scheme Comet \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 
-# Staging candidate: Crew Staging, ai.ashler.crew.staging, version 1.0 build 17
+# Staging candidate: Crew Staging, ai.ashler.crew.staging, version 1.0 build 18
 xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 ```
@@ -65,8 +65,8 @@ The artifact `crew-mobile-<environment>-<source SHA>` contains:
 
 | Environment | Device archive | Simulator app package |
 | --- | --- | --- |
-| staging | `Crew-Staging-1.0-17-unsigned.xcarchive.tar.gz` | `Crew-Staging-1.0-17-simulator-arm64.tar.gz` |
-| production | `Crew-1.0-11-unsigned.xcarchive.tar.gz` | `Crew-1.0-11-simulator-arm64.tar.gz` |
+| staging | `Crew-Staging-1.0-18-unsigned.xcarchive.tar.gz` | `Crew-Staging-1.0-18-simulator-arm64.tar.gz` |
+| production | `Crew-1.0-12-unsigned.xcarchive.tar.gz` | `Crew-1.0-12-simulator-arm64.tar.gz` |
 
 Both also include `SHA256SUMS`, `source-sha.txt`, `provenance.json`, `e2e.log`,
 and `archive-signed.entitlements`. Artifacts originate in
