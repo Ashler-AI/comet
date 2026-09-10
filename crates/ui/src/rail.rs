@@ -37,6 +37,15 @@ pub struct RailTick {
     pub reply: Option<String>,
 }
 
+/// Rail content and row lookup change with transcript revisions, not animation
+/// frames. Previews are capped here so a frame never copies a complete reply.
+#[derive(Default)]
+pub(crate) struct RailCache {
+    revision: Option<u64>,
+    pairs: Vec<(RailTick, usize)>,
+    tick_rows: Vec<usize>,
+}
+
 fn user_text(entry: &SessionMessageEntry) -> String {
     let raw = entry
         .parts
@@ -55,23 +64,18 @@ fn user_text(entry: &SessionMessageEntry) -> String {
     crate::attachments::user_message_rail_text(&raw)
 }
 
-fn first_reply_text(entries: &[SessionMessageEntry]) -> Option<String> {
-    entries
-        .iter()
-        .find(|e| e.role == MessageRole::Assistant)
-        .and_then(|entry| {
-            entry.parts.iter().find_map(|part| match part {
-                MessagePart::Text { text, .. } | MessagePart::TextWindow { text, .. }
-                    if !text.trim().is_empty() =>
-                {
-                    Some(text.trim().to_string())
-                }
-                _ => None,
-            })
-        })
+fn first_reply_text(entry: &SessionMessageEntry) -> Option<String> {
+    entry.parts.iter().find_map(|part| match part {
+        MessagePart::Text { text, .. } | MessagePart::TextWindow { text, .. }
+            if !text.trim().is_empty() =>
+        {
+            Some(text.trim().to_string())
+        }
+        _ => None,
+    })
 }
 
-/// Extract rail ticks from the transcript: one per user entry (doc entries
+/// Extract rail ticks from the transcript: one per non-peer user entry (doc entries
 /// first, then unconfirmed echoes — matching transcript row order). Each tick
 /// carries the opening of the assistant reply that followed it, for the hover
 /// preview card.
@@ -80,18 +84,31 @@ pub fn rail_ticks(
     echoes: &[SessionMessageEntry],
 ) -> Vec<RailTick> {
     let mut ticks: Vec<RailTick> = Vec::new();
-    for (ix, entry) in entries.iter().enumerate() {
-        if entry.role != MessageRole::User {
+    let mut next_assistant = None;
+    for entry in entries.iter().rev() {
+        if entry.role == MessageRole::Assistant {
+            next_assistant = Some(entry);
+        }
+        if entry.role != MessageRole::User || entry.is_peer_message() {
             continue;
         }
         ticks.push(RailTick {
             message_id: entry.id.clone(),
             prompt: user_text(entry),
-            reply: first_reply_text(&entries[ix + 1..]),
+            reply: next_assistant.and_then(first_reply_text),
         });
     }
+    ticks.reverse();
+    let mut seen: std::collections::HashSet<&str> = entries
+        .iter()
+        .filter(|entry| entry.role == MessageRole::User)
+        .map(|entry| entry.id.as_str())
+        .collect();
     for echo in echoes {
-        if echo.role == MessageRole::User && !ticks.iter().any(|t| t.message_id == echo.id) {
+        if echo.role == MessageRole::User
+            && !echo.is_peer_message()
+            && seen.insert(echo.id.as_str())
+        {
             ticks.push(RailTick {
                 message_id: echo.id.clone(),
                 prompt: user_text(echo),
@@ -109,10 +126,11 @@ pub fn active_tick(tick_rows: &[usize], top_row: usize) -> Option<usize> {
     if tick_rows.is_empty() {
         return None;
     }
-    match tick_rows.iter().rposition(|&row| row <= top_row) {
-        Some(ix) => Some(ix),
-        None => Some(0),
-    }
+    Some(
+        tick_rows
+            .partition_point(|&row| row <= top_row)
+            .saturating_sub(1),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -417,27 +435,38 @@ impl Transcript {
         }
         let state = self.state_entity().clone();
         let state = state.read(cx);
-        let echoes = state.pending_echoes().to_vec();
-        let ticks = rail_ticks(&state.transcript, &echoes);
-        // Map each tick to its transcript row (user rows share the entry id).
-        let pairs: Vec<(RailTick, usize)> = ticks
-            .into_iter()
-            .filter_map(|tick| {
-                let row = self
-                    .rows()
-                    .iter()
-                    .position(|r| r.id.as_ref() == tick.message_id.as_str())?;
-                Some((tick, row))
-            })
-            .collect();
+        let revision = state.transcript_revision();
+        if self.rail_cache.revision != Some(revision) {
+            let mut row_indices = std::collections::HashMap::new();
+            for (ix, row) in self.rows().iter().enumerate() {
+                row_indices.entry(row.id.as_ref()).or_insert(ix);
+            }
+            let pairs: Vec<_> = rail_ticks(&state.transcript, state.pending_echoes())
+                .into_iter()
+                .filter_map(|mut tick| {
+                    let row = *row_indices.get(tick.message_id.as_str())?;
+                    tick.prompt = truncate_preview(&tick.prompt, PREVIEW_PROMPT_CHARS);
+                    tick.reply = tick
+                        .reply
+                        .as_deref()
+                        .map(|reply| truncate_preview(reply, PREVIEW_REPLY_CHARS));
+                    Some((tick, row))
+                })
+                .collect();
+            self.rail_cache = RailCache {
+                revision: Some(revision),
+                tick_rows: pairs.iter().map(|(_, row)| *row).collect(),
+                pairs,
+            };
+        }
+        let pairs = &self.rail_cache.pairs;
         // A minimap of one exchange is noise, not navigation — the original
         // rail hides below two marks (message-rail.tsx `marks.length < 2`).
         if pairs.len() < 2 {
             return gpui::Empty.into_any_element();
         }
-        let tick_rows: Vec<usize> = pairs.iter().map(|(_, row)| *row).collect();
         let top_row = self.list_state().logical_scroll_top().item_ix;
-        let active = active_tick(&tick_rows, top_row);
+        let active = active_tick(&self.rail_cache.tick_rows, top_row);
         let hover = self.rail_hover();
         let theme = Theme::of(cx).clone();
 
@@ -480,11 +509,8 @@ impl Transcript {
                 } else {
                     crate::theme::ink(0.16)
                 };
-                let prompt = truncate_preview(&tick.prompt, PREVIEW_PROMPT_CHARS);
-                let reply = tick
-                    .reply
-                    .as_deref()
-                    .map(|r| truncate_preview(r, PREVIEW_REPLY_CHARS));
+                let prompt = tick.prompt;
+                let reply = tick.reply;
                 let card: Option<AnyElement> = is_hovered.then(|| {
                     let card = popover::popover_card(&theme)
                         .w(px(280.0))
@@ -572,7 +598,31 @@ mod tests {
             device_id: "d".into(),
             status: Some(MessageStatus::Complete),
             continuation_of: None,
+            peer_message: None,
         }
+    }
+
+    #[test]
+    fn peer_messages_never_create_prompt_previews_even_as_echoes() {
+        let mut peer = entry("peer", MessageRole::User, "private transport body");
+        peer.peer_message = Some(comet_proto::PeerMessageProvenance {
+            command_id: peer.id.clone(),
+            source_chat_id: "source".into(),
+            thread_id: "thread".into(),
+            reply_to: None,
+        });
+        let ordinary = entry("ordinary", MessageRole::User, "[Peer message] ordinary prompt");
+        let reply = entry("reply", MessageRole::Assistant, "visible answer");
+        let ticks = rail_ticks(&[peer.clone(), ordinary.clone(), reply], &[peer.clone()]);
+        assert_eq!(ticks, vec![RailTick {
+            message_id: ordinary.id.clone(),
+            prompt: "[Peer message] ordinary prompt".into(),
+            reply: Some("visible answer".into()),
+        }]);
+        assert!(rail_ticks(&[peer.clone()], &[peer.clone()]).is_empty());
+        peer.peer_message.as_mut().unwrap().command_id = "mismatch".into();
+        let ticks = rail_ticks(&[peer], &[]);
+        assert_eq!(ticks[0].prompt, "private transport body");
     }
 
     #[test]

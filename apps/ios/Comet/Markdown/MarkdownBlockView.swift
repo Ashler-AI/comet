@@ -235,6 +235,7 @@ struct CodeBlockView: View {
             let result = await Task.detached(priority: .utility) {
                 Highlighter.highlight(code: source, language: lang)
             }.value
+            guard !Task.isCancelled else { return }
             spans = result
         }
     }
@@ -244,14 +245,19 @@ struct CodeBlockView: View {
         var attr = AttributedString(line)
         attr.foregroundColor = Theme.text.opacity(0.9)
         guard !spans.isEmpty else { return attr }
-        let chars = Array(line)
+        // Tokenizer spans are ordered and disjoint. Walk character indices
+        // once instead of rebuilding/counting every token's entire prefix.
+        let length = attr.characters.count
+        var cursor = attr.startIndex
+        var offset = 0
         for span in spans {
-            guard span.range.lowerBound < chars.count else { continue }
-            let upper = min(span.range.upperBound, chars.count)
-            let prefix = String(chars[0..<span.range.lowerBound])
-            let body = String(chars[span.range.lowerBound..<upper])
-            guard let start = attr.index(afterCharacters: prefix.count),
-                  let end = attr.index(afterCharacters: prefix.count + body.count) else { continue }
+            guard span.range.lowerBound >= offset,
+                  span.range.lowerBound < length else { continue }
+            let upper = min(span.range.upperBound, length)
+            let start = attr.characters.index(cursor, offsetBy: span.range.lowerBound - offset)
+            let end = attr.characters.index(start, offsetBy: upper - span.range.lowerBound)
+            cursor = end
+            offset = upper
             attr[start..<end].foregroundColor = color(for: span.cls)
         }
         return attr
@@ -267,11 +273,6 @@ struct CodeBlockView: View {
     }
 }
 
-private extension AttributedString {
-    func index(afterCharacters count: Int) -> AttributedString.Index? {
-        characters.index(startIndex, offsetBy: count, limitedBy: endIndex)
-    }
-}
 
 // MARK: - Blockquote
 

@@ -37,7 +37,7 @@ on:
           - staging-deployed
           - production-deployed
       candidate_run_id:
-        description: "Successful release run whose exact candidate should be reused for production promotion; empty rebuilds"
+        description: "Successful release run whose exact candidate should be reused for staging or production promotion; empty rebuilds"
         required: false
         default: ""
         type: string
@@ -99,14 +99,21 @@ jobs:
               exit 1
               ;;
           esac
+          if [[ "$promotion_target" == "production" ]]; then
+            git fetch origin main
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+              echo "::error::production release source must be merged into main before promotion"
+              exit 1
+            fi
+          fi
           candidate_run_id="$REQUESTED_CANDIDATE_RUN_ID"
           if [[ -n "$candidate_run_id" ]]; then
             if [[ ! "$candidate_run_id" =~ ^[1-9][0-9]*$ ]]; then
               echo "::error::candidate_run_id must be a positive GitHub Actions run id"
               exit 1
             fi
-            if [[ "$promotion_target" != "production" ]]; then
-              echo "::error::candidate_run_id is only supported for production promotion"
+            if [[ "$promotion_target" != "staging" && "$promotion_target" != "production" ]]; then
+              echo "::error::candidate_run_id is only supported for staging or production promotion"
               exit 1
             fi
           fi
@@ -230,8 +237,27 @@ jobs:
       - name: Select checked-in Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - name: Verify desktop session and attachment behavior
+        run: cargo test --locked -p comet-ui --lib
+      - name: Verify large-journal fork behavior
+        run: cargo test --locked -p comet-harness fork_session_file_
+      - name: Verify gateway extension ownership and discovery
+        run: cargo test --locked -p comet-harness auth_gateway::tests
+      - name: Verify desktop and Scaffold gateway launch policies
+        run: cargo test --locked -p comet-harness shared_inference_
+      - name: Verify native handoff preparation and runtime coordinates
+        run: |
+          cargo test --locked -p comet-engine --lib scaffold_session
+          cargo test --locked -p comet-engine --lib worktree
+          cargo test --locked -p comet-engine --lib materializer
+          cargo test --locked -p comet-engine --lib join_grant_rejection
+          cargo test --locked -p comet-engine --lib historical_attachments
+          cargo test --locked -p comet-harness native_handoff_executable_
+          cargo test --locked -p comet --bin comet session
       - name: Package
         run: scripts/package-macos.sh
+      - name: Verify packaged native handoff command
+        run: target/package/Crew.app/Contents/MacOS/comet session handoff --help
       - name: Record artifact checksums
         run: |
           cd target/package

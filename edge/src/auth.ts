@@ -28,6 +28,11 @@ export interface Verified {
   readonly credential: "scaffold" | "device" | "dev";
 }
 
+export type ScaffoldAuthenticationResult =
+  | { status: "authenticated"; identity: Verified }
+  | { status: "invalid" }
+  | { status: "unavailable" };
+
 interface ScaffoldSession {
   readonly ok?: unknown;
   readonly resource?: unknown;
@@ -101,12 +106,12 @@ export const bearerFromRequest = (request: Request): string | undefined => {
   return url.searchParams.get("token")?.trim() || undefined;
 };
 
-export const verifyScaffoldToken = async (env: ScaffoldAuthEnv, token: string): Promise<Verified | undefined> => {
-  if (!token.startsWith("sc_rc_")) return undefined;
+const verifyScaffoldTokenResult = async (env: ScaffoldAuthEnv, token: string): Promise<ScaffoldAuthenticationResult> => {
+  if (!token.startsWith("sc_rc_")) return { status: "invalid" };
   const resource = normalizedOrigin(env.SCAFFOLD_CONTROL_PLANE_URL);
   const projectScope = env.SCAFFOLD_PROJECT_SCOPE.trim();
   const required = requiredCapabilities(env);
-  if (!resource || !projectScope || required.length === 0) return undefined;
+  if (!resource || !projectScope || required.length === 0) return { status: "unavailable" };
 
   let response: Response;
   try {
@@ -114,16 +119,20 @@ export const verifyScaffoldToken = async (env: ScaffoldAuthEnv, token: string): 
       headers: { authorization: `Bearer ${token}`, accept: "application/json" }
     });
   } catch {
-    return undefined;
+    return { status: "unavailable" };
   }
-  if (!response.ok) return undefined;
+  // Only an explicit credential rejection is authoritative. Network errors,
+  // other HTTP failures and malformed authority responses must not revoke state.
+  if (response.status === 401 || response.status === 403) return { status: "invalid" };
+  if (!response.ok) return { status: "unavailable" };
 
   let session: ScaffoldSession;
   try {
     session = (await response.json()) as ScaffoldSession;
   } catch {
-    return undefined;
+    return { status: "unavailable" };
   }
+  if (!session || typeof session !== "object") return { status: "unavailable" };
   const subject = typeof session.actor?.sub === "string" ? session.actor.sub.trim().toLowerCase() : "";
   const scopes = Array.isArray(session.scopes)
     ? [...new Set(session.scopes.filter((scope): scope is string => typeof scope === "string" && scope.length > 0))]
@@ -136,34 +145,50 @@ export const verifyScaffoldToken = async (env: ScaffoldAuthEnv, token: string): 
     normalizedOrigin(typeof session.resource === "string" ? session.resource : "") !== resource ||
     !required.every((capability) => capabilities.includes(capability))
   ) {
-    return undefined;
+    return { status: "unavailable" };
   }
   return {
-    userId: subject,
-    email: subject,
-    projectScope,
-    capabilities,
-    credential: "scaffold"
+    status: "authenticated",
+    identity: {
+      userId: subject,
+      email: subject,
+      projectScope,
+      capabilities,
+      credential: "scaffold"
+    }
   };
 };
 
-export const authenticateScaffold = async (env: ScaffoldAuthEnv, request: Request): Promise<Verified | undefined> => {
-  if (!credentialTransportAllowed(request.url)) return undefined;
+export const verifyScaffoldToken = async (env: ScaffoldAuthEnv, token: string): Promise<Verified | undefined> => {
+  const result = await verifyScaffoldTokenResult(env, token);
+  return result.status === "authenticated" ? result.identity : undefined;
+};
+
+export const authenticateScaffoldResult = async (env: ScaffoldAuthEnv, request: Request): Promise<ScaffoldAuthenticationResult> => {
+  if (!credentialTransportAllowed(request.url)) return { status: "invalid" };
   const token = bearerFromRequest(request);
-  if (!token) return undefined;
+  if (!token) return { status: "invalid" };
   if (env.AUTH_MODE === "dev") {
-    if (env.ENVIRONMENT !== "local") return undefined;
+    if (env.ENVIRONMENT !== "local") return { status: "unavailable" };
     const [userId, requestedProject] = token.split("@", 2);
-    if (!userId || (requestedProject && requestedProject !== env.SCAFFOLD_PROJECT_SCOPE)) return undefined;
+    if (!userId || (requestedProject && requestedProject !== env.SCAFFOLD_PROJECT_SCOPE)) return { status: "invalid" };
     const capabilities = requiredCapabilities(env);
-    if (capabilities.length === 0) return undefined;
+    if (capabilities.length === 0) return { status: "unavailable" };
     return {
-      userId,
-      email: `${userId}@dev.local`,
-      projectScope: env.SCAFFOLD_PROJECT_SCOPE,
-      capabilities,
-      credential: "dev"
+      status: "authenticated",
+      identity: {
+        userId,
+        email: `${userId}@dev.local`,
+        projectScope: env.SCAFFOLD_PROJECT_SCOPE,
+        capabilities,
+        credential: "dev"
+      }
     };
   }
-  return verifyScaffoldToken(env, token);
+  return verifyScaffoldTokenResult(env, token);
+};
+
+export const authenticateScaffold = async (env: ScaffoldAuthEnv, request: Request): Promise<Verified | undefined> => {
+  const result = await authenticateScaffoldResult(env, request);
+  return result.status === "authenticated" ? result.identity : undefined;
 };

@@ -1,6 +1,6 @@
 // Space detail — the phone's answer to the desktop's horizontal session tabs:
-// the space's sessions as a vertical list (creation order, like tab order),
-// swipe-to-archive (= tab close), and "+" to start a session in this space.
+// the space's sessions as a recency-ordered vertical list, swipe-to-archive,
+// an archived section with explicit restore, and "+" to start a session.
 
 import SwiftUI
 
@@ -10,13 +10,14 @@ struct SpaceView: View {
     @Binding var path: [Route]
 
     private var space: Space? {
-        model.spaces.first { $0.id == spaceId }
+        model.space(id: spaceId)
     }
 
     var body: some View {
         List {
             let chats = model.chats(in: spaceId)
-            if chats.isEmpty {
+            let archived = model.settledChats(in: spaceId)
+            if chats.isEmpty && archived.isEmpty {
                 emptyState
             }
             ForEach(chats) { chat in
@@ -38,6 +39,7 @@ struct SpaceView: View {
                     .tint(Theme.surfaceRaised)
                 }
             }
+            ArchivedSessionsSection(chats: archived, path: $path)
         }
         .listStyle(.plain)
         .environment(\.defaultMinListRowHeight, 10)
@@ -110,6 +112,53 @@ struct SpaceView: View {
 
     private func shortPath(_ path: String) -> String {
         (path as NSString).lastPathComponent
+    }
+}
+
+/// Shared by Home and space details so an archived row is always reachable
+/// without changing its persisted state merely by viewing it.
+struct ArchivedSessionsSection: View {
+    @Environment(AppModel.self) private var model
+    let chats: [Chat]
+    @Binding var path: [Route]
+
+    var body: some View {
+        if !chats.isEmpty {
+            Section {
+                ForEach(chats) { chat in
+                    Button {
+                        path.append(.chat(chat.id))
+                    } label: {
+                        ChatRow(chat: chat, showLocation: true)
+                    }
+                    .buttonStyle(PressWashButtonStyle())
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+                    .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
+                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                        Button {
+                            model.restoreChat(chatId: chat.id)
+                        } label: {
+                            Label("Restore", systemImage: "arrow.uturn.backward")
+                        }
+                        .tint(Theme.surfaceRaised)
+                    }
+                    .contextMenu {
+                        Button {
+                            model.restoreChat(chatId: chat.id)
+                        } label: {
+                            Label("Restore", systemImage: "arrow.uturn.backward")
+                        }
+                    }
+                }
+            } header: {
+                Text("Archived sessions")
+                    .font(Theme.sans(11, weight: .medium))
+                    .foregroundStyle(Theme.textMuted.opacity(0.6))
+                    .textCase(nil)
+                    .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 3, trailing: 16))
+            }
+        }
     }
 }
 

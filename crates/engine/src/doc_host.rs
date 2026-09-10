@@ -22,9 +22,9 @@ use comet_doc::{
 };
 use comet_proto::{
     AgentSessionRecord, AuditEvent, AuditResult, COLLABORATION_SCHEMA_VERSION, CapabilityGrant,
-    FileTargetReference, HarnessId, MessageProvenance, ModelHandoff, PublicationRecord,
-    PublicationValue, SemanticAnchor, SemanticAnnotation, SessionRoomProjection, SessionStatus,
-    UserInputAnswer, UserInputQuestion, VerifiedCapabilityGrantEnvelope,
+    FileTargetReference, HarnessId, MessageProvenance, ModelHandoff, PeerMessageProvenance,
+    PublicationRecord, PublicationValue, SemanticAnchor, SemanticAnnotation, SessionRoomProjection,
+    SessionStatus, UserInputAnswer, UserInputQuestion, VerifiedCapabilityGrantEnvelope,
 };
 use comet_sync::{DocsStore, RoomClient};
 
@@ -381,6 +381,7 @@ pub struct ChatDocHandle {
     snapshot_bytes: AtomicUsize,
     room_projection: Mutex<Option<SessionRoomProjection>>,
     room: Mutex<Option<RoomClient>>,
+    room_join_task: Mutex<Option<tokio::task::AbortHandle>>,
     /// Invalidates a room join that was already dialing when an unprojected
     /// local handle adopts its trusted Scaffold projection.
     room_generation: AtomicU64,
@@ -389,6 +390,14 @@ pub struct ChatDocHandle {
     room_join_started: AtomicBool,
     /// Doc subscription (drop = unsubscribe) — bumps the change watch on every commit.
     _sub: loro::Subscription,
+}
+
+impl Drop for ChatDocHandle {
+    fn drop(&mut self) {
+        if let Some(task) = lock(&self.room_join_task).take() {
+            task.abort();
+        }
+    }
 }
 
 impl ChatDocHandle {
@@ -458,7 +467,11 @@ impl ChatDocHandle {
         // A join may already be connected or dialing the legacy room. Bump the
         // generation before dropping the current client so an old dial cannot
         // install itself after the new projected join starts.
+        let mut join_task = lock(&self.room_join_task);
         self.room_generation.fetch_add(1, Ordering::AcqRel);
+        if let Some(task) = join_task.take() {
+            task.abort();
+        }
         drop(lock(&self.room).take());
         self.room_join_started.store(false, Ordering::Release);
         Ok(())
@@ -468,14 +481,14 @@ impl ChatDocHandle {
         lock(&self.room).is_some()
     }
 
-    /// Write a complete user message entry, idempotent by id (the client-minted message
-    /// id — a re-executed command or optimistic echo never duplicates the entry).
+    /// Write a complete user message, idempotent by durable message id. Returns whether
+    /// the persisted entry has peer provenance, for content-free UI previews.
     pub fn write_user_message(
         &self,
         message_id: &str,
         text: &str,
         created_at: i64,
-    ) -> Result<(), DocError> {
+    ) -> Result<bool, DocError> {
         self.write_user_message_with_status(message_id, text, created_at, MessageStatus::Complete)
     }
 
@@ -487,11 +500,37 @@ impl ChatDocHandle {
         text: &str,
         created_at: i64,
         status: MessageStatus,
-    ) -> Result<(), DocError> {
-        if self.doc.read_entries()?.iter().any(|e| e.id == message_id) {
-            return Ok(());
+    ) -> Result<bool, DocError> {
+        if let Some(entry) = self.doc.read_entry(message_id)? {
+            // Never infer or retrofit provenance onto an existing historical entry.
+            return Ok(entry.is_peer_message());
         }
-        self.doc.push_message(&SessionMessageEntry {
+        // Native peer delivery uses the immutable command id as its message id in
+        // all three paths: live waiter, active steering, and queued/new turn.
+        // Text (including a user-typed peer prompt lookalike) is never consulted.
+        let peer_message = self.doc.read_command(message_id)?.and_then(|entry| {
+            if !matches!(
+                entry.status,
+                SessionCommandStatus::Pending | SessionCommandStatus::Applied
+            ) {
+                return None;
+            }
+            match entry.payload {
+                SessionCommandPayload::PeerMessage {
+                    source_chat_id,
+                    thread_id,
+                    reply_to,
+                    ..
+                } => Some(PeerMessageProvenance {
+                    command_id: entry.id,
+                    source_chat_id,
+                    thread_id,
+                    reply_to,
+                }),
+                _ => None,
+            }
+        });
+        let entry = SessionMessageEntry {
             id: message_id.to_string(),
             role: MessageRole::User,
             parts: vec![MessagePart::Text {
@@ -502,7 +541,11 @@ impl ChatDocHandle {
             device_id: self.device_id.clone(),
             status: Some(status),
             continuation_of: None,
-        })
+            peer_message,
+        };
+        let is_peer_message = entry.is_peer_message();
+        self.doc.push_message(&entry)?;
+        Ok(is_peer_message)
     }
 
     /// Recovery sweep: stamp this device's abandoned `streaming` entries `aborted`, appending
@@ -958,6 +1001,9 @@ impl DocHost {
         let Some(edge) = &self.inner.config.edge else {
             return;
         };
+        // Serialize task installation with projection invalidation so a stale
+        // pending connection cannot outlive its owner or replace the new task.
+        let mut join_task = lock(&handle.room_join_task);
         if !self.chat_allows_room_join(&handle.chat_id)
             || lock(&handle.room).is_some()
             || handle
@@ -977,7 +1023,7 @@ impl DocHost {
         let room_doc = handle.doc.doc().clone();
         let chat = handle.chat_id.clone();
         let weak = Arc::downgrade(&handle);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut wake = comet_sync::wake::subscribe();
             let mut backoff = crate::workspace_host::JOIN_RETRY_BASE;
             loop {
@@ -1020,6 +1066,7 @@ impl DocHost {
                 }
             }
         });
+        *join_task = Some(task.abort_handle());
     }
 
     /// Start room supervision for an already-open chat (e.g. once a native run
@@ -1149,6 +1196,7 @@ impl DocHost {
             snapshot_bytes: AtomicUsize::new(snapshot_len),
             room_projection: Mutex::new(projection.cloned()),
             room: Mutex::new(None),
+            room_join_task: Mutex::new(None),
             room_generation: AtomicU64::new(0),
             command_lock: Mutex::new(()),
             room_join_started: AtomicBool::new(false),
@@ -1199,8 +1247,9 @@ impl DocHost {
         let mut by_age: Vec<(i64, String)> = {
             let handles = lock(&self.inner.handles);
             handles
-                .values()
-                .map(|h| (h.last_access.load(Ordering::Relaxed), h.chat_id.clone()))
+                .iter()
+                .filter(|(key, handle)| key.as_str() == handle.chat_id)
+                .map(|(_, h)| (h.last_access.load(Ordering::Relaxed), h.chat_id.clone()))
                 .collect()
         };
         by_age.sort_unstable();
@@ -1211,13 +1260,14 @@ impl DocHost {
             }
             let (count, estimate) = {
                 let handles = lock(&self.inner.handles);
-                (
-                    handles.len(),
-                    handles
-                        .values()
-                        .map(|h| h.resident_estimate())
-                        .sum::<usize>(),
-                )
+                // Execution keys alias a shared handle; budget each document
+                // once, not once per agent session that has used it.
+                handles
+                    .iter()
+                    .filter(|(key, handle)| key.as_str() == handle.chat_id)
+                    .fold((0, 0), |(count, bytes), (_, handle)| {
+                        (count + 1, bytes + handle.resident_estimate())
+                    })
             };
             if count <= WARM_DOC_CAP && estimate <= comet_doc::DOC_LRU_BYTE_BUDGET {
                 return;
@@ -1225,7 +1275,11 @@ impl DocHost {
             let evicted = {
                 let mut handles = lock(&self.inner.handles);
                 match handles.get(&chat_id) {
-                    Some(handle) if !self.pinned(handle) => handles.remove(&chat_id),
+                    Some(handle) if !self.pinned(handle) => {
+                        let handle = handle.clone();
+                        handles.retain(|_, candidate| !Arc::ptr_eq(candidate, &handle));
+                        Some(handle)
+                    }
                     _ => None,
                 }
             };
@@ -1263,8 +1317,11 @@ impl DocHost {
     /// Probe every open chat's room (window-focus liveness sweep). Each
     /// room ignores the hint unless it has been broadcast-quiet ≥30s.
     pub fn probe_open_chats(&self) {
-        let handles: Vec<Arc<ChatDocHandle>> =
-            lock(&self.inner.handles).values().cloned().collect();
+        let handles: Vec<Arc<ChatDocHandle>> = lock(&self.inner.handles)
+            .iter()
+            .filter(|(key, handle)| key.as_str() == handle.chat_id)
+            .map(|(_, handle)| handle.clone())
+            .collect();
         for handle in handles {
             if let Some(room) = lock(&handle.room).as_ref() {
                 room.probe();
@@ -1275,8 +1332,11 @@ impl DocHost {
     /// Per-open-chat room introspection for SyncStatus / `comet sync`.
     /// `None` room = still dialing (join retry loop) or edge-less.
     pub fn sync_statuses(&self) -> Vec<(String, Option<comet_sync::RoomStatsSnapshot>)> {
-        let handles: Vec<Arc<ChatDocHandle>> =
-            lock(&self.inner.handles).values().cloned().collect();
+        let handles: Vec<Arc<ChatDocHandle>> = lock(&self.inner.handles)
+            .iter()
+            .filter(|(key, handle)| key.as_str() == handle.chat_id)
+            .map(|(_, handle)| handle.clone())
+            .collect();
         let mut rows: Vec<(String, Option<comet_sync::RoomStatsSnapshot>)> = handles
             .iter()
             .map(|h| {
@@ -1294,8 +1354,7 @@ impl DocHost {
     /// chat is gone (DeleteChat / DeleteSpace cascade). Watchers see the
     /// stream end; a racing writer keeps its orphaned doc until the run ends.
     pub fn purge_chat(&self, chat_id: &str) {
-        let removed = lock(&self.inner.handles).remove(chat_id);
-        drop(removed);
+        lock(&self.inner.handles).retain(|_, handle| handle.chat_id != chat_id);
         if let Err(err) = self.inner.store.delete_snapshot(chat_id) {
             tracing::warn!(chat = %chat_id, error = %err, "snapshot delete failed");
         }
@@ -1469,8 +1528,8 @@ impl DocHost {
             return Ok(existing);
         }
         let now = now_ms();
-        let based_on = handle.doc.read_entries()?.last().map(|m| CommandBasedOn {
-            turn_id: Some(m.id.clone()),
+        let based_on = handle.doc.last_message_id().map(|id| CommandBasedOn {
+            turn_id: Some(id),
             frontier: None,
         });
         let entry = SessionCommandEntry {
@@ -2667,16 +2726,20 @@ impl DocHost {
 
     /// Persist every open doc now (shutdown path; bypasses the debounce).
     pub fn flush_all(&self) {
-        let handles: Vec<_> = lock(&self.inner.handles).values().cloned().collect();
+        let handles: Vec<_> = lock(&self.inner.handles)
+            .iter()
+            .filter(|(key, handle)| key.as_str() == handle.chat_id)
+            .map(|(_, handle)| handle.clone())
+            .collect();
         for handle in handles {
             self.save_snapshot(&handle);
         }
     }
 }
 
-/// The exact user-visible prompt delivered to a peer session's transcript and
-/// harness. Keeping one string prevents the recorded and executed instructions
-/// from diverging.
+/// The exact prompt delivered to a peer session's transcript and harness. The
+/// transcript UI collapses typed peer messages, never rewrites their content.
+/// Keeping one string prevents recorded and executed instructions from diverging.
 pub fn peer_message_prompt(
     source_chat_id: &str,
     thread_id: &str,
@@ -2768,6 +2831,132 @@ mod authority_tests {
     use super::*;
     use comet_proto::AgentSessionSource;
     use loro::LoroMap;
+
+    #[tokio::test]
+    async fn shared_session_aliases_do_not_survive_document_purge() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let host = DocHost::new(
+            store.clone(),
+            DocHostConfig {
+                device_id: "device-a".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        let handle = host.open("shared-chat").unwrap();
+        host.bind_session_execution_key(&handle, "session-a");
+        host.bind_session_execution_key(&handle, "session-b");
+        host.flush_all();
+        assert_eq!(
+            host.sync_statuses()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            ["shared-chat"]
+        );
+
+        host.purge_chat("shared-chat");
+        host.flush_all();
+        assert!(host.sync_statuses().is_empty());
+        assert!(store.load_snapshot("shared-chat").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn unfinished_session_backfill_stops_on_purge_or_projection_change() {
+        use futures::{SinkExt, StreamExt};
+        use loro_protocol::{CrdtType, Permission, ProtocolMessage, decode, encode};
+        use tokio_tungstenite::tungstenite::Message;
+
+        for change_projection in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let source = loro::LoroDoc::new();
+            source
+                .get_map("meta")
+                .insert("remote", "awaiting history")
+                .unwrap();
+            source.commit();
+            let version = source.oplog_vv().encode();
+            let (advertised_tx, advertised_rx) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let mut advertised_tx = Some(advertised_tx);
+                while let Some(Ok(message)) = socket.next().await {
+                    let Message::Binary(bytes) = message else {
+                        continue;
+                    };
+                    match decode(&bytes).unwrap() {
+                        ProtocolMessage::JoinRequest {
+                            crdt: CrdtType::Loro,
+                            room_id,
+                            ..
+                        } => {
+                            socket
+                                .send(Message::Binary(
+                                    encode(&ProtocolMessage::JoinResponseOk {
+                                        crdt: CrdtType::Loro,
+                                        room_id,
+                                        permission: Permission::Write,
+                                        version: version.clone(),
+                                        extra: None,
+                                    })
+                                    .unwrap(),
+                                ))
+                                .await
+                                .unwrap();
+                        }
+                        ProtocolMessage::JoinRequest {
+                            crdt: CrdtType::LoroEphemeralStore,
+                            ..
+                        } => {
+                            if let Some(tx) = advertised_tx.take() {
+                                let _ = tx.send(());
+                            }
+                        }
+                        ProtocolMessage::Leave { .. } => return,
+                        _ => {}
+                    }
+                }
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let host = DocHost::new(
+                Arc::new(DocsStore::open(dir.path()).unwrap()),
+                DocHostConfig {
+                    device_id: "session-lifetime".into(),
+                    default_harness: HarnessId::Mock,
+                    edge: Some(EdgeConfig::with_static_token(
+                        format!("http://{address}"),
+                        "test",
+                    )),
+                },
+            );
+            let chat_id = "ac091c7f-3a6c-4ef6-b9aa-57eb89b51f54";
+            let handle = host.open(chat_id).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), advertised_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            if change_projection {
+                handle
+                    .ensure_room_projection(Some(&SessionRoomProjection {
+                        project_id: "project-lifetime".into(),
+                        deployment_id: "deployment-lifetime".into(),
+                        session_id: chat_id.into(),
+                    }))
+                    .unwrap();
+            } else {
+                host.purge_chat(chat_id);
+            }
+            drop(handle);
+            tokio::time::timeout(std::time::Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            host.purge_chat(chat_id);
+        }
+    }
 
     #[tokio::test]
     async fn imported_local_chats_never_join_edge_rooms() {
@@ -2899,6 +3088,7 @@ mod authority_tests {
                     chat_id: "session-a".into(),
                     added_at: chrono::Utc::now(),
                     environment: None,
+                    startup: None,
                 },
             )
             .unwrap();

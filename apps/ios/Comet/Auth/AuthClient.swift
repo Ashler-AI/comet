@@ -183,7 +183,7 @@ struct AuthClient {
               Self.scopes.allSatisfy(sessionScopes.contains) else {
             throw AuthError.invalidContract("Scaffold identity response was not authorized")
         }
-        let subject = session.actor.sub.lowercased()
+        let subject = session.actor.sub.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return (
             AuthUser(id: subject, email: subject, name: session.actor.displayName),
             AuthTokens(accessToken: tokens.accessToken)
@@ -254,7 +254,7 @@ struct AuthClient {
 // MARK: - Keychain storage
 
 enum Keychain {
-    private static let service = "dev.cometnative.Comet"
+    private static let service = Bundle.main.bundleIdentifier ?? "ai.ashler.crew"
 
     static func save(_ value: String, key: String) {
         let data = Data(value.utf8)

@@ -336,6 +336,32 @@ pub struct AgentRoute {
 }
 
 impl AgentRoute {
+    /// Resolve an OMP provider-qualified model for a native Scaffold session.
+    pub fn from_omp_model(selected: &str) -> Option<Self> {
+        let selected = selected.trim();
+        let lower = selected.to_ascii_lowercase();
+        let (_, model) = selected.rsplit_once('/')?;
+        if model.is_empty() {
+            return None;
+        }
+        let provider = if lower.starts_with("anthropic/") {
+            AgentProvider::Anthropic
+        } else if lower.starts_with("openai/") || lower.starts_with("openai-codex/") {
+            AgentProvider::OpenAi
+        } else {
+            return None;
+        };
+        Some(Self::automatic(provider, model))
+    }
+
+    pub fn omp_model(&self) -> String {
+        let provider = match self.provider {
+            AgentProvider::OpenAi => "openai-codex",
+            AgentProvider::Anthropic => "anthropic",
+        };
+        format!("{provider}/{}", self.model)
+    }
+
     pub fn automatic(provider: AgentProvider, model: impl Into<String>) -> Self {
         Self {
             provider,
@@ -611,6 +637,9 @@ pub struct ScaffoldControlGrant {
 #[serde(rename_all = "camelCase")]
 pub struct ScaffoldEnvironmentControlResult {
     pub environment: SessionEnvironment,
+    /// Exact preparation attempt to acknowledge when admitting its first command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation_generation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attached_device_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -651,6 +680,18 @@ pub struct AgentSessionRecord {
     pub created_at: i64,
     #[serde(flatten, default)]
     pub unknown: UnknownFields,
+}
+
+/// Identity of the native peer command that first wrote a Crew transcript message.
+/// This is separate from collaboration publications and is never inferred from text.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerMessageProvenance {
+    pub command_id: String,
+    pub source_chat_id: String,
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
 }
 
 /// Additive provenance for a legacy transcript entry. Keeping this append-only avoids
@@ -978,6 +1019,46 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn mobile_scaffold_create_attach_and_inspect_wire_shapes_decode() {
+        let create: ScaffoldEnvironmentControl = serde_json::from_value(serde_json::json!({
+            "operation": "create",
+            "scope": {
+                "projectId": "ashler-staging",
+                "deploymentId": "ashler-staging",
+                "sessionId": "11111111-1111-1111-1111-111111111111",
+            },
+            "source_ref": "master",
+            "database_environment": "local",
+            "agentRoute": {
+                "provider": "openai",
+                "model": "gpt-5.6-sol",
+                "fallback": "disabled",
+                "routingMode": "automatic",
+            },
+        }))
+        .unwrap();
+        assert!(matches!(create, ScaffoldEnvironmentControl::Create { .. }));
+
+        for operation in ["attach", "inspect"] {
+            let control: ScaffoldEnvironmentControl = serde_json::from_value(serde_json::json!({
+                "operation": operation,
+                "sandbox_id": "sandbox-a",
+                "scope": {
+                    "projectId": "ashler-staging",
+                    "deploymentId": "ashler-staging",
+                    "sessionId": "11111111-1111-1111-1111-111111111111",
+                },
+            }))
+            .unwrap();
+            assert!(matches!(
+                (operation, control),
+                ("attach", ScaffoldEnvironmentControl::Attach { .. })
+                    | ("inspect", ScaffoldEnvironmentControl::Inspect { .. })
+            ));
+        }
     }
 
     #[test]

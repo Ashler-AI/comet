@@ -41,6 +41,7 @@ fn text_message(id: &str, device: &str, text: &str) -> SessionMessageEntry {
         device_id: device.to_string(),
         status: None,
         continuation_of: None,
+        peer_message: None,
     }
 }
 

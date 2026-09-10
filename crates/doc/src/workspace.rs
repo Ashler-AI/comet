@@ -587,6 +587,12 @@ impl WorkspaceDoc {
             )?,
             None => row.delete("environment")?,
         }
+        match &session_ref.startup {
+            Some(startup) => {
+                row.insert("startup", LoroValue::from(serde_json::to_value(startup)?))?
+            }
+            None => row.delete("startup")?,
+        }
         self.doc.commit();
         Ok(())
     }
@@ -612,6 +618,15 @@ impl WorkspaceDoc {
                 Ok(None)
             }
         }
+    }
+
+    /// Includes a removed membership: automatic legacy recovery must not undo
+    /// an explicit unpin. Map tombstones retain editors even in shallow state.
+    pub fn has_session_ref_history(&self, user_id: &str, chat_id: &str) -> bool {
+        self.doc
+            .get_map("sessionRefs")
+            .get_last_editor(&session_ref_key(user_id, chat_id))
+            .is_some()
     }
 
     pub fn read_session_refs(&self) -> Result<Vec<SessionRef>, DocError> {
@@ -925,6 +940,8 @@ struct RawSessionRef {
     added_at: i64,
     #[serde(default)]
     environment: Option<comet_proto::SessionEnvironment>,
+    #[serde(default)]
+    startup: Option<comet_proto::SessionStartup>,
 }
 
 impl From<RawSessionRef> for SessionRef {
@@ -933,6 +950,7 @@ impl From<RawSessionRef> for SessionRef {
             chat_id: raw.chat_id,
             added_at: dt(raw.added_at),
             environment: raw.environment,
+            startup: raw.startup,
         }
     }
 }
@@ -1013,6 +1031,7 @@ mod tests {
             chat_id: chat_id.into(),
             added_at: ts(added_at),
             environment: None,
+            startup: None,
         }
     }
 

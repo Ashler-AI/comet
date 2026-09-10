@@ -117,6 +117,7 @@ fn try_text_append(prev: &SessionMessageEntry, next: &SessionMessageEntry) -> Op
         || prev.device_id != next.device_id
         || prev.status != next.status
         || prev.continuation_of != next.continuation_of
+        || prev.peer_message != next.peer_message
         || prev.parts.len() != next.parts.len()
     {
         return None;
@@ -400,7 +401,42 @@ mod tests {
             device_id: "dev".into(),
             status: None,
             continuation_of: None,
+            peer_message: None,
         }
+    }
+
+    #[test]
+    fn peer_metadata_transitions_survive_text_growth_and_wire_frames() {
+        let mut ordinary = entry("peer-command", "original");
+        ordinary.role = MessageRole::User;
+        let mut peer = ordinary.clone();
+        peer.peer_message = Some(comet_proto::PeerMessageProvenance {
+            command_id: peer.id.clone(),
+            source_chat_id: "source-chat".into(),
+            thread_id: "thread".into(),
+            reply_to: None,
+        });
+        peer.parts = entry("unused", "original plus peer text").parts;
+        let mut changed_peer = peer.clone();
+        changed_peer.peer_message.as_mut().unwrap().reply_to = Some("reply-command".into());
+        changed_peer.parts = entry("unused", "original plus peer text and reply").parts;
+        let mut visible_again = changed_peer.clone();
+        visible_again.peer_message = None;
+        visible_again.parts = entry("unused", "original plus peer text and reply and ordinary").parts;
+        let states = [ordinary, peer, changed_peer, visible_again];
+        for pair in states.windows(2) {
+            let frame = diff_transcript(&pair[..1], &pair[1..], None);
+            let frame: TranscriptFrame = serde_json::from_value(serde_json::to_value(frame).unwrap()).unwrap();
+            let mut current = vec![pair[0].clone()];
+            apply_transcript_frame(&mut current, frame).unwrap();
+            assert_eq!(current, pair[1..]);
+            assert_eq!(current[0].is_peer_message(), pair[1].is_peer_message());
+        }
+        let frame = TranscriptFrame::reset(&states[1..2], None);
+        let frame: TranscriptFrame = serde_json::from_value(serde_json::to_value(frame).unwrap()).unwrap();
+        let mut current = Vec::new();
+        apply_transcript_frame(&mut current, frame).unwrap();
+        assert_eq!(current, states[1..2]);
     }
 
     fn apply(prev: &[SessionMessageEntry], next: &[SessionMessageEntry]) {

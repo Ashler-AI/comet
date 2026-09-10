@@ -229,6 +229,19 @@ describe("session-scoped host RPC", () => {
     expect(rpcAllowedForScopedHost(rpc, payload({ method: "LocalDevice", params: { targetDeviceId: "other" } }), grant)).toBe(false);
   });
 
+  it("requires file authority and the exact session for attachment uploads", () => {
+    const fileGrant = { ...grant, capabilities: [...grant.capabilities, "session.files"] };
+    for (const method of ["UploadChunk", "UploadCommit"]) {
+      const params = { sessionId: rawGrant.scope.sessionId, uploadId: "image-upload" };
+      expect(rpcAllowedForScopedHost(rpc, payload({ method, params }), fileGrant)).toBe(true);
+      expect(rpcAllowedForScopedHost(rpc, payload({ method, params }), grant)).toBe(false);
+      expect(rpcAllowedForScopedHost(rpc, payload({ method }), fileGrant)).toBe(false);
+      expect(rpcAllowedForScopedHost(rpc, payload({ method, params: { ...params, sessionId: "other" } }), fileGrant)).toBe(false);
+      expect(rpcAllowedForScopedHost(rpc, payload({ method, params: { ...params, targetDeviceId: "other" } }), fileGrant)).toBe(false);
+      expect(rpcAllowedForScopedHost(rpc, payload({ method, params: { ...params, targetDeviceId: rawGrant.targetDeviceId } }), fileGrant)).toBe(true);
+    }
+  });
+
   it("denies unrelated document RPCs and generic harness/model discovery", () => {
     expect(rpcAllowedForScopedHost(rpc, payload({ method: "WatchDocMessages" }), grant)).toBe(false);
     expect(rpcAllowedForScopedHost(rpc, payload({ method: "ListHarnesses" }), grant)).toBe(false);

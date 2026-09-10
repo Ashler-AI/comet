@@ -18,6 +18,86 @@ use std::path::{Path, PathBuf};
 /// plus the 2px column gap.
 const SPACE_ROW_SLOT: f32 = 31.0;
 
+/// A fixed-height sidebar card whose expensive subtree is built only inside
+/// the ancestor scroll viewport. The leaf still occupies its complete slot,
+/// so the existing scrollbar, resort offsets and access to history are intact.
+struct SidebarSessionRow {
+    height: f32,
+    render: Box<dyn FnMut(&mut Window, &mut App) -> AnyElement>,
+}
+
+impl gpui::Element for SidebarSessionRow {
+    type RequestLayoutState = ();
+    type PrepaintState = Option<AnyElement>;
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (gpui::LayoutId, ()) {
+        let mut style = gpui::Style::default();
+        style.size.width = gpui::relative(1.0).into();
+        style.size.height = px(self.height).into();
+        style.flex_shrink = 0.0;
+        (window.request_layout(style, None, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        bounds: gpui::Bounds<gpui::Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        if !bounds.intersects(&window.content_mask().bounds) {
+            return None;
+        }
+        let mut element = (self.render)(window, cx);
+        element.layout_as_root(
+            gpui::size(bounds.size.width.into(), bounds.size.height.into()),
+            window,
+            cx,
+        );
+        element.prepaint_at(bounds.origin, window, cx);
+        Some(element)
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _: gpui::Bounds<gpui::Pixels>,
+        _: &mut (),
+        element: &mut Option<AnyElement>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(element) = element {
+            element.paint(window, cx);
+        }
+    }
+}
+
+impl IntoElement for SidebarSessionRow {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
 fn detached_worktree_label(cwd: &str) -> Option<String> {
     let parts: Vec<String> = Path::new(cwd)
         .components()
@@ -218,16 +298,10 @@ fn sidebar_session_source(
 fn spaces_with_visible_sessions(
     spaces: Vec<Space>,
     visible_space_ids: &std::collections::HashSet<String>,
-    retained_space_ids: &[String],
-    selected_space_id: Option<&str>,
 ) -> Vec<Space> {
     spaces
         .into_iter()
-        .filter(|space| {
-            visible_space_ids.contains(&space.id)
-                || retained_space_ids.iter().any(|id| id == &space.id)
-                || selected_space_id == Some(space.id.as_str())
-        })
+        .filter(|space| visible_space_ids.contains(&space.id))
         .collect()
 }
 
@@ -498,12 +572,7 @@ impl Shell {
                 visible_space_ids,
             )
         };
-        let spaces = spaces_with_visible_sessions(
-            spaces,
-            &visible_space_ids,
-            &self.settings.pinned_space_ids,
-            selected.as_deref(),
-        );
+        let spaces = spaces_with_visible_sessions(spaces, &visible_space_ids);
         // Manual (drag) order overrides the synced creation order — device-
         // local, resolved exactly like the session-tab order.
         let spaces: Vec<SidebarSource> = {
@@ -705,24 +774,18 @@ impl Shell {
 
     /// Commit a drag: persist the new visual order (device-local).
     fn commit_space_reorder(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
-        let (spaces, local_device_id, selected, visible_space_ids) = {
+        let (spaces, local_device_id, visible_space_ids) = {
             let state = self.state.read(cx);
             (
                 state.spaces.clone(),
                 state.local_device_id.clone(),
-                state.selected_space.clone(),
                 state
                     .visible_chats()
                     .filter_map(|chat| chat.space_id.clone())
                     .collect(),
             )
         };
-        let spaces = spaces_with_visible_sessions(
-            spaces,
-            &visible_space_ids,
-            &self.settings.pinned_space_ids,
-            selected.as_deref(),
-        );
+        let spaces = spaces_with_visible_sessions(spaces, &visible_space_ids);
         let created: Vec<String> = spaces.iter().map(|space| space.id.clone()).collect();
         let resolved = super::tabs::resolve_tab_order(&created, &self.settings.space_order);
         let mut by_id: std::collections::HashMap<String, Space> = spaces
@@ -881,7 +944,7 @@ impl Shell {
             state
                 .overview_chats(now)
                 .into_iter()
-                .map(|(status, chat)| (status, chat.clone()))
+                .map(|(status, chat)| (status, chat.id.clone()))
                 .collect()
         };
         self.render_session_rows(chats, false, theme, cx)
@@ -898,7 +961,7 @@ impl Shell {
             state
                 .settled_chats()
                 .into_iter()
-                .map(|chat| (ChatIndicator::Idle, chat.clone()))
+                .map(|chat| (ChatIndicator::Idle, chat.id.clone()))
                 .collect()
         };
         self.render_session_rows(chats, true, theme, cx)
@@ -906,31 +969,32 @@ impl Shell {
 
     fn render_session_rows(
         &mut self,
-        chats: Vec<(ChatIndicator, comet_proto::Chat)>,
+        chats: Vec<(ChatIndicator, String)>,
         settled: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Vec<(String, f32, AnyElement)> {
         let now = Utc::now();
-        let rows: Vec<(
-            ChatIndicator,
-            comet_proto::Chat,
-            String,
-            Option<String>,
-            String,
-            super::SidebarSessionMeta,
-        )> = {
-            let state = self.state.read(cx);
-            chats
-                .into_iter()
-                .map(|(status, chat)| {
-                    let status = if state.scaffold_chat_starting(&chat.id) {
+        let height = super::chat_row_height(self.settings.density);
+        let theme = std::rc::Rc::new(theme.clone());
+        chats
+            .into_iter()
+            .map(|(status, id)| {
+                let key = format!("{}:{id}", if settled { "s" } else { "c" });
+                let theme = theme.clone();
+                let render = cx.processor(move |this, (), _, cx| {
+                    let state = this.state.clone();
+                    let state = state.read(cx);
+                    let Some(chat) = state.chats.iter().find(|chat| chat.id == id) else {
+                        return Empty.into_any_element();
+                    };
+                    let status = if state.scaffold_chat_starting(&id) {
                         ChatIndicator::Working
                     } else {
                         status
                     };
-                    let space = state.space_for_chat(&chat);
-                    let mut folder = space
+                    let mut folder = state
+                        .space_for_chat(chat)
                         .map(|space| space.display_name().to_string())
                         .unwrap_or_else(|| "?".to_string());
                     if state.local_device_id.as_deref() != Some(chat.device_id.as_str())
@@ -938,10 +1002,8 @@ impl Shell {
                     {
                         folder = format!("{folder} · {device}");
                     }
-                    let branch = sidebar_branch_label(&chat);
-                    let scaffold_environment = state.scaffold_environment(&chat.id);
-                    let scaffold_title =
-                        scaffold_environment.and_then(|environment| environment.name.clone());
+                    let branch = sidebar_branch_label(chat);
+                    let scaffold_environment = state.scaffold_environment(&id);
                     let (scaffold_web, scaffold_session) = scaffold_environment
                         .and_then(|environment| match &environment.source {
                             comet_proto::SessionEnvironmentSource::Scaffold { links, .. } => {
@@ -950,14 +1012,12 @@ impl Shell {
                             comet_proto::SessionEnvironmentSource::Local => None,
                         })
                         .unwrap_or_default();
-                    let title = scaffold_title
-                        .or_else(|| chat.title.clone())
-                        .unwrap_or_else(|| "New session".into());
-                    let agent_session = state.collaboration_sessions(&chat.id).next();
+                    let title = state.chat_display_name(chat).unwrap_or("New session");
+                    let agent_session = state.collaboration_sessions(&id).next();
                     let source = sidebar_session_source(
                         state.local_device_id.as_deref(),
                         &chat.device_id,
-                        state.chat_is_scaffold(&chat.id),
+                        state.chat_is_scaffold(&id),
                         agent_session.map(|session| session.source),
                     );
                     let runtime = chat
@@ -971,53 +1031,49 @@ impl Shell {
                                 .as_ref()
                                 .and_then(|config| config.model.as_deref())
                         });
-                    let runtime_model = crate::multiplayer::runtime_model(runtime, model).into();
-                    (
+                    let meta = super::SidebarSessionMeta {
+                        source,
+                        history_source: imported_chat_history_source(
+                            &id,
+                            chat.harness_session_id.as_deref(),
+                        ),
+                        runtime_model: crate::multiplayer::runtime_model(runtime, model).into(),
+                        scaffold_web: scaffold_web.map(SharedString::from),
+                        scaffold_session: scaffold_session.map(SharedString::from),
+                    };
+                    let time_ago =
+                        format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now)
+                            .into();
+                    let is_selected = state.selected_chat.as_deref() == Some(id.as_str());
+                    let element = this.render_chat_row(
+                        id.clone(),
+                        transcript::single_line(title).into(),
+                        time_ago,
+                        folder.into(),
+                        branch.map(SharedString::from),
+                        meta,
                         status,
-                        chat,
-                        folder,
-                        branch,
-                        title,
-                        super::SidebarSessionMeta {
-                            source,
-                            runtime_model,
-                            scaffold_web: scaffold_web.map(SharedString::from),
-                            scaffold_session: scaffold_session.map(SharedString::from),
-                        },
-                    )
-                })
-                .collect()
-        };
-        let selected = self.state.read(cx).selected_chat.clone();
-        rows.into_iter()
-            .map(|(status, chat, folder, branch, title, meta)| {
-                let time_ago: SharedString =
-                    format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
-                let is_selected = selected.as_deref() == Some(chat.id.as_str());
-                let height = super::chat_row_height(self.settings.density);
-                let element = self.render_chat_row(
-                    chat.id.clone(),
-                    transcript::single_line(&title).into(),
-                    time_ago,
-                    folder.into(),
-                    branch.map(SharedString::from),
-                    meta,
-                    status,
-                    settled,
-                    is_selected,
-                    theme,
-                    cx,
-                );
-                let element = if settled {
-                    div().opacity(0.52).child(element).into_any_element()
-                } else {
-                    element
-                };
-                (
-                    format!("{}:{}", if settled { "s" } else { "c" }, chat.id),
+                        settled,
+                        is_selected,
+                        &theme,
+                        cx,
+                    );
+                    if settled {
+                        div()
+                            .w_full()
+                            .opacity(0.52)
+                            .child(element)
+                            .into_any_element()
+                    } else {
+                        element
+                    }
+                });
+                let element = SidebarSessionRow {
                     height,
-                    element,
-                )
+                    render: Box::new(move |window, cx| render((), window, cx)),
+                }
+                .into_any_element();
+                (key, height, element)
             })
             .collect()
     }
@@ -1199,19 +1255,6 @@ impl Shell {
         }));
     }
 
-    fn retain_space_in_sidebar(&mut self, space_id: &str, cx: &mut Context<Self>) {
-        if self
-            .settings
-            .pinned_space_ids
-            .iter()
-            .any(|id| id == space_id)
-        {
-            return;
-        }
-        self.settings.pinned_space_ids.push(space_id.to_string());
-        self.schedule_save(cx);
-    }
-
     /// Create the space for the browser's current folder.
     fn submit_add_space(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -1243,7 +1286,6 @@ impl Shell {
             .map(|s| s.id.clone())
         {
             self.add_space = None;
-            self.retain_space_in_sidebar(&existing, cx);
             self.activate_space(existing, cx);
             return;
         }
@@ -1285,7 +1327,6 @@ impl Shell {
                 match result {
                     Ok(_) => {
                         shell.add_space = None;
-                        shell.retain_space_in_sidebar(&submit_id, cx);
                         shell.activate_space(submit_id.clone(), cx);
                     }
                     Err(err) => {
@@ -2172,7 +2213,7 @@ mod tests {
         }
     }
     #[test]
-    fn sidebar_hides_stale_spaces_but_keeps_selected_and_manually_added_folders() {
+    fn sidebar_shows_only_spaces_with_visible_sessions() {
         let spaces = vec![
             space("active", "device-current", "/repo/active", 1),
             space("manual", "device-current", "/repo/manual", 2),
@@ -2180,16 +2221,15 @@ mod tests {
             space("stale", "device-current", "/repo/stale", 4),
         ];
         let visible = std::collections::HashSet::from(["active".to_string()]);
-        let retained = vec!["manual".to_string()];
 
-        let filtered = spaces_with_visible_sessions(spaces, &visible, &retained, Some("selected"));
+        let filtered = spaces_with_visible_sessions(spaces, &visible);
 
         assert_eq!(
             filtered
                 .iter()
                 .map(|space| space.id.as_str())
                 .collect::<Vec<_>>(),
-            ["active", "manual", "selected"]
+            ["active"]
         );
     }
 
@@ -2220,34 +2260,6 @@ mod tests {
                 links.web.clone(),
                 Some("https://scaffold.example/?q=sandbox-ready".into())
             )
-        );
-    }
-
-    #[test]
-    fn manual_reorder_does_not_retain_a_stale_space() {
-        let spaces = vec![
-            space("active", "device-current", "/repo/active", 1),
-            space("stale", "device-current", "/repo/stale", 2),
-        ];
-        let visible = std::collections::HashSet::from(["active".to_string()]);
-        let settings = crate::settings::UiSettings {
-            space_order: vec!["stale".to_string(), "active".to_string()],
-            ..Default::default()
-        };
-
-        let filtered = spaces_with_visible_sessions(
-            spaces,
-            &visible,
-            &settings.pinned_space_ids,
-            Some("active"),
-        );
-
-        assert_eq!(
-            filtered
-                .iter()
-                .map(|space| space.id.as_str())
-                .collect::<Vec<_>>(),
-            ["active"]
         );
     }
 

@@ -11,6 +11,7 @@ import Foundation
 
 enum RowKind {
     case user(text: String)
+    case peerMessage(text: String)
     case markdown(block: MDBlock, streaming: Bool)
     case toolGroup(tools: [ToolItem], autoOpen: Bool)
     case inputChip(header: String, resolved: Bool)
@@ -39,6 +40,40 @@ struct TranscriptRow: Identifiable {
     /// deriving it in the view body forced an `enumerated()` copy of the whole
     /// row array on every frame; now the body just reads it.
     var topGap: CGFloat = 0
+}
+
+/// View-local disclosure; body replacements, navigation, and removed rows must
+/// require a new reveal rather than reusing a prior message's open state.
+struct PeerMessageVisibility {
+    private struct Key: Hashable {
+        let chatId: String
+        let messageId: String
+        let version: UInt64
+    }
+    private var revealed: Set<Key> = []
+
+    func body(for row: TranscriptRow, chatId: String) -> String? {
+        guard case .peerMessage(let text) = row.kind,
+              revealed.contains(Key(chatId: chatId, messageId: row.id, version: row.version)) else { return nil }
+        return text
+    }
+
+    mutating func toggle(_ row: TranscriptRow, chatId: String) {
+        guard case .peerMessage = row.kind else { return }
+        let key = Key(chatId: chatId, messageId: row.id, version: row.version)
+        if !revealed.insert(key).inserted { revealed.remove(key) }
+    }
+
+    mutating func retain(rows: [TranscriptRow], chatId: String) {
+        revealed = revealed.filter { key in
+            key.chatId == chatId && rows.contains { row in
+                guard case .peerMessage = row.kind else { return false }
+                return row.id == key.messageId && row.version == key.version
+            }
+        }
+    }
+
+    mutating func clear() { revealed.removeAll() }
 }
 
 /// A settled part's parse, keyed by content so a completed block is parsed
@@ -74,10 +109,14 @@ enum TranscriptRowBuilder {
                                       timestamp: nil,
                                       partKey: nil))
         }
-        // Drop memos for parts that no longer exist. The count guard keeps the
-        // common (append-only) rebuild from copying the dict every token.
-        if completed.count > live.count {
-            completed = completed.filter { live.contains($0.key) }
+        // A replacement can keep the same part count, so counts cannot prove
+        // that every memo is still live. Remove only stale keys; append-only
+        // rebuilds do not copy either dictionary.
+        for key in completed.keys where !live.contains(key) {
+            completed.removeValue(forKey: key)
+        }
+        for key in parsers.keys where !live.contains(key) {
+            parsers.removeValue(forKey: key)
         }
         for ix in rows.indices {
             rows[ix].topGap = gap(for: rows[ix],
@@ -106,14 +145,17 @@ enum TranscriptRowBuilder {
         let settled = entry.status != nil && !streaming
 
         if entry.role == .user {
-            // One bubble row per user message.
+            // One bubble or collapsed disclosure per user message.
+            let isPeerMessage = entry.isPeerMessage
             let text = entry.parts.compactMap { part -> String? in
                 if case .text(_, let t) = part { return t }
                 return nil
             }.joined(separator: "\n")
-            guard !text.isEmpty else { return }
-            rows.append(TranscriptRow(id: entry.id, version: fnv1a(text),
-                                      turnStart: true, kind: .user(text: text),
+            guard !text.isEmpty || isPeerMessage else { return }
+            rows.append(TranscriptRow(id: entry.id,
+                                      version: (fnv1a(text) << 1) | (isPeerMessage ? 1 : 0),
+                                      turnStart: true,
+                                      kind: isPeerMessage ? .peerMessage(text: text) : .user(text: text),
                                       entryId: entry.id, timestamp: entry.createdAt,
                                       partKey: nil))
             return

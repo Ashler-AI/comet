@@ -6,6 +6,7 @@ import SwiftUI
 
 @main
 struct CometApp: App {
+    @UIApplicationDelegateAdaptor(NotificationAppDelegate.self) private var appDelegate
     @State private var model = AppModel()
     @Environment(\.scenePhase) private var scenePhase
 
@@ -27,6 +28,8 @@ struct CometApp: App {
                 .onChange(of: scenePhase) { _, phase in
                     if phase == .background {
                         model.flushDocs()
+                    } else if phase == .active {
+                        model.notifications.refresh()
                     }
                 }
         }

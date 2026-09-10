@@ -43,11 +43,19 @@ pub mod methods {
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
     /// Read one older transcript page before an opaque raw-list cursor.
     pub const READ_DOC_MESSAGES: &str = "ReadDocMessages";
+    /// Read one full message on explicit reveal, without expanding the transcript window.
+    pub const READ_DOC_MESSAGE: &str = "ReadDocMessage";
     pub const SEND_PEER_MESSAGE: &str = "SendPeerMessage";
     pub const REPLY_PEER_MESSAGE: &str = "ReplyPeerMessage";
     pub const WAIT_PEER_REPLY: &str = "WaitPeerReply";
     /// Create a distinct Crew chat from an existing session's native context.
     pub const FORK_SESSION: &str = "ForkSession";
+    /// Transfer native context to Scaffold and queue its initial remote command.
+    pub const HANDOFF_SESSION_TO_SCAFFOLD: &str = "HandoffSessionToScaffold";
+    /// Create and attach a Scaffold environment, transferring native session context.
+    pub const PREPARE_SCAFFOLD_SESSION: &str = "PrepareScaffoldSession";
+    /// Retain an interrupted preparation without changing newer attempts or admission.
+    pub const REPORT_SCAFFOLD_PREPARATION_FAILURE: &str = "ReportScaffoldPreparationFailure";
     /// Metadata-only harness-native session candidates stored on this device.
     pub const LIST_LOCAL_SESSIONS: &str = "ListLocalSessions";
     /// Re-resolve and import one local candidate into a Comet chat.
@@ -186,6 +194,13 @@ pub struct ReadCheckoutDiffResult {
 pub struct SessionRefParams {
     pub chat_id: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReportScaffoldPreparationFailureParams {
+    pub chat_id: String,
+    pub generation: String,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ForkSessionParams {
@@ -196,6 +211,26 @@ pub struct ForkSessionParams {
 #[serde(rename_all = "camelCase")]
 pub struct ForkSessionResult {
     pub chat_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandoffSessionToScaffoldParams {
+    pub source_chat_id: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub database_environment: comet_proto::ScaffoldDatabaseEnvironment,
+}
+
+/// Receipt for a transferred native session with its initial remote command queued.
+/// This does not indicate that the remote task has completed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandoffSessionToScaffoldResult {
+    pub chat_id: String,
+    pub sandbox_id: String,
+    pub command_id: String,
+    pub environment: comet_proto::SessionEnvironment,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -293,6 +328,9 @@ pub enum RpcError {
     BadParams(String),
     #[error("{0}")]
     Failed(String),
+    /// Locally classified before Scaffold HTTP dispatch; never reconstructed from wire text.
+    #[error("scaffold_auth_unavailable")]
+    ScaffoldAuthUnavailable,
     #[error("transport: {0}")]
     Transport(String),
     #[error("connection closed")]

@@ -17,12 +17,14 @@ struct HomeView: View {
     @Environment(AppModel.self) private var model
     @State private var path: [Route] = []
     @State private var showNewSpace = false
+    @State private var showNotifications = false
 
     var body: some View {
         NavigationStack(path: $path) {
             List {
                 spacesSection
                 sessionsSection
+                ArchivedSessionsSection(chats: model.settledChats, path: $path)
             }
             .listStyle(.plain)
             .environment(\.defaultMinListRowHeight, 10)
@@ -66,6 +68,7 @@ struct HomeView: View {
                         if model.demo != nil {
                             Text("Demo mode")
                         }
+                        Button("Notifications") { showNotifications = true }
                         Button("Sign out", role: .destructive) { model.signOut() }
                     } label: {
                         Image(systemName: "person.circle")
@@ -77,8 +80,8 @@ struct HomeView: View {
                     path.append(.space(spaceId))
                 }
             }
-            .task(id: (model.overviewChats.map(\.id) + model.sharedSessionRefs.map(\.chatId)).joined()) {
-                model.preloadSessions()
+            .sheet(isPresented: $showNotifications) {
+                NotificationSettingsView()
             }
             .onChange(of: model.launchRoute) { _, route in
                 // Live one-click invite while Home is already up (cold-start
@@ -110,15 +113,16 @@ struct HomeView: View {
     // MARK: Spaces
 
     private var spacesSection: some View {
-        Section {
-            if model.spaces.isEmpty {
-                Text("No spaces yet — add one from a desktop device")
+        let spaces = model.occupiedSpaces
+        return Section {
+            if spaces.isEmpty {
+                Text("Spaces with sessions will appear here — tap + to choose a folder")
                     .font(Theme.sans(12))
                     .foregroundStyle(Theme.textFaint)
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
             }
-            ForEach(model.spaces) { space in
+            ForEach(spaces) { space in
                 Button {
                     path.append(.space(space.id))
                 } label: {
@@ -141,7 +145,7 @@ struct HomeView: View {
             let chats = model.overviewChats
             let refs = model.sharedSessionRefs
             if chats.isEmpty && refs.isEmpty {
-                Text("No sessions yet")
+                Text(model.settledChats.isEmpty ? "No Crew sessions yet" : "No active Crew sessions")
                     .font(Theme.sans(12))
                     .foregroundStyle(Theme.textFaint)
                     .listRowBackground(Color.clear)
@@ -209,10 +213,12 @@ struct SpaceRow: View {
     var body: some View {
         HStack(spacing: 8) {
             // Leading 6pt aggregate dot — position stable, most-urgent member.
-            let agg = model.spaceIndicator(space.id)
-            Circle()
-                .fill((agg == .working || agg == .awaitingInput) ? (agg?.dotColor ?? whiteAlpha(0.14)) : whiteAlpha(0.14))
-                .frame(width: 6, height: 6)
+            TimelineView(.periodic(from: .now, by: 1)) { _ in
+                let agg = model.spaceIndicator(space.id)
+                Circle()
+                    .fill((agg == .working || agg == .awaitingInput) ? (agg?.dotColor ?? whiteAlpha(0.14)) : whiteAlpha(0.14))
+                    .frame(width: 6, height: 6)
+            }
             Image(systemName: "folder")
                 .font(.system(size: 13))
                 .foregroundStyle(Theme.textMuted)
@@ -241,32 +247,26 @@ struct SpaceRow: View {
     }
 }
 
-/// The desktop session row (shell.rs `render_chat_row`), line for line: the
-/// status rail leads a muted context line carrying the space name and the
-/// relative time; the title sits on its own line below; harness mark and branch
-/// close it out. Lines 2 and 3 indent by rail + gap so they start exactly under
-/// the context line rather than beside the rail.
+/// Mobile port of the desktop rich session row (`shell.rs render_chat_row`):
+/// context and top-right status share the first line, followed by title and
+/// harness/branch metadata. Working replaces recency with a thin spinner;
+/// completed, awaiting-input, and errored rows replace it with one blue
+/// attention dot. Idle rows keep the recency label.
 ///
-/// The one addition the phone needs: the desktop row names only the space
-/// because its sidebar sits on the machine running the work. Here the Sessions
-/// list interleaves every device, and a session whose host has gone offline
-/// can't be driven at all — so the context line reads "space · device".
+/// The phone adds the owning device to the context because this list
+/// interleaves sessions hosted by every device.
 struct ChatRow: View {
     @Environment(AppModel.self) private var model
     let chat: Chat
     var showLocation: Bool
 
-    /// Rail (6) + gap (8) — see `render_chat_row`'s `pl(px(14.0))`.
-    private static let indent: CGFloat = StatusRail.width + 8
 
     private var subline: Color { Theme.textMuted.opacity(0.5) }
 
     var body: some View {
-        let indicator = model.indicator(for: chat)
         VStack(alignment: .leading, spacing: 2) {
-            // Line 1: status rail, space · device, time-ago.
+            // Unread, live status, and recency are independent signals.
             HStack(spacing: 8) {
-                StatusRail(indicator: indicator)
                 if showLocation {
                     Text(location)
                         .font(Theme.sans(11))
@@ -277,19 +277,43 @@ struct ChatRow: View {
                 } else {
                     Spacer(minLength: 4)
                 }
-                Text(relativeTime(chat.lastMessageAt ?? chat.createdAt))
-                    .font(Theme.sans(11))
-                    .foregroundStyle(subline)
-                    .fixedSize()
+                TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                    let now = Int64(timeline.date.timeIntervalSince1970 * 1000)
+                    let activity = model.activity(chatId: chat.id, now: now)
+                    HStack(spacing: 6) {
+                        if chat.unseen {
+                            Circle()
+                                .fill(Theme.attention)
+                                .frame(width: 7, height: 7)
+                                .accessibilityLabel("Unread")
+                        }
+                        SessionStatusBadge(status: activity.status,
+                                           sending: model.hasPendingSend(chatId: chat.id))
+                        let updatedAt = max(chat.lastMessageAt ?? chat.createdAt, activity.row?.updatedAt ?? 0)
+                        Text(relativeTime(updatedAt))
+                            .font(Theme.sans(11))
+                            .foregroundStyle(Theme.textMuted)
+                            .fixedSize()
+                            .accessibilityLabel("Last updated")
+                            .accessibilityValue(Text(Date(timeIntervalSince1970: Double(updatedAt) / 1000), style: .relative))
+                    }
+                }
             }
 
             // Line 2: the session title.
-            Text(chat.displayTitle)
+            Text(model.sessionTitle(for: chat))
                 .font(Theme.sans(13))
                 .foregroundStyle(Theme.text)
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.leading, Self.indent)
+            if let reference = model.workspace?.sessionRef(id: chat.id),
+               reference.startup != nil,
+               reference.startup?.status != "admitted",
+               let label = reference.startupLabel {
+                Text(label)
+                    .font(Theme.sans(11))
+                    .foregroundStyle(Theme.attention)
+            }
 
             // Line 3: harness brand mark, then the branch when the engine
             // stamped one.
@@ -307,12 +331,14 @@ struct ChatRow: View {
                 }
                 Spacer(minLength: 0)
             }
-            .padding(.leading, Self.indent)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
         .contentShape(RoundedRectangle(cornerRadius: 8))
+        .onAppear { model.retainListMetadata(chatId: chat.id) }
+        .onDisappear { model.releaseListMetadata(chatId: chat.id) }
     }
+
 
     /// "space · device", with offline marker. The space name (not the cwd
     /// basename) is what the desktop row shows — they differ once a space has
@@ -332,25 +358,59 @@ struct SharedSessionRow: View {
     let sessionRef: SessionRef
 
     var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "globe")
-                .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(Theme.textMuted.opacity(0.7))
-                .frame(width: 16)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(model.sessionTitle(for: sessionRef))
-                    .font(Theme.sans(13))
-                    .foregroundStyle(Theme.text)
-                    .lineLimit(1)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                Text(relativeTime(sessionRef.addedAt))
-                    .font(Theme.sans(10.5))
-                    .foregroundStyle(Theme.textFaint)
+        TimelineView(.periodic(from: .now, by: 1)) { timeline in
+            let now = Int64(timeline.date.timeIntervalSince1970 * 1000)
+            let activity = model.activity(chatId: sessionRef.chatId, now: now)
+            let updatedAt = max(sessionRef.addedAt, activity.row?.updatedAt ?? 0)
+            HStack(spacing: 10) {
+                Image(systemName: "globe")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Theme.textMuted.opacity(0.7))
+                    .frame(width: 16)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(model.sessionTitle(for: sessionRef))
+                        .font(Theme.sans(13))
+                        .foregroundStyle(Theme.text)
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Text(sessionRef.startupLabel.map { "\($0) · \(relativeTime(updatedAt))" } ?? relativeTime(updatedAt))
+                        .font(Theme.sans(10.5))
+                        .foregroundStyle(Theme.textMuted)
+                        .accessibilityLabel(sessionRef.startupLabel ?? "Last updated")
+                }
+                SessionStatusBadge(status: activity.status,
+                                   sending: model.hasPendingSend(chatId: sessionRef.chatId))
             }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 7)
         .contentShape(RoundedRectangle(cornerRadius: 8))
+        .onAppear { model.retainListMetadata(chatId: sessionRef.chatId) }
+        .onDisappear { model.releaseListMetadata(chatId: sessionRef.chatId) }
+    }
+}
+
+private struct SessionStatusBadge: View {
+    let status: SessionStatus?
+    var sending = false
+
+    var body: some View {
+        Group {
+            if sending || status == .working {
+                HStack(spacing: 4) {
+                    ArcSpinner()
+                    Text(sending ? "Sending" : "Running")
+                }
+            } else if status == .awaitingInput {
+                Text("Awaiting input").foregroundStyle(Theme.attention)
+            } else if status == .errored {
+                Text("Failed").foregroundStyle(Theme.danger)
+            }
+        }
+        .font(Theme.sans(11))
+        .foregroundStyle(Theme.textMuted)
+        .fixedSize()
+        .accessibilityElement(children: .combine)
     }
 }
 

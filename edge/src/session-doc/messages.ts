@@ -110,6 +110,14 @@ export interface SessionTokenUsage {
   readonly cachedInputTokens?: number;
 }
 
+/** Native peer-command identity. Never inferred from transcript text. */
+export interface PeerMessageProvenance {
+  readonly commandId: string;
+  readonly sourceChatId: string;
+  readonly threadId: string;
+  readonly replyTo?: string;
+}
+
 /** One entry in the doc's `messages` list. Writer discipline (§1.1): any peer
  * inserts its own entries; the host is the sole writer of assistant/system
  * entries and of edits to any entry. */
@@ -126,7 +134,30 @@ export interface SessionMessageEntry {
   /** Set on continuation entries produced by the segment split cap; points at
    * the root entry's id. Renderers concatenate parts in list order. */
   readonly continuationOf?: string;
+  readonly peerMessage?: PeerMessageProvenance;
 }
+
+const nonblank = (value: unknown): value is string =>
+  typeof value === "string" && value.trim().length > 0;
+
+/** Unsupported metadata is deliberately not a reason to hide a message. */
+export const isPeerMessageEntry = (entry: SessionMessageEntry): boolean => {
+  const peer = entry.peerMessage;
+  return entry.role === "user" && entry.continuationOf == null
+    && peer != null && typeof peer === "object" && !Array.isArray(peer)
+    && nonblank(peer.commandId) && peer.commandId === entry.id
+    && nonblank(peer.sourceChatId) && nonblank(peer.threadId)
+    && (peer.replyTo == null || nonblank(peer.replyTo));
+};
+
+const samePeerMessage = (
+  left: PeerMessageProvenance,
+  right: PeerMessageProvenance | undefined
+): boolean => right != null && typeof right === "object" && !Array.isArray(right)
+  && left.commandId === right.commandId
+  && left.sourceChatId === right.sourceChatId
+  && left.threadId === right.threadId
+  && (left.replyTo ?? null) === (right.replyTo ?? null);
 
 const encoder = new TextEncoder();
 const partBytes = (part: DocMessagePart): number =>
@@ -207,13 +238,25 @@ export const joinContinuations = (
   if (!entries.some((e) => e.continuationOf)) return entries;
   const rootIndex = new Map<string, number>();
   const order: SessionMessageEntry[] = [];
+  // Only joined roots own mutable part arrays; leave input entries untouched.
+  const joinedParts = new Map<number, DocMessagePart[]>();
   for (const entry of entries) {
     if (entry.continuationOf) {
       const at = rootIndex.get(entry.continuationOf);
       if (at !== undefined) {
         const root = order[at]!;
-        order[at] = { ...root, parts: [...root.parts, ...entry.parts] };
-        continue;
+        // Never pull ordinary or unsupported content under a hidden peer root.
+        if (root.role === entry.role
+          && (!isPeerMessageEntry(root) || samePeerMessage(root.peerMessage!, entry.peerMessage))) {
+          let parts = joinedParts.get(at);
+          if (!parts) {
+            parts = [...root.parts];
+            joinedParts.set(at, parts);
+            order[at] = { ...root, parts };
+          }
+          for (const part of entry.parts) parts.push(part);
+          continue;
+        }
       }
       // Orphan continuation (root trimmed or not yet synced): surface as-is
       // rather than dropping content.

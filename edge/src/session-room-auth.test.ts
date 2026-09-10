@@ -1,5 +1,10 @@
+import { Buffer } from "node:buffer";
+import { readFileSync } from "node:fs";
+import { fileURLToPath, URL as NodeUrl } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { CrdtType, MessageType, decode, type JoinRequest } from "loro-protocol";
+import { CrdtType, JoinErrorCode, MessageType, UpdateStatusCode, decode, encode, type JoinRequest, type ProtocolMessage } from "loro-protocol";
+import { LoroDoc } from "loro-crdt";
+import type { VersionVector } from "loro-crdt";
 import {
   AUTH_CAPABILITIES_HEADER,
   AUTH_PROJECT_HEADER,
@@ -18,7 +23,26 @@ class MemorySql {
   private readonly blobs = new Map<string, Map<number, ArrayBuffer>>();
   private readonly updates: ArrayBuffer[] = [];
 
+  putBlob(name: string, bytes: Uint8Array): void {
+    this.blobs.set(name, new Map([[0, bytes.slice().buffer as ArrayBuffer]]));
+  }
+
+  appendUpdate(bytes: Uint8Array): void {
+    this.updates.push(bytes.slice().buffer as ArrayBuffer);
+  }
+
+  hasBlob(name: string): boolean {
+    return this.blobs.has(name);
+  }
+
+  updateCount(): number {
+    return this.updates.length;
+  }
+
   exec(query: string, ...bindings: unknown[]): SqlStorageCursor<SqlRow> {
+    if (bindings.some((value) => value instanceof ArrayBuffer && value.byteLength > 2_000_000)) {
+      throw new Error("string or blob too big: SQLITE_TOOBIG");
+    }
     const sql = query.replace(/\s+/g, " ").trim().toLowerCase();
 
     if (sql.startsWith("create table")) return cursor([]);
@@ -40,6 +64,12 @@ class MemorySql {
       chunks.set(Number(bindings[1]), bindings[2] as ArrayBuffer);
       this.blobs.set(name, chunks);
       return cursor([]);
+    }
+    if (sql.startsWith("select sum(length(bytes)) as size from blobs")) {
+      const chunks = this.blobs.get(String(bindings[0]));
+      return cursor([{
+        size: chunks ? [...chunks.values()].reduce((total, bytes) => total + bytes.byteLength, 0) : null
+      }]);
     }
     if (sql.startsWith("select bytes from blobs")) {
       const chunks = this.blobs.get(String(bindings[0]));
@@ -70,7 +100,9 @@ class MemorySql {
 }
 
 class CapturingSocket {
+  readyState: number = WebSocket.OPEN;
   readonly sent: Uint8Array[] = [];
+  readonly closed: Array<{ code: number | undefined; reason: string | undefined }> = [];
   private attachment: unknown;
 
   send(bytes: Uint8Array): void {
@@ -85,7 +117,10 @@ class CapturingSocket {
     return this.attachment;
   }
 
-  close(): void {}
+  close(code?: number, reason?: string): void {
+    this.readyState = WebSocket.CLOSED;
+    this.closed.push({ code, reason });
+  }
 }
 
 const PROJECT_SCOPE = "project-a";
@@ -98,10 +133,15 @@ interface JoinState {
   rooms: string[];
   deviceId?: string;
   workspace?: boolean;
+  grantId?: string;
+  grantExpiresAt?: number;
 }
 
 interface SessionRoomInternals {
   eph?: unknown;
+  ensureDoc(): Promise<LoroDoc>;
+  trimHistoryIfDue(doc: LoroDoc, now: number): Promise<boolean>;
+  foldLog(): Promise<void>;
   handleJoin(ws: WebSocket, state: JoinState, message: JoinRequest): Promise<void>;
   applyUpdates(
     ws: WebSocket,
@@ -113,13 +153,29 @@ interface SessionRoomInternals {
   ): Promise<void>;
 }
 
+const oversizedPayload = (): Uint8Array => {
+  const payload = new Uint8Array(2_100_000);
+  let random = 0x12345678;
+  for (let i = 0; i < payload.length; i++) {
+    random ^= random << 13;
+    random ^= random >>> 17;
+    random ^= random << 5;
+    payload[i] = random & 255;
+  }
+  return payload;
+};
+
 const makeRoom = (
-  sql = new MemorySql()
+  sql = new MemorySql(),
+  sync: () => Promise<void> = async () => {},
+  grantStatus: () => Promise<Response> = async () => new Response(null, { status: 200 }),
+  putBackup?: (key: string, bytes: Uint8Array) => Promise<void>
 ): { room: SessionRoom; sql: MemorySql; sockets: WebSocket[] } => {
   const sockets: WebSocket[] = [];
   const storage = {
     sql: sql as unknown as SqlStorage,
-    sync: async () => {},
+    sync,
+    transactionSync: <T>(body: () => T): T => body(),
     getAlarm: async () => null,
     setAlarm: async () => {}
   };
@@ -132,7 +188,14 @@ const makeRoom = (
       throw new Error(reason ?? "aborted");
     }
   } as unknown as DurableObjectState;
-  return { room: new SessionRoom(ctx, {} as Env), sql, sockets };
+  const env = {
+    BLOBS: { put: putBackup },
+    AUTH_GRANTS: {
+      idFromName: (id: string) => id,
+      get: () => ({ fetch: grantStatus })
+    }
+  } as unknown as Env;
+  return { room: new SessionRoom(ctx, env), sql, sockets };
 };
 
 const authedRequest = (path: string, userId: string, init: RequestInit = {}): Request => {
@@ -151,7 +214,12 @@ const joinRequest = (roomId: string): JoinRequest => ({
   version: new Uint8Array()
 });
 
-const join = async (room: SessionRoom, userId: string, roomId: string): Promise<CapturingSocket> => {
+const join = async (
+  room: SessionRoom,
+  userId: string,
+  roomId: string,
+  version: Uint8Array = new Uint8Array()
+): Promise<CapturingSocket> => {
   const socket = new CapturingSocket();
   const state: JoinState = {
     userId,
@@ -163,16 +231,57 @@ const join = async (room: SessionRoom, userId: string, roomId: string): Promise<
   await (room as unknown as SessionRoomInternals).handleJoin(
     socket as unknown as WebSocket,
     state,
-    joinRequest(roomId)
+    { ...joinRequest(roomId), version }
   );
   expect(state.rooms).toContain(CrdtType.Loro);
   expect(socket.sent.some((bytes) => decode(bytes).type === MessageType.JoinResponseOk)).toBe(true);
   return socket;
 };
 
+const compactedJoinFixture = () => {
+  const source = new LoroDoc();
+  const compacted = new LoroDoc();
+  try {
+    source.setPeerId("1");
+    source.getMap("metadata").set("revision", "old");
+    source.commit();
+    const stale = source.version();
+    let staleVersion: Uint8Array;
+    try {
+      staleVersion = stale.encode();
+    } finally {
+      stale.free();
+    }
+    source.getText("history").insert(
+      0,
+      Array.from({ length: 512 }, (_, i) => `${i}: retained value ${i * i}\n`).join("")
+    );
+    source.commit();
+    const cutoff = source.frontiers();
+    const coveredSnapshot = source.export({ mode: "snapshot" });
+    source.getMap("metadata").set("revision", "latest");
+    source.commit();
+    const shallow = source.export({ mode: "shallow-snapshot", frontiers: cutoff });
+    compacted.import(shallow);
+    const sql = new MemorySql();
+    // A log fold persists a regular re-export, then a cold room imports it.
+    sql.putBlob("snapshot", compacted.export({ mode: "snapshot" }));
+    return {
+      room: makeRoom(sql).room,
+      staleVersion,
+      coveredSnapshot,
+      expected: source.toJSON()
+    };
+  } finally {
+    compacted.free();
+    source.free();
+  }
+};
+
 describe("SessionRoom chat authorization", () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", { OPEN: 1, CLOSED: 3 });
     vi.stubGlobal(
       "WebSocketRequestResponsePair",
       class {
@@ -195,6 +304,516 @@ describe("SessionRoom chat authorization", () => {
     await join(room, "user-b", "shared-chat");
     expect(sql.meta.get("owner")).toBe(PROJECT_SCOPE);
   });
+
+  it("preserves durable state when four readers cold-start the same room", async () => {
+    const source = new LoroDoc();
+    const map = source.getMap("metadata");
+    try {
+      map.set("retained", "must survive simultaneous joins");
+      const sql = new MemorySql();
+      sql.meta.set("owner", PROJECT_SCOPE);
+      sql.meta.set("chatId", "concurrent-cold-chat");
+      sql.putBlob("snapshot", source.export({ mode: "snapshot" }));
+      const { room } = makeRoom(sql);
+      const responses = await Promise.all(Array.from({ length: 4 }, () =>
+        room.fetch(authedRequest("/snapshot", "user-a"))));
+      for (const response of responses) {
+        expect(response.status).toBe(200);
+        const mirror = new LoroDoc();
+        try {
+          mirror.import(new Uint8Array(await response.arrayBuffer()));
+          expect(mirror.toJSON()).toEqual(source.toJSON());
+        } finally { mirror.free(); }
+      }
+    } finally { map.free(); source.free(); }
+  });
+
+  it("accepts two independent warm deltas without rereading retained history", async () => {
+    const first = new LoroDoc();
+    const second = new LoroDoc();
+    const mirror = new LoroDoc();
+    let base: VersionVector | undefined;
+    try {
+      first.getMap("metadata").set("payload", oversizedPayload());
+      first.commit();
+      first.getMap("metadata").set("payload", "current");
+      first.commit();
+      const baseline = first.export({ mode: "snapshot" });
+      second.import(baseline);
+      base = first.oplogVersion();
+      const sql = new MemorySql();
+      sql.meta.set("roomKind", "workspace");
+      sql.meta.set("owner", PROJECT_SCOPE);
+      sql.putBlob("snapshot", baseline);
+      const { room } = makeRoom(sql);
+      const internals = room as unknown as SessionRoomInternals;
+      await internals.ensureDoc();
+      const exec = sql.exec.bind(sql);
+      const noHistoricalReads = vi.spyOn(sql, "exec").mockImplementation((query, ...bindings) => {
+        if (/^SELECT bytes FROM (blobs|updates)/i.test(query)) throw new Error("historical reads unavailable on warm path");
+        return exec(query, ...bindings);
+      });
+      try {
+        first.getMap("metadata").set("first", true);
+        first.commit();
+        second.getMap("metadata").set("second", true);
+        second.commit();
+        for (const peer of [first, second]) {
+          expect((await room.fetch(authedRequest("/append", "user-a", {
+            method: "POST", body: peer.export({ mode: "update", from: base })
+          }))).status).toBe(200);
+        }
+        expect((await internals.ensureDoc()).toJSON()).toEqual({ metadata: { payload: "current", first: true, second: true } });
+      } finally { noHistoricalReads.mockRestore(); }
+      await room.fetch(authedRequest("/stats", "user-a"));
+      const cold = await makeRoom(sql).room.fetch(authedRequest("/snapshot", "user-a"));
+      mirror.import(new Uint8Array(await cold.arrayBuffer()));
+      expect(mirror.toJSON()).toEqual({ metadata: { payload: "current", first: true, second: true } });
+    } finally { base?.free(); mirror.free(); second.free(); first.free(); }
+  });
+
+  it("folds the current replica when a snapshot replaces it during a no-op trim", async () => {
+    const source = new LoroDoc();
+    const mirror = new LoroDoc();
+    const entered = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    try {
+      source.getMap("metadata").set("before", true);
+      source.commit();
+      const sql = new MemorySql();
+      sql.meta.set("roomKind", "workspace");
+      sql.meta.set("owner", PROJECT_SCOPE);
+      sql.putBlob("snapshot", source.export({ mode: "snapshot" }));
+      const { room } = makeRoom(sql);
+      const internals = room as unknown as SessionRoomInternals;
+      await internals.ensureDoc();
+      const trimming = vi.spyOn(internals, "trimHistoryIfDue").mockImplementationOnce(async () => {
+        entered.resolve();
+        await resume.promise;
+        return false;
+      });
+      const folding = internals.foldLog();
+      try {
+        await entered.promise;
+        source.getMap("metadata").set("duringFold", true);
+        source.commit();
+        expect((await room.fetch(authedRequest("/append", "user-a", {
+          method: "POST", body: source.export({ mode: "snapshot" })
+        }))).status).toBe(200);
+      } finally { resume.resolve(); await folding; trimming.mockRestore(); }
+      const cold = await makeRoom(sql).room.fetch(authedRequest("/snapshot", "user-a"));
+      mirror.import(new Uint8Array(await cold.arrayBuffer()));
+      expect(mirror.toJSON()).toEqual(source.toJSON());
+    } finally { resume.resolve(); mirror.free(); source.free(); }
+  });
+
+  it("keeps backup bytes and version aligned when a snapshot replaces the replica during R2 persistence", async () => {
+    const source = new LoroDoc();
+    const backed = new LoroDoc();
+    const entered = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    let uploaded: Uint8Array | undefined;
+    let pause = true;
+    try {
+      source.getMap("metadata").set("before", true);
+      source.commit();
+      const sql = new MemorySql();
+      sql.meta.set("roomKind", "workspace");
+      sql.meta.set("owner", PROJECT_SCOPE);
+      sql.meta.set("chatId", "ws4/project-a");
+      sql.meta.set("backupDirty", "1");
+      sql.putBlob("snapshot", source.export({ mode: "snapshot" }));
+      const { room } = makeRoom(sql, undefined, undefined, async (_key, bytes) => {
+        uploaded = bytes;
+        if (pause) {
+          pause = false;
+          entered.resolve();
+          await resume.promise;
+        }
+      });
+      const backingUp = room.alarm();
+      try {
+        await entered.promise;
+        source.getMap("metadata").set("duringBackup", true);
+        source.commit();
+        expect((await room.fetch(authedRequest("/append", "user-a", {
+          method: "POST", body: source.export({ mode: "snapshot" })
+        }))).status).toBe(200);
+      } finally { resume.resolve(); await backingUp; }
+      backed.import(uploaded!);
+      expect(backed.toJSON()).toEqual({ metadata: { before: true } });
+      let version = backed.oplogVersion();
+      try { expect(sql.meta.get("backupVV")).toBe(Buffer.from(version.encode()).toString("base64")); }
+      finally { version.free(); }
+      expect(sql.meta.get("backupDirty")).toBe("1");
+      await room.alarm();
+      backed.import(uploaded!);
+      expect(backed.toJSON()).toEqual(source.toJSON());
+      version = backed.oplogVersion();
+      try { expect(sql.meta.get("backupVV")).toBe(Buffer.from(version.encode()).toString("base64")); }
+      finally { version.free(); }
+      expect(sql.meta.get("backupDirty")).toBe("0");
+    } finally { resume.resolve(); backed.free(); source.free(); }
+  });
+
+  it("merges compatible concurrent snapshots across cold restart without client resync", async () => {
+    const first = new LoroDoc();
+    const second = new LoroDoc();
+    const firstMap = first.getMap("metadata");
+    const secondMap = second.getMap("metadata");
+    const mirror = new LoroDoc();
+    try {
+      firstMap.set("firstPeer", "retained baseline");
+      secondMap.set("secondPeer", "incoming branch");
+      const sql = new MemorySql();
+      sql.meta.set("owner", PROJECT_SCOPE);
+      sql.meta.set("chatId", "concurrent-snapshot-chat");
+      sql.putBlob("snapshot", first.export({ mode: "snapshot" }));
+      const { room } = makeRoom(sql);
+      const incoming = second.export({ mode: "snapshot" });
+      expect((await room.fetch(authedRequest("/append", "user-a", {
+        method: "POST", body: incoming
+      }))).status).toBe(200);
+      first.import(incoming);
+      const restarted = makeRoom(sql).room;
+      const response = await restarted.fetch(authedRequest("/snapshot", "user-a"));
+      expect(response.status).toBe(200);
+      mirror.import(new Uint8Array(await response.arrayBuffer()));
+      expect(mirror.toJSON()).toEqual(first.toJSON());
+    } finally {
+      firstMap.free(); secondMap.free(); mirror.free(); second.free(); first.free();
+    }
+  });
+
+  it.each([1, 2])("preserves both branches at a shallow boundary after %i server writes", async (serverWrites) => {
+    const source = new LoroDoc();
+    const offline = new LoroDoc();
+    const mirror = new LoroDoc();
+    try {
+      source.getMap("metadata").set("base", true);
+      source.commit();
+      offline.import(source.export({ mode: "snapshot" }));
+      offline.getMap("metadata").set("offline", "retained locally");
+      offline.commit();
+      source.getMap("metadata").set("server", "retained remotely");
+      source.commit();
+      // The frontier's own operation remains exportable. A second server
+      // operation moves shallowSinceVV beyond the offline writer's base.
+      if (serverWrites === 2) {
+        source.getMap("metadata").set("afterGap", true);
+        source.commit();
+      }
+      const sql = new MemorySql();
+      sql.meta.set("owner", PROJECT_SCOPE);
+      sql.meta.set("roomKind", "workspace");
+      sql.putBlob("snapshot", source.export({ mode: "shallow-snapshot", frontiers: source.frontiers() }));
+      const { room } = makeRoom(sql);
+      expect((await room.fetch(authedRequest("/append", "user-a", {
+        method: "POST", body: offline.export({ mode: "snapshot" })
+      }))).status).toBe(serverWrites === 1 ? 200 : 400);
+      if (serverWrites === 1) source.import(offline.export({ mode: "snapshot" }));
+      expect((await (room as unknown as SessionRoomInternals).ensureDoc()).toJSON()).toEqual(source.toJSON());
+      const cold = await makeRoom(sql).room.fetch(authedRequest("/snapshot", "user-a"));
+      mirror.import(new Uint8Array(await cold.arrayBuffer()));
+      expect(mirror.toJSON()).toEqual(source.toJSON());
+      expect(offline.toJSON()).toEqual({ metadata: { base: true, offline: "retained locally" } });
+    } finally { mirror.free(); offline.free(); source.free(); }
+  });
+
+  it.each(["pending", "malformed"] as const)("rejects a %s batch without contaminating live or persisted state", async (failure) => {
+    const source = new LoroDoc();
+    const missing = new LoroDoc();
+    const mirror = new LoroDoc();
+    let before: VersionVector | undefined;
+    let dependencyVersion: VersionVector | undefined;
+    try {
+      source.getMap("metadata").set("baseline", true);
+      source.commit();
+      const sql = new MemorySql();
+      sql.putBlob("snapshot", source.export({ mode: "snapshot" }));
+      const { room } = makeRoom(sql);
+      const socket = await join(room, "user-a", "atomic-chat");
+      const internals = room as unknown as SessionRoomInternals;
+      before = source.oplogVersion();
+      source.getMap("metadata").set("unaccepted", true);
+      source.commit();
+      missing.getMap("metadata").set("dependency", true);
+      missing.commit();
+      const dependency = missing.export({ mode: "snapshot" });
+      dependencyVersion = missing.oplogVersion();
+      missing.getMap("metadata").set("unresolved", true);
+      missing.commit();
+      socket.sent.length = 0;
+      await internals.applyUpdates(socket as unknown as WebSocket, socket.deserializeAttachment() as JoinState,
+        CrdtType.Loro, "atomic-chat", "0x0000000000000001", [
+          source.export({ mode: "update", from: before }),
+          failure === "pending" ? missing.export({ mode: "update", from: dependencyVersion }) : new Uint8Array([1, 2, 3])
+        ]);
+      expect(socket.sent.map((bytes) => decode(bytes))).toEqual([expect.objectContaining({
+        type: MessageType.Ack, status: UpdateStatusCode.InvalidUpdate
+      })]);
+      expect((await internals.ensureDoc()).toJSON()).toEqual({ metadata: { baseline: true } });
+      const cold = await makeRoom(sql).room.fetch(authedRequest("/snapshot", "user-a"));
+      mirror.import(new Uint8Array(await cold.arrayBuffer()));
+      expect(mirror.toJSON()).toEqual({ metadata: { baseline: true } });
+      // Supplying the missing dependency later must not resurrect rejected ops.
+      expect((await room.fetch(authedRequest("/append", "user-a", { method: "POST", body: dependency }))).status).toBe(200);
+      expect((await internals.ensureDoc()).toJSON()).toEqual({ metadata: { baseline: true, dependency: true } });
+    } finally {
+      dependencyVersion?.free(); before?.free(); mirror.free(); missing.free(); source.free();
+    }
+  });
+
+  it("keeps offline workspace writes mergeable through retention pressure and backfills a fresh reader", async () => {
+    const source = new LoroDoc();
+    const offline = new LoroDoc();
+    const reader = new LoroDoc();
+    let offlineBase: VersionVector | undefined;
+    let bufferedBase: VersionVector | undefined;
+    try {
+      source.getMap("metadata").set("base", true);
+      source.commit();
+      const sql = new MemorySql();
+      sql.putBlob("snapshot", source.export({ mode: "snapshot" }));
+      offline.import(source.export({ mode: "snapshot" }));
+      offlineBase = offline.oplogVersion();
+      offline.getMap("metadata").set("offline", "preserved");
+      offline.commit();
+      sql.meta.set("roomKind", "workspace");
+      sql.meta.set("owner", PROJECT_SCOPE);
+      sql.meta.set("chatId", "ws4/project-a");
+      const { room } = makeRoom(sql);
+      const internals = room as unknown as SessionRoomInternals;
+      // Large obsolete history triggers folding; an aged cutoff would also
+      // trim past the offline writer if workspaces shared transcript policy.
+      source.getMap("metadata").set("payload", oversizedPayload());
+      source.commit();
+      source.getMap("metadata").set("payload", "current");
+      source.commit();
+      expect((await room.fetch(authedRequest("/append", "user-a", {
+        method: "POST", body: source.export({ mode: "update" })
+      }))).status).toBe(200);
+      sql.meta.set("checkpoints", JSON.stringify([{ at: Date.now() - 365 * 24 * 60 * 60 * 1000, frontiers: source.frontiers() }]));
+      await room.fetch(authedRequest("/stats", "user-a"));
+      expect(await internals.trimHistoryIfDue(await internals.ensureDoc(), Date.now())).toBe(false);
+      const offlineDelta = offline.export({ mode: "update", from: offlineBase });
+      expect((await room.fetch(authedRequest("/append", "user-a", { method: "POST", body: offlineDelta }))).status).toBe(200);
+      source.import(offlineDelta);
+      await room.fetch(authedRequest("/stats", "user-a"));
+      bufferedBase = source.oplogVersion();
+      source.getMap("metadata").set("buffered", "latest");
+      source.commit();
+      expect((await room.fetch(authedRequest("/append", "user-a", {
+        method: "POST", body: source.export({ mode: "update", from: bufferedBase })
+      }))).status).toBe(200);
+      const emptyVersion = reader.oplogVersion();
+      let socket: CapturingSocket;
+      try { socket = await join(room, "user-a", "ws4/project-a", emptyVersion.encode()); }
+      finally { emptyVersion.free(); }
+      let fragments: Uint8Array | undefined;
+      let offset = 0;
+      for (const bytes of socket.sent) {
+        const message = decode(bytes);
+        if (message.type === MessageType.DocUpdateFragmentHeader) {
+          fragments = new Uint8Array(message.totalSizeBytes);
+          offset = 0;
+        } else if (message.type === MessageType.DocUpdateFragment) {
+          fragments!.set(message.fragment, offset);
+          offset += message.fragment.length;
+          if (offset === fragments!.length) expect(reader.import(fragments!).pending?.size ?? 0).toBe(0);
+        } else if (message.type === MessageType.DocUpdate) {
+          for (const update of message.updates) expect(reader.import(update).pending?.size ?? 0).toBe(0);
+        }
+      }
+      expect(reader.toJSON()).toEqual(source.toJSON());
+      offline.import(reader.export({ mode: "update", from: offlineBase }));
+      expect(offline.toJSON()).toEqual(source.toJSON());
+    } finally {
+      bufferedBase?.free(); offlineBase?.free(); reader.free(); offline.free(); source.free();
+    }
+  });
+
+  it("bootstraps out-of-order pending deltas without losing them across cold replay", async () => {
+    const source = new LoroDoc();
+    const map = source.getMap("metadata");
+    let before: VersionVector | undefined;
+    const mirror = new LoroDoc();
+    try {
+      map.set("base", "preserved");
+      source.commit();
+      const snapshot = source.export({ mode: "snapshot" });
+      before = source.version();
+      map.set("late", "retained");
+      source.commit();
+      const delta = source.export({ mode: "update", from: before });
+      const intermediate = source.version();
+      let later: Uint8Array;
+      try {
+        map.set("last", "also retained");
+        source.commit();
+        later = source.export({ mode: "update", from: intermediate });
+      } finally { intermediate.free(); }
+      const sql = new MemorySql();
+      sql.appendUpdate(later);
+      sql.appendUpdate(delta);
+      const { room } = makeRoom(sql);
+      const socket = new CapturingSocket();
+      const state: JoinState = { userId: "user-a", projectScope: PROJECT_SCOPE, capabilities: CAPABILITIES, rooms: [] };
+      socket.serializeAttachment(state);
+      const internals = room as unknown as SessionRoomInternals;
+      await internals.handleJoin(socket as unknown as WebSocket, state, joinRequest("bootstrap-chat"));
+      expect(socket.sent.map((bytes) => decode(bytes))).toEqual([expect.objectContaining({
+        type: MessageType.JoinError, code: JoinErrorCode.AppError, message: "incomplete_history"
+      })]);
+      expect(state.rooms).toEqual([]);
+      socket.sent.length = 0;
+      await room.webSocketMessage(socket as unknown as WebSocket, Uint8Array.from(encode({
+        type: MessageType.DocUpdate, crdt: CrdtType.Loro, roomId: "bootstrap-chat",
+        batchId: "0x0000000000000001", updates: [delta]
+      })).buffer);
+      expect(socket.sent.map((bytes) => decode(bytes))).toEqual([expect.objectContaining({
+        type: MessageType.Ack, status: UpdateStatusCode.InvalidUpdate
+      })]);
+      socket.sent.length = 0;
+      await room.webSocketMessage(socket as unknown as WebSocket, Uint8Array.from(encode({
+        type: MessageType.DocUpdate, crdt: CrdtType.Loro, roomId: "bootstrap-chat",
+        batchId: "0x0000000000000002", updates: [snapshot]
+      })).buffer);
+      expect(socket.sent.map((bytes) => decode(bytes))).toEqual([expect.objectContaining({
+        type: MessageType.Ack, status: UpdateStatusCode.Ok
+      })]);
+      expect(state.rooms).toEqual([]);
+      socket.sent.length = 0;
+      await internals.handleJoin(socket as unknown as WebSocket, state, joinRequest("bootstrap-chat"));
+      expect(socket.sent.map((bytes) => decode(bytes))).toContainEqual(expect.objectContaining({ type: MessageType.JoinResponseOk }));
+      for (const bytes of socket.sent) {
+        const message = decode(bytes);
+        if (message.type === MessageType.DocUpdate) {
+          for (const update of message.updates) expect(mirror.import(update).pending?.size ?? 0).toBe(0);
+        }
+      }
+      expect(mirror.toJSON()).toEqual(source.toJSON());
+      expect((await internals.ensureDoc()).toJSON()).toEqual(source.toJSON());
+      const restarted = makeRoom(sql).room;
+      const replay = await restarted.fetch(authedRequest("/snapshot", "user-a"));
+      mirror.import(new Uint8Array(await replay.arrayBuffer()));
+      expect(mirror.toJSON()).toEqual(source.toJSON());
+    } finally {
+      before?.free();
+      map.free();
+      mirror.free();
+      source.free();
+    }
+  });
+
+  it("rejects an earlier unresolved delta even when the last replay row is covered", async () => {
+    const source = new LoroDoc();
+    const map = source.getMap("metadata");
+    const unrelated = new LoroDoc();
+    const unrelatedMap = unrelated.getMap("metadata");
+    let before: VersionVector | undefined;
+    const mirror = new LoroDoc();
+    try {
+      map.set("base", "preserved");
+      source.commit();
+      before = source.version();
+      map.set("late", "retained");
+      source.commit();
+      const delta = source.export({ mode: "update", from: before });
+      const sql = new MemorySql();
+      sql.appendUpdate(delta);
+      unrelatedMap.set("old", true);
+      sql.appendUpdate(unrelated.export({ mode: "snapshot" }));
+      const { room } = makeRoom(sql);
+      sql.meta.set("owner", PROJECT_SCOPE);
+      sql.meta.set("chatId", "bootstrap-chat");
+      unrelatedMap.set("unrelated", true);
+      const rejected = await room.fetch(authedRequest("/append", "user-a", {
+        method: "POST", body: unrelated.export({ mode: "snapshot" })
+      }));
+      expect(rejected.status).toBe(400);
+      source.import(unrelated.export({ mode: "snapshot" }));
+      const accepted = await room.fetch(authedRequest("/append", "user-a", { method: "POST", body: source.export({ mode: "snapshot" }) }));
+      expect(accepted.status).toBe(200);
+      const replay = await makeRoom(sql).room.fetch(authedRequest("/snapshot", "user-a"));
+      mirror.import(new Uint8Array(await replay.arrayBuffer()));
+      expect(mirror.toJSON()).toEqual(source.toJSON());
+    } finally {
+      before?.free();
+      map.free();
+      unrelatedMap.free();
+      mirror.free();
+      unrelated.free();
+      source.free();
+    }
+  });
+
+  it(
+    "fully backfills a stale client after compacted room rematerialization",
+    async () => {
+      const { room, staleVersion, expected } = compactedJoinFixture();
+      const socket = await join(room, "user-a", "retained-chat", staleVersion);
+      const backfill = socket.sent
+        .map((bytes) => decode(bytes))
+        .find((message) => message.type === MessageType.DocUpdate);
+      expect(backfill?.type).toBe(MessageType.DocUpdate);
+      // Native recovery installs a validated replacement replica: importing a
+      // truncated snapshot into an old nonempty replica can itself stay pending.
+      const recovered = new LoroDoc();
+      try {
+        if (backfill?.type === MessageType.DocUpdate) {
+          for (const update of backfill.updates) {
+            expect(recovered.import(update).pending?.size ?? 0).toBe(0);
+          }
+        }
+        expect(recovered.toJSON()).toEqual(expected);
+        const state = recovered.version();
+        const oplog = recovered.oplogVersion();
+        try {
+          expect(state.compare(oplog)).toBe(0);
+        } finally {
+          oplog.free();
+          state.free();
+        }
+      } finally {
+        recovered.free();
+      }
+    }
+  );
+
+  it(
+    "incrementally catches up a covered client after compacted room rematerialization",
+    async () => {
+      const { room, coveredSnapshot, expected } = compactedJoinFixture();
+      const mirror = new LoroDoc();
+      try {
+        mirror.import(coveredSnapshot);
+        const version = mirror.version();
+        let socket: CapturingSocket;
+        try {
+          socket = await join(room, "user-a", "retained-chat", version.encode());
+        } finally {
+          version.free();
+        }
+        const backfill = socket.sent
+          .map((bytes) => decode(bytes))
+          .find((message) => message.type === MessageType.DocUpdate);
+        expect(backfill?.type).toBe(MessageType.DocUpdate);
+        if (backfill?.type === MessageType.DocUpdate) {
+          // The unchanged retained text must not be retransmitted to a caught-up
+          // client. This also rejects an unconditional full-snapshot fallback.
+          const bytes = backfill.updates.reduce((total, update) => total + update.byteLength, 0);
+          expect(bytes).toBeLessThan(coveredSnapshot.byteLength / 2);
+          for (const update of backfill.updates) {
+            expect(mirror.import(update).pending?.size ?? 0).toBe(0);
+          }
+        }
+        expect(mirror.toJSON()).toEqual(expected);
+      } finally {
+        mirror.free();
+      }
+    }
+  );
 
   it("replays bounded workspace presence without allocating another WASM store", async () => {
     const { room, sockets } = makeRoom();
@@ -257,6 +876,481 @@ describe("SessionRoom chat authorization", () => {
     expect(
       expired.sent.some((bytes) => decode(bytes).type === MessageType.DocUpdate)
     ).toBe(false);
+  });
+
+  it("assembles out-of-order fragments once despite retransmitted indices", async () => {
+    const { room } = makeRoom();
+    const socket = await join(room, "user-a", "fragment-chat");
+    socket.sent.length = 0;
+    const source = new LoroDoc();
+    try {
+      source.getText("text").insert(0, "fragmented transcript");
+      const update = source.export({ mode: "snapshot" });
+      const middle = Math.floor(update.length / 2);
+      const envelope = {
+        crdt: CrdtType.Loro,
+        roomId: "fragment-chat",
+        batchId: "0x0000000000000001" as const
+      };
+      const send = async (message: ProtocolMessage) => {
+        await room.webSocketMessage(socket as unknown as WebSocket, Uint8Array.from(encode(message)).buffer);
+      };
+      await send({
+        type: MessageType.DocUpdateFragmentHeader,
+        ...envelope,
+        fragmentCount: 2,
+        totalSizeBytes: update.length
+      });
+      const second: ProtocolMessage = {
+        type: MessageType.DocUpdateFragment,
+        ...envelope,
+        index: 1,
+        fragment: update.subarray(middle)
+      };
+      await send(second);
+      await send(second);
+      expect(socket.sent).toEqual([]);
+      await send({
+        type: MessageType.DocUpdateFragment,
+        ...envelope,
+        index: 0,
+        fragment: update.subarray(0, middle)
+      });
+      expect(socket.sent.map((bytes) => decode(bytes))).toEqual([{
+        type: MessageType.Ack,
+        crdt: CrdtType.Loro,
+        roomId: "fragment-chat",
+        refId: envelope.batchId,
+        status: UpdateStatusCode.Ok
+      }]);
+      const received = await (room as unknown as SessionRoomInternals).ensureDoc();
+      expect(received.getText("text").toString()).toBe("fragmented transcript");
+    } finally {
+      source.free();
+    }
+  });
+
+  it("rejects a grant revoked while a cold document is materializing", async () => {
+    const entered = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    let pause = false;
+    let authorized = true;
+    const { room } = makeRoom(new MemorySql(), async () => {
+      if (!pause) return;
+      pause = false;
+      entered.resolve();
+      await resume.promise;
+    }, async () => new Response(null, { status: authorized ? 200 : 403 }));
+    const socket = await join(room, "user-a", "authority-chat");
+    const state = socket.deserializeAttachment() as JoinState;
+    state.grantId = "grant-1";
+    state.grantExpiresAt = Date.now() + 600_000;
+    socket.sent.length = 0;
+    vi.advanceTimersByTime(61_000);
+    const source = new LoroDoc();
+    source.getMap("metadata").set("forbidden", true);
+    pause = true;
+    const applying = room.webSocketMessage(socket as unknown as WebSocket, Uint8Array.from(encode({
+      type: MessageType.DocUpdate,
+      crdt: CrdtType.Loro,
+      roomId: "authority-chat",
+      batchId: "0x0000000000000001",
+      updates: [source.export({ mode: "update" })]
+    })).buffer);
+    try {
+      await Promise.race([entered.promise, applying]);
+      expect(pause).toBe(false);
+      // The authority revokes before its notification reaches the room.
+      authorized = false;
+      resume.resolve();
+      await applying;
+      expect(socket.closed).toContainEqual({ code: 4403, reason: "device grant invalid" });
+      expect(socket.sent).toEqual([]);
+      const live = await (room as unknown as SessionRoomInternals).ensureDoc();
+      expect(live.getMap("metadata").get("forbidden")).toBeUndefined();
+      const stats = await room.fetch(authedRequest("/stats", "user-a"));
+      expect(stats.status).toBe(200);
+      const snapshot = await room.fetch(authedRequest("/snapshot", "user-a"));
+      const mirror = new LoroDoc();
+      try {
+        mirror.import(new Uint8Array(await snapshot.arrayBuffer()));
+        expect(mirror.getMap("metadata").get("forbidden")).toBeUndefined();
+      } finally {
+        mirror.free();
+      }
+    } finally {
+      resume.resolve();
+      await applying;
+      source.free();
+    }
+  });
+
+  it.each(["trim", "idle release", "reset"] as const)(
+    "uses only the live document after %s during authority lookup",
+    async (transition) => {
+      const entered = Promise.withResolvers<void>();
+      const resume = Promise.withResolvers<void>();
+      let pause = false;
+      const { room, sql, sockets } = makeRoom(new MemorySql(), undefined, async () => {
+        if (pause) {
+          pause = false;
+          entered.resolve();
+          await resume.promise;
+        }
+        return new Response(null, { status: 200 });
+      });
+      const socket = await join(room, "user-a", "authority-chat");
+      const state = socket.deserializeAttachment() as JoinState;
+      state.grantId = "grant-1";
+      state.grantExpiresAt = Date.now() + 600_000;
+      sockets.push(socket as unknown as WebSocket);
+      socket.sent.length = 0;
+      const internals = room as unknown as SessionRoomInternals;
+      const source = new LoroDoc();
+      source.getMap("metadata").set("baseline", true);
+      expect((await room.fetch(authedRequest("/append", "user-a", {
+        method: "POST",
+        body: source.export({ mode: "update" })
+      }))).status).toBe(200);
+      await room.fetch(authedRequest("/stats", "user-a"));
+      socket.sent.length = 0;
+      const before = source.oplogVersion();
+      source.getMap("metadata").set("duringAuthority", true);
+      const delta = source.export({ mode: "update", from: before });
+      before.free();
+      pause = true;
+      const applying = internals.applyUpdates(
+        socket as unknown as WebSocket, state, CrdtType.Loro, "authority-chat",
+        "0x0000000000000001", [delta]
+      );
+      try {
+        await Promise.race([entered.promise, applying]);
+        expect(pause).toBe(false);
+        if (transition === "trim") {
+          const live = await internals.ensureDoc();
+          sql.meta.set("checkpoints", JSON.stringify([{
+            at: Date.now() - 365 * 24 * 60 * 60 * 1000,
+            frontiers: live.frontiers()
+          }]));
+          expect(await internals.trimHistoryIfDue(live, Date.now())).toBe(true);
+        } else if (transition === "idle release") {
+          vi.advanceTimersByTime(61_000);
+        } else {
+          expect((await room.fetch(authedRequest("/reset-log", "user-a", {
+            method: "POST"
+          }))).status).toBe(200);
+          // Even a new live doc must not admit a pre-reset socket's write.
+          await internals.ensureDoc();
+        }
+        resume.resolve();
+        await applying;
+        const messages = socket.sent.map((bytes) => decode(bytes));
+        if (transition === "reset") {
+          expect(socket.closed).toContainEqual({ code: 4410, reason: "room reset" });
+          expect(messages).toEqual([]);
+        } else {
+          expect(messages).toEqual([{
+            type: MessageType.Ack,
+            crdt: CrdtType.Loro,
+            roomId: "authority-chat",
+            refId: "0x0000000000000001",
+            status: transition === "trim" ? UpdateStatusCode.Ok : UpdateStatusCode.InvalidUpdate
+          }]);
+        }
+        const live = await internals.ensureDoc();
+        expect(live.getMap("metadata").get("duringAuthority")).toBe(
+          transition === "trim" ? true : undefined
+        );
+        const snapshot = await room.fetch(authedRequest("/snapshot", "user-a"));
+        const mirror = new LoroDoc();
+        try {
+          mirror.import(new Uint8Array(await snapshot.arrayBuffer()));
+          expect(mirror.getMap("metadata").get("duringAuthority")).toBe(
+            transition === "trim" ? true : undefined
+          );
+        } finally {
+          mirror.free();
+        }
+      } finally {
+        resume.resolve();
+        await applying;
+        source.free();
+      }
+    }
+  );
+
+  it.each(["trim", "idle release", "reset"] as const)(
+    "answers a join safely after %s during authority lookup",
+    async (transition) => {
+      const entered = Promise.withResolvers<void>();
+      const resume = Promise.withResolvers<void>();
+      let pause = true;
+      const { room, sql, sockets } = makeRoom(new MemorySql(), undefined, async () => {
+        pause = false;
+        entered.resolve();
+        await resume.promise;
+        return new Response(null, { status: 200 });
+      });
+      const source = new LoroDoc();
+      source.getMap("metadata").set("baseline", true);
+      sql.appendUpdate(source.export({ mode: "update" }));
+      const internals = room as unknown as SessionRoomInternals;
+      const socket = new CapturingSocket();
+      const state: JoinState = {
+        userId: "user-a",
+        projectScope: PROJECT_SCOPE,
+        capabilities: CAPABILITIES,
+        rooms: [],
+        grantId: "grant-1",
+        grantExpiresAt: Date.now() + 600_000
+      };
+      socket.serializeAttachment(state);
+      sockets.push(socket as unknown as WebSocket);
+      const joining = internals.handleJoin(
+        socket as unknown as WebSocket, state, joinRequest("authority-chat")
+      );
+      try {
+        await Promise.race([entered.promise, joining]);
+        expect(pause).toBe(false);
+        if (transition === "trim") {
+          const live = await internals.ensureDoc();
+          sql.meta.set("checkpoints", JSON.stringify([{
+            at: Date.now() - 365 * 24 * 60 * 60 * 1000,
+            frontiers: live.frontiers()
+          }]));
+          expect(await internals.trimHistoryIfDue(live, Date.now())).toBe(true);
+        } else if (transition === "idle release") {
+          vi.advanceTimersByTime(61_000);
+        } else {
+          expect((await room.fetch(authedRequest("/reset-log", "user-a", {
+            method: "POST"
+          }))).status).toBe(200);
+          await internals.ensureDoc();
+        }
+        resume.resolve();
+        await joining;
+        const messages = socket.sent.map((bytes) => decode(bytes));
+        if (transition === "trim") {
+          expect(messages[0]?.type).toBe(MessageType.JoinResponseOk);
+          expect(state.rooms).toContain(CrdtType.Loro);
+          const backfill = messages.find((message) => message.type === MessageType.DocUpdate);
+          expect(backfill?.type).toBe(MessageType.DocUpdate);
+          const mirror = new LoroDoc();
+          try {
+            if (backfill?.type === MessageType.DocUpdate) {
+              for (const update of backfill.updates) mirror.import(update);
+            }
+            expect(mirror.getMap("metadata").get("baseline")).toBe(true);
+          } finally {
+            mirror.free();
+          }
+        } else {
+          expect(state.rooms).toEqual([]);
+          if (transition === "idle release") {
+            expect(messages).toEqual([expect.objectContaining({
+              type: MessageType.JoinError,
+              code: JoinErrorCode.AppError
+            })]);
+          } else {
+            expect(socket.closed).toContainEqual({ code: 4410, reason: "room reset" });
+            expect(messages).toEqual([]);
+          }
+        }
+      } finally {
+        resume.resolve();
+        await joining;
+        source.free();
+      }
+    }
+  );
+
+  it("bounds fragment reservations across incomplete batches and rejects oversized payloads", async () => {
+    const { room } = makeRoom();
+    const socket = await join(room, "user-a", "fragment-chat");
+    socket.sent.length = 0;
+    const envelope = { crdt: CrdtType.Loro, roomId: "fragment-chat" };
+    const send = async (message: ProtocolMessage) => {
+      await room.webSocketMessage(socket as unknown as WebSocket, Uint8Array.from(encode(message)).buffer);
+    };
+    const header = { type: MessageType.DocUpdateFragmentHeader, ...envelope } as const;
+    await send({
+      ...header,
+      batchId: "0x0000000000000001",
+      fragmentCount: 1025,
+      totalSizeBytes: 1
+    });
+    await send({
+      ...header,
+      batchId: "0x0000000000000002",
+      fragmentCount: 1,
+      totalSizeBytes: 64 * 1024 * 1024 + 1
+    });
+    await send({
+      ...header,
+      batchId: "0x0000000000000003",
+      fragmentCount: 1,
+      totalSizeBytes: 64 * 1024 * 1024
+    });
+    await send({
+      ...header,
+      batchId: "0x0000000000000004",
+      fragmentCount: 1,
+      totalSizeBytes: 1
+    });
+    // Replacing an existing batch releases its previous reservation.
+    await send({
+      ...header,
+      batchId: "0x0000000000000003",
+      fragmentCount: 1,
+      totalSizeBytes: 1
+    });
+    await send({
+      type: MessageType.DocUpdateFragment,
+      ...envelope,
+      batchId: "0x0000000000000003",
+      index: 0,
+      fragment: new Uint8Array([1, 2])
+    });
+    expect(socket.sent.map((bytes) => decode(bytes))).toEqual(
+      [1, 2, 4, 3].map((id) => ({
+        type: MessageType.Ack,
+        ...envelope,
+        refId: `0x${id.toString(16).padStart(16, "0")}`,
+        status: UpdateStatusCode.PayloadTooLarge
+      }))
+    );
+  });
+
+  it("persists oversized Loro updates and subsequent deltas across a cold restart", async () => {
+    const { room, sql } = makeRoom();
+    await join(room, "user-a", "large-workspace");
+    const source = new LoroDoc();
+    source.getMap("metadata").set("before", true);
+    source.commit();
+    const append = (bytes: Uint8Array) => room.fetch(
+      authedRequest("/append", "user-a", { method: "POST", body: bytes })
+    );
+    expect((await append(source.export({ mode: "update" }))).status).toBe(200);
+    expect((await room.fetch(authedRequest("/stats", "user-a"))).status).toBe(200);
+
+    const payload = oversizedPayload();
+    source.getMap("metadata").set("payload", payload);
+    source.commit();
+    const oversized = source.export({ mode: "update" });
+    expect(oversized.byteLength).toBeGreaterThan(2_000_000);
+    expect((await append(oversized)).status).toBe(200);
+    expect((await room.fetch(authedRequest("/stats", "user-a"))).status).toBe(200);
+
+    const beforeDelta = source.oplogVersion();
+    source.getMap("metadata").set("after", true);
+    source.commit();
+    expect((await append(source.export({ mode: "update", from: beforeDelta }))).status).toBe(200);
+    expect((await room.fetch(authedRequest("/stats", "user-a"))).status).toBe(200);
+
+    const reopened = makeRoom(sql).room;
+    const snapshot = await reopened.fetch(authedRequest("/snapshot", "user-a"));
+    expect(snapshot.status).toBe(200);
+    const restored = new LoroDoc();
+    restored.import(new Uint8Array(await snapshot.arrayBuffer()));
+    expect(restored.getMap("metadata").get("before")).toBe(true);
+    const recoveredPayload = restored.getMap("metadata").get("payload");
+    expect(recoveredPayload).toBeInstanceOf(Uint8Array);
+    // Compare every byte without recursively inspecting millions of indices.
+    expect(Buffer.compare(recoveredPayload as Uint8Array, payload)).toBe(0);
+    expect(restored.getMap("metadata").get("after")).toBe(true);
+    restored.free();
+    source.free();
+  });
+
+  it("compacts oversized backfills without losing writes accepted during persistence", async () => {
+    const entered = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    let pause = false;
+    const { room, sql } = makeRoom(new MemorySql(), async () => {
+      if (!pause) return;
+      pause = false;
+      entered.resolve();
+      await resume.promise;
+    });
+    await join(room, "user-a", "compacting-workspace");
+    const source = new LoroDoc();
+    source.getMap("metadata").set("payload", oversizedPayload());
+    source.commit();
+    source.getMap("metadata").set("payload", "latest");
+    source.commit();
+    const append = (bytes: Uint8Array) => room.fetch(
+      authedRequest("/append", "user-a", { method: "POST", body: bytes })
+    );
+    expect((await append(source.export({ mode: "update" }))).status).toBe(200);
+    pause = true;
+    const flushing = room.fetch(authedRequest("/stats", "user-a"));
+    try {
+      await Promise.race([entered.promise, flushing]);
+      expect(pause).toBe(false);
+      const beforeDelta = source.oplogVersion();
+      source.getMap("metadata").set("duringPersistence", true);
+      source.commit();
+      expect((await append(source.export({ mode: "update", from: beforeDelta }))).status).toBe(200);
+      const overlappingFlush = room.fetch(authedRequest("/stats", "user-a"));
+      resume.resolve();
+      await Promise.all([flushing, overlappingFlush]);
+
+      const live = await room.fetch(authedRequest("/snapshot", "user-a"));
+      const bytes = new Uint8Array(await live.arrayBuffer());
+      // Only the current small value belongs in the backfill, not the deleted
+      // multi-megabyte history that triggered compaction.
+      expect(bytes.byteLength).toBeLessThan(100_000);
+      const mirror = new LoroDoc();
+      mirror.import(bytes);
+      expect(mirror.getMap("metadata").toJSON()).toEqual({
+        payload: "latest",
+        duringPersistence: true
+      });
+      mirror.free();
+
+      const cold = await makeRoom(sql).room.fetch(authedRequest("/snapshot", "user-a"));
+      const recovered = new LoroDoc();
+      recovered.import(new Uint8Array(await cold.arrayBuffer()));
+      expect(recovered.getMap("metadata").toJSON()).toEqual({
+        payload: "latest",
+        duringPersistence: true
+      });
+      recovered.free();
+    } finally {
+      resume.resolve();
+      await flushing;
+      source.free();
+    }
+  });
+
+  it("preserves rejected workspace history through replay failures and cold restart", async () => {
+    const corruptSnapshot = new Uint8Array(
+      readFileSync(
+        fileURLToPath(new NodeUrl("./fixtures/corrupt-loro-snapshot.bin", import.meta.url))
+      )
+    );
+
+    for (const source of ["snapshot", "update"] as const) {
+      const sql = new MemorySql();
+      if (source === "snapshot") sql.putBlob("snapshot", corruptSnapshot);
+      else sql.appendUpdate(corruptSnapshot);
+      const { room, sockets } = makeRoom(sql);
+      const socket = new CapturingSocket();
+      sockets.push(socket as unknown as WebSocket);
+      const internals = room as unknown as SessionRoomInternals;
+
+      await expect(internals.ensureDoc()).rejects.toBeDefined();
+      expect(socket.closed).toContainEqual({ code: 4410, reason: "room reset" });
+      await expect((makeRoom(sql).room as unknown as SessionRoomInternals).ensureDoc()).rejects.toBeDefined();
+      expect(sql.hasBlob("snapshot")).toBe(source === "snapshot");
+      expect(sql.updateCount()).toBe(source === "update" ? 1 : 0);
+      const stored = Array.from(sql.exec(source === "snapshot" ? "SELECT bytes FROM blobs WHERE name = ?" : "SELECT bytes FROM updates ORDER BY seq", "snapshot"));
+      expect(Buffer.compare(Buffer.from(stored[0].bytes as ArrayBuffer), corruptSnapshot)).toBe(0);
+      sql.meta.set("replayAttempts", "3");
+      await expect((makeRoom(sql).room as unknown as SessionRoomInternals).ensureDoc()).rejects.toBeDefined();
+      const retained = Array.from(sql.exec(source === "snapshot" ? "SELECT bytes FROM blobs WHERE name = ?" : "SELECT bytes FROM updates ORDER BY seq", "snapshot"));
+      expect(Buffer.compare(Buffer.from(retained[0].bytes as ArrayBuffer), corruptSnapshot)).toBe(0);
+    }
   });
 
   it("lets different authenticated users mutate and read every authorized chat surface", async () => {

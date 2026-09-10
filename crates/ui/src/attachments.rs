@@ -583,6 +583,7 @@ pub async fn upload_attachment(
     engine: &EngineHandle,
     executor: &BackgroundExecutor,
     target_device_id: Option<&str>,
+    session_id: &str,
     attachment: &StagedAttachment,
 ) -> Result<String, String> {
     let mut reader = attachment.reader()?;
@@ -605,7 +606,7 @@ pub async fn upload_attachment(
         }
         let data = BASE64.encode(&raw[..read]);
         let params = with_target(
-            serde_json::json!({ "uploadId": upload_id, "seq": seq, "data": data }),
+            serde_json::json!({ "uploadId": upload_id, "seq": seq, "data": data, "sessionId": session_id }),
             target_device_id,
         );
         let timeout = if seq == 0 {
@@ -638,7 +639,7 @@ pub async fn upload_attachment(
         }
     }
     let params = with_target(
-        serde_json::json!({ "uploadId": upload_id, "fileName": attachment.name }),
+        serde_json::json!({ "uploadId": upload_id, "fileName": attachment.name, "sessionId": session_id }),
         target_device_id,
     );
     let commit_seconds = attachment

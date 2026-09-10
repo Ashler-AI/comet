@@ -56,7 +56,11 @@ function modelConfig(model: GatewayModel) {
 }
 
 export default async function cometAuthGateway(pi: ExtensionAPI) {
-  const token = process.env[TOKEN_ENV];
+  return registerGateway(pi, TOKEN_ENV);
+}
+
+export async function registerGateway(pi: ExtensionAPI, tokenEnv: string) {
+  const token = process.env[tokenEnv];
   if (!token) return;
 
   const gatewayUrl = (process.env.PRIME_AGENT_AUTH_GATEWAY_URL ?? DEFAULT_GATEWAY_URL).replace(/\/$/, "");
@@ -64,12 +68,12 @@ export default async function cometAuthGateway(pi: ExtensionAPI) {
     headers: { authorization: `Bearer ${token}` },
   });
   if (!response.ok) {
-    throw new Error(`Comet auth gateway model discovery failed with HTTP ${response.status}`);
+    throw new Error(`Crew auth gateway model discovery failed with HTTP ${response.status}`);
   }
 
   const catalog: unknown = await response.json();
   if (!isGatewayCatalog(catalog)) {
-    throw new Error("Comet auth gateway returned an invalid model catalog");
+    throw new Error("Crew auth gateway returned an invalid model catalog");
   }
 
   const anthropicModels = catalog.data.filter(
@@ -81,9 +85,9 @@ export default async function cometAuthGateway(pi: ExtensionAPI) {
 
   if (anthropicModels.length > 0) {
     pi.registerProvider("comet-anthropic", {
-      name: "Comet Anthropic",
+      name: "Crew Anthropic",
       baseUrl: gatewayUrl,
-      apiKey: TOKEN_ENV,
+      apiKey: tokenEnv,
       api: "anthropic-messages",
       authHeader: true,
       models: anthropicModels.map(modelConfig),
@@ -92,9 +96,9 @@ export default async function cometAuthGateway(pi: ExtensionAPI) {
 
   if (openaiModels.length > 0) {
     pi.registerProvider("comet-openai", {
-      name: "Comet OpenAI",
+      name: "Crew OpenAI",
       baseUrl: `${gatewayUrl}/v1`,
-      apiKey: TOKEN_ENV,
+      apiKey: tokenEnv,
       api: "openai-responses",
       authHeader: true,
       models: openaiModels.map(modelConfig),

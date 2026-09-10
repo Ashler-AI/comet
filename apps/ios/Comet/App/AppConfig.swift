@@ -1,8 +1,32 @@
-// Session-wide connection config: edge base URL, identity, token minting for
-// room sockets (WS auth rides the URL query — sockets can't set headers), and
-// the durable-nudge POST. Thread-safe (rooms call in from their actors).
+// Session-wide connection config: edge base URL, identity, and token minting
+// for room sockets (WS auth rides the URL query).
 
 import Foundation
+import CryptoKit
+
+enum ReleaseConfig {
+    static let edgeURL = requiredURL("CrewEdgeURL")
+    static let scaffoldURL = requiredURL("CrewScaffoldURL")
+    static let projectScope = requiredString("CrewProjectScope")
+    static let inviteScheme = requiredString("CrewInviteScheme")
+    static let displayName = requiredString("CFBundleDisplayName")
+
+    private static func requiredString(_ key: String) -> String {
+        guard let value = Bundle.main.object(forInfoDictionaryKey: key) as? String,
+              !value.isEmpty else {
+            fatalError("Missing required Info.plist value: \(key)")
+        }
+        return value
+    }
+
+    private static func requiredURL(_ key: String) -> URL {
+        let value = requiredString(key)
+        guard let url = URL(string: value), url.scheme == "https", url.host != nil else {
+            fatalError("Invalid required URL in Info.plist: \(key)")
+        }
+        return url
+    }
+}
 
 final class AppConfig: @unchecked Sendable {
     enum Mode: String {
@@ -25,12 +49,26 @@ final class AppConfig: @unchecked Sendable {
          tokens: AuthTokens? = nil, devBearer: String? = nil) {
         self.edgeURL = edgeURL
         self.mode = mode
-        self.userId = userId
+        // Match the edge's verified Scaffold subject, including restored logins
+        // written by older clients. Explicit dev identities remain opaque.
+        self.userId = mode == .scaffold
+            ? userId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            : userId
         self.projectScope = projectScope
         self.deviceId = deviceId
         self.deviceName = deviceName
         self.tokens = tokens
         self.devBearer = devBearer
+    }
+
+    /// Disk replicas must never be reused across an edge, principal, project,
+    /// or deployment boundary. Legacy unscoped caches are intentionally left
+    /// untouched; the correct room backfills a fresh replica after sign-in.
+    func documentCacheId(roomId: String, deploymentId: String? = nil) -> String {
+        let identity = [edgeURL.absoluteString, mode.rawValue, userId, projectScope,
+                        roomId, deploymentId ?? ""]
+        let bytes = Data(identity.map { "\($0.utf8.count):\($0)" }.joined().utf8)
+        return "scoped-" + SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
     }
 
     /// Current revocable Scaffold bearer. The control plane validates it on
@@ -55,15 +93,16 @@ final class AppConfig: @unchecked Sendable {
         return url
     }
 
-    func sessionSocketURL(chatId: String) async -> URL? {
+    func sessionSocketURL(chatId: String, deploymentId: String? = nil) async -> URL? {
         guard let token = await currentToken() else { return nil }
         var url = wsBase.appending(path: "session/\(chatId)/ws")
-        url.append(queryItems: [
-            URLQueryItem(name: "token", value: token),
-            // Native Scaffold clients share the project's canonical deployment
-            // namespace with desktop engines and sandbox device credentials.
-            URLQueryItem(name: "deploymentId", value: projectScope),
-        ])
+        url.append(queryItems: [URLQueryItem(name: "token", value: token)])
+        // Local-controller sessions use the project/session room. A deployment
+        // selects a different physical room and must come from the session's
+        // Scaffold environment, never from the workspace project scope.
+        if let deploymentId, !deploymentId.isEmpty {
+            url.append(queryItems: [URLQueryItem(name: "deploymentId", value: deploymentId)])
+        }
         return url
     }
 
@@ -79,15 +118,4 @@ final class AppConfig: @unchecked Sendable {
         return "http=\(http.statusCode) body=\(String(data: data, encoding: .utf8) ?? "")"
     }
 
-    /// POST /device/{deviceId}/nudge {chatId} — wake a cold host to drain the
-    /// command queue.
-    func nudge(deviceId: String, chatId: String) async {
-        guard let token = await currentToken() else { return }
-        var request = URLRequest(url: edgeURL.appending(path: "device/\(deviceId)/nudge"))
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: ["chatId": chatId])
-        _ = try? await URLSession.shared.data(for: request)
-    }
 }

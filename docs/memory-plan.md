@@ -142,3 +142,456 @@ recent chats (PARITY gap) is unchanged.
 - mem-smoke thresholds in CI: engine idle <40MB; stream-retention <3× raw
   text; reopen p95 <100ms; idle creep <1MB/10min.
 - No feel-budget regression (§2), verified per landing PR.
+
+## 9. Crew 0.1.67 performance audit (2026-09-05)
+
+Audit baseline: `ba0511d` on `origin/main`. This pass covers desktop transcript
+rendering, engine/room backpressure and document lifetime, the edge's session
+projection/storage path, and iOS rendering/reconnection/persistence.
+
+### Root causes and fixes
+
+- Desktop animation frames rebuilt the message rail from the whole transcript
+  and searched all rows for every prompt. The rail is now revision-cached, with
+  one row-index map per revision and logarithmic active-tick lookup.
+- Visible markdown rows scanned all blocks just to request one block's
+  highlights. Highlight lookup now receives that block directly. Render-cache
+  invalidation removes a row bucket rather than scanning every settled entry;
+  code-copy closures share the cached source instead of copying it each frame.
+- Incremental markdown discarded its tail with a full-prefix retain scan and
+  copied append deltas. Ordered truncation and borrowed suffixes remove those
+  costs. Structural row retirement now prunes stale entry, parse, and highlight
+  caches while retaining explicitly loaded history.
+- PTY raw output, subscriber queues, and time-only batches were unbounded.
+  Raw queues, event queues, and batch sizes are now bounded, with lossless
+  per-terminal backpressure and cancellation on close. Data-free filesystem
+  invalidation kicks coalesce to one pending notification.
+- Linux file-access notifications could make Git diff capture trigger another
+  capture of its own reads. Read-only access events no longer request capture;
+  close-after-write and mutations still do.
+- Execution-key aliases retained chat documents after canonical eviction/purge
+  and duplicated snapshot/status work. Eviction removes aliases; sweeps visit
+  canonical document handles once.
+- Slow room sends and missing ACKs retained unlimited callback updates/batches.
+  Queue overflow now requests the existing reconnect/VV recovery path. Limits
+  are update-count bounds, not an absolute cap on a single snapshot's bytes.
+- Edge fragment reservations lacked aggregate limits and duplicate-index
+  handling. Per-socket reservations now enforce the existing sync limits and
+  validate complete, exact-size reassembly. Blob size/existence reads use SQL
+  `SUM(length(bytes))`, avoiding payload materialization.
+- Edge tail projection walked unrelated document roots, and continuation
+  joining repeatedly copied all accumulated parts. Projection is now scoped to
+  messages/metadata and joining appends into one owned output array.
+- iOS numeric highlighting could loop forever on numerals outside its
+  continuation predicate. It now always advances. Token recoloring walks
+  character indices monotonically rather than rebuilding every prefix.
+- iOS reconnect callbacks could schedule duplicate sockets; obsolete batch IDs
+  retained payloads after reconnect. Generation-checked redial is single-flight
+  and resubmission derives missing operations from the durable document VV.
+- iOS snapshot debounce created a sleeper for every update, and pruning
+  protected the obsolete `ws3_` prefix. Each saver now keeps one sleeper and
+  pruning preserves current `ws4_` workspace snapshots. Retired mobile parse
+  caches are pruned by live part keys.
+
+### Measured evidence
+
+Local optimized microbenchmarks, best of five; identical old/new Loro outputs
+were asserted. These measure the named operations, not end-to-end latency.
+
+| Scenario | Baseline | Fixed |
+| --- | ---: | ---: |
+| Join 1,000 continuations | 4.565 ms | 0.107 ms |
+| Join 4,000 continuations | 28.423 ms | 0.135 ms |
+| Join 10,000 continuations | 258.059 ms | 0.657 ms |
+| Tail with unrelated 8 MB root | 2.566 ms | 0.023 ms |
+| iOS Unicode numeral highlighting | Exceeded 1.5 s deadline | Three fixtures in 11.1 ms |
+
+Actual SQLite smoke covered missing, empty, multi-chunk 4.5 MB, and deleted
+blobs. The iOS lifecycle smoke used the real Swift Loro client against a local
+WebSocket endpoint: eight evictions with lost ACKs produced one socket at a
+time, full durable convergence, and no redial after stop. Trailing persistence,
+immediate flush, absence of a delayed duplicate save, and workspace retention
+beside 81 newer snapshots passed.
+
+The optimized iOS simulator benchmark built 5,000 transcript rows in 45.06 ms
+cold and 2.07 ms warm, with 24.80 ms off-main entry decode. The 120-turn demo
+rendered the streaming reply, allowed history scrolling, and returned to the
+tail through its jump control. These are current-path measurements, not a
+before/after claim for this release.
+
+Release validation passed 707 Rust library tests, 17 terminal/diff integration
+tests, 93 Edge tests, and 18 release-workflow/runtime-guard tests. The real local
+Edge/Rust collaboration smoke covered authenticated relay, reconnect, forged-
+actor rejection, and revocation. A real PTY firehose delivered all 64 MiB in
+order after a stalled subscriber resumed; another terminal stayed responsive,
+and closing the stalled terminal took 154 microseconds. The candidate desktop
+app passed composer-send, rendered-reply/code, and history-scroll smoke checks.
+Production and staging iOS simulator builds both rendered the large transcript.
+
+Typechecking was intentionally not run: global agent instructions prohibit it.
+The normal `main` deployment workflow retains its Typecheck step. This release
+uses a temporary deployment branch omitting that step, while retaining Rust
+build, real collaboration smoke, Edge tests, and immutable-candidate checks.
+
+### Staging workspace persistence repair
+
+The subsequent official desktop cutover exposed a separate device-discovery
+failure: the device relay was connected, but workspace requests returned HTTP
+500 with `SQLITE_TOOBIG`. Full workspace backfills could exceed SQLite's
+approximately 2 MB value limit before the normal post-insert compaction ran.
+Oversized pending updates now persist the merged document through the existing
+chunked snapshot store. Smaller updates retain the incremental log path; no
+workspace reset or history deletion is required.
+
+The regression failed with the original SQLite error before the fix. All 94
+Edge tests then passed. A real local Worker persisted a 2,100,000-byte payload
+and recovered identical bytes after a process restart. The installed official
+desktop binary also passed authenticated collaboration, reconnect, forged-actor
+rejection, and revocation smoke checks.
+
+The staging-only deployment is Worker version
+`d49376e2-3ad0-42cb-899f-ae25633e9cb4`, from source commit `d658daf`.
+A fresh authenticated cloud client verified the preserved desktop device ID,
+version 0.1.67, all 27 expected unarchived sessions, and a 3.9-second-old
+presence heartbeat. Workspace stats returned HTTP 200 with a 692,129-byte
+snapshot and 13 ms cold replay. Physical-phone UI visibility was not inspected.
+
+### Corrective staging release: desktop 0.1.68 and iOS 1.0 (3)
+
+Oversized persistence now also preserves writes accepted while snapshot storage
+is awaiting completion. Compaction folds the document before exporting and
+retains force-trimming behavior. The concurrency regression failed before the
+fix; all 95 Edge tests passed afterward. A real Worker compacted a 2.1 MB
+historical overwrite to 323 bytes and recovered it after a process restart.
+Staging Worker version `1fd8be1e-7f6f-45ee-927d-344249fa96f5` uses source
+`ad95509`; production was not changed by this corrective deployment.
+
+The blank mobile transcript was a routing error, not a rendering failure.
+iOS supplied the project scope as a fallback deployment ID, opening a separate
+empty room for an ordinary desktop session. The affected session had 46
+messages in its correct room and none in the fallback namespace. AppConfig now
+adds a deployment ID only when one is explicitly supplied, preserving actual
+Scaffold deployment scopes.
+
+Both desktop and iOS hide spaces without unarchived sessions. Obsolete desktop
+pinning exceptions were removed. The user's authorized cleanup consolidated 20
+duplicate spaces across seven paths, moving 52 archived sessions before deleting
+their empty source spaces. All 699 stored session rows and all 27 unarchived
+sessions were preserved. The two occupied spaces contain 24 and three
+unarchived sessions; unused unique spaces remain stored but hidden.
+
+Native verification rendered the affected session's actual 46-message snapshot
+in an isolated iOS simulator backed by a local Worker. Both the native iOS
+sidebar and the desktop viewport attached to the live engine showed only
+`ashler-platform` and `ashler-comet`. All 525 Rust UI library tests passed;
+the desktop executable, staging simulator app, and staging iOS archive built
+successfully. TestFlight accepted staging 1.0 (3) for the existing internal
+tester group. Physical-phone installation and rendering were not inspected.
+Typechecking was intentionally not run because global instructions prohibit it.
+
+Official desktop release run
+[`33988484041`](https://github.com/Ashler-AI/comet/actions/runs/33988484041)
+successfully published staging 0.1.68 from `15cf6d7`. Both artifact checksums
+and the app signature verified; the installed executable matched the official
+artifact byte-for-byte. Its native viewport rendered the live transcript and
+only the two occupied spaces. The obsolete window and debug viewport were
+closed, while the existing 0.1.67 engine deliberately remained running so the
+active agent turn was not interrupted. No new workspace reconnects occurred
+during the UI cutover.
+
+The simulator retained readable transcript content across a local Worker
+process restart, with both workspace and affected-session sockets rejoining.
+The isolated app installation, Worker state, and throwaway probe were removed
+after verification. Rollback bundles and the pre-cleanup workspace snapshot
+remain under `~/Library/Application Support/Crew Migration Backups/`.
+
+#### Archived-history availability and authorization follow-up
+
+The 699 count refers to workspace session records, not a guarantee that every
+historical transcript is cached locally. Per-user membership filtering excludes
+117 archived records from the 582-row view. In both the live principal-scoped
+DocsStore and the pre-cutover backup, 24 of those records have nonempty decoded
+transcripts, 17 have valid snapshots without messages, and 76 have no snapshot.
+All 41 existing snapshots are byte-identical to their pre-cutover copies; none
+is backup-only. No matching journals were found in the principal-scoped or
+legacy staging project directories, and none of the 41 snapshots contains an
+ownership publication. Cloud transcript availability for these historical
+records was not verified. Unarchiving alone does not create the missing
+per-user membership; recovery must use the existing authorized session-ID or
+invitation flow rather than bypassing the ownership boundary.
+
+Follow-up review found an authorization-ordering race: document materialization
+could yield after the socket's final authority check. Update and join handlers
+now materialize first, authorize last, reject closed/reset sockets, and use only
+the current live document after that await. This also avoids retaining a
+document freed by concurrent compaction. The compaction regression now asserts
+that its persistence barrier was actually entered instead of allowing a
+sequential run to pass.
+
+The revocation regression failed against the pre-fix implementation. All 102
+Edge tests passed with the final guards, including trim, idle release, and
+reset/rematerialization interleavings. The real local Worker/official-desktop
+collaboration smoke also passed authentication, relay, reconnect, forged-actor
+rejection, and active revocation.
+
+The final guard deployment is staging Worker
+`52fd8306-d242-4639-84ac-e29322fdfc26`, from `e83a5d7`. The installed official
+desktop's live sync command confirmed the workspace and open chat rooms
+connected after rollout, with zero full resyncs. The existing engine process
+was not restarted. The recovery audit also confirmed that all 610 pre-cutover
+DocsStore snapshot IDs remain present in the live store.
+
+### Mobile command and desktop latency corrections
+
+The phone's ordinary-session sender wrote command-ledger entries directly,
+without the host-local admission record required to drain them. Commands now
+go through `QueueCommand` on the actual host; Scaffold commands retain their
+verified controller route. Admission/transport failures remove only the
+matching optimistic send, expose the error, and restore its draft.
+
+Native verification also caught a creation-ordering defect: directly writing
+a chat row did not establish the host's principal-scoped session membership.
+Creation now awaits the host's authenticated `Mutate:createChat` before local
+echo or sending. No ownership check was relaxed. A real iOS simulator, local
+Worker, and Rust mock host completed both the initial command and a second
+command to that existing session, producing four transcript entries.
+
+The desktop's eager sidebar layout constructed and shaped offscreen rows on
+every redraw. Rows now retain their existing geometry and scroll container
+while constructing content only when intersecting the clip. Native session
+selection and history scrolling rendered correctly. Cold document reads are
+offloaded from the RPC dispatch loop, and command ancestry/duplicate lookup
+no longer materializes the entire transcript.
+
+A throwaway dev-profile smoke with 500 messages / approximately 4 MiB verified
+raw continuation ancestry and torn-row duplicate semantics. Fifty old-style
+full-transcript ancestry lookups took 261.301 ms; fifty narrow lookups took
+216.375 microseconds. These are document-operation timings, not end-to-end
+send or session-open latency. The changed Rust library suites passed 741 tests.
+The actual Swift room client also received fresh staging status updates;
+an initial transient stale interval was not treated as proof of a persistent
+decoder or delivery defect. Unsupported timestamp compatibility code was
+removed rather than retained as a speculative fix.
+
+The final native two-turn smoke completed with four transcript entries.
+During a separately paced live turn, the phone rendered streaming content and
+`Riffing... 1s`; its session list showed an explicit `Running` label while a
+desktop-submitted command streamed. The desktop composer cleared and the
+captured response showed `Pondering... 1s`. These are observed UI states, not
+latency percentiles.
+
+Official release run
+[`33996352949`](https://github.com/Ashler-AI/comet/actions/runs/33996352949)
+published staging desktop **0.1.69** from `fe64931`. Artifact checksums and the
+installed executable matched; the app's ad-hoc signature verified. The
+repository's unnotarized packaging fails Gatekeeper assessment. Installation
+through the existing internal staging launcher received explicit user approval;
+no system-wide trust setting was changed.
+
+The installed viewport rendered populated session history and navigation.
+The old engine unexpectedly exited during the separately targeted viewport
+shutdown; this was reported as a process-isolation anomaly. The new embedded
+0.1.69 engine recovered two journals: one resumed and reported `working`,
+while the other reported `errored` because its original OMP writer remained
+active. The user explicitly chose to leave that writer running. This cutover
+is **not** claimed to have been uninterrupted.
+
+Staging iOS **1.0 (4)** archived successfully and App Store Connect accepted
+its cloud-signed upload. After web authentication became available, App Store
+Connect showed all four builds in the internal group and confirmed that its
+tester had installed **1.0 (4)**. No additional invitation was needed. Physical
+phone interactions were not directly inspected.
+
+Owned simulator, mock-host, Worker, copied-source, and profiling fixtures were
+removed. Final archives, rollback bundles, UI screenshots, the two-turn log,
+and recovery receipt are retained in the private `latency-0.1.69` directory
+under `~/Library/Application Support/Crew Migration Backups/20260905-staging/`.
+
+Typechecking was intentionally not run because global instructions prohibit it.
+
+### Sidebar sizing and trailing controls follow-up
+
+Deferred card layout exposed an implicit parent-stretch assumption: the
+rendered card root did not request the full available width. Active cards
+and the settled opacity wrapper now explicitly fill their fixed-height slots.
+The existing clip-aware construction and scroll geometry remain intact.
+
+Status indicators and settle actions share a trailing slot with an 18px
+minimum width. The hover overlay no longer crowds a long folder label.
+In the native desktop smoke, short and long cards had matching dimensions;
+clicking the relocated settle button moved only its fixture into Settled,
+preserved the selected Short session, and retained full-width settled rows.
+
+A freshly built native iOS simulator showed consistent rows and the live
+`Running` label. Its initial and existing-session commands both completed,
+producing four transcript entries; desktop settlement also removed that
+fixture from the phone's active list. The mock host deliberately paced its
+output, so these runs are behavior checks rather than latency measurements.
+No iOS source change is required for this desktop-only layout correction.
+
+Official release run
+[`34005890849`](https://github.com/Ashler-AI/comet/actions/runs/34005890849)
+published staging desktop **0.1.70** from `0b1abdf`. Both artifact checksums,
+the installed executable comparison, and the ad-hoc signature verified.
+The user approved the internal build's installation. The new viewport
+connected to the already-running 0.1.69 engine; its old window was minimized,
+not closed. The engine retained the same PID and device identity throughout
+this handover. The surviving OMP writer was not taken over.
+
+The actual installed viewport rendered equal-width cards and the trailing
+status rail. Official artifacts, screenshots, the TestFlight installation
+receipt, and the native two-turn log are retained in the private
+`sidebar-0.1.70` directory beside the earlier release evidence.
+
+### Staging mobile cached-history recovery and harness launch
+
+The reported staging 1.0 (4) failure was reproduced with a preserved old
+workspace cache against the live staging room. Server history had been
+compacted past the cache's version vector. Loro accepted incoming bytes but
+reported pending dependencies; the phone treated that as successful progress.
+Importing a full snapshot into the same stale replica also remained pending.
+This was not fixed by changing heartbeat cadence or restarting the host.
+
+The edge now checks coverage of the retained-history floor before choosing an
+incremental join backfill, including after a regular snapshot rematerializes a
+shallow document. The mobile client validates a full snapshot in a fresh replica,
+preserves recoverable local operations, and atomically adopts it across the room,
+store subscriptions, projection, and disk saver. Disjoint nested-map edits,
+deletions, and already-satisfied writes survive dependency gaps. Diverged values
+or unsupported container changes fail closed with the old data preserved.
+
+A read-only native probe recovered the original stale workspace cache and
+continued receiving live updates. Native safety scenarios preserved both early
+and late offline edits, reloaded the recovered cache, and rejected corrupt,
+truncated, and update-only replacement payloads. Separate nested-map, deletion,
+same-value, conflicting-value, and new-container cases passed. The integrated
+edge suite passed **104 tests in 15 files**, including stale versus covered
+clients after compacted-room rematerialization.
+
+Mobile harness selection now uses the selected host's `ListHarnesses` and
+`ListModels` results. The actual simulator exposed Claude Code, Codex, OMP, and
+Prime Agent, loaded OMP's 540-model catalog, and completed initial and subsequent
+real OMP commands with transcript entries. Large catalogs use lazy rows and
+search; fetch failures remain visible and retryable. Scaffold stays OMP-only.
+
+Staging **1.0 (5)** archived and its cloud-signed TestFlight upload succeeded.
+App Store Connect confirmed its assignment to **Ashler Internal** and installation
+by `zhenchristopher@gmail.com` on the registered iPhone. Physical phone behavior
+was not directly inspected.
+
+Deployment run
+[`34036591243`](https://github.com/Ashler-AI/comet/actions/runs/34036591243)
+published staging Worker **72172176-7ac9-4e6f-ab27-3c73324bb4a5** from `b3d4a3d`.
+Against that deployment, the original cached native replica recovered once,
+materialized 702 chats and 592 session rows, and stayed connected while fresh
+remote updates advanced from two to five over the 21-second observation.
+
+CI also exposed recursive assertion overhead on a 2.1 MB binary regression
+fixture. The assertion now compares every byte using the native buffer comparator
+without traversing millions of JavaScript indices; its timeout and payload
+boundary are unchanged. All 104 edge tests passed locally and in CI.
+
+The accepted archive, native OMP log, model-picker and installation screenshots,
+original cache, deployment log, exact deployed source archive, and release receipt are retained in the private
+`mobile-recovery-1.0.5` directory beside the earlier release evidence.
+
+Typechecking was intentionally not run locally or in CI: the global prohibition
+includes CI jobs. Run `34036591243` used the deployment-only branch
+`deploy/staging-mobile-recovery-no-typecheck-20260906`, whose workflow removed
+the `Typecheck` step. That workflow change was not merged into `main`; the
+workflow on `main` is unchanged. The real Rust/Edge collaboration smoke, binding
+generation checks, all 104 edge tests, and sealed-candidate deployment still ran.
+The one-off remote branch was deleted after preserving commit `b3d4a3d` in
+`deployment-source.tar` alongside the release evidence.
+
+### Coordinated Scaffold and mobile release (2026-09-06)
+
+Crew 0.1.71 preserves the managed-worktree draft fix after rebasing onto current
+`main` and integrates the source of the previously distributed staging mobile
+build 6. [Candidate run 34044550324](https://github.com/Ashler-AI/comet/actions/runs/34044550324)
+built macOS and both Linux architectures from `8667124`.
+[Promotion run 34045163805](https://github.com/Ashler-AI/comet/actions/runs/34045163805)
+reused those exact bytes for both staging and production desktop/Scaffold feeds.
+
+[Edge deployment 34045152900](https://github.com/Ashler-AI/comet/actions/runs/34045152900)
+deployed the same sealed candidate to staging
+`0e6198e1-ed06-49d0-a6d7-285d7c2fc24a` and production
+`09e9eb8c-e780-41ce-bbd6-f5bbb7d166a3`. The deployment-only source `ca559fa`
+omits the prohibited typecheck without changing `main`'s workflow. All 104 edge
+tests and the real Rust/Edge collaboration smoke passed. Both native overlapping
+send admission and unresolved worktree-base regressions passed.
+
+A fresh native Scaffold launch exposed `runtime_unreachable` in
+`write_omp_inference_access`: the managed proxy override used the non-resolving
+bare canary domain. Removing that override through Infisical and rolling the
+provider restored SDK-generated per-sandbox routing. A new sandbox became ready,
+completed a real OMP command, and produced the identical transcript on two
+independent authorized Crew engines. The second client continued the same session
+and recovered identical history after its engine restarted. The wrong model
+namespace in the initial diagnostic RPC was rejected; the supported
+`openai-codex/gpt-6-astra` binding completed normally.
+
+A second fresh sandbox received the immutable 0.1.71 Linux artifact through a
+scoped upload before its first engine attach. The uploaded binary and running
+`/proc/<pid>/exe` both matched SHA-256
+`ea8253d6ffa805eba2926fc7361226aae030766ce9ff0d82e5e2e4e01eb9b136`.
+That engine returned `CREW_0_1_71_RELEASE_OK` through the shared DO to both
+clients. This proves the released engine in a real sandbox, not an updated fleet
+template; the existing image manifest was deliberately left unchanged.
+
+The exact published macOS application archive matched SHA-256
+`be317df5b7c3d402f227d783fe2bba6b39f1ee23e421207b35104e6ef823e957`.
+Its native UI opened the shared transcript and composer without any local spaces,
+showing both the release reply and `CREW_0_1_71_CONTINUATION_OK`. An apparent
+onboarding failure was traced to per-window automation input not landing;
+focused desktop input worked. No new rendering patch or replacement release
+was required.
+
+TestFlight processed production **1.0 (4)** and staging **1.0 (7)** and assigned
+both to **Ashler Internal**. The production tester still needs to accept the
+invitation. The simulator rendered the login surface; authenticated mobile UI
+verification awaits system sign-in consent. No physical installation is claimed.
+
+Scaffold's future Crew version/digest pins now select 0.1.71, but its deployed
+template still contains 0.1.64. [Platform PR 5838](https://github.com/Ashler-AI/ashler-platform/pull/5838)
+contains the permanent direct-routing fix and is queued for squash merge after
+independent review. A pre-existing failed staging deployment, run 34043670364,
+retains its immutable attestation after activation and rollback were denied.
+It was not deleted or bypassed. The full session-image build also invokes a
+typecheck cache builder; that workflow was not dispatched. Completing the full
+Scaffold rollout requires those release prerequisites, not just updated pins.
+
+PR 5838 also migrates existing Infisical `proxy-url` values explicitly: omission
+from a dotenv upsert does not delete a remote key. Eleven focused executable
+bootstrap/capacity regressions passed, including lookup/deletion recovery without
+reseeding. The exact live path exposes only the required four direct-routing
+keys. The script retains credentials on a migration failure and is idempotent
+when the legacy key is already absent.
+Capacity coverage executes the quota plan and validates the workflow's
+10-vCPU/16-GiB profile; unsupported odd template CPU counts are rejected before
+provisioning. The tier fixture refuses execution while the seed tunnel is open.
+The bootstrap requires `jq` before creating recovery state or mutating remote
+credentials; a missing-parser regression confirms that boundary.
+
+Release receipts, source archives, signed iOS archives, and the exact-release
+native screenshot are retained under
+`~/Library/Application Support/Crew Migration Backups/20260905-staging/coordinated-0.1.71/`.
+Both smoke sandboxes are paused with history retained; isolated native clients
+were stopped and their copied session credential was removed. Four focused
+managed-secret projection tests also passed.
+
+### Limits of this audit
+
+A three-second sample of the already-running desktop process showed a 1.2 GB
+physical footprint (2.1 GB peak); `vmmap` attributed 944.5 MB of swapped memory
+to IOAccelerator regions. That GPU high-water observation is **not attributed
+to or claimed fixed by this pass**. The older process was an active session,
+not a controlled idle baseline. The isolated two-turn candidate smoke reported
+60.5 MB Metal device allocation, a 1 MB atlas, and one 2 MB instance-pool buffer.
+That small workload is not comparable to the user's active session. The
+eight-hour residency acceptance criteria above remain unmeasured.
+
+Source-visible costs still needing workload attribution include whole-live-
+reply display-tree construction, very large individual code blocks, Mermaid
+layout, and collaboration/command-ledger projection. No arbitrary eviction or
+notification-cadence change was introduced to hide those costs.

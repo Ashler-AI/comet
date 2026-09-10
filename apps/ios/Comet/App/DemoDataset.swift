@@ -9,10 +9,11 @@ import Observation
 @MainActor
 @Observable
 final class DemoDataset {
-    var devices: [DeviceRow]
-    var spaces: [Space]
-    var chats: [Chat]
+    var devices: [DeviceRow] { didSet { rebuildLists() } }
+    var spaces: [Space] { didSet { rebuildLists() } }
+    var chats: [Chat] { didSet { rebuildLists() } }
     var sessions: [String: SessionRow]
+    private(set) var lists = WorkspaceLists()
     private var stores: [String: SessionStore] = [:]
     private var streamTask: Task<Void, Never>?
 
@@ -25,7 +26,16 @@ final class DemoDataset {
         self.spaces = spaces
         self.chats = chats
         self.sessions = sessions
+        rebuildLists()
     }
+
+    private func rebuildLists() {
+        let next = WorkspaceLists(devices: devices, spaces: spaces, chats: chats)
+        if lists != next { lists = next }
+    }
+
+    var overviewChats: [Chat] { lists.overviewChats }
+    var settledChats: [Chat] { lists.settledChats }
 
     static func standard() -> DemoDataset {
         let now = nowMs()
@@ -51,22 +61,41 @@ final class DemoDataset {
                  branch: "veil-fade", checkoutId: nil,
                  config: claude, lastMessagePreview: "Porting the paint-only fade…",
                  lastMessageAt: now - 40_000, createdAt: now - 3_600_000,
+                 harnessSessionId: "native-veil", harnessSessionCwd: comet.path,
                  spaceId: comet.id, lastSeenAt: now),
             Chat(id: "chat-picker", deviceId: "dev-mac", title: "Model picker catalog sync",
                  archived: false, cwd: comet.path, branch: "main", checkoutId: nil,
                  config: claude, lastMessagePreview: "Which device owns the catalog?",
                  lastMessageAt: now - 120_000, createdAt: now - 7_200_000,
+                 harnessSessionId: "native-picker", harnessSessionCwd: comet.path,
                  spaceId: comet.id, lastSeenAt: now - 130_000),
             Chat(id: "chat-tabs", deviceId: "dev-mac", title: "Tool group header colors",
                  archived: false, cwd: comet.path, branch: "main", checkoutId: nil,
                  config: codex, lastMessagePreview: "Done — failed children stay quiet.",
                  lastMessageAt: now - 900_000, createdAt: now - 86_400_000,
+                 harnessSessionId: "native-tabs", harnessSessionCwd: comet.path,
                  spaceId: comet.id, lastSeenAt: now - 3_600_000),
             Chat(id: "chat-deploy", deviceId: "dev-vps", title: "Wrangler deploy hygiene",
                  archived: false, cwd: edge.path, branch: nil, checkoutId: nil,
                  config: claude, lastMessagePreview: "Hibernation-safe flush timer",
                  lastMessageAt: now - 86_400_000, createdAt: now - 86_400_000 * 2,
+                 harnessSessionId: "native-deploy", harnessSessionCwd: edge.path,
                  spaceId: edge.id, lastSeenAt: now - 86_400_000),
+            Chat(id: "chat-detached", deviceId: "dev-mac", title: "Crew session without a space",
+                 archived: false, cwd: "/tmp", branch: nil, checkoutId: nil,
+                 config: codex, lastMessagePreview: nil,
+                 lastMessageAt: now - 86_400_000 * 2, createdAt: now - 86_400_000 * 3,
+                 spaceId: nil, lastSeenAt: now),
+            Chat(id: "chat-missing-space", deviceId: "dev-vps", title: "Crew session from a missing space",
+                 archived: false, cwd: "/srv/previous-workspace", branch: nil, checkoutId: nil,
+                 config: claude, lastMessagePreview: nil,
+                 lastMessageAt: now - 86_400_000 * 3, createdAt: now - 86_400_000 * 4,
+                 spaceId: "space-missing", lastSeenAt: now),
+            Chat(id: "chat-archived", deviceId: "dev-mac", title: "Crew archived session",
+                 archived: true, cwd: comet.path, branch: nil, checkoutId: nil,
+                 config: codex, lastMessagePreview: nil,
+                 lastMessageAt: now - 86_400_000 * 4, createdAt: now - 86_400_000 * 5,
+                 spaceId: comet.id, lastSeenAt: now),
         ]
         let sessions: [String: SessionRow] = [
             "chat-veil": SessionRow(chatId: "chat-veil", deviceId: "dev-mac", status: .working,

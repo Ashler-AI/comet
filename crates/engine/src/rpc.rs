@@ -86,6 +86,7 @@ use crate::terminals::Terminals;
 use crate::uploads::Uploads;
 use crate::workspace_host::WorkspaceHost;
 
+mod scaffold_session;
 const FILE_SEARCH_RPC_TIMEOUT: Duration = Duration::from_secs(6);
 const WORKTREE_CREATE_RPC_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const SCAFFOLD_OWNER_ROOM_READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -141,6 +142,15 @@ struct CancelChatStartupParams {
 struct ReadDocMessagesParams {
     chat_id: String,
     before: usize,
+    #[serde(default)]
+    room_projection: Option<SessionRoomProjection>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadDocMessageParams {
+    chat_id: String,
+    message_id: String,
     #[serde(default)]
     room_projection: Option<SessionRoomProjection>,
 }
@@ -212,6 +222,8 @@ struct QueueCommandParams {
     command: SessionCommandPayload,
     #[serde(default)]
     command_id: Option<String>,
+    #[serde(default)]
+    preparation_generation: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1191,6 +1203,7 @@ fn forwardable(method: &str) -> bool {
             | methods::TAKE_OVER_OMP_SESSION
             | methods::WATCH_DOC_MESSAGES
             | methods::READ_DOC_MESSAGES
+            | methods::READ_DOC_MESSAGE
             | "WatchCollaboration"
             // Repos/worktrees/folders are device-local filesystem state.
             | methods::LIST_REPOS
@@ -1730,6 +1743,14 @@ impl RpcService for EngineRpc {
             }
             methods::QUEUE_COMMAND => {
                 let p: QueueCommandParams = parse_params(params)?;
+                let starts_session = matches!(&p.command, SessionCommandPayload::Run { .. })
+                    || matches!(&p.command, SessionCommandPayload::Control { action, .. }
+                        if matches!(action.as_ref(), comet_doc::SessionControlAction::Start { .. }));
+                let mut startup = if starts_session {
+                    scaffold_session::PreparationOutcome::for_command(
+                        self, &p.chat_id, p.preparation_generation.as_deref(),
+                    )?
+                } else { None };
                 let activates_chat = match &p.command {
                     SessionCommandPayload::Run { .. }
                     | SessionCommandPayload::Steer { .. }
@@ -1751,6 +1772,7 @@ impl RpcService for EngineRpc {
                     self.doc_host.queue_command(&p.chat_id, p.command)
                 }
                 .map_err(|e| RpcError::Failed(e.to_string()))?;
+                if let Some(startup) = startup.as_mut() { startup.admitted(&command_id)?; }
                 if activates_chat {
                     self.workspace
                         .set_chat_archived(&p.chat_id, false)
@@ -1965,35 +1987,61 @@ impl RpcService for EngineRpc {
             }
             methods::READ_DOC_MESSAGES => {
                 let p: ReadDocMessagesParams = parse_params(params)?;
-                let handle = self
-                    .doc_host
-                    .open_projection(&p.chat_id, p.room_projection.as_ref())
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                let page = handle
-                    .doc()
-                    .read_entry_window(Some(p.before), comet_doc::TAIL_MESSAGE_COUNT)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let doc_host = self.doc_host.clone();
+                let page = tokio::task::spawn_blocking(move || {
+                    let handle =
+                        doc_host.open_projection(&p.chat_id, p.room_projection.as_ref())?;
+                    handle
+                        .doc()
+                        .read_entry_window(Some(p.before), comet_doc::TAIL_MESSAGE_COUNT)
+                        .map_err(crate::EngineError::from)
+                })
+                .await
+                .map_err(|e| RpcError::Failed(format!("transcript read task failed: {e}")))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&page)
+            }
+            methods::READ_DOC_MESSAGE => {
+                let p: ReadDocMessageParams = parse_params(params)?;
+                let doc_host = self.doc_host.clone();
+                let entry = tokio::task::spawn_blocking(move || {
+                    let handle = doc_host.open_projection(&p.chat_id, p.room_projection.as_ref())?;
+                    handle.doc().read_message(&p.message_id).map_err(crate::EngineError::from)
+                })
+                .await
+                .map_err(|e| RpcError::Failed(format!("message read task failed: {e}")))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .ok_or_else(|| RpcError::Failed("message_not_found".into()))?;
+                RpcReply::value(&entry)
             }
             methods::WATCH_DOC_MESSAGES => {
                 let p: ChatParams = parse_params(params)?;
-                let handle = self
-                    .doc_host
-                    .open_projection(&p.chat_id, p.room_projection.as_ref())
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                Ok(RpcReply::Stream(doc_messages_stream(
-                    handle.watch_messages(),
-                )))
+                // Snapshot import and the first tail projection are synchronous
+                // Loro work. Keep cold opens off the interactive RPC workers.
+                let doc_host = self.doc_host.clone();
+                let messages = tokio::task::spawn_blocking(move || {
+                    let handle =
+                        doc_host.open_projection(&p.chat_id, p.room_projection.as_ref())?;
+                    Ok::<_, crate::EngineError>(handle.watch_messages())
+                })
+                .await
+                .map_err(|e| RpcError::Failed(format!("transcript watch task failed: {e}")))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                Ok(RpcReply::Stream(doc_messages_stream(messages)))
             }
             "WatchCollaboration" => {
                 let p: ChatParams = parse_params(params)?;
-                let handle = self
-                    .doc_host
-                    .open_projection(&p.chat_id, p.room_projection.as_ref())
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                let doc = handle.doc_arc();
+                let doc_host = self.doc_host.clone();
+                let projection = p.room_projection.clone();
+                let (messages, doc) = tokio::task::spawn_blocking(move || {
+                    let handle = doc_host.open_projection(&p.chat_id, projection.as_ref())?;
+                    Ok::<_, crate::EngineError>((handle.watch_messages(), handle.doc_arc()))
+                })
+                .await
+                .map_err(|e| RpcError::Failed(format!("collaboration watch task failed: {e}")))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
                 Ok(RpcReply::Stream(collaboration_stream(
-                    handle.watch_messages(),
+                    messages,
                     self.doc_host.watch_authority(),
                     doc,
                     self.doc_host.clone(),
@@ -2082,41 +2130,26 @@ impl RpcService for EngineRpc {
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
                 RpcReply::value(&snapshot)
             }
+            methods::HANDOFF_SESSION_TO_SCAFFOLD => {
+                let p = parse_params(params)?;
+                RpcReply::value(&self.handoff_session_to_scaffold(p).await?)
+            }
+            methods::PREPARE_SCAFFOLD_SESSION => {
+                let p = parse_params(params)?;
+                RpcReply::value(&self.prepare_scaffold_session(p).await?)
+            }
+            methods::REPORT_SCAFFOLD_PREPARATION_FAILURE => {
+                let p: comet_rpc::ReportScaffoldPreparationFailureParams = parse_params(params)?;
+                self.workspace.report_scaffold_preparation_failure(&p.chat_id, &p.generation)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "reported": true }))
+            }
             methods::CONTROL_SCAFFOLD_ENVIRONMENT => {
                 let control: ScaffoldEnvironmentControl = parse_params(params)?;
                 let cancellation = comet_harness::CancellationToken::new();
-                let scaffold = self.scaffold()?;
-                let owner_room = self.prepare_scaffold_attach(&control)?;
-                self.await_scaffold_owner_room(owner_room.as_deref(), &cancellation)
+                let result = self
+                    .control_scaffold_environment(control, &cancellation)
                     .await?;
-                let result = scaffold
-                    .control(control, &cancellation)
-                    .await
-                    .map_err(|error| RpcError::Failed(error.to_string()))?;
-                if let Some(projection) = result.room_projection.as_ref() {
-                    if result.environment.scope.project_id != projection.project_id
-                        || result.environment.scope.deployment_id.as_deref()
-                            != Some(projection.deployment_id.as_str())
-                        || result.environment.scope.session_id.as_deref()
-                            != Some(projection.session_id.as_str())
-                    {
-                        return Err(RpcError::Failed(
-                            "Scaffold attachment environment projection mismatch".into(),
-                        ));
-                    }
-                    self.workspace
-                        .upsert_session_ref(
-                            &projection.session_id,
-                            Some(result.environment.clone()),
-                        )
-                        .map_err(|error| RpcError::Failed(error.to_string()))?;
-                }
-                if let Err(error) = self.install_scaffold_control_grant(&result) {
-                    tracing::warn!(
-                        error = %error,
-                        "Scaffold attached without local control grant projection"
-                    );
-                }
                 RpcReply::value(&result)
             }
             methods::WATCH_SESSIONS => {

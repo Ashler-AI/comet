@@ -148,7 +148,7 @@ struct InProcessEngine {
     refresh_task: tokio::task::JoinHandle<()>,
     /// Serves this engine to other viewports over the IPC port. `None` when the
     /// port was already taken — the window still works over its own transport.
-    ipc_task: Option<tokio::task::JoinHandle<()>>,
+    ipc_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     client: RpcClient,
 }
 
@@ -164,9 +164,12 @@ impl EngineBackend for InProcessEngine {
         self.boot_task.abort();
         // Stop accepting first: a viewport must not connect midway through the
         // drain and queue work against stores that are closing.
-        if let Some(ipc) = &self.ipc_task {
+        let mut ipc_task = self.ipc_task.lock().await;
+        if let Some(ipc) = ipc_task.take() {
             ipc.abort();
+            let _ = ipc.await;
         }
+        drop(ipc_task);
         if let Some(runtime) = self.runtime.lock().await.take() {
             runtime.shutdown().await;
         }
@@ -278,7 +281,10 @@ impl EngineHandle {
             harness_supervisor_executable: std::env::current_exe().ok().filter(|path| {
                 path.file_stem()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.eq_ignore_ascii_case("comet"))
+                    .is_some_and(|name| {
+                        name.eq_ignore_ascii_case("comet")
+                            || name.eq_ignore_ascii_case("crew-staging")
+                    })
             }),
         };
         let auth = Engine::build_auth(&engine_config).await;
@@ -339,10 +345,20 @@ impl EngineHandle {
                 runtime,
                 boot_task,
                 refresh_task,
-                ipc_task,
+                ipc_task: tokio::sync::Mutex::new(ipc_task),
                 client,
             }),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(service: Arc<dyn RpcService>) -> Self {
+        Self {
+            inner: Arc::new(RemoteEngine {
+                client: memory_client(service),
+                url: "memory://test".into(),
+            }),
+        }
     }
 
     pub fn client(&self) -> &RpcClient {
@@ -381,13 +397,14 @@ pub enum ChatStartupPhase {
     Admitting,
 }
 
-/// A compact transcript-derived label for an imported session. The first user
-/// turn is stable as the conversation grows; blank/tool-only turns keep the
+/// A compact transcript-derived label for an imported session. Peer turns are
+/// never eligible; blank/tool-only ordinary turns keep the
 /// exact-id fallback.
-fn shared_session_preview(entries: &[SessionMessageEntry]) -> Option<String> {
-    let text = entries
+fn shared_session_preview(entries: &[SessionMessageEntry]) -> Option<(String, String)> {
+    let entry = entries
         .iter()
-        .find(|entry| entry.role == MessageRole::User)?
+        .find(|entry| entry.role == MessageRole::User && !entry.is_peer_message())?;
+    let text = entry
         .parts
         .iter()
         .filter_map(|part| match part {
@@ -404,11 +421,12 @@ fn shared_session_preview(entries: &[SessionMessageEntry]) -> Option<String> {
     }
     let mut chars = one_line.chars();
     let preview: String = chars.by_ref().take(48).collect();
-    Some(if chars.next().is_some() {
+    let preview = if chars.next().is_some() {
         format!("{preview}\u{2026}")
     } else {
         preview
-    })
+    };
+    Some((entry.id.clone(), preview))
 }
 
 fn agent_indicator_with_transcript(
@@ -437,7 +455,7 @@ fn agent_indicator_with_transcript(
     }
 }
 
-fn session_ref_fallback(chat_id: &str) -> String {
+pub(crate) fn session_ref_fallback(chat_id: &str) -> String {
     format!("Session {}", chat_id.chars().take(8).collect::<String>())
 }
 
@@ -455,7 +473,7 @@ pub(crate) struct ScaffoldOmpHandoffDraft {
 
 /// A local Comet session selected for Scaffold. The sandbox does not exist
 /// until this session's first prompt is submitted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ScaffoldSessionDraft {
     pub project_id: String,
     pub deployment_id: String,
@@ -494,42 +512,6 @@ pub(crate) struct ScaffoldSessionAttachment {
     pub actor_subject: String,
     pub source_ref: Option<String>,
     pub control_target: ScaffoldControlTarget,
-}
-
-/// Start the staging sandbox without coupling creation to remote Comet
-/// readiness. The composer owns the bounded readiness wait and fails closed.
-pub(crate) async fn create_scaffold_session(
-    handle: &EngineHandle,
-    scope: &CollaborationScope,
-    name: Option<&str>,
-    source_ref: Option<&str>,
-    database_environment: ScaffoldDatabaseEnvironment,
-    agent_route: &AgentRoute,
-) -> Result<(String, CollaborationScope), RpcError> {
-    let create = ScaffoldEnvironmentControl::Create {
-        scope: scope.clone(),
-        name: name.map(str::to_string),
-        source_ref: source_ref.map(str::to_string),
-        region: None,
-        database_environment,
-        agent_route: agent_route.clone(),
-    };
-    let value = handle
-        .client()
-        .call(
-            methods::CONTROL_SCAFFOLD_ENVIRONMENT,
-            serde_json::to_value(create).unwrap_or_default(),
-        )
-        .await?;
-    let created: ScaffoldEnvironmentControlResult =
-        serde_json::from_value(value).map_err(|err| RpcError::Failed(err.to_string()))?;
-    let authoritative_scope = created.environment.scope.clone();
-    let SessionEnvironmentSource::Scaffold { sandbox_id, .. } = created.environment.source else {
-        return Err(RpcError::Failed(
-            "Scaffold returned a local environment".into(),
-        ));
-    };
-    Ok((sandbox_id, authoritative_scope))
 }
 
 /// Read the sandbox lifecycle without opening a session-room projection or
@@ -594,6 +576,14 @@ pub(crate) async fn attach_scaffold_session(
         .await?;
     let attached: ScaffoldEnvironmentControlResult =
         serde_json::from_value(value).map_err(|err| RpcError::Failed(err.to_string()))?;
+    scaffold_session_attachment(attached, sandbox_id, scope)
+}
+
+fn scaffold_session_attachment(
+    attached: ScaffoldEnvironmentControlResult,
+    sandbox_id: &str,
+    scope: CollaborationScope,
+) -> Result<ScaffoldSessionAttachment, RpcError> {
     let environment = attached.environment.clone();
     let source_ref = attached.environment.source_ref.clone();
     let SessionEnvironmentSource::Scaffold {
@@ -665,98 +655,12 @@ pub(crate) async fn attach_scaffold_session(
     })
 }
 
-/// Materialize an authenticated OMP session in an already ready Scaffold host,
-/// rebind it to the remote workspace, and return the native id plus remote cwd
-/// for the first run.
-pub(crate) async fn handoff_omp_session(
-    handle: &EngineHandle,
-    sandbox_id: &str,
-    scope: &CollaborationScope,
-    native_session_id: &str,
-    cwd: &str,
-) -> Result<(String, String), RpcError> {
-    let value = handle
-        .client()
-        .call(
-            methods::CONTROL_SCAFFOLD_ENVIRONMENT,
-            serde_json::to_value(ScaffoldEnvironmentControl::HandoffOmpSession {
-                sandbox_id: sandbox_id.to_string(),
-                scope: scope.clone(),
-                native_session_id: native_session_id.to_string(),
-                cwd: cwd.to_string(),
-            })
-            .unwrap_or_default(),
-        )
-        .await?;
-    let handed_off: ScaffoldEnvironmentControlResult =
-        serde_json::from_value(value).map_err(|err| RpcError::Failed(err.to_string()))?;
-    let SessionEnvironmentSource::Scaffold {
-        sandbox_id: handed_off_sandbox_id,
-        ..
-    } = &handed_off.environment.source
-    else {
-        return Err(RpcError::Failed(
-            "OMP handoff returned a local environment".into(),
-        ));
-    };
-    if handed_off_sandbox_id != sandbox_id || handed_off.environment.scope != *scope {
-        return Err(RpcError::Failed(
-            "OMP handoff returned a different sandbox scope".into(),
-        ));
-    }
-    let projection = handed_off
-        .room_projection
-        .ok_or_else(|| RpcError::Failed("OMP handoff returned no session room".into()))?;
-    if projection.project_id != scope.project_id
-        || Some(projection.deployment_id.as_str()) != scope.deployment_id.as_deref()
-        || Some(projection.session_id.as_str()) != scope.session_id.as_deref()
-    {
-        return Err(RpcError::Failed(
-            "OMP handoff returned a different session room".into(),
-        ));
-    }
-    let native_session_id = handed_off
-        .handoff_native_session_id
-        .filter(|session_id| !session_id.trim().is_empty())
-        .ok_or_else(|| RpcError::Failed("OMP handoff returned no native session id".into()))?;
-    let remote_cwd = handed_off
-        .handoff_cwd
-        .filter(|cwd| !cwd.trim().is_empty())
-        .ok_or_else(|| RpcError::Failed("OMP handoff returned no remote cwd".into()))?;
-    Ok((native_session_id, remote_cwd))
-}
-// Half-second retries match the composer's ten-minute Scaffold readiness budget.
+// Existing-session reconnects retry transient control failures for up to ten minutes.
 const SCAFFOLD_CONTROL_MAX_ATTEMPTS: usize = 1_200;
 #[cfg(not(test))]
 const SCAFFOLD_CONTROL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 #[cfg(test)]
 const SCAFFOLD_CONTROL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
-
-fn is_retryable_scaffold_control_error(error: &RpcError) -> bool {
-    matches!(
-        error,
-        RpcError::Failed(message)
-            if message.contains("scaffold_api_error:500:scaffold_request_rejected")
-                || message.contains("scaffold_api_error:502:scaffold_request_rejected")
-                || message.contains("scaffold_api_error:503:scaffold_request_rejected")
-                || message.contains("scaffold_api_error:504:scaffold_request_rejected")
-                || message.contains(
-                    "scaffold_api_error:404:not_found:Sandbox agent route projection failed",
-                )
-                || message.contains(
-                    "scaffold_api_error:409:sandbox_provider_error:Sandbox lifecycle changed while the operation was in flight",
-                )
-                || message.contains("scaffold_session_owner_room_unavailable")
-                || message.contains(
-                    "scaffold_api_error:404:sandbox_provider_error:E2B sandbox control channel is unavailable",
-                )
-                || (message.contains("scaffold_response_invalid: sandbox ")
-                    && message.contains(" is not ready"))
-                || message.contains(
-                    "Scaffold agent route update returned unavailable lifecycle",
-                )
-    )
-}
 
 async fn retry_scaffold_control_operation<T, Operation, OperationFuture, Wait, WaitFuture>(
     mut operation: Operation,
@@ -774,7 +678,7 @@ where
             Ok(value) => return Ok(value),
             Err(error)
                 if attempt < SCAFFOLD_CONTROL_MAX_ATTEMPTS
-                    && is_retryable_scaffold_control_error(&error) =>
+                    && comet_engine::scaffold::is_retryable_scaffold_control_error(&error) =>
             {
                 attempt += 1;
                 wait(SCAFFOLD_CONTROL_RETRY_DELAY).await;
@@ -938,37 +842,107 @@ where
     .await
 }
 
-/// Create the sandbox and immediately dispatch its supervised Comet bootstrap.
-/// Runtime readiness depends on this attachment, so callers must not wait for
-/// `Ready` before attaching.
-pub(crate) async fn create_and_attach_scaffold_session<Wait, WaitFuture>(
+/// Reports abandoned client-side startup without changing provider readiness.
+/// Ownership moves with the admission future, not with the composer entity.
+pub(crate) struct ScaffoldPreparationGuard {
+    engine: EngineHandle,
+    chat_id: String,
+    generation: String,
+    admitted: bool,
+}
+
+impl ScaffoldPreparationGuard {
+    pub(crate) fn generation(&self) -> &str {
+        &self.generation
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.admitted = true;
+    }
+}
+
+impl Drop for ScaffoldPreparationGuard {
+    fn drop(&mut self) {
+        if !self.admitted
+            && let Err(error) = self.engine.client().notify(
+                methods::REPORT_SCAFFOLD_PREPARATION_FAILURE,
+                serde_json::json!({
+                    "chatId": self.chat_id,
+                    "generation": self.generation,
+                }),
+            )
+        {
+            tracing::warn!(%error, "could not report abandoned Scaffold preparation");
+        }
+    }
+}
+
+/// The engine owns creation, bootstrap/readiness, and native history transfer.
+pub(crate) async fn prepare_scaffold_session(
     handle: &EngineHandle,
     scope: &CollaborationScope,
     name: Option<&str>,
     source_ref: Option<&str>,
     database_environment: ScaffoldDatabaseEnvironment,
     agent_route: &AgentRoute,
-    wait: &Wait,
-) -> Result<(String, ScaffoldSessionAttachment), RpcError>
-where
-    Wait: Fn(std::time::Duration) -> WaitFuture,
-    WaitFuture: Future<Output = ()>,
-{
-    let (sandbox_id, authoritative_scope) = create_scaffold_session(
-        handle,
-        scope,
-        name,
-        source_ref,
-        database_environment,
-        agent_route,
-    )
-    .await?;
-    let attachment = retry_scaffold_control_operation(
-        || attach_scaffold_session(handle, &sandbox_id, authoritative_scope.clone()),
-        wait,
-    )
-    .await?;
-    Ok((sandbox_id, attachment))
+    omp_handoff: Option<&ScaffoldOmpHandoffDraft>,
+) -> Result<(ScaffoldSessionAttachment, Option<String>, Option<String>, ScaffoldPreparationGuard), RpcError> {
+    let value = handle
+        .client()
+        .call_cancellable(
+            methods::PREPARE_SCAFFOLD_SESSION,
+            serde_json::json!({
+                "scope": scope,
+                "name": name,
+                "sourceRef": source_ref,
+                "databaseEnvironment": database_environment,
+                "agentRoute": agent_route,
+                "ompHandoff": omp_handoff.map(|handoff| serde_json::json!({
+                    "nativeSessionId": handoff.native_session_id,
+                    "cwd": handoff.cwd,
+                })),
+            }),
+        )
+        .await?;
+    // Capture the receipt before decoding/validating the remaining response:
+    // malformed attachment or handoff metadata still abandons this generation.
+    let generation = value.get("preparationGeneration")
+        .and_then(serde_json::Value::as_str)
+        .filter(|generation| !generation.is_empty())
+        .ok_or_else(|| RpcError::Failed("Scaffold preparation returned no generation".into()))?;
+    let preparation = ScaffoldPreparationGuard {
+        engine: handle.clone(),
+        chat_id: scope.session_id.clone()
+            .ok_or_else(|| RpcError::Failed("Scaffold preparation has no session identity".into()))?,
+        generation: generation.to_string(),
+        admitted: false,
+    };
+    let result: ScaffoldEnvironmentControlResult =
+        serde_json::from_value(value).map_err(|error| RpcError::Failed(error.to_string()))?;
+    let native_session_id = result.handoff_native_session_id.clone();
+    let cwd = result.handoff_cwd.clone();
+    if omp_handoff.is_some()
+        && (native_session_id
+            .as_deref()
+            .is_none_or(|id| id.trim().is_empty())
+            || cwd.as_deref().is_none_or(|cwd| cwd.trim().is_empty()))
+    {
+        return Err(RpcError::Failed(
+            "Scaffold preparation returned no native session resume identity".into(),
+        ));
+    }
+    let SessionEnvironmentSource::Scaffold { sandbox_id, .. } = &result.environment.source else {
+        return Err(RpcError::Failed(
+            "Scaffold returned a local environment".into(),
+        ));
+    };
+    let sandbox_id = sandbox_id.clone();
+    Ok((
+        scaffold_session_attachment(result, &sandbox_id, scope.clone())?,
+        native_session_id,
+        cwd,
+        preparation,
+    ))
 }
 /// Pause exactly the sandbox attached to a chat. The response must preserve
 /// both physical sandbox identity and logical session scope.
@@ -1108,10 +1082,14 @@ pub struct AppState {
     /// replaces the optimistic row and clears `pending_local_chat_ids`.
     chat_startup_phases: HashMap<String, ChatStartupPhase>,
     pub sessions: Vec<Session>,
+    /// Factual watch publications, independent of UI/heartbeat notifications.
+    pub sessions_revision: u64,
+    /// First frame of each subscription establishes a silent attention baseline.
+    pub sessions_epoch: u64,
     /// Imported session memberships from the workspace `sessionRefs` map.
     pub session_refs: Vec<SessionRef>,
-    /// Transcript-derived labels learned after an imported room has opened.
-    shared_session_previews: HashMap<String, String>,
+    /// Source entry id and label learned after an imported room has opened.
+    shared_session_previews: HashMap<String, (String, String)>,
     /// The space whose tabs fill the main area. Healed by [`Self::apply_spaces`]
     /// when the row vanishes; selecting a chat implies its space.
     pub selected_space: Option<String>,
@@ -1243,6 +1221,8 @@ impl AppState {
             pending_local_chat_ids: HashSet::new(),
             chat_startup_phases: HashMap::new(),
             sessions: Vec::new(),
+            sessions_revision: 0,
+            sessions_epoch: 0,
             session_refs: Vec::new(),
             shared_session_previews: HashMap::new(),
             selected_space: None,
@@ -1297,12 +1277,6 @@ impl AppState {
     // ---- reducers (pure) ----
 
     pub fn apply_chats(&mut self, mut chats: Vec<Chat>) {
-        chats.retain(|chat| {
-            !chat
-                .space_id
-                .as_deref()
-                .is_some_and(|id| id.starts_with(LEGACY_SCAFFOLD_SPACE_ID_PREFIX))
-        });
         // First-send setup may spend seconds materializing a large worktree.
         // Preserve its optimistic row across unrelated watch frames so tabs and
         // the sidebar acknowledge the session immediately. The authoritative
@@ -1368,9 +1342,13 @@ impl AppState {
 
     pub fn apply_sessions(&mut self, sessions: Vec<Session>) {
         self.sessions = sessions;
+        self.sessions_revision = self.sessions_revision.wrapping_add(1);
     }
 
     pub fn apply_scaffold_environments(&mut self, snapshot: ScaffoldEnvironmentSnapshot) {
+        for environment in &snapshot.environments {
+            self.remember_scaffold_route(environment);
+        }
         self.scaffold_environments = snapshot
             .environments
             .into_iter()
@@ -1382,6 +1360,18 @@ impl AppState {
     }
 
     pub fn apply_session_refs(&mut self, mut refs: Vec<SessionRef>) {
+        // Persisted refs seed missing routes. Live snapshots and attachments
+        // refresh them; a later ref notification must not roll back that state.
+        for session_ref in &refs {
+            if let Some(environment) = &session_ref.environment
+                && environment.scope.session_id.as_deref() == Some(session_ref.chat_id.as_str())
+                && !self
+                    .scaffold_control_targets
+                    .contains_key(&session_ref.chat_id)
+            {
+                self.remember_scaffold_route(environment);
+            }
+        }
         refs.sort_by(|a, b| {
             b.added_at
                 .cmp(&a.added_at)
@@ -1389,6 +1379,52 @@ impl AppState {
         });
         self.session_refs = refs;
         self.heal_selected_session();
+    }
+
+    /// Environment snapshots and persisted refs are route hints, not grants.
+    /// The engine still verifies exact room/device authority on every attach.
+    fn remember_scaffold_route(&mut self, environment: &SessionEnvironment) {
+        let Some((project, deployment)) = self.scaffold_scope.as_ref() else {
+            return;
+        };
+        let scope = &environment.scope;
+        let Some(chat_id) = scope.session_id.as_ref() else {
+            return;
+        };
+        if &scope.project_id != project || scope.deployment_id.as_ref() != Some(deployment) {
+            return;
+        }
+        let SessionEnvironmentSource::Scaffold {
+            sandbox_id,
+            lifecycle_epoch,
+            ..
+        } = &environment.source
+        else {
+            return;
+        };
+        self.room_projections.insert(
+            chat_id.clone(),
+            SessionRoomProjection {
+                project_id: project.clone(),
+                deployment_id: deployment.clone(),
+                session_id: chat_id.clone(),
+            },
+        );
+        self.scaffold_control_targets.insert(
+            chat_id.clone(),
+            ScaffoldControlTarget {
+                sandbox_id: sandbox_id.clone(),
+                scope: scope.clone(),
+            },
+        );
+        if let Some(epoch) = lifecycle_epoch {
+            self.scaffold_host_devices.insert(
+                chat_id.clone(),
+                format!("comet-scaffold-{sandbox_id}-e{epoch}"),
+            );
+        }
+        self.scaffold_environments
+            .insert(chat_id.clone(), environment.clone());
     }
 
     fn heal_selected_session(&mut self) {
@@ -1866,6 +1902,11 @@ impl AppState {
         sort_chats(&mut self.chats);
     }
 
+    pub(crate) fn chat_is_pending(&self, chat_id: &str) -> bool {
+        self.pending_local_chat_ids.contains(chat_id)
+            || self.scaffold_session_draft_for_chat(chat_id).is_some()
+    }
+
     pub fn set_chat_startup_phase(&mut self, chat_id: &str, phase: ChatStartupPhase) {
         self.chat_startup_phases.insert(chat_id.to_string(), phase);
     }
@@ -1881,12 +1922,31 @@ impl AppState {
     /// Release a failed first-send reservation after its durable chat and any
     /// managed checkout have been rolled back.
     pub fn cancel_pending_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        if self
+            .pending_scaffold_session
+            .as_ref()
+            .is_some_and(|draft| draft.chat_id == chat_id)
+        {
+            self.pending_scaffold_session = None;
+            self.scaffold_session_error = None;
+            self.scaffold_starting_chats.remove(chat_id);
+        }
         self.pending_local_chat_ids.remove(chat_id);
         self.chat_startup_phases.remove(chat_id);
         self.chats.retain(|chat| chat.id != chat_id);
         if self.selected_chat.as_deref() == Some(chat_id) {
             self.select_chat(None, cx);
         }
+    }
+
+    pub(crate) fn cancel_unaccepted_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        if self.scaffold_control_targets.contains_key(chat_id)
+            || (self.scaffold_session_error.is_some()
+                && self.scaffold_session_draft_for_chat(chat_id).is_some())
+        {
+            return;
+        }
+        self.cancel_pending_chat(chat_id, cx);
     }
 
     /// Drop an echo (send failed — the prompt returns to the draft).
@@ -1914,14 +1974,25 @@ impl AppState {
         let Some(chat_id) = self.selected_chat.as_deref() else {
             return;
         };
-        if self.chats.iter().any(|chat| chat.id == chat_id)
-            || self.shared_session_previews.contains_key(chat_id)
-        {
+        if self.chats.iter().any(|chat| chat.id == chat_id) || self.transcript.is_empty() {
             return;
+        }
+        if let Some((entry_id, _)) = self.shared_session_previews.get(chat_id) {
+            // A bounded replay may not include the original title's source.
+            // Keep that stable label, but never retain it when its source is
+            // now known to be a peer entry.
+            let Some(entry) = self.transcript.iter().find(|entry| &entry.id == entry_id) else {
+                return;
+            };
+            if !entry.is_peer_message() {
+                return;
+            }
         }
         if let Some(preview) = shared_session_preview(&self.transcript) {
             self.shared_session_previews
                 .insert(chat_id.to_string(), preview);
+        } else {
+            self.shared_session_previews.remove(chat_id);
         }
     }
 
@@ -2110,17 +2181,44 @@ impl AppState {
         self.chats.iter().any(|chat| chat.id == chat_id)
     }
 
-    /// Cached transcript-derived title without allocating the id fallback.
+    /// Existing sidebar name precedence, without loading session content.
+    pub(crate) fn chat_display_name<'a>(&'a self, chat: &'a Chat) -> Option<&'a str> {
+        self.scaffold_session_name(&chat.id).or_else(|| {
+            chat.title
+                .as_deref()
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+        })
+    }
+
+    fn scaffold_session_name(&self, chat_id: &str) -> Option<&str> {
+        self.scaffold_environment(chat_id)
+            .and_then(|environment| environment.name.as_deref())
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .or_else(|| {
+                self.session_refs
+                    .iter()
+                    .find(|session_ref| session_ref.chat_id == chat_id)
+                    .and_then(|session_ref| session_ref.environment.as_ref())
+                    .and_then(|environment| environment.name.as_deref())
+            })
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+    }
+
+    /// Canonical imported environment name, then a learned transcript preview.
     pub(crate) fn shared_session_preview(&self, chat_id: &str) -> Option<&str> {
-        self.shared_session_previews
-            .get(chat_id)
-            .map(String::as_str)
+        self.scaffold_session_name(chat_id).or_else(|| {
+            self.shared_session_previews
+                .get(chat_id)
+                .map(|(_, preview)| preview.as_str())
+        })
     }
 
     pub fn shared_session_title(&self, chat_id: &str) -> String {
-        self.shared_session_previews
-            .get(chat_id)
-            .cloned()
+        self.shared_session_preview(chat_id)
+            .map(str::to_owned)
             .unwrap_or_else(|| session_ref_fallback(chat_id))
     }
 
@@ -2201,36 +2299,25 @@ impl AppState {
         }
     }
 
-    /// The sidebar's Sessions list: every non-archived chat of a LIVE space,
-    /// on any device — idle included — in pure recency order (status drives
-    /// the dot, never the position; see [`sort_active`]).
+    /// Every non-archived member session, including detached/missing-space
+    /// rows, in pure recency order. Space membership supplies context, never
+    /// visibility; the engine has already applied the principal's memberships.
     pub fn overview_chats(&self, now: DateTime<Utc>) -> Vec<(ChatIndicator, &Chat)> {
         let mut rows: Vec<(ChatIndicator, &Chat)> = self
             .visible_chats()
-            .filter(|c| {
-                c.space_id
-                    .as_deref()
-                    .is_some_and(|id| self.space_row(id).is_some())
-            })
             .map(|c| (self.display_status_for(c, now), c))
             .collect();
         sort_active(&mut rows);
         rows
     }
 
-    /// Archived chats of a live space, newest first. The main sidebar presents
-    /// these as settled sessions below the active list.
+    /// Archived member sessions, newest first, including detached rows.
+    /// Archiving changes the section, never the session's reachability.
     pub fn settled_chats(&self) -> Vec<&Chat> {
         let mut rows: Vec<(ChatIndicator, &Chat)> = self
             .chats
             .iter()
-            .filter(|chat| {
-                chat.archived
-                    && chat
-                        .space_id
-                        .as_deref()
-                        .is_some_and(|id| self.space_row(id).is_some())
-            })
+            .filter(|chat| chat.archived)
             .map(|chat| (ChatIndicator::Idle, chat))
             .collect();
         sort_active(&mut rows);
@@ -2257,6 +2344,16 @@ impl AppState {
 
     pub fn engine(&self) -> Option<&EngineHandle> {
         self.engine.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_engine_for_test(&mut self, handle: EngineHandle) {
+        self.engine = Some(handle);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_scaffold_scope_for_test(&mut self, project: &str, deployment: &str) {
+        self.scaffold_scope = Some((project.into(), deployment.into()));
     }
 
     // ---- gpui glue ----
@@ -2647,7 +2744,25 @@ impl AppState {
     }
 
     pub(crate) fn scaffold_session_draft(&self) -> Option<&ScaffoldSessionDraft> {
-        self.pending_scaffold_session.as_ref()
+        self.selected_chat
+            .as_deref()
+            .and_then(|chat_id| self.scaffold_session_draft_for_chat(chat_id))
+    }
+
+    pub(crate) fn scaffold_session_draft_for_chat(
+        &self,
+        chat_id: &str,
+    ) -> Option<&ScaffoldSessionDraft> {
+        self.pending_scaffold_session
+            .as_ref()
+            .filter(|draft| draft.chat_id == chat_id)
+    }
+
+    pub(crate) fn complete_scaffold_session_startup(&mut self, chat_id: &str) {
+        if self.scaffold_session_draft_for_chat(chat_id).is_some() {
+            self.pending_scaffold_session = None;
+            self.scaffold_session_error = None;
+        }
     }
 
     pub(crate) fn install_scaffold_session(
@@ -2666,7 +2781,8 @@ impl AppState {
             .insert(chat_id.clone(), attachment.environment.clone());
         self.scaffold_host_devices
             .insert(chat_id.clone(), attachment.owner_device_id.clone());
-        self.pending_scaffold_session = None;
+        // Attachment is not command admission. Keep the original draft so a
+        // checkout/upload/admission failure can prepare the same target again.
         self.scaffold_session_error = None;
         if self.selected_chat.as_deref() != Some(chat_id.as_str()) {
             self.select_chat(Some(chat_id), cx);
@@ -2703,6 +2819,10 @@ impl AppState {
             || self.selected_chat.as_deref() != Some(chat_id)
             || self.transcript_task.is_some()
             || self.collaboration_task.is_some()
+            || self
+                .pending_scaffold_session
+                .as_ref()
+                .is_some_and(|draft| draft.chat_id == chat_id)
         {
             return;
         }
@@ -2922,6 +3042,10 @@ impl AppState {
         .detach();
     }
 
+    pub(crate) fn transcript_room_projection(&self, chat_id: &str) -> Option<SessionRoomProjection> {
+        self.room_projections.get(chat_id).cloned()
+    }
+
     pub fn load_older_transcript(&mut self, cx: &mut Context<Self>) {
         if self.transcript_history_loading {
             return;
@@ -2975,11 +3099,12 @@ impl AppState {
     /// watch server-side. Selecting a chat also lands in its space and marks it
     /// seen (a global-list click must switch the tab strip too).
     pub fn select_chat(&mut self, chat_id: Option<String>, cx: &mut Context<Self>) {
-        if self
-            .pending_scaffold_session
-            .as_ref()
-            .is_some_and(|draft| Some(draft.chat_id.as_str()) != chat_id.as_deref())
-        {
+        if self.pending_scaffold_session.as_ref().is_some_and(|draft| {
+            !self.scaffold_control_targets.contains_key(&draft.chat_id)
+                && self.scaffold_session_error.is_none()
+                && !self.scaffold_starting_chats.contains(&draft.chat_id)
+                && Some(draft.chat_id.as_str()) != chat_id.as_deref()
+        }) {
             self.pending_scaffold_session = None;
         }
         if self.selected_chat == chat_id {
@@ -3056,7 +3181,13 @@ impl AppState {
                 }
                 self.selected_space = None;
                 self.selected_space_members.clear();
-                self.pending_scaffold_session = None;
+                if self.pending_scaffold_session.as_ref().is_some_and(|draft| {
+                    !self.scaffold_control_targets.contains_key(&draft.chat_id)
+                        && self.scaffold_session_error.is_none()
+                        && !self.scaffold_starting_chats.contains(&draft.chat_id)
+                }) {
+                    self.pending_scaffold_session = None;
+                }
                 cx.notify();
             }
         }
@@ -3080,7 +3211,13 @@ impl AppState {
         {
             return;
         }
-        self.pending_scaffold_session = None;
+        if self.pending_scaffold_session.as_ref().is_some_and(|draft| {
+            !self.scaffold_control_targets.contains_key(&draft.chat_id)
+                && self.scaffold_session_error.is_none()
+                && !self.scaffold_starting_chats.contains(&draft.chat_id)
+        }) {
+            self.pending_scaffold_session = None;
+        }
         self.selected_space = Some(space_id);
         self.selected_space_members = member_ids;
         cx.notify();
@@ -3245,6 +3382,7 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
                 return;
             }
         };
+        let mut first_frame = true;
         while let Some(value) = rx.recv().await {
             let parsed: T = match serde_json::from_value(value) {
                 Ok(parsed) => parsed,
@@ -3254,6 +3392,10 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
                 }
             };
             let alive = this.update(cx, |state, cx| {
+                if first_frame && method == methods::WATCH_SESSIONS {
+                    state.sessions_epoch = state.sessions_epoch.wrapping_add(1);
+                }
+                first_frame = false;
                 apply(state, parsed);
                 cx.notify();
             });
@@ -3374,7 +3516,14 @@ fn spawn_transcript_watch(
                 }
             };
             while let Some(value) = rx.recv().await {
-                let frame: TranscriptFrame = match serde_json::from_value(value) {
+                // The opening bounded tail can still contain large text parts.
+                // Decode off the UI executor, preserving stream order and the
+                // selection guard below when the result returns.
+                let decoded = cx
+                    .background_executor()
+                    .spawn(async move { serde_json::from_value::<TranscriptFrame>(value) })
+                    .await;
+                let frame = match decoded {
                     Ok(frame) => frame,
                     Err(err) => {
                         // Schema skew (a newer peer's entry shape arriving
@@ -3531,32 +3680,6 @@ mod tests {
                 .get("operation")
                 .and_then(serde_json::Value::as_str)
                 .expect("typed Scaffold operation");
-            if operation == "create" {
-                assert_eq!(
-                    params.get("name").and_then(serde_json::Value::as_str),
-                    Some("Investigate staging resume delivery")
-                );
-                assert_eq!(
-                    params.get("source_ref").and_then(serde_json::Value::as_str),
-                    Some("feat/comet-identity-integration")
-                );
-                assert_eq!(
-                    params.get("agentRoute"),
-                    Some(&serde_json::json!({
-                        "provider": "openai",
-                        "model": "gpt-5.6-sol",
-                        "fallback": "disabled",
-                        "routingMode": "automatic",
-                    }))
-                );
-                assert!(matches!(
-                    params
-                        .get("database_environment")
-                        .and_then(serde_json::Value::as_str),
-                    Some("local" | "staging_snapshot" | "production_snapshot")
-                ));
-                assert!(params.get("runtime_mode").is_none());
-            }
             self.operations
                 .lock()
                 .expect("Scaffold operation log")
@@ -3591,7 +3714,7 @@ mod tests {
                 .and_then(serde_json::Value::as_str)
                 .expect("session id");
             let lifecycle = match operation {
-                "inspect" | "handoffOmpSession" => self.inspect_lifecycle,
+                "inspect" => self.inspect_lifecycle,
                 "pause" => "paused",
                 "updateAgentRoute" => "ready",
                 _ => "starting",
@@ -3634,36 +3757,116 @@ mod tests {
                         "capabilities": [comet_proto::CAPABILITY_SESSION_CHAT]
                     }
                 })
-            } else if operation == "handoffOmpSession" {
-                assert_eq!(
-                    params
-                        .get("nativeSessionId")
-                        .and_then(serde_json::Value::as_str),
-                    Some("omp-session-a")
-                );
-                assert_eq!(
-                    params.get("cwd").and_then(serde_json::Value::as_str),
-                    Some("/workspace/ashler-platform")
-                );
-                serde_json::json!({
-                    "environment": environment,
-                    "roomProjection": {
-                        "projectId": "ashler-staging",
-                        "deploymentId": "ashler-staging",
-                        "sessionId": session_id
-                    },
-                    "handoffNativeSessionId": "omp-session-a",
-                    "handoffCwd": "/workspace/ashler-platform"
-                })
             } else {
                 assert!(matches!(
                     operation,
-                    "create" | "inspect" | "pause" | "resume" | "updateAgentRoute"
+                    "inspect" | "pause" | "resume" | "updateAgentRoute"
                 ));
                 serde_json::json!({ "environment": environment })
             };
             RpcReply::value(&result)
         }
+    }
+
+    struct PreparedScaffoldRpc {
+        ready: ReadyScaffoldRpc,
+        generation: AtomicU16,
+        malformed_attachment: bool,
+        reports: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    }
+
+    #[async_trait::async_trait]
+    impl RpcService for PreparedScaffoldRpc {
+        async fn handle(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<RpcReply, RpcError> {
+            match method {
+                methods::PREPARE_SCAFFOLD_SESSION => {
+                    let RpcReply::Value(mut result) = self.ready.handle(
+                        methods::CONTROL_SCAFFOLD_ENVIRONMENT,
+                        serde_json::json!({ "operation": "attach", "scope": params["scope"] }),
+                    ).await? else { panic!("unary attachment") };
+                    let generation = self.generation.fetch_add(1, Ordering::SeqCst);
+                    result["preparationGeneration"] = format!("generation-{generation}").into();
+                    if self.malformed_attachment {
+                        result["environment"] = serde_json::Value::Null;
+                    }
+                    Ok(RpcReply::Value(result))
+                }
+                methods::REPORT_SCAFFOLD_PREPARATION_FAILURE => {
+                    self.reports.send(params).unwrap();
+                    RpcReply::value(&serde_json::json!({ "reported": true }))
+                }
+                _ => Err(RpcError::UnknownMethod(method.to_string())),
+            }
+        }
+    }
+
+    fn preparation_client(
+        malformed_attachment: bool,
+    ) -> (EngineHandle, tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>) {
+        let (reports, received) = tokio::sync::mpsc::unbounded_channel();
+        let handle = EngineHandle::for_test(Arc::new(PreparedScaffoldRpc {
+            ready: ReadyScaffoldRpc {
+                operations: Arc::new(StdMutex::new(Vec::new())),
+                attach_failures_remaining: AtomicU16::new(0),
+                update_route_failures_remaining: AtomicU16::new(0),
+                inspect_lifecycle: "ready",
+                archive_fails: false,
+            },
+            generation: AtomicU16::new(1),
+            malformed_attachment,
+            reports,
+        }));
+        (handle, received)
+    }
+
+    async fn prepare_test_session(
+        handle: &EngineHandle,
+    ) -> Result<(ScaffoldSessionAttachment, Option<String>, Option<String>, ScaffoldPreparationGuard), RpcError> {
+        let scope = CollaborationScope {
+            project_id: "ashler-staging".into(),
+            deployment_id: Some("ashler-staging".into()),
+            session_id: Some("session-ready".into()),
+            unknown: Default::default(),
+        };
+        let route = comet_proto::AgentRoute::automatic(
+            comet_proto::AgentProvider::OpenAi, "gpt-6-astra",
+        );
+        prepare_scaffold_session(
+            handle, &scope, None, None, ScaffoldDatabaseEnvironment::Local, &route, None,
+        ).await
+    }
+
+    #[tokio::test]
+    async fn malformed_prepare_attachment_reports_the_returned_generation() {
+        let (handle, mut reports) = preparation_client(true);
+        assert!(prepare_test_session(&handle).await.is_err());
+        let report = tokio::time::timeout(std::time::Duration::from_secs(3), reports.recv())
+            .await.unwrap().unwrap();
+        assert_eq!(report, serde_json::json!({
+            "chatId": "session-ready", "generation": "generation-1",
+        }));
+    }
+
+    #[tokio::test]
+    async fn abandoned_preparation_reports_origin_not_newer_attempt_and_admission_disarms() {
+        let (handle, mut reports) = preparation_client(false);
+        let (_, _, _, first) = prepare_test_session(&handle).await.unwrap();
+        let (_, _, _, mut second) = prepare_test_session(&handle).await.unwrap();
+        // Dropping the owning future after preparation (for example during an
+        // upload) must report the old receipt, even after a newer Prepare.
+        drop(first);
+        let report = tokio::time::timeout(std::time::Duration::from_secs(3), reports.recv())
+            .await.unwrap().unwrap();
+        assert_eq!(report, serde_json::json!({
+            "chatId": "session-ready", "generation": "generation-1",
+        }));
+        second.disarm();
+        drop(second);
+        assert!(matches!(reports.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)));
     }
 
     /// A localhost port that was just free — picked OUTSIDE the OS ephemeral
@@ -3713,7 +3916,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scaffold_attaches_while_starting_before_readiness_inspection() {
+    async fn archiving_scaffold_pauses_the_attached_sandbox_after_persistence() {
         let operations = Arc::new(StdMutex::new(Vec::new()));
         let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
             operations: Arc::clone(&operations),
@@ -3734,89 +3937,9 @@ mod tests {
             session_id: Some("session-ready".into()),
             unknown: Default::default(),
         };
-        let no_wait = |_| futures::future::ready(());
-
-        let (sandbox_id, attachment) = create_and_attach_scaffold_session(
-            &handle,
-            &scope,
-            Some("Investigate staging resume delivery"),
-            Some("feat/comet-identity-integration"),
-            ScaffoldDatabaseEnvironment::StagingSnapshot,
-            &AgentRoute::automatic(comet_proto::AgentProvider::OpenAi, "gpt-5.6-sol"),
-            &no_wait,
-        )
-        .await
-        .unwrap();
-        assert_eq!(sandbox_id, "sandbox-ready");
-        assert_eq!(
-            operations
-                .lock()
-                .expect("Scaffold operation log")
-                .as_slice(),
-            ["create", "attach"]
-        );
-        assert_eq!(
-            inspect_scaffold_session(&handle, &sandbox_id, &scope)
-                .await
-                .unwrap(),
-            ScaffoldLifecycle::Ready
-        );
-        assert_eq!(
-            operations
-                .lock()
-                .expect("Scaffold operation log")
-                .as_slice(),
-            ["create", "attach", "inspect"]
-        );
-        assert_eq!(attachment.projection.session_id, "session-ready");
-        assert_eq!(
-            attachment.environment.name.as_deref(),
-            Some("Investigate staging resume delivery")
-        );
-        let SessionEnvironmentSource::Scaffold { links, .. } = &attachment.environment.source
-        else {
-            panic!("expected Scaffold environment")
-        };
-        assert_eq!(
-            links.web.as_deref(),
-            Some("https://scaffold.example/sessions/sandbox-ready/web")
-        );
-        assert_eq!(
-            links.session.as_deref(),
-            Some("https://scaffold.example/?q=sandbox-ready")
-        );
-        assert_eq!(
-            attachment.owner_device_id,
-            "comet-scaffold-sandbox-ready-e1"
-        );
-        assert_eq!(attachment.grant_id, "grant-ready");
-        assert_eq!(
-            attachment.actor_subject,
-            "accounts.google.com:ready@example.com"
-        );
-        assert_eq!(
-            attachment.source_ref.as_deref(),
-            Some("387d6652abd642f0b85e8bd14f9131a9f23b7e70")
-        );
-        assert_eq!(
-            attachment.control_target,
-            ScaffoldControlTarget {
-                sandbox_id: "sandbox-ready".into(),
-                scope: scope.clone(),
-            }
-        );
-        assert_eq!(
-            handoff_omp_session(
-                &handle,
-                "sandbox-ready",
-                &scope,
-                "omp-session-a",
-                "/workspace/ashler-platform",
-            )
+        let attachment = attach_scaffold_session(&handle, "sandbox-ready", scope)
             .await
-            .unwrap(),
-            ("omp-session-a".into(), "/workspace/ashler-platform".into())
-        );
+            .unwrap();
         archive_and_pause_scaffold_session(&handle, "session-ready", &attachment.control_target)
             .await
             .unwrap();
@@ -3825,19 +3948,13 @@ mod tests {
                 .lock()
                 .expect("Scaffold operation log")
                 .as_slice(),
-            [
-                "create",
-                "attach",
-                "inspect",
-                "handoffOmpSession",
-                "archive",
-                "pause"
-            ]
+            ["attach", "archive", "pause"]
         );
     }
 
     #[test]
     fn scaffold_control_retries_transient_provider_and_readiness_failures() {
+        use comet_engine::scaffold::is_retryable_scaffold_control_error;
         assert!(is_retryable_scaffold_control_error(&RpcError::Failed(
             "scaffold_api_error:500:scaffold_request_rejected".into()
         )));
@@ -3892,26 +4009,20 @@ mod tests {
                 unknown: Default::default(),
             };
             let no_wait = |_| futures::future::ready(());
-            let (sandbox_id, attachment) = create_and_attach_scaffold_session(
-                &handle,
-                &scope,
-                Some("Investigate staging resume delivery"),
-                Some("feat/comet-identity-integration"),
-                ScaffoldDatabaseEnvironment::ProductionSnapshot,
-                &AgentRoute::automatic(comet_proto::AgentProvider::OpenAi, "gpt-5.6-sol"),
-                &no_wait,
-            )
-            .await
-            .unwrap();
+            let attachment =
+                ensure_scaffold_session_attached(&handle, "sandbox-ready", &scope, &no_wait)
+                    .await
+                    .unwrap();
 
-            assert_eq!(sandbox_id, "sandbox-ready");
             assert_eq!(attachment.projection.session_id, "session-transient");
             assert_eq!(
                 operations
                     .lock()
                     .expect("Scaffold operation log")
                     .as_slice(),
-                ["create", "attach", "attach", "attach"]
+                [
+                    "inspect", "attach", "inspect", "attach", "inspect", "attach"
+                ]
             );
         });
     }
@@ -4409,6 +4520,73 @@ mod tests {
             assert!(state.pending_scaffold_session.is_none());
         });
     }
+
+    #[gpui::test]
+    fn attached_scaffold_draft_survives_failure_and_navigation_until_admission(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            let draft = ScaffoldSessionDraft {
+                project_id: "project-a".into(),
+                deployment_id: "deployment-a".into(),
+                space_id: "space-a".into(),
+                chat_id: "chat-a".into(),
+                database_environment: ScaffoldDatabaseEnvironment::Local,
+                source_ref: "master".into(),
+                omp_handoff: None,
+            };
+            let scope = draft.collaboration_scope();
+            state.select_pending_scaffold_chat(draft, cx);
+            state.mark_scaffold_chat_starting("chat-a");
+            let attachment = ScaffoldSessionAttachment {
+                environment: serde_json::from_value(serde_json::json!({
+                    "source": {
+                        "kind": "scaffold", "sandbox_id": "sandbox-a",
+                        "lifecycle": "ready", "lifecycle_epoch": 1, "links": {}
+                    },
+                    "ownerPrincipal": "owner@example.com",
+                    "scope": scope,
+                })).unwrap(),
+                projection: SessionRoomProjection {
+                    project_id: "project-a".into(),
+                    deployment_id: "deployment-a".into(),
+                    session_id: "chat-a".into(),
+                },
+                grant_id: "grant-a".into(),
+                owner_device_id: "comet-scaffold-sandbox-a-e1".into(),
+                actor_subject: "owner@example.com".into(),
+                source_ref: Some("master".into()),
+                control_target: ScaffoldControlTarget {
+                    sandbox_id: "sandbox-a".into(), scope: scope.clone(),
+                },
+            };
+            state.install_scaffold_session(&attachment, cx);
+            assert_eq!(state.scaffold_session_draft().unwrap().collaboration_scope(), scope);
+
+            state.clear_scaffold_chat_starting("chat-a", cx);
+            state.select_chat(None, cx);
+            state.select_space_source("other-space".into(), Vec::new(), cx);
+            state.select_space(None, cx);
+            state.select_chat(Some("chat-a".into()), cx);
+            assert_eq!(state.scaffold_session_draft().unwrap().collaboration_scope(), scope);
+            assert_eq!(state.scaffold_control_target("chat-a"), Some(&attachment.control_target));
+
+            // An upload can fail after Attach has installed the room and grant.
+            state.scaffold_session_error = Some("upload failed".into());
+            state.select_chat(None, cx);
+            state.select_chat(Some("chat-a".into()), cx);
+            assert_eq!(state.scaffold_session_draft().unwrap().collaboration_scope(), scope);
+
+            state.complete_scaffold_session_startup("another-chat");
+            assert!(state.scaffold_session_draft().is_some());
+            state.complete_scaffold_session_startup("chat-a");
+            assert!(state.scaffold_session_draft().is_none());
+            assert!(state.scaffold_session_error.is_none());
+            assert_eq!(state.scaffold_control_target("chat-a"), Some(&attachment.control_target));
+        });
+    }
+
     #[gpui::test]
     fn pending_scaffold_chat_does_not_open_the_unscoped_room(cx: &mut gpui::TestAppContext) {
         let runtime = tokio::runtime::Runtime::new().expect("Tokio test runtime");
@@ -4443,11 +4621,69 @@ mod tests {
                 },
                 cx,
             );
+            let unaccepted = state.scaffold_session_draft().unwrap().clone();
+            state.cancel_unaccepted_chat("chat-a", cx);
+            assert!(state.pending_scaffold_session.is_none());
+            assert!(!state.pending_local_chat_ids.contains("chat-a"));
+            assert!(state.selected_chat.is_none());
+            state.select_pending_scaffold_chat(unaccepted, cx);
 
             assert_eq!(state.selected_chat.as_deref(), Some("chat-a"));
             assert!(!state.scaffold_chat_starting("chat-a"));
             assert!(state.transcript_task.is_none());
             assert!(state.collaboration_task.is_none());
+            let target = ScaffoldControlTarget {
+                sandbox_id: "sandbox-pending".into(),
+                scope: state
+                    .scaffold_session_draft()
+                    .unwrap()
+                    .collaboration_scope(),
+            };
+            state.mark_scaffold_chat_starting("chat-a");
+            // An error may arrive before the engine's accepted-ref watch frame.
+            state.scaffold_session_error = Some("attachment interrupted".into());
+            state.clear_scaffold_chat_starting("chat-a", cx);
+            state.select_chat(None, cx);
+            state.cancel_unaccepted_chat("chat-a", cx);
+            state.select_space_source("other-space".into(), Vec::new(), cx);
+            state.select_space(None, cx);
+            state.select_chat(Some("chat-a".into()), cx);
+            assert!(state.scaffold_session_draft().is_some());
+            assert!(state.transcript_task.is_none());
+            assert!(state.collaboration_task.is_none());
+            state.scaffold_session_error = None;
+            state.scaffold_scope = Some(("project-a".into(), "deployment-a".into()));
+            let accepted: SessionEnvironment = serde_json::from_value(serde_json::json!({
+                "source": { "kind": "scaffold", "sandbox_id": "sandbox-pending", "lifecycle": "starting", "links": {} },
+                "ownerPrincipal": "owner@example.com",
+                "scope": target.scope,
+            })).unwrap();
+            state.apply_session_refs(vec![SessionRef {
+                chat_id: "chat-a".into(),
+                added_at: Utc::now(),
+                environment: Some(accepted),
+                startup: None,
+            }]);
+            state.clear_scaffold_chat_starting("chat-a", cx);
+            assert!(state.transcript_task.is_none());
+            assert!(state.collaboration_task.is_none());
+            state.select_chat(None, cx);
+            state.cancel_unaccepted_chat("chat-a", cx);
+            assert!(state.scaffold_session_draft_for_chat("chat-a").is_some());
+            assert_eq!(state.scaffold_control_target("chat-a"), Some(&target));
+            state.select_space(None, cx);
+            state.select_chat(Some("chat-a".into()), cx);
+            assert!(state.scaffold_session_draft().is_some());
+            assert_eq!(state.scaffold_control_target("chat-a"), Some(&target));
+            assert!(state.chat_is_scaffold("chat-a"));
+            assert!(state.transcript_task.is_none());
+            assert!(state.collaboration_task.is_none());
+            state.scaffold_scope = Some(("project-a".into(), "deployment-a".into()));
+            state.selected_space = Some("space-a".into());
+            assert!(!state.can_start_scaffold_session());
+            state.cancel_pending_chat("chat-a", cx);
+            assert!(state.can_start_scaffold_session());
+            assert!(state.chat_is_scaffold("chat-a"));
         });
         assert!(
             operations
@@ -4849,16 +5085,19 @@ mod tests {
             .map(|c| c.id.as_str())
             .collect();
         assert_eq!(ids, ["old", "new"]);
-        assert!(!state.chats.iter().any(|chat| chat.id == "legacy-scaffold"));
-        // The overview shows every live-space chat (idle included) — chats of
-        // unknown spaces stay hidden. Completed ("old") outranks idle ("new").
+        assert!(state.chats.iter().any(|chat| chat.id == "legacy-scaffold"));
+        // Missing space context must not hide a member session. Status never
+        // reorders the list: activity/creation recency determines position.
         let now = Utc::now();
         let overview: Vec<&str> = state
             .overview_chats(now)
             .iter()
             .map(|(_, c)| c.id.as_str())
             .collect();
-        assert_eq!(overview, ["old", "new"]);
+        assert_eq!(
+            overview,
+            ["legacy-scaffold", "old", "new", "dangling", "other"]
+        );
     }
 
     #[test]
@@ -5064,7 +5303,7 @@ mod tests {
     }
 
     #[test]
-    fn settled_chats_are_archived_live_space_rows_in_recency_order() {
+    fn settled_chats_keep_detached_members_in_recency_order() {
         let mut state = AppState::new();
         state.apply_spaces(vec![space("space", "dev", "/workspace", 0)]);
         let mut older = chat("older", 0, Some(2));
@@ -5085,7 +5324,7 @@ mod tests {
             .into_iter()
             .map(|chat| chat.id.as_str())
             .collect();
-        assert_eq!(settled, ["newer", "older"]);
+        assert_eq!(settled, ["dangling", "newer", "older"]);
     }
 
     #[test]
@@ -5100,6 +5339,7 @@ mod tests {
             device_id: "local".into(),
             status: None,
             continuation_of: None,
+            peer_message: None,
         };
         state.push_echo("c1", echo.clone());
         // Duplicate pushes dedupe.
@@ -5147,6 +5387,7 @@ mod tests {
             device_id: "device".into(),
             status: None,
             continuation_of: None,
+            peer_message: None,
         }
     }
 
@@ -5501,6 +5742,90 @@ mod tests {
         assert_eq!(state.chat_host_device_id("chat-a"), Some("device-owner"));
     }
     #[test]
+    fn native_handoff_reference_restores_remote_routing_without_ui_creation() {
+        let chat_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let mut state = AppState::new();
+        state.scaffold_scope = Some(("project-a".into(), "deployment-a".into()));
+        let environment: SessionEnvironment = serde_json::from_value(serde_json::json!({
+            "source": { "kind": "scaffold", "sandbox_id": "sandbox-cli", "lifecycle": "ready", "lifecycle_epoch": 2, "links": {} },
+            "ownerPrincipal": "owner@example.com",
+            "scope": { "projectId": "project-a", "deploymentId": "deployment-a", "sessionId": chat_id },
+        })).unwrap();
+        state.apply_session_refs(vec![SessionRef {
+            chat_id: chat_id.into(),
+            added_at: Utc::now(),
+            environment: Some(environment.clone()),
+            startup: None,
+        }]);
+        assert!(state.chat_is_scaffold(chat_id));
+        assert_eq!(
+            state.chat_host_device_id(chat_id),
+            Some("comet-scaffold-sandbox-cli-e2")
+        );
+        assert_eq!(
+            state.scaffold_control_target(chat_id).unwrap().sandbox_id,
+            "sandbox-cli"
+        );
+        assert!(
+            !state.scaffold_control_grants.contains_key(chat_id),
+            "discovery must not manufacture authority"
+        );
+
+        let mut other_deployment = AppState::new();
+        other_deployment.scaffold_scope = Some(("project-a".into(), "deployment-b".into()));
+        other_deployment.apply_session_refs(vec![SessionRef {
+            chat_id: chat_id.into(),
+            added_at: Utc::now(),
+            environment: Some(environment),
+            startup: None,
+        }]);
+        assert!(!other_deployment.chat_is_scaffold(chat_id));
+    }
+
+    #[test]
+    fn native_handoff_reference_does_not_roll_back_live_environment() {
+        let chat_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let mut state = AppState::new();
+        state.scaffold_scope = Some(("project-a".into(), "deployment-a".into()));
+        let persisted: SessionEnvironment = serde_json::from_value(serde_json::json!({
+            "source": { "kind": "scaffold", "sandbox_id": "sandbox-cli", "lifecycle": "ready", "lifecycle_epoch": 1, "links": {} },
+            "ownerPrincipal": "owner@example.com",
+            "scope": { "projectId": "project-a", "deploymentId": "deployment-a", "sessionId": chat_id },
+        })).unwrap();
+        let session_ref = SessionRef { chat_id: chat_id.into(),
+        added_at: Utc::now(), environment: Some(persisted.clone()), startup: None };
+        state.apply_session_refs(vec![session_ref.clone()]);
+        let mut live = persisted;
+        if let SessionEnvironmentSource::Scaffold {
+            lifecycle,
+            lifecycle_epoch,
+            ..
+        } = &mut live.source
+        {
+            *lifecycle = ScaffoldLifecycle::Paused;
+            *lifecycle_epoch = Some(2);
+        }
+        state.apply_scaffold_environments(ScaffoldEnvironmentSnapshot {
+            environments: vec![live.clone()],
+            refreshed_at: 2,
+        });
+        state.apply_session_refs(vec![
+            session_ref,
+            SessionRef {
+                chat_id: "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee".into(),
+                added_at: Utc::now(),
+                environment: None,
+                startup: None,
+            },
+        ]);
+        assert_eq!(
+            state.chat_host_device_id(chat_id),
+            Some("comet-scaffold-sandbox-cli-e2")
+        );
+        assert_eq!(state.scaffold_environment(chat_id), Some(&live));
+    }
+
+    #[test]
     fn imported_membership_keeps_selection_without_a_chat_row() {
         let chat_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
         let mut state = AppState::new();
@@ -5509,6 +5834,7 @@ mod tests {
             chat_id: chat_id.into(),
             added_at: Utc::now(),
             environment: None,
+            startup: None,
         }]);
 
         state.apply_chats(Vec::new());
@@ -5521,6 +5847,33 @@ mod tests {
     }
 
     #[test]
+    fn chat_display_name_prefers_canonical_environment_then_local_rename() {
+        let mut state = AppState::new();
+        let mut chat = chat("chat", 0, None);
+        chat.title = Some("  Local rename  ".into());
+        let mut environment: SessionEnvironment = serde_json::from_value(serde_json::json!({
+            "source": { "kind": "scaffold", "sandbox_id": "sandbox", "lifecycle": "ready", "links": {} },
+            "name": "  Imported name  ",
+            "ownerPrincipal": "owner",
+            "scope": { "projectId": "project", "deploymentId": "deployment", "sessionId": "chat" }
+        }))
+        .unwrap();
+        state.session_refs.push(SessionRef { chat_id: chat.id.clone(),
+        added_at: Utc::now(), environment: Some(environment.clone()), startup: None });
+        environment.name = Some("  Canonical name  ".into());
+        state
+            .scaffold_environments
+            .insert(chat.id.clone(), environment);
+        assert_eq!(state.chat_display_name(&chat), Some("Canonical name"));
+        state.scaffold_environments.clear();
+        assert_eq!(state.chat_display_name(&chat), Some("Imported name"));
+        state.session_refs[0].environment.as_mut().unwrap().name = Some("\n \t".into());
+        assert_eq!(state.chat_display_name(&chat), Some("Local rename"));
+        chat.title = Some("\n \t".into());
+        assert_eq!(state.chat_display_name(&chat), None);
+    }
+
+    #[test]
     fn imported_session_title_promotes_from_id_to_transcript_preview() {
         let chat_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
         let mut state = AppState::new();
@@ -5529,6 +5882,7 @@ mod tests {
             chat_id: chat_id.into(),
             added_at: Utc::now(),
             environment: None,
+            startup: None,
         }]);
         assert_eq!(state.shared_session_title(chat_id), "Session aaaaaaaa");
 
@@ -5543,11 +5897,47 @@ mod tests {
             device_id: "remote".into(),
             status: None,
             continuation_of: None,
+            peer_message: None,
         }]);
         assert_eq!(
             state.shared_session_title(chat_id),
             "Explain the shared transcript"
         );
+    }
+
+    #[test]
+    fn imported_session_preview_skips_peer_turns_and_evicts_stale_body() {
+        let chat_id = "shared-peer";
+        let mut state = AppState::new();
+        state.selected_chat = Some(chat_id.into());
+        let mut peer = transcript_entry("peer");
+        peer.role = MessageRole::User;
+        peer.parts = vec![MessagePart::Text {
+            id: "text".into(),
+            text: "private peer payload".into(),
+        }];
+        state.apply_transcript(vec![peer.clone()]);
+        assert_eq!(state.shared_session_preview(chat_id), Some("private peer payload"));
+        peer.peer_message = Some(comet_proto::PeerMessageProvenance {
+            command_id: peer.id.clone(),
+            source_chat_id: "source".into(),
+            thread_id: "thread".into(),
+            reply_to: None,
+        });
+        state.apply_transcript(vec![peer.clone()]);
+        assert!(state.shared_session_preview(chat_id).is_none());
+        let mut ordinary = transcript_entry("ordinary");
+        ordinary.role = MessageRole::User;
+        ordinary.parts = vec![MessagePart::Text {
+            id: "text".into(),
+            text: "[Peer message] ordinary prompt".into(),
+        }];
+        state.apply_transcript(vec![peer.clone(), ordinary]);
+        assert_eq!(state.shared_session_preview(chat_id), Some("[Peer message] ordinary prompt"));
+        peer.peer_message.as_mut().unwrap().command_id = "mismatch".into();
+        assert_eq!(shared_session_preview(&[peer]), Some(("peer".into(), "private peer payload".into())));
+        state.apply_transcript(vec![transcript_entry("later-window")]);
+        assert_eq!(state.shared_session_preview(chat_id), Some("[Peer message] ordinary prompt"));
     }
 
     #[test]
@@ -5558,6 +5948,7 @@ mod tests {
             chat_id: chat_id.into(),
             added_at: Utc::now(),
             environment: None,
+            startup: None,
         }]);
         state.apply_chats(vec![chat(chat_id, 1, None)]);
 

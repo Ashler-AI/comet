@@ -24,6 +24,7 @@ pub mod loaders;
 pub mod markdown;
 pub mod motion;
 pub mod multiplayer;
+pub mod notifications;
 pub mod pickers;
 pub mod popover;
 pub mod rail;
@@ -146,6 +147,7 @@ pub fn run_app(config: UiConfig) {
         }
     });
     app.run(move |cx: &mut App| {
+        cx.set_app_identity("comet", "Crew");
         // NB: pinned-rev API — `gpui_tokio::init(cx)` free function (not `Tokio::init`).
         gpui_tokio::init(cx);
         // Standalone staging must not take over production invitation links.
@@ -167,6 +169,7 @@ pub fn run_app(config: UiConfig) {
         app_menus::init(cx);
 
         let state = cx.new(|_| state::AppState::new());
+        notifications::init(state.clone(), &settings::UiSettings::load(&config.boot().data_dir), cx);
         state::AppState::bootstrap(state.clone(), config.boot(), cx);
         if let Some(invitation) = config
             .initial_url

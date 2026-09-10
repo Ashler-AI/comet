@@ -264,6 +264,12 @@ pub enum RowKind {
         pending: bool,
         delivery: UserDelivery,
     },
+    /// Native peer transport text, kept verbatim and never projected as mentions
+    /// or attachments. Only an explicit reveal mounts this body.
+    PeerMessage {
+        text: SharedString,
+        truncated: bool,
+    },
     /// One top-level markdown block of a completed message.
     Markdown {
         tree: Arc<BlockTree>,
@@ -427,12 +433,24 @@ pub fn rows_for_entry(
             })
             .collect::<Vec<_>>()
             .join("\n\n");
+        if entry.is_peer_message() {
+            return vec![Row {
+                id: entry_id.clone(),
+                version: entry_fingerprint(entry, pending),
+                turn_start: true,
+                kind: RowKind::PeerMessage {
+                    text: raw.into(),
+                    truncated: entry.parts.iter().any(|part| matches!(part, MessagePart::TextWindow { .. })),
+                },
+                entry_id,
+                timestamp: Some(entry.created_at),
+            }];
+        }
         // Attachment refs ride the plain text transport; split them back out
         // for the image thumbnail and file-card strips.
         let parsed = crate::attachments::parse_user_message_attachments(&raw);
         // File mentions render as chips here too, not just in the composer.
-        // The projection is pure over the text, so the raw-length row version
-        // below stays a valid cache/diff key.
+        // The row version hashes the original transport text.
         let (text, mentions) = match crate::composer::sent_mention_display(&parsed.text) {
             Some((display, spans)) => (display, spans),
             None => (parsed.text, Vec::new()),
@@ -444,7 +462,7 @@ pub fn rows_for_entry(
         };
         return vec![Row {
             id: entry.id.clone().into(),
-            version: (raw.len() as u64) << 3 | (delivery as u64) << 1 | pending as u64,
+            version: entry_fingerprint(entry, pending),
             turn_start: true,
             kind: RowKind::User {
                 text: text.into(),
@@ -910,6 +928,7 @@ impl HighlightStore {
         block_ix: usize,
         lang: Lang,
         code: &str,
+        chat_id: Option<String>,
         cx: &mut Context<Transcript>,
     ) -> Option<Arc<Vec<Vec<Token>>>> {
         let key = (row_id.clone(), block_ix);
@@ -941,11 +960,22 @@ impl HighlightStore {
                 })
                 .await;
             this.update(cx, |transcript, cx| {
-                if let Some(entry) = transcript.highlights.entries.get_mut(&key)
+                let selected = transcript.chat_id == chat_id;
+                let highlights = if selected {
+                    Some(&mut transcript.highlights)
+                } else {
+                    chat_id
+                        .as_deref()
+                        .and_then(|id| transcript.render_windows.get_mut(id))
+                        .map(|cached| &mut cached.highlights)
+                };
+                if let Some(entry) = highlights.and_then(|store| store.entries.get_mut(&key))
                     && entry.code_len == code_len
                 {
                     entry.lines = Some(Arc::new(lines));
-                    cx.notify();
+                    if selected {
+                        cx.notify();
+                    }
                 }
             })
             .ok();
@@ -1008,6 +1038,44 @@ fn splice_entry_rows<T>(
 const RENDER_WINDOW_CHAT_LIMIT: usize = 8;
 const RENDER_WINDOW_ROW_LIMIT: usize = 4096;
 
+/// Reveal state is local to this attachment, not part of cached transcript rows.
+/// A changed body must be explicitly revealed again, even under the same id.
+#[derive(Default)]
+struct PeerMessageVisibility {
+    revealed: HashMap<SharedString, u64>,
+}
+
+impl PeerMessageVisibility {
+    fn body<'a>(&self, row: &'a Row) -> Option<&'a SharedString> {
+        match &row.kind {
+            RowKind::PeerMessage { text, .. }
+                if self.revealed.get(&row.id) == Some(&row.version) => Some(text),
+            _ => None,
+        }
+    }
+
+    fn toggle(&mut self, row: &Row) {
+        if self.body(row).is_some() {
+            self.revealed.remove(&row.id);
+        } else if matches!(&row.kind, RowKind::PeerMessage { .. }) {
+            self.revealed.insert(row.id.clone(), row.version);
+        }
+    }
+
+    fn retain_rows(&mut self, rows: &[Row]) {
+        self.revealed.retain(|id, version| {
+            rows.iter().any(|row| {
+                &row.id == id && row.version == *version
+                    && matches!(&row.kind, RowKind::PeerMessage { .. })
+            })
+        });
+    }
+
+    fn clear(&mut self) {
+        self.revealed.clear();
+    }
+}
+
 struct CachedTranscriptRender {
     rows: Vec<Row>,
     entry_row_counts: Vec<usize>,
@@ -1015,6 +1083,8 @@ struct CachedTranscriptRender {
     echo_row_counts: Vec<usize>,
     row_cache: HashMap<String, CachedRows>,
     tree_cache: HashMap<String, (usize, Arc<BlockTree>)>,
+    render_cache: Rc<RefCell<RenderCache>>,
+    highlights: HighlightStore,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -1079,9 +1149,13 @@ pub struct Transcript {
     row_cache: HashMap<String, CachedRows>,
     live_parsers: HashMap<String, IncrementalParser>,
     tree_cache: HashMap<String, (usize, Arc<BlockTree>)>,
+    cache_prune_needed: bool,
     render_windows: HashMap<String, CachedTranscriptRender>,
     render_window_lru: Vec<String>,
     folds: HashMap<SharedString, FoldState>,
+    peer_visibility: PeerMessageVisibility,
+    peer_message_details: HashMap<SharedString, Result<SharedString, ()>>,
+    peer_message_loads: HashMap<SharedString, Task<()>>,
     /// Expanded chips (tool part ids) — pane state, cleared on chat switch
     /// like `folds`.
     expanded_tools: std::collections::HashSet<SharedString>,
@@ -1136,6 +1210,8 @@ pub struct Transcript {
     rail_enabled: bool,
     /// Hovered rail tick (grows + shows the preview card).
     rail_hover: Option<usize>,
+    /// Revision-keyed message-rail projection, reused by scroll and fade frames.
+    pub(crate) rail_cache: crate::rail::RailCache,
     /// `(row id, entry id)` under the pointer — reveals the entry's timestamp
     /// strip (comet chat-view.tsx `group-hover`; the rows report hover
     /// themselves). Keyed by ROW so a row→row move within one entry can't
@@ -1183,9 +1259,13 @@ impl Transcript {
             row_cache: HashMap::new(),
             live_parsers: HashMap::new(),
             tree_cache: HashMap::new(),
+            cache_prune_needed: false,
             render_windows: HashMap::new(),
             render_window_lru: Vec::new(),
             folds: HashMap::new(),
+            peer_visibility: PeerMessageVisibility::default(),
+            peer_message_details: HashMap::new(),
+            peer_message_loads: HashMap::new(),
             expanded_tools: std::collections::HashSet::new(),
             tool_details: HashMap::new(),
             tool_detail_loads: HashMap::new(),
@@ -1208,6 +1288,7 @@ impl Transcript {
             selection_drag_scroll_active: false,
             rail_enabled: true,
             rail_hover: None,
+            rail_cache: crate::rail::RailCache::default(),
             hovered_entry: None,
             copied_code: None,
             copied_clear: None,
@@ -1562,6 +1643,7 @@ impl Transcript {
             ) {
                 self.list.remeasure_items(changed);
             } else {
+                self.cache_prune_needed = true;
                 self.list.splice(changed, new_count);
             }
         }
@@ -1606,7 +1688,8 @@ impl Transcript {
         let missed_revision = !attached
             && (change.revision != revision || revision != self.state_revision.wrapping_add(1));
         self.state_revision = revision;
-        let echoes = state.pending_echoes().to_vec();
+        let revealed_before = self.peer_visibility.revealed.len();
+        let echoes = state.pending_echoes();
         let entries = &state.transcript;
         if attached {
             if let Some(previous) = self.chat_id.take()
@@ -1621,6 +1704,8 @@ impl Transcript {
                         echo_row_counts: std::mem::take(&mut self.echo_row_counts),
                         row_cache: std::mem::take(&mut self.row_cache),
                         tree_cache: std::mem::take(&mut self.tree_cache),
+                        render_cache: std::mem::take(&mut self.render_cache),
+                        highlights: std::mem::take(&mut self.highlights),
                     },
                 );
                 self.render_window_lru.retain(|id| id != &previous);
@@ -1651,6 +1736,8 @@ impl Transcript {
                 self.echo_row_counts = cached.echo_row_counts;
                 self.row_cache = cached.row_cache;
                 self.tree_cache = cached.tree_cache;
+                self.render_cache = cached.render_cache;
+                self.highlights = cached.highlights;
             } else {
                 self.rows.clear();
                 self.entry_row_counts.clear();
@@ -1658,15 +1745,19 @@ impl Transcript {
                 self.echo_row_counts.clear();
                 self.row_cache.clear();
                 self.tree_cache.clear();
+                self.render_cache.borrow_mut().clear();
+                self.highlights.entries.clear();
             }
             self.live_parsers.clear();
             self.folds.clear();
+            self.peer_visibility.clear();
+            self.peer_message_details.clear();
+            self.peer_message_loads.clear();
+            crate::markdown::selection::clear();
             self.expanded_tools.clear();
             self.tool_details.clear();
             self.tool_detail_loads.clear();
             self.veils.clear();
-            self.render_cache.borrow_mut().clear();
-            self.highlights.entries.clear();
             self.list.reset(self.rows.len());
             self.pinned = true;
             self.spring.reset();
@@ -1695,12 +1786,19 @@ impl Transcript {
             || matches!(&change.entries, TranscriptEntriesChange::Reset)
             || !splice_valid
             || !echo_shape_valid;
+        if matches!(&change.entries, TranscriptEntriesChange::Reset) {
+            self.peer_visibility.clear();
+            self.peer_message_details.clear();
+            self.peer_message_loads.clear();
+            crate::markdown::selection::clear();
+        }
         let was_empty = self.rows.is_empty();
         let changed = if full_rebuild {
+            self.cache_prune_needed = true;
             let real_rows_by_entry = self.build_entry_rows(entries, false);
             let new_entry_counts: Vec<usize> = real_rows_by_entry.iter().map(Vec::len).collect();
             let new_entry_row_count: usize = new_entry_counts.iter().sum();
-            let echo_rows_by_entry = self.build_entry_rows(&echoes, true);
+            let echo_rows_by_entry = self.build_entry_rows(echoes, true);
             let new_echo_counts: Vec<usize> = echo_rows_by_entry.iter().map(Vec::len).collect();
             let mut new_rows: Vec<Row> = real_rows_by_entry.into_iter().flatten().collect();
             new_rows.extend(echo_rows_by_entry.into_iter().flatten());
@@ -1748,7 +1846,7 @@ impl Transcript {
             }
             if change.echoes_changed {
                 let old_echoes = 0..self.echo_row_counts.len();
-                let replacement = self.build_entry_rows(&echoes, true);
+                let replacement = self.build_entry_rows(echoes, true);
                 changed |= self.reconcile_entry_range(old_echoes, replacement, false);
             }
             if self.veil_attach_pending && !entries.is_empty() {
@@ -1762,7 +1860,20 @@ impl Transcript {
             changed
         };
 
-        if !changed {
+        if self.cache_prune_needed {
+            self.prune_retired_caches(entries, echoes);
+            self.cache_prune_needed = false;
+        }
+
+        self.peer_visibility.retain_rows(&self.rows);
+        self.peer_message_details.retain(|id, _| self.peer_visibility.revealed.contains_key(id));
+        self.peer_message_loads.retain(|id, _| self.peer_visibility.revealed.contains_key(id));
+        let visibility_changed = self.peer_visibility.revealed.len() != revealed_before;
+        if visibility_changed {
+            crate::markdown::selection::clear();
+            self.list.remeasure_items(0..self.rows.len());
+        }
+        if !changed && !visibility_changed {
             return;
         }
         if self.pinned {
@@ -1774,6 +1885,39 @@ impl Transcript {
             self.spring_kick = true;
         }
         cx.notify();
+    }
+
+    /// Structural row changes can retire entries/parts when the live tail rolls
+    /// over or history is replaced. Keep only loaded history, including pages
+    /// the user explicitly opened; ordinary token updates skip this sweep.
+    fn prune_retired_caches(
+        &mut self,
+        entries: &[SessionMessageEntry],
+        echoes: &[SessionMessageEntry],
+    ) {
+        let mut entry_ids = std::collections::HashSet::new();
+        let mut part_keys = std::collections::HashSet::new();
+        let mut live_keys = std::collections::HashSet::new();
+        for entry in entries.iter().chain(echoes) {
+            entry_ids.insert(entry.id.as_str());
+            for part in &entry.parts {
+                if let MessagePart::Text { id, .. } | MessagePart::TextWindow { id, .. } = part {
+                    let key = format!("{}#{id}", entry.id);
+                    if entry.status == Some(MessageStatus::Streaming) {
+                        live_keys.insert(key.clone());
+                    }
+                    part_keys.insert(key);
+                }
+            }
+        }
+        self.row_cache
+            .retain(|id, _| entry_ids.contains(id.as_str()));
+        self.tree_cache.retain(|key, _| part_keys.contains(key));
+        self.live_parsers.retain(|key, _| live_keys.contains(key));
+        let row_ids: std::collections::HashSet<_> = self.rows.iter().map(|row| &row.id).collect();
+        self.highlights
+            .entries
+            .retain(|(id, _), _| row_ids.contains(id));
     }
 
     /// Cached row build for one entry (streaming entries bypass the cache).
@@ -2392,6 +2536,9 @@ impl Transcript {
                 }
                 column.into_any_element()
             }
+            RowKind::PeerMessage { .. } => {
+                self.render_peer_message(&row, &theme, cx)
+            }
             RowKind::Markdown { tree, block_ix } => {
                 let Some(top) = tree.blocks.get(*block_ix) else {
                     return gpui::Empty.into_any_element();
@@ -2411,7 +2558,7 @@ impl Transcript {
                         .and_then(|chat| chat.cwd.clone())
                         .map(SharedString::from),
                 };
-                let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
+                let highlight = self.code_highlight_for(&row.id, *block_ix, &top.block, cx);
                 render::render_block(
                     &top.block,
                     *block_ix,
@@ -2419,10 +2566,7 @@ impl Transcript {
                     &opts,
                     &theme,
                     window,
-                    highlight
-                        .get(block_ix)
-                        .and_then(|o| o.as_deref())
-                        .map(|v| v.as_slice()),
+                    highlight.as_deref().map(|v| v.as_slice()),
                 )
             }
             RowKind::LiveMarkdown { tree, block_ix } => {
@@ -2461,7 +2605,7 @@ impl Transcript {
                         .and_then(|chat| chat.cwd.clone())
                         .map(SharedString::from),
                 };
-                let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
+                let highlight = self.code_highlight_for(&row.id, *block_ix, &top.block, cx);
                 let timer = frame_stats_enabled().then(Instant::now);
                 let el = render::render_block(
                     &top.block,
@@ -2470,10 +2614,7 @@ impl Transcript {
                     &opts,
                     &theme,
                     window,
-                    highlight
-                        .get(block_ix)
-                        .and_then(|o| o.as_deref())
-                        .map(|v| v.as_slice()),
+                    highlight.as_deref().map(|v| v.as_slice()),
                 );
                 if let Some(start) = timer {
                     record_live_frame_us(start.elapsed().as_micros() as u64);
@@ -2734,30 +2875,167 @@ impl Transcript {
         render::CopyUi { handler, copied_ix }
     }
 
-    /// Request highlights for the code blocks of a tree. `only` limits to one
-    /// block index (split rows); `None` covers the whole tree (live rows).
+    /// Request highlights for the visible block without scanning its whole reply.
     fn code_highlight_for(
         &mut self,
         row_id: &SharedString,
-        tree: &Arc<BlockTree>,
-        only: Option<usize>,
+        block_ix: usize,
+        block: &Block,
         cx: &mut Context<Self>,
-    ) -> HashMap<usize, Option<Arc<Vec<Vec<Token>>>>> {
-        let mut out = HashMap::new();
-        for (ix, top) in tree.blocks.iter().enumerate() {
-            if only.is_some_and(|o| o != ix) {
-                continue;
+    ) -> Option<Arc<Vec<Vec<Token>>>> {
+        let Block::CodeBlock { language, code } = block else {
+            return None;
+        };
+        let lang = language.as_deref().and_then(lang_for_tag)?;
+        self.highlights.request(
+            row_id.clone(),
+            block_ix,
+            lang,
+            code,
+            self.chat_id.clone(),
+            cx,
+        )
+    }
+
+    fn load_peer_message(&mut self, row: &Row, cx: &mut Context<Self>) {
+        let Some(chat_id) = self.chat_id.clone() else { return; };
+        let state = self.state.read(cx);
+        let Some(engine) = state.engine().cloned() else {
+            self.peer_message_details.insert(row.id.clone(), Err(()));
+            return;
+        };
+        let projection = state.transcript_room_projection(&chat_id);
+        let id = row.id.clone();
+        let version = row.version;
+        let message_id = row.entry_id.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let reply = crate::attachments::call_with_timeout(
+                &engine,
+                cx.background_executor(),
+                comet_rpc::methods::READ_DOC_MESSAGE,
+                serde_json::json!({
+                    "chatId": chat_id,
+                    "messageId": message_id.as_ref(),
+                    "roomProjection": projection,
+                }),
+                Duration::from_secs(20),
+            ).await;
+            let text = reply.ok()
+                .and_then(|value| serde_json::from_value::<SessionMessageEntry>(value).ok())
+                .filter(|entry| entry.is_peer_message() && entry.id == message_id.as_ref())
+                .map(|entry| SharedString::from(entry.parts.into_iter().filter_map(|part| {
+                    if let MessagePart::Text { text, .. } = part { Some(text) } else { None }
+                }).collect::<Vec<_>>().join("\n\n")))
+                .ok_or(());
+            this.update(cx, |transcript, cx| {
+                if transcript.chat_id.as_deref() != Some(chat_id.as_str())
+                    || transcript.peer_visibility.revealed.get(&id) != Some(&version)
+                { return; }
+                transcript.peer_message_loads.remove(&id);
+                transcript.peer_message_details.insert(id.clone(), text);
+                if let Some(ix) = transcript.rows.iter().position(|row| row.id == id) {
+                    transcript.list.remeasure_items(ix..ix + 1);
+                }
+                cx.notify();
+            }).ok();
+        });
+        self.peer_message_loads.insert(row.id.clone(), task);
+    }
+
+    fn render_peer_message(
+        &mut self,
+        row: &Row,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let revealed = self.peer_visibility.body(row).cloned();
+        let open = revealed.is_some();
+        let truncated = matches!(&row.kind, RowKind::PeerMessage { truncated: true, .. });
+        let (body, feedback) = if open && truncated {
+            match self.peer_message_details.get(&row.id) {
+                Some(Ok(text)) => (Some(text.clone()), None),
+                Some(Err(())) => (None, Some("Original message unavailable. Collapse and reveal to retry.")),
+                None => (None, Some("Loading original message…")),
             }
-            if let Block::CodeBlock { language, code } = &top.block
-                && let Some(lang) = language.as_deref().and_then(lang_for_tag)
-            {
-                out.insert(
-                    ix,
-                    self.highlights.request(row_id.clone(), ix, lang, code, cx),
-                );
-            }
-        }
-        out
+        } else {
+            (revealed, None)
+        };
+        let toggle_id = row.id.clone();
+        let header = div()
+            .id(SharedString::from(format!("{}-peer-hdr", row.id)))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(4.0))
+            .h(px(26.0))
+            .cursor_pointer()
+            .text_size(px(12.0))
+            .text_color(theme.text_muted)
+            .hover(|s| s.text_color(theme.text))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(ix) = this.rows.iter().position(|row| row.id == toggle_id) {
+                    this.peer_visibility.toggle(&this.rows[ix]);
+                    if this.peer_visibility.body(&this.rows[ix]).is_some() {
+                        if matches!(&this.rows[ix].kind, RowKind::PeerMessage { truncated: true, .. }) {
+                            let row = this.rows[ix].clone();
+                            this.load_peer_message(&row, cx);
+                        }
+                    } else {
+                        this.peer_message_details.remove(&toggle_id);
+                        this.peer_message_loads.remove(&toggle_id);
+                    }
+                    this.list.remeasure_items(ix..ix + 1);
+                    crate::markdown::selection::clear();
+                    cx.notify();
+                }
+            }))
+            .child(
+                div()
+                    .size(px(18.0))
+                    .flex_none()
+                    .rounded(px(5.0))
+                    .bg(crate::theme::ink(0.06))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(10.0))
+                    .text_color(theme.text_muted.opacity(0.7))
+                    .child(if open { "▾" } else { "▸" }),
+            )
+            .child(if open {
+                "Inter-session message · Hide"
+            } else {
+                "Inter-session message · Show"
+            });
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(header)
+            .when_some(feedback, |el, feedback| {
+                el.child(div().text_size(px(12.0)).text_color(theme.text_muted).child(feedback))
+            })
+            .when_some(body, |el, text| {
+                el.child(
+                    div()
+                        .min_w_0()
+                        .px(px(16.0))
+                        .py(px(10.0))
+                        .rounded(px(Theme::BUBBLE_RADIUS))
+                        .bg(theme.surface_raised)
+                        .text_size(px(14.0))
+                        .line_height(px(22.0))
+                        .text_color(theme.text)
+                        .child(render::selectable_styled_text(
+                            format!("{}#peer:0", row.id).into(),
+                            text.clone(),
+                            StyledText::new(text),
+                            theme,
+                        )),
+                )
+            })
+            .into_any_element()
     }
 
     fn render_tool_group(
@@ -3411,6 +3689,13 @@ fn tool_detail_pane(
 fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
     let mut acc: Vec<u8> = Vec::with_capacity(entry.parts.len() * 8 + 16);
     acc.extend_from_slice(entry.id.as_bytes());
+    acc.push(match entry.role {
+        MessageRole::User => 0,
+        MessageRole::Assistant => 1,
+        MessageRole::System => 2,
+    });
+    acc.push(entry.is_peer_message() as u8);
+    acc.extend_from_slice(&entry.created_at.to_le_bytes());
     acc.push(match entry.status {
         None => 0,
         Some(MessageStatus::Streaming) => 1,
@@ -3423,6 +3708,18 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
     for part in &entry.parts {
         acc.extend_from_slice(part.id().as_bytes());
         acc.extend_from_slice(&(part.byte_len() as u64).to_le_bytes());
+        if entry.role == MessageRole::User {
+            match part {
+                MessagePart::Text { text, .. } => {
+                    acc.extend_from_slice(&fnv1a(text.as_bytes()).to_le_bytes());
+                }
+                MessagePart::TextWindow { text, omitted_prefix_bytes, .. } => {
+                    acc.extend_from_slice(&fnv1a(text.as_bytes()).to_le_bytes());
+                    acc.extend_from_slice(&omitted_prefix_bytes.to_le_bytes());
+                }
+                _ => {}
+            }
+        }
         if let MessagePart::Tool {
             is_error, resolved, ..
         } = part
@@ -3874,6 +4171,7 @@ mod tests {
             device_id: "dev".into(),
             status: Some(status),
             continuation_of: None,
+            peer_message: None,
         }
     }
 
@@ -4115,6 +4413,77 @@ mod tests {
         ));
     }
 
+    fn peer_entry(text: &str) -> SessionMessageEntry {
+        let mut entry = assistant("peer-command", MessageStatus::Complete, vec![text_part("t0", text)]);
+        entry.role = MessageRole::User;
+        entry.peer_message = Some(comet_proto::PeerMessageProvenance {
+            command_id: entry.id.clone(),
+            source_chat_id: "source".into(),
+            thread_id: "thread".into(),
+            reply_to: None,
+        });
+        entry
+    }
+
+    #[test]
+    fn peer_rows_reveal_exact_transport_and_collapse() {
+        let raw = crate::attachments::with_attachment_files(
+            "  [src/lib.rs](file:///repo/src/lib.rs)\n\nPeer message from another session  ",
+            &["/data/uploads/image.png".into()],
+            &["/data/uploads/source.txt".into()],
+        );
+        let mut entry = peer_entry(&raw);
+        entry.status = Some(MessageStatus::Streaming);
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(&rows[0].kind, RowKind::PeerMessage { .. }));
+        let mut visibility = PeerMessageVisibility::default();
+        assert!(visibility.body(&rows[0]).is_none());
+        visibility.toggle(&rows[0]);
+        assert_eq!(visibility.body(&rows[0]).map(|text| text.as_ref()), Some(raw.as_str()));
+        visibility.toggle(&rows[0]);
+        assert!(visibility.body(&rows[0]).is_none());
+    }
+
+    #[test]
+    fn peer_reveal_does_not_survive_replacement_removal_or_reattachment() {
+        let mut entry = peer_entry("first");
+        let first = rows_for_entry(&entry, false, &mut parse);
+        let mut visibility = PeerMessageVisibility::default();
+        visibility.toggle(&first[0]);
+        entry.parts = vec![text_part("t0", "other")];
+        let replacement = rows_for_entry(&entry, false, &mut parse);
+        visibility.retain_rows(&replacement);
+        assert!(visibility.body(&replacement[0]).is_none());
+        assert!(visibility.body(&first[0]).is_none());
+        visibility.toggle(&replacement[0]);
+        visibility.clear();
+        assert!(visibility.body(&replacement[0]).is_none());
+        visibility.toggle(&replacement[0]);
+        visibility.retain_rows(&[]);
+        assert!(visibility.body(&replacement[0]).is_none());
+    }
+
+    #[test]
+    fn peer_lookalikes_invalid_metadata_and_assistants_stay_visible() {
+        let text = "[Peer message from worker] keep this ordinary prompt visible";
+        let mut entry = peer_entry(text);
+        entry.peer_message = None;
+        let ordinary = rows_for_entry(&entry, false, &mut parse);
+        assert!(matches!(&ordinary[0].kind, RowKind::User { text: body, .. } if body.as_ref() == text));
+        entry = peer_entry(text);
+        entry.peer_message.as_mut().unwrap().command_id = "different".into();
+        let invalid = rows_for_entry(&entry, false, &mut parse);
+        assert!(matches!(&invalid[0].kind, RowKind::User { text: body, .. } if body.as_ref() == text));
+        entry = peer_entry(text);
+        let peer = rows_for_entry(&entry, false, &mut parse);
+        assert!(diff_rows(&ordinary, &peer).is_some());
+        assert!(diff_rows(&peer, &invalid).is_some());
+        entry.role = MessageRole::Assistant;
+        let assistant = rows_for_entry(&entry, false, &mut parse);
+        assert!(matches!(&assistant[0].kind, RowKind::Markdown { .. }));
+    }
+
     #[test]
     fn bounded_text_rows_show_omitted_byte_marker() {
         let assistant = assistant(
@@ -4215,8 +4584,7 @@ mod tests {
 
     /// A sent prompt's file mentions render as chips in the transcript: the
     /// row carries the projected display text plus spans, while ordinary
-    /// prompts keep the empty-spans fast path. The row version derives from
-    /// the RAW text either way, so projection never perturbs the diff key.
+    /// prompts keep the empty-spans fast path.
     #[test]
     fn user_rows_project_file_mentions_into_chips() {
         let raw = "look at [composer.rs](comet-file:crates/ui/src/composer.rs) please";
@@ -4240,8 +4608,17 @@ mod tests {
             let projected: &str = "\u{00A0}@composer.rs\u{00A0}";
             projected
         });
-        // Raw length in the high bits; delivery (Normal) and pending are zero.
-        assert_eq!(rows[0].version, (raw.len() as u64) << 3);
+
+        // A same-length target edit keeps the chip label, but must invalidate
+        // the row so its click target is rebuilt rather than left stale.
+        entry.parts = vec![text_part("t0", &raw.replace("crates/ui/", "crates/ux/"))];
+        let replaced = rows_for_entry(&entry, false, &mut parse);
+        let RowKind::User { text: replaced_text, mentions: replaced_mentions, .. } = &replaced[0].kind else {
+            panic!("expected a user row");
+        };
+        assert_eq!(replaced_text, text);
+        assert_eq!(replaced_mentions[0].path.as_ref(), "crates/ux/src/composer.rs");
+        assert_eq!(diff_rows(&rows, &replaced), Some((0..1, 1)));
 
         entry.parts = vec![text_part("t0", "no mentions here")];
         let rows = rows_for_entry(&entry, false, &mut parse);
@@ -4452,6 +4829,7 @@ mod tests {
             device_id: "dev".into(),
             status: None,
             continuation_of: None,
+            peer_message: None,
         };
         let rows = rows_for_entry(&user, true, &mut parse);
         assert_eq!(rows.len(), 1);
