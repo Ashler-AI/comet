@@ -58,6 +58,10 @@ struct Repository {
     path: &'static str,
     sha256: String,
     byte_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prerequisite_sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shallow: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -88,11 +92,12 @@ impl ManifestEntry {
 }
 #[cfg(test)]
 pub(crate) fn capture_worktree_handoff(cwd: &Path) -> Result<WorktreeHandoffArchive, EngineError> {
-    capture_worktree_handoff_cancellable(cwd, &CancellationToken::new())
+    capture_worktree_handoff_cancellable(cwd, None, &CancellationToken::new())
 }
 
 pub(crate) fn capture_worktree_handoff_cancellable(
     cwd: &Path,
+    remote_base: Option<&str>,
     cancellation: &CancellationToken,
 ) -> Result<WorktreeHandoffArchive, EngineError> {
     check_cancelled(cancellation)?;
@@ -185,6 +190,7 @@ pub(crate) fn capture_worktree_handoff_cancellable(
         archive.as_file_mut(),
         &canonical_root,
         &base_sha,
+        remote_base,
         cancellation,
     )?;
     let mut manifest_variable_bytes = listing_bytes;
@@ -271,10 +277,11 @@ fn append_repository(
     archive: &mut File,
     root: &Path,
     base_sha: &str,
+    remote_base: Option<&str>,
     cancellation: &CancellationToken,
 ) -> Result<Repository, EngineError> {
-    // A detached HEAD in a private bare repository pins the bundle without
-    // racing or changing any source refs, including a linked worktree's HEAD.
+    // Pin HEAD and traversal boundaries privately; never change source refs,
+    // its index, or its shallow metadata (including for linked worktrees).
     let repository = tempfile::tempdir()?;
     if repository.path().canonicalize()?.starts_with(root) {
         return Err(invalid(
@@ -319,6 +326,96 @@ fn append_repository(
         repository.path().join("objects/info/alternates"),
         format!("{objects}\n"),
     )?;
+    let shallow_path = run_git_bounded(
+        root,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "shallow",
+        ],
+        16 * 1024,
+        cancellation,
+    )?;
+    let shallow_path = std::str::from_utf8(trim_ascii(&shallow_path))
+        .map_err(|_| invalid("Source Git shallow path is not UTF-8"))?;
+    let mut source_boundaries = BTreeSet::new();
+    match File::open(shallow_path) {
+        Ok(file) => {
+            let mut boundaries = Vec::new();
+            file.take(MAX_GIT_PATH_OUTPUT_BYTES as u64 + 1)
+                .read_to_end(&mut boundaries)?;
+            if boundaries.len() > MAX_GIT_PATH_OUTPUT_BYTES {
+                return Err(invalid("Source Git shallow metadata exceeds its limit"));
+            }
+            let text = std::str::from_utf8(&boundaries)
+                .map_err(|_| invalid("Source Git shallow metadata is not UTF-8"))?;
+            for boundary in text.lines() {
+                if source_boundaries.len() >= MAX_HANDOFF_FILES {
+                    return Err(invalid("Source Git has too many shallow boundaries"));
+                }
+                source_boundaries.insert(validate_base_sha(boundary)?.to_string());
+            }
+            std::fs::write(repository.path().join("shallow"), boundaries)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut prerequisite_sha = match remote_base {
+        Some(remote_base) => {
+            let remote_base = validate_base_sha(remote_base)?;
+            // Missing/unrelated sandbox commits deliberately fall back to a
+            // snapshot. Lazy fetching is disabled for this ancestry check.
+            let known_ancestor = run_git_bounded(
+                repository.path(),
+                &["merge-base", "--is-ancestor", remote_base, base_sha],
+                1024,
+                cancellation,
+            )
+            .is_ok();
+            check_cancelled(cancellation)?;
+            known_ancestor.then(|| remote_base.to_string())
+        }
+        None => None,
+    };
+    if let Some(prerequisite) = prerequisite_sha.as_deref() {
+        let exclusion = format!("^{prerequisite}");
+        let commits = run_git_bounded(
+            repository.path(),
+            &["rev-list", "--boundary", "HEAD", &exclusion],
+            MAX_GIT_PATH_OUTPUT_BYTES,
+            cancellation,
+        )?;
+        // A merged branch can add an older exclusion boundary even in a full
+        // clone. The receiver only guarantees the declared prerequisite, not
+        // its ancestors. Source shallow boundaries also require a snapshot.
+        if commits.split(|byte| *byte == b'\n').any(|commit| {
+            if let Some(boundary) = commit.strip_prefix(b"-") {
+                boundary != prerequisite.as_bytes()
+            } else {
+                std::str::from_utf8(commit).is_ok_and(|sha| source_boundaries.contains(sha))
+            }
+        }) {
+            prerequisite_sha = None;
+        }
+    }
+    if prerequisite_sha.as_deref() == Some(base_sha) {
+        append_bytes(archive, REPOSITORY_PATH, &[], 0o600)?;
+        return Ok(Repository {
+            path: REPOSITORY_PATH,
+            sha256: hex_sha256(&[]),
+            byte_count: 0,
+            prerequisite_sha,
+            shallow: None,
+        });
+    }
+    let shallow = prerequisite_sha.is_none().then_some(true);
+    if shallow.is_some() {
+        // A single exact commit and its tree, not the repository's history.
+        std::fs::write(repository.path().join("shallow"), format!("{base_sha}\n"))?;
+    }
+    let exclusion = prerequisite_sha.as_ref().map(|sha| format!("^{sha}"));
+    hydrate_missing_bundle_objects(root, repository.path(), exclusion.as_deref(), cancellation)?;
 
     let header_offset = archive.stream_position()?;
     append_tar_header(archive, REPOSITORY_PATH, 0, 0o600)?;
@@ -327,12 +424,14 @@ fn append_repository(
     // pre-write capacity checks. No bundle-sized buffer or temporary pack on disk.
     let limit = MAX_HANDOFF_ARCHIVE_BYTES.saturating_sub(output.metadata()?.len() + 1535);
     let cancel_reader = cancellation.clone();
-    let (sha256, byte_count) = run_git_with_reader(
-        repository.path(),
-        &["-c", "pack.threads=1", "bundle", "create", "-", "HEAD"],
-        cancellation,
-        move |input| copy_bundle_bounded(input, output, limit, &cancel_reader),
-    )?;
+    let mut args = vec!["-c", "pack.threads=1", "bundle", "create", "-", "HEAD"];
+    if let Some(exclusion) = exclusion.as_deref() {
+        args.push(exclusion);
+    }
+    let (sha256, byte_count) =
+        run_git_with_reader(repository.path(), &args, cancellation, move |input| {
+            copy_bundle_bounded(input, output, limit, &cancel_reader)
+        })?;
     let end = archive.stream_position()?;
     archive.seek(SeekFrom::Start(header_offset))?;
     append_tar_header(archive, REPOSITORY_PATH, byte_count, 0o600)?;
@@ -342,7 +441,239 @@ fn append_repository(
         path: REPOSITORY_PATH,
         sha256,
         byte_count,
+        prerequisite_sha,
+        shallow,
     })
+}
+
+fn hydrate_missing_bundle_objects(
+    source: &Path,
+    repository: &Path,
+    exclusion: Option<&str>,
+    cancellation: &CancellationToken,
+) -> Result<(), EngineError> {
+    let mut hydrated = BTreeSet::new();
+    let objects = repository.join("objects");
+    let limits = FetchLimits::default();
+    loop {
+        let mut args = vec![
+            "rev-list",
+            "--objects",
+            "--no-object-names",
+            "--missing=print",
+            "HEAD",
+        ];
+        if let Some(exclusion) = exclusion {
+            args.push(exclusion);
+        }
+        let listing = run_git_bounded(repository, &args, MAX_GIT_PATH_OUTPUT_BYTES, cancellation)?;
+        let listing = std::str::from_utf8(&listing)
+            .map_err(|_| invalid("Source Git object listing is not UTF-8"))?;
+        let Some(object) = listing.lines().find_map(|line| line.strip_prefix('?')) else {
+            return Ok(());
+        };
+        let object = validate_base_sha(object)?;
+        if hydrated.len() >= limits.objects || !hydrated.insert(object.to_string()) {
+            return Err(invalid(
+                "Source Git objects could not be hydrated within the handoff limit",
+            ));
+        }
+        // Preserve the source's remote/auth configuration, but redirect every
+        // child fetch into private storage. Its alternates provide source reads.
+        run_git_with_reader_fetching(
+            source,
+            &["cat-file", "-s", object],
+            cancellation,
+            Some((&objects, limits, true)),
+            |mut input| {
+                let mut size = String::new();
+                input.by_ref().take(64).read_to_string(&mut size)?;
+                let size = size
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|_| invalid("Invalid hydrated Git object size"))?;
+                if size > MAX_HANDOFF_ARCHIVE_BYTES {
+                    return Err(invalid("Source Git object exceeds the handoff limit"));
+                }
+                Ok(())
+            },
+        )?;
+        // A server may include more than the requested object. Account every
+        // local pack before another fetch or the final bundle, not just stdout.
+        verify_fetched_objects(repository, &objects, limits, cancellation)?;
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FetchLimits {
+    file_bytes: u64,
+    storage_bytes: u64,
+    memory_bytes: u64,
+    objects: usize,
+    expanded_bytes: u64,
+}
+
+impl Default for FetchLimits {
+    fn default() -> Self {
+        Self {
+            file_bytes: MAX_HANDOFF_ARCHIVE_BYTES,
+            storage_bytes: 512 * 1024 * 1024,
+            memory_bytes: 2 * 1024 * 1024 * 1024,
+            objects: 250_000,
+            expanded_bytes: 4 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
+// Inspect only the private directory, never follow its source alternates. This
+// runs during fetch (10ms polling) and again after exit: aggregate limits are
+// observed/cancelled, while RLIMIT_FSIZE is the hard per-file write boundary.
+fn inspect_fetch_storage(
+    objects: &Path,
+    limits: FetchLimits,
+    cancellation: &CancellationToken,
+) -> Result<Vec<PathBuf>, EngineError> {
+    let mut files = Vec::new();
+    let pack_directory = objects.join("pack");
+    let mut bytes = 0_u64;
+    let mut entries = 0_usize;
+    let mut pack_objects = 0_u64;
+    let mut directories = vec![(objects.to_path_buf(), 0)];
+    while let Some((directory, depth)) = directories.pop() {
+        for entry in std::fs::read_dir(directory)? {
+            check_cancelled(cancellation)?;
+            let entry = entry?;
+            entries += 1;
+            if entries > limits.objects.saturating_add(260) {
+                return Err(invalid("Fetched Git storage has too many entries"));
+            }
+            let path = entry.path();
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if metadata.is_dir() && depth == 0 {
+                directories.push((path, depth + 1));
+                continue;
+            }
+            if !metadata.is_file() {
+                return Err(invalid("Unexpected fetched Git storage entry"));
+            }
+            bytes = bytes.saturating_add(metadata.len());
+            if metadata.len() > limits.file_bytes || bytes > limits.storage_bytes {
+                return Err(invalid("Fetched Git storage exceeds the handoff limit"));
+            }
+            if path.parent() == Some(pack_directory.as_path()) {
+                let mut header = [0_u8; 12];
+                match open_regular_nofollow(&path) {
+                    Ok(mut file) => {
+                        if file.read_exact(&mut header).is_ok() && &header[..4] == b"PACK" {
+                            pack_objects +=
+                                u32::from_be_bytes(header[8..12].try_into().unwrap()) as u64;
+                            if pack_objects > limits.objects as u64 {
+                                return Err(invalid("Fetched Git packs contain too many objects"));
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            files.push(path);
+        }
+    }
+    Ok(files)
+}
+
+fn verify_fetched_objects(
+    repository: &Path,
+    objects: &Path,
+    limits: FetchLimits,
+    cancellation: &CancellationToken,
+) -> Result<(), EngineError> {
+    let files: BTreeSet<_> = inspect_fetch_storage(objects, limits, cancellation)?
+        .into_iter()
+        .collect();
+    let alternates = objects.join("info/alternates");
+    let pack_directory = objects.join("pack");
+    let mut count = 0_usize;
+    let mut expanded = 0_u64;
+    for path in &files {
+        if path == &alternates {
+            continue;
+        }
+        if path.parent() != Some(pack_directory.as_path()) {
+            return Err(invalid("Unexpected loose object in isolated Git fetch"));
+        }
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("pack" | "promisor" | "rev")
+                if files.contains(&path.with_extension("idx"))
+                    && files.contains(&path.with_extension("pack")) =>
+            {
+                continue;
+            }
+            Some("idx") if files.contains(&path.with_extension("pack")) => {}
+            _ => return Err(invalid("Incomplete isolated Git fetch")),
+        }
+        let path = path
+            .to_str()
+            .ok_or_else(|| invalid("Git pack path is not UTF-8"))?;
+        let (pack_count, pack_bytes) = run_git_with_reader_fetching(
+            repository,
+            &["verify-pack", "-v", path],
+            cancellation,
+            Some((objects, limits, false)),
+            move |input| {
+                use std::io::BufRead as _;
+                let mut input = io::BufReader::new(input);
+                let mut line = String::new();
+                let mut count = 0_usize;
+                let mut expanded = 0_u64;
+                loop {
+                    line.clear();
+                    if std::io::Read::by_ref(&mut input)
+                        .take(1025)
+                        .read_line(&mut line)?
+                        == 0
+                    {
+                        return Ok((count, expanded));
+                    }
+                    if line.len() > 1024 {
+                        return Err(invalid("Git object accounting output exceeds its limit"));
+                    }
+                    let mut fields = line.split_whitespace();
+                    let Some(sha) = fields.next() else { continue };
+                    if validate_base_sha(sha).is_err() {
+                        continue;
+                    }
+                    let _kind = fields.next();
+                    let size = fields
+                        .next()
+                        .and_then(|size| size.parse::<u64>().ok())
+                        .ok_or_else(|| invalid("Invalid fetched Git object size"))?;
+                    count += 1;
+                    expanded = expanded.saturating_add(size);
+                    if size > MAX_HANDOFF_ARCHIVE_BYTES
+                        || count > limits.objects
+                        || expanded > limits.expanded_bytes
+                    {
+                        return Err(invalid(
+                            "Fetched Git objects exceed the expanded handoff limit",
+                        ));
+                    }
+                }
+            },
+        )?;
+        count = count.saturating_add(pack_count);
+        expanded = expanded.saturating_add(pack_bytes);
+        if count > limits.objects || expanded > limits.expanded_bytes {
+            return Err(invalid(
+                "Fetched Git objects exceed the expanded handoff limit",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn copy_bundle_bounded(
@@ -663,8 +994,100 @@ fn run_git_with_reader<T: Send + 'static>(
     cancellation: &CancellationToken,
     consume: impl FnOnce(std::process::ChildStdout) -> Result<T, EngineError> + Send + 'static,
 ) -> Result<T, EngineError> {
+    run_git_with_reader_fetching(cwd, args, cancellation, None, consume)
+}
+
+#[cfg(target_os = "macos")]
+fn inspect_fetch_memory(group: u32, limit: u64) -> Result<(), EngineError> {
+    // Darwin's RLIMIT_AS/RSS are not hard memory limits. Enforce observed total
+    // group RSS instead; between-sample overshoot remains possible. Fixed-size
+    // buffers bound inspection and reject unexpectedly large process groups.
+    #[repr(C)]
+    #[derive(Default)]
+    struct TaskInfo {
+        sizes_and_times: [u64; 6],
+        counters: [i32; 12],
+    }
+    unsafe extern "C" {
+        fn proc_listpgrppids(
+            group: libc::pid_t,
+            buffer: *mut libc::c_void,
+            size: libc::c_int,
+        ) -> libc::c_int;
+        fn proc_pidinfo(
+            pid: libc::c_int,
+            flavor: libc::c_int,
+            arg: u64,
+            buffer: *mut libc::c_void,
+            size: libc::c_int,
+        ) -> libc::c_int;
+    }
+    let mut pids = [0 as libc::pid_t; 65];
+    let count = unsafe {
+        proc_listpgrppids(
+            group as libc::pid_t,
+            pids.as_mut_ptr().cast(),
+            std::mem::size_of_val(&pids) as libc::c_int,
+        )
+    };
+    if count < 0 || count as usize >= pids.len() {
+        return Err(invalid("Could not bound Git fetch process group"));
+    }
+    let mut resident = 0_u64;
+    for pid in &pids[..count as usize] {
+        if *pid <= 0 {
+            return Err(invalid("Invalid Git fetch process group member"));
+        }
+        let mut info = TaskInfo::default();
+        let size = std::mem::size_of::<TaskInfo>() as libc::c_int;
+        let read = unsafe { proc_pidinfo(*pid, 4, 0, (&mut info as *mut TaskInfo).cast(), size) };
+        if read != size {
+            // Exited members (including zombies) have no task memory to inspect.
+            if io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                continue;
+            }
+            return Err(invalid("Could not inspect Git fetch process memory"));
+        }
+        resident = resident.saturating_add(info.sizes_and_times[1]);
+        if resident > limit {
+            return Err(invalid(
+                "Git fetch process memory exceeds the handoff limit",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn run_git_with_reader_fetching<T: Send + 'static>(
+    cwd: &Path,
+    args: &[&str],
+    cancellation: &CancellationToken,
+    fetch: Option<(&Path, FetchLimits, bool)>,
+    consume: impl FnOnce(std::process::ChildStdout) -> Result<T, EngineError> + Send + 'static,
+) -> Result<T, EngineError> {
     check_cancelled(cancellation)?;
+    if fetch.is_some() && !cfg!(any(target_os = "linux", target_os = "macos")) {
+        return Err(invalid(
+            "Isolated Git hydration requires supported subprocess memory enforcement",
+        ));
+    }
     let mut command = Command::new("git");
+    if fetch.is_some() {
+        command.args([
+            "-c",
+            "pack.threads=1",
+            "-c",
+            "index.threads=1",
+            "-c",
+            "fetch.unpackLimit=0",
+            "-c",
+            "transfer.unpackLimit=0",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
+        ]);
+    }
     command
         .args(args)
         .env("ASHLER_INCREMENTAL_TSC_CHECKS", "false")
@@ -674,15 +1097,51 @@ fn run_git_with_reader<T: Send + 'static>(
         .env_remove("GIT_INDEX_FILE")
         .env_remove("GIT_OBJECT_DIRECTORY")
         .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_SHALLOW_FILE")
+        .env(
+            "GIT_NO_LAZY_FETCH",
+            if fetch.is_some_and(|(_, _, lazy)| lazy) {
+                "0"
+            } else {
+                "1"
+            },
+        )
         .env("GIT_NO_REPLACE_OBJECTS", "1")
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    if let Some((objects, _, _)) = fetch {
+        // Apply only this explicitly controlled override AFTER clearing caller
+        // environment; Git's promisor fetch/index-pack children inherit it.
+        command.env("GIT_OBJECT_DIRECTORY", objects);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
+        if let Some((_, limits, _)) = fetch {
+            // pre_exec is limited to async-signal-safe syscalls and stack data.
+            unsafe {
+                command.pre_exec(move || {
+                    for (resource, value) in [
+                        (libc::RLIMIT_FSIZE, limits.file_bytes),
+                        #[cfg(target_os = "linux")]
+                        (libc::RLIMIT_AS, limits.memory_bytes),
+                        (libc::RLIMIT_CORE, 0),
+                    ] {
+                        let limit = libc::rlimit {
+                            rlim_cur: value as libc::rlim_t,
+                            rlim_max: value as libc::rlim_t,
+                        };
+                        if libc::setrlimit(resource, &limit) != 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                });
+            }
+        }
     }
     let mut child = command
         .spawn()
@@ -692,11 +1151,16 @@ fn run_git_with_reader<T: Send + 'static>(
     let reader = thread::spawn(move || {
         let _ = read_tx.send(consume(stdout));
     });
+    let mut reaped = false;
     let result = (|| {
         let mut output = None;
-        let mut status = None;
         loop {
             check_cancelled(cancellation)?;
+            if let Some((objects, limits, _)) = fetch {
+                #[cfg(target_os = "macos")]
+                inspect_fetch_memory(child.id(), limits.memory_bytes)?;
+                inspect_fetch_storage(objects, limits, cancellation)?;
+            }
             match read_rx.try_recv() {
                 Ok(result) => output = Some(result?),
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -705,21 +1169,24 @@ fn run_git_with_reader<T: Send + 'static>(
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {}
             }
-            if status.is_none() {
-                status = child.try_wait()?;
-            }
-            if let Some(status) = status.as_ref() {
-                if !status.success() {
-                    return Err(invalid("Git could not capture the worktree handoff"));
+            // Keep the leader waitable while output/descendants are pending, so
+            // cancellation cannot address a PGID reused after an early reap.
+            if output.is_some() {
+                if let Some((objects, limits, _)) = fetch {
+                    inspect_fetch_storage(objects, limits, cancellation)?;
                 }
-                if let Some(output) = output.take() {
-                    return Ok(output);
+                if let Some(status) = child.try_wait()? {
+                    reaped = true;
+                    if !status.success() {
+                        return Err(invalid("Git could not capture the worktree handoff"));
+                    }
+                    return Ok(output.take().expect("Git output is complete"));
                 }
             }
             thread::sleep(Duration::from_millis(10));
         }
     })();
-    if result.is_err() {
+    if result.is_err() && !reaped {
         // Git bundle spawns pack-objects; killing only Git leaves the packer
         // alive with our stdout pipe open and can hang the reader join.
         #[cfg(unix)]
@@ -953,7 +1420,7 @@ mod tests {
         let (temp, _) = fixture();
         let cancellation = CancellationToken::new();
         cancellation.cancel();
-        assert!(capture_worktree_handoff_cancellable(temp.path(), &cancellation).is_err());
+        assert!(capture_worktree_handoff_cancellable(temp.path(), None, &cancellation).is_err());
     }
 
     #[cfg(unix)]
@@ -1047,16 +1514,13 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        git(
-            unpacked.path(),
-            &["clone", "-q", "source.bundle", "restored"],
-        );
-        assert_eq!(run_head(&unpacked.path().join("restored")), linked_head);
+        let restored = restore_snapshot(unpacked.path(), &linked_head);
+        assert_eq!(run_head(&restored), linked_head);
     }
 
     #[test]
-    fn transfers_source_history_and_nested_dirty_worktree_without_destination_base() {
-        let (source, first_commit) = fixture();
+    fn transfers_source_snapshot_and_nested_dirty_worktree_without_destination_base() {
+        let (source, _) = fixture();
         let (platform, _) = fixture();
         std::fs::write(platform.path().join("platform.txt"), "unrelated platform\n").unwrap();
         git(platform.path(), &["add", "."]);
@@ -1108,18 +1572,13 @@ mod tests {
         let bundle = std::fs::read(unpacked.path().join(REPOSITORY_PATH)).unwrap();
         assert_eq!(manifest["repository"]["sha256"], hex_sha256(&bundle));
         assert_eq!(manifest["repository"]["byteCount"], bundle.len() as u64);
-        // Delete the actual source to prove all reachable Git objects are in
-        // the archive, rather than accidentally resolving through alternates.
+        // Delete the source to prove the exact HEAD tree is self-contained.
         source.close().unwrap();
-        git(
-            unpacked.path(),
-            &["clone", "-q", "source.bundle", "restored"],
-        );
-        let restored = unpacked.path().join("restored");
+        let restored = restore_snapshot(unpacked.path(), &source_head);
         assert_eq!(run_head(&restored), source_head);
-        git(
-            &restored,
-            &["merge-base", "--is-ancestor", &first_commit, "HEAD"],
+        assert_eq!(
+            git_output(&restored, &["rev-list", "--count", "HEAD"]),
+            b"1\n"
         );
         assert_eq!(
             std::fs::read_to_string(restored.join("packages/app/tracked.txt")).unwrap(),
@@ -1175,6 +1634,377 @@ mod tests {
         assert!(file.metadata().unwrap().len() <= MAX_HANDOFF_ARCHIVE_BYTES);
     }
 
+    fn unpack(snapshot: &WorktreeHandoffArchive) -> (tempfile::TempDir, serde_json::Value) {
+        let unpacked = tempfile::tempdir().unwrap();
+        assert!(
+            Command::new("tar")
+                .arg("-xf")
+                .arg(snapshot.file.path())
+                .arg("-C")
+                .arg(unpacked.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let manifest =
+            serde_json::from_slice(&std::fs::read(unpacked.path().join(MANIFEST_PATH)).unwrap())
+                .unwrap();
+        (unpacked, manifest)
+    }
+
+    fn restore_snapshot(unpacked: &Path, head: &str) -> PathBuf {
+        let restored = unpacked.join("restored");
+        std::fs::create_dir(&restored).unwrap();
+        git(&restored, &["init", "-q"]);
+        std::fs::write(restored.join(".git/shallow"), format!("{head}\n")).unwrap();
+        git(&restored, &["bundle", "unbundle", "../source.bundle"]);
+        git(&restored, &["checkout", "--detach", "-q", head]);
+        git(&restored, &["fsck", "--strict"]);
+        restored
+    }
+
+    #[test]
+    fn snapshot_omits_large_deleted_history_and_unknown_prerequisite() {
+        let (source, _) = fixture();
+        let mut large = File::create(source.path().join("historical.bin")).unwrap();
+        for index in 0..65536_u64 {
+            large
+                .write_all(&Sha256::digest(index.to_le_bytes()))
+                .unwrap();
+        }
+        drop(large);
+        git(source.path(), &["add", "."]);
+        git(source.path(), &["commit", "-qm", "large historical object"]);
+        git(source.path(), &["rm", "-q", "historical.bin"]);
+        git(
+            source.path(),
+            &["commit", "-qm", "remove historical object"],
+        );
+        let head = run_head(source.path());
+        let refs = git_output(source.path(), &["show-ref"]);
+        let snapshot = capture_worktree_handoff_cancellable(
+            source.path(),
+            Some("1111111111111111111111111111111111111111"),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let (unpacked, manifest) = unpack(&snapshot);
+        assert_eq!(manifest["repository"]["shallow"], true);
+        assert!(manifest["repository"].get("prerequisiteSha").is_none());
+        assert!(manifest["repository"]["byteCount"].as_u64().unwrap() < 16 * 1024);
+        assert_eq!(git_output(source.path(), &["show-ref"]), refs);
+        assert!(!source.path().join(".git/shallow").exists());
+        source.close().unwrap();
+        let restored = restore_snapshot(unpacked.path(), &head);
+        assert_eq!(run_head(&restored), head);
+        assert_eq!(
+            git_output(&restored, &["rev-list", "--count", "HEAD"]),
+            b"1\n"
+        );
+        assert_eq!(std::fs::read(restored.join("kept.txt")).unwrap(), b"base\n");
+    }
+
+    #[test]
+    fn delta_requires_and_restores_against_exact_ancestor() {
+        let (source, prerequisite) = fixture();
+        let platform = tempfile::tempdir().unwrap();
+        git(
+            platform.path(),
+            &["clone", "-q", source.path().to_str().unwrap(), "repo"],
+        );
+        std::fs::write(source.path().join("kept.txt"), "delta\n").unwrap();
+        git(source.path(), &["add", "."]);
+        git(source.path(), &["commit", "-qm", "delta"]);
+        let head = run_head(source.path());
+        let snapshot = capture_worktree_handoff_cancellable(
+            source.path(),
+            Some(&prerequisite),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let (unpacked, manifest) = unpack(&snapshot);
+        assert_eq!(manifest["repository"]["prerequisiteSha"], prerequisite);
+        assert!(manifest["repository"].get("shallow").is_none());
+        let restored = platform.path().join("repo");
+        let bundle = unpacked.path().join(REPOSITORY_PATH);
+        source.close().unwrap();
+        git(&restored, &["bundle", "verify", bundle.to_str().unwrap()]);
+        git(&restored, &["bundle", "unbundle", bundle.to_str().unwrap()]);
+        git(&restored, &["checkout", "--detach", "-q", &head]);
+        git(&restored, &["fsck", "--strict"]);
+        assert_eq!(run_head(&restored), head);
+        assert_eq!(
+            std::fs::read(restored.join("kept.txt")).unwrap(),
+            b"delta\n"
+        );
+        assert_eq!(
+            git_output(&restored, &["rev-parse", "HEAD^"]),
+            format!("{prerequisite}\n").as_bytes()
+        );
+    }
+
+    #[test]
+    fn equal_head_sends_empty_repository_with_dirty_overlay() {
+        let (source, head) = fixture();
+        std::fs::write(source.path().join("kept.txt"), "dirty\n").unwrap();
+        let snapshot = capture_worktree_handoff_cancellable(
+            source.path(),
+            Some(&head),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let (unpacked, manifest) = unpack(&snapshot);
+        assert_eq!(manifest["repository"]["prerequisiteSha"], head);
+        assert_eq!(manifest["repository"]["byteCount"], 0);
+        assert_eq!(manifest["repository"]["sha256"], hex_sha256(&[]));
+        assert_eq!(
+            std::fs::metadata(unpacked.path().join(REPOSITORY_PATH))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            std::fs::read(unpacked.path().join("files/kept.txt")).unwrap(),
+            b"dirty\n"
+        );
+    }
+
+    fn object_store_fingerprint(objects: &Path) -> BTreeSet<(PathBuf, String)> {
+        let mut pending = vec![objects.to_path_buf()];
+        let mut result = BTreeSet::new();
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(path);
+                } else {
+                    result.insert((
+                        path.strip_prefix(objects).unwrap().to_path_buf(),
+                        hex_sha256(&std::fs::read(path).unwrap()),
+                    ));
+                }
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn rejects_oversized_isolated_fetch_without_mutating_source_objects() {
+        let (origin, _) = fixture();
+        let mut large = File::create(origin.path().join("large.bin")).unwrap();
+        for index in 0..32768_u64 {
+            large
+                .write_all(&Sha256::digest(index.to_le_bytes()))
+                .unwrap();
+        }
+        drop(large);
+        git(origin.path(), &["add", "."]);
+        git(origin.path(), &["commit", "-qm", "large blob"]);
+        git(origin.path(), &["config", "uploadpack.allowFilter", "true"]);
+        git(
+            origin.path(),
+            &["config", "uploadpack.allowAnySHA1InWant", "true"],
+        );
+        let directory = tempfile::tempdir().unwrap();
+        git(
+            directory.path(),
+            &[
+                "clone",
+                "-q",
+                "--depth=1",
+                "--filter=blob:none",
+                "--no-checkout",
+                &format!("file://{}", origin.path().display()),
+                "partial",
+            ],
+        );
+        let source = directory.path().join("partial");
+        let source_objects = source.join(".git/objects");
+        let before = object_store_fingerprint(&source_objects);
+        let object =
+            String::from_utf8(git_output(origin.path(), &["rev-parse", "HEAD:large.bin"])).unwrap();
+        let object = object.trim();
+        let cancellation = CancellationToken::new();
+        // Separate real fetches exercise hard per-file writes, observed aggregate
+        // storage, and subprocess memory, not just a cat-file output counter.
+        for limits in [
+            FetchLimits {
+                file_bytes: 64 * 1024,
+                ..FetchLimits::default()
+            },
+            FetchLimits {
+                storage_bytes: 64 * 1024,
+                ..FetchLimits::default()
+            },
+            FetchLimits {
+                memory_bytes: 1,
+                ..FetchLimits::default()
+            },
+        ] {
+            let repository = tempfile::tempdir().unwrap();
+            git(repository.path(), &["init", "--bare", "-q"]);
+            let objects = repository.path().join("objects");
+            std::fs::write(
+                objects.join("info/alternates"),
+                format!("{}\n", source_objects.display()),
+            )
+            .unwrap();
+            let result = run_git_with_reader_fetching(
+                &source,
+                &["cat-file", "-s", object],
+                &cancellation,
+                Some((&objects, limits, true)),
+                |mut output| {
+                    io::copy(&mut output, &mut io::sink())?;
+                    Ok(())
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(object_store_fingerprint(&source_objects), before);
+            // RLIMIT_FSIZE is a hard bound even when aggregate polling has not
+            // sampled the incoming file yet.
+            for entry in std::fs::read_dir(objects.join("pack")).unwrap() {
+                assert!(entry.unwrap().metadata().unwrap().len() <= limits.file_bytes);
+            }
+            let path = repository.path().to_path_buf();
+            repository.close().unwrap();
+            assert!(!path.exists());
+        }
+        // A valid fetch can still exceed the receiver's expanded-object budget;
+        // verify the stored pack rather than trusting the requested object's size.
+        let repository = tempfile::tempdir().unwrap();
+        git(repository.path(), &["init", "--bare", "-q"]);
+        let objects = repository.path().join("objects");
+        std::fs::write(
+            objects.join("info/alternates"),
+            format!("{}\n", source_objects.display()),
+        )
+        .unwrap();
+        run_git_with_reader_fetching(
+            &source,
+            &["cat-file", "-s", object],
+            &cancellation,
+            Some((&objects, FetchLimits::default(), true)),
+            |mut output| {
+                io::copy(&mut output, &mut io::sink())?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        let error = verify_fetched_objects(
+            repository.path(),
+            &objects,
+            FetchLimits {
+                expanded_bytes: 64 * 1024,
+                ..FetchLimits::default()
+            },
+            &cancellation,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("expanded handoff limit"));
+        assert_eq!(object_store_fingerprint(&source_objects), before);
+    }
+
+    #[test]
+    fn captures_shallow_partial_clone_without_exporting_promisor_config() {
+        let (origin, _) = fixture();
+        std::fs::write(origin.path().join("kept.txt"), "current\n").unwrap();
+        git(origin.path(), &["add", "."]);
+        git(origin.path(), &["commit", "-qm", "current head"]);
+        git(origin.path(), &["config", "uploadpack.allowFilter", "true"]);
+        git(
+            origin.path(),
+            &["config", "uploadpack.allowAnySHA1InWant", "true"],
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!("file://{}", origin.path().display());
+        git(
+            directory.path(),
+            &[
+                "clone",
+                "-q",
+                "--depth=1",
+                "--filter=blob:none",
+                "--no-checkout",
+                &url,
+                "partial",
+            ],
+        );
+        let source = directory.path().join("partial");
+        git(
+            &source,
+            &["sparse-checkout", "set", "--no-cone", "/kept.txt"],
+        );
+        git(&source, &["checkout", "-q"]);
+        let head = run_head(&source);
+        let missing = git_output(
+            &source,
+            &["rev-list", "--objects", "--missing=print", "HEAD"],
+        );
+        assert!(
+            missing
+                .split(|byte| *byte == b'\n')
+                .any(|line| line.starts_with(b"?"))
+        );
+        let shallow_before = std::fs::read(source.join(".git/shallow")).unwrap();
+        let config_before = std::fs::read(source.join(".git/config")).unwrap();
+        let refs_before = git_output(&source, &["show-ref"]);
+        let index_before = std::fs::read(source.join(".git/index")).unwrap();
+        let objects_before = object_store_fingerprint(&source.join(".git/objects"));
+        let snapshot = capture_worktree_handoff(&source).unwrap();
+        assert_eq!(
+            std::fs::read(source.join(".git/shallow")).unwrap(),
+            shallow_before
+        );
+        assert_eq!(
+            std::fs::read(source.join(".git/config")).unwrap(),
+            config_before
+        );
+        assert_eq!(git_output(&source, &["show-ref"]), refs_before);
+        assert_eq!(
+            std::fs::read(source.join(".git/index")).unwrap(),
+            index_before
+        );
+        assert_eq!(
+            object_store_fingerprint(&source.join(".git/objects")),
+            objects_before
+        );
+        let (unpacked, manifest) = unpack(&snapshot);
+        assert_eq!(manifest["repository"]["shallow"], true);
+        origin.close().unwrap();
+        directory.close().unwrap();
+        let restored = restore_snapshot(unpacked.path(), &head);
+        assert_eq!(
+            std::fs::read(restored.join("kept.txt")).unwrap(),
+            b"current\n"
+        );
+        assert_eq!(
+            std::fs::read(restored.join("deleted.txt")).unwrap(),
+            b"delete\n"
+        );
+        assert_eq!(
+            git_output(&restored, &["rev-list", "--count", "HEAD"]),
+            b"1\n"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_non_promisor_blob_instead_of_emitting_incomplete_snapshot() {
+        let (source, _) = fixture();
+        let blob = git_output(source.path(), &["rev-parse", "HEAD:deleted.txt"]);
+        let blob = std::str::from_utf8(&blob).unwrap().trim();
+        std::fs::remove_file(
+            source
+                .path()
+                .join(".git/objects")
+                .join(&blob[..2])
+                .join(&blob[2..]),
+        )
+        .unwrap();
+        assert!(capture_worktree_handoff(source.path()).is_err());
+    }
+
     fn git_output(cwd: &Path, args: &[&str]) -> Vec<u8> {
         let output = Command::new("git")
             .args(args)
@@ -1199,5 +2029,119 @@ mod tests {
         .unwrap()
         .trim()
         .to_string()
+    }
+
+    #[test]
+    fn merged_older_boundary_falls_back_to_snapshot_for_depth_one_receiver() {
+        let (source, older_boundary) = fixture();
+        git(source.path(), &["branch", "feature"]);
+        std::fs::write(source.path().join("kept.txt"), "prerequisite\n").unwrap();
+        git(source.path(), &["add", "."]);
+        git(source.path(), &["commit", "-qm", "sandbox prerequisite"]);
+        let prerequisite = run_head(source.path());
+        let platform = tempfile::tempdir().unwrap();
+        let origin_url = format!("file://{}", source.path().display());
+        git(
+            platform.path(),
+            &["clone", "-q", "--depth=1", &origin_url, "repo"],
+        );
+        let restored = platform.path().join("repo");
+        assert_eq!(run_head(&restored), prerequisite);
+        assert_eq!(
+            std::fs::read_to_string(restored.join(".git/shallow")).unwrap(),
+            format!("{prerequisite}\n")
+        );
+
+        git(source.path(), &["checkout", "-q", "feature"]);
+        std::fs::write(source.path().join("feature.txt"), "merged feature\n").unwrap();
+        git(source.path(), &["add", "."]);
+        git(
+            source.path(),
+            &["commit", "-qm", "feature from older boundary"],
+        );
+        let feature_head = run_head(source.path());
+        git(
+            source.path(),
+            &["checkout", "--detach", "-q", &prerequisite],
+        );
+        git(
+            source.path(),
+            &["merge", "-q", "--no-ff", "-m", "merge feature", "feature"],
+        );
+        let head = run_head(source.path());
+        let tree = git_output(source.path(), &["rev-parse", "HEAD^{tree}"]);
+        let snapshot = capture_worktree_handoff_cancellable(
+            source.path(),
+            Some(&prerequisite),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let (unpacked, manifest) = unpack(&snapshot);
+        assert_eq!(manifest["repository"]["shallow"], true);
+        assert!(manifest["repository"].get("prerequisiteSha").is_none());
+        source.close().unwrap();
+
+        std::fs::write(
+            restored.join(".git/shallow"),
+            format!("{prerequisite}\n{head}\n"),
+        )
+        .unwrap();
+        let bundle = unpacked.path().join(REPOSITORY_PATH);
+        git(&restored, &["bundle", "verify", bundle.to_str().unwrap()]);
+        git(&restored, &["bundle", "unbundle", bundle.to_str().unwrap()]);
+        git(&restored, &["checkout", "--detach", "-q", &head]);
+        git(&restored, &["fsck", "--strict"]);
+        assert_eq!(run_head(&restored), head);
+        assert_eq!(git_output(&restored, &["rev-parse", "HEAD^{tree}"]), tree);
+        assert_eq!(
+            git_output(&restored, &["rev-list", "--count", "HEAD"]),
+            b"1\n"
+        );
+        assert_eq!(
+            std::fs::read(restored.join("kept.txt")).unwrap(),
+            b"prerequisite\n"
+        );
+        assert_eq!(
+            std::fs::read(restored.join("feature.txt")).unwrap(),
+            b"merged feature\n"
+        );
+        for unavailable in [&older_boundary, &feature_head] {
+            assert!(
+                !Command::new("git")
+                    .args(["cat-file", "-e", unavailable])
+                    .env("ASHLER_INCREMENTAL_TSC_CHECKS", "false")
+                    .current_dir(&restored)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fetch_memory_inspection_ignores_exited_unreaped_children() {
+        use std::os::unix::process::CommandExt as _;
+        let mut child = Command::new("git")
+            .arg("--version")
+            .env("ASHLER_INCREMENTAL_TSC_CHECKS", "false")
+            .stdout(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut status = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id(),
+                &mut status,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        let inspected = inspect_fetch_memory(child.id(), 0);
+        child.wait().unwrap();
+        assert_eq!(waited, 0);
+        assert!(inspected.is_ok(), "{inspected:?}");
     }
 }

@@ -117,13 +117,28 @@ distinct Crew chat. The receipt contains `chatId`, `sandboxId`, `commandId`, and
 `environment`; it confirms command admission, not remote task completion.
 Monitor the returned chat in Crew, not standalone `handoff.*` lifecycle tools.
 
-Native transfer captures the source repository's HEAD and reachable Git history,
-plus its dirty and untracked files, into a bounded, verified archive. Scaffold
-reconstructs it at `/workspace/crew-handoff`, preserving a nested source cwd;
-the provisioned `/workspace/ashler-platform` checkout is left untouched. The two
-repositories do not need a shared commit. OMP context is rebased to the imported
-cwd. Capture/import fail closed on archive, expanded-object, checkout-size, path,
-or symlink safety violations; Git submodules are not reconstructed.
+Native transfer reads the sandbox checkout's exact HEAD before capture. When it
+is a known source ancestor and the only bundle boundary, the archive contains only
+the Git delta after that commit; matching HEADs transfer no Git objects. Dirty and untracked files remain
+a separate verified overlay. The 256 MiB archive limit is unchanged.
+
+Scaffold reconstructs the exact source HEAD at `/workspace/crew-handoff`, preserving
+a nested source cwd. Delta checkouts borrow the provisioned platform repository's
+object store, so those base objects must remain available; its checkout, index,
+and refs are left untouched. Without a usable shared ancestor, transfer includes
+a self-contained shallow snapshot of the exact source HEAD, not its history.
+Source shallow/partial clones are supported; missing selected promisor objects
+are hydrated into private temporary storage through the source's existing Git
+configuration, without copying it or growing the source object store. Fetches have
+a hard per-file write limit and observed aggregate-storage checks. Linux applies
+a per-process address-space limit; macOS samples process-group RSS and cancels on
+overflow (between-sample overshoot is possible). Every fetched pack is accounted
+against expanded-object limits before further hydration or bundling.
+OMP context is rebased to the imported cwd. Capture/import fail closed on archive,
+expanded-object, checkout-size, path, or symlink safety violations; Git submodules
+are not reconstructed. Oversized deltas still fail rather than pushing a branch
+automatically. Provisioning order is unchanged; a capture failure can still leave
+the newly provisioned remote session awaiting recovery.
 
 Starting with **0.1.86**, native handoff prepares only the captured **prior
 conversation** for attachment replay. Recognized image, file/document, and audio

@@ -1548,12 +1548,12 @@ def digest_file(path, limit, contents=False):
 def git(cwd, args, output=False):
     # No inherited repository overrides, configuration, hooks, prompts or filters.
     environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-    environment.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null", GIT_TERMINAL_PROMPT="0")
+    environment.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null", GIT_TERMINAL_PROMPT="0", GIT_NO_REPLACE_OBJECTS="1", ASHLER_INCREMENTAL_TSC_CHECKS="false")
     def limits():
         resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_TOTAL, MAX_TOTAL))
         if sys.platform == "linux":
             resource.setrlimit(resource.RLIMIT_AS, (MAX_MEMORY, MAX_MEMORY))
-    with tempfile.TemporaryFile(dir=cwd) as stdout:
+    with tempfile.TemporaryFile(dir=temporary) as stdout:
         process = subprocess.Popen(["git", "-c", "core.hooksPath=/dev/null", "-c", "pack.threads=1", "-C", str(cwd), *args], stdout=stdout if output else subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=environment, preexec_fn=limits, start_new_session=True)
         try:
             if process.wait(timeout=max(0.01, deadline - time.monotonic())) != 0: raise SystemExit(45)
@@ -1563,8 +1563,10 @@ def git(cwd, args, output=False):
                 if len(result) > 32 * 1024 * 1024: raise SystemExit(45)
                 return result
         finally:
-            try: os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError: pass
+            # wait() already reaped completed commands; never signal a stale PGID.
+            if process.returncode is None:
+                try: os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError: pass
             process.wait()
 
 def remove_path(path):
@@ -1601,8 +1603,14 @@ def inspect_bundle(path):
             raise SystemExit(45)
 
 def inspect_objects(workspace):
-    # index-pack retains compressed data; inspect expanded sizes before checkout.
-    listing = git(workspace, ["cat-file", "--batch-all-objects", "--batch-check=%(objectsize)"], True)
+    # Enumerate imported objects only, not the platform's entire object store.
+    # Thin-pack bases are copied into the local pack by index-pack.
+    alternates = workspace / ".git/objects/info/alternates"
+    alternate_bytes = alternates.read_bytes() if alternates.exists() else None
+    if alternate_bytes is not None: alternates.unlink()
+    try: listing = git(workspace, ["cat-file", "--batch-all-objects", "--batch-check=%(objectsize)"], True)
+    finally:
+        if alternate_bytes is not None: alternates.write_bytes(alternate_bytes)
     count, expanded = 0, 0
     for line in listing.splitlines():
         size = int(line)
@@ -1663,8 +1671,14 @@ try:
         raise SystemExit(42)
     cwd_parts = safe_path(expected_cwd).parts if expected_cwd else ()
     entries, repository = manifest.get("entries"), manifest.get("repository")
-    if not isinstance(entries, list) or len(entries) != expected_count or not isinstance(repository, dict) or repository.get("path") != "source.bundle" or not sha(repository.get("sha256")) or type(repository.get("byteCount")) is not int or not 0 < repository["byteCount"] <= MAX_TOTAL:
+    if not isinstance(entries, list) or len(entries) != expected_count or not isinstance(repository, dict) or repository.get("path") != "source.bundle" or not sha(repository.get("sha256")) or type(repository.get("byteCount")) is not int or not 0 <= repository["byteCount"] <= MAX_TOTAL:
         raise SystemExit(42)
+    prerequisite = repository.get("prerequisiteSha")
+    shallow = repository.get("shallow", False)
+    if "prerequisiteSha" in repository and (not isinstance(prerequisite, str) or len(prerequisite) != len(expected_base) or any(c not in "0123456789abcdef" for c in prerequisite)):
+        raise SystemExit(42)
+    if type(shallow) is not bool or (prerequisite is not None and shallow): raise SystemExit(42)
+    if repository["byteCount"] == 0 and prerequisite != expected_base: raise SystemExit(42)
     bundle = staging / "source.bundle"
     bundle_sha, bundle_bytes, _, _ = digest_file(bundle, MAX_TOTAL)
     if (bundle_sha, bundle_bytes) != (repository["sha256"], repository["byteCount"]): raise SystemExit(44)
@@ -1710,17 +1724,51 @@ try:
         total += count
     if total > MAX_TOTAL: raise SystemExit(44)
 
-    # Materialize in isolation: no command is ever run in the platform checkout.
+    # Platform commands are read-only; all refs and imported objects stay isolated.
     temporary = pathlib.Path(tempfile.mkdtemp(prefix=".crew-handoff-", dir=destination.parent))
     workspace = temporary / "checkout"
     workspace.mkdir()
     git(workspace, ["init", "-q", "--template=", "--object-format=" + ("sha256" if len(expected_base) == 64 else "sha1")])
-    git(workspace, ["bundle", "verify", str(bundle)])
-    inspect_bundle(bundle)
-    git(workspace, ["bundle", "unbundle", str(bundle)])
+    shallow_path = workspace / ".git/shallow"
+    platform_shallow = b""
+    if prerequisite is not None:
+        objects_path = pathlib.Path(git(platform, ["rev-parse", "--path-format=absolute", "--git-path", "objects"], True).decode("utf-8").strip()).resolve(strict=True)
+        if not objects_path.is_dir() or any(c in str(objects_path) for c in "\r\n"): raise SystemExit(45)
+        (workspace / ".git/objects/info/alternates").write_text(str(objects_path) + "\n")
+        if git(workspace, ["cat-file", "-t", prerequisite], True).strip() != b"commit": raise SystemExit(45)
+        git(workspace, ["update-ref", "refs/crew-handoff/prerequisite", prerequisite])
+        platform_shallow_path = pathlib.Path(git(platform, ["rev-parse", "--path-format=absolute", "--git-path", "shallow"], True).decode("utf-8").strip())
+        if platform_shallow_path.exists():
+            with platform_shallow_path.open("rb") as source: platform_shallow = source.read(MAX_OBJECTS * (len(expected_base) + 1) + 1)
+            boundaries = platform_shallow.splitlines()
+            if len(boundaries) > MAX_OBJECTS or any(len(oid) != len(expected_base) or any(c not in b"0123456789abcdef" for c in oid) for oid in boundaries): raise SystemExit(45)
+            shallow_path.write_bytes(platform_shallow)
+    elif shallow:
+        shallow_path.write_text(expected_base + "\n")
+    if bundle_bytes:
+        inspect_bundle(bundle)
+        git(workspace, ["bundle", "verify", str(bundle)])
+        git(workspace, ["bundle", "unbundle", str(bundle)])
     inspect_objects(workspace)
-    git(workspace, ["cat-file", "-e", expected_base + "^{commit}"])
-    git(workspace, ["fsck", "--full", "--strict"])
+    if git(workspace, ["cat-file", "-t", expected_base], True).strip() != b"commit": raise SystemExit(45)
+    if prerequisite is not None:
+        # Validate the imported graph and complete checkout tree, stopping at the
+        # trusted prerequisite instead of traversing all platform history.
+        shallow_path.write_text(prerequisite + "\n")
+        try:
+            git(workspace, ["merge-base", "--is-ancestor", prerequisite, expected_base])
+            # Verify imported pack contents, then walk only the bounded graph.
+            # fsck --no-full cannot validate packed HEAD; --full scans alternates.
+            for pack in (workspace / ".git/objects/pack").glob("*.pack"):
+                git(workspace, ["index-pack", "--strict", "--verify", str(pack)])
+            reachable = git(workspace, ["rev-list", "--objects", "--no-object-names", "--missing=error", expected_base], True)
+            if reachable.count(b"\n") > MAX_OBJECTS: raise SystemExit(45)
+        finally:
+            if platform_shallow: shallow_path.write_bytes(platform_shallow)
+            else: shallow_path.unlink()
+        git(workspace, ["update-ref", "-d", "refs/crew-handoff/prerequisite"])
+    else:
+        git(workspace, ["fsck", "--full", "--strict"])
     git(workspace, ["checkout", "-q", "--detach", expected_base])
     if git(workspace, ["rev-parse", "HEAD"], True).strip().decode("ascii") != expected_base: raise SystemExit(47)
     inspect_materialized_tree(workspace)
@@ -2426,6 +2474,39 @@ impl ScaffoldRuntime {
                         permit.map_err(|_| ScaffoldError::OmpSessionHandoffFailed)?
                     }
                 };
+                // Read the sandbox's actual checkout, not a mutable source-ref label.
+                // Capture uses this only when it can prove a local shared ancestor.
+                let base_argv = vec![
+                    "git".to_string(),
+                    "-C".to_string(),
+                    "/workspace/ashler-platform".to_string(),
+                    "rev-parse".to_string(),
+                    "--verify".to_string(),
+                    "HEAD^{commit}".to_string(),
+                ];
+                let remote_base = self
+                    .inner
+                    .client
+                    .exec(
+                        &sandbox_id,
+                        &ExecBody {
+                            argv: &base_argv,
+                            mode: "inline",
+                            timeout_ms: 10_000,
+                        },
+                        cancellation,
+                    )
+                    .await?;
+                if !remote_base.ok || remote_base.exit_code != Some(0) {
+                    return Err(ScaffoldError::HandoffStage("source_repository_base"));
+                }
+                let remote_base = remote_base.stdout.as_deref().unwrap_or_default().trim();
+                if !(remote_base.len() == 40 || remote_base.len() == 64)
+                    || !remote_base.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    return Err(ScaffoldError::HandoffStage("source_repository_base"));
+                }
+                let remote_base = remote_base.to_ascii_lowercase();
                 let capture_native_session_id = native_session_id.clone();
                 let capture_cwd = cwd.clone();
                 let capture_cancellation = cancellation.clone();
@@ -2446,6 +2527,7 @@ impl ScaffoldRuntime {
                     let artifact = prepare_omp_handoff_archive(captured, &capture_cancellation)?;
                     let worktree = crate::worktree_handoff::capture_worktree_handoff_cancellable(
                         std::path::Path::new(&capture_cwd),
+                        Some(&remote_base),
                         &capture_cancellation,
                     )
                     .map_err(|error| {
@@ -4354,6 +4436,242 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn worktree_materializer_imports_delta_and_equal_head_without_platform_mutation() {
+        use std::os::unix::fs::symlink;
+
+        for scenario in [
+            "delta",
+            "equal",
+            "shallow_platform",
+            "missing_prerequisite",
+            "unrelated_prerequisite",
+            "invalid_prerequisite",
+            "invalid_shallow",
+            "incompatible_shallow",
+            "zero_wrong_prerequisite",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let source = root.join("source");
+            let platform = root.join("platform");
+            let remote = root.join("remote");
+            std::fs::create_dir(&source).unwrap();
+            std::fs::create_dir(&remote).unwrap();
+            std::fs::write(remote.join("sentinel"), "preserve\n").unwrap();
+            let git = |cwd: &std::path::Path, args: &[&str]| {
+                let output = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(cwd)
+                    .env("ASHLER_INCREMENTAL_TSC_CHECKS", "false")
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                output.stdout
+            };
+            git(&source, &["init", "-q"]);
+            git(&source, &["config", "user.email", "crew@example.com"]);
+            git(&source, &["config", "user.name", "Crew"]);
+            std::fs::write(source.join("history"), vec![b'x'; 600 * 1024]).unwrap();
+            git(&source, &["add", "."]);
+            git(&source, &["commit", "-qm", "large historical object"]);
+            std::fs::remove_file(source.join("history")).unwrap();
+            std::fs::write(source.join("tracked.txt"), "base\n").unwrap();
+            std::fs::write(source.join("deleted.txt"), "delete\n").unwrap();
+            git(&source, &["add", "-A"]);
+            git(&source, &["commit", "-qm", "shared prerequisite"]);
+            let prerequisite = String::from_utf8(git(&source, &["rev-parse", "HEAD"]))
+                .unwrap()
+                .trim()
+                .to_string();
+            if scenario == "shallow_platform" {
+                git(
+                    &root,
+                    &[
+                        "clone",
+                        "-q",
+                        "--depth=1",
+                        &format!("file://{}", source.display()),
+                        platform.to_str().unwrap(),
+                    ],
+                );
+            } else {
+                git(
+                    &root,
+                    &[
+                        "clone",
+                        "-q",
+                        "--no-hardlinks",
+                        source.to_str().unwrap(),
+                        platform.to_str().unwrap(),
+                    ],
+                );
+            }
+            // The prerequisite is an object dependency, not permission to reset
+            // the platform's unrelated branch or dirty working tree.
+            git(&platform, &["config", "user.email", "platform@example.com"]);
+            git(&platform, &["config", "user.name", "Platform"]);
+            git(&platform, &["checkout", "-q", "--orphan", "platform-only"]);
+            git(&platform, &["rm", "-q", "-rf", "."]);
+            std::fs::write(platform.join("platform.txt"), "platform base\n").unwrap();
+            git(&platform, &["add", "."]);
+            git(&platform, &["commit", "-qm", "unrelated platform"]);
+            let platform_head = git(&platform, &["rev-parse", "HEAD"]);
+            let platform_refs = git(&platform, &["show-ref"]);
+            let platform_index = std::fs::read(platform.join(".git/index")).unwrap();
+            std::fs::write(platform.join("platform.txt"), "platform dirty\n").unwrap();
+            if !matches!(scenario, "equal" | "zero_wrong_prerequisite") {
+                std::fs::write(source.join("committed.txt"), "source delta\n").unwrap();
+                git(&source, &["add", "."]);
+                git(&source, &["commit", "-qm", "local change"]);
+            }
+            std::fs::write(source.join("tracked.txt"), "overlay\n").unwrap();
+            std::fs::remove_file(source.join("deleted.txt")).unwrap();
+            std::fs::create_dir(source.join("nested")).unwrap();
+            std::fs::write(source.join("nested/new.txt"), "untracked\n").unwrap();
+            symlink("tracked.txt", source.join("tracked-link")).unwrap();
+            let snapshot = crate::worktree_handoff::capture_worktree_handoff_cancellable(
+                &source.join("nested"),
+                Some(&prerequisite),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            let staging = platform.join(".scaffold/crew-handoff-staging");
+            std::fs::create_dir_all(&staging).unwrap();
+            let archive = tempfile::NamedTempFile::new().unwrap();
+            std::io::copy(
+                &mut snapshot.reopen().unwrap(),
+                &mut archive.reopen().unwrap(),
+            )
+            .unwrap();
+            assert!(
+                std::process::Command::new("tar")
+                    .args([
+                        "-xf",
+                        archive.path().to_str().unwrap(),
+                        "-C",
+                        staging.to_str().unwrap()
+                    ])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let manifest_path = staging.join(".crew-handoff-manifest.json");
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+            match scenario {
+                "missing_prerequisite" | "zero_wrong_prerequisite" => {
+                    manifest["repository"]["prerequisiteSha"] =
+                        serde_json::json!("f".repeat(prerequisite.len()));
+                }
+                "unrelated_prerequisite" => {
+                    manifest["repository"]["prerequisiteSha"] =
+                        serde_json::json!(String::from_utf8_lossy(&platform_head).trim());
+                }
+                "invalid_prerequisite" => {
+                    manifest["repository"]["prerequisiteSha"] = serde_json::json!("not-a-commit");
+                }
+                "invalid_shallow" => manifest["repository"]["shallow"] = serde_json::json!("true"),
+                "incompatible_shallow" => {
+                    manifest["repository"]["shallow"] = serde_json::json!(true)
+                }
+                _ => {}
+            }
+            let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+            let manifest_sha = format!("{:x}", sha2::Sha256::digest(&manifest_bytes));
+            std::fs::write(&manifest_path, manifest_bytes).unwrap();
+            let script = VERIFY_WORKTREE_HANDOFF_PYTHON
+                .replace("/workspace/ashler-platform", platform.to_str().unwrap())
+                .replace("/workspace/crew-handoff", remote.to_str().unwrap())
+                .replace(
+                    "MAX_HISTORY_BYTES = 4 * 1024 * 1024 * 1024",
+                    "MAX_HISTORY_BYTES = 64 * 1024",
+                );
+            let result = std::process::Command::new("python3")
+                .args([
+                    "-c",
+                    &script,
+                    staging.to_str().unwrap(),
+                    &manifest_sha,
+                    &snapshot.base_sha,
+                    &snapshot.entry_count.to_string(),
+                    &serde_json::to_string(&snapshot.cwd_relative_path).unwrap(),
+                ])
+                .output()
+                .unwrap();
+            if matches!(scenario, "delta" | "equal" | "shallow_platform") {
+                assert!(
+                    result.status.success(),
+                    "{scenario}: status={} stderr={}",
+                    result.status,
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                assert_eq!(
+                    git(&remote, &["rev-parse", "HEAD"]),
+                    git(&source, &["rev-parse", "HEAD"])
+                );
+                assert_eq!(
+                    std::fs::read(remote.join("tracked.txt")).unwrap(),
+                    b"overlay\n"
+                );
+                assert_eq!(
+                    std::fs::read(remote.join("nested/new.txt")).unwrap(),
+                    b"untracked\n"
+                );
+                assert_eq!(
+                    std::fs::read_link(remote.join("tracked-link")).unwrap(),
+                    std::path::Path::new("tracked.txt")
+                );
+                assert!(!remote.join("deleted.txt").exists());
+                assert!(!remote.join("sentinel").exists());
+                if scenario != "equal" {
+                    assert_eq!(
+                        std::fs::read(remote.join("committed.txt")).unwrap(),
+                        b"source delta\n"
+                    );
+                }
+                let history = git(&remote, &["rev-list", "--count", "HEAD"]);
+                let expected_history = if scenario == "delta" { "3" } else { "2" };
+                assert_eq!(String::from_utf8_lossy(&history).trim(), expected_history);
+            } else {
+                let expected_code =
+                    if matches!(scenario, "missing_prerequisite" | "unrelated_prerequisite") {
+                        45
+                    } else {
+                        42
+                    };
+                assert_eq!(
+                    result.status.code(),
+                    Some(expected_code),
+                    "{scenario}: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                assert_eq!(
+                    std::fs::read(remote.join("sentinel")).unwrap(),
+                    b"preserve\n"
+                );
+                assert!(!remote.join(".git").exists());
+            }
+            assert_eq!(git(&platform, &["rev-parse", "HEAD"]), platform_head);
+            assert_eq!(git(&platform, &["show-ref"]), platform_refs);
+            assert_eq!(
+                std::fs::read(platform.join(".git/index")).unwrap(),
+                platform_index
+            );
+            assert_eq!(
+                std::fs::read(platform.join("platform.txt")).unwrap(),
+                b"platform dirty\n"
+            );
+            assert!(!platform.join("tracked.txt").exists());
+            assert!(!staging.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn worktree_materializer_enforces_containment_and_separate_expansion_budgets() {
         use std::os::unix::fs::symlink;
         for scenario in [
@@ -4362,8 +4680,8 @@ mod tests {
             "object_expansion",
             "tree_expansion",
             "object_count",
-            "history_fits",
-            "history_overflow",
+            "shallow_snapshot",
+            "import_expansion",
         ] {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().canonicalize().unwrap();
@@ -4405,7 +4723,7 @@ mod tests {
                     std::fs::write(source.join("two"), &bytes).unwrap();
                 }
                 "object_count" => std::fs::write(source.join("file"), "one\n").unwrap(),
-                "history_fits" | "history_overflow" => {
+                "shallow_snapshot" => {
                     for value in [b'a', b'b', b'c'] {
                         std::fs::write(source.join("revision"), vec![value; 600 * 1024]).unwrap();
                         git(&["add", "."]);
@@ -4413,6 +4731,9 @@ mod tests {
                     }
                     std::fs::remove_file(source.join("revision")).unwrap();
                     std::fs::write(source.join("current"), "small checkout\n").unwrap();
+                }
+                "import_expansion" => {
+                    std::fs::write(source.join("current"), vec![b'x'; 600 * 1024]).unwrap();
                 }
                 _ => unreachable!(),
             }
@@ -4447,10 +4768,10 @@ mod tests {
                 .replace("/workspace/ashler-platform", platform.to_str().unwrap())
                 .replace("/workspace/crew-handoff", remote.to_str().unwrap())
                 .replace("MAX_TOTAL = 256 * 1024 * 1024", "MAX_TOTAL = 1024 * 1024");
-            let script = if scenario == "history_overflow" {
+            let script = if scenario == "import_expansion" {
                 script.replace(
                     "MAX_HISTORY_BYTES = 4 * 1024 * 1024 * 1024",
-                    "MAX_HISTORY_BYTES = 1024 * 1024",
+                    "MAX_HISTORY_BYTES = 512 * 1024",
                 )
             } else {
                 script
@@ -4472,10 +4793,10 @@ mod tests {
                 ])
                 .output()
                 .unwrap();
-            if scenario == "history_fits" {
+            if scenario == "shallow_snapshot" {
                 assert!(
                     result.status.success(),
-                    "historical revisions must not consume checkout budget: {}",
+                    "unshared history must not be imported: {}",
                     String::from_utf8_lossy(&result.stderr)
                 );
                 assert_eq!(
@@ -4490,7 +4811,7 @@ mod tests {
                     .output()
                     .unwrap();
                 assert!(history.status.success());
-                assert_eq!(String::from_utf8_lossy(&history.stdout).trim(), "4");
+                assert_eq!(String::from_utf8_lossy(&history.stdout).trim(), "1");
                 assert_eq!(
                     std::fs::read(platform.join("sentinel")).unwrap(),
                     b"platform\n"
