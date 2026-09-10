@@ -38,6 +38,7 @@ use crate::settings::advisor::AdvisorPage;
 use crate::settings::appearance::AppearancePage;
 use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
+use crate::settings::permissions::PermissionsPage;
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
     Density, KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
@@ -167,6 +168,7 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSection {
     Devices,
+    Permissions,
     Agents,
     Advisor,
     Appearance,
@@ -175,8 +177,9 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 6] = [
+    pub const ALL: [SettingsSection; 7] = [
         SettingsSection::Devices,
+        SettingsSection::Permissions,
         SettingsSection::Agents,
         SettingsSection::Advisor,
         SettingsSection::Appearance,
@@ -189,6 +192,7 @@ impl SettingsSection {
     pub fn label(self) -> &'static str {
         match self {
             SettingsSection::Devices => "Devices",
+            SettingsSection::Permissions => "Permissions",
             SettingsSection::Agents => "Accounts",
             SettingsSection::Advisor => "Advisor",
             SettingsSection::Appearance => "Appearance",
@@ -1493,6 +1497,7 @@ pub struct Shell {
     /// Route history behind the titlebar back/forward buttons (§ nav history).
     nav: NavHistory,
     devices_page: Option<Entity<DevicesPage>>,
+    permissions_page: Option<Entity<PermissionsPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
     advisor_page: Option<Entity<AdvisorPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
@@ -1717,6 +1722,7 @@ impl Shell {
                 Route::Settings(SettingsSection::Devices)
             }
             Some("settings/agents") => Route::Settings(SettingsSection::Agents),
+            Some("settings/permissions") => Route::Settings(SettingsSection::Permissions),
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
             Some("settings/advisor") => Route::Settings(SettingsSection::Advisor),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
@@ -1753,6 +1759,7 @@ impl Shell {
             changes_sub: None,
             changes_observation: None,
             devices_page: None,
+            permissions_page: None,
             archived_page: None,
             appearance_page: None,
             shortcuts_page: None,
@@ -3189,6 +3196,15 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
+            SettingsSection::Permissions => {
+                if self.permissions_page.is_none() {
+                    self.permissions_page = Some(cx.new(PermissionsPage::new));
+                }
+                match &self.permissions_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
             SettingsSection::Agents => {
                 if self.accounts_page.is_none() {
                     let state = self.state.clone();
@@ -3728,6 +3744,7 @@ impl Shell {
     ) -> AnyElement {
         let section_icon = |item: SettingsSection| match item {
             SettingsSection::Devices => icons::MONITOR,
+            SettingsSection::Permissions => icons::KEY_MINIMALISTIC,
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
             SettingsSection::Advisor => icons::CHAT_ROUND_LINE,
             SettingsSection::Appearance => icons::TUNING,

@@ -31,6 +31,9 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::watch;
 
+#[cfg(target_os = "macos")]
+mod macos_verification;
+
 /// The version compiled into this binary (the workspace version).
 pub const fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -195,11 +198,16 @@ pub enum InstallKind {
     Managed { app_root: PathBuf },
     /// Running out of a macOS `.app` bundle.
     MacApp { bundle: PathBuf },
-    /// Source build or hand-copied binary — updates are report-only.
+    /// Source, standalone staging, or hand-copied build — updates are report-only.
     Unmanaged,
 }
 
 pub fn detect_install() -> InstallKind {
+    // Both promoted release feeds distribute the production bundle. A standalone
+    // staging build must retain its separate macOS permission identity.
+    if option_env!("COMET_PACKAGE_ENVIRONMENT") == Some("staging") {
+        return InstallKind::Unmanaged;
+    }
     let Ok(exe) = std::env::current_exe() else {
         return InstallKind::Unmanaged;
     };
@@ -393,6 +401,17 @@ pub fn restart_service() -> anyhow::Result<()> {
 // macOS app-bundle installs — the desktop path
 // ---------------------------------------------------------------------------
 
+fn ensure_mac_app_updates_supported() -> anyhow::Result<()> {
+    if option_env!("COMET_PACKAGE_ENVIRONMENT") == Some("staging") {
+        bail!(
+            "Crew Staging requires a separately packaged staging update; the release feed contains Crew, not Crew Staging"
+        );
+    }
+    #[cfg(target_os = "macos")]
+    macos_verification::expected_team()?;
+    Ok(())
+}
+
 /// Download + unpack the app tarball into `{data_dir}/updates/<ver>/Crew.app`
 /// (idempotent). Returns the staged bundle path.
 pub async fn stage_mac_app(
@@ -401,10 +420,18 @@ pub async fn stage_mac_app(
     manifest: &Manifest,
     data_dir: &Path,
 ) -> anyhow::Result<PathBuf> {
+    ensure_mac_app_updates_supported()?;
     let version = &manifest.version;
     let dir = data_dir.join("updates").join(version);
     let staged = dir.join("Crew.app");
-    if staged.join("Contents/MacOS/comet").exists() {
+    if staged.exists() {
+        #[cfg(target_os = "macos")]
+        macos_verification::Policy::pinned()?
+            .verify_distribution(&staged)
+            .context("cached Crew update failed signature verification")?;
+        if !staged.join("Contents/MacOS/comet").exists() {
+            bail!("cached Crew update is not an app bundle");
+        }
         return Ok(staged);
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -425,13 +452,25 @@ pub async fn stage_mac_app(
     if !staged.join("Contents/MacOS/comet").exists() {
         bail!("app tarball {file} did not contain Crew.app");
     }
+    #[cfg(target_os = "macos")]
+    macos_verification::Policy::pinned()?
+        .verify_distribution(&staged)
+        .context("downloaded Crew update failed signature verification")?;
     Ok(staged)
 }
 
 /// Install the staged bundle next to the current app, preserving metadata and
 /// migrating legacy `Comet.app` installs to the user-facing `Crew.app` name.
+/// Incoming, copied, and installed macOS bundles are authenticated before any
+/// installed bundle is moved. Legacy ad-hoc migration requires the updater itself
+/// to run from an already trusted distribution; it never re-signs an old app.
 /// Any existing target bundle is restored if the replacement fails.
 pub fn apply_mac_app(staged: &Path, bundle: &Path) -> anyhow::Result<PathBuf> {
+    ensure_mac_app_updates_supported()?;
+    #[cfg(target_os = "macos")]
+    let policy = macos_verification::Policy::pinned()?;
+    #[cfg(target_os = "macos")]
+    policy.verify_distribution(staged)?;
     let parent = bundle
         .parent()
         .context("app bundle has no parent directory")?;
@@ -445,19 +484,45 @@ pub fn apply_mac_app(staged: &Path, bundle: &Path) -> anyhow::Result<PathBuf> {
         .to_string_lossy();
     let target_name = target_name.to_string_lossy();
     let pid = std::process::id();
-    let fresh = parent.join(format!(".{target_name}.new-{pid}"));
+    // Keep the .app suffix: stapler validates bundles by their file type.
+    let fresh = parent.join(format!(".{target_name}.new-{pid}.app"));
     let old = parent.join(format!(".{current_name}.old-{pid}"));
     let displaced_target = (target.as_path() != bundle && target.exists())
         .then(|| parent.join(format!(".{target_name}.old-{pid}")));
-    let _ = std::fs::remove_dir_all(&fresh);
-    let _ = std::fs::remove_dir_all(&old);
-    if let Some(displaced) = displaced_target.as_ref() {
-        let _ = std::fs::remove_dir_all(displaced);
+    // Do not discard an interrupted update's backups or follow a stale symlink.
+    for path in [&fresh, &old].into_iter().chain(displaced_target.iter()) {
+        if path.symlink_metadata().is_ok() {
+            bail!("update work path already exists: {}", path.display());
+        }
     }
-    run(
-        "ditto",
+    if let Err(error) = run(
+        if cfg!(target_os = "macos") {
+            "/usr/bin/ditto"
+        } else {
+            "ditto"
+        },
         &[&staged.to_string_lossy(), &fresh.to_string_lossy()],
-    )?;
+    ) {
+        let _ = std::fs::remove_dir_all(&fresh);
+        return Err(error).context("copying the verified Crew update");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Verify the actual copy, then every installed bundle we would move.
+        // All trust checks precede the first rename or removal of installed data.
+        let verified = (|| -> anyhow::Result<()> {
+            policy.verify_distribution(&fresh)?;
+            policy.verify_installed(bundle)?;
+            if displaced_target.is_some() {
+                policy.verify_installed(&target)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = verified {
+            let _ = std::fs::remove_dir_all(&fresh);
+            return Err(error).context("Crew update refused before replacing the installed app");
+        }
+    }
     if let Some(displaced) = displaced_target.as_ref() {
         std::fs::rename(&target, displaced).context("moving the existing target app aside")?;
     }
@@ -1235,8 +1300,30 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn app_update_refuses_unsigned_cached_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = Manifest {
+            version: "1.2.3".to_owned(),
+            ..Manifest::default()
+        };
+        let binary = tmp
+            .path()
+            .join("updates/1.2.3/Crew.app/Contents/MacOS/comet");
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(&binary, b"untrusted cached binary").unwrap();
+
+        assert!(
+            stage_mac_app("http://127.0.0.1:1", None, &manifest, tmp.path())
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(binary).unwrap(), b"untrusted cached binary");
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
-    fn app_update_migrates_legacy_bundle_name_to_crew() {
+    fn app_update_refuses_unsigned_legacy_migration_without_changing_install() {
         let tmp = tempfile::tempdir().unwrap();
         let legacy = tmp.path().join("Comet.app");
         let staged = tmp.path().join("updates").join("Crew.app");
@@ -1247,19 +1334,15 @@ mod tests {
         std::fs::write(&legacy_binary, b"old").unwrap();
         std::fs::write(&staged_binary, b"new").unwrap();
 
-        let installed = apply_mac_app(&staged, &legacy).unwrap();
-
-        assert_eq!(installed, tmp.path().join("Crew.app"));
-        assert!(!legacy.exists());
-        assert_eq!(
-            std::fs::read(installed.join("Contents/MacOS/comet")).unwrap(),
-            b"new"
-        );
+        assert!(apply_mac_app(&staged, &legacy).is_err());
+        assert_eq!(std::fs::read(&legacy_binary).unwrap(), b"old");
+        assert_eq!(std::fs::read(&staged_binary).unwrap(), b"new");
+        assert!(!tmp.path().join("Crew.app").exists());
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn app_update_replaces_a_stale_crew_bundle_during_legacy_migration() {
+    fn app_update_refuses_unsigned_migration_without_displacing_target() {
         let tmp = tempfile::tempdir().unwrap();
         let legacy = tmp.path().join("Comet.app");
         let target = tmp.path().join("Crew.app");
@@ -1274,14 +1357,17 @@ mod tests {
             std::fs::write(binary, contents).unwrap();
         }
 
-        let installed = apply_mac_app(&staged, &legacy).unwrap();
-
-        assert_eq!(installed, target);
-        assert!(!legacy.exists());
-        assert_eq!(
-            std::fs::read(installed.join("Contents/MacOS/comet")).unwrap(),
-            b"current"
-        );
+        assert!(apply_mac_app(&staged, &legacy).is_err());
+        for (bundle, contents) in [
+            (&legacy, b"legacy".as_slice()),
+            (&target, b"stale".as_slice()),
+            (&staged, b"current".as_slice()),
+        ] {
+            assert_eq!(
+                std::fs::read(bundle.join("Contents/MacOS/comet")).unwrap(),
+                contents
+            );
+        }
     }
 
     #[test]

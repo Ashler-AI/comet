@@ -176,10 +176,57 @@ jobs:
       COMET_RELEASE_VERSION: ${{ needs.version.outputs.version }}
       SOURCE_DATE_EPOCH: ${{ needs.version.outputs.source_epoch }}
       COMET_DEFAULT_ENVIRONMENT: production
+      # Promotion channels all reuse this production-identity bundle. Standalone
+      # Crew Staging.app is a separate local packaging target, not a release feed.
+      COMET_PACKAGE_ENVIRONMENT: production
+      COMET_MACOS_SIGNING: distribution
+      # Public release trust root, independent of notarization credentials.
+      COMET_MACOS_SIGNING_TEAM_ID: ${{ vars.MACOS_SIGNING_TEAM_ID }}
+      CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+      CODESIGN_KEYCHAIN: ${{ runner.temp }}/crew-signing.keychain-db
+      NOTARYTOOL_KEYCHAIN_PROFILE: crew-distribution
     steps:
       - uses: actions/checkout@v4
       - name: Require Apple silicon runner
         run: test "$(uname -m)" = arm64
+      - name: Import Developer ID and notarization credentials
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.MACOS_NOTARY_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          umask 077
+          for name in COMET_MACOS_SIGNING_TEAM_ID CODESIGN_IDENTITY MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing required macOS distribution credential: $name (see dist/README.md)"
+              exit 1
+            fi
+          done
+          if [[ ! "$COMET_MACOS_SIGNING_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]]; then
+            echo "::error::vars.MACOS_SIGNING_TEAM_ID must be 10 uppercase alphanumeric characters"
+            exit 1
+          fi
+          if [[ "$APPLE_TEAM_ID" != "$COMET_MACOS_SIGNING_TEAM_ID" ]]; then
+            echo "::error::Notarization team must match vars.MACOS_SIGNING_TEAM_ID"
+            exit 1
+          fi
+          certificate="$RUNNER_TEMP/crew-signing.p12"
+          trap 'rm -f "$certificate"' EXIT
+          keychain_password="$(uuidgen)"
+          echo "::add-mask::$keychain_password"
+          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$certificate"
+          security create-keychain -p "$keychain_password" "$CODESIGN_KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$CODESIGN_KEYCHAIN"
+          security unlock-keychain -p "$keychain_password" "$CODESIGN_KEYCHAIN"
+          security import "$certificate" -P "$MACOS_CERTIFICATE_PASSWORD" -k "$CODESIGN_KEYCHAIN" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$CODESIGN_KEYCHAIN" >/dev/null
+          xcrun notarytool store-credentials "$NOTARYTOOL_KEYCHAIN_PROFILE" \
+            --keychain "$CODESIGN_KEYCHAIN" --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID"
       - name: Select checked-in Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
@@ -197,6 +244,15 @@ jobs:
             target/package/comet-*.tar.gz
             target/package/SHA256SUMS
           if-no-files-found: error
+      - name: Remove temporary signing credentials
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f "$CODESIGN_KEYCHAIN" ]]; then
+            security delete-keychain "$CODESIGN_KEYCHAIN"
+          fi
+          rm -f "$RUNNER_TEMP/crew-signing.p12"
 
   candidate:
     if: >-
@@ -361,13 +417,38 @@ jobs:
             release-candidate.tar.gz.sha256
           if-no-files-found: error
 
+  verify-macos-candidate:
+    if: ${{ always() && needs.version.result == 'success' && needs.candidate.result == 'success' }}
+    needs: [version, candidate]
+    runs-on: macos-14
+    env:
+      COMET_MACOS_SIGNING_TEAM_ID: ${{ vars.MACOS_SIGNING_TEAM_ID }}
+      VERSION: ${{ needs.version.outputs.version }}
+      EXPECTED_DIGEST: ${{ needs.candidate.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-candidate-${{ needs.version.outputs.version }}
+      - name: Verify exact candidate and signed macOS artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          shasum -a 256 --check release-candidate.tar.gz.sha256
+          actual="$(shasum -a 256 release-candidate.tar.gz | cut -d' ' -f1)"
+          test "$actual" = "$EXPECTED_DIGEST"
+          mkdir candidate
+          tar -xzf release-candidate.tar.gz -C candidate
+          bash scripts/verify-macos-release.sh candidate "$VERSION"
+
   publish-staging:
     if: >-
       always() &&
       needs.version.result == 'success' &&
       needs.candidate.result == 'success' &&
+      needs['verify-macos-candidate'].result == 'success' &&
       (needs.version.outputs.promotion_target == 'staging-candidate' || needs.version.outputs.promotion_target == 'staging' || needs.version.outputs.promotion_target == 'production')
-    needs: [version, candidate]
+    needs: [version, candidate, verify-macos-candidate]
     runs-on: ubuntu-24.04
     environment: comet-release-staging
     outputs:
@@ -504,9 +585,10 @@ jobs:
       always() &&
       needs.version.result == 'success' &&
       needs.candidate.result == 'success' &&
+      needs['verify-macos-candidate'].result == 'success' &&
       needs['publish-staging'].result == 'success' &&
       needs.version.outputs.promotion_target == 'production'
-    needs: [version, candidate, publish-staging]
+    needs: [version, candidate, verify-macos-candidate, publish-staging]
     runs-on: ubuntu-24.04
     environment: comet-release-production
     env:

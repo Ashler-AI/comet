@@ -148,7 +148,10 @@ pub fn run_app(config: UiConfig) {
     app.run(move |cx: &mut App| {
         // NB: pinned-rev API — `gpui_tokio::init(cx)` free function (not `Tokio::init`).
         gpui_tokio::init(cx);
-        cx.register_url_scheme("comet").detach();
+        // Standalone staging must not take over production invitation links.
+        if option_env!("COMET_PACKAGE_ENVIRONMENT") != Some("staging") {
+            cx.register_url_scheme("comet").detach();
+        }
         register_fonts(cx);
         // Appearance before anything paints: the theme global has to be the
         // final one on the very first frame, or the window flashes the wrong

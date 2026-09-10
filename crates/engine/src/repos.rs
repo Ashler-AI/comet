@@ -4,9 +4,10 @@
 //! Repos are device-local (paths differ per machine), so the known set is a plain
 //! JSON list (`{data_dir}/repos.json`) — no sync. Existing repos can live anywhere
 //! the user points us; cloned/created ones land in `{data_dir}/repos`. Worktrees are
-//! created under `~/.comet-native/worktrees/<repoName>/<worktreeName>` (NOT the data
-//! dir — worktrees are user-facing working checkouts), with an auto-generated name +
-//! matching `comet/<name>` branch. `COMET_WORKTREES_DIR` overrides the root.
+//! created under `~/.comet-native/worktrees/<repoName>/<worktreeName>` (standalone
+//! staging uses `~/.comet-native-staging/worktrees`). Worktrees are user-facing
+//! checkouts, independent of the data dir, with a generated name + `comet/<name>`
+//! branch. `COMET_WORKTREES_DIR` explicitly overrides the ownership root.
 //!
 //! All git access is via subprocess (`tokio::process`) — never libgit2.
 
@@ -74,7 +75,14 @@ fn default_worktrees_root() -> PathBuf {
     std::env::var_os("COMET_WORKTREES_DIR")
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".comet-native").join("worktrees"))
+        .unwrap_or_else(|| {
+            let directory = if option_env!("COMET_PACKAGE_ENVIRONMENT") == Some("staging") {
+                ".comet-native-staging"
+            } else {
+                ".comet-native"
+            };
+            home_dir().join(directory).join("worktrees")
+        })
 }
 
 struct ReposInner {
@@ -91,7 +99,7 @@ pub struct Repos {
 
 impl Repos {
     /// `data_dir` holds `repos.json` + cloned/created repos; the worktree root
-    /// comes from `$COMET_WORKTREES_DIR` or `~/.comet-native/worktrees`.
+    /// comes from `$COMET_WORKTREES_DIR` or the packaged environment's default.
     pub fn new(data_dir: &Path, device_id: &str) -> Self {
         Self::with_worktrees_root(data_dir, device_id, default_worktrees_root())
     }

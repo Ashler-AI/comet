@@ -36,6 +36,32 @@ This installs the official [oh-my-pi v17.2.9](https://github.com/can1357/oh-my-p
 
 To use a remote OMP auth broker, launch Comet with `OMP_AUTH_BROKER_URL` and either `OMP_AUTH_BROKER_TOKEN` or `OMP_AUTH_BROKER_TOKEN_FILE`. The token-file form is preferred for service managers: it must be mode `0600`, is removed before parsing/spawn on every outcome, and Comet passes the bearer only in the OMP child environment, never argv or logs. Do not print or interpolate the token in shell commands. Scaffold-host OMP launches remain isolated with `--profile scaffold-host --no-extensions --no-skills --no-rules`.
 
+## macOS computer-use permissions
+
+Open **Settings → Permissions** in Crew. The page checks this desktop process
+without prompting; its executable path and PID identify the app being checked.
+Use **Request Accessibility** for inspecting and controlling other apps, and
+**Request Screen Recording** for screen capture. Approve each request yourself
+in macOS; agent tool approval does not grant operating-system access.
+
+If a prompt does not appear, use the corresponding **Open System Settings**
+button, enable the current app under Privacy & Security, then return and choose
+**Refresh status**. “Not granted” can mean never requested, declined, or restricted.
+macOS may require quitting and reopening Crew, especially for Screen Recording.
+Remote sessions and separately launched headless daemons are not covered by the
+desktop status. A terminal-launched process can have a different permission owner.
+
+If the switches are already enabled but access still fails after an update, the
+saved grant may belong to an older ad-hoc-signed binary. Install the final
+Developer ID-signed release first, then remove and re-add that app in the affected
+Privacy & Security lists and relaunch it. Moving from ad-hoc signing can require
+one last approval; normal signed updates retain the same identity. Do not replace
+the app with another build between approving access and retesting.
+
+The independently packaged **Crew Staging.app** has its own permission identity;
+it is not a launcher for the production app. See [macOS packaging](dist/README.md#macos)
+for signing prerequisites, staging isolation, and migration from ad-hoc installs.
+
 ## Local collaboration smoke
 
 The deterministic smoke uses two in-memory headless devices and needs no cloud credentials, agent CLI, network, or persistent state:

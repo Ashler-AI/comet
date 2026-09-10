@@ -13,7 +13,14 @@ use std::process::Command;
 
 use anyhow::{Context, bail};
 
-const LAUNCHD_LABEL: &str = "ai.ashler.comet";
+fn launchd_label() -> &'static str {
+    if super::is_standalone_staging() {
+        "ai.ashler.comet.staging"
+    } else {
+        "ai.ashler.comet"
+    }
+}
+
 /// Same unit name the curl|sh installer (`edge/src/install.sh`) writes, so
 /// `comet daemon …` manages that installation rather than a competing copy.
 const SYSTEMD_UNIT: &str = "comet-native.service";
@@ -54,7 +61,8 @@ pub fn install(data_dir: &Path) -> anyhow::Result<()> {
             &["bootstrap", &launchd_domain()?, &plist.to_string_lossy()],
         )?;
         println!(
-            "Installed and started {LAUNCHD_LABEL} ({}).",
+            "Installed and started {} ({}).",
+            launchd_label(),
             plist.display()
         );
     } else if cfg!(target_os = "linux") {
@@ -176,7 +184,8 @@ pub fn status() -> anyhow::Result<()> {
             .context("running launchctl")?;
         if !output.status.success() {
             println!(
-                "{LAUNCHD_LABEL}: not loaded{}",
+                "{}: not loaded{}",
+                launchd_label(),
                 if launchd_plist_path()?.exists() {
                     " (installed — `comet daemon start`)"
                 } else {
@@ -187,7 +196,7 @@ pub fn status() -> anyhow::Result<()> {
         }
         // `launchctl print` is pages long; surface just the liveness lines.
         let text = String::from_utf8_lossy(&output.stdout);
-        println!("{LAUNCHD_LABEL}: loaded");
+        println!("{}: loaded", launchd_label());
         for line in text.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with("state = ")
@@ -295,7 +304,7 @@ fn render_launchd_plist(exe: &Path, env: &[(String, String)], log: &Path) -> Str
   </dict>
 </plist>
 "#,
-        label = LAUNCHD_LABEL,
+        label = launchd_label(),
         exe = xml_escape(&exe.to_string_lossy()),
         env_dict = env_dict,
         log = xml_escape(&log.to_string_lossy()),
@@ -322,7 +331,7 @@ fn home_dir() -> anyhow::Result<PathBuf> {
 fn launchd_plist_path() -> anyhow::Result<PathBuf> {
     Ok(home_dir()?
         .join("Library/LaunchAgents")
-        .join(format!("{LAUNCHD_LABEL}.plist")))
+        .join(format!("{}.plist", launchd_label())))
 }
 
 fn systemd_unit_path() -> anyhow::Result<PathBuf> {
@@ -342,7 +351,7 @@ fn launchd_domain() -> anyhow::Result<String> {
 }
 
 fn launchd_service_target() -> anyhow::Result<String> {
-    Ok(format!("{}/{LAUNCHD_LABEL}", launchd_domain()?))
+    Ok(format!("{}/{}", launchd_domain()?, launchd_label()))
 }
 
 /// Run a command echoing it first; error (with stderr) on nonzero exit.

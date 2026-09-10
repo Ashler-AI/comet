@@ -127,6 +127,21 @@ const PRODUCTION_SCAFFOLD_URL: &str = "https://scaffold.internal.ashler.com";
 const STAGING_PROJECT_SCOPE: &str = "ashler-staging";
 const PRODUCTION_PROJECT_SCOPE: &str = "ashler-production";
 
+fn is_standalone_staging() -> bool {
+    option_env!("COMET_PACKAGE_ENVIRONMENT") == Some("staging")
+}
+
+fn ipc_port_from_env() -> u16 {
+    std::env::var("COMET_IPC_PORT")
+        .ok()
+        .and_then(|port| port.parse().ok())
+        .unwrap_or(if is_standalone_staging() {
+            27655
+        } else {
+            27654
+        })
+}
+
 fn release_defaults() -> (&'static str, &'static str, &'static str) {
     if option_env!("COMET_DEFAULT_ENVIRONMENT") == Some("production") {
         (
@@ -342,10 +357,7 @@ fn run_headed(initial_url: Option<String>) {
         data_dir: std::env::var_os("COMET_DATA_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(dirs_data_dir),
-        ipc_port: std::env::var("COMET_IPC_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(27654),
+        ipc_port: ipc_port_from_env(),
         edge_url: edge_url_from_env(),
         scaffold_url: scaffold_url_from_env(&edge_token),
         edge_token,
@@ -395,10 +407,7 @@ fn engine_config_from_env() -> comet_engine::EngineConfig {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(dirs_data_dir),
         edge_url: edge_url_from_env(),
-        ipc_port: std::env::var("COMET_IPC_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(27654),
+        ipc_port: ipc_port_from_env(),
         default_harness: harness_from_env(),
         runtime_profile: runtime_profile_from_env(),
         project_scope: std::env::var("COMET_PROJECT_SCOPE")
@@ -425,7 +434,11 @@ fn harness_from_env() -> comet_engine::HarnessId {
 
 fn dirs_data_dir() -> std::path::PathBuf {
     let home = std::env::var_os("HOME").expect("HOME not set");
-    std::path::PathBuf::from(home).join(".comet-native")
+    std::path::PathBuf::from(home).join(if is_standalone_staging() {
+        ".comet-native-staging"
+    } else {
+        ".comet-native"
+    })
 }
 
 async fn scaffold_authority_cli(ipc_port: u16) -> anyhow::Result<()> {

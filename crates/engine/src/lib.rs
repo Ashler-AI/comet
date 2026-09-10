@@ -894,7 +894,13 @@ fn ipc_port_from_env() -> u16 {
     std::env::var("COMET_IPC_PORT")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(27654)
+        .unwrap_or(
+            if option_env!("COMET_PACKAGE_ENVIRONMENT") == Some("staging") {
+                27655
+            } else {
+                27654
+            },
+        )
 }
 
 /// Filesystem-safe project/principal path segment.
