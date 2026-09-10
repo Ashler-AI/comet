@@ -22,9 +22,9 @@ automatically): [loro-swift 1.13.x](https://github.com/loro-dev/loro-swift)
 (cmark-gfm: tables/strikethrough/tasklists — the same feature set as the
 desktop's pulldown-cmark config).
 
-The Crew 0.1.88 candidate uses mobile staging **1.0 (16)** and production
-**1.0 (10)**. These are source build numbers; upload and TestFlight availability
-must be verified separately before describing either candidate as released.
+Crew 0.1.88 uses mobile staging **1.0 (16)** and production **1.0 (10)**.
+Both uploads were accepted by Apple; final processing and internal-group
+availability remain unverified pending App Store Connect login.
 
 Production and staging use the same Swift target with separate checked-in schemes,
 bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
@@ -38,6 +38,34 @@ xcodebuild -project Comet.xcodeproj -scheme Comet \
 xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 ```
+
+### Crew 0.1.88 upload evidence
+
+Both archives use source `3d4c161f27bc9a61ff1118710a18c2c9dbc085f9` on `main`.
+[Staging CI](https://github.com/Ashler-AI/comet/actions/runs/34421498961) and
+[production CI](https://github.com/Ashler-AI/comet/actions/runs/34421499417)
+passed all ten mobile scenarios. Production attempt 1 timed out during simulator
+boot; attempt 2 reran the failed job without source changes and passed.
+Downloaded archive checksums verified. Both inspection and exact uploaded IPAs
+passed strict deep signature verification with the expected bundle/build,
+matching distribution profile, and `aps-environment = production`.
+
+Apple accepted staging build **16** at **2026-09-10 00:44:26 UTC** (delivery
+`c4af3113-93ec-45e3-8213-3b75b51574d0`) and production build **10** at
+**00:56:30 UTC** (delivery `8e186c6f-902d-4fdb-b33b-72751afb5699`). Both native
+distribution logs report upload success without errors and package processing.
+Exact uploaded IPA SHA-256 values:
+
+- Staging: `c285c2d296c766cf509ade393291c19149c64a12e35d8f34ac422ef2fe760358`
+- Production: `d99ea220b77a69bec352c4f94847a2e2b6ea7c6a5a012ba38e8f10ec3191f777`
+
+Export/upload used the existing Xcode account with internal-TestFlight-only
+distribution; no tester lists changed and no public App Store submission occurred.
+The App Store Connect browser requires interactive Apple login, so processing
+completion and availability in the existing **Ashler Internal** groups are not
+claimed. Physical-phone installation, paired desktop/mobile account recovery,
+and live first-send Scaffold behavior remain manual acceptance checks.
+
 
 | Scheme | Edge | Scaffold | Project scope | Invite scheme |
 | --- | --- | --- | --- | --- |

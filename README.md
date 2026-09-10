@@ -2,6 +2,43 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Crew 0.1.88 release
+
+Source `3d4c161f27bc9a61ff1118710a18c2c9dbc085f9` is merged into `main`.
+It combines inter-session message reveal/collapse, readiness-driven Scaffold
+startup with draft retention through admission, and mobile workspace backfill,
+projection, recovery, and identity-normalization fixes. Firstmate-only worker
+lifecycle integration is not included. OpenCode review was explicitly waived by
+the user after the configured provider rejected review with a usage limit.
+
+[Staging publication](https://github.com/Ashler-AI/comet/actions/runs/34421499147)
+built desktop and both Linux Scaffold artifacts. All four downloaded artifact
+checksums and the macOS bundle's strict signature verified. The packaged app and
+live staging update feed both report **0.1.88**.
+[Production promotion](https://github.com/Ashler-AI/comet/actions/runs/34422692407)
+reused the exact candidate without rebuilding and successfully read back both
+desktop and Scaffold manifests, checksums, and version pointers. Local production
+update readback returned HTTP 401; production verification is from the authenticated
+publication workflow. The installed/running desktop was not replaced or restarted.
+
+[Edge production rollout](https://github.com/Ashler-AI/comet/actions/runs/34422649146)
+passed remote typechecking, tests, and real local Edge/Rust collaboration smoke.
+Its byte-identical candidate
+`8c159f33d9619b4dc6d3d1841c1379ae437c6f85ae3021c6360b561604b7b6a7`
+deployed to staging Worker `06163544-c132-4452-bfb2-d63fd80f49ff` and production
+Worker `fa60a9ce-6e1d-48a8-9ac7-4df449a9e4e0`. Both live health endpoints returned
+`ok: true` with the expected environment. Local typechecks were intentionally
+skipped to preserve workstation resources.
+
+Mobile staging **1.0 (16)** and production **1.0 (10)** passed all ten CI scenarios
+and were accepted by Apple for internal TestFlight processing. Distribution
+signatures, bundle/build identities, and production APNs entitlements verified.
+Final Apple processing and availability in the existing internal groups remain
+unverified pending interactive App Store Connect login; see the
+[mobile release evidence](apps/ios/README.md#crew-0188-upload-evidence).
+Live cold-Scaffold first-send acceptance and Lois's affected-account recovery
+remain manual checks, not established by fixture or local collaboration tests.
+
 ## Install the Linux daemon
 
 ```bash
