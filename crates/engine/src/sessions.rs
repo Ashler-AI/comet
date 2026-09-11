@@ -781,7 +781,6 @@ impl SessionsEngine {
                 },
                 Some(handle) => {
                     let was_turn_active = handle.turn_active;
-                    handle.turn_active = true;
                     if !handle.steerable {
                         ExistingRunDecision::Replace {
                             run_id: handle.run_id.clone(),
@@ -791,16 +790,20 @@ impl SessionsEngine {
                             prompt: request.prompt.clone(),
                             message_id: Some(user_id.clone()),
                         };
-                        if handle.steer_tx.try_send(message.clone()).is_err() {
-                            ExistingRunDecision::Replace {
-                                run_id: handle.run_id.clone(),
+                        if handle.steer_tx.try_send(message.clone()).is_ok() {
+                            handle.turn_active = true;
+                            if !was_turn_active {
+                                self.set_status(chat_id, SessionStatus::Working, true);
                             }
-                        } else {
                             let status = handle.mailbox_message_status(was_turn_active, message);
                             handle.user_message_id = user_id.clone();
                             ExistingRunDecision::Routed {
                                 run_id: handle.run_id.clone(),
                                 status,
+                            }
+                        } else {
+                            ExistingRunDecision::Replace {
+                                run_id: handle.run_id.clone(),
                             }
                         }
                     }
@@ -820,7 +823,6 @@ impl SessionsEngine {
             // impossible for an observer to hold [new message, old status]
             // — that gap read as unseen-with-no-live-run = a phantom
             // "completed" flash on every remote send (2026-07-31).
-            self.set_status(chat_id, SessionStatus::Working, false);
             self.inner.note_message(chat_id, user_message_preview(&request.prompt, peer_message));
             return Ok(run_id.clone());
         }
@@ -899,8 +901,6 @@ impl SessionsEngine {
                 .or_else(|| self.inner.resume_for(chat_id, &request.cwd));
             resume_injected = request.resume.is_some();
         }
-        lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
-
         let run_id = new_id();
         let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
         let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -947,7 +947,9 @@ impl SessionsEngine {
             ));
         }
 
-        lock(&self.inner.runs).insert(
+        {
+            let mut runs = lock(&self.inner.runs);
+            runs.insert(
             chat_id.to_string(),
             RunHandle {
                 user_message_id: user_id.clone(),
@@ -965,7 +967,8 @@ impl SessionsEngine {
                 pending_inputs,
             },
         );
-        self.set_status(chat_id, SessionStatus::Working, true);
+            self.set_status(chat_id, SessionStatus::Working, true);
+        }
         // AFTER Working (same causal-order guarantee as the steer path): the
         // lastMessageAt bump must never be observable ahead of the live run.
         self.inner.note_message(chat_id, user_message_preview(&request.prompt, peer_message));
@@ -1043,6 +1046,7 @@ impl SessionsEngine {
                 return Err(err.into());
             }
         };
+        lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
         lock(&self.inner.blocked_omp_takeovers).remove(chat_id);
 
         tokio::spawn(drive_run(
@@ -1086,9 +1090,12 @@ impl SessionsEngine {
                 return Ok(SteerOutcome::NotSteerable);
             };
             let was_turn_active = handle.turn_active;
-            handle.turn_active = true;
             if handle.steer_tx.try_send(message.clone()).is_err() {
                 return Ok(SteerOutcome::NotSteerable);
+            }
+            handle.turn_active = true;
+            if !was_turn_active {
+                self.set_status(chat_id, SessionStatus::Working, true);
             }
             handle.mailbox_message_status(was_turn_active, message)
         };
@@ -1097,12 +1104,6 @@ impl SessionsEngine {
         // The optimistic echo may already exist with a generic steer status.
         // Stamp the harness-authoritative state instead of preserving that guess.
         handle.doc_arc().set_message_status(&user_id, status)?;
-        if status == MessageStatus::Complete {
-            // Parked delivery starts the next turn now. Working must land
-            // before the lastMessageAt bump (same causal-order rule as
-            // dispatch — no phantom "completed" flash for remote observers).
-            self.set_status(chat_id, SessionStatus::Working, false);
-        }
         self.inner.note_message(chat_id, user_message_preview(prompt, peer_message));
         Ok(SteerOutcome::Accepted(status))
     }
@@ -1131,6 +1132,7 @@ impl SessionsEngine {
                     return Ok(QueueOutcome::NotRunning);
                 }
                 handle.turn_active = true;
+                self.set_status(chat_id, SessionStatus::Working, true);
                 QueueOutcome::Delivered
             } else {
                 handle.queued_followups.push_back(message);
@@ -1152,7 +1154,6 @@ impl SessionsEngine {
             handle
                 .doc_arc()
                 .set_message_status(&user_id, MessageStatus::Complete)?;
-            self.set_status(chat_id, SessionStatus::Working, false);
         }
         self.inner.note_message(chat_id, user_message_preview(prompt, peer_message));
         Ok(outcome)
@@ -1162,29 +1163,24 @@ impl SessionsEngine {
     /// `Done{interrupted}` and its streaming entry stamped `aborted`; this waits
     /// (bounded) for that settlement so callers observe a consistent doc.
     pub async fn interrupt(&self, chat_id: &str) -> Result<bool, EngineError> {
-        let target = lock(&self.inner.runs).get(chat_id).map(|h| {
-            (
+        let target = {
+            let runs = lock(&self.inner.runs);
+            runs.get(chat_id).map(|h| {
+                let parked: Vec<_> = lock(&h.pending_inputs).drain().map(|(_, tx)| tx).collect();
+                for tx in parked {
+                    let _ = tx.send(Vec::new());
+                }
+                h.interrupt_token.cancel();
+                let _ = h.cancel.send(true);
+                (
                 h.run_id.clone(),
                 h.route.harness,
-                h.interrupt_token.clone(),
-                h.cancel.clone(),
-                h.pending_inputs.clone(),
-            )
-        });
-        let Some((run_id, harness_id, token, cancel, pending)) = target else {
+                )
+            })
+        };
+        let Some((run_id, harness_id)) = target else {
             return Ok(false);
         };
-        // Unpark any blocked question FIRST (mirrors comet: harness teardown can await a
-        // parked question callback — a run stuck on a question would deadlock the stop).
-        let parked: Vec<_> = lock(&pending).drain().map(|(_, tx)| tx).collect();
-        for tx in parked {
-            let _ = tx.send(Vec::new());
-        }
-        // Harness-level interrupt (protocol + child teardown) …
-        token.cancel();
-        // … plus the engine-side grace deadline in the run task, so a harness that
-        // ignores its token still settles with a synthesized Done{interrupted}.
-        let _ = cancel.send(true);
         // Bounded settle wait (the run task appends Done + stamps `aborted`).
         for _ in 0..500 {
             if !self.is_live(chat_id, &run_id) {
@@ -1612,6 +1608,13 @@ impl Inner {
         self.doc_host.get().and_then(|host| host.workspace())
     }
 
+    fn workspace_continuation_id(&self, chat_id: &str) -> String {
+        self.doc_host.get().map_or_else(
+            || chat_id.to_string(),
+            |host| host.workspace_continuation_id(chat_id),
+        )
+    }
+
     /// Sidebar freshness: push a message-persist preview into the chat's workspace row.
     fn note_message(&self, chat_id: &str, text: &str) {
         if text.is_empty() {
@@ -1675,8 +1678,9 @@ impl Inner {
             },
         );
         if let Some(ws) = self.workspace() {
-            ws.set_chat_harness_session(chat_id, session_id, cwd);
-            if let Err(err) = ws.clear_chat_fork(chat_id) {
+            let workspace_id = self.workspace_continuation_id(chat_id);
+            ws.set_chat_harness_session(&workspace_id, session_id, cwd);
+            if let Err(err) = ws.clear_chat_fork(&workspace_id) {
                 tracing::warn!(chat = %chat_id, error = %err, "consumed session fork cleanup failed");
             }
         }
@@ -1697,7 +1701,7 @@ impl Inner {
             },
         );
         if let Some(ws) = self.workspace() {
-            ws.set_chat_harness_session(chat_id, "", "");
+            ws.set_chat_harness_session(&self.workspace_continuation_id(chat_id), "", "");
         }
     }
 
@@ -1716,7 +1720,8 @@ impl Inner {
                 .then_some(known.session_id);
         }
         if let Some(ws) = self.workspace()
-            && let Some((session_id, session_cwd)) = ws.chat_harness_session(chat_id)
+            && let Some((session_id, session_cwd)) =
+                ws.chat_harness_session(&self.workspace_continuation_id(chat_id))
         {
             return (!session_id.is_empty() && cwd_ok(session_cwd.as_deref().unwrap_or("")))
                 .then_some(session_id);
@@ -1728,7 +1733,8 @@ impl Inner {
     }
     /// Pending one-shot fork source, gated against the run cwd before launch.
     fn fork_for(&self, chat_id: &str) -> Option<comet_proto::HarnessSessionFork> {
-        self.workspace()?.chat_fork(chat_id)
+        self.workspace()?
+            .chat_fork(&self.workspace_continuation_id(chat_id))
     }
 
     fn note_route_restart_progress(&self, chat_id: &str, run_id: &str) {
@@ -2026,7 +2032,10 @@ async fn drive_run(
         // First event after parking idle = the next turn beginning (a routed
         // dispatch steered in): the session is Working again.
         if idle_since.take().is_some() {
-            inner.set_status(&chat_id, SessionStatus::Working, true);
+            let _runs = lock(&inner.runs);
+            let already_started = lock(&inner.statuses).get(&chat_id)
+                .is_some_and(|session| session.status == SessionStatus::Working);
+            inner.set_status(&chat_id, SessionStatus::Working, !already_started);
         }
         // Empty reasoning deltas are PURE heartbeats: redacted thinking and
         // tool-input-generation windows stream them with no text. They fold
@@ -2272,12 +2281,14 @@ async fn drive_run(
                             if let Some(followup) = handle.queued_followups.pop_front() {
                                 if handle.steer_tx.try_send(followup.clone()).is_ok() {
                                     handle.turn_active = true;
+                                    inner.set_status(&chat_id, SessionStatus::Working, true);
                                     (Some(followup), true)
                                 } else {
                                     handle.queued_followups.push_front(followup);
                                     (None, false)
                                 }
                             } else {
+                                inner.set_status(&chat_id, SessionStatus::Idle, false);
                                 (None, true)
                             }
                         } else {
@@ -2312,9 +2323,6 @@ async fn drive_run(
                         );
                     }
                     idle_since = None;
-                    inner.set_status(&chat_id, SessionStatus::Working, false);
-                } else {
-                    inner.set_status(&chat_id, SessionStatus::Idle, false);
                 }
                 continue;
             }
@@ -2348,8 +2356,13 @@ async fn drive_run(
     if let (Some(relay), Some(token)) = (inner.inference_relay.get(), inference_token.as_deref()) {
         relay.remove(token);
     }
-    inner.remove_run(&chat_id, &run_id);
-    inner.set_status(&chat_id, final_status, false);
+    {
+        let mut runs = lock(&inner.runs);
+        if runs.get(&chat_id).is_some_and(|handle| handle.run_id == run_id) {
+            inner.set_status(&chat_id, final_status, false);
+            runs.remove(&chat_id);
+        }
+    }
 
     if interrupted {
         for followup in deferred_followups {
@@ -2493,6 +2506,34 @@ mod tests {
             Arc::new(HarnessRegistry::new()),
             27654,
         )
+    }
+
+    #[tokio::test]
+    async fn failed_parked_steer_keeps_session_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = bare_sessions(dir.path());
+        let (cancel, _cancel_rx) = watch::channel(false);
+        let (steer_tx, _steer_rx) = mpsc::channel(8);
+        let (engine_tx, _engine_rx) = mpsc::unbounded_channel();
+        lock(&sessions.inner.runs).insert("chat".into(), RunHandle {
+            run_id: "run".into(),
+            user_message_id: "user".into(),
+            route: RunRoute::new(HarnessId::Mock, &test_request("hello", None), sessions.auth_identity()),
+            steerable: true,
+            steering_mode: SteeringMode::StepBoundary,
+            steer_tx,
+            turn_active: false,
+            queued_followups: VecDeque::new(),
+            pending_turn_boundary_steers: VecDeque::new(),
+            interrupt_token: CancellationToken::new(),
+            cancel,
+            engine_tx,
+            pending_inputs: Arc::new(Mutex::new(HashMap::new())),
+        });
+        sessions.set_status("chat", SessionStatus::Idle, false);
+        drop(_steer_rx);
+        assert!(matches!(sessions.steer("chat", "undeliverable", None).await.unwrap(), SteerOutcome::NotSteerable));
+        assert_eq!(sessions.session_status("chat").unwrap().status, SessionStatus::Idle);
     }
 
     fn test_request(prompt: &str, resume: Option<&str>) -> RunRequest {
@@ -2889,6 +2930,56 @@ mod tests {
             "Stop must still attempt exact-journal cleanup after interrupt"
         );
         assert!(!sessions.is_live("takeover-chat", &run_id));
+    }
+
+    #[tokio::test]
+    async fn completed_native_session_survives_restart_without_request_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path().join("store")).unwrap());
+        let host = DocHost::new(store, DocHostConfig {
+            device_id: "test-device".into(), default_harness: HarnessId::Omp, edge: None,
+        });
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let registry = Arc::new(HarnessRegistry::new());
+        registry.register(Arc::new(TakeoverHarness {
+            runs: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            stops: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            requests: requests.clone(),
+            fail_cleanup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }));
+        let open = || {
+            let sessions = SessionsEngine::new(
+                "test-device".into(),
+                Arc::new(RunJournal::open(dir.path().join("journal")).unwrap()),
+                registry.clone(), 27654,
+            );
+            sessions.set_doc_host(host.clone());
+            sessions
+        };
+        let key = "transferred::session::transferred";
+        let sessions = open();
+        let mut request = test_request("transferred turn", Some("native-takeover-session"));
+        request.cwd = "/workspace/transferred".into();
+        sessions.dispatch(key, HarnessId::Omp, request.clone(), None).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if matches!(sessions.inner.journal.last_event(key).unwrap(),
+                    Some((_, AgentEvent::Done { status: DoneStatus::Completed, .. }))) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        sessions.interrupt(key).await.unwrap();
+        drop(sessions);
+        let restarted = open();
+        assert!(restarted.last_request(key).is_none());
+        assert!(restarted.inner.resume_for(key, "/wrong-workspace").is_none());
+        let mut next_request = test_request("native next turn", None);
+        next_request.cwd = "/workspace/transferred".into();
+        restarted.dispatch(key, HarnessId::Omp, next_request, None).await.unwrap();
+        assert_eq!(lock(&requests).last().unwrap().resume.as_deref(), Some("native-takeover-session"));
+        restarted.interrupt(key).await.unwrap();
     }
 
     struct RouteRestartHarness {

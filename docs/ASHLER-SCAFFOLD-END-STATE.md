@@ -47,7 +47,7 @@ They do not gate Comet 0.1.23 or the initial no-webview staging acceptance.
 
 1. A Scaffold agent sandbox runs a headless Comet engine as its collaboration
    and session UI layer. The browser OpenCode view is not the authoritative UI.
-2. OMP over ACP is the default and only user-selectable harness in the Scaffold
+2. OMP is the default and only user-selectable harness in the Scaffold
    Comet runtime profile.
 3. The remote profile disables incompatible local-controller features:
    - creating or attaching to nested Scaffold environments;
@@ -112,19 +112,20 @@ configuration. Filter UI catalogs for usability, but also reject prohibited RPC
 and harness operations in the engine. Cover profile serialization and negative
 RPC tests first.
 
-### B. OMP ACP harness
+### B. OMP harness
 
-Add `HarnessId::Omp` and an adapter that spawns `omp acp`, implementing ACP
-initialize, session/new, session/load or resume, prompt, streaming updates,
-approvals/input, cancellation, model/config discovery, and deterministic terminal
-status. Store OMP's native session id and cwd for continuation. Package a pinned
+Use `HarnessId::Omp` and the adapter described in the
+[harness architecture](../ARCHITECTURE.md#5-engine-plan) for session creation
+and continuation, prompts, streaming updates, approvals/input, cancellation,
+model/config discovery, and deterministic terminal status.
+Store OMP's native session id and cwd for continuation. Package a pinned
 OMP runtime in the Scaffold session image and make it the `scaffold-host` default.
 
 ### C. Existing-session discovery and import
 
 Add provider-specific discovery adapters:
 
-- OMP: native session index and ACP load/resume;
+- OMP: native session index and the OMP harness's continuation path;
 - Codex: local Codex thread/session store and app-server resume;
 - Claude Code: local project/session store and `--resume` continuation.
 

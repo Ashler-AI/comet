@@ -31,11 +31,11 @@ Production and staging use the same Swift target with separate checked-in scheme
 bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
 
 ```sh
-# Production candidate: Crew, ai.ashler.crew, version 1.0 build 12
+# Production candidate: Crew, ai.ashler.crew, version 1.0 build 13
 xcodebuild -project Comet.xcodeproj -scheme Comet \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 
-# Staging candidate: Crew Staging, ai.ashler.crew.staging, version 1.0 build 18
+# Staging candidate: Crew Staging, ai.ashler.crew.staging, version 1.0 build 19
 xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 ```
@@ -65,8 +65,8 @@ The artifact `crew-mobile-<environment>-<source SHA>` contains:
 
 | Environment | Device archive | Simulator app package |
 | --- | --- | --- |
-| staging | `Crew-Staging-1.0-18-unsigned.xcarchive.tar.gz` | `Crew-Staging-1.0-18-simulator-arm64.tar.gz` |
-| production | `Crew-1.0-12-unsigned.xcarchive.tar.gz` | `Crew-1.0-12-simulator-arm64.tar.gz` |
+| staging | `Crew-Staging-1.0-19-unsigned.xcarchive.tar.gz` | `Crew-Staging-1.0-19-simulator-arm64.tar.gz` |
+| production | `Crew-1.0-13-unsigned.xcarchive.tar.gz` | `Crew-1.0-13-simulator-arm64.tar.gz` |
 
 Both also include `SHA256SUMS`, `source-sha.txt`, `provenance.json`, `e2e.log`,
 and `archive-signed.entitlements`. Artifacts originate in

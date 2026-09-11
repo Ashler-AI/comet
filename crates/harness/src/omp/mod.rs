@@ -1780,7 +1780,9 @@ fn omp_config_command(cwd: &str) -> Result<Command, HarnessError> {
 }
 
 async fn run_omp_config(cwd: &str, args: &[&str]) -> Result<Value, HarnessError> {
-    let output = omp_config_command(cwd)?.args(args).output().await?;
+    let output = omp_config_command(cwd)?
+        .env("ASHLER_INCREMENTAL_TSC_CHECKS", "false")
+        .args(args).output().await?;
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(HarnessError::Protocol(if message.is_empty() {
@@ -3600,6 +3602,16 @@ mod tests {
             .to_string()
             .contains("does not match")
         );
+
+        std::fs::write(
+            &profile_path,
+            r#"{"profile":"scaffold-host","model":"openai-codex/gpt-5.6-sol"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            scaffold_inference_selection_at(runtime_dir.path(), Some("openai-codex/gpt-5.6-sol")),
+            Err(HarnessError::Protocol(_))
+        ));
 
         let extension_path = runtime_dir.path().join("scaffold-anthropic-provider.ts");
         std::fs::write(&extension_path, "export default function provider() {}\n").unwrap();
