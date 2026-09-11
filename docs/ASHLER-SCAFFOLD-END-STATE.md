@@ -29,11 +29,10 @@ This document defines the required product boundary for Ashler Comet. A partial
    surface. It can create/inspect, pause, resume, stop, and attach to a running
    Scaffold OMP session without creating a parallel session backend.
 
-### Future web and mobile viewports
+### Web and mobile viewport boundary
 
-Web and mobile clients are explicitly out of scope for the initial Comet/OMP
-Scaffold rollout. The initial implementation must remain compatible with adding
-them later as authorized Comet clients: keep existing Durable Objects and typed
+Web and mobile clients were explicitly out of scope for the initial Comet/OMP
+Scaffold rollout. Authorized Comet clients must keep existing Durable Objects and typed
 commands as the shared data/control plane, keep execution on the owning local or
 Scaffold host, preserve exact deployment/session/device/epoch authority, and do
 not expose host, bootstrap, provider, or OMP credentials to observer clients.
@@ -42,6 +41,8 @@ The saved future architecture, mobile alternative, delivery slices, acceptance
 matrix, and open questions live in
 `internal/scaffold/docs/comet-web-viewport.md` in the platform repository.
 They do not gate Comet 0.1.23 or the initial no-webview staging acceptance.
+For the current web implementation and its rollout requirements, see the
+[Scaffold session web view](../README.md#scaffold-session-web-view).
 
 ### Scaffold Comet
 
@@ -100,8 +101,11 @@ fails closed.
    session id must never share transcript, tail, diff, grant, or attachment
    state.
 9. A `scaffold-host` does not expose generic `ListHarnesses` or `ListModels`
-   RPCs. The trusted bootstrap fixes OMP and its model gateway; discovery is a
-   local-controller capability, not a remotely selectable sandbox surface.
+   RPCs. The trusted bootstrap fixes OMP and its model gateway; generic discovery
+   remains a local-controller capability. `ListSessionModels` is the scoped
+   exception: it requires the exact locally hosted session and a current live read
+   grant, and returns only the OMP catalog's `openai-codex/` and `anthropic/` models.
+   The authority check and catalog filter are owned by `crates/engine/src/rpc.rs`.
 
 ## Implementation slices
 
