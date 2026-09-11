@@ -161,11 +161,6 @@ jobs:
       - name: Select checked-in Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-      - name: Verify fixed-session web viewport
-        run: node --test apps/web/*.test.mjs
       - name: Package
         run: scripts/package-linux.sh
       - name: Record artifact checksums

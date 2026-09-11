@@ -2,43 +2,6 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
-## Scaffold session web view
-
-`apps/web` provides the browser surface for one existing Crew/OMP session in a
-Scaffold sandbox: empty and active conversation states, streamed messages, tool
-details, model/reasoning selection, attachments, input answers, and send/steer/stop.
-It deliberately has no session creation, session list, settings, or checkout controls.
-
-The dependency-free Node service connects to the assigned engine's loopback IPC.
-Scaffold's authenticated attach proxy supplies a dedicated server-side credential;
-the browser never receives that credential or unrestricted RPC access. The service
-requires exact trusted session/sandbox bindings and existing Crew capability grants.
-Model changes go through Scaffold's owner-authorized
-`/sessions/<sandbox>/opencode/api/model-route` before the
-next message; active turns must be stopped before switching model or reasoning.
-Protected reads and stream updates require a current live read grant; losing it
-clears the cached transcript. Queued commands retain submitted content until their
-durable outcome is applied; rejection or expiry remains visible and retryable.
-
-Linux archives include `crew-web/` beside `comet`, so the viewport and its
-[scoped engine RPCs](docs/ASHLER-SCAFFOLD-END-STATE.md#durable-mirroring-invariants)
-ship together. Runtime: Node >=22.4,
-`node /opt/crew-web/server.mjs`; Scaffold configures `COMET_IPC_PORT`, `COMET_DATA_DIR`,
-`SCAFFOLD_RUNTIME_DIR`, and `CREW_WEB_AUTH_TOKEN`. Trusted `sessionId` and `sandboxId`
-bindings come from `SCAFFOLD_COMET_RUNTIME_PROFILE_JSON`; explicit
-`CREW_WEB_SESSION_ID` (which must match any profile session) and
-`CREW_WEB_SANDBOX_ID` (used when the profile omits the sandbox) are also supported.
-`CREW_WEB_HOST` and `CREW_WEB_PORT` default to `127.0.0.1` and `4096`.
-The attach proxy must follow the authentication and mutation-origin contract in
-`authorize` in `apps/web/server.mjs`.
-Tests: `node --test apps/web/server.test.mjs`.
-
-Rollout requires publishing a new immutable Crew Linux release containing these
-assets, selecting its verified release tuple in the platform repository, rebuilding
-the sandbox image, and deploying the coordinated provider/control-plane changes.
-Existing images are not upgraded by editing this repository. No rollout is implied
-by the presence of this code.
-
 ## Crew 0.1.90 release
 
 Release source `356ccff31934f5eca6310d7a128345a13daa7456` is merged into `main`

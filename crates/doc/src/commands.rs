@@ -61,10 +61,7 @@ pub enum SessionControlAction {
     },
     Pause {},
     Resume {},
-    Stop {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        expected_turn_id: Option<String>,
-    },
+    Stop {},
     Focus {
         target_id: String,
     },
@@ -100,27 +97,10 @@ impl SessionControlAction {
             | Self::AnnotationEdit { .. }
             | Self::AnnotationResolve { .. } => comet_proto::CAPABILITY_SESSION_ANNOTATE,
             Self::EnvironmentLifecycle { .. } => comet_proto::CAPABILITY_SESSION_ENVIRONMENT,
-            Self::Pause {} | Self::Resume {} | Self::Stop { .. } | Self::Focus { .. } => {
+            Self::Pause {} | Self::Resume {} | Self::Stop {} | Self::Focus { .. } => {
                 comet_proto::CAPABILITY_SESSION_CONTROL
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod stop_contract_tests {
-    use super::*;
-
-    #[test]
-    fn stop_preserves_legacy_and_expected_turn_contracts() {
-        let legacy: SessionControlAction = serde_json::from_value(serde_json::json!({ "action": "stop" })).unwrap();
-        assert_eq!(legacy, SessionControlAction::Stop { expected_turn_id: None });
-        assert_eq!(serde_json::to_value(&legacy).unwrap(), serde_json::json!({ "action": "stop" }));
-        let targeted = SessionControlAction::Stop { expected_turn_id: Some("engine-turn".into()) };
-        let wire = serde_json::to_value(&targeted).unwrap();
-        assert_eq!(wire["expected_turn_id"], "engine-turn");
-        assert_eq!(serde_json::from_value::<SessionControlAction>(wire).unwrap(), targeted);
-        assert_eq!(targeted.required_capability(), comet_proto::CAPABILITY_SESSION_CONTROL);
     }
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -250,7 +230,7 @@ impl SessionCommandEntry {
                 SessionControlAction::RespondInput { .. } => "respondInput",
                 SessionControlAction::Pause {} => "pause",
                 SessionControlAction::Resume {} => "resume",
-                SessionControlAction::Stop { .. } => "stop",
+                SessionControlAction::Stop {} => "stop",
                 SessionControlAction::Focus { .. } => "focus",
                 SessionControlAction::AnnotationCreate { .. } => "annotationCreate",
                 SessionControlAction::AnnotationEdit { .. } => "annotationEdit",

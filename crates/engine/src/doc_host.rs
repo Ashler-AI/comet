@@ -1542,14 +1542,6 @@ impl DocHost {
             turn_id: Some(id),
             frontier: None,
         });
-        if let SessionCommandPayload::Control { session_id, owner_device_id, action, .. } = &payload
-            && owner_device_id == &self.inner.config.device_id
-            && let SessionControlAction::Stop { expected_turn_id: Some(expected) } = action.as_ref()
-        {
-            let execution_key = self.bind_session_execution_key(&handle, session_id);
-            let sessions = self.inner.sessions.get().ok_or_else(|| EngineError::Other("Stop target is no longer active".into()))?;
-            sessions.require_turn(&execution_key, expected)?;
-        }
         let entry = SessionCommandEntry {
             id: command_id.to_string(),
             payload,
@@ -2038,7 +2030,7 @@ impl DocHost {
                 session_id, action, ..
             } = &entry.payload
             && let Some(next_status) = match action.as_ref() {
-                SessionControlAction::Pause {} | SessionControlAction::Stop { .. } => {
+                SessionControlAction::Pause {} | SessionControlAction::Stop {} => {
                     Some(comet_proto::SessionStatus::Idle)
                 }
                 _ => None,
@@ -2381,8 +2373,8 @@ impl DocHost {
                         );
                         Ok((SessionCommandStatus::Applied, Some("resumed".into())))
                     }
-                    SessionControlAction::Stop { expected_turn_id } => {
-                        sessions.interrupt_turn(&execution_key, expected_turn_id.as_deref()).await?;
+                    SessionControlAction::Stop {} => {
+                        sessions.interrupt(&execution_key).await?;
                         Ok((SessionCommandStatus::Applied, None))
                     }
                     SessionControlAction::Focus { .. } => {
@@ -2849,35 +2841,6 @@ mod authority_tests {
     use super::*;
     use comet_proto::AgentSessionSource;
     use loro::LoroMap;
-
-    #[tokio::test]
-    async fn stop_admission_rejects_missing_live_turn_without_appending() {
-        let dir = tempfile::tempdir().unwrap();
-        let host = DocHost::new(
-            Arc::new(DocsStore::open(dir.path()).unwrap()),
-            DocHostConfig { device_id: "device-a".into(), default_harness: HarnessId::Mock, edge: None },
-        );
-        host.set_sessions(SessionsEngine::new(
-            "device-a".into(),
-            Arc::new(crate::RunJournal::open(dir.path().join("journal")).unwrap()),
-            Arc::new(crate::HarnessRegistry::new()),
-            27654,
-        ));
-        let command = SessionCommandPayload::Control {
-            session_id: "session-a".into(),
-            owner_device_id: "device-a".into(),
-            actor_device_id: "device-a".into(),
-            actor_subject: "owner".into(),
-            grant_id: "grant".into(),
-            source: AgentSessionSource::Scaffold,
-            action: Box::new(SessionControlAction::Stop {
-                expected_turn_id: Some(serde_json::json!(["chat::session::session-a", "device-a", "2026-09-11T10:00:00Z"]).to_string()),
-            }),
-        };
-        let error = host.queue_command_with_id("chat", "stop", command).unwrap_err();
-        assert!(error.to_string().contains("Stop target is no longer active"));
-        assert!(host.command_entry("chat", "stop").unwrap().is_none());
-    }
 
     #[tokio::test]
     async fn shared_session_aliases_do_not_survive_document_purge() {

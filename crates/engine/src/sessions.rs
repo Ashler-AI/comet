@@ -171,7 +171,7 @@ struct BlockedOmpTakeover {
     user_message_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RunAuthIdentity {
     Unattached,
     SignedOut,
@@ -605,17 +605,6 @@ impl SessionsEngine {
         lock(&self.inner.last_requests).get(chat_id).cloned()
     }
 
-    pub(crate) fn recovered_context(&self, execution_key: &str) -> Result<RunRequest, EngineError> {
-        let (identity, device_id, harness, request): (RunAuthIdentity, String, HarnessId, RunRequest) = self.inner.journal
-            .read_context(execution_key)?
-            .ok_or_else(|| EngineError::Other("session_context_recovery_missing".into()))?;
-        if identity != self.auth_identity() || device_id != self.inner.device_id
-            || harness != HarnessId::Omp || request.cwd.is_empty() {
-            return Err(EngineError::Other("session_context_binding_mismatch".into()));
-        }
-        Ok(request)
-    }
-
     /// Subscribe to a chat's live event stream: returns the journal replay after
     /// `after_seq` plus a live receiver. Subscribe-then-replay ordering means overlap
     /// (dedupe by seq) rather than gaps.
@@ -801,12 +790,7 @@ impl SessionsEngine {
                             prompt: request.prompt.clone(),
                             message_id: Some(user_id.clone()),
                         };
-                        let sender = handle.steer_tx.clone();
-                        if let Ok(permit) = sender.try_reserve() {
-                            self.inner.journal.save_context(
-                                chat_id, &(requested_route.auth_identity.clone(), &self.inner.device_id, harness_id, request.clone()),
-                            )?;
-                            permit.send(message.clone());
+                        if handle.steer_tx.try_send(message.clone()).is_ok() {
                             handle.turn_active = true;
                             if !was_turn_active {
                                 self.set_status(chat_id, SessionStatus::Working, true);
@@ -970,7 +954,7 @@ impl SessionsEngine {
             RunHandle {
                 user_message_id: user_id.clone(),
                 run_id: run_id.clone(),
-                route: requested_route.clone(),
+                route: requested_route,
                 steerable: harness.supports_steering(),
                 steering_mode: harness.steering_mode(),
                 steer_tx,
@@ -1062,18 +1046,8 @@ impl SessionsEngine {
                 return Err(err.into());
             }
         };
-        let context_result = self.inner.journal.save_context(
-            chat_id, &(requested_route.auth_identity.clone(), &self.inner.device_id, harness_id, request.clone()),
-        );
-        if context_result.is_err() {
-            if let Some(run) = lock(&self.inner.runs).get(chat_id).filter(|run| run.run_id == run_id) {
-                run.interrupt_token.cancel();
-                let _ = run.cancel.send(true);
-            }
-        } else {
-            lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
-            lock(&self.inner.blocked_omp_takeovers).remove(chat_id);
-        }
+        lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
+        lock(&self.inner.blocked_omp_takeovers).remove(chat_id);
 
         tokio::spawn(drive_run(
             self.inner.clone(),
@@ -1092,11 +1066,6 @@ impl SessionsEngine {
             },
             inference_token,
         ));
-        if let Err(error) = context_result {
-            self.interrupt(chat_id).await?;
-            self.inner.set_status(chat_id, SessionStatus::Errored, false);
-            return Err(error.into());
-        }
         Ok(run_id)
     }
 
@@ -1194,25 +1163,8 @@ impl SessionsEngine {
     /// `Done{interrupted}` and its streaming entry stamped `aborted`; this waits
     /// (bounded) for that settlement so callers observe a consistent doc.
     pub async fn interrupt(&self, chat_id: &str) -> Result<bool, EngineError> {
-        self.interrupt_turn(chat_id, None).await
-    }
-
-    pub(crate) fn require_turn(&self, chat_id: &str, expected: &str) -> Result<(), EngineError> {
-        let statuses = lock(&self.inner.statuses);
-        require_session_turn(statuses.get(chat_id), expected)
-    }
-
-    pub(crate) async fn interrupt_turn(
-        &self,
-        chat_id: &str,
-        expected: Option<&str>,
-    ) -> Result<bool, EngineError> {
         let target = {
             let runs = lock(&self.inner.runs);
-            let statuses = lock(&self.inner.statuses);
-            if let Some(expected) = expected {
-                require_session_turn(statuses.get(chat_id), expected)?;
-            }
             runs.get(chat_id).map(|h| {
                 let parked: Vec<_> = lock(&h.pending_inputs).drain().map(|(_, tx)| tx).collect();
                 for tx in parked {
@@ -1227,9 +1179,6 @@ impl SessionsEngine {
             })
         };
         let Some((run_id, harness_id)) = target else {
-            if expected.is_some() {
-                return Err(EngineError::Other("Stop target is no longer active".into()));
-            }
             return Ok(false);
         };
         // Bounded settle wait (the run task appends Done + stamps `aborted`).
@@ -1246,7 +1195,7 @@ impl SessionsEngine {
         // interrupt into a Stop failure when the ownership probe is unavailable
         // or races the writer's exit. The live-run deadline below remains the
         // authoritative Stop result.
-        if harness_id == HarnessId::Omp && expected.is_none() {
+        if harness_id == HarnessId::Omp {
             let session_id = lock(&self.inner.harness_sessions)
                 .get(chat_id)
                 .map(|session| session.session_id.clone());
@@ -1638,9 +1587,7 @@ impl Inner {
             entry.status = status;
             entry.updated_at = now;
             if fresh_start {
-                entry.started_at = Some(entry.started_at.map_or(now, |previous| {
-                    now.max(previous + chrono::Duration::nanoseconds(1))
-                }));
+                entry.started_at = Some(now);
             }
             let session = entry.clone();
             let mut list: Vec<Session> = statuses.values().cloned().collect();
@@ -2491,19 +2438,6 @@ async fn drive_run(
     }
 }
 
-fn require_session_turn(session: Option<&Session>, expected: &str) -> Result<(), EngineError> {
-    let target = serde_json::from_str::<(String, String, chrono::DateTime<Utc>)>(expected).ok();
-    if let (Some(session), Some((chat_id, device_id, started_at))) = (session, target)
-        && session.chat_id == chat_id
-        && session.device_id == device_id
-        && session.started_at == Some(started_at)
-        && matches!(session.status, SessionStatus::Working | SessionStatus::AwaitingInput)
-    {
-        return Ok(());
-    }
-    Err(EngineError::Other("Stop target is no longer active".into()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2575,11 +2509,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn targeted_stop_rechecks_admitted_turn_before_signaling() {
+    async fn failed_parked_steer_keeps_session_idle() {
         let dir = tempfile::tempdir().unwrap();
         let sessions = bare_sessions(dir.path());
-        let token = CancellationToken::new();
-        let (cancel, cancel_rx) = watch::channel(false);
+        let (cancel, _cancel_rx) = watch::channel(false);
         let (steer_tx, _steer_rx) = mpsc::channel(8);
         let (engine_tx, _engine_rx) = mpsc::unbounded_channel();
         lock(&sessions.inner.runs).insert("chat".into(), RunHandle {
@@ -2589,48 +2522,18 @@ mod tests {
             steerable: true,
             steering_mode: SteeringMode::StepBoundary,
             steer_tx,
-            turn_active: true,
+            turn_active: false,
             queued_followups: VecDeque::new(),
             pending_turn_boundary_steers: VecDeque::new(),
-            interrupt_token: token.clone(),
+            interrupt_token: CancellationToken::new(),
             cancel,
             engine_tx,
             pending_inputs: Arc::new(Mutex::new(HashMap::new())),
         });
-        sessions.set_status("chat", SessionStatus::Working, true);
-        lock(&sessions.inner.runs).get_mut("chat").unwrap().turn_active = false;
+        sessions.set_status("chat", SessionStatus::Idle, false);
         drop(_steer_rx);
         assert!(matches!(sessions.steer("chat", "undeliverable", None).await.unwrap(), SteerOutcome::NotSteerable));
-        assert!(!lock(&sessions.inner.runs).get("chat").unwrap().turn_active);
-        lock(&sessions.inner.runs).get_mut("chat").unwrap().turn_active = true;
-        let identity = || {
-            let statuses = lock(&sessions.inner.statuses);
-            let session = statuses.get("chat").unwrap();
-            serde_json::to_string(&(&session.chat_id, &session.device_id, session.started_at.unwrap())).unwrap()
-        };
-        let old = identity();
-        sessions.require_turn("chat", &old).unwrap();
-        sessions.set_status("chat", SessionStatus::Working, true);
-        assert!(sessions.require_turn("chat", &old).is_err());
-        assert!(sessions.interrupt_turn("chat", Some(&old)).await.is_err());
-        assert!(!token.is_cancelled());
-        assert!(!*cancel_rx.borrow());
-        let current = identity();
-        sessions.set_status("chat", SessionStatus::AwaitingInput, false);
-        sessions.require_turn("chat", &current).unwrap();
-        let remove = sessions.clone();
-        let cancelled = token.clone();
-        tokio::spawn(async move {
-            cancelled.cancelled().await;
-            lock(&remove.inner.runs).remove("chat");
-        });
-        assert!(sessions.interrupt_turn("chat", Some(&current)).await.unwrap());
-        assert!(token.is_cancelled());
-        assert!(*cancel_rx.borrow());
-        sessions.set_status("chat", SessionStatus::Idle, false);
-        assert!(sessions.require_turn("chat", &current).is_err());
-        assert!(sessions.require_turn("chat", "invalid").is_err());
-        assert!(!sessions.interrupt("chat").await.unwrap());
+        assert_eq!(sessions.session_status("chat").unwrap().status, SessionStatus::Idle);
     }
 
     fn test_request(prompt: &str, resume: Option<&str>) -> RunRequest {
@@ -2693,43 +2596,6 @@ mod tests {
                 project_scope: "project-a".into(),
             },
         )
-    }
-
-    #[test]
-    fn durable_context_survives_restart_without_workspace_or_request_cache() {
-        let dir = tempfile::tempdir().unwrap();
-        let key = "transferred::session::transferred";
-        let sessions = bare_sessions(dir.path());
-        let mut request = test_request("accepted", Some("native-transferred"));
-        request.cwd = "/workspace/transferred".into();
-        request.model = Some("openai-codex/gpt-5.6".into());
-        sessions.inner.journal.save_context(key, &(
-            sessions.auth_identity(), &sessions.inner.device_id, HarnessId::Omp, &request,
-        )).unwrap();
-        drop(sessions);
-        let restarted = bare_sessions(dir.path());
-        assert!(restarted.last_request(key).is_none());
-        let recovered = restarted.recovered_context(key).unwrap();
-        assert_eq!(serde_json::to_value(&recovered).unwrap(), serde_json::to_value(&request).unwrap());
-        assert_eq!(recovered.resume.as_deref(), Some("native-transferred"));
-        assert!(restarted.recovered_context("other::session::other").is_err());
-    }
-
-    #[test]
-    fn durable_context_rejects_wrong_tenant_device_harness_and_missing_evidence() {
-        let dir = tempfile::tempdir().unwrap();
-        let sessions = bare_sessions(dir.path());
-        let key = "chat::session::chat";
-        assert!(sessions.recovered_context(key).is_err());
-        let request = test_request("accepted", Some("native"));
-        for (identity, device, harness) in [
-            (RunAuthIdentity::SignedIn { owner_subject: "other-owner".into(), project_scope: "other-project".into() }, sessions.inner.device_id.clone(), HarnessId::Omp),
-            (sessions.auth_identity(), "other-device".into(), HarnessId::Omp),
-            (sessions.auth_identity(), sessions.inner.device_id.clone(), HarnessId::Codex),
-        ] {
-            sessions.inner.journal.save_context(key, &(identity, device, harness, &request)).unwrap();
-            assert!(sessions.recovered_context(key).is_err());
-        }
     }
 
     #[test]
@@ -3007,7 +2873,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("already running"));
-        assert!(sessions.recovered_context("takeover-chat").is_err());
         assert!(lock(&sessions.inner.blocked_omp_takeovers).contains_key("takeover-chat"));
 
         let run_id = sessions
@@ -3068,7 +2933,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatched_context_and_completed_native_session_survive_restart() {
+    async fn completed_native_session_survives_restart_without_request_cache() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DocsStore::open(dir.path().join("store")).unwrap());
         let host = DocHost::new(store, DocHostConfig {
@@ -3109,12 +2974,10 @@ mod tests {
         drop(sessions);
         let restarted = open();
         assert!(restarted.last_request(key).is_none());
-        let recovered = restarted.recovered_context(key).unwrap();
-        assert_eq!(serde_json::to_value(&recovered).unwrap(), serde_json::to_value(&request).unwrap());
         assert!(restarted.inner.resume_for(key, "/wrong-workspace").is_none());
-        request.prompt = "web next turn".into();
-        request.resume = None;
-        restarted.dispatch(key, HarnessId::Omp, request, None).await.unwrap();
+        let mut next_request = test_request("native next turn", None);
+        next_request.cwd = "/workspace/transferred".into();
+        restarted.dispatch(key, HarnessId::Omp, next_request, None).await.unwrap();
         assert_eq!(lock(&requests).last().unwrap().resume.as_deref(), Some("native-takeover-session"));
         restarted.interrupt(key).await.unwrap();
     }
