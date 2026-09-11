@@ -903,10 +903,17 @@ impl ScaffoldClient {
                 tracing::warn!(error = %error, "Scaffold worktree handoff archive upload failed");
             })?;
 
+        let verify_path = format!(".scaffold/crew-handoff-verify-{}.py", crate::new_id());
+        self.put_file(
+            sandbox_id,
+            &verify_path,
+            VERIFY_WORKTREE_HANDOFF_PYTHON,
+            cancellation,
+        )
+        .await?;
         let verify_argv = vec![
             "python3".to_string(),
-            "-c".to_string(),
-            VERIFY_WORKTREE_HANDOFF_PYTHON.to_string(),
+            verify_path.clone(),
             grant.destination_path.clone(),
             snapshot.manifest_sha256.clone(),
             snapshot.base_sha.clone(),
@@ -924,7 +931,10 @@ impl ScaffoldClient {
                 },
                 cancellation,
             )
-            .await?;
+            .await;
+        self.remove_file(sandbox_id, &verify_path, cancellation)
+            .await;
+        let verified = verified?;
         let remote_cwd = if snapshot.cwd_relative_path.is_empty() {
             SCAFFOLD_HANDOFF_CWD.to_string()
         } else {
@@ -935,9 +945,15 @@ impl ScaffoldClient {
             || verified.exit_code != Some(0)
             || verified.stdout.as_deref().map(str::trim) != Some(expected.as_str())
         {
+            let stderr = verified.stderr.as_deref().unwrap_or("");
+            let mut stderr_end = stderr.len().min(2048);
+            while !stderr.is_char_boundary(stderr_end) {
+                stderr_end -= 1;
+            }
             tracing::warn!(
                 ok = verified.ok,
                 exit_code = ?verified.exit_code,
+                stderr = &stderr[..stderr_end],
                 "Scaffold worktree handoff verification failed"
             );
             let stage = match verified.exit_code {
@@ -952,6 +968,7 @@ impl ScaffoldClient {
         }
         Ok(remote_cwd)
     }
+
     async fn upload_granted_file(
         &self,
         grant: &UploadGrant,
@@ -969,6 +986,7 @@ impl ScaffoldClient {
         let send = self
             .http
             .post(url)
+            .timeout(Duration::from_secs(5 * 60))
             .bearer_auth(&token)
             .header(reqwest::header::CONTENT_TYPE, "application/x-tar")
             .header(reqwest::header::CONTENT_LENGTH, byte_count)
@@ -1450,6 +1468,8 @@ struct ExecResponse {
     #[serde(default)]
     stdout: Option<String>,
     #[serde(default)]
+    stderr: Option<String>,
+    #[serde(default)]
     error: Option<String>,
 }
 
@@ -1508,6 +1528,7 @@ expected_cwd = json.loads(sys.argv[5])
 if platform not in staging.parents or staging.relative_to(platform).as_posix() != ".scaffold/crew-handoff-staging":
     raise SystemExit(40)
 MAX_TOTAL = 256 * 1024 * 1024
+MAX_CHECKOUT_BYTES = 1024 * 1024 * 1024
 MAX_HISTORY_BYTES = 4 * 1024 * 1024 * 1024
 MAX_OBJECTS = 250000
 MAX_FILES = 25000
@@ -1553,10 +1574,13 @@ def git(cwd, args, output=False):
         resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_TOTAL, MAX_TOTAL))
         if sys.platform == "linux":
             resource.setrlimit(resource.RLIMIT_AS, (MAX_MEMORY, MAX_MEMORY))
-    with tempfile.TemporaryFile(dir=temporary) as stdout:
-        process = subprocess.Popen(["git", "-c", "core.hooksPath=/dev/null", "-c", "pack.threads=1", "-C", str(cwd), *args], stdout=stdout if output else subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=environment, preexec_fn=limits, start_new_session=True)
+    with tempfile.TemporaryFile(dir=temporary) as stdout, tempfile.TemporaryFile(dir=temporary) as stderr:
+        process = subprocess.Popen(["git", "-c", "core.hooksPath=/dev/null", "-c", "pack.threads=1", "-c", "core.preloadIndex=false", "-c", "index.threads=1", "-C", str(cwd), *args], stdout=stdout if output else subprocess.DEVNULL, stderr=stderr, env=environment, preexec_fn=limits, start_new_session=True)
         try:
-            if process.wait(timeout=max(0.01, deadline - time.monotonic())) != 0: raise SystemExit(45)
+            if process.wait(timeout=max(0.01, deadline - time.monotonic())) != 0:
+                stderr.seek(0)
+                print("git " + args[0] + ": " + stderr.read(2048).decode("utf-8", "replace"), file=sys.stderr)
+                raise SystemExit(45)
             if output:
                 stdout.seek(0)
                 result = stdout.read(32 * 1024 * 1024 + 1)
@@ -1631,7 +1655,7 @@ def inspect_objects(workspace):
         if kind != b"blob" or mode not in (b"100644", b"100755", b"120000"): raise SystemExit(45)
         size = int(size)
         expanded += size
-        if size < 0 or count > MAX_FILES or expanded > MAX_TOTAL: raise SystemExit(45)
+        if size < 0 or count > MAX_FILES or expanded > MAX_CHECKOUT_BYTES: raise SystemExit(45)
 
 def inspect_materialized_tree(workspace):
     count, expanded = 0, 0
@@ -1658,7 +1682,7 @@ def inspect_materialized_tree(workspace):
                 expanded += info.st_size
             elif stat.S_ISREG(info.st_mode): expanded += info.st_size
             elif not stat.S_ISDIR(info.st_mode): raise SystemExit(46)
-            if count > MAX_FILES or expanded > MAX_TOTAL: raise SystemExit(46)
+            if count > MAX_FILES or expanded > MAX_CHECKOUT_BYTES: raise SystemExit(46)
 
 temporary = None
 published = False
@@ -3148,6 +3172,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn archive_upload_outlives_control_request_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\nx") {
+                let mut chunk = [0_u8; 1024];
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&chunk[..count]);
+                assert!(request.len() < 8192);
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let mut client =
+            ScaffoldClient::new(&origin, "project-a", Arc::new(StaticToken("owner".into()))).unwrap();
+        client.http = scaffold_http_client(Some(Duration::from_millis(50))).unwrap();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, b"x").unwrap();
+        let grant = UploadGrant {
+            url: origin,
+            token: "upload-token".into(),
+            token_env: "UPLOAD_TOKEN".into(),
+            destination_path: ".".into(),
+            expires_at: i64::MAX,
+            _command: String::new(),
+        };
+        client
+            .upload_granted_file(&grant, file.reopen().unwrap(), 1, &CancellationToken::new())
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn inference_response_outlives_the_control_plane_timeout() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -4114,32 +4178,26 @@ mod tests {
             vec!["config", "user.email", "crew@example.com"],
             vec!["config", "user.name", "Crew"],
         ] {
-            assert!(
-                std::process::Command::new("git")
-                    .args(args)
-                    .current_dir(repo.path())
-                    .status()
-                    .unwrap()
-                    .success()
-            );
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success());
         }
         std::fs::write(repo.path().join("tracked.txt"), "base\n").unwrap();
-        assert!(
-            std::process::Command::new("git")
-                .args(["add", "."])
-                .current_dir(repo.path())
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(
-            std::process::Command::new("git")
-                .args(["commit", "-qm", "base"])
-                .current_dir(repo.path())
-                .status()
-                .unwrap()
-                .success()
-        );
+        assert!(std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["commit", "-qm", "base"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .success());
         std::fs::write(repo.path().join("tracked.txt"), "changed\n").unwrap();
         let snapshot = crate::worktree_handoff::capture_worktree_handoff(repo.path()).unwrap();
         let mut expected_archive = Vec::new();
@@ -4167,8 +4225,10 @@ mod tests {
             })
             .to_string(),
             "{}".to_string(),
+            "{}".to_string(),
             serde_json::json!({"ok": true, "exitCode": 0, "stdout": verified_stdout})
                 .to_string(),
+            r#"{"ok":true,"exitCode":0}"#.to_string(),
         ];
         let captured = tokio::spawn(async move {
             let mut requests = Vec::new();
@@ -4214,11 +4274,19 @@ mod tests {
                             || argv.len() > 64
                             || argv
                                 .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::len)
+                                .sum::<usize>()
+                                > 16_384
+                            || argv
+                                .iter()
                                 .any(|arg| arg.as_str().is_none_or(str::is_empty))
                     })
                 {
                     stream.write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await.unwrap();
-                    panic!("Scaffold requires 1–64 nonempty exec arguments");
+                    panic!(
+                        "Scaffold requires 1–64 nonempty exec arguments totaling at most 16 KiB"
+                    );
                 }
                 requests.push(bytes);
                 let response = format!(
@@ -4242,21 +4310,12 @@ mod tests {
             .unwrap();
 
         let requests = captured.await.unwrap();
-        assert_eq!(requests.len(), 4);
-        assert!(
-            String::from_utf8_lossy(&requests[0])
-                .contains(r#"["rm","-rf","--",".scaffold/crew-handoff-staging"]"#)
-        );
-        assert!(
-            String::from_utf8_lossy(&requests[1])
-                .contains(r#"{"destinationPath":".scaffold/crew-handoff-staging"}"#)
-        );
         let upload_header_end = requests[2]
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
             .unwrap();
         assert_eq!(&requests[2][upload_header_end + 4..], expected_archive);
-        let verify = String::from_utf8_lossy(&requests[3]);
+        let verify = String::from_utf8_lossy(&requests[4]);
         assert!(verify.contains(&snapshot.manifest_sha256));
         assert!(verify.contains(&snapshot.base_sha));
         assert!(!verify.contains("worktree_upload_secret"));
@@ -4293,6 +4352,8 @@ mod tests {
         std::fs::write(source.join("tracked.txt"), "base\n").unwrap();
         std::fs::write(source.join(".gitignore"), ".omx/\n").unwrap();
         std::fs::write(source.join("deleted.txt"), "delete\n").unwrap();
+        std::fs::write(source.join("expanded-a.bin"), vec![b'a'; 80 * 1024]).unwrap();
+        std::fs::write(source.join("expanded-b.bin"), vec![b'b'; 80 * 1024]).unwrap();
         git(&source, &["add", "."]);
         git(&source, &["commit", "-qm", "base"]);
         let base_sha = String::from_utf8(git(&source, &["rev-parse", "HEAD"]))
@@ -4318,6 +4379,7 @@ mod tests {
         symlink("tracked.txt", source.join("tracked-link")).unwrap();
         let snapshot =
             crate::worktree_handoff::capture_worktree_handoff(&source.join("nested")).unwrap();
+        assert!(snapshot.byte_count <= 128 * 1024);
         let staging = platform.join(".scaffold/crew-handoff-staging");
         std::fs::create_dir_all(&staging).unwrap();
         let archive = tempfile::NamedTempFile::new().unwrap();
@@ -4339,7 +4401,12 @@ mod tests {
         );
         let script = VERIFY_WORKTREE_HANDOFF_PYTHON
             .replace("/workspace/ashler-platform", platform.to_str().unwrap())
-            .replace("/workspace/crew-handoff", remote.to_str().unwrap());
+            .replace("/workspace/crew-handoff", remote.to_str().unwrap())
+            .replace("MAX_TOTAL = 256 * 1024 * 1024", "MAX_TOTAL = 128 * 1024")
+            .replace(
+                "MAX_CHECKOUT_BYTES = 1024 * 1024 * 1024",
+                "MAX_CHECKOUT_BYTES = 256 * 1024",
+            );
         let applied = std::process::Command::new("python3")
             .args([
                 "-c",
@@ -4357,6 +4424,14 @@ mod tests {
             "status={} stderr={}",
             applied.status,
             String::from_utf8_lossy(&applied.stderr)
+        );
+        assert_eq!(
+            std::fs::read(remote.join("expanded-a.bin")).unwrap(),
+            vec![b'a'; 80 * 1024]
+        );
+        assert_eq!(
+            std::fs::read(remote.join("expanded-b.bin")).unwrap(),
+            vec![b'b'; 80 * 1024]
         );
         assert_eq!(
             String::from_utf8_lossy(&applied.stdout).trim(),
@@ -4400,11 +4475,11 @@ mod tests {
         );
         assert!(!staging.exists());
 
-        // A corrupt bundle is rejected before replacing the existing destination.
-        std::fs::write(remote.join("local-marker"), "preserve\n").unwrap();
-        std::fs::create_dir_all(&staging).unwrap();
-        assert!(
-            std::process::Command::new("tar")
+        // Neither corruption nor an oversized checkout may replace the destination.
+        for corrupt_bundle in [true, false] {
+            std::fs::write(remote.join("local-marker"), "preserve\n").unwrap();
+            std::fs::create_dir_all(&staging).unwrap();
+            assert!(std::process::Command::new("tar")
                 .args([
                     "-xf",
                     archive.path().to_str().unwrap(),
@@ -4413,36 +4488,49 @@ mod tests {
                 ])
                 .status()
                 .unwrap()
-                .success()
-        );
-        std::fs::write(staging.join("source.bundle"), "corrupt").unwrap();
-        let rejected = std::process::Command::new("python3")
-            .args([
-                "-c",
-                &script,
-                staging.to_str().unwrap(),
-                &snapshot.manifest_sha256,
-                &snapshot.base_sha,
-                &snapshot.entry_count.to_string(),
-                &serde_json::to_string(&snapshot.cwd_relative_path).unwrap(),
-            ])
-            .output()
-            .unwrap();
-        assert!(!rejected.status.success());
-        assert_eq!(
-            std::fs::read(remote.join("local-marker")).unwrap(),
-            b"preserve\n"
-        );
-        assert_eq!(
-            git(&remote, &["rev-parse", "HEAD"]),
-            format!("{base_sha}\n").as_bytes()
-        );
-        assert_eq!(git(&platform, &["rev-parse", "HEAD"]), platform_head);
-        assert_eq!(
-            std::fs::read(platform.join("platform.txt")).unwrap(),
-            b"platform dirty\n"
-        );
-        assert!(!staging.exists());
+                .success());
+            if corrupt_bundle {
+                std::fs::write(staging.join("source.bundle"), "corrupt").unwrap();
+            }
+            let rejection_script = if corrupt_bundle {
+                script.clone()
+            } else {
+                script.replace(
+                    "MAX_CHECKOUT_BYTES = 256 * 1024",
+                    "MAX_CHECKOUT_BYTES = 128 * 1024",
+                )
+            };
+            let rejected = std::process::Command::new("python3")
+                .args([
+                    "-c",
+                    &rejection_script,
+                    staging.to_str().unwrap(),
+                    &snapshot.manifest_sha256,
+                    &snapshot.base_sha,
+                    &snapshot.entry_count.to_string(),
+                    &serde_json::to_string(&snapshot.cwd_relative_path).unwrap(),
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(
+                rejected.status.code(),
+                Some(if corrupt_bundle { 44 } else { 45 })
+            );
+            assert_eq!(
+                std::fs::read(remote.join("local-marker")).unwrap(),
+                b"preserve\n"
+            );
+            assert_eq!(
+                git(&remote, &["rev-parse", "HEAD"]),
+                format!("{base_sha}\n").as_bytes()
+            );
+            assert_eq!(git(&platform, &["rev-parse", "HEAD"]), platform_head);
+            assert_eq!(
+                std::fs::read(platform.join("platform.txt")).unwrap(),
+                b"platform dirty\n"
+            );
+            assert!(!staging.exists());
+        }
     }
 
     #[cfg(unix)]
@@ -4778,7 +4866,8 @@ mod tests {
             let script = VERIFY_WORKTREE_HANDOFF_PYTHON
                 .replace("/workspace/ashler-platform", platform.to_str().unwrap())
                 .replace("/workspace/crew-handoff", remote.to_str().unwrap())
-                .replace("MAX_TOTAL = 256 * 1024 * 1024", "MAX_TOTAL = 1024 * 1024");
+                .replace("MAX_TOTAL = 256 * 1024 * 1024", "MAX_TOTAL = 1024 * 1024")
+                .replace("MAX_CHECKOUT_BYTES = 1024 * 1024 * 1024", "MAX_CHECKOUT_BYTES = 1024 * 1024");
             let script = if scenario == "import_expansion" {
                 script.replace(
                     "MAX_HISTORY_BYTES = 4 * 1024 * 1024 * 1024",

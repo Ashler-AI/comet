@@ -145,6 +145,12 @@ Native transfer reads the sandbox checkout's exact HEAD before capture. When it
 is a known source ancestor and the only bundle boundary, the archive contains only
 the Git delta after that commit; matching HEADs transfer no Git objects. Dirty and untracked files remain
 a separate verified overlay. The 256 MiB archive limit is unchanged.
+Archive uploads have a five-minute total request deadline, separate from the
+30-second control-request deadline. Cancellation still stops an in-flight upload.
+The worktree verifier runs from a temporary sandbox file rather than exceeding
+the runtime's 16 KiB exec-argument limit with inline program text.
+The reconstructed checkout has a separate 1 GiB byte budget; compressed Git
+objects and archive bytes are checked independently before checkout publication.
 
 Scaffold reconstructs the exact source HEAD at `/workspace/crew-handoff`, preserving
 a nested source cwd. Delta checkouts borrow the provisioned platform repository's
