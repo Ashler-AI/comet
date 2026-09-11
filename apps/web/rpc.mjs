@@ -58,7 +58,7 @@ export class CrewRpc extends EventEmitter {
 
   request(method, params, item) {
     if (this.socket?.readyState !== WebSocket.OPEN) return Promise.reject(new Error('Crew engine disconnected'));
-    const id = String(++this.nextId);
+    const id = ++this.nextId;
     const promise = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
