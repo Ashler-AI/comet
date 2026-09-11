@@ -225,7 +225,7 @@ test('follow-ups leave native continuation to the engine for the assigned sessio
 
 test('browser restores the authorized route after failed admission or rejection and preserves retries', async () => {
   const source = await readFile(new URL('./public/app.js', import.meta.url), 'utf8');
-  for (const failure of ['admission', 'rejection', 'outcome', 'response', 'default-outcome', 'default-response', 'edited-response']) {
+  for (const failure of ['admission', 'rejection', 'outcome', 'response', 'default-admission', 'default-outcome', 'default-response', 'edited-response']) {
     const nodes = new Map();
     const node = id => {
       if (!nodes.has(id)) nodes.set(id, {
@@ -258,6 +258,7 @@ test('browser restores the authorized route after failed admission or rejection 
           admitted.set(body.requestId, { status: 'applied' });
           if (fail) throw new TypeError('Response lost');
         } else if (path === './api/message') {
+          if (fail && failure === 'default-admission') route = 'remote';
           if (admitted.has(body.requestId)) result = {};
           else if (fail && failure === 'admission') status = 503;
           else if (route !== body.model.split('/')[1]) status = 409;
@@ -283,6 +284,7 @@ test('browser restores the authorized route after failed admission or rejection 
     const submit = () => node('composer').listeners.submit({ preventDefault() {} });
     await submit();
     assert.equal(node('message').value, 'Continue');
+    if (failure === 'default-admission') assert.equal(admitted.size, 0);
     if (failure === 'admission') {
       node('model').value = 'openai-codex/gpt-example';
       await submit();
@@ -299,7 +301,12 @@ test('browser restores the authorized route after failed admission or rejection 
       await submit();
       const messages = calls.filter(call => call.path === './api/message');
       assert.equal(messages.length, 2);
-      if (failure === 'edited-response') {
+      if (failure === 'default-admission') {
+        assert.notEqual(messages[0].body.requestId, messages[1].body.requestId);
+        assert.equal(messages[1].body.text, 'Continue');
+        assert.equal(messages[1].body.model, 'openai-codex/remote');
+        assert.equal(admitted.size, 1);
+      } else if (failure === 'edited-response') {
         assert.notEqual(messages[0].body.requestId, messages[1].body.requestId);
         assert.equal(messages[1].body.text, 'New draft');
         assert.equal(messages[1].body.model, 'openai-codex/remote');

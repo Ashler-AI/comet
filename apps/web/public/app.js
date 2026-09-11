@@ -506,6 +506,7 @@ ui.composer.addEventListener('submit', async (event) => {
   if (ui.model.value) payload.model = ui.model.value;
   payload.reasoning = ui.reasoning.value || null;
   const draftKey = JSON.stringify([text, payload.attachments, submittedModelRevision, modelDirty ? [payload.model, payload.reasoning] : null]);
+  const currentPayload = payload;
   payload = unresolvedMessages.get(draftKey) || payload;
   sending = true; updateControls();
   try {
@@ -517,6 +518,8 @@ ui.composer.addEventListener('submit', async (event) => {
         retrying = true;
       } catch (error) {
         if (error.status !== 404) throw error;
+        unresolvedMessages.delete(draftKey);
+        payload = currentPayload;
       }
     }
     if (!retrying && running() && (payload.model !== state.session.model || payload.reasoning !== (state.session.reasoning ?? null))) throw new Error('Stop the current turn before changing model or reasoning. Your message has been kept.');
