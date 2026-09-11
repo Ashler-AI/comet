@@ -580,20 +580,19 @@ const main = async () => {
   });
   assert.ok(committed.path.startsWith(dataDir + path.sep));
   assert.deepEqual(await readFile(committed.path), imageBytes);
-  assert.equal(await expectRelayDenial(clientA, uploadRPC++, "UploadChunk", {
+  await assert.rejects(rpcCall(clientA, uploadRPC++, "UploadChunk", {
     uploadId, sessionId: "other-session", data: "AA=="
-  }), "session_scope_denied");
+  }), { message: "session_scope_denied" });
   console.log("PASS mobile chunk upload committed 100019 byte-identical bytes on scoped Rust host; cross-session upload denied");
 
-  const actorDenial = await expectRelayDenial(clientA, 0, "QueueCommand", {
+  await assert.rejects(rpcCall(clientA, 0, "QueueCommand", {
     command: {
       kind: "control",
       sessionId: SESSION_ID,
       actorSubject: OWNER_SUBJECT,
       action: { action: "pause" }
     }
-  });
-  assert.equal(actorDenial, "actor_mismatch");
+  }), { message: "actor_mismatch" });
   console.log("PASS Edge rejected a forged command actor from a different authenticated principal");
   const pauseCommand = {
     chatId: SESSION_ID,
