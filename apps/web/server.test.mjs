@@ -100,6 +100,18 @@ test('deployment session connects and admits messages and controls without legac
   assert.equal((await f.post('/api/interrupt', { requestId: 'stop-a' })).status, 202);
   f.viewport.messages = [{ parts: [{ kind: 'input', requestId: 'input-a', questions: [{ id: 'q', multiSelect: false }] }] }];
   assert.equal((await f.post('/api/input', { requestId: 'answer-a', inputRequestId: 'input-a', answers: [{ questionId: 'q', labels: ['yes'] }] })).status, 202);
+  const session = { chatId: 'session-a::session::session-a', deviceId: 'device-a', status: 'working', startedAt: '2026-09-11T10:00:00Z' };
+  watches.get('WatchSessions').callback([session]);
+  const firstTurn = f.viewport.state().session.turnId;
+  assert.ok(firstTurn);
+  watches.get('WatchDocMessages').callback({ reset: [{ id: 'message-a', parts: [] }] });
+  watches.get('WatchSessions').callback([{ ...session, status: 'awaitingInput' }]);
+  assert.equal(f.viewport.state().session.turnId, firstTurn);
+  watches.get('WatchSessions').callback([{ ...session, startedAt: '2026-09-11T10:01:00Z' }]);
+  assert.notEqual(f.viewport.state().session.turnId, firstTurn);
+  assert.equal(f.viewport.state().messages.at(-1).id, 'message-a');
+  watches.get('WatchSessions').callback([{ ...session, startedAt: null }]);
+  assert.equal(f.viewport.state().session.turnId, null);
 });
 
 test('session context binding mismatch clears protected readiness before admission', async t => {
@@ -273,17 +285,22 @@ test('browser restores the authorized route after failed admission or rejection 
     node('reasoning').listeners.change();
     runInContext(`state.session.model = 'openai-codex/another'; renderModels();`, context);
     assert.equal(node('model').value, 'openai-codex/unsent');
-    runInContext(`state.session.id = 'session-a'; state.capabilities.interrupt = true; state.messages = [{ id: 'turn-a' }];`, context);
+    runInContext(`state.session.id = 'session-a'; state.session.turnId = JSON.stringify(['session-a', 'device-a', '2026-09-11T10:00:00Z']); state.capabilities.interrupt = true; state.messages = [{ id: 'message-a' }];`, context);
     const stop = () => node('stop').listeners.click();
     fail = true;
     await stop();
+    runInContext(`state.messages.push({ id: 'message-a2' }); state.session.status = 'awaitingInput';`, context);
     await stop();
-    runInContext(`state.messages = [{ id: 'turn-b' }];`, context);
+    runInContext(`state.session = { ...state.session, status: 'working', turnId: JSON.stringify(['session-a', 'device-a', '2026-09-11T10:01:00Z']) };`, context);
     fail = false;
     await stop();
     const stops = calls.filter(call => call.path === './api/interrupt');
     assert.equal(stops[0].body.requestId, stops[1].body.requestId);
     assert.notEqual(stops[0].body.requestId, stops[2].body.requestId);
+    runInContext(`state.session.turnId = null; updateControls();`, context);
+    assert.equal(node('stop').disabled, true);
+    await stop();
+    assert.equal(calls.filter(call => call.path === './api/interrupt').length, 3);
   }
 });
 

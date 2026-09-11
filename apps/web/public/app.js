@@ -124,7 +124,7 @@ function updateControls() {
   ui.send.title = ui.send.ariaLabel = running() ? 'Steer agent' : 'Send message';
   ui.message.placeholder = running() ? 'Steer this agent…' : 'Message Crew…';
   ui.stop.hidden = !running();
-  ui.stop.disabled = !allowed('interrupt') || stopping;
+  ui.stop.disabled = !allowed('interrupt') || !state?.session.turnId || stopping;
   ui.stop.title = ui.stop.ariaLabel = stopping ? 'Stop requested…' : 'Stop agent';
   for (const submit of ui['pending-input'].querySelectorAll('button[type="submit"]')) submit.disabled = !allowed('input') || submit.dataset.submitting === 'true';
 }
@@ -535,9 +535,9 @@ ui.composer.addEventListener('submit', async (event) => {
   finally { sending = false; updateControls(); }
 });
 ui.stop.addEventListener('click', async () => {
-  if (!allowed('interrupt') || stopping) return;
+  if (!allowed('interrupt') || !running() || !state.session.turnId || stopping) return;
   stopping = true; updateControls();
-  try { await command('interrupt', {}, JSON.stringify([state.session.id, state.messages.at(-1)?.id])); }
+  try { await command('interrupt', {}, state.session.turnId); }
   catch (error) { showError(error); }
   finally { stopping = false; updateControls(); }
 });

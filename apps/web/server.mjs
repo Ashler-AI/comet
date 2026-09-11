@@ -250,6 +250,7 @@ export class Viewport {
     return {
       sandboxId: this.config.sandboxId,
       session: { id: this.config.sessionId, title: context?.title || 'Crew', cwd: context?.cwd || '', branch: context?.branch || '', status,
+        turnId: this.live?.startedAt ? JSON.stringify([this.config.sessionId, this.live.deviceId, this.live.startedAt]) : null,
         model: this.selection?.model || record?.model || context?.config?.model,
         reasoning: this.selection ? this.selection.reasoning : context?.config?.reasoning },
       messages: this.messages, models: this.models, history: { hasOlder: this.before != null, before: this.before ?? null },
