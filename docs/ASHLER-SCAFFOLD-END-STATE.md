@@ -105,6 +105,9 @@ fails closed.
    remains a local-controller capability. `ListSessionModels` is the scoped
    exception: it requires the exact locally hosted session and a current live read
    grant, and returns only the OMP catalog's `openai-codex/` and `anthropic/` models.
+   `ReadSessionAuthority`, `ReadSessionSelection`, and `ReadSessionCommand` share
+   that live-read boundary and expose, respectively, current authority, the last
+   execution's model/reasoning selection, and a durable command's outcome.
    The authority check and catalog filter are owned by `crates/engine/src/rpc.rs`.
 
 ## Implementation slices
@@ -148,10 +151,13 @@ and opens the same mirrored session in the native UI.
 
 Add an explicit Scaffold/Comet agent runtime profile in the platform. The
 provider/supervisor owns one headless Comet process, health/sync state, restart,
-and OMP child lifecycle. Remove OpenCode process, port 4096 attach rewrites,
-OpenCode completion/activity/handoff state, and browser Agent view from this
-profile. Retain the old profile only as a time-bounded rollback until acceptance
-passes, then delete it.
+and OMP child lifecycle. Remove the OpenCode runtime and its
+completion/activity/handoff state from this profile. The browser Agent view is
+replaced by the authenticated fixed-session Crew viewport, not a parallel session
+backend; its compatibility attach path may retain the `opencode` name. See the
+[Scaffold session web view](../README.md#scaffold-session-web-view) for runtime
+configuration. Retain the old profile only as a time-bounded rollback until
+acceptance passes, then delete it.
 
 ### F. Staged cutover
 
@@ -189,7 +195,8 @@ For OMP, Codex, and Claude Code independently:
 2. attempts to start Codex or Claude Code fail at the engine boundary;
 3. attempts to list/create nested Scaffold environments fail at the engine
    boundary;
-4. no OpenCode process or port 4096 listener exists;
+4. no OpenCode runtime process exists; the browser attach surface serves only the
+   authenticated fixed-session Crew viewport;
 5. no local account/session-import surface is available;
 6. bootstrap is mode 0600, absent from argv/logs, consumed before exchange, and
    deleted on success and every failure.

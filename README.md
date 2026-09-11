@@ -23,8 +23,14 @@ durable outcome is applied; rejection or expiry remains visible and retryable.
 Linux archives include `crew-web/` beside `comet`, so the viewport and its scoped
 catalog, selection, live-authority, and command-outcome RPCs ship together. Runtime: Node >=22.4,
 `node /opt/crew-web/server.mjs`; Scaffold configures `COMET_IPC_PORT`, `COMET_DATA_DIR`,
-`SCAFFOLD_RUNTIME_DIR`, `SCAFFOLD_COMET_RUNTIME_PROFILE_JSON`, `CREW_WEB_AUTH_TOKEN`,
-and the HTTP bind address/port. Tests: `node --test apps/web/server.test.mjs`.
+`SCAFFOLD_RUNTIME_DIR`, and `CREW_WEB_AUTH_TOKEN`. Trusted `sessionId` and `sandboxId`
+bindings come from `SCAFFOLD_COMET_RUNTIME_PROFILE_JSON`; explicit
+`CREW_WEB_SESSION_ID` (which must match any profile session) and
+`CREW_WEB_SANDBOX_ID` (used when the profile omits the sandbox) are also supported.
+`CREW_WEB_HOST` and `CREW_WEB_PORT` default to `127.0.0.1` and `4096`.
+The attach proxy must follow the authentication and mutation-origin contract in
+`authorize` in `apps/web/server.mjs`.
+Tests: `node --test apps/web/server.test.mjs`.
 
 Rollout requires publishing a new immutable Crew Linux release containing these
 assets, selecting its verified release tuple in the platform repository, rebuilding
