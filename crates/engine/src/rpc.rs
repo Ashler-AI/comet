@@ -219,11 +219,9 @@ fn session_catalog_binding_allowed(
     authority: &crate::auth::DeviceGrantAuthority,
     chat_id: &str,
     device_id: &str,
-    locally_hosted: bool,
 ) -> bool {
     authority.scope.session_id.as_deref() == Some(chat_id)
         && authority.device_id == device_id
-        && locally_hosted
         && authority.expires_at > crate::now_ms()
         && authority.capabilities.iter().any(|capability| capability == comet_proto::CAPABILITY_SESSION_READ)
 }
@@ -235,10 +233,12 @@ fn session_viewport_authority(
     if rpc.runtime_profile != RuntimeProfile::ScaffoldHost {
         return Err(RpcError::Failed("session_viewport_requires_scaffold_host".into()));
     }
+    // Scaffold sessions are hosted through their deployment-bound grant, not a
+    // legacy workspace chat row; a newly attached session has no such row.
     let mut authority = rpc.auth()?.device_grant_authority()
         .ok_or_else(|| RpcError::Failed("scaffold_host_authority_unavailable".into()))?;
     if !session_catalog_binding_allowed(
-        &authority, chat_id, rpc.doc_host.device_id(), rpc.doc_host.is_locally_hosted(chat_id),
+        &authority, chat_id, rpc.doc_host.device_id(),
     ) {
         return Err(RpcError::Failed("session_viewport_binding_mismatch".into()));
     }
@@ -2712,15 +2712,14 @@ mod tests {
             lifecycle_epoch: 1,
             capabilities: vec![comet_proto::CAPABILITY_SESSION_READ.into()],
         };
-        assert!(session_catalog_binding_allowed(&authority, "session-a", "device-a", true));
-        assert!(!session_catalog_binding_allowed(&authority, "session-b", "device-a", true));
-        assert!(!session_catalog_binding_allowed(&authority, "session-a", "device-b", true));
-        assert!(!session_catalog_binding_allowed(&authority, "session-a", "device-a", false));
+        assert!(session_catalog_binding_allowed(&authority, "session-a", "device-a"));
+        assert!(!session_catalog_binding_allowed(&authority, "session-b", "device-a"));
+        assert!(!session_catalog_binding_allowed(&authority, "session-a", "device-b"));
         authority.capabilities.clear();
-        assert!(!session_catalog_binding_allowed(&authority, "session-a", "device-a", true));
+        assert!(!session_catalog_binding_allowed(&authority, "session-a", "device-a"));
         authority.capabilities.push(comet_proto::CAPABILITY_SESSION_READ.into());
         authority.expires_at = 0;
-        assert!(!session_catalog_binding_allowed(&authority, "session-a", "device-a", true));
+        assert!(!session_catalog_binding_allowed(&authority, "session-a", "device-a"));
     }
 
     #[test]
