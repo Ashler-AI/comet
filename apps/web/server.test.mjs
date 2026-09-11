@@ -113,11 +113,17 @@ test('deployment session connects and admits messages and controls without legac
   assert.equal(watches.has('WatchChats'), false);
   watches.get('WatchSessions').callback([]);
   watches.get('WatchDocMessages').callback({ reset: [], before: null });
-  watches.get('WatchCollaboration').callback({ sessions: [] });
+   watches.get('WatchCollaboration').callback({ sessions: [{ sessionId: 'session-a', status: 'idle', model: 'openai-codex/gpt-example' }], grants: [{ id: 'private-grant' }], participants: [{ email: 'private@example.com' }] });
   await Promise.resolve();
   assert.equal(f.viewport.chat, undefined);
   assert.equal(f.viewport.state().capabilities.message, true);
-  assert.equal(f.viewport.state().session.cwd, '/workspace');
+   assert.equal(f.viewport.state().session.cwd, '/workspace');
+   const browserState = await (await fetch(f.url + '/api/session', { headers: f.headers })).json();
+   assert.equal(Object.hasOwn(browserState, 'collaboration'), false);
+   assert.equal(Object.hasOwn(browserState, 'grants'), false);
+   assert.equal(Object.hasOwn(browserState, 'participants'), false);
+   assert.equal(browserState.session.model, 'openai-codex/gpt-example');
+   assert.equal(browserState.capabilities.input, true);
   const { model, reasoning, ...defaultMessage } = message;
   assert.equal((await f.post('/api/message', { ...defaultMessage, cwd: '/browser' })).status, 400);
   assert.equal((await f.post('/api/message', defaultMessage)).status, 202);
@@ -219,7 +225,7 @@ test('follow-ups leave native continuation to the engine for the assigned sessio
 
 test('browser restores the authorized route after failed admission or rejection and preserves retries', async () => {
   const source = await readFile(new URL('./public/app.js', import.meta.url), 'utf8');
-  for (const failure of ['admission', 'rejection', 'outcome', 'response']) {
+  for (const failure of ['admission', 'rejection', 'outcome', 'response', 'default-outcome', 'default-response', 'edited-response']) {
     const nodes = new Map();
     const node = id => {
       if (!nodes.has(id)) nodes.set(id, {
@@ -257,12 +263,12 @@ test('browser restores the authorized route after failed admission or rejection 
           else if (route !== body.model.split('/')[1]) status = 409;
           else {
             admitted.set(body.requestId, { status: fail && failure === 'rejection' ? 'rejected' : 'applied' });
-            if (fail && failure === 'response') throw new TypeError('Response lost');
+            if (fail && failure.endsWith('response')) throw new TypeError('Response lost');
           }
         } else {
           result = admitted.get(path.split('/').at(-1));
           if (!result) { status = 404; result = {}; }
-          else if (fail && failure === 'outcome') status = 503;
+          else if (fail && failure.endsWith('outcome')) status = 503;
         }
         return new Response(JSON.stringify(result), { status, headers: { 'content-type': 'application/json' } });
       },
@@ -270,9 +276,10 @@ test('browser restores the authorized route after failed admission or rejection 
     runInContext(source, context);
     runInContext(`state = { connection: 'connected', sandboxId: 'sandbox-a', session: { model: 'openai-codex/gpt-example', reasoning: 'high', status: 'idle' }, capabilities: { message: true }, models: [{}] }; connected = true;`, context);
     node('message').value = 'Continue';
-    node('model').value = 'openai-codex/gpt-other';
+    const defaultSelection = failure.startsWith('default-') || failure === 'edited-response';
+    node('model').value = defaultSelection ? 'openai-codex/gpt-example' : 'openai-codex/gpt-other';
     node('reasoning').value = 'high';
-    node('reasoning').listeners.change();
+    if (!defaultSelection) node('reasoning').listeners.change();
     const submit = () => node('composer').listeners.submit({ preventDefault() {} });
     await submit();
     assert.equal(node('message').value, 'Continue');
@@ -284,7 +291,25 @@ test('browser restores the authorized route after failed admission or rejection 
       node('model').value = 'openai-codex/gpt-other';
     }
     fail = false;
-    if (failure === 'outcome' || failure === 'response') {
+    if (defaultSelection) {
+      route = 'remote';
+      runInContext(`state.session.model = 'openai-codex/remote'; state.session.status = 'working'; renderModels();`, context);
+      assert.equal(node('model').value, 'openai-codex/remote');
+      if (failure === 'edited-response') node('message').value = 'New draft';
+      await submit();
+      const messages = calls.filter(call => call.path === './api/message');
+      assert.equal(messages.length, 2);
+      if (failure === 'edited-response') {
+        assert.notEqual(messages[0].body.requestId, messages[1].body.requestId);
+        assert.equal(messages[1].body.text, 'New draft');
+        assert.equal(messages[1].body.model, 'openai-codex/remote');
+        assert.equal(admitted.size, 2);
+      } else {
+        assert.deepEqual(messages[1].body, messages[0].body);
+        assert.equal(admitted.size, 1);
+      }
+      assert.equal(calls.filter(call => call.path.endsWith('/model-route')).length, 1);
+    } else if (failure === 'outcome' || failure === 'response') {
       route = 'gpt-example';
       await submit();
       const messages = calls.filter(call => call.path === './api/message');

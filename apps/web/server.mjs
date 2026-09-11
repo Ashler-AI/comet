@@ -254,7 +254,7 @@ export class Viewport {
         model: this.selection?.model || record?.model || context?.config?.model,
         reasoning: this.selection ? this.selection.reasoning : context?.config?.reasoning },
       messages: this.messages, models: this.models, history: { hasOlder: this.before != null, before: this.before ?? null },
-      collaboration: this.collaboration, connection: this.connection,
+      connection: this.connection,
       capabilities: { message: active && caps.includes(CAP_CHAT), input: active && caps.includes(CAP_CHAT), interrupt: active && caps.includes(CAP_CONTROL) },
     };
   }

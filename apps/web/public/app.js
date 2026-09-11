@@ -42,6 +42,7 @@ function userText(text) {
   return root;
 }
 const commandIds = new Map();
+const unresolvedMessages = new Map();
 const pendingCommands = new Map();
 const inputDrafts = new Map();
 const terminalCommandStatuses = new Set(['rejected', 'expired', 'superseded', 'cancelled']);
@@ -501,9 +502,11 @@ ui.composer.addEventListener('submit', async (event) => {
   const text = ui.message.value;
   const submittedModelRevision = modelRevision;
   const submitted = uploads.slice();
-  const payload = { text, attachments: submitted.map((file) => file.metadata) };
+  let payload = { text, attachments: submitted.map((file) => file.metadata) };
   if (ui.model.value) payload.model = ui.model.value;
   payload.reasoning = ui.reasoning.value || null;
+  const draftKey = JSON.stringify([text, payload.attachments, submittedModelRevision, modelDirty ? [payload.model, payload.reasoning] : null]);
+  payload = unresolvedMessages.get(draftKey) || payload;
   sending = true; updateControls();
   try {
     const requestId = commandIds.get(`message:${JSON.stringify(payload)}`);
@@ -525,6 +528,7 @@ ui.composer.addEventListener('submit', async (event) => {
       if (!state.sandboxId) throw new Error('The sandbox identity is unavailable. Reconnect before changing models.');
       await api(`/sessions/${encodeURIComponent(state.sandboxId)}/opencode/api/model-route`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ provider, model: payload.model.slice(separator + 1) }) });
     }
+    unresolvedMessages.set(draftKey, payload);
     await command('message', payload);
     if (modelRevision === submittedModelRevision && ui.message.value === text) modelDirty = false;
     if (ui.message.value === text) ui.message.value = '';
@@ -532,7 +536,10 @@ ui.composer.addEventListener('submit', async (event) => {
     renderAttachments(); resizeComposer();
     ui.message.focus();
   } catch (error) { showError(error); }
-  finally { sending = false; updateControls(); }
+  finally {
+    if (!commandIds.has(`message:${JSON.stringify(payload)}`)) unresolvedMessages.delete(draftKey);
+    sending = false; updateControls();
+  }
 });
 ui.stop.addEventListener('click', async () => {
   if (!allowed('interrupt') || !running() || !state.session.turnId || stopping) return;
