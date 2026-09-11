@@ -72,6 +72,33 @@ impl RunJournal {
         self.dir.join(format!("{}.resume", sanitize_id(chat_id)))
     }
 
+    pub(crate) fn save_context<T: Serialize>(&self, chat_id: &str, context: &T) -> Result<(), JournalError> {
+        let _guard = self.lock();
+        let path = self.dir.join(format!("{}.context", sanitize_id(chat_id)));
+        let temporary = path.with_extension("context.tmp");
+        let bytes = serde_json::to_vec(&(chat_id, context))?;
+        let mut file = File::create(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(temporary, path)?;
+        File::open(&self.dir)?.sync_all()?;
+        Ok(())
+    }
+
+    pub(crate) fn read_context<T: serde::de::DeserializeOwned>(&self, chat_id: &str) -> Result<Option<T>, JournalError> {
+        let path = self.dir.join(format!("{}.context", sanitize_id(chat_id)));
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let (stored_id, context): (String, T) = serde_json::from_slice(&bytes)?;
+        if stored_id != chat_id {
+            return Err(std::io::Error::other("session_context_binding_mismatch").into());
+        }
+        Ok(Some(context))
+    }
+
     /// Auto-resume revival budget (comet `resumeAttempt`/`MAX_AUTO_RESUME`):
     /// persisted beside the journal so a run that CRASHES THE ENGINE cannot
     /// revive itself in an infinite boot loop.
@@ -214,6 +241,12 @@ impl RunJournal {
     /// Remove a chat's journal file entirely (tests / future compaction).
     pub fn discard(&self, chat_id: &str) -> Result<(), JournalError> {
         self.lock().remove(chat_id);
+        let context_path = self.dir.join(format!("{}.context", sanitize_id(chat_id)));
+        match std::fs::remove_file(context_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         let path = self.path_for(chat_id);
         if path.exists() {
             std::fs::remove_file(path)?;
@@ -282,6 +315,19 @@ mod tests {
 
     fn text(s: &str) -> AgentEvent {
         AgentEvent::TextDelta { text: s.into() }
+    }
+
+    #[test]
+    fn context_recovery_rejects_aliases_corruption_and_discarded_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal.save_context("chat::session::chat", &"accepted").unwrap();
+        assert!(journal.read_context::<String>("chat__session__chat").is_err());
+        std::fs::write(dir.path().join("chat__session__chat.context"), b"truncated").unwrap();
+        assert!(journal.read_context::<String>("chat::session::chat").is_err());
+        journal.save_context("chat::session::chat", &"replacement").unwrap();
+        journal.discard("chat::session::chat").unwrap();
+        assert!(journal.read_context::<String>("chat::session::chat").unwrap().is_none());
     }
 
     fn done() -> AgentEvent {

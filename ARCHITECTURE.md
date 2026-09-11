@@ -6,9 +6,9 @@ A ground-up native rewrite of [comet](../comet) — a multi-device controller fo
 **Pillars (from the goal):**
 - Sync is Loro CRDT docs (loro-mirror model) through Cloudflare Durable Objects.
 - Durable Objects stay **TypeScript** (decision + evidence: `docs/research/durable-objects-language.md`).
-  Everything device-side is Rust.
+  The native engine and desktop app are Rust.
 - Feature parity with comet **except token-usage display** (poor fit for CRDTs; excluded).
-- Frontend is **gpui** (pinned Zed rev). Virtualization + markdown techniques ported from
+- Desktop frontend is **gpui** (pinned Zed rev). Virtualization + markdown techniques ported from
   **mugen + pretext** (`docs/research/mugen-pretext.md`).
 - One binary, **headed or headless**. Smooth transitions/animations matching the original
   (catalog in `docs/research/feature-inventory.md` §1.12).
@@ -24,12 +24,14 @@ gpui UI ─ in-proc/localhost RPC ─ engine A ══ DeviceRoom DO relay ══
 
 - **Engine = backend** (was `@comet/backend`): runs agents, owns auth, terminals, repos/worktrees,
   diff sync, doc hosting. Pure Rust daemon, fully functional headless.
-- **UI = viewport** (was Electron): gpui app rendering engine state. Talks the same typed RPC
+- **Desktop UI = viewport** (was Electron): gpui app rendering engine state. Talks the same typed RPC
   whether the engine is in-process or a separate daemon. Organized around **spaces** — synced
   (device, folder) pairs: the sidebar lists spaces plus a global attention-sorted Active list;
   the main area shows the selected space's sessions as horizontal tabs (closing a tab archives);
   new sessions are minted onto the space's device via relay-forwardable RPCs.
 - **Edge (TypeScript)**: Worker + SessionRoom DO (per shared thread) + DeviceRoom DO (per device) + R2 attachments. It verifies Google Cloud IAP principals through Scaffold's existing access path and binds capabilities to explicit Scaffold project/deployment/session scope. No Ashler application database or application-auth flow participates.
+
+For the separate browser surface, see the [Scaffold session web view](README.md#scaffold-session-web-view).
 
 ### Headed / headless
 Single binary `comet`:
