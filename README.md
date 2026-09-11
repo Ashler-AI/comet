@@ -123,7 +123,7 @@ comet update
 comet daemon start|stop|restart|status
 ```
 
-Download the macOS DMG from the same release feed. Comet uses OMP over ACP. The installer bootstraps any missing agent CLI (OMP, Claude Code, Codex) after the comet install — failures there never abort the install, and `COMET_SKIP_AGENT_BOOTSTRAP=1` skips the phase for managed environments. An existing `omp` is never silently replaced; to bootstrap or validate it explicitly:
+Download the macOS DMG from the same release feed. For OMP transport details, see [the harness architecture](ARCHITECTURE.md#5-engine-plan). The installer bootstraps any missing agent CLI (OMP, Claude Code, Codex) after the comet install — failures there never abort the install, and `COMET_SKIP_AGENT_BOOTSTRAP=1` skips the phase for managed environments. An existing `omp` is never silently replaced; to bootstrap or validate it explicitly:
 
 ```bash
 # Run the same private install.sh downloaded above:
