@@ -328,7 +328,7 @@ fn controller_payload(
         SessionCommandPayload::Queue { prompt, message_id } => {
             SessionControlAction::Queue { prompt, message_id }
         }
-        SessionCommandPayload::Interrupt {} => SessionControlAction::Stop {},
+        SessionCommandPayload::Interrupt {} => SessionControlAction::Stop { expected_turn_id: None },
         SessionCommandPayload::RespondInput {
             request_id,
             answers,

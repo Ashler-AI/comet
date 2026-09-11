@@ -68,6 +68,50 @@ async function fixture(t) {
 
 const message = { requestId: 'request-a', text: 'Continue', model: 'openai-codex/gpt-example', reasoning: 'high', attachments: [] };
 
+test('SSE waits for drain and coalesces transcript updates with fresh authority', async t => {
+  const f = await fixture(t);
+  const client = new EventEmitter();
+  const frames = [];
+  client.writableLength = 0;
+  client.write = frame => { frames.push(frame); client.writableLength = Buffer.byteLength(frame); return false; };
+  client.destroy = () => assert.fail('Normal backpressure must not disconnect');
+  f.viewport.clients.add(client);
+  f.viewport.messages = [{ text: 'x'.repeat(32000) }];
+  await f.viewport.emit();
+  f.viewport.messages = [{ text: 'intermediate' }];
+  await f.viewport.emit();
+  f.viewport.messages = [{ text: 'latest' }];
+  await f.viewport.emit();
+  assert.equal(frames.length, 1);
+  assert.equal(client.listenerCount('drain'), 1);
+  client.writableLength = 0;
+  client.emit('drain');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(frames.length, 2);
+  assert.equal(JSON.parse(frames[1].split('data: ')[1]).messages[0].text, 'latest');
+  client.end = frame => frames.push(frame);
+  f.rpc.call = async () => { throw new Error('Authority revoked'); };
+  client.writableLength = 0;
+  client.emit('drain');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(JSON.parse(frames[2].split('data: ')[1]).transcriptReset, true);
+  assert.equal(f.viewport.clients.size, 0);
+});
+
+test('SSE disconnects when buffered and pending state exceed the backlog limit', () => {
+  const viewport = new Viewport({}, new EventEmitter());
+  const client = new EventEmitter();
+  let destroyed = false;
+  client.writableLength = 1024 * 1024;
+  client.write = () => false;
+  client.destroy = () => { destroyed = true; };
+  viewport.clients.add(client);
+  viewport.sendState(client, 'first');
+  viewport.sendState(client, 'x'.repeat(1024 * 1024 + 1));
+  assert.equal(destroyed, true);
+  assert.equal(viewport.clients.size, 0);
+});
+
 test('RPC recovers from a failed dial without a close event and ignores the retired socket', async t => {
   const sockets = [];
   t.mock.method(globalThis, 'WebSocket', function () {
@@ -132,18 +176,24 @@ test('deployment session connects and admits messages and controls without legac
   assert.equal(request.model, model);
   assert.equal(request.reasoning, reasoning);
   assert.deepEqual(request.modelOptions, { trusted: true });
-  assert.equal((await f.post('/api/interrupt', { requestId: 'stop-a' })).status, 202);
+   assert.equal((await f.post('/api/interrupt', { requestId: 'stop-a' })).status, 400);
   f.viewport.messages = [{ parts: [{ kind: 'input', requestId: 'input-a', questions: [{ id: 'q', multiSelect: false }] }] }];
   assert.equal((await f.post('/api/input', { requestId: 'answer-a', inputRequestId: 'input-a', answers: [{ questionId: 'q', labels: ['yes'] }] })).status, 202);
   const session = { chatId: 'session-a::session::session-a', deviceId: 'device-a', status: 'working', startedAt: '2026-09-11T10:00:00Z' };
   watches.get('WatchSessions').callback([session]);
   const firstTurn = f.viewport.state().session.turnId;
-  assert.ok(firstTurn);
+   assert.ok(firstTurn);
+   assert.equal((await f.post('/api/interrupt', { requestId: 'stop-a', turnId: firstTurn })).status, 202);
+   assert.deepEqual(f.commands.get('crew-web:stop-a').command.action, { action: 'stop', expected_turn_id: firstTurn });
   watches.get('WatchDocMessages').callback({ reset: [{ id: 'message-a', parts: [] }] });
   watches.get('WatchSessions').callback([{ ...session, status: 'awaitingInput' }]);
   assert.equal(f.viewport.state().session.turnId, firstTurn);
   watches.get('WatchSessions').callback([{ ...session, startedAt: '2026-09-11T10:01:00Z' }]);
-  assert.notEqual(f.viewport.state().session.turnId, firstTurn);
+   assert.notEqual(f.viewport.state().session.turnId, firstTurn);
+   assert.equal((await f.post('/api/interrupt', { requestId: 'stale-stop', turnId: firstTurn })).status, 409);
+   assert.equal(f.commands.has('crew-web:stale-stop'), false);
+   assert.equal((await f.post('/api/interrupt', { requestId: 'stop-a', turnId: firstTurn })).status, 202);
+   assert.equal(f.commands.get('crew-web:stop-a').command.action.expected_turn_id, firstTurn);
   assert.equal(f.viewport.state().messages.at(-1).id, 'message-a');
   watches.get('WatchSessions').callback([{ ...session, startedAt: null }]);
   assert.equal(f.viewport.state().session.turnId, null);
@@ -357,6 +407,9 @@ test('browser restores the authorized route after failed admission or rejection 
     await stop();
     const stops = calls.filter(call => call.path === './api/interrupt');
     assert.equal(stops[0].body.requestId, stops[1].body.requestId);
+    assert.equal(stops[0].body.turnId, JSON.stringify(['session-a', 'device-a', '2026-09-11T10:00:00Z']));
+    assert.equal(stops[0].body.turnId, stops[1].body.turnId);
+    assert.equal(stops[2].body.turnId, JSON.stringify(['session-a', 'device-a', '2026-09-11T10:01:00Z']));
     assert.notEqual(stops[0].body.requestId, stops[2].body.requestId);
     runInContext(`state.session.turnId = null; updateControls();`, context);
     assert.equal(node('stop').disabled, true);

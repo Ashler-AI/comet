@@ -1663,35 +1663,19 @@ impl RpcService for EngineRpc {
                     return RpcReply::value(&authority);
                 }
                 if method == "ReadSessionContext" {
-                    let cwd = std::env::current_dir()
-                        .map_err(|error| RpcError::Failed(error.to_string()))?;
-                    let cwd = cwd.to_str()
-                        .ok_or_else(|| RpcError::Failed("session_context_cwd_invalid".into()))?;
                     let execution_key = format!("{}::session::{}", p.chat_id, p.chat_id);
-                    let request = self.sessions.last_request(&execution_key)
-                        .or_else(|| self.sessions.last_request(&p.chat_id));
+                    let request = self.sessions.recovered_context(&execution_key)
+                        .map_err(|error| RpcError::Failed(error.to_string()))?;
                     let chat = self.workspace.doc().chat(&p.chat_id)
                         .map_err(|error| RpcError::Failed(error.to_string()))?
                         .filter(|chat| chat.device_id == authority.device_id);
-                    let cwd = request.as_ref().map(|request| request.cwd.as_str())
-                        .or_else(|| chat.as_ref().and_then(|chat| chat.cwd.as_deref()))
-                        .unwrap_or(cwd);
-                    let mut config = if let Some(request) = request.as_ref() {
-                        serde_json::json!({
+                    let cwd = request.cwd.as_str();
+                    let mut config = serde_json::json!({
                             "harness": "omp", "model": request.model,
+                            "agentAccountId": request.agent_account_id,
                             "reasoning": request.reasoning, "modelOptions": request.model_options,
                             "sandbox": request.sandbox,
-                        })
-                    } else if let Some(config) = chat.as_ref()
-                        .and_then(|chat| chat.config.as_ref())
-                        .filter(|config| config.harness == HarnessId::Omp)
-                    {
-                        serde_json::to_value(config)
-                            .map_err(|error| RpcError::Failed(error.to_string()))?
-                    } else {
-                        comet_harness::omp::read_session_config(cwd).await
-                            .map_err(|error| RpcError::Failed(error.to_string()))?
-                    };
+                        });
                     config["model"] = config["model"].as_str()
                         .and_then(crate::local_sessions::canonical_omp_model_selector)
                         .map(serde_json::Value::String).unwrap_or(serde_json::Value::Null);

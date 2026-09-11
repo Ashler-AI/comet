@@ -547,7 +547,8 @@ ui.composer.addEventListener('submit', async (event) => {
 ui.stop.addEventListener('click', async () => {
   if (!allowed('interrupt') || !running() || !state.session.turnId || stopping) return;
   stopping = true; updateControls();
-  try { await command('interrupt', {}, state.session.turnId); }
+  const turnId = state.session.turnId;
+  try { await command('interrupt', { turnId }, turnId); }
   catch (error) { showError(error); }
   finally { stopping = false; updateControls(); }
 });

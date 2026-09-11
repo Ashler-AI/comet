@@ -82,6 +82,7 @@ export class Viewport {
     this.config = config;
     this.rpc = rpc;
     this.clients = new Set();
+    this.blockedClients = new WeakSet();
     this.messages = [];
     this.models = [];
     this.connection = 'disconnected';
@@ -250,13 +251,28 @@ export class Viewport {
     return {
       sandboxId: this.config.sandboxId,
       session: { id: this.config.sessionId, title: context?.title || 'Crew', cwd: context?.cwd || '', branch: context?.branch || '', status,
-        turnId: this.live?.startedAt ? JSON.stringify([this.config.sessionId, this.live.deviceId, this.live.startedAt]) : null,
+        turnId: this.live?.startedAt ? JSON.stringify([this.live.chatId, this.live.deviceId, this.live.startedAt]) : null,
         model: this.selection?.model || record?.model || context?.config?.model,
         reasoning: this.selection ? this.selection.reasoning : context?.config?.reasoning },
       messages: this.messages, models: this.models, history: { hasOlder: this.before != null, before: this.before ?? null },
       connection: this.connection,
       capabilities: { message: active && caps.includes(CAP_CHAT), input: active && caps.includes(CAP_CHAT), interrupt: active && caps.includes(CAP_CONTROL) },
     };
+  }
+  sendState(client, frame) {
+    if (client.writableLength + Buffer.byteLength(frame) > 2 * 1024 * 1024) {
+      this.clients.delete(client);
+      client.destroy();
+      return;
+    }
+    if (this.blockedClients.has(client)) return;
+    if (!client.write(frame)) {
+      this.blockedClients.add(client);
+      client.once('drain', () => {
+        this.blockedClients.delete(client);
+        if (this.clients.has(client)) void this.emit();
+      });
+    }
   }
   async emit() {
     if (!this.clients.size) return;
@@ -271,10 +287,7 @@ export class Viewport {
         await this.readAuthority();
         const frame = `event: state\ndata: ${JSON.stringify(this.state())}\n\n`;
         for (const client of this.clients) {
-          if (client.writableLength > 2 * 1024 * 1024 || !client.write(frame)) {
-            client.destroy();
-            this.clients.delete(client);
-          }
+          this.sendState(client, frame);
         }
       }
     } catch {
@@ -297,7 +310,7 @@ export class Viewport {
     return task;
   }
   async admit(kind, input) {
-    const allowed = kind === 'message' ? ['requestId', 'text', 'model', 'reasoning', 'attachments'] : kind === 'input' ? ['requestId', 'inputRequestId', 'answers'] : ['requestId'];
+    const allowed = kind === 'message' ? ['requestId', 'text', 'model', 'reasoning', 'attachments'] : kind === 'input' ? ['requestId', 'inputRequestId', 'answers'] : ['requestId', 'turnId'];
     object(input, allowed);
     const requestId = identifier(input.requestId);
     const requestHash = digest(JSON.stringify({ kind, input }));
@@ -351,7 +364,9 @@ export class Viewport {
         } };
       }
     } else if (kind === 'interrupt') {
-      action = { action: 'stop' };
+      requireValue(typeof input.turnId === 'string' && input.turnId.length > 0 && input.turnId.length <= 2048, 'Expected turn required');
+      requireValue(input.turnId === this.state().session.turnId && ['working', 'awaitingInput'].includes(this.state().session.status), 'Stop target is no longer active', 409);
+      action = { action: 'stop', expected_turn_id: input.turnId };
     } else {
       requireValue(typeof input.inputRequestId === 'string' && input.inputRequestId.length > 0 && input.inputRequestId.length <= 512, 'Invalid input request');
       const pending = this.messages.flatMap(entry => entry.parts).find(part => part.kind === 'input' && !part.resolved && part.requestId === input.inputRequestId);
@@ -456,8 +471,8 @@ export async function createServer(config, viewport = new Viewport(config)) {
       if (req.method === 'GET' && path === '/api/events') {
         requireValue(viewport.clients.size < 16, 'Too many event streams', 429);
         res.writeHead(200, { 'Content-Type': 'text/event-stream', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
-        res.write(`event: state\ndata: ${JSON.stringify(viewport.state())}\n\n`);
         viewport.clients.add(res);
+        viewport.sendState(res, `event: state\ndata: ${JSON.stringify(viewport.state())}\n\n`);
         const heartbeat = setInterval(() => viewport.emit(), 15000);
         res.on('close', () => { clearInterval(heartbeat); viewport.clients.delete(res); });
         return;

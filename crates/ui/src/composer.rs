@@ -5825,7 +5825,7 @@ impl Composer {
             cx.notify();
             return;
         }
-        let action = Box::new(SessionControlAction::Stop {});
+        let action = Box::new(SessionControlAction::Stop { expected_turn_id: None });
         let params = match self.control_route(action.required_capability(), cx) {
             Ok(Some(route)) => serde_json::json!({
                 "chatId": chat_id,
@@ -8207,7 +8207,7 @@ mod tests {
             comet_proto::CAPABILITY_SESSION_CHAT,
             comet_proto::CAPABILITY_SESSION_CONTROL,
         ]);
-        let action = SessionControlAction::Stop {};
+        let action = SessionControlAction::Stop { expected_turn_id: None };
         assert_eq!(
             control_route_grant_id(
                 &snapshot,
@@ -8243,7 +8243,7 @@ mod tests {
     #[test]
     fn chat_only_authority_cannot_route_stop() {
         let snapshot = route_snapshot(&[comet_proto::CAPABILITY_SESSION_CHAT]);
-        let action = SessionControlAction::Stop {};
+        let action = SessionControlAction::Stop { expected_turn_id: None };
         assert!(
             control_route_grant_id(
                 &snapshot,
