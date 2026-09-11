@@ -103,11 +103,18 @@ fails closed.
 9. A `scaffold-host` does not expose generic `ListHarnesses` or `ListModels`
    RPCs. The trusted bootstrap fixes OMP and its model gateway; generic discovery
    remains a local-controller capability. `ListSessionModels` is the scoped
-   exception: it requires the exact locally hosted session and a current live read
+   exception: it requires the exact deployment-bound session and a current live read
    grant, and returns only the OMP catalog's `openai-codex/` and `anthropic/` models.
    `ReadSessionAuthority`, `ReadSessionSelection`, and `ReadSessionCommand` share
    that live-read boundary and expose, respectively, current authority, the last
    execution's model/reasoning selection, and a durable command's outcome.
+   `ReadSessionContext` shares that boundary and returns current authority, trusted
+   execution cwd, resolved OMP configuration, and optional workspace title/branch.
+   The cwd comes from the last execution request, then an owned workspace chat,
+   then the engine's working directory. Configuration comes from that request,
+   the owned chat's OMP configuration, or OMP configuration discovery in that cwd.
+   A legacy workspace chat row is not required. Authority is revalidated before
+   returning the context; browser input never supplies the cwd.
    The authority check and catalog filter are owned by `crates/engine/src/rpc.rs`.
 
 ## Implementation slices

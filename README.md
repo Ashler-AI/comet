@@ -20,8 +20,9 @@ Protected reads and stream updates require a current live read grant; losing it
 clears the cached transcript. Queued commands retain submitted content until their
 durable outcome is applied; rejection or expiry remains visible and retryable.
 
-Linux archives include `crew-web/` beside `comet`, so the viewport and its scoped
-catalog, selection, live-authority, and command-outcome RPCs ship together. Runtime: Node >=22.4,
+Linux archives include `crew-web/` beside `comet`, so the viewport and its
+[scoped engine RPCs](docs/ASHLER-SCAFFOLD-END-STATE.md#durable-mirroring-invariants)
+ship together. Runtime: Node >=22.4,
 `node /opt/crew-web/server.mjs`; Scaffold configures `COMET_IPC_PORT`, `COMET_DATA_DIR`,
 `SCAFFOLD_RUNTIME_DIR`, and `CREW_WEB_AUTH_TOKEN`. Trusted `sessionId` and `sandboxId`
 bindings come from `SCAFFOLD_COMET_RUNTIME_PROFILE_JSON`; explicit

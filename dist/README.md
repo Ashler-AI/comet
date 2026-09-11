@@ -20,7 +20,9 @@ Produces `target/package/comet-<version>-linux-<arch>.tar.gz` containing:
 - `comet` — the binary (headed by default; `comet headless` runs the engine alone)
 - `comet.desktop` — XDG desktop entry
 - `comet.png` / `comet.svg` — raster and scalable Crew app icons
-- The [Scaffold session web view assets](../README.md#scaffold-session-web-view)
+- `crew-web/` — the [Scaffold session web view assets](../README.md#scaffold-session-web-view);
+  the bundled `install.sh` does not install or launch these assets. Scaffold image
+  assembly supplies their runtime location and Node separately.
 - `install.sh` — installs into `~/.local/{bin,share/applications,share/icons}`,
   including both the `1024x1024` and scalable hicolor icon paths
 
