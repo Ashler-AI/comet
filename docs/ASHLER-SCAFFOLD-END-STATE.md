@@ -29,11 +29,10 @@ This document defines the required product boundary for Ashler Comet. A partial
    surface. It can create/inspect, pause, resume, stop, and attach to a running
    Scaffold OMP session without creating a parallel session backend.
 
-### Future web and mobile viewports
+### Web and mobile viewport boundary
 
-Web and mobile clients are explicitly out of scope for the initial Comet/OMP
-Scaffold rollout. The initial implementation must remain compatible with adding
-them later as authorized Comet clients: keep existing Durable Objects and typed
+Web and mobile clients were explicitly out of scope for the initial Comet/OMP
+Scaffold rollout. Authorized Comet clients must keep existing Durable Objects and typed
 commands as the shared data/control plane, keep execution on the owning local or
 Scaffold host, preserve exact deployment/session/device/epoch authority, and do
 not expose host, bootstrap, provider, or OMP credentials to observer clients.
@@ -42,12 +41,14 @@ The saved future architecture, mobile alternative, delivery slices, acceptance
 matrix, and open questions live in
 `internal/scaffold/docs/comet-web-viewport.md` in the platform repository.
 They do not gate Comet 0.1.23 or the initial no-webview staging acceptance.
+For the current web implementation and its rollout requirements, see the
+[Scaffold session web view](../README.md#scaffold-session-web-view).
 
 ### Scaffold Comet
 
 1. A Scaffold agent sandbox runs a headless Comet engine as its collaboration
    and session UI layer. The browser OpenCode view is not the authoritative UI.
-2. OMP over ACP is the default and only user-selectable harness in the Scaffold
+2. OMP is the default and only user-selectable harness in the Scaffold
    Comet runtime profile.
 3. The remote profile disables incompatible local-controller features:
    - creating or attaching to nested Scaffold environments;
@@ -100,8 +101,21 @@ fails closed.
    session id must never share transcript, tail, diff, grant, or attachment
    state.
 9. A `scaffold-host` does not expose generic `ListHarnesses` or `ListModels`
-   RPCs. The trusted bootstrap fixes OMP and its model gateway; discovery is a
-   local-controller capability, not a remotely selectable sandbox surface.
+   RPCs. The trusted bootstrap fixes OMP and its model gateway; generic discovery
+   remains a local-controller capability. `ListSessionModels` is the scoped
+   exception: it requires the exact deployment-bound session and a current live read
+   grant, and returns only the OMP catalog's `openai-codex/` and `anthropic/` models.
+   `ReadSessionAuthority`, `ReadSessionSelection`, and `ReadSessionCommand` share
+   that live-read boundary and expose, respectively, current authority, the last
+   execution's model/reasoning selection, and a durable command's outcome.
+   `ReadSessionContext` shares that boundary and returns current authority, trusted
+   execution cwd, resolved OMP configuration, and optional workspace title/branch.
+   The cwd comes from the last execution request, then an owned workspace chat,
+   then the engine's working directory. Configuration comes from that request,
+   the owned chat's OMP configuration, or OMP configuration discovery in that cwd.
+   A legacy workspace chat row is not required. Authority is revalidated before
+   returning the context; browser input never supplies the cwd.
+   The authority check and catalog filter are owned by `crates/engine/src/rpc.rs`.
 
 ## Implementation slices
 
@@ -112,19 +126,20 @@ configuration. Filter UI catalogs for usability, but also reject prohibited RPC
 and harness operations in the engine. Cover profile serialization and negative
 RPC tests first.
 
-### B. OMP ACP harness
+### B. OMP harness
 
-Add `HarnessId::Omp` and an adapter that spawns `omp acp`, implementing ACP
-initialize, session/new, session/load or resume, prompt, streaming updates,
-approvals/input, cancellation, model/config discovery, and deterministic terminal
-status. Store OMP's native session id and cwd for continuation. Package a pinned
+Use `HarnessId::Omp` and the adapter described in the
+[harness architecture](../ARCHITECTURE.md#5-engine-plan) for session creation
+and continuation, prompts, streaming updates, approvals/input, cancellation,
+model/config discovery, and deterministic terminal status.
+Store OMP's native session id and cwd for continuation. Package a pinned
 OMP runtime in the Scaffold session image and make it the `scaffold-host` default.
 
 ### C. Existing-session discovery and import
 
 Add provider-specific discovery adapters:
 
-- OMP: native session index and ACP load/resume;
+- OMP: native session index and the OMP harness's continuation path;
 - Codex: local Codex thread/session store and app-server resume;
 - Claude Code: local project/session store and `--resume` continuation.
 
@@ -144,10 +159,13 @@ and opens the same mirrored session in the native UI.
 
 Add an explicit Scaffold/Comet agent runtime profile in the platform. The
 provider/supervisor owns one headless Comet process, health/sync state, restart,
-and OMP child lifecycle. Remove OpenCode process, port 4096 attach rewrites,
-OpenCode completion/activity/handoff state, and browser Agent view from this
-profile. Retain the old profile only as a time-bounded rollback until acceptance
-passes, then delete it.
+and OMP child lifecycle. Remove the OpenCode runtime and its
+completion/activity/handoff state from this profile. The browser Agent view is
+replaced by the authenticated fixed-session Crew viewport, not a parallel session
+backend; its compatibility attach path may retain the `opencode` name. See the
+[Scaffold session web view](../README.md#scaffold-session-web-view) for runtime
+configuration. Retain the old profile only as a time-bounded rollback until
+acceptance passes, then delete it.
 
 ### F. Staged cutover
 
@@ -185,7 +203,8 @@ For OMP, Codex, and Claude Code independently:
 2. attempts to start Codex or Claude Code fail at the engine boundary;
 3. attempts to list/create nested Scaffold environments fail at the engine
    boundary;
-4. no OpenCode process or port 4096 listener exists;
+4. no OpenCode runtime process exists; the browser attach surface serves only the
+   authenticated fixed-session Crew viewport;
 5. no local account/session-import surface is available;
 6. bootstrap is mode 0600, absent from argv/logs, consumed before exchange, and
    deleted on success and every failure.

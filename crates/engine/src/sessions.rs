@@ -1612,6 +1612,13 @@ impl Inner {
         self.doc_host.get().and_then(|host| host.workspace())
     }
 
+    fn workspace_continuation_id(&self, chat_id: &str) -> String {
+        self.doc_host.get().map_or_else(
+            || chat_id.to_string(),
+            |host| host.workspace_continuation_id(chat_id),
+        )
+    }
+
     /// Sidebar freshness: push a message-persist preview into the chat's workspace row.
     fn note_message(&self, chat_id: &str, text: &str) {
         if text.is_empty() {
@@ -1675,8 +1682,9 @@ impl Inner {
             },
         );
         if let Some(ws) = self.workspace() {
-            ws.set_chat_harness_session(chat_id, session_id, cwd);
-            if let Err(err) = ws.clear_chat_fork(chat_id) {
+            let workspace_id = self.workspace_continuation_id(chat_id);
+            ws.set_chat_harness_session(&workspace_id, session_id, cwd);
+            if let Err(err) = ws.clear_chat_fork(&workspace_id) {
                 tracing::warn!(chat = %chat_id, error = %err, "consumed session fork cleanup failed");
             }
         }
@@ -1697,7 +1705,7 @@ impl Inner {
             },
         );
         if let Some(ws) = self.workspace() {
-            ws.set_chat_harness_session(chat_id, "", "");
+            ws.set_chat_harness_session(&self.workspace_continuation_id(chat_id), "", "");
         }
     }
 
@@ -1716,7 +1724,8 @@ impl Inner {
                 .then_some(known.session_id);
         }
         if let Some(ws) = self.workspace()
-            && let Some((session_id, session_cwd)) = ws.chat_harness_session(chat_id)
+            && let Some((session_id, session_cwd)) =
+                ws.chat_harness_session(&self.workspace_continuation_id(chat_id))
         {
             return (!session_id.is_empty() && cwd_ok(session_cwd.as_deref().unwrap_or("")))
                 .then_some(session_id);
@@ -1728,7 +1737,8 @@ impl Inner {
     }
     /// Pending one-shot fork source, gated against the run cwd before launch.
     fn fork_for(&self, chat_id: &str) -> Option<comet_proto::HarnessSessionFork> {
-        self.workspace()?.chat_fork(chat_id)
+        self.workspace()?
+            .chat_fork(&self.workspace_continuation_id(chat_id))
     }
 
     fn note_route_restart_progress(&self, chat_id: &str, run_id: &str) {

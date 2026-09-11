@@ -47,6 +47,14 @@ install -m 644 "$ROOT/dist/comet.desktop" "$STAGE/comet.desktop"
 install -m 644 "$ROOT/assets/brand/png/crew-icon-1024.png" "$STAGE/comet.png"
 install -m 644 "$ROOT/assets/brand/crew-icon.svg" "$STAGE/comet.svg"
 
+# The sandbox serves this fixed-session viewport from the same immutable release
+# as its Crew engine. No package installation or frontend build runs at boot.
+mkdir -p "$STAGE/crew-web"
+tar -cf - --exclude='*.test.mjs' --exclude=node_modules --exclude=package-lock.json \
+  -C "$ROOT/apps/web" . | tar -xf - -C "$STAGE/crew-web"
+test -f "$STAGE/crew-web/server.mjs"
+test -f "$STAGE/crew-web/public/index.html"
+
 cat >"$STAGE/install.sh" <<'INSTALL'
 #!/usr/bin/env bash
 # Install Crew into ~/.local (no root needed).

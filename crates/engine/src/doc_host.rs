@@ -1233,6 +1233,16 @@ impl DocHost {
         key
     }
 
+    pub(crate) fn workspace_continuation_id(&self, execution_key: &str) -> String {
+        let handles = lock(&self.inner.handles);
+        if let Some(handle) = handles.get(execution_key)
+            && execution_key == format!("{}::session::{}", handle.chat_id, handle.chat_id)
+        {
+            return handle.chat_id.clone();
+        }
+        execution_key.to_string()
+    }
+
     /// LRU eviction: while the warm set exceeds [`WARM_DOC_CAP`] or the
     /// resident estimate exceeds `DOC_LRU_BYTE_BUDGET`, close the
     /// least-recently-touched unpinned docs. Pinned (never evicted):
@@ -3390,6 +3400,132 @@ mod authority_tests {
             lock(&execution_handle.room_projection).as_ref(),
             Some(&projection)
         );
+    }
+
+    #[tokio::test]
+    async fn assigned_session_continuation_uses_owned_workspace_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let workspace = WorkspaceHost::open(
+            store.clone(),
+            crate::workspace_host::WorkspaceHostConfig {
+                device_id: "device-a".into(),
+                device_name: "test".into(),
+                platform: "test".into(),
+                project_scope: "project-a".into(),
+                user_id: "owner-a".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        workspace.claim_chat("chat-a", Some("/workspace")).unwrap();
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "device-a".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        host.set_workspace(workspace.clone());
+        let handle = host.open("chat-a").unwrap();
+        let assigned = host.bind_session_execution_key(&handle, "chat-a");
+        let other = host.bind_session_execution_key(&handle, "agent-b");
+        assert_eq!(host.workspace_continuation_id(&assigned), "chat-a");
+        assert_eq!(host.workspace_continuation_id(&other), other);
+        assert_eq!(
+            host.workspace_continuation_id("unbound::session::unbound"),
+            "unbound::session::unbound"
+        );
+
+        for (key, cwd, explicit, expected, rejected) in [
+            (assigned.as_str(), "/workspace", None, Some("native-old"), false),
+            (assigned.as_str(), "/elsewhere", None, None, false),
+            (other.as_str(), "/workspace", None, None, false),
+            (
+                assigned.as_str(),
+                "/workspace",
+                Some("explicit"),
+                Some("explicit"),
+                true,
+            ),
+            (assigned.as_str(), "/workspace", None, None, true),
+        ] {
+            workspace.set_chat_harness_session("chat-a", "native-old", "/workspace");
+            let registry = crate::HarnessRegistry::for_profile(comet_proto::RuntimeProfile::Mock);
+            registry.register(Arc::new(comet_harness::mock::MockHarness {
+                script: vec![comet_proto::AgentEvent::Done {
+                    status: if rejected {
+                        comet_proto::DoneStatus::Errored
+                    } else {
+                        comet_proto::DoneStatus::Completed
+                    },
+                    result: None,
+                    error: None,
+                    session_id: (!rejected).then(|| "native-new".into()),
+                }],
+            }));
+            let journal_dir = tempfile::tempdir().unwrap();
+            let sessions = SessionsEngine::new(
+                "device-a".into(),
+                Arc::new(crate::RunJournal::open(journal_dir.path()).unwrap()),
+                Arc::new(registry),
+                27654,
+            );
+            sessions.set_doc_host(host.clone());
+            sessions
+                .dispatch(
+                    key,
+                    HarnessId::Mock,
+                    comet_proto::RunRequest {
+                        prompt: "continue".into(),
+                        model: None,
+                        agent_account_id: None,
+                        reasoning: None,
+                        model_options: Default::default(),
+                        cwd: cwd.into(),
+                        sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
+                        auto_approve: true,
+                        resume: explicit.map(str::to_string),
+                        attachments: vec![],
+                    },
+                    Some(crate::new_id()),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    let request = sessions.last_request(key).unwrap();
+                    let tombstoned = workspace.chat_harness_session("chat-a").unwrap().0.is_empty();
+                    if request.resume.as_deref() == expected
+                        && (!rejected || explicit.is_some() || tombstoned)
+                        && sessions.session_status(key).is_some_and(|session| {
+                            session.status == if rejected {
+                                SessionStatus::Errored
+                            } else {
+                                SessionStatus::Idle
+                            }
+                        })
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                workspace.chat_harness_session("chat-a").unwrap().0,
+                if rejected && explicit.is_none() {
+                    ""
+                } else if !rejected && key == assigned {
+                    "native-new"
+                } else {
+                    "native-old"
+                },
+            );
+            sessions.interrupt(key).await.unwrap();
+        }
     }
 
     #[tokio::test]

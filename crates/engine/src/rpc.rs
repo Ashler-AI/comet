@@ -215,6 +215,68 @@ fn generic_catalog_allowed(profile: RuntimeProfile, method: &str) -> bool {
         )
 }
 
+fn session_catalog_binding_allowed(
+    authority: &crate::auth::DeviceGrantAuthority,
+    chat_id: &str,
+    device_id: &str,
+) -> bool {
+    authority.scope.session_id.as_deref() == Some(chat_id)
+        && authority.device_id == device_id
+        && authority.scope.deployment_id.as_deref().is_some_and(|id| !id.is_empty())
+        && authority.expires_at > crate::now_ms()
+        && authority.capabilities.iter().any(|capability| capability == comet_proto::CAPABILITY_SESSION_READ)
+}
+
+fn session_viewport_models(models: Vec<comet_proto::Model>) -> Vec<comet_proto::Model> {
+    models
+        .into_iter()
+        .filter_map(|mut model| {
+            model.id = crate::local_sessions::canonical_omp_model_selector(&model.id)?;
+            (model.id.starts_with("openai-codex/") || model.id.starts_with("anthropic/"))
+                .then_some(model)
+        })
+        .collect()
+}
+
+fn session_viewport_authority(
+    rpc: &EngineRpc,
+    chat_id: &str,
+) -> Result<crate::auth::DeviceGrantAuthority, RpcError> {
+    if rpc.runtime_profile != RuntimeProfile::ScaffoldHost {
+        return Err(RpcError::Failed("session_viewport_requires_scaffold_host".into()));
+    }
+    // Scaffold sessions are hosted through their deployment-bound grant, not a
+    // legacy workspace chat row; a newly attached session has no such row.
+    let mut authority = rpc.auth()?.device_grant_authority()
+        .ok_or_else(|| RpcError::Failed("scaffold_host_authority_unavailable".into()))?;
+    if !session_catalog_binding_allowed(
+        &authority, chat_id, rpc.doc_host.device_id(),
+    ) {
+        return Err(RpcError::Failed("session_viewport_binding_mismatch".into()));
+    }
+    // Auth's stored bootstrap token does not establish that the relay still
+    // grants access. This projection excludes expired/revoked grants and is
+    // cleared when the edge grant stream disconnects.
+    let grant = rpc.doc_host.collaboration_grants(
+        &authority.principal_subject, &[chat_id.to_owned()],
+    ).into_iter().find(|grant| {
+        grant.id == authority.grant_id
+            && grant.principal_subject == authority.principal_subject
+            && grant.scope.session_id == authority.scope.session_id
+            && grant.revoked_at.is_none()
+            && grant.expires_at.is_none_or(|expires| expires > crate::now_ms())
+            && grant.scope.project_id == authority.scope.project_id
+            && grant.scope.deployment_id == authority.scope.deployment_id
+            && grant.device_id.as_deref() == Some(authority.device_id.as_str())
+            && grant.sandbox_id.as_deref() == Some(authority.sandbox_id.as_str())
+            && grant.lifecycle_epoch == Some(authority.lifecycle_epoch)
+            && grant.capabilities.iter().any(|capability| capability == comet_proto::CAPABILITY_SESSION_READ)
+    }).ok_or_else(|| RpcError::Failed("session_viewport_read_grant_unavailable".into()))?;
+    authority.expires_at = authority.expires_at.min(grant.expires_at.unwrap_or(0));
+    authority.capabilities.retain(|capability| grant.capabilities.contains(capability));
+    Ok(authority)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct QueueCommandParams {
@@ -1589,6 +1651,97 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&models)
             }
+            // The browser viewport may discover models only for the exact
+            // deployment-bound session. Generic harness discovery stays disabled.
+            "ListSessionModels" | "ReadSessionSelection" | "ReadSessionAuthority" | "ReadSessionContext" => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct Params { chat_id: String }
+                let p: Params = parse_params(params)?;
+                let authority = session_viewport_authority(self, &p.chat_id)?;
+                if method == "ReadSessionAuthority" {
+                    return RpcReply::value(&authority);
+                }
+                if method == "ReadSessionContext" {
+                    let cwd = std::env::current_dir()
+                        .map_err(|error| RpcError::Failed(error.to_string()))?;
+                    let cwd = cwd.to_str()
+                        .ok_or_else(|| RpcError::Failed("session_context_cwd_invalid".into()))?;
+                    let execution_key = format!("{}::session::{}", p.chat_id, p.chat_id);
+                    let request = self.sessions.last_request(&execution_key)
+                        .or_else(|| self.sessions.last_request(&p.chat_id));
+                    let chat = self.workspace.doc().chat(&p.chat_id)
+                        .map_err(|error| RpcError::Failed(error.to_string()))?
+                        .filter(|chat| chat.device_id == authority.device_id);
+                    let cwd = request.as_ref().map(|request| request.cwd.as_str())
+                        .or_else(|| chat.as_ref().and_then(|chat| chat.cwd.as_deref()))
+                        .unwrap_or(cwd);
+                    let mut config = if let Some(request) = request.as_ref() {
+                        serde_json::json!({
+                            "harness": "omp", "model": request.model,
+                            "reasoning": request.reasoning, "modelOptions": request.model_options,
+                            "sandbox": request.sandbox,
+                        })
+                    } else if let Some(config) = chat.as_ref()
+                        .and_then(|chat| chat.config.as_ref())
+                        .filter(|config| config.harness == HarnessId::Omp)
+                    {
+                        serde_json::to_value(config)
+                            .map_err(|error| RpcError::Failed(error.to_string()))?
+                    } else {
+                        comet_harness::omp::read_session_config(cwd).await
+                            .map_err(|error| RpcError::Failed(error.to_string()))?
+                    };
+                    config["model"] = config["model"].as_str()
+                        .and_then(crate::local_sessions::canonical_omp_model_selector)
+                        .map(serde_json::Value::String).unwrap_or(serde_json::Value::Null);
+                    let current = session_viewport_authority(self, &p.chat_id)?;
+                    if current.scope != authority.scope || current.device_id != authority.device_id
+                        || current.sandbox_id != authority.sandbox_id
+                        || current.lifecycle_epoch != authority.lifecycle_epoch
+                        || current.grant_id != authority.grant_id
+                        || current.principal_subject != authority.principal_subject
+                    {
+                        return Err(RpcError::Failed("session_context_binding_changed".into()));
+                    }
+                    return RpcReply::value(&serde_json::json!({
+                        "authority": current, "cwd": cwd, "config": config,
+                        "title": chat.as_ref().map(|chat| &chat.title),
+                        "branch": chat.as_ref().map(|chat| &chat.branch),
+                    }));
+                }
+                if method == "ReadSessionSelection" {
+                    let execution_key = format!("{}::session::{}", p.chat_id, p.chat_id);
+                    let request = self.sessions.last_request(&execution_key)
+                        .or_else(|| self.sessions.last_request(&p.chat_id));
+                    let selection = request.map(|request| serde_json::json!({
+                        "model": request.model,
+                        "reasoning": request.reasoning,
+                    }));
+                    return RpcReply::value(&serde_json::json!({ "selection": selection }));
+                }
+                let harness = self.registry.resolve(HarnessId::Omp)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let models = harness.models().await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let models = session_viewport_models(models);
+                RpcReply::value(&models)
+            }
+            "ReadSessionCommand" => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct Params { chat_id: String, command_id: String }
+                let p: Params = parse_params(params)?;
+                session_viewport_authority(self, &p.chat_id)?;
+                let command = self.doc_host.command_entry(&p.chat_id, &p.command_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?
+                    .map(|entry| serde_json::json!({
+                        "commandId": entry.id,
+                        "status": entry.status,
+                        "resolution": entry.resolution,
+                    }));
+                RpcReply::value(&serde_json::json!({ "command": command }))
+            }
             methods::LIST_HARNESS_COMMANDS
                 if !generic_catalog_allowed(self.runtime_profile, method) =>
             {
@@ -2603,6 +2756,58 @@ impl RpcService for EngineRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scaffold_catalog_normalizes_routed_models_before_filtering() {
+        let model = |id: &str| comet_proto::Model {
+            id: id.into(),
+            label: id.into(),
+            description: None,
+            reasoning_levels: Vec::new(),
+            options: Vec::new(),
+        };
+        let models = session_viewport_models(vec![
+            model("scaffold-openai/model-a"),
+            model("baseten/other-model"),
+            model("scaffold-anthropic/model-b"),
+        ]);
+        assert_eq!(
+            models.into_iter().map(|model| model.id).collect::<Vec<_>>(),
+            vec!["openai-codex/model-a", "anthropic/model-b"]
+        );
+    }
+
+    #[test]
+    fn session_catalog_rejects_foreign_missing_and_expired_authority() {
+        let mut authority = crate::auth::DeviceGrantAuthority {
+            grant_id: "grant-a".into(),
+            expires_at: crate::now_ms() + 60_000,
+            principal_subject: "owner-a".into(),
+            scope: CollaborationScope {
+                project_id: "project-a".into(),
+                deployment_id: Some("deployment-a".into()),
+                session_id: Some("session-a".into()),
+                unknown: Default::default(),
+            },
+            sandbox_id: "sandbox-a".into(),
+            device_id: "device-a".into(),
+            lifecycle_epoch: 1,
+            capabilities: vec![comet_proto::CAPABILITY_SESSION_READ.into()],
+        };
+        assert!(session_catalog_binding_allowed(&authority, "session-a", "device-a"));
+        let deployment = authority.scope.deployment_id.take();
+        assert!(!session_catalog_binding_allowed(&authority, "session-a", "device-a"));
+        authority.scope.deployment_id = Some(String::new());
+        assert!(!session_catalog_binding_allowed(&authority, "session-a", "device-a"));
+        authority.scope.deployment_id = deployment;
+        assert!(!session_catalog_binding_allowed(&authority, "session-b", "device-a"));
+        assert!(!session_catalog_binding_allowed(&authority, "session-a", "device-b"));
+        authority.capabilities.clear();
+        assert!(!session_catalog_binding_allowed(&authority, "session-a", "device-a"));
+        authority.capabilities.push(comet_proto::CAPABILITY_SESSION_READ.into());
+        authority.expires_at = 0;
+        assert!(!session_catalog_binding_allowed(&authority, "session-a", "device-a"));
+    }
 
     #[test]
     fn agent_account_params_accept_global_shapes() {
