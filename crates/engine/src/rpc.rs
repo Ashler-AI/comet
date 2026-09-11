@@ -1663,7 +1663,7 @@ impl RpcService for EngineRpc {
                         .map_err(|error| RpcError::Failed(error.to_string()))?
                         .filter(|chat| chat.device_id == authority.device_id);
                     let cwd = request.as_ref().map(|request| request.cwd.as_str())
-                        .or_else(|| chat.as_ref().map(|chat| chat.cwd.as_str()))
+                        .or_else(|| chat.as_ref().and_then(|chat| chat.cwd.as_deref()))
                         .unwrap_or(cwd);
                     let mut config = if let Some(request) = request.as_ref() {
                         serde_json::json!({
