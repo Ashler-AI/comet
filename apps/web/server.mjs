@@ -365,8 +365,7 @@ export class Viewport {
     });
     const { command } = await this.rpc.call('ReadSessionCommand', { chatId: this.config.sessionId, commandId: record.commandId });
     await this.readAuthority();
-    requireValue(command, 'Command admission outcome unavailable', 404);
-    return command;
+    return command || { commandId: record.commandId, status: 'pending', resolution: null };
   }
   async upload(req) {
     requireValue(this.connection === 'connected' && this.snapshots.size === 5 && this.chat, 'Assigned Crew session unavailable', 503);

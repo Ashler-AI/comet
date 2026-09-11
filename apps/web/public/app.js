@@ -72,7 +72,7 @@ async function api(path, options = {}) {
   const response = await fetch(path.startsWith('/') ? path : `./api/${path}`, { credentials: 'same-origin', cache: 'no-store', ...options });
   const contentType = response.headers.get('content-type') || '';
   const payload = contentType.includes('application/json') ? await response.json() : null;
-  if (!response.ok) throw new Error(payload?.error?.message || payload?.error || payload?.message || `Request failed (${response.status}). Please try again.`);
+  if (!response.ok) throw Object.assign(new Error(payload?.error?.message || payload?.error || payload?.message || `Request failed (${response.status}). Please try again.`), { status: response.status });
   if (payload === null) throw new Error('Crew returned an unexpected response. Check the connection and try again.');
   return payload;
 }
@@ -504,7 +504,16 @@ ui.composer.addEventListener('submit', async (event) => {
   payload.reasoning = ui.reasoning.value || null;
   sending = true; updateControls();
   try {
-    const retrying = commandIds.has(`message:${JSON.stringify(payload)}`);
+    const requestId = commandIds.get(`message:${JSON.stringify(payload)}`);
+    let retrying = false;
+    if (requestId) {
+      try {
+        await api(`command/${encodeURIComponent(requestId)}`);
+        retrying = true;
+      } catch (error) {
+        if (error.status !== 404) throw error;
+      }
+    }
     if (!retrying && running() && (payload.model !== state.session.model || payload.reasoning !== (state.session.reasoning ?? null))) throw new Error('Stop the current turn before changing model or reasoning. Your message has been kept.');
     if (!retrying && !running() && payload.model) {
       const separator = payload.model.indexOf('/');

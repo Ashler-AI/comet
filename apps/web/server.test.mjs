@@ -74,7 +74,7 @@ test('follow-ups leave native continuation to the engine for the assigned sessio
 
 test('browser restores the authorized route after failed admission or rejection and preserves retries', async () => {
   const source = await readFile(new URL('./public/app.js', import.meta.url), 'utf8');
-  for (const failure of ['admission', 'rejection', 'outcome']) {
+  for (const failure of ['admission', 'rejection', 'outcome', 'response']) {
     const nodes = new Map();
     const node = id => {
       if (!nodes.has(id)) nodes.set(id, {
@@ -87,6 +87,7 @@ test('browser restores the authorized route after failed admission or rejection 
     const calls = [];
     let fail = true;
     let route = 'gpt-example';
+    const admitted = new Map();
     const context = createContext({
       document: { getElementById: node, querySelector: node },
       window: { addEventListener() {} },
@@ -101,11 +102,17 @@ test('browser restores the authorized route after failed admission or rejection 
         let result = {};
         if (path.endsWith('/model-route')) route = body.model;
         else if (path === './api/message') {
-          if (fail && failure === 'admission') status = 503;
+          if (admitted.has(body.requestId)) result = {};
+          else if (fail && failure === 'admission') status = 503;
           else if (route !== body.model.split('/')[1]) status = 409;
+          else {
+            admitted.set(body.requestId, { status: fail && failure === 'rejection' ? 'rejected' : 'applied' });
+            if (fail && failure === 'response') throw new TypeError('Response lost');
+          }
         } else {
-          if (fail && failure === 'outcome') status = 503;
-          result = { status: fail && failure === 'rejection' ? 'rejected' : 'applied' };
+          result = admitted.get(path.split('/').at(-1));
+          if (!result) { status = 404; result = {}; }
+          else if (fail && failure === 'outcome') status = 503;
         }
         return new Response(JSON.stringify(result), { status, headers: { 'content-type': 'application/json' } });
       },
@@ -118,12 +125,30 @@ test('browser restores the authorized route after failed admission or rejection 
     const submit = () => node('composer').listeners.submit({ preventDefault() {} });
     await submit();
     assert.equal(node('message').value, 'Continue');
+    if (failure === 'admission') {
+      node('model').value = 'openai-codex/gpt-example';
+      await submit();
+      assert.equal(node('message').value, 'Continue');
+      assert.equal(route, 'gpt-example');
+      node('model').value = 'openai-codex/gpt-other';
+    }
     fail = false;
-    if (failure === 'outcome') {
+    if (failure === 'outcome' || failure === 'response') {
+      route = 'gpt-example';
       await submit();
       const messages = calls.filter(call => call.path === './api/message');
       assert.equal(messages[0].body.requestId, messages[1].body.requestId);
       assert.equal(calls.filter(call => call.path.endsWith('/model-route')).length, 1);
+      assert.equal(admitted.size, 1);
+    } else if (failure === 'admission') {
+      await submit();
+      const messages = calls.filter(call => call.path === './api/message');
+      assert.equal(messages.length, 3);
+      assert.equal(messages[0].body.requestId, messages[2].body.requestId);
+      assert.notEqual(messages[0].body.requestId, messages[1].body.requestId);
+      assert.equal(route, 'gpt-other');
+      assert.equal(calls.filter(call => call.path.endsWith('/model-route')).length, 3);
+      assert.equal(admitted.size, 1);
     } else {
       node('model').value = 'openai-codex/gpt-example';
       await submit();
@@ -132,6 +157,25 @@ test('browser restores the authorized route after failed admission or rejection 
     }
     assert.equal(node('message').value, '');
   }
+});
+
+test('durable admission remains discoverable before engine queue acknowledgement', async t => {
+  const f = await fixture(t);
+  const original = f.rpc.call;
+  f.rpc.call = async (method, params) => {
+    if (method === 'QueueCommand') throw new Error('Engine unavailable');
+    return original(method, params);
+  };
+  assert.equal((await f.post('/api/message', message)).status, 503);
+  assert.equal(f.commands.size, 0);
+  const outcome = await fetch(f.url + '/api/command/' + message.requestId, { headers: f.headers });
+  assert.equal(outcome.status, 200);
+  assert.equal((await outcome.json()).status, 'pending');
+  f.rpc.call = original;
+  f.viewport.live = { status: 'working' };
+  assert.equal((await f.post('/api/message', message)).status, 202);
+  assert.equal([...f.commands.values()][0].command.action.action, 'start');
+  assert.equal(f.commands.size, 1);
 });
 
 test('durable request retry does not turn a started message into a steer or duplicate after restart', async t => {
