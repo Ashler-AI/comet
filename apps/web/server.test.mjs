@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer, Viewport, loadConfig } from './server.mjs';
-import { applyTranscriptFrame } from './rpc.mjs';
+import { CrewRpc, applyTranscriptFrame } from './rpc.mjs';
 
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), 'crew-web-test-'));
@@ -67,6 +67,35 @@ async function fixture(t) {
 }
 
 const message = { requestId: 'request-a', text: 'Continue', model: 'openai-codex/gpt-example', reasoning: 'high', attachments: [] };
+
+test('RPC recovers from a failed dial without a close event and ignores the retired socket', async t => {
+  const sockets = [];
+  t.mock.method(globalThis, 'WebSocket', function () {
+    const socket = new EventTarget();
+    socket.readyState = WebSocket.CONNECTING;
+    socket.send = frame => { socket.request = JSON.parse(frame); };
+    socket.close = () => {
+      socket.readyState = WebSocket.CLOSING;
+      if (socket !== sockets[0]) socket.dispatchEvent(new Event('close'));
+    };
+    sockets.push(socket);
+    queueMicrotask(() => {
+      socket.readyState = socket === sockets[0] ? WebSocket.CLOSING : WebSocket.OPEN;
+      socket.dispatchEvent(new Event(socket === sockets[0] ? 'error' : 'open'));
+    });
+    return socket;
+  });
+  const rpc = new CrewRpc(39400);
+  t.after(() => rpc.close());
+  await assert.rejects(rpc.connect(), /Crew engine unavailable/);
+  await rpc.connect();
+  const reply = rpc.call('ReadSessionAuthority', { chatId: 'session-a' });
+  sockets[0].dispatchEvent(new Event('close'));
+  sockets[1].dispatchEvent(new MessageEvent('message', { data: JSON.stringify({
+    id: sockets[1].request.id, ok: { capabilities: ['session.read'] },
+  }) }));
+  assert.deepEqual(await reply, { capabilities: ['session.read'] });
+});
 
 test('deployment session connects and admits messages and controls without legacy chat rows', async t => {
   const f = await fixture(t);

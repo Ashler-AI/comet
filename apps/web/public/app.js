@@ -593,14 +593,24 @@ ui.latest.addEventListener('click', scrollLatest);
 window.addEventListener('scroll', () => { ui.latest.hidden = nearBottom() || !state?.messages.length; }, { passive: true });
 new ResizeObserver(([entry]) => { document.documentElement.style.setProperty('--dock-height', `${entry.target.getBoundingClientRect().height}px`); }).observe(document.querySelector('.composer-dock'));
 let events;
+let reconnect;
 function connectEvents() {
-  events = new EventSource('./api/events');
-  events.addEventListener('state', (event) => {
+  const stream = new EventSource('./api/events');
+  events = stream;
+  stream.addEventListener('state', (event) => {
+    if (events !== stream) return;
     try { frameVersion++; connected = true; receive(JSON.parse(event.data)); }
     catch { showError('Unable to read the live session update. Reconnect to Crew.'); connection(false); }
   });
-  events.addEventListener('open', () => connection(true));
-  events.addEventListener('error', () => connection(false));
+  stream.addEventListener('open', () => { if (events === stream) connection(true); });
+  stream.addEventListener('error', () => {
+    if (events !== stream) return;
+    connection(false);
+    if (stream.readyState === EventSource.CLOSED) {
+      clearTimeout(reconnect);
+      reconnect = setTimeout(connectEvents, 1500);
+    }
+  });
 }
 connectEvents();
 const initialVersion = frameVersion;
@@ -610,5 +620,5 @@ api('models').then((catalog) => {
   modelCatalog = catalog.models;
   if (state) { renderModels(); updateControls(); }
 }).catch(showError);
-window.addEventListener('pagehide', () => events.close());
+window.addEventListener('pagehide', () => { clearTimeout(reconnect); events.close(); events = null; });
 window.addEventListener('pageshow', (event) => { if (event.persisted) { connection(false); connectEvents(); } });

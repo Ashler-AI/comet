@@ -13,21 +13,30 @@ export class CrewRpc extends EventEmitter {
     const socket = new WebSocket(this.url);
     this.socket = socket;
     await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { socket.close(); reject(new Error('Crew connection timed out')); }, 10000);
-      socket.addEventListener('open', () => { clearTimeout(timer); resolve(); }, { once: true });
-      socket.addEventListener('error', () => { clearTimeout(timer); reject(new Error('Crew engine unavailable')); }, { once: true });
-      socket.addEventListener('close', () => {
+      const disconnect = error => {
+        if (this.socket !== socket) return;
         clearTimeout(timer);
         this.socket = null;
         for (const pending of this.pending.values()) {
           clearTimeout(pending.timer);
-          pending.reject(new Error('Crew engine disconnected'));
+          pending.reject(error);
         }
         this.pending.clear();
-        reject(new Error('Crew engine disconnected'));
+        reject(error);
         this.emit('disconnect');
+      };
+      const timer = setTimeout(() => {
+        disconnect(new Error('Crew connection timed out'));
+        socket.close();
+      }, 10000);
+      socket.addEventListener('open', () => { clearTimeout(timer); resolve(); }, { once: true });
+      socket.addEventListener('error', () => {
+        disconnect(new Error('Crew engine unavailable'));
+        socket.close();
       }, { once: true });
+      socket.addEventListener('close', () => disconnect(new Error('Crew engine disconnected')), { once: true });
       socket.addEventListener('message', ({ data }) => {
+        if (this.socket !== socket) return;
         try {
           if (typeof data !== 'string' || Buffer.byteLength(data) > 32 * 1024 * 1024) throw new Error('Invalid RPC frame');
           const frame = JSON.parse(data);
