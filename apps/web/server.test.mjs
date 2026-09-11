@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, readFile } from 'node:fs/promises';
+import { createContext, runInContext } from 'node:vm';
+import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer, Viewport, loadConfig } from './server.mjs';
@@ -56,6 +58,80 @@ test('HTTP boundary denies missing credentials, unverified writes, raw RPC and c
   assert.equal(f.commands.size, 0);
   const health = await fetch(f.url + '/health', { headers: f.headers });
   assert.deepEqual(await health.json(), { service: 'crew-web', sessionId: 'session-a', sandboxId: 'sandbox-a' });
+  assert.equal((await fetch(f.url + '/healthz', { headers: f.headers })).status, 404);
+});
+
+test('follow-ups leave native continuation to the engine for the assigned session', async t => {
+  const f = await fixture(t);
+  f.viewport.chat.harnessSessionId = 'stale-chat-native';
+  f.viewport.collaboration = { sessions: [{ sessionId: 'session-a', harnessSessionId: 'stale-projected-native' }] };
+  assert.equal((await f.post('/api/message', message)).status, 202);
+  const entry = [...f.commands.values()][0];
+  assert.equal(entry.chatId, 'session-a');
+  assert.equal(entry.command.sessionId, 'session-a');
+  assert.equal(entry.command.action.request.resume, null);
+});
+
+test('browser restores the authorized route after failed admission or rejection and preserves retries', async () => {
+  const source = await readFile(new URL('./public/app.js', import.meta.url), 'utf8');
+  for (const failure of ['admission', 'rejection', 'outcome']) {
+    const nodes = new Map();
+    const node = id => {
+      if (!nodes.has(id)) nodes.set(id, {
+        value: '', style: {}, dataset: {}, options: [], listeners: {},
+        addEventListener(name, listener) { this.listeners[name] = listener; },
+        querySelectorAll() { return []; }, replaceChildren() {}, focus() {},
+      });
+      return nodes.get(id);
+    };
+    const calls = [];
+    let fail = true;
+    let route = 'gpt-example';
+    const context = createContext({
+      document: { getElementById: node, querySelector: node },
+      window: { addEventListener() {} },
+      ResizeObserver: class { observe() {} },
+      EventSource: class { addEventListener() {} },
+      crypto: { randomUUID },
+      fetch: async (path, options) => {
+        if (path === './api/session' || path === './api/models') return new Promise(() => {});
+        const body = options.body && JSON.parse(options.body);
+        calls.push({ path, body });
+        let status = 200;
+        let result = {};
+        if (path.endsWith('/model-route')) route = body.model;
+        else if (path === './api/message') {
+          if (fail && failure === 'admission') status = 503;
+          else if (route !== body.model.split('/')[1]) status = 409;
+        } else {
+          if (fail && failure === 'outcome') status = 503;
+          result = { status: fail && failure === 'rejection' ? 'rejected' : 'applied' };
+        }
+        return new Response(JSON.stringify(result), { status, headers: { 'content-type': 'application/json' } });
+      },
+    });
+    runInContext(source, context);
+    runInContext(`state = { connection: 'connected', sandboxId: 'sandbox-a', session: { model: 'openai-codex/gpt-example', reasoning: 'high', status: 'idle' }, capabilities: { message: true }, models: [{}] }; connected = true;`, context);
+    node('message').value = 'Continue';
+    node('model').value = 'openai-codex/gpt-other';
+    node('reasoning').value = 'high';
+    const submit = () => node('composer').listeners.submit({ preventDefault() {} });
+    await submit();
+    assert.equal(node('message').value, 'Continue');
+    fail = false;
+    if (failure === 'outcome') {
+      await submit();
+      const messages = calls.filter(call => call.path === './api/message');
+      assert.equal(messages[0].body.requestId, messages[1].body.requestId);
+      assert.equal(calls.filter(call => call.path.endsWith('/model-route')).length, 1);
+    } else {
+      node('model').value = 'openai-codex/gpt-example';
+      await submit();
+      assert.equal(route, 'gpt-example');
+      assert.equal(calls.filter(call => call.path.endsWith('/model-route')).length, 2);
+    }
+    assert.equal(node('message').value, '');
+  }
 });
 
 test('durable request retry does not turn a started message into a steer or duplicate after restart', async t => {

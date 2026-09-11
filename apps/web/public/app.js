@@ -506,7 +506,7 @@ ui.composer.addEventListener('submit', async (event) => {
   try {
     const retrying = commandIds.has(`message:${JSON.stringify(payload)}`);
     if (!retrying && running() && (payload.model !== state.session.model || payload.reasoning !== (state.session.reasoning ?? null))) throw new Error('Stop the current turn before changing model or reasoning. Your message has been kept.');
-    if (!retrying && payload.model && payload.model !== state.session.model) {
+    if (!retrying && !running() && payload.model) {
       const separator = payload.model.indexOf('/');
       const providerId = payload.model.slice(0, separator);
       const provider = providerId === 'openai-codex' ? 'openai' : providerId === 'anthropic' ? 'anthropic' : null;

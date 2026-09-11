@@ -322,7 +322,7 @@ export class Viewport {
         action = { action: 'start', message_id: `crew-web:${requestId}`, request: {
           prompt, model, reasoning, modelOptions: this.chat.config?.modelOptions || {}, cwd: this.chat.cwd,
           sandbox: this.chat.config?.sandbox || 'workspace-write', autoApprove: false,
-          resume: this.collaboration?.sessions?.find(row => row.sessionId === this.config.sessionId)?.harnessSessionId || this.chat.harnessSessionId || null,
+          resume: null,
           attachments: images,
         } };
       }
@@ -416,7 +416,7 @@ export async function createServer(config, viewport = new Viewport(config)) {
       const url = new URL(req.url, 'http://crew.invalid');
       const path = url.pathname;
       if (req.method === 'GET' && (['/api/session', '/api/events', '/api/messages'].includes(path) || path.startsWith('/api/tool/'))) await viewport.readAuthority();
-      if (req.method === 'GET' && ['/health', '/healthz'].includes(path)) return respond(res, 200, { service: 'crew-web', sessionId: config.sessionId, sandboxId: config.sandboxId });
+      if (req.method === 'GET' && path === '/health') return respond(res, 200, { service: 'crew-web', sessionId: config.sessionId, sandboxId: config.sandboxId });
       if (req.method === 'GET' && path === '/api/session') return respond(res, 200, viewport.state());
       if (req.method === 'GET' && path === '/api/models') {
         await viewport.readAuthority();
