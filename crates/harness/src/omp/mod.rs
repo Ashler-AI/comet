@@ -1780,7 +1780,9 @@ fn omp_config_command(cwd: &str) -> Result<Command, HarnessError> {
 }
 
 async fn run_omp_config(cwd: &str, args: &[&str]) -> Result<Value, HarnessError> {
-    let output = omp_config_command(cwd)?.args(args).output().await?;
+    let output = omp_config_command(cwd)?
+        .env("ASHLER_INCREMENTAL_TSC_CHECKS", "false")
+        .args(args).output().await?;
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(HarnessError::Protocol(if message.is_empty() {
@@ -1838,6 +1840,17 @@ fn parse_advisor_config(settings: &Value) -> Result<OmpAdvisorConfig, HarnessErr
 pub async fn read_advisor_config(cwd: &str) -> Result<OmpAdvisorConfig, HarnessError> {
     let settings = run_omp_config(cwd, &["config", "list", "--json"]).await?;
     parse_advisor_config(&settings)
+}
+
+pub async fn read_session_config(cwd: &str) -> Result<Value, HarnessError> {
+    let settings = run_omp_config(cwd, &["config", "list", "--json"]).await?;
+    Ok(serde_json::json!({
+        "harness": "omp",
+        "model": settings.pointer("/modelRoles/value/default"),
+        "reasoning": settings.pointer("/defaultThinkingLevel/value"),
+        "modelOptions": {},
+        "sandbox": "workspace-write",
+    }))
 }
 
 pub async fn update_advisor_config(

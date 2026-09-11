@@ -222,6 +222,7 @@ fn session_catalog_binding_allowed(
 ) -> bool {
     authority.scope.session_id.as_deref() == Some(chat_id)
         && authority.device_id == device_id
+        && authority.scope.deployment_id.as_deref().is_some_and(|id| !id.is_empty())
         && authority.expires_at > crate::now_ms()
         && authority.capabilities.iter().any(|capability| capability == comet_proto::CAPABILITY_SESSION_READ)
 }
@@ -249,6 +250,10 @@ fn session_viewport_authority(
         &authority.principal_subject, &[chat_id.to_owned()],
     ).into_iter().find(|grant| {
         grant.id == authority.grant_id
+            && grant.principal_subject == authority.principal_subject
+            && grant.scope.session_id == authority.scope.session_id
+            && grant.revoked_at.is_none()
+            && grant.expires_at.is_none_or(|expires| expires > crate::now_ms())
             && grant.scope.project_id == authority.scope.project_id
             && grant.scope.deployment_id == authority.scope.deployment_id
             && grant.device_id.as_deref() == Some(authority.device_id.as_str())
@@ -1637,7 +1642,7 @@ impl RpcService for EngineRpc {
             }
             // The browser viewport may discover models only for the exact
             // deployment-bound session. Generic harness discovery stays disabled.
-            "ListSessionModels" | "ReadSessionSelection" | "ReadSessionAuthority" => {
+            "ListSessionModels" | "ReadSessionSelection" | "ReadSessionAuthority" | "ReadSessionContext" => {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "camelCase", deny_unknown_fields)]
                 struct Params { chat_id: String }
@@ -1645,6 +1650,54 @@ impl RpcService for EngineRpc {
                 let authority = session_viewport_authority(self, &p.chat_id)?;
                 if method == "ReadSessionAuthority" {
                     return RpcReply::value(&authority);
+                }
+                if method == "ReadSessionContext" {
+                    let cwd = std::env::current_dir()
+                        .map_err(|error| RpcError::Failed(error.to_string()))?;
+                    let cwd = cwd.to_str()
+                        .ok_or_else(|| RpcError::Failed("session_context_cwd_invalid".into()))?;
+                    let execution_key = format!("{}::session::{}", p.chat_id, p.chat_id);
+                    let request = self.sessions.last_request(&execution_key)
+                        .or_else(|| self.sessions.last_request(&p.chat_id));
+                    let chat = self.workspace.doc().chat(&p.chat_id)
+                        .map_err(|error| RpcError::Failed(error.to_string()))?
+                        .filter(|chat| chat.device_id == authority.device_id);
+                    let cwd = request.as_ref().map(|request| request.cwd.as_str())
+                        .or_else(|| chat.as_ref().map(|chat| chat.cwd.as_str()))
+                        .unwrap_or(cwd);
+                    let mut config = if let Some(request) = request.as_ref() {
+                        serde_json::json!({
+                            "harness": "omp", "model": request.model,
+                            "reasoning": request.reasoning, "modelOptions": request.model_options,
+                            "sandbox": request.sandbox,
+                        })
+                    } else if let Some(config) = chat.as_ref()
+                        .and_then(|chat| chat.config.as_ref())
+                        .filter(|config| config.harness == HarnessId::Omp)
+                    {
+                        serde_json::to_value(config)
+                            .map_err(|error| RpcError::Failed(error.to_string()))?
+                    } else {
+                        comet_harness::omp::read_session_config(cwd).await
+                            .map_err(|error| RpcError::Failed(error.to_string()))?
+                    };
+                    config["model"] = config["model"].as_str()
+                        .and_then(crate::local_sessions::canonical_omp_model_selector)
+                        .map(serde_json::Value::String).unwrap_or(serde_json::Value::Null);
+                    let current = session_viewport_authority(self, &p.chat_id)?;
+                    if current.scope != authority.scope || current.device_id != authority.device_id
+                        || current.sandbox_id != authority.sandbox_id
+                        || current.lifecycle_epoch != authority.lifecycle_epoch
+                        || current.grant_id != authority.grant_id
+                        || current.principal_subject != authority.principal_subject
+                    {
+                        return Err(RpcError::Failed("session_context_binding_changed".into()));
+                    }
+                    return RpcReply::value(&serde_json::json!({
+                        "authority": current, "cwd": cwd, "config": config,
+                        "title": chat.as_ref().map(|chat| &chat.title),
+                        "branch": chat.as_ref().map(|chat| &chat.branch),
+                    }));
                 }
                 if method == "ReadSessionSelection" {
                     let execution_key = format!("{}::session::{}", p.chat_id, p.chat_id);
@@ -2713,6 +2766,11 @@ mod tests {
             capabilities: vec![comet_proto::CAPABILITY_SESSION_READ.into()],
         };
         assert!(session_catalog_binding_allowed(&authority, "session-a", "device-a"));
+        let deployment = authority.scope.deployment_id.take();
+        assert!(!session_catalog_binding_allowed(&authority, "session-a", "device-a"));
+        authority.scope.deployment_id = Some(String::new());
+        assert!(!session_catalog_binding_allowed(&authority, "session-a", "device-a"));
+        authority.scope.deployment_id = deployment;
         assert!(!session_catalog_binding_allowed(&authority, "session-b", "device-a"));
         assert!(!session_catalog_binding_allowed(&authority, "session-a", "device-b"));
         authority.capabilities.clear();

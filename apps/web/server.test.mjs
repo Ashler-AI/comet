@@ -18,12 +18,31 @@ async function fixture(t) {
   const rpc = new EventEmitter();
   rpc.close = () => {};
   const commands = new Map();
+  const uploads = new Map();
+  const context = { cwd: '/workspace', config: { harness: 'omp', model: 'openai-codex/gpt-example', reasoning: 'high', sandbox: 'workspace-write', modelOptions: { trusted: true } } };
   rpc.call = async (method, params) => {
     if (method === 'ReadSessionAuthority') return {
       scope: { projectId: 'project-a', deploymentId: 'deployment-a', sessionId: 'session-a' }, sandboxId: 'sandbox-a',
-      deviceId: 'device-a', principalSubject: 'owner-a', grantId: 'grant-a', expiresAt: Date.now() + 60000,
+      deviceId: 'device-a', lifecycleEpoch: 1, principalSubject: 'owner-a', grantId: 'grant-a', expiresAt: Date.now() + 60000,
       capabilities: ['session.read', 'session.chat', 'session.control'],
     };
+    if (method === 'ReadSessionContext') {
+      assert.deepEqual(params, { chatId: config.sessionId });
+      return { ...context, authority: await rpc.call('ReadSessionAuthority', params) };
+    }
+    if (method === 'UploadChunk') {
+      const bytes = Buffer.from(params.data, 'base64');
+      if (bytes.length > 45000) throw new Error('Upload chunk exceeds 45000 raw bytes');
+      const chunks = uploads.get(params.uploadId) || [];
+      assert.equal(params.seq, chunks.length);
+      chunks.push(bytes);
+      uploads.set(params.uploadId, chunks);
+      return {};
+    }
+    if (method === 'UploadCommit') {
+      assert.ok(uploads.has(params.uploadId));
+      return { path: `/workspace/uploads/${params.uploadId}/${params.fileName}` };
+    }
     if (method === 'QueueCommand') {
       if (!commands.has(params.commandId)) commands.set(params.commandId, params);
       return { commandId: params.commandId };
@@ -36,18 +55,103 @@ async function fixture(t) {
   };
   const viewport = new Viewport(config, rpc);
   viewport.connection = 'connected';
-  viewport.snapshots = new Set(['chat', 'sessions', 'selection', 'messages', 'collaboration']);
-  viewport.chat = { id: 'session-a', deviceId: 'device-a', cwd: '/workspace', config: { model: 'openai-codex/gpt-example', reasoning: 'high', sandbox: 'workspace-write' } };
+  viewport.snapshots = new Set(['context', 'sessions', 'selection', 'messages', 'collaboration']);
+  viewport.context = context;
   const { server } = await createServer(config, viewport);
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(() => { server.closeAllConnections(); return new Promise(resolve => server.close(resolve)); });
   const url = `http://127.0.0.1:${server.address().port}`;
   const headers = { authorization: `Basic ${Buffer.from(`opencode:${config.token}`).toString('base64')}`, 'content-type': 'application/json', 'x-crew-web-origin-verified': 'true' };
   const post = (path, value, customHeaders = headers) => fetch(url + path, { method: 'POST', headers: customHeaders, body: JSON.stringify(value) });
-  return { config, rpc, viewport, commands, url, headers, post };
+  return { config, rpc, viewport, commands, uploads, context, url, headers, post };
 }
 
 const message = { requestId: 'request-a', text: 'Continue', model: 'openai-codex/gpt-example', reasoning: 'high', attachments: [] };
+
+test('deployment session connects and admits messages and controls without legacy chat rows', async t => {
+  const f = await fixture(t);
+  const watches = new Map();
+  const original = f.rpc.call;
+  f.rpc.connect = async () => {};
+  f.rpc.watch = (method, params, callback) => { watches.set(method, { params, callback }); };
+  f.rpc.call = async (method, params) => {
+    if (method === 'ReadSessionSelection') return { selection: null };
+    if (method === 'ListSessionModels') return [];
+    return original(method, params);
+  };
+  f.viewport.clearProtected();
+  await f.viewport.connect();
+  assert.equal(watches.has('WatchChats'), false);
+  watches.get('WatchSessions').callback([]);
+  watches.get('WatchDocMessages').callback({ reset: [], before: null });
+  watches.get('WatchCollaboration').callback({ sessions: [] });
+  await Promise.resolve();
+  assert.equal(f.viewport.chat, undefined);
+  assert.equal(f.viewport.state().capabilities.message, true);
+  assert.equal(f.viewport.state().session.cwd, '/workspace');
+  const { model, reasoning, ...defaultMessage } = message;
+  assert.equal((await f.post('/api/message', { ...defaultMessage, cwd: '/browser' })).status, 400);
+  assert.equal((await f.post('/api/message', defaultMessage)).status, 202);
+  const request = [...f.commands.values()][0].command.action.request;
+  assert.equal(request.cwd, '/workspace');
+  assert.equal(request.model, model);
+  assert.equal(request.reasoning, reasoning);
+  assert.deepEqual(request.modelOptions, { trusted: true });
+  assert.equal((await f.post('/api/interrupt', { requestId: 'stop-a' })).status, 202);
+  f.viewport.messages = [{ parts: [{ kind: 'input', requestId: 'input-a', questions: [{ id: 'q', multiSelect: false }] }] }];
+  assert.equal((await f.post('/api/input', { requestId: 'answer-a', inputRequestId: 'input-a', answers: [{ questionId: 'q', labels: ['yes'] }] })).status, 202);
+});
+
+test('session context binding mismatch clears protected readiness before admission', async t => {
+  const f = await fixture(t);
+  await f.viewport.readAuthority();
+  const original = f.rpc.call;
+  f.rpc.call = async (method, params) => {
+    const result = await original(method, params);
+    return method === 'ReadSessionContext' ? { ...result, authority: { ...result.authority, lifecycleEpoch: 2 } } : result;
+  };
+  assert.equal((await f.post('/api/message', message)).status, 503);
+  assert.equal(f.viewport.context, null);
+  assert.equal(f.viewport.state().capabilities.message, false);
+  assert.equal(f.commands.size, 0);
+});
+
+test('uploads enforce 45000 raw-byte chunks and preserve bytes across boundaries', async t => {
+  const f = await fixture(t);
+  await assert.rejects(f.rpc.call('UploadChunk', { uploadId: 'oversize', seq: 0, data: Buffer.alloc(45001).toString('base64') }), /45000/);
+  for (const size of [44999, 45000, 45001, 90000, 90001, 192 * 1024]) {
+    const bytes = Buffer.alloc(size);
+    for (let index = 0; index < size; index++) bytes[index] = index % 251;
+    const response = await fetch(f.url + '/api/upload', { method: 'POST', headers: { ...f.headers, 'content-type': 'application/octet-stream', 'x-filename': 'boundary.bin' }, body: bytes });
+    assert.equal(response.status, 201);
+    const metadata = await response.json();
+    assert.equal(metadata.size, size);
+    const chunks = f.uploads.get(metadata.id);
+    assert.equal(chunks.length, Math.ceil(size / 45000));
+    assert.ok(chunks.every(chunk => chunk.length <= 45000));
+    assert.deepEqual(Buffer.concat(chunks), bytes);
+    assert.equal((await f.post('/api/message', { ...message, requestId: `upload-${size}`, attachments: [metadata] })).status, 202);
+    const entry = f.commands.get(`crew-web:upload-${size}`);
+    assert.ok(entry.command.action.request.prompt.includes(`/workspace/uploads/${metadata.id}/boundary.bin`));
+  }
+});
+
+test('upload revocation between chunks prevents remaining chunks and commit', async t => {
+  const f = await fixture(t);
+  const original = f.rpc.call;
+  let revoked = false;
+  let commits = 0;
+  f.rpc.call = async (method, params) => {
+    if (method === 'UploadCommit') commits++;
+    const result = await original(method, params);
+    if (method === 'UploadChunk') revoked = true;
+    return method === 'ReadSessionAuthority' && revoked ? { ...result, capabilities: ['session.read'] } : result;
+  };
+  const response = await fetch(f.url + '/api/upload', { method: 'POST', headers: { ...f.headers, 'x-filename': 'revoked.bin' }, body: Buffer.alloc(45001) });
+  assert.equal(response.status, 403);
+  assert.equal([...f.uploads.values()][0].length, 1);
+  assert.equal(commits, 0);
+});
 
 test('HTTP boundary denies missing credentials, unverified writes, raw RPC and caller-selected sessions', async t => {
   const f = await fixture(t);
@@ -63,7 +167,7 @@ test('HTTP boundary denies missing credentials, unverified writes, raw RPC and c
 
 test('follow-ups leave native continuation to the engine for the assigned session', async t => {
   const f = await fixture(t);
-  f.viewport.chat.harnessSessionId = 'stale-chat-native';
+  f.viewport.context.harnessSessionId = 'stale-context-native';
   f.viewport.collaboration = { sessions: [{ sessionId: 'session-a', harnessSessionId: 'stale-projected-native' }] };
   assert.equal((await f.post('/api/message', message)).status, 202);
   const entry = [...f.commands.values()][0];
@@ -80,7 +184,8 @@ test('browser restores the authorized route after failed admission or rejection 
       if (!nodes.has(id)) nodes.set(id, {
         value: '', style: {}, dataset: {}, options: [], listeners: {},
         addEventListener(name, listener) { this.listeners[name] = listener; },
-        querySelectorAll() { return []; }, replaceChildren() {}, focus() {},
+        querySelectorAll() { return []; }, replaceChildren(...children) { this.options = children; },
+        add(option) { this.options.push(option); }, focus() {},
       });
       return nodes.get(id);
     };
@@ -94,6 +199,7 @@ test('browser restores the authorized route after failed admission or rejection 
       ResizeObserver: class { observe() {} },
       EventSource: class { addEventListener() {} },
       crypto: { randomUUID },
+      Option: class { constructor(label, value) { this.label = label; this.value = value; } },
       fetch: async (path, options) => {
         if (path === './api/session' || path === './api/models') return new Promise(() => {});
         const body = options.body && JSON.parse(options.body);
@@ -101,7 +207,10 @@ test('browser restores the authorized route after failed admission or rejection 
         let status = 200;
         let result = {};
         if (path.endsWith('/model-route')) route = body.model;
-        else if (path === './api/message') {
+        else if (path === './api/interrupt') {
+          admitted.set(body.requestId, { status: 'applied' });
+          if (fail) throw new TypeError('Response lost');
+        } else if (path === './api/message') {
           if (admitted.has(body.requestId)) result = {};
           else if (fail && failure === 'admission') status = 503;
           else if (route !== body.model.split('/')[1]) status = 409;
@@ -122,6 +231,7 @@ test('browser restores the authorized route after failed admission or rejection 
     node('message').value = 'Continue';
     node('model').value = 'openai-codex/gpt-other';
     node('reasoning').value = 'high';
+    node('reasoning').listeners.change();
     const submit = () => node('composer').listeners.submit({ preventDefault() {} });
     await submit();
     assert.equal(node('message').value, 'Continue');
@@ -156,6 +266,24 @@ test('browser restores the authorized route after failed admission or rejection 
       assert.equal(calls.filter(call => call.path.endsWith('/model-route')).length, 2);
     }
     assert.equal(node('message').value, '');
+    assert.equal(runInContext('modelDirty', context), false);
+    runInContext(`state.session.model = 'openai-codex/remote'; state.session.status = 'working'; renderModels();`, context);
+    assert.equal(node('model').value, 'openai-codex/remote');
+    node('model').value = 'openai-codex/unsent';
+    node('reasoning').listeners.change();
+    runInContext(`state.session.model = 'openai-codex/another'; renderModels();`, context);
+    assert.equal(node('model').value, 'openai-codex/unsent');
+    runInContext(`state.session.id = 'session-a'; state.capabilities.interrupt = true; state.messages = [{ id: 'turn-a' }];`, context);
+    const stop = () => node('stop').listeners.click();
+    fail = true;
+    await stop();
+    await stop();
+    runInContext(`state.messages = [{ id: 'turn-b' }];`, context);
+    fail = false;
+    await stop();
+    const stops = calls.filter(call => call.path === './api/interrupt');
+    assert.equal(stops[0].body.requestId, stops[1].body.requestId);
+    assert.notEqual(stops[0].body.requestId, stops[2].body.requestId);
   }
 });
 

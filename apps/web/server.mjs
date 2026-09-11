@@ -110,12 +110,8 @@ export class Viewport {
       const authority = await this.readAuthority();
       if (generation !== this.generation || this.stopped) return;
       this.binding = { chatId: this.config.sessionId, roomProjection: authority.scope };
-      this.rpc.watch('WatchChats', {}, rows => {
-        if (generation !== this.generation) return;
-        this.snapshots.add('chat');
-        this.chat = rows.find(row => row.id === this.config.sessionId && row.deviceId === authority.deviceId) || null;
-        this.emit();
-      });
+      await this.readContext();
+      if (generation !== this.generation || this.stopped) return;
       this.rpc.watch('WatchSessions', {}, rows => {
         if (generation !== this.generation) return;
         this.snapshots.add('sessions');
@@ -169,10 +165,14 @@ export class Viewport {
     const generation = this.generation;
     const authority = await this.rpc.call('ReadSessionAuthority', { chatId: this.config.sessionId });
     requireValue(generation === this.generation, 'Crew connection changed', 503);
+    return this.acceptAuthority(authority, capability);
+  }
+  acceptAuthority(authority, capability) {
     requireValue(authority.scope?.sessionId === this.config.sessionId && (!this.config.sandboxId || authority.sandboxId === this.config.sandboxId), 'Crew session authority mismatch', 503);
     requireValue(authority.expiresAt > Date.now(), 'Crew authority expired', 503);
     if (this.currentAuthority) {
       requireValue(authority.deviceId === this.currentAuthority.deviceId
+        && authority.principalSubject === this.currentAuthority.principalSubject
         && authority.lifecycleEpoch === this.currentAuthority.lifecycleEpoch
         && authority.scope.projectId === this.currentAuthority.scope.projectId
         && authority.scope.deploymentId === this.currentAuthority.scope.deploymentId,
@@ -182,6 +182,28 @@ export class Viewport {
     this.currentAuthority = authority;
     return authority;
   }
+  async readContext() {
+    const generation = this.generation;
+    try {
+      const context = await this.rpc.call('ReadSessionContext', { chatId: this.config.sessionId });
+      requireValue(generation === this.generation, 'Crew connection changed', 503);
+      this.acceptAuthority(context.authority, 'session.read');
+      requireValue(typeof context.cwd === 'string' && context.cwd.startsWith('/') && context.config?.harness === 'omp', 'Invalid Crew session context', 503);
+      this.context = context;
+      this.snapshots.add('context');
+      return context;
+    } catch (error) {
+      if (generation === this.generation) {
+        this.clearProtected();
+        this.rpc.close();
+      }
+      throw error;
+    }
+  }
+  ready() {
+    return this.connection === 'connected' && !!this.context
+      && ['context', 'sessions', 'selection', 'messages', 'collaboration'].every(key => this.snapshots.has(key));
+  }
   canRead() {
     return !!this.currentAuthority && this.currentAuthority.expiresAt > Date.now()
       && this.currentAuthority.capabilities.includes('session.read');
@@ -189,7 +211,7 @@ export class Viewport {
   clearProtected() {
     this.snapshots.clear();
     this.currentAuthority = null;
-    this.chat = null;
+    this.context = null;
     this.live = null;
     this.selection = null;
     this.collaboration = null;
@@ -220,16 +242,16 @@ export class Viewport {
       transcriptReset: true,
       connection: 'disconnected', capabilities: { message: false, input: false, interrupt: false },
     };
-    const chat = this.chat;
+    const context = this.context;
     const record = this.collaboration?.sessions?.find(row => row.sessionId === this.config.sessionId);
     const status = this.live?.status || record?.status || 'idle';
-    const active = this.connection === 'connected' && this.snapshots.size === 5 && !!chat && this.currentAuthority?.expiresAt > Date.now();
+    const active = this.ready() && this.currentAuthority?.expiresAt > Date.now();
     const caps = this.currentAuthority?.capabilities || [];
     return {
       sandboxId: this.config.sandboxId,
-      session: { id: this.config.sessionId, title: chat?.title || 'Crew', cwd: chat?.cwd || '', branch: chat?.branch || '', status,
-        model: this.selection?.model || record?.model || chat?.config?.model,
-        reasoning: this.selection ? this.selection.reasoning : chat?.config?.reasoning },
+      session: { id: this.config.sessionId, title: context?.title || 'Crew', cwd: context?.cwd || '', branch: context?.branch || '', status,
+        model: this.selection?.model || record?.model || context?.config?.model,
+        reasoning: this.selection ? this.selection.reasoning : context?.config?.reasoning },
       messages: this.messages, models: this.models, history: { hasOlder: this.before != null, before: this.before ?? null },
       collaboration: this.collaboration, connection: this.connection,
       capabilities: { message: active && caps.includes(CAP_CHAT), input: active && caps.includes(CAP_CHAT), interrupt: active && caps.includes(CAP_CONTROL) },
@@ -286,8 +308,9 @@ export class Viewport {
       if (record.receipt) return record.receipt;
       return this.queueRecord(recordPath, record);
     }
-    requireValue(this.connection === 'connected' && this.snapshots.size === 5 && this.chat, 'Assigned Crew session unavailable', 503);
+    requireValue(this.ready(), 'Assigned Crew session unavailable', 503);
     const generation = this.generation;
+    await this.readContext();
     const authority = await this.readAuthority();
     requireValue(authority.capabilities.includes(kind === 'interrupt' ? CAP_CONTROL : CAP_CHAT), 'Session capability unavailable', 403);
     let action;
@@ -313,15 +336,15 @@ export class Viewport {
       const reasoning = Object.hasOwn(input, 'reasoning') ? input.reasoning : state.reasoning ?? null;
       requireValue(reasoning === null || ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'ultracode', 'ultrathink'].includes(reasoning), 'Invalid reasoning');
       await this.approvedModel(model);
-      requireValue(generation === this.generation && this.snapshots.size === 5 && this.chat, 'Crew session state changed; retry', 503);
+      requireValue(generation === this.generation && this.ready(), 'Crew session state changed; retry', 503);
       const currentState = this.state().session;
       if (['working', 'awaitingInput'].includes(currentState.status)) {
         requireValue(model === currentState.model && reasoning === (currentState.reasoning ?? null), 'Stop the current turn before changing model or reasoning', 409);
         action = { action: 'steer', prompt, message_id: `crew-web:${requestId}` };
       } else {
         action = { action: 'start', message_id: `crew-web:${requestId}`, request: {
-          prompt, model, reasoning, modelOptions: this.chat.config?.modelOptions || {}, cwd: this.chat.cwd,
-          sandbox: this.chat.config?.sandbox || 'workspace-write', autoApprove: false,
+          prompt, model, reasoning, modelOptions: this.context.config?.modelOptions || {}, cwd: this.context.cwd,
+          sandbox: this.context.config?.sandbox || 'workspace-write', autoApprove: false,
           resume: null,
           attachments: images,
         } };
@@ -368,7 +391,9 @@ export class Viewport {
     return command || { commandId: record.commandId, status: 'pending', resolution: null };
   }
   async upload(req) {
-    requireValue(this.connection === 'connected' && this.snapshots.size === 5 && this.chat, 'Assigned Crew session unavailable', 503);
+    requireValue(this.ready(), 'Assigned Crew session unavailable', 503);
+    const generation = this.generation;
+    await this.readContext();
     const authority = await this.readAuthority();
     requireValue(authority.capabilities.includes(CAP_CHAT), 'Session capability unavailable', 403);
     let name;
@@ -377,10 +402,14 @@ export class Viewport {
     const bytes = await body(req, UPLOAD_LIMIT);
     requireValue(bytes.length > 0, 'Empty attachment');
     const id = randomUUID();
-    const chunkSize = 192 * 1024;
+    const chunkSize = 45000;
     for (let offset = 0, seq = 0; offset < bytes.length; offset += chunkSize, seq++) {
+      await this.authority(CAP_CHAT);
+      requireValue(generation === this.generation && this.ready(), 'Crew session state changed; retry', 503);
       await this.rpc.call('UploadChunk', { uploadId: id, seq, data: bytes.subarray(offset, offset + chunkSize).toString('base64') });
     }
+    await this.authority(CAP_CHAT);
+    requireValue(generation === this.generation && this.ready(), 'Crew session state changed; retry', 503);
     const { path } = await this.rpc.call('UploadCommit', { uploadId: id, fileName: name });
     const type = /^image\/(png|jpeg|gif|webp)$/.test(req.headers['content-type'] || '') ? req.headers['content-type'] : 'application/octet-stream';
     const metadata = { id, name, size: bytes.length, type };

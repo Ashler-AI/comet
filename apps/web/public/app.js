@@ -6,6 +6,7 @@ let sending = false;
 let stopping = false;
 let uploads = [];
 let modelDirty = false;
+let modelRevision = 0;
 let modelCatalog;
 let modelSignature = '';
 let inputSignature = '';
@@ -76,8 +77,8 @@ async function api(path, options = {}) {
   if (payload === null) throw new Error('Crew returned an unexpected response. Check the connection and try again.');
   return payload;
 }
-async function command(path, payload) {
-  const key = `${path}:${JSON.stringify(payload)}`;
+async function command(path, payload, scope = '') {
+  const key = `${path}:${JSON.stringify(payload)}${scope}`;
   let requestId = commandIds.get(key);
   if (!requestId) {
     requestId = crypto.randomUUID();
@@ -492,12 +493,13 @@ ui.message.addEventListener('keydown', (event) => {
     if (!ui.send.disabled) ui.composer.requestSubmit();
   }
 });
-ui.model.addEventListener('change', () => { modelDirty = true; setReasoning(''); updateControls(); });
-ui.reasoning.addEventListener('change', () => { modelDirty = true; });
+ui.model.addEventListener('change', () => { modelDirty = true; modelRevision++; setReasoning(''); updateControls(); });
+ui.reasoning.addEventListener('change', () => { modelDirty = true; modelRevision++; });
 ui.composer.addEventListener('submit', async (event) => {
   event.preventDefault();
   if (ui.send.disabled) return;
   const text = ui.message.value;
+  const submittedModelRevision = modelRevision;
   const submitted = uploads.slice();
   const payload = { text, attachments: submitted.map((file) => file.metadata) };
   if (ui.model.value) payload.model = ui.model.value;
@@ -524,6 +526,7 @@ ui.composer.addEventListener('submit', async (event) => {
       await api(`/sessions/${encodeURIComponent(state.sandboxId)}/opencode/api/model-route`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ provider, model: payload.model.slice(separator + 1) }) });
     }
     await command('message', payload);
+    if (modelRevision === submittedModelRevision && ui.message.value === text) modelDirty = false;
     if (ui.message.value === text) ui.message.value = '';
     uploads = uploads.filter((file) => !submitted.includes(file));
     renderAttachments(); resizeComposer();
@@ -534,7 +537,7 @@ ui.composer.addEventListener('submit', async (event) => {
 ui.stop.addEventListener('click', async () => {
   if (!allowed('interrupt') || stopping) return;
   stopping = true; updateControls();
-  try { await command('interrupt', {}); }
+  try { await command('interrupt', {}, JSON.stringify([state.session.id, state.messages.at(-1)?.id])); }
   catch (error) { showError(error); }
   finally { stopping = false; updateControls(); }
 });
