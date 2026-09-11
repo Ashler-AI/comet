@@ -100,7 +100,11 @@ fn harness_run_request(request: &RunRequest, harness_id: HarnessId) -> RunReques
 /// Sidebar/tabs/mobile previews are presentation, not harness input. Keep their
 /// activity timestamps without copying hidden peer content into workspace rows.
 fn user_message_preview(prompt: &str, peer_message: bool) -> &str {
-    if peer_message { "Inter-session message" } else { prompt }
+    if peer_message {
+        "Inter-session message"
+    } else {
+        prompt
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -813,8 +817,12 @@ impl SessionsEngine {
         if let ExistingRunDecision::Routed { run_id, status } = &existing {
             lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
             let handle = self.doc_handle(chat_id)?;
-            let peer_message =
-                handle.write_user_message_with_status(&user_id, &request.prompt, now_ms(), *status)?;
+            let peer_message = handle.write_user_message_with_status(
+                &user_id,
+                &request.prompt,
+                now_ms(),
+                *status,
+            )?;
             // The optimistic echo may already exist with a composer-guessed
             // steer status. Stamp the engine-authoritative state over it.
             handle.doc_arc().set_message_status(&user_id, *status)?;
@@ -823,7 +831,8 @@ impl SessionsEngine {
             // impossible for an observer to hold [new message, old status]
             // — that gap read as unseen-with-no-live-run = a phantom
             // "completed" flash on every remote send (2026-07-31).
-            self.inner.note_message(chat_id, user_message_preview(&request.prompt, peer_message));
+            self.inner
+                .note_message(chat_id, user_message_preview(&request.prompt, peer_message));
             return Ok(run_id.clone());
         }
 
@@ -929,7 +938,7 @@ impl SessionsEngine {
             steering: steer_rx,
             interrupt: interrupt_token.clone(),
             context: Some(RunContext {
-                session_id: chat_id.to_string(),
+                session_id: self.inner.workspace_continuation_id(chat_id),
                 ipc_port: self.inner.ipc_port,
                 inference,
                 fork_from: fork_from.as_ref().map(|fork| fork.session_id.clone()),
@@ -950,28 +959,29 @@ impl SessionsEngine {
         {
             let mut runs = lock(&self.inner.runs);
             runs.insert(
-            chat_id.to_string(),
-            RunHandle {
-                user_message_id: user_id.clone(),
-                run_id: run_id.clone(),
-                route: requested_route,
-                steerable: harness.supports_steering(),
-                steering_mode: harness.steering_mode(),
-                steer_tx,
-                turn_active: true,
-                queued_followups: VecDeque::new(),
-                pending_turn_boundary_steers: VecDeque::new(),
-                interrupt_token,
-                cancel: cancel_tx,
-                engine_tx,
-                pending_inputs,
-            },
-        );
+                chat_id.to_string(),
+                RunHandle {
+                    user_message_id: user_id.clone(),
+                    run_id: run_id.clone(),
+                    route: requested_route,
+                    steerable: harness.supports_steering(),
+                    steering_mode: harness.steering_mode(),
+                    steer_tx,
+                    turn_active: true,
+                    queued_followups: VecDeque::new(),
+                    pending_turn_boundary_steers: VecDeque::new(),
+                    interrupt_token,
+                    cancel: cancel_tx,
+                    engine_tx,
+                    pending_inputs,
+                },
+            );
             self.set_status(chat_id, SessionStatus::Working, true);
         }
         // AFTER Working (same causal-order guarantee as the steer path): the
         // lastMessageAt bump must never be observable ahead of the live run.
-        self.inner.note_message(chat_id, user_message_preview(&request.prompt, peer_message));
+        self.inner
+            .note_message(chat_id, user_message_preview(&request.prompt, peer_message));
 
         // Name the chat immediately from its first prompt. This is entirely
         // local and never starts an auxiliary harness/model session.
@@ -1100,11 +1110,13 @@ impl SessionsEngine {
             handle.mailbox_message_status(was_turn_active, message)
         };
         let handle = self.doc_handle(chat_id)?;
-        let peer_message = handle.write_user_message_with_status(&user_id, prompt, now_ms(), status)?;
+        let peer_message =
+            handle.write_user_message_with_status(&user_id, prompt, now_ms(), status)?;
         // The optimistic echo may already exist with a generic steer status.
         // Stamp the harness-authoritative state instead of preserving that guess.
         handle.doc_arc().set_message_status(&user_id, status)?;
-        self.inner.note_message(chat_id, user_message_preview(prompt, peer_message));
+        self.inner
+            .note_message(chat_id, user_message_preview(prompt, peer_message));
         Ok(SteerOutcome::Accepted(status))
     }
 
@@ -1155,7 +1167,8 @@ impl SessionsEngine {
                 .doc_arc()
                 .set_message_status(&user_id, MessageStatus::Complete)?;
         }
-        self.inner.note_message(chat_id, user_message_preview(prompt, peer_message));
+        self.inner
+            .note_message(chat_id, user_message_preview(prompt, peer_message));
         Ok(outcome)
     }
 
@@ -1172,10 +1185,7 @@ impl SessionsEngine {
                 }
                 h.interrupt_token.cancel();
                 let _ = h.cancel.send(true);
-                (
-                h.run_id.clone(),
-                h.route.harness,
-                )
+                (h.run_id.clone(), h.route.harness)
             })
         };
         let Some((run_id, harness_id)) = target else {
@@ -1621,7 +1631,7 @@ impl Inner {
             return;
         }
         if let Some(ws) = self.workspace() {
-            ws.note_message(chat_id, text);
+            ws.note_message(&self.workspace_continuation_id(chat_id), text);
         }
     }
 
@@ -2033,7 +2043,8 @@ async fn drive_run(
         // dispatch steered in): the session is Working again.
         if idle_since.take().is_some() {
             let _runs = lock(&inner.runs);
-            let already_started = lock(&inner.statuses).get(&chat_id)
+            let already_started = lock(&inner.statuses)
+                .get(&chat_id)
                 .is_some_and(|session| session.status == SessionStatus::Working);
             inner.set_status(&chat_id, SessionStatus::Working, !already_started);
         }
@@ -2358,7 +2369,10 @@ async fn drive_run(
     }
     {
         let mut runs = lock(&inner.runs);
-        if runs.get(&chat_id).is_some_and(|handle| handle.run_id == run_id) {
+        if runs
+            .get(&chat_id)
+            .is_some_and(|handle| handle.run_id == run_id)
+        {
             inner.set_status(&chat_id, final_status, false);
             runs.remove(&chat_id);
         }
@@ -2515,25 +2529,38 @@ mod tests {
         let (cancel, _cancel_rx) = watch::channel(false);
         let (steer_tx, _steer_rx) = mpsc::channel(8);
         let (engine_tx, _engine_rx) = mpsc::unbounded_channel();
-        lock(&sessions.inner.runs).insert("chat".into(), RunHandle {
-            run_id: "run".into(),
-            user_message_id: "user".into(),
-            route: RunRoute::new(HarnessId::Mock, &test_request("hello", None), sessions.auth_identity()),
-            steerable: true,
-            steering_mode: SteeringMode::StepBoundary,
-            steer_tx,
-            turn_active: false,
-            queued_followups: VecDeque::new(),
-            pending_turn_boundary_steers: VecDeque::new(),
-            interrupt_token: CancellationToken::new(),
-            cancel,
-            engine_tx,
-            pending_inputs: Arc::new(Mutex::new(HashMap::new())),
-        });
+        lock(&sessions.inner.runs).insert(
+            "chat".into(),
+            RunHandle {
+                run_id: "run".into(),
+                user_message_id: "user".into(),
+                route: RunRoute::new(
+                    HarnessId::Mock,
+                    &test_request("hello", None),
+                    sessions.auth_identity(),
+                ),
+                steerable: true,
+                steering_mode: SteeringMode::StepBoundary,
+                steer_tx,
+                turn_active: false,
+                queued_followups: VecDeque::new(),
+                pending_turn_boundary_steers: VecDeque::new(),
+                interrupt_token: CancellationToken::new(),
+                cancel,
+                engine_tx,
+                pending_inputs: Arc::new(Mutex::new(HashMap::new())),
+            },
+        );
         sessions.set_status("chat", SessionStatus::Idle, false);
         drop(_steer_rx);
-        assert!(matches!(sessions.steer("chat", "undeliverable", None).await.unwrap(), SteerOutcome::NotSteerable));
-        assert_eq!(sessions.session_status("chat").unwrap().status, SessionStatus::Idle);
+        assert!(matches!(
+            sessions.steer("chat", "undeliverable", None).await.unwrap(),
+            SteerOutcome::NotSteerable
+        ));
+        assert_eq!(
+            sessions.session_status("chat").unwrap().status,
+            SessionStatus::Idle
+        );
     }
 
     fn test_request(prompt: &str, resume: Option<&str>) -> RunRequest {
@@ -2936,9 +2963,14 @@ mod tests {
     async fn completed_native_session_survives_restart_without_request_cache() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DocsStore::open(dir.path().join("store")).unwrap());
-        let host = DocHost::new(store, DocHostConfig {
-            device_id: "test-device".into(), default_harness: HarnessId::Omp, edge: None,
-        });
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "test-device".into(),
+                default_harness: HarnessId::Omp,
+                edge: None,
+            },
+        );
         let requests = Arc::new(Mutex::new(Vec::new()));
         let registry = Arc::new(HarnessRegistry::new());
         registry.register(Arc::new(TakeoverHarness {
@@ -2951,7 +2983,8 @@ mod tests {
             let sessions = SessionsEngine::new(
                 "test-device".into(),
                 Arc::new(RunJournal::open(dir.path().join("journal")).unwrap()),
-                registry.clone(), 27654,
+                registry.clone(),
+                27654,
             );
             sessions.set_doc_host(host.clone());
             sessions
@@ -2960,25 +2993,49 @@ mod tests {
         let sessions = open();
         let mut request = test_request("transferred turn", Some("native-takeover-session"));
         request.cwd = "/workspace/transferred".into();
-        sessions.dispatch(key, HarnessId::Omp, request.clone(), None).await.unwrap();
+        sessions
+            .dispatch(key, HarnessId::Omp, request.clone(), None)
+            .await
+            .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                if matches!(sessions.inner.journal.last_event(key).unwrap(),
-                    Some((_, AgentEvent::Done { status: DoneStatus::Completed, .. }))) {
+                if matches!(
+                    sessions.inner.journal.last_event(key).unwrap(),
+                    Some((
+                        _,
+                        AgentEvent::Done {
+                            status: DoneStatus::Completed,
+                            ..
+                        }
+                    ))
+                ) {
                     break;
                 }
                 tokio::task::yield_now().await;
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         sessions.interrupt(key).await.unwrap();
         drop(sessions);
         let restarted = open();
         assert!(restarted.last_request(key).is_none());
-        assert!(restarted.inner.resume_for(key, "/wrong-workspace").is_none());
+        assert!(
+            restarted
+                .inner
+                .resume_for(key, "/wrong-workspace")
+                .is_none()
+        );
         let mut next_request = test_request("native next turn", None);
         next_request.cwd = "/workspace/transferred".into();
-        restarted.dispatch(key, HarnessId::Omp, next_request, None).await.unwrap();
-        assert_eq!(lock(&requests).last().unwrap().resume.as_deref(), Some("native-takeover-session"));
+        restarted
+            .dispatch(key, HarnessId::Omp, next_request, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            lock(&requests).last().unwrap().resume.as_deref(),
+            Some("native-takeover-session")
+        );
         restarted.interrupt(key).await.unwrap();
     }
 

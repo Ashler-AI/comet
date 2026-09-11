@@ -592,20 +592,12 @@ export class DeviceRoom implements DurableObject {
       const actorSubject =
         frame.header.k === "rpc" ? controlActorForRpc(frame.payload) : undefined;
       if (actorSubject !== undefined && actorSubject !== state.userId) {
-        this.deliver(
-          ws,
-          { s: frame.header.s, k: RELAY_KIND },
-          encodeRelayError("actor_mismatch")
-        );
+        this.rejectRequest(ws, frame, "actor_mismatch");
         return;
       }
       const required = requiredCapabilityForRpc(frame.header, frame.payload);
       if (!hasCapability(state.capabilities, required)) {
-        this.deliver(
-          ws,
-          { s: frame.header.s, k: RELAY_KIND },
-          encodeRelayError("capability_denied")
-        );
+        this.rejectRequest(ws, frame, "capability_denied");
         return;
       }
       const host = this.liveHost();
@@ -617,11 +609,7 @@ export class DeviceRoom implements DurableObject {
       }
       const hostGrant = (host.deserializeAttachment() as SocketState | null)?.grant;
       if (hostGrant && !rpcAllowedForScopedHost(frame.header, frame.payload, hostGrant)) {
-        this.deliver(
-          ws,
-          { s: frame.header.s, k: RELAY_KIND },
-          encodeRelayError("session_scope_denied")
-        );
+        this.rejectRequest(ws, frame, "session_scope_denied");
         return;
       }
       this.deliver(host, { s: frame.header.s, k: frame.header.k, from: state.connId }, frame.payload);
@@ -665,6 +653,31 @@ export class DeviceRoom implements DurableObject {
 
   async webSocketError(ws: WebSocket): Promise<void> {
     await this.webSocketClose(ws);
+  }
+
+  private rejectRequest(
+    ws: WebSocket,
+    frame: { header: DeviceFrameHeader; payload: Uint8Array },
+    code: string
+  ): void {
+    if (frame.header.k === "rpc") {
+      try {
+        const value = JSON.parse(new TextDecoder().decode(frame.payload));
+        const id = value?.id;
+        if (typeof id === "string" || (Number.isSafeInteger(id) && id >= 0)) {
+          // A denied invocation is not a dead transport: fail only its RPC id.
+          this.deliver(
+            ws,
+            { s: frame.header.s, k: "rpc" },
+            new TextEncoder().encode(JSON.stringify({ id, err: code }))
+          );
+          return;
+        }
+      } catch {
+        // Uncorrelatable/non-RPC frames retain the relay-level failure.
+      }
+    }
+    this.deliver(ws, { s: frame.header.s, k: RELAY_KIND }, encodeRelayError(code));
   }
 
   private deliver(ws: WebSocket, header: DeviceFrameHeader, payload: Uint8Array): void {

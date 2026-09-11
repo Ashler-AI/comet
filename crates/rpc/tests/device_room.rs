@@ -103,6 +103,17 @@ impl FakeRelay {
             .send(Out::Frame(frame))
             .expect("send");
     }
+
+    fn send_client_frame(&self, conn_id: &str, kind: &str, payload: serde_json::Value) {
+        let frame = encode_device_frame(
+            &DeviceFrameHeader::new("rpc", kind),
+            payload.to_string().as_bytes(),
+        )
+        .expect("encode response");
+        self.state.lock().expect("lock").clients[conn_id]
+            .send(Out::Frame(frame))
+            .expect("client connected");
+    }
 }
 
 fn relay_error(code: &str) -> Vec<u8> {
@@ -333,6 +344,14 @@ fn noop_nudge() -> comet_rpc::NudgeHandler {
     Arc::new(|_| {})
 }
 
+async fn next_rpc_request(requests: &mut mpsc::UnboundedReceiver<Out>) -> comet_rpc::ClientFrame {
+    let Some(Out::Frame(bytes)) = requests.recv().await else {
+        panic!("expected an RPC request");
+    };
+    let (_, payload) = decode_device_frame(&bytes).expect("decode request");
+    serde_json::from_slice(&payload).expect("parse request")
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -403,6 +422,138 @@ async fn client_disconnect_tears_down_virtual_conn() {
     // the host drops the virtual conn, aborting the client's server-side streams.
     drop(link);
     wait_until(|| active.load(Ordering::SeqCst) == 0).await;
+}
+
+#[tokio::test]
+async fn legacy_scope_denial_closes_link_and_all_pending_requests() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let relay = FakeRelay::start().await;
+        // Hold host replies so the legacy edge denial arrives with work still pending.
+        let (host, mut requests) = mpsc::unbounded_channel();
+        relay.state.lock().expect("lock").host = Some(host);
+        let url = device_room_ws_url(&relay.edge_url(), "dev-a", "client", Some("conn-x"), "t");
+        let link = DeviceLink::connect(&url).await.expect("link connects");
+        let client = link.client();
+        let mut items = client
+            .subscribe(
+                methods::WATCH_DOC_MESSAGES,
+                serde_json::json!({ "chatId": "chat-a" }),
+            )
+            .await
+            .expect("subscribe");
+        next_rpc_request(&mut requests).await;
+
+        let (first, second, ()) = tokio::join!(
+            client.call(methods::LOCAL_DEVICE, serde_json::json!({})),
+            client.call(
+                methods::LIST_MODELS,
+                serde_json::json!({ "harness": "omp" })
+            ),
+            async {
+                next_rpc_request(&mut requests).await;
+                next_rpc_request(&mut requests).await;
+                relay.send_client_frame(
+                    "conn-x",
+                    RELAY_KIND,
+                    serde_json::json!({ "error": "session_scope_denied" }),
+                );
+            }
+        );
+        assert!(matches!(first, Err(RpcError::Closed)));
+        assert!(matches!(second, Err(RpcError::Closed)));
+        assert_eq!(items.recv().await, None);
+        assert!(link.is_closed());
+        assert_eq!(
+            link.closed().borrow().as_deref(),
+            Some("session_scope_denied")
+        );
+        assert!(matches!(
+            client
+                .call(methods::LOCAL_DEVICE, serde_json::json!({}))
+                .await,
+            Err(RpcError::Closed)
+        ));
+    })
+    .await
+    .expect("legacy denial must terminate pending work, not hang");
+}
+
+#[tokio::test]
+async fn rpc_scope_denial_preserves_pending_and_subsequent_authorized_calls() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let relay = FakeRelay::start().await;
+        let (host, mut requests) = mpsc::unbounded_channel();
+        relay.state.lock().expect("lock").host = Some(host);
+        let url = device_room_ws_url(&relay.edge_url(), "dev-a", "client", Some("conn-x"), "t");
+        let link = DeviceLink::connect(&url).await.expect("link connects");
+        let client = link.client();
+
+        let ((), pending, ()) = tokio::join!(
+            async {
+                let denied = client
+                    .call(
+                        methods::LIST_MODELS,
+                        serde_json::json!({ "harness": "omp" }),
+                    )
+                    .await;
+                assert!(
+                    matches!(denied, Err(RpcError::Failed(code)) if code == "session_scope_denied")
+                );
+                let accepted = client
+                    .call(
+                        methods::QUEUE_COMMAND,
+                        serde_json::json!({
+                            "command": { "sessionId": "session-a" }
+                        }),
+                    )
+                    .await
+                    .expect("authorized call after denial");
+                assert_eq!(accepted, serde_json::json!({ "accepted": true }));
+            },
+            client.call(methods::LOCAL_DEVICE, serde_json::json!({})),
+            async {
+                let first = next_rpc_request(&mut requests).await;
+                let second = next_rpc_request(&mut requests).await;
+                let (denied, pending) = if first.method.as_deref() == Some(methods::LIST_MODELS) {
+                    (first, second)
+                } else {
+                    (second, first)
+                };
+                // Exact new-edge wire shape, parsed by the existing RPC client.
+                relay.send_client_frame(
+                    "conn-x",
+                    "rpc",
+                    serde_json::json!({
+                        "id": denied.id, "err": "session_scope_denied"
+                    }),
+                );
+                // No reply to the independent pending call until a post-denial call arrives.
+                let subsequent = next_rpc_request(&mut requests).await;
+                assert_eq!(subsequent.method.as_deref(), Some(methods::QUEUE_COMMAND));
+                relay.send_client_frame(
+                    "conn-x",
+                    "rpc",
+                    serde_json::json!({
+                        "id": subsequent.id, "ok": { "accepted": true }
+                    }),
+                );
+                relay.send_client_frame(
+                    "conn-x",
+                    "rpc",
+                    serde_json::json!({
+                        "id": pending.id, "ok": { "deviceId": "dev-a" }
+                    }),
+                );
+            }
+        );
+        assert_eq!(
+            pending.expect("independent request survives denial"),
+            serde_json::json!({ "deviceId": "dev-a" })
+        );
+        assert!(!link.is_closed());
+    })
+    .await
+    .expect("request-specific denial must preserve the connection");
 }
 
 #[tokio::test]

@@ -575,6 +575,16 @@ impl Changes {
     /// Retries with a flat 2 s delay if the stream fails or ends; the last
     /// content stays visible under an error banner meanwhile.
     pub fn ensure_watch(&mut self, cx: &mut Context<Self>) {
+        // Scoped Scaffold hosts do not expose the device-wide diff catalog.
+        if self.state.read(cx).selected_chat_is_scaffold_room() {
+            self.watch_task = None;
+            self.watch_target = None;
+            self.started = false;
+            self.diffs.clear();
+            self.clear_selected_content();
+            self.error = None;
+            return;
+        }
         let target = self.desired_target(cx);
         if self.started && self.watch_target == target {
             return;
@@ -1488,6 +1498,19 @@ fn render_file_body(
 impl Render for Changes {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
+        if self.state.read(cx).selected_chat_is_scaffold_room() {
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p(px(Theme::SPACE_MD))
+                .text_size(px(12.0))
+                .text_color(theme.text_faint)
+                .child(SharedString::from(
+                    "Changes preview is unavailable for Scaffold sessions",
+                ));
+        }
         let resolved = self.resolved(cx);
         // With no session selected (new-chat canvas) there is nothing to
         // prepare — show the quiet empty state, not an endless spinner.

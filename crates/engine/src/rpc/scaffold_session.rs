@@ -111,21 +111,28 @@ impl EngineRpc {
             .try_lock_owned().map_err(|_| RpcError::Failed(
                 "Scaffold session preparation already in progress; wait for the existing request".into()
             ))?;
-        params.agent_route.validate().map_err(|error| RpcError::Failed(error.into()))?;
+        params
+            .agent_route
+            .validate()
+            .map_err(|error| RpcError::Failed(error.into()))?;
         let reference = self
             .workspace
             .doc()
             .session_ref(&actor.id, session_id)
             .map_err(|error| RpcError::Failed(error.to_string()))?;
         if reference.as_ref().is_some_and(|reference| {
-            reference.environment.is_none() && reference.startup.as_ref().is_some_and(|startup|
-                startup.status == comet_proto::SessionStartupStatus::CreationUncertain)
+            reference.environment.is_none()
+                && reference.startup.as_ref().is_some_and(|startup| {
+                    startup.status == comet_proto::SessionStartupStatus::CreationUncertain
+                })
         }) {
             return Err(RpcError::Failed(
                 "Sandbox creation outcome is unknown; inspect the existing request before retrying creation".into(),
             ));
         }
-        let accepted = reference.and_then(|reference| reference.environment).filter(|environment| {
+        let accepted = reference
+            .and_then(|reference| reference.environment)
+            .filter(|environment| {
                 matches!(
                     &environment.source,
                     SessionEnvironmentSource::Scaffold { .. }
@@ -321,7 +328,9 @@ impl EngineRpc {
             .ok_or_else(|| RpcError::Failed("native_handoff_target_identity_missing".into()))?
             .clone();
         let mut outcome = PreparationOutcome::for_command(
-            self, &chat_id, attached.preparation_generation.as_deref(),
+            self,
+            &chat_id,
+            attached.preparation_generation.as_deref(),
         )?;
         let config = source
             .config
@@ -377,7 +386,7 @@ impl EngineRpc {
         };
         let remote_chat = Chat {
             id: chat_id.clone(),
-            device_id: source.device_id.clone(),
+            device_id: owner_device_id.clone(),
             title: source.title,
             archived: false,
             cwd: Some(remote_cwd.clone()),
@@ -421,7 +430,9 @@ impl EngineRpc {
                     "{error}; sandbox {sandbox_id}; session {chat_id}; initial command not admitted"
                 ))
             })?;
-        if let Some(outcome) = outcome.as_mut() { outcome.admitted(&command_id)?; }
+        if let Some(outcome) = outcome.as_mut() {
+            outcome.admitted(&command_id)?;
+        }
         Ok(HandoffSessionToScaffoldResult {
             chat_id,
             sandbox_id: sandbox_id.clone(),
@@ -445,37 +456,55 @@ impl PreparationOutcome {
         self.startup.status = comet_proto::SessionStartupStatus::Admitted;
         self.startup.updated_at = chrono::Utc::now();
         self.startup.command_id = Some(command_id.to_string());
-        self.workspace.update_session_startup(
-            &self.session_id, Some(&self.startup.generation), self.startup.clone(),
-        ).map_err(|error| RpcError::Failed(format!("{error}; command {command_id} was admitted")))
+        self.workspace
+            .update_session_startup(
+                &self.session_id,
+                Some(&self.startup.generation),
+                self.startup.clone(),
+            )
+            .map_err(|error| {
+                RpcError::Failed(format!("{error}; command {command_id} was admitted"))
+            })
     }
     pub(super) fn for_command(
         rpc: &EngineRpc,
         session_id: &str,
         generation: Option<&str>,
     ) -> Result<Option<Self>, RpcError> {
-        let startup = rpc.workspace.session_startup(session_id)
+        let startup = rpc
+            .workspace
+            .session_startup(session_id)
             .map_err(|error| RpcError::Failed(error.to_string()))?;
         let Some(startup) = startup else {
             return if generation.is_some() {
-                Err(RpcError::Failed("Scaffold preparation is no longer tracked".into()))
+                Err(RpcError::Failed(
+                    "Scaffold preparation is no longer tracked".into(),
+                ))
             } else {
                 Ok(None)
             };
         };
         if generation.is_some_and(|generation| generation != startup.generation)
-            || (generation.is_none() && startup.status != comet_proto::SessionStartupStatus::Admitted)
+            || (generation.is_none()
+                && startup.status != comet_proto::SessionStartupStatus::Admitted)
         {
-            return Err(RpcError::Failed("Scaffold preparation generation mismatch".into()));
+            return Err(RpcError::Failed(
+                "Scaffold preparation generation mismatch".into(),
+            ));
         }
         if startup.status == comet_proto::SessionStartupStatus::Admitted {
             return Ok(None);
         }
         if startup.status == comet_proto::SessionStartupStatus::CreationUncertain {
-            return Err(RpcError::Failed("Scaffold creation outcome is unknown".into()));
+            return Err(RpcError::Failed(
+                "Scaffold creation outcome is unknown".into(),
+            ));
         }
         Ok(Some(Self {
-            workspace: rpc.workspace.clone(), session_id: session_id.to_string(), startup, armed: true,
+            workspace: rpc.workspace.clone(),
+            session_id: session_id.to_string(),
+            startup,
+            armed: true,
         }))
     }
     fn begin(workspace: WorkspaceHost, session_id: &str) -> Result<Self, RpcError> {
@@ -485,18 +514,27 @@ impl PreparationOutcome {
             updated_at: chrono::Utc::now(),
             command_id: None,
         };
-        workspace.update_session_startup(session_id, None, startup.clone())
+        workspace
+            .update_session_startup(session_id, None, startup.clone())
             .map_err(|error| RpcError::Failed(error.to_string()))?;
-        Ok(Self { workspace, session_id: session_id.to_string(), startup, armed: true })
+        Ok(Self {
+            workspace,
+            session_id: session_id.to_string(),
+            startup,
+            armed: true,
+        })
     }
 }
 
 impl Drop for PreparationOutcome {
     fn drop(&mut self) {
-        if !self.armed { return; }
-        if let Err(error) = self.workspace.report_scaffold_preparation_failure(
-            &self.session_id, &self.startup.generation,
-        ) {
+        if !self.armed {
+            return;
+        }
+        if let Err(error) = self
+            .workspace
+            .report_scaffold_preparation_failure(&self.session_id, &self.startup.generation)
+        {
             tracing::warn!(session_id = %self.session_id, %error, "could not retain interrupted preparation outcome");
         }
     }
@@ -667,21 +705,26 @@ where
             match inspected {
                 Ok(result) => {
                     let lifecycle = checked_lifecycle(&result, created_id, &scope)?;
-                    let SessionEnvironmentSource::Scaffold { lifecycle_epoch, .. } =
-                        &result.environment.source
+                    let SessionEnvironmentSource::Scaffold {
+                        lifecycle_epoch, ..
+                    } = &result.environment.source
                     else {
                         unreachable!()
                     };
-                    let SessionEnvironmentSource::Scaffold { lifecycle_epoch: attached_epoch, .. } =
-                        &attached.environment.source
+                    let SessionEnvironmentSource::Scaffold {
+                        lifecycle_epoch: attached_epoch,
+                        ..
+                    } = &attached.environment.source
                     else {
                         unreachable!()
                     };
                     if lifecycle_epoch != attached_epoch
-                        || result.environment.owner_principal != attached.environment.owner_principal
+                        || result.environment.owner_principal
+                            != attached.environment.owner_principal
                     {
                         return Err(RpcError::Failed(
-                            "Scaffold lifecycle authority changed while waiting for readiness".into(),
+                            "Scaffold lifecycle authority changed while waiting for readiness"
+                                .into(),
                         ));
                     }
                     match lifecycle {

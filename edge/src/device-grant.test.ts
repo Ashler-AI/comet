@@ -3,6 +3,8 @@ import {
   authorizedDeviceSocketRole,
   canonicalGrantEnvelope,
   deviceGrantTargetsRoom,
+  decodeDeviceFrame,
+  encodeDeviceFrame,
   DeviceRoom,
   enforceDeviceHostGrantAuthority,
   parseTrustedDeviceGrant,
@@ -247,5 +249,60 @@ describe("session-scoped host RPC", () => {
     expect(rpcAllowedForScopedHost(rpc, payload({ method: "ListHarnesses" }), grant)).toBe(false);
     expect(rpcAllowedForScopedHost(rpc, payload({ method: "ListModels", params: { harness: "omp" } }), grant)).toBe(false);
     expect(rpcAllowedForScopedHost(term, new Uint8Array(), grant)).toBe(false);
+  });
+
+  it("keeps authorized traffic on the same connection after request-specific denials", async () => {
+    const clientState = {
+      role: "client",
+      connId: "client-1",
+      userId: rawGrant.subject,
+      capabilities: ["session.read", "session.control", "session.chat"]
+    };
+    const client = { deserializeAttachment: () => clientState, send: vi.fn(), close: vi.fn() };
+    const host = {
+      deserializeAttachment: () => ({ role: "host", grant }),
+      send: vi.fn(),
+      close: vi.fn()
+    };
+    const room = Object.assign(Object.create(DeviceRoom.prototype), {
+      liveHost: () => host,
+      liveClient: () => client,
+      authorizeHost: async () => true
+    }) as DeviceRoom;
+    const send = async (value: unknown) => {
+      const bytes = encodeDeviceFrame(rpc, payload(value));
+      await room.webSocketMessage(client as unknown as WebSocket, bytes.buffer as ArrayBuffer);
+    };
+    const reply = (index: number) => {
+      const frame = decodeDeviceFrame(client.send.mock.calls[index][0]);
+      return { header: frame.header, value: JSON.parse(new TextDecoder().decode(frame.payload)) };
+    };
+
+    await send({ id: 1, method: "LocalDevice", params: {} });
+    expect(host.send).toHaveBeenCalledTimes(1);
+    await send({ id: 2, method: "WatchCheckoutDiffs", params: {} });
+    await send({ id: 3, method: "QueueCommand", params: { command: { sessionId: "other-session" } } });
+    await send({ id: 4, method: "QueueCommand", params: { command: {
+      kind: "control", actorSubject: "other-user", sessionId: grant.scope.sessionId,
+      action: { action: "start" }
+    } } });
+    await send({ id: 5, method: "UploadChunk", params: { sessionId: grant.scope.sessionId } });
+    expect(host.send).toHaveBeenCalledTimes(1);
+    for (const [index, err] of [
+      "session_scope_denied", "session_scope_denied", "actor_mismatch", "capability_denied"
+    ].entries()) {
+      expect(reply(index)).toEqual({ header: rpc, value: { id: index + 2, err } });
+    }
+
+    const command = { id: 6, method: "QueueCommand", params: { command: { sessionId: grant.scope.sessionId } } };
+    await send(command);
+    const forwarded = decodeDeviceFrame(host.send.mock.calls[1][0]);
+    expect(forwarded.header).toEqual({ ...rpc, from: clientState.connId });
+    expect(JSON.parse(new TextDecoder().decode(forwarded.payload))).toEqual(command);
+    const response = encodeDeviceFrame({ ...rpc, to: clientState.connId }, payload({ id: 6, ok: { accepted: true } }));
+    await room.webSocketMessage(host as unknown as WebSocket, response.buffer as ArrayBuffer);
+    expect(reply(4)).toEqual({ header: rpc, value: { id: 6, ok: { accepted: true } } });
+    expect(client.close).not.toHaveBeenCalled();
+    expect(host.close).not.toHaveBeenCalled();
   });
 });

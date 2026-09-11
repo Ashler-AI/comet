@@ -317,9 +317,13 @@ async fn healthy_preparation_outlives_the_old_deadline_and_resets_transient_faul
     .await
     .unwrap();
     assert!(started.elapsed() > Duration::from_secs(10 * 60));
-    assert!(matches!(result.environment.source, SessionEnvironmentSource::Scaffold {
-        lifecycle: ScaffoldLifecycle::Ready, ..
-    }));
+    assert!(matches!(
+        result.environment.source,
+        SessionEnvironmentSource::Scaffold {
+            lifecycle: ScaffoldLifecycle::Ready,
+            ..
+        }
+    ));
 }
 
 #[tokio::test(start_paused = true)]
@@ -664,8 +668,98 @@ async fn preparation_creates_when_saved_environment_is_local_or_out_of_scope() {
     }
 }
 
+struct HandoffHarness {
+    requests: tokio::sync::mpsc::UnboundedSender<(RunRequest, String)>,
+    steers: tokio::sync::mpsc::UnboundedSender<comet_harness::SteerMessage>,
+    interrupts: tokio::sync::mpsc::UnboundedSender<String>,
+    answers: tokio::sync::mpsc::UnboundedSender<(String, Vec<comet_proto::UserInputAnswer>)>,
+}
+
+#[async_trait::async_trait]
+impl comet_harness::Harness for HandoffHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Omp
+    }
+    fn display_name(&self) -> &str {
+        "Handoff recording harness"
+    }
+    fn supports_steering(&self) -> bool {
+        true
+    }
+    fn steering_mode(&self) -> comet_proto::SteeringMode {
+        comet_proto::SteeringMode::StepBoundary
+    }
+    fn reasoning_levels(&self) -> &[comet_proto::ReasoningLevel] {
+        &[]
+    }
+    async fn models(&self) -> Result<Vec<comet_proto::Model>, comet_harness::HarnessError> {
+        Ok(Vec::new())
+    }
+    async fn run(
+        &self,
+        request: RunRequest,
+        mut controls: comet_harness::RunControls,
+    ) -> Result<
+        futures::stream::BoxStream<
+            'static,
+            Result<comet_proto::AgentEvent, comet_harness::HarnessError>,
+        >,
+        comet_harness::HarnessError,
+    > {
+        let session_id = controls.context.as_ref().unwrap().session_id.clone();
+        self.requests.send((request.clone(), session_id)).unwrap();
+        let steers = self.steers.clone();
+        let interrupts = self.interrupts.clone();
+        let answers = self.answers.clone();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let native_id = request
+                .resume
+                .expect("handoff must preserve native identity");
+            let _ = tx.send(Ok(comet_proto::AgentEvent::SessionStarted {
+                harness: HarnessId::Omp,
+                model: request.model.unwrap(),
+                tools: Vec::new(),
+                cwd: request.cwd,
+                session_id: native_id.clone(),
+                assistant_message_id: "handoff-assistant".into(),
+            }));
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = controls.interrupt.cancelled() => {
+                        let _ = interrupts.send(native_id.clone());
+                        break;
+                    },
+                    message = controls.steering.recv() => {
+                        let Some(message) = message else { break; };
+                        if steers.send(message).is_err() { break; }
+                        let received = (controls.request_input)(vec![comet_proto::UserInputQuestion {
+                            id: "next-step".into(),
+                            header: "Continue".into(),
+                            question: "Which step should run next?".into(),
+                            options: vec!["Verify".into(), "Finish".into()],
+                            multi_select: false,
+                        }]).await.expect("live input answer");
+                        answers.send((native_id.clone(), received)).unwrap();
+                    }
+                }
+            }
+            let _ = tx.send(Ok(comet_proto::AgentEvent::Done {
+                status: comet_proto::DoneStatus::Interrupted,
+                result: None,
+                error: None,
+                session_id: Some(native_id),
+            }));
+        });
+        Ok(Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        })))
+    }
+}
+
 #[tokio::test]
-async fn prepared_handoff_persists_a_distinct_chat_and_remote_resume_command() {
+async fn prepared_handoff_routes_peer_messages_and_interrupts_to_the_remote_native_writer() {
     let dir = tempfile::tempdir().unwrap();
     let core = crate::EngineCore::assemble_with_identity(
         dir.path(),
@@ -716,10 +810,17 @@ async fn prepared_handoff_persists_a_distinct_chat_and_remote_resume_command() {
     prepared.preparation_generation = Some(startup.startup.generation.clone());
     let mut stale = prepared.clone();
     stale.preparation_generation = Some("older-preparation".into());
-    assert!(core.rpc_service().admit_scaffold_handoff(
-        source.clone(), "Stale task".into(), "openai-codex/gpt-6-astra".into(),
-        "owner@example.com".into(), stale,
-    ).is_err());
+    assert!(
+        core.rpc_service()
+            .admit_scaffold_handoff(
+                source.clone(),
+                "Stale task".into(),
+                "openai-codex/gpt-6-astra".into(),
+                "owner@example.com".into(),
+                stale,
+            )
+            .is_err()
+    );
     assert!(core.workspace.doc().chat(&target_id).unwrap().is_none());
     assert!(!core.doc_host.chat_has_commands(&target_id).unwrap());
 
@@ -765,10 +866,291 @@ async fn prepared_handoff_persists_a_distinct_chat_and_remote_resume_command() {
     assert_eq!(request.resume.as_deref(), Some("native-source"));
     assert_eq!(request.cwd, "/workspace/ashler-platform");
     assert_eq!(request.prompt, "Continue the exact task");
-    let admitted = core.workspace.session_startup(&receipt.chat_id).unwrap().unwrap();
+    let admitted = core
+        .workspace
+        .session_startup(&receipt.chat_id)
+        .unwrap()
+        .unwrap();
     assert_eq!(admitted.generation, startup.startup.generation);
     assert_eq!(admitted.status, comet_proto::SessionStartupStatus::Admitted);
-    assert_eq!(admitted.command_id.as_deref(), Some(receipt.command_id.as_str()));
+    assert_eq!(
+        admitted.command_id.as_deref(),
+        Some(receipt.command_id.as_str())
+    );
+    let local_handle = core.doc_host.open(&receipt.chat_id).unwrap();
+    let start_snapshot = local_handle.doc().export_snapshot().unwrap();
+
+    // A peer send must remain pending on the controller even though the source
+    // chat and transferred native identity both originated on this device.
+    let client = comet_rpc::memory_client(core.rpc_service());
+    let peer_params = serde_json::json!({
+        "sourceChatId": source_id,
+        "targetChatId": receipt.chat_id,
+        "commandId": "handoff-peer",
+        "text": "Continue remotely, without starting another writer",
+    });
+    client
+        .call(methods::SEND_PEER_MESSAGE, peer_params.clone())
+        .await
+        .unwrap();
+    core.doc_host.drain_commands(&local_handle).await;
+    assert_eq!(
+        core.doc_host
+            .command_entry(&receipt.chat_id, "handoff-peer")
+            .unwrap()
+            .unwrap()
+            .status,
+        comet_doc::SessionCommandStatus::Pending,
+    );
+
+    // A fresh scoped host receives only the session document and its verified
+    // authority, not the controller's project-wide workspace document.
+    let remote_dir = tempfile::tempdir().unwrap();
+    std::fs::write(remote_dir.path().join("device-id"), &owner_device_id).unwrap();
+    let (requests_tx, mut requests_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (steers_tx, mut steers_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (interrupts_tx, mut interrupts_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (answers_tx, mut answers_rx) = tokio::sync::mpsc::unbounded_channel();
+    let registry = crate::HarnessRegistry::for_profile(RuntimeProfile::ScaffoldHost);
+    registry.register(std::sync::Arc::new(HandoffHarness {
+        requests: requests_tx,
+        steers: steers_tx,
+        interrupts: interrupts_tx,
+        answers: answers_tx,
+    }));
+    let remote_core = crate::EngineCore::assemble_with_identity(
+        remote_dir.path(),
+        std::sync::Arc::new(registry),
+        HarnessId::Omp,
+        None,
+        "project-a",
+        "owner@example.com",
+        RuntimeProfile::ScaffoldHost,
+    )
+    .unwrap();
+    let grant = core
+        .doc_host
+        .collaboration_grants("owner@example.com", &[receipt.chat_id.clone()])
+        .pop()
+        .expect("validated controller attachment grant");
+    let envelope = comet_proto::VerifiedCapabilityGrantEnvelope {
+        grant,
+        room_id: format!("s4/project-a/deployment-a/{}", receipt.chat_id),
+        target_device_id: owner_device_id,
+        target_session_id: receipt.chat_id.clone(),
+        unknown: Default::default(),
+    };
+    remote_core
+        .doc_host
+        .ingest_verified_grant(&receipt.chat_id, &serde_json::to_vec(&envelope).unwrap())
+        .unwrap();
+    let remote_handle = remote_core.doc_host.open(&receipt.chat_id).unwrap();
+    remote_handle.doc().doc().import(&start_snapshot).unwrap();
+    let (started, child_session_id) =
+        tokio::time::timeout(Duration::from_secs(5), requests_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(started.resume.as_deref(), Some("native-source"));
+    assert_eq!(started.cwd, "/workspace/ashler-platform");
+    remote_handle
+        .doc()
+        .doc()
+        .import(&local_handle.doc().export_snapshot().unwrap())
+        .unwrap();
+    let steered = tokio::time::timeout(Duration::from_secs(5), steers_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(steered.message_id.as_deref(), Some("handoff-peer"));
+    assert!(
+        steered
+            .prompt
+            .contains("Continue remotely, without starting another writer")
+    );
+    assert!(
+        requests_rx.try_recv().is_err(),
+        "peer delivery must not launch a second native writer"
+    );
+    let remote_chat = remote_core
+        .workspace
+        .doc()
+        .chat(&receipt.chat_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(remote_chat.device_id, remote_core.device_id);
+    assert!(remote_core.workspace.is_host(&receipt.chat_id));
+    assert_eq!(
+        remote_core
+            .doc_host
+            .command_entry(&receipt.chat_id, "handoff-peer")
+            .unwrap()
+            .unwrap()
+            .status,
+        comet_doc::SessionCommandStatus::Applied,
+    );
+
+    // Replaying the controller request and its CRDT history cannot re-deliver it.
+    client
+        .call(methods::SEND_PEER_MESSAGE, peer_params)
+        .await
+        .unwrap();
+    remote_handle
+        .doc()
+        .doc()
+        .import(&local_handle.doc().export_snapshot().unwrap())
+        .unwrap();
+    remote_core.doc_host.drain_commands(&remote_handle).await;
+    assert!(requests_rx.try_recv().is_err());
+    assert!(steers_rx.try_recv().is_err());
+
+    // The id exported to the native child must remain a usable Crew session
+    // address, not the engine's private per-agent execution key.
+    let remote_client = comet_rpc::memory_client(remote_core.rpc_service());
+    let reply = remote_client
+        .call(
+            methods::REPLY_PEER_MESSAGE,
+            serde_json::json!({
+                "sessionId": child_session_id,
+                "commandId": "handoff-peer",
+                "text": "Reply from the resumed native session",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply["threadId"], "handoff-peer");
+    let reply_command = remote_core
+        .doc_host
+        .command_entry(source_id, "reply:handoff-peer")
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(reply_command.payload, SessionCommandPayload::PeerMessage {
+        source_chat_id, reply_to: Some(reply_to), ..
+    } if source_chat_id == receipt.chat_id && reply_to == "handoff-peer")
+    );
+
+    // Answer the question raised by the peer-steered native writer through
+    // the host-local legacy RPC, using its public canonical chat id.
+    let mut input_updates = remote_handle.watch_messages();
+    let input_request_id = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let request_id = remote_handle
+                .doc()
+                .read_entries()
+                .unwrap()
+                .iter()
+                .find_map(|entry| {
+                    entry.parts.iter().find_map(|part| match part {
+                        comet_doc::MessagePart::Input {
+                            request_id,
+                            resolved: false,
+                            ..
+                        } => Some(request_id.clone()),
+                        _ => None,
+                    })
+                });
+            if let Some(request_id) = request_id {
+                break request_id;
+            }
+            input_updates.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    remote_client
+        .call(
+            methods::QUEUE_COMMAND,
+            serde_json::json!({
+                "chatId": child_session_id,
+                "commandId": "handoff-answer",
+                "command": {
+                    "kind": "respondInput",
+                    "requestId": input_request_id,
+                    "answers": [{ "questionId": "next-step", "labels": ["Verify"] }],
+                },
+            }),
+        )
+        .await
+        .unwrap();
+    let (answer_native_id, received_answers) =
+        tokio::time::timeout(Duration::from_secs(5), answers_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(answer_native_id, "native-source");
+    assert_eq!(
+        received_answers,
+        vec![comet_proto::UserInputAnswer {
+            question_id: "next-step".into(),
+            labels: vec!["Verify".into()],
+        }]
+    );
+    assert!(
+        requests_rx.try_recv().is_err(),
+        "answer must not launch another writer"
+    );
+
+    // The host-local legacy RPC is authorized, but must interrupt the assigned
+    // native writer rather than silently succeeding against an empty bare key.
+    remote_client
+        .call(
+            methods::QUEUE_COMMAND,
+            serde_json::json!({
+                "chatId": child_session_id,
+                "commandId": "handoff-interrupt",
+                "command": { "kind": "interrupt" },
+            }),
+        )
+        .await
+        .unwrap();
+    remote_core.doc_host.drain_commands(&remote_handle).await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), interrupts_rx.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        "native-source",
+    );
+
+    // Chats without an assigned agent session still use the bare chat writer.
+    let bare_chat_id = "00000000-0000-4000-8000-000000000003";
+    let mut bare_request = started;
+    bare_request.resume = Some("native-bare".into());
+    remote_core
+        .doc_host
+        .queue_command(
+            bare_chat_id,
+            SessionCommandPayload::Run {
+                request: bare_request,
+                message_id: "bare-run".into(),
+            },
+        )
+        .unwrap();
+    let (_, bare_child_session_id) =
+        tokio::time::timeout(Duration::from_secs(5), requests_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(bare_child_session_id, bare_chat_id);
+    remote_client
+        .call(
+            methods::QUEUE_COMMAND,
+            serde_json::json!({
+                "chatId": bare_chat_id,
+                "command": { "kind": "interrupt" },
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), interrupts_rx.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        "native-bare",
+    );
+    remote_core.shutdown().await;
     core.shutdown().await;
 }
 
@@ -777,41 +1159,78 @@ async fn initial_queue_requires_exact_preparation_but_admitted_followups_do_not(
     use comet_proto::{SessionStartup, SessionStartupStatus};
     let dir = tempfile::tempdir().unwrap();
     let core = crate::EngineCore::assemble_with_identity(
-        dir.path(), std::sync::Arc::new(crate::HarnessRegistry::new()), HarnessId::Omp,
-        None, "project-a", "owner@example.com", RuntimeProfile::LocalController,
-    ).unwrap();
+        dir.path(),
+        std::sync::Arc::new(crate::HarnessRegistry::new()),
+        HarnessId::Omp,
+        None,
+        "project-a",
+        "owner@example.com",
+        RuntimeProfile::LocalController,
+    )
+    .unwrap();
     let chat_id = params().scope.session_id.unwrap();
-    core.workspace.create_space("space", &core.device_id, "/workspace", None, false).unwrap();
-    core.workspace.create_chat(&chat_id, "space", None, None).unwrap();
+    core.workspace
+        .create_space("space", &core.device_id, "/workspace", None, false)
+        .unwrap();
+    core.workspace
+        .create_chat(&chat_id, "space", None, None)
+        .unwrap();
     let preparing = SessionStartup {
-        generation: "new-attempt".into(), status: SessionStartupStatus::Preparing,
-        updated_at: chrono::Utc::now(), command_id: None,
+        generation: "new-attempt".into(),
+        status: SessionStartupStatus::Preparing,
+        updated_at: chrono::Utc::now(),
+        command_id: None,
     };
-    core.workspace.update_session_startup(&chat_id, None, preparing.clone()).unwrap();
+    core.workspace
+        .update_session_startup(&chat_id, None, preparing.clone())
+        .unwrap();
     let request = RunRequest {
-        prompt: "Start once".into(), model: None, agent_account_id: None, reasoning: None,
-        model_options: Default::default(), cwd: "/workspace".into(),
-        sandbox: SandboxLevel::WorkspaceWrite, auto_approve: true, resume: None,
+        prompt: "Start once".into(),
+        model: None,
+        agent_account_id: None,
+        reasoning: None,
+        model_options: Default::default(),
+        cwd: "/workspace".into(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+        auto_approve: true,
+        resume: None,
         attachments: Vec::new(),
     };
-    let run = SessionCommandPayload::Run { request: request.clone(), message_id: "message".into() };
+    let run = SessionCommandPayload::Run {
+        request: request.clone(),
+        message_id: "message".into(),
+    };
     let control = SessionCommandPayload::Control {
-        session_id: chat_id.clone(), owner_device_id: "remote-owner".into(),
-        actor_device_id: core.device_id.clone(), actor_subject: "owner@example.com".into(),
-        grant_id: "grant".into(), source: AgentSessionSource::Scaffold,
+        session_id: chat_id.clone(),
+        owner_device_id: "remote-owner".into(),
+        actor_device_id: core.device_id.clone(),
+        actor_subject: "owner@example.com".into(),
+        grant_id: "grant".into(),
+        source: AgentSessionSource::Scaffold,
         action: Box::new(comet_doc::SessionControlAction::Start {
-            request, message_id: "remote-message".into(),
+            request,
+            message_id: "remote-message".into(),
         }),
     };
     let rpc = core.rpc_service();
     for command in [&run, &control] {
         for generation in [None, Some("old-attempt")] {
-            assert!(rpc.handle(methods::QUEUE_COMMAND, serde_json::json!({
-                "chatId": chat_id, "commandId": "rejected", "command": command,
-                "preparationGeneration": generation,
-            })).await.is_err());
+            assert!(
+                rpc.handle(
+                    methods::QUEUE_COMMAND,
+                    serde_json::json!({
+                        "chatId": chat_id, "commandId": "rejected", "command": command,
+                        "preparationGeneration": generation,
+                    })
+                )
+                .await
+                .is_err()
+            );
             assert!(!core.doc_host.chat_has_commands(&chat_id).unwrap());
-            assert_eq!(core.workspace.session_startup(&chat_id).unwrap(), Some(preparing.clone()));
+            assert_eq!(
+                core.workspace.session_startup(&chat_id).unwrap(),
+                Some(preparing.clone())
+            );
         }
     }
     let first_request = serde_json::json!({
@@ -824,22 +1243,64 @@ async fn initial_queue_requires_exact_preparation_but_admitted_followups_do_not(
     );
     first.unwrap();
     retry.unwrap();
-    let commands = core.doc_host.open(&chat_id).unwrap().doc().read_commands().unwrap();
-    assert_eq!(commands.iter().map(|command| command.id.as_str()).collect::<Vec<_>>(), ["first"]);
-    assert!(core.doc_host.command_entry(&chat_id, "first").unwrap().is_some());
+    let commands = core
+        .doc_host
+        .open(&chat_id)
+        .unwrap()
+        .doc()
+        .read_commands()
+        .unwrap();
+    assert_eq!(
+        commands
+            .iter()
+            .map(|command| command.id.as_str())
+            .collect::<Vec<_>>(),
+        ["first"]
+    );
+    assert!(
+        core.doc_host
+            .command_entry(&chat_id, "first")
+            .unwrap()
+            .is_some()
+    );
     let admitted = core.workspace.session_startup(&chat_id).unwrap().unwrap();
     assert_eq!(admitted.status, SessionStartupStatus::Admitted);
     assert_eq!(admitted.command_id.as_deref(), Some("first"));
-    rpc.handle(methods::QUEUE_COMMAND, serde_json::json!({
-        "chatId": chat_id, "commandId": "followup", "command": run,
-    })).await.unwrap();
-    assert!(core.doc_host.command_entry(&chat_id, "followup").unwrap().is_some());
-    assert!(rpc.handle(methods::QUEUE_COMMAND, serde_json::json!({
-        "chatId": chat_id, "commandId": "late-stale", "command": run,
-        "preparationGeneration": "old-attempt",
-    })).await.is_err());
-    assert!(core.doc_host.command_entry(&chat_id, "late-stale").unwrap().is_none());
-    assert_eq!(core.workspace.session_startup(&chat_id).unwrap(), Some(admitted));
+    rpc.handle(
+        methods::QUEUE_COMMAND,
+        serde_json::json!({
+            "chatId": chat_id, "commandId": "followup", "command": run,
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        core.doc_host
+            .command_entry(&chat_id, "followup")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        rpc.handle(
+            methods::QUEUE_COMMAND,
+            serde_json::json!({
+                "chatId": chat_id, "commandId": "late-stale", "command": run,
+                "preparationGeneration": "old-attempt",
+            })
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        core.doc_host
+            .command_entry(&chat_id, "late-stale")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        core.workspace.session_startup(&chat_id).unwrap(),
+        Some(admitted)
+    );
     core.shutdown().await;
 }
 
@@ -848,24 +1309,44 @@ async fn failure_reports_only_mark_the_matching_existing_unadmitted_preparation(
     use comet_proto::{SessionStartup, SessionStartupStatus};
     let dir = tempfile::tempdir().unwrap();
     let core = crate::EngineCore::assemble_with_identity(
-        dir.path(), std::sync::Arc::new(crate::HarnessRegistry::new()), HarnessId::Omp,
-        None, "project-a", "owner@example.com", RuntimeProfile::LocalController,
-    ).unwrap();
+        dir.path(),
+        std::sync::Arc::new(crate::HarnessRegistry::new()),
+        HarnessId::Omp,
+        None,
+        "project-a",
+        "owner@example.com",
+        RuntimeProfile::LocalController,
+    )
+    .unwrap();
     let rpc = core.rpc_service();
     for (chat_id, status, reported_generation, changes) in [
         ("matched", SessionStartupStatus::Preparing, "current", true),
         ("stale", SessionStartupStatus::Preparing, "old", false),
         ("admitted", SessionStartupStatus::Admitted, "current", false),
-        ("uncertain", SessionStartupStatus::CreationUncertain, "current", false),
+        (
+            "uncertain",
+            SessionStartupStatus::CreationUncertain,
+            "current",
+            false,
+        ),
     ] {
         let original = SessionStartup {
-            generation: "current".into(), status, updated_at: chrono::Utc::now(),
+            generation: "current".into(),
+            status,
+            updated_at: chrono::Utc::now(),
             command_id: (status == SessionStartupStatus::Admitted).then(|| "first".into()),
         };
-        core.workspace.update_session_startup(chat_id, None, original.clone()).unwrap();
-        rpc.handle(methods::REPORT_SCAFFOLD_PREPARATION_FAILURE, serde_json::json!({
-            "chatId": chat_id, "generation": reported_generation,
-        })).await.unwrap();
+        core.workspace
+            .update_session_startup(chat_id, None, original.clone())
+            .unwrap();
+        rpc.handle(
+            methods::REPORT_SCAFFOLD_PREPARATION_FAILURE,
+            serde_json::json!({
+                "chatId": chat_id, "generation": reported_generation,
+            }),
+        )
+        .await
+        .unwrap();
         let actual = core.workspace.session_startup(chat_id).unwrap().unwrap();
         if changes {
             assert_eq!(actual.status, SessionStartupStatus::AttentionNeeded);
@@ -874,47 +1355,82 @@ async fn failure_reports_only_mark_the_matching_existing_unadmitted_preparation(
             assert_eq!(actual, original);
         }
     }
-    core.workspace.upsert_session_ref("untracked", None).unwrap();
-    let untracked = core.workspace.doc().session_ref("owner@example.com", "untracked").unwrap();
+    core.workspace
+        .upsert_session_ref("untracked", None)
+        .unwrap();
+    let untracked = core
+        .workspace
+        .doc()
+        .session_ref("owner@example.com", "untracked")
+        .unwrap();
     core.workspace.remove_session_ref("matched").unwrap();
     for chat_id in ["missing", "matched", "untracked"] {
-        rpc.handle(methods::REPORT_SCAFFOLD_PREPARATION_FAILURE, serde_json::json!({
-            "chatId": chat_id, "generation": "current",
-        })).await.unwrap();
+        rpc.handle(
+            methods::REPORT_SCAFFOLD_PREPARATION_FAILURE,
+            serde_json::json!({
+                "chatId": chat_id, "generation": "current",
+            }),
+        )
+        .await
+        .unwrap();
     }
     for chat_id in ["missing", "matched"] {
-        assert!(core.workspace.doc().session_ref("owner@example.com", chat_id).unwrap().is_none());
+        assert!(
+            core.workspace
+                .doc()
+                .session_ref("owner@example.com", chat_id)
+                .unwrap()
+                .is_none()
+        );
         assert!(core.workspace.doc().chat(chat_id).unwrap().is_none());
     }
-    assert_eq!(core.workspace.doc().session_ref("owner@example.com", "untracked").unwrap(), untracked);
+    assert_eq!(
+        core.workspace
+            .doc()
+            .session_ref("owner@example.com", "untracked")
+            .unwrap(),
+        untracked
+    );
     core.shutdown().await;
 }
 
 #[tokio::test]
 async fn provider_auth_text_cannot_make_uncertain_creation_retryable() {
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use comet_proto::SessionStartupStatus;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     for pre_dispatch in [true, false] {
         let dir = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let core = crate::EngineCore::assemble_with_identity(
-            dir.path(), std::sync::Arc::new(crate::HarnessRegistry::new()), HarnessId::Omp,
-            None, "project-a", "owner@example.com", RuntimeProfile::LocalController,
-        ).unwrap();
+            dir.path(),
+            std::sync::Arc::new(crate::HarnessRegistry::new()),
+            HarnessId::Omp,
+            None,
+            "project-a",
+            "owner@example.com",
+            RuntimeProfile::LocalController,
+        )
+        .unwrap();
         let mut auth_config = crate::AuthConfig::new(&origin, dir.path());
         auth_config.project_scope = "project-a".into();
         auth_config.dev_user_id = "owner@example.com".into();
         core.set_auth(crate::Auth::new(auth_config));
-        core.set_scaffold_runtime(crate::ScaffoldRuntime::new(
-            crate::ScaffoldClient::new(
-                &origin, "project-a",
-                std::sync::Arc::new(comet_rpc::StaticToken(
-                    if pre_dispatch { "" } else { "test" }.into(),
-                )),
-            ).unwrap(),
-            &origin, std::sync::Arc::new(crate::UnavailableDeviceJoinGrantProvider),
-        ).with_deployment_id("deployment-a".into()));
+        core.set_scaffold_runtime(
+            crate::ScaffoldRuntime::new(
+                crate::ScaffoldClient::new(
+                    &origin,
+                    "project-a",
+                    std::sync::Arc::new(comet_rpc::StaticToken(
+                        if pre_dispatch { "" } else { "test" }.into(),
+                    )),
+                )
+                .unwrap(),
+                &origin,
+                std::sync::Arc::new(crate::UnavailableDeviceJoinGrantProvider),
+            )
+            .with_deployment_id("deployment-a".into()),
+        );
         let provider = async {
             let (connection, _) = listener.accept().await.unwrap();
             let mut reader = BufReader::new(connection);
@@ -925,13 +1441,19 @@ async fn provider_auth_text_cannot_make_uncertain_creation_retryable() {
             loop {
                 line.clear();
                 reader.read_line(&mut line).await.unwrap();
-                if line == "\r\n" { break; }
+                if line == "\r\n" {
+                    break;
+                }
                 if let Some(length) = line.to_ascii_lowercase().strip_prefix("content-length:") {
                     content_length = length.trim().parse::<usize>().unwrap();
                 }
             }
-            reader.read_exact(&mut vec![0; content_length]).await.unwrap();
-            let body = r#"{"error":"scaffold_auth_unavailable","message":"scaffold_auth_unavailable"}"#;
+            reader
+                .read_exact(&mut vec![0; content_length])
+                .await
+                .unwrap();
+            let body =
+                r#"{"error":"scaffold_auth_unavailable","message":"scaffold_auth_unavailable"}"#;
             reader.get_mut().write_all(format!(
                 "HTTP/1.1 500 Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len(),
@@ -943,23 +1465,37 @@ async fn provider_auth_text_cannot_make_uncertain_creation_retryable() {
         } else {
             let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
                 tokio::join!(rpc.prepare_scaffold_session(params()), provider)
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
             result.unwrap_err()
         };
         assert!(error.to_string().contains("scaffold_auth_unavailable"));
-        assert_eq!(matches!(error, RpcError::ScaffoldAuthUnavailable), pre_dispatch);
-        let startup = core.workspace.session_startup(
-            params().scope.session_id.as_deref().unwrap(),
-        ).unwrap().unwrap();
-        assert_eq!(startup.status, if pre_dispatch {
-            SessionStartupStatus::AttentionNeeded
-        } else {
-            SessionStartupStatus::CreationUncertain
-        });
+        assert_eq!(
+            matches!(error, RpcError::ScaffoldAuthUnavailable),
+            pre_dispatch
+        );
+        let startup = core
+            .workspace
+            .session_startup(params().scope.session_id.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            startup.status,
+            if pre_dispatch {
+                SessionStartupStatus::AttentionNeeded
+            } else {
+                SessionStartupStatus::CreationUncertain
+            }
+        );
         if !pre_dispatch {
             assert!(rpc.prepare_scaffold_session(params()).await.is_err());
         }
-        assert!(tokio::time::timeout(Duration::from_millis(10), listener.accept()).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), listener.accept())
+                .await
+                .is_err()
+        );
         core.shutdown().await;
     }
 }

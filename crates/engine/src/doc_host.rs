@@ -1233,6 +1233,24 @@ impl DocHost {
         key
     }
 
+    // A native handoff assigns the chat UUID as its agent session. Legacy
+    // chat-addressed commands must reach that writer, not a second bare-chat run.
+    fn chat_execution_key(&self, handle: &Arc<ChatDocHandle>) -> Result<String, EngineError> {
+        if handle
+            .doc
+            .collaboration_snapshot()?
+            .sessions
+            .iter()
+            .any(|session| {
+                session.session_id == handle.chat_id && session.owner_device_id == self.device_id()
+            })
+        {
+            Ok(self.bind_session_execution_key(handle, &handle.chat_id))
+        } else {
+            Ok(handle.chat_id.clone())
+        }
+    }
+
     pub(crate) fn workspace_continuation_id(&self, execution_key: &str) -> String {
         let handles = lock(&self.inner.handles);
         if let Some(handle) = handles.get(execution_key)
@@ -2139,14 +2157,15 @@ impl DocHost {
                         ));
                     }
                 }
+                let execution_key = self.chat_execution_key(handle)?;
                 match sessions
-                    .steer(chat_id, &prompt, Some(entry.id.clone()))
+                    .steer(&execution_key, &prompt, Some(entry.id.clone()))
                     .await?
                 {
                     SteerOutcome::Accepted(_) => Ok((SessionCommandStatus::Applied, None)),
                     SteerOutcome::NotSteerable => {
                         let request = sessions
-                            .last_request(chat_id)
+                            .last_request(&execution_key)
                             .or_else(|| self.request_from_chat_row(chat_id, &prompt));
                         let Some(mut request) = request else {
                             return Ok((
@@ -2159,7 +2178,7 @@ impl DocHost {
                         request.attachments = Vec::new();
                         sessions
                             .dispatch(
-                                chat_id,
+                                &execution_key,
                                 self.harness_for(chat_id),
                                 request,
                                 Some(entry.id.clone()),
@@ -2173,15 +2192,23 @@ impl DocHost {
                 }
             }
             SessionCommandPayload::Interrupt {} => {
-                sessions.interrupt(chat_id).await?;
+                sessions
+                    .interrupt(&self.chat_execution_key(handle)?)
+                    .await?;
                 Ok((SessionCommandStatus::Applied, None))
             }
             SessionCommandPayload::RespondInput {
                 request_id,
                 answers,
             } => {
-                self.execute_respond_input(sessions, handle, chat_id, request_id, answers)
-                    .await
+                self.execute_respond_input(
+                    sessions,
+                    handle,
+                    &self.chat_execution_key(handle)?,
+                    request_id,
+                    answers,
+                )
+                .await
             }
             SessionCommandPayload::Control {
                 session_id,
@@ -3439,7 +3466,13 @@ mod authority_tests {
         );
 
         for (key, cwd, explicit, expected, rejected) in [
-            (assigned.as_str(), "/workspace", None, Some("native-old"), false),
+            (
+                assigned.as_str(),
+                "/workspace",
+                None,
+                Some("native-old"),
+                false,
+            ),
             (assigned.as_str(), "/elsewhere", None, None, false),
             (other.as_str(), "/workspace", None, None, false),
             (
@@ -3496,15 +3529,20 @@ mod authority_tests {
             tokio::time::timeout(std::time::Duration::from_secs(1), async {
                 loop {
                     let request = sessions.last_request(key).unwrap();
-                    let tombstoned = workspace.chat_harness_session("chat-a").unwrap().0.is_empty();
+                    let tombstoned = workspace
+                        .chat_harness_session("chat-a")
+                        .unwrap()
+                        .0
+                        .is_empty();
                     if request.resume.as_deref() == expected
                         && (!rejected || explicit.is_some() || tombstoned)
                         && sessions.session_status(key).is_some_and(|session| {
-                            session.status == if rejected {
-                                SessionStatus::Errored
-                            } else {
-                                SessionStatus::Idle
-                            }
+                            session.status
+                                == if rejected {
+                                    SessionStatus::Errored
+                                } else {
+                                    SessionStatus::Idle
+                                }
                         })
                     {
                         break;
