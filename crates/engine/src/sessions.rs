@@ -610,14 +610,18 @@ impl SessionsEngine {
     }
 
     pub(crate) fn recovered_context(&self, execution_key: &str) -> Result<RunRequest, EngineError> {
-        let (identity, device_id, harness, request): (RunAuthIdentity, String, HarnessId, RunRequest) = self.inner.journal
-            .read_context(execution_key)?
-            .ok_or_else(|| EngineError::Other("session_context_recovery_missing".into()))?;
+        self.recovered_context_if_present(execution_key)?
+            .ok_or_else(|| EngineError::Other("session_context_recovery_missing".into()))
+    }
+
+    pub(crate) fn recovered_context_if_present(&self, execution_key: &str) -> Result<Option<RunRequest>, EngineError> {
+        let context: Option<(RunAuthIdentity, String, HarnessId, RunRequest)> = self.inner.journal.read_context(execution_key)?;
+        let Some((identity, device_id, harness, request)) = context else { return Ok(None) };
         if identity != self.auth_identity() || device_id != self.inner.device_id
             || harness != HarnessId::Omp || request.cwd.is_empty() {
             return Err(EngineError::Other("session_context_binding_mismatch".into()));
         }
-        Ok(request)
+        Ok(Some(request))
     }
 
     /// Subscribe to a chat's live event stream: returns the journal replay after
@@ -2735,6 +2739,7 @@ mod tests {
         let sessions = bare_sessions(dir.path());
         let key = "chat::session::chat";
         assert!(sessions.recovered_context(key).is_err());
+        assert!(sessions.recovered_context_if_present(key).unwrap().is_none());
         let request = test_request("accepted", Some("native"));
         for (identity, device, harness) in [
             (RunAuthIdentity::SignedIn { owner_subject: "other-owner".into(), project_scope: "other-project".into() }, sessions.inner.device_id.clone(), HarnessId::Omp),
@@ -2743,6 +2748,7 @@ mod tests {
         ] {
             sessions.inner.journal.save_context(key, &(identity, device, harness, &request)).unwrap();
             assert!(sessions.recovered_context(key).is_err());
+            assert!(sessions.recovered_context_if_present(key).is_err());
         }
     }
 
