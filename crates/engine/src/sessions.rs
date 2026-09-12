@@ -1631,9 +1631,7 @@ impl Inner {
             self.sessions_tx.send_replace(list);
             session
         };
-        if let Some(ws) = self.workspace() {
-            ws.record_session(&session);
-        }
+        self.record_session(session);
     }
 
     fn set_status(&self, chat_id: &str, status: SessionStatus, fresh_start: bool) {
@@ -1666,8 +1664,16 @@ impl Inner {
         };
         // Mirror the transition into the workspace doc's session-status row so
         // remote devices' sidebars show this run (staleness-checked client-side).
-        if let Some(ws) = self.workspace() {
-            ws.record_session(&session);
+        self.record_session(session);
+    }
+
+    fn record_session(&self, mut session: Session) {
+        if let Some(host) = self.doc_host.get() {
+            host.record_session_status(&session);
+            if let Some(workspace) = host.workspace() {
+                session.chat_id = host.workspace_continuation_id(&session.chat_id);
+                workspace.record_session(&session);
+            }
         }
     }
 

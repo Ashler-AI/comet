@@ -651,9 +651,7 @@ final class AppModel {
         guard let workspace else { throw MobileSessionError.unavailable("Not connected") }
         let deviceId: String
         if let environment = scaffoldEnvironment(chatId: chatId), environment.source.kind == "scaffold" {
-            guard let controller = scaffoldRoutes[chatId]?.controllerDeviceId
-                ?? workspace.chat(id: chatId)?.deviceId
-                ?? scaffoldControllerDeviceId() else {
+            guard let controller = scaffoldControllerDeviceId(chatId: chatId) else {
                 throw MobileSessionError.unavailable("This session has no Scaffold controller")
             }
             var route = try await workspace.scaffoldRoute(controllerDeviceId: controller, environment: environment)
@@ -837,11 +835,14 @@ final class AppModel {
             ?? workspace?.sessionRef(id: chatId)?.environment
     }
 
-    private func scaffoldControllerDeviceId() -> String? {
+    private func scaffoldControllerDeviceId(chatId: String) -> String? {
         guard let workspace else { return nil }
-        return workspace.devices.first(where: {
-            $0.platform != "ios" && workspace.deviceOnline($0.id)
-        })?.id ?? workspace.devices.first(where: { $0.platform != "ios" })?.id
+        return selectScaffoldControllerDeviceId(
+            devices: workspace.devices,
+            preferred: [scaffoldRoutes[chatId]?.controllerDeviceId,
+                        workspace.chat(id: chatId)?.deviceId].compactMap { $0 },
+            isOnline: workspace.deviceOnline
+        )
     }
 
     private func configureSessionTransport(store: SessionStore,
@@ -867,9 +868,7 @@ final class AppModel {
             // a cached transcript was first opened.
             let environment = self.scaffoldEnvironment(chatId: chatId) ?? environment
             if let environment, environment.source.kind == "scaffold" {
-                guard let controllerDeviceId = self.scaffoldRoutes[chatId]?.controllerDeviceId
-                    ?? workspace.chat(id: chatId)?.deviceId
-                    ?? self.scaffoldControllerDeviceId() else {
+                guard let controllerDeviceId = self.scaffoldControllerDeviceId(chatId: chatId) else {
                     throw MobileSessionError.unavailable("This session has no Scaffold controller")
                 }
                 try await workspace.sendScaffoldCommand(

@@ -24,7 +24,7 @@ use comet_proto::{
     AgentSessionRecord, AuditEvent, AuditResult, COLLABORATION_SCHEMA_VERSION, CapabilityGrant,
     FileTargetReference, HarnessId, MessageProvenance, ModelHandoff, PeerMessageProvenance,
     PublicationRecord, PublicationValue, SemanticAnchor, SemanticAnnotation, SessionRoomProjection,
-    SessionStatus, UserInputAnswer, UserInputQuestion, VerifiedCapabilityGrantEnvelope,
+    UserInputAnswer, UserInputQuestion, VerifiedCapabilityGrantEnvelope,
 };
 use comet_sync::{DocsStore, RoomClient};
 
@@ -607,76 +607,6 @@ impl ChatDocHandle {
     }
 }
 
-fn append_agent_session_status(
-    handle: &ChatDocHandle,
-    session_id: &str,
-    status: comet_proto::SessionStatus,
-    published_by: &str,
-    publication_id: String,
-) -> Result<(), EngineError> {
-    let Some(mut session) = handle
-        .doc
-        .collaboration_snapshot()?
-        .sessions
-        .into_iter()
-        .find(|session| session.session_id == session_id)
-    else {
-        return Ok(());
-    };
-    let at = now_ms();
-    session.status = Some(status);
-    session.updated_at = Some(at);
-    handle.doc.append_publication(&PublicationRecord {
-        id: publication_id,
-        schema_version: COLLABORATION_SCHEMA_VERSION,
-        published_at: at,
-        published_by: published_by.to_string(),
-        value: PublicationValue::AgentSession(Box::new(session)),
-        unknown: Default::default(),
-    })?;
-    Ok(())
-}
-
-fn monitor_agent_session_terminal(
-    sessions: &SessionsEngine,
-    handle: Arc<ChatDocHandle>,
-    execution_key: String,
-    session_id: String,
-    published_by: String,
-    command_id: String,
-) {
-    let mut statuses = sessions.watch_sessions();
-    tokio::spawn(async move {
-        loop {
-            let status = statuses
-                .borrow()
-                .iter()
-                .find(|session| session.chat_id == execution_key)
-                .map(|session| session.status);
-            if let Some(status @ (SessionStatus::Idle | SessionStatus::Errored)) = status {
-                if let Err(err) = append_agent_session_status(
-                    &handle,
-                    &session_id,
-                    status,
-                    &published_by,
-                    format!("session/{session_id}/terminal/{command_id}"),
-                ) {
-                    tracing::warn!(
-                        chat = %handle.chat_id,
-                        session = %session_id,
-                        error = %err,
-                        "terminal session state publication failed"
-                    );
-                }
-                return;
-            }
-            if statuses.changed().await.is_err() {
-                return;
-            }
-        }
-    });
-}
-
 impl DocHost {
     pub fn new(store: Arc<DocsStore>, config: DocHostConfig) -> Self {
         let (authority_tx, _) = watch::channel(0);
@@ -1233,6 +1163,66 @@ impl DocHost {
         key
     }
 
+    /// A new sandbox epoch may continue a room without another Start command.
+    /// Only the edge-verified current host grant can transfer its prior ownership.
+    fn adopt_scaffold_session_owners(&self, handle: &ChatDocHandle) -> Result<(), EngineError> {
+        let Some((sandbox, epoch)) = comet_proto::parse_scaffold_device_id(self.device_id()) else {
+            return Ok(());
+        };
+        let now = now_ms();
+        let projection = lock(&handle.room_projection).clone();
+        let principal = lock(&self.inner.trusted_grants)
+            .values()
+            .find_map(|trusted| {
+                let grant = &trusted.grant;
+                (trusted.edge_derived
+                    && grant.device_id.as_deref() == Some(self.device_id())
+                    && grant.sandbox_id.as_deref() == Some(sandbox)
+                    && grant.lifecycle_epoch == Some(epoch)
+                    && grant.granted_at <= now
+                    && grant.expires_at.is_some_and(|expires| now < expires)
+                    && grant.revoked_at.is_none()
+                    && grant_matches_projected_scaffold_room(
+                        grant,
+                        &handle.chat_id,
+                        projection.as_ref(),
+                    )
+                    && grant.capabilities.iter().any(|capability| {
+                        capability == comet_proto::CAPABILITY_SESSION_CHAT
+                            || capability == comet_proto::CAPABILITY_SESSION_CONTROL
+                    }))
+                .then(|| grant.principal_subject.clone())
+            });
+        let Some(principal) = principal else {
+            return Ok(());
+        };
+        for mut session in handle.doc.collaboration_snapshot()?.sessions {
+            if session.source != comet_proto::AgentSessionSource::Scaffold
+                || session.chat_id != handle.chat_id
+                || session.owner_subject != principal
+                || !comet_proto::parse_scaffold_device_id(&session.owner_device_id).is_some_and(
+                    |(previous_sandbox, previous_epoch)| {
+                        previous_sandbox == sandbox && previous_epoch < epoch
+                    },
+                )
+            {
+                continue;
+            }
+            session.owner_device_id = self.device_id().to_string();
+            session.status = Some(comet_proto::SessionStatus::Idle);
+            session.updated_at = Some(now);
+            handle.doc.append_publication(&PublicationRecord {
+                id: new_id(),
+                schema_version: COLLABORATION_SCHEMA_VERSION,
+                published_at: now,
+                published_by: principal.clone(),
+                value: PublicationValue::AgentSession(Box::new(session)),
+                unknown: Default::default(),
+            })?;
+        }
+        Ok(())
+    }
+
     // A native handoff assigns the chat UUID as its agent session. Legacy
     // chat-addressed commands must reach that writer, not a second bare-chat run.
     fn chat_execution_key(&self, handle: &Arc<ChatDocHandle>) -> Result<String, EngineError> {
@@ -1259,6 +1249,58 @@ impl DocHost {
             return handle.chat_id.clone();
         }
         execution_key.to_string()
+    }
+
+    /// Mirror every owner transition and throttled heartbeat into the shared room,
+    /// including turns started by steer/queue after the initial command completes.
+    pub(crate) fn record_session_status(&self, status: &comet_proto::Session) {
+        let handle = lock(&self.inner.handles).get(&status.chat_id).cloned();
+        let Some(handle) = handle else { return };
+        let Some(session_id) = status
+            .chat_id
+            .strip_prefix(&handle.chat_id)
+            .and_then(|suffix| suffix.strip_prefix("::session::"))
+        else {
+            return;
+        };
+        let result = (|| -> Result<(), EngineError> {
+            let Some(mut session) = handle
+                .doc
+                .collaboration_snapshot()?
+                .sessions
+                .into_iter()
+                .find(|session| {
+                    session.session_id == session_id && session.owner_device_id == status.device_id
+                })
+            else {
+                return Ok(());
+            };
+            let at = status.updated_at.timestamp_millis();
+            if session.status == Some(status.status)
+                && (session.updated_at == Some(at)
+                    || matches!(
+                        status.status,
+                        comet_proto::SessionStatus::Idle | comet_proto::SessionStatus::Errored
+                    ))
+            {
+                return Ok(());
+            }
+            session.status = Some(status.status);
+            session.updated_at = Some(at);
+            handle.doc.append_publication(&PublicationRecord {
+                id: new_id(),
+                schema_version: COLLABORATION_SCHEMA_VERSION,
+                published_at: at,
+                published_by: session.owner_subject.clone(),
+                value: PublicationValue::AgentSession(Box::new(session)),
+                unknown: Default::default(),
+            })?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            tracing::warn!(chat = %handle.chat_id, session = %session_id, %error,
+                "session state publication failed");
+        }
     }
 
     /// LRU eviction: while the warm set exceeds [`WARM_DOC_CAP`] or the
@@ -2090,6 +2132,7 @@ impl DocHost {
         entry: &SessionCommandEntry,
     ) -> Result<(SessionCommandStatus, Option<String>), EngineError> {
         let chat_id = &handle.chat_id;
+        self.adopt_scaffold_session_owners(handle)?;
         let carries_user_input = match &entry.payload {
             SessionCommandPayload::Run { .. }
             | SessionCommandPayload::Steer { .. }
@@ -2344,14 +2387,6 @@ impl DocHost {
                             })?;
                             return Err(error);
                         }
-                        monitor_agent_session_terminal(
-                            sessions,
-                            handle.clone(),
-                            execution_key.clone(),
-                            session_id.clone(),
-                            actor_subject.clone(),
-                            entry.id.clone(),
-                        );
                         Ok((SessionCommandStatus::Applied, None))
                     }
                     SessionControlAction::Steer { prompt, message_id } => {
@@ -2391,21 +2426,6 @@ impl DocHost {
                         sessions
                             .dispatch(&execution_key, self.harness_for(chat_id), request, None)
                             .await?;
-                        append_agent_session_status(
-                            handle,
-                            session_id,
-                            SessionStatus::Working,
-                            actor_subject,
-                            format!("session/{session_id}/resume/{}", entry.id),
-                        )?;
-                        monitor_agent_session_terminal(
-                            sessions,
-                            handle.clone(),
-                            execution_key.clone(),
-                            session_id.clone(),
-                            actor_subject.clone(),
-                            entry.id.clone(),
-                        );
                         Ok((SessionCommandStatus::Applied, Some("resumed".into())))
                     }
                     SessionControlAction::Stop { expected_turn_id } => {
@@ -2874,7 +2894,7 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
 #[cfg(test)]
 mod authority_tests {
     use super::*;
-    use comet_proto::AgentSessionSource;
+    use comet_proto::{AgentSessionSource, SessionStatus};
     use loro::LoroMap;
 
     #[tokio::test]
@@ -3604,110 +3624,267 @@ mod authority_tests {
     }
 
     #[tokio::test]
-    async fn projected_room_control_start_reuses_attached_handle() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
-        let workspace = WorkspaceHost::open(
-            store.clone(),
-            crate::workspace_host::WorkspaceHostConfig {
-                device_id: "comet-scaffold-smoke-001-e1".into(),
-                device_name: "test".into(),
-                platform: "test".into(),
-                project_scope: "project-a".into(),
-                user_id: "accounts.google.com:owner@example.com".into(),
-                edge: None,
-            },
-        )
-        .unwrap();
-        let host = DocHost::new(
-            store,
-            DocHostConfig {
-                device_id: "comet-scaffold-smoke-001-e1".into(),
-                default_harness: HarnessId::Mock,
-                edge: None,
-            },
-        );
-        host.set_workspace(workspace);
-        let projection = SessionRoomProjection {
-            project_id: "project-a".into(),
-            deployment_id: "deployment-a".into(),
-            session_id: "session-a".into(),
-        };
-        let handle = host
-            .open_projection("session-a", Some(&projection))
+    async fn resumed_epoch_adopts_prior_owner_and_publishes_status() {
+        for continuation in ["queue", "steer", "peer"] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+            let workspace = WorkspaceHost::open(
+                store.clone(),
+                crate::workspace_host::WorkspaceHostConfig {
+                    device_id: "comet-scaffold-smoke-001-e1".into(),
+                    device_name: "test".into(),
+                    platform: "test".into(),
+                    project_scope: "project-a".into(),
+                    user_id: "accounts.google.com:owner@example.com".into(),
+                    edge: None,
+                },
+            )
             .unwrap();
-        let registry = crate::HarnessRegistry::for_profile(comet_proto::RuntimeProfile::Mock);
-        registry.register(Arc::new(comet_harness::mock::MockHarness {
-            script: vec![comet_proto::AgentEvent::Done {
-                status: comet_proto::DoneStatus::Completed,
-                result: None,
-                error: None,
-                session_id: None,
-            }],
-        }));
-        let sessions = SessionsEngine::new(
-            "comet-scaffold-smoke-001-e1".into(),
-            Arc::new(crate::RunJournal::open(dir.path().join("journal")).unwrap()),
-            Arc::new(registry),
-            27654,
-        );
-        sessions.set_doc_host(host.clone());
-        let now = now_ms();
-        let command = SessionCommandEntry {
-            id: "command-start".into(),
-            payload: SessionCommandPayload::Control {
+            let host = DocHost::new(
+                store.clone(),
+                DocHostConfig {
+                    device_id: "comet-scaffold-smoke-001-e1".into(),
+                    default_harness: HarnessId::Mock,
+                    edge: None,
+                },
+            );
+            workspace
+                .claim_chat("session-a", Some("/workspace"))
+                .unwrap();
+            host.set_workspace(workspace.clone());
+            let projection = SessionRoomProjection {
+                project_id: "project-a".into(),
+                deployment_id: "deployment-a".into(),
                 session_id: "session-a".into(),
-                owner_device_id: "comet-scaffold-smoke-001-e1".into(),
-                actor_device_id: "operator-device".into(),
-                actor_subject: "accounts.google.com:owner@example.com".into(),
-                grant_id: "grant-a".into(),
-                source: AgentSessionSource::Scaffold,
-                action: Box::new(SessionControlAction::Start {
-                    request: comet_proto::RunRequest {
-                        prompt: "hello".into(),
-                        model: None,
-                        agent_account_id: None,
-                        reasoning: None,
-                        model_options: Default::default(),
-                        cwd: "/workspace".into(),
-                        sandbox: comet_proto::SandboxLevel::DangerFullAccess,
-                        auto_approve: true,
-                        resume: None,
-                        attachments: vec![],
-                    },
-                    message_id: "message-start".into(),
-                }),
-            },
-            issued_by: "operator-device".into(),
-            issued_at: now,
-            based_on: None,
-            expires_at: Some(now + 60_000),
-            status: SessionCommandStatus::Pending,
-            resolution: None,
-        };
+            };
+            let handle = host
+                .open_projection("session-a", Some(&projection))
+                .unwrap();
+            let registry = crate::HarnessRegistry::for_profile(comet_proto::RuntimeProfile::Mock);
+            registry.register(Arc::new(comet_harness::mock::MockHarness {
+                script: vec![comet_proto::AgentEvent::Done {
+                    status: comet_proto::DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                }],
+            }));
+            let registry = Arc::new(registry);
+            let sessions = SessionsEngine::new(
+                "comet-scaffold-smoke-001-e1".into(),
+                Arc::new(crate::RunJournal::open(dir.path().join("journal")).unwrap()),
+                registry.clone(),
+                27654,
+            );
+            sessions.set_doc_host(host.clone());
+            let now = now_ms();
+            let command = SessionCommandEntry {
+                id: "command-start".into(),
+                payload: SessionCommandPayload::Control {
+                    session_id: "session-a".into(),
+                    owner_device_id: "comet-scaffold-smoke-001-e1".into(),
+                    actor_device_id: "operator-device".into(),
+                    actor_subject: "accounts.google.com:owner@example.com".into(),
+                    grant_id: "grant-a".into(),
+                    source: AgentSessionSource::Scaffold,
+                    action: Box::new(SessionControlAction::Start {
+                        request: comet_proto::RunRequest {
+                            prompt: "hello".into(),
+                            model: None,
+                            agent_account_id: None,
+                            reasoning: None,
+                            model_options: Default::default(),
+                            cwd: "/workspace".into(),
+                            sandbox: comet_proto::SandboxLevel::DangerFullAccess,
+                            auto_approve: true,
+                            resume: None,
+                            attachments: vec![],
+                        },
+                        message_id: "message-start".into(),
+                    }),
+                },
+                issued_by: "operator-device".into(),
+                issued_at: now,
+                based_on: None,
+                expires_at: Some(now + 60_000),
+                status: SessionCommandStatus::Pending,
+                resolution: None,
+            };
 
-        assert_eq!(
-            host.execute(&sessions, &handle, &command).await.unwrap(),
-            (SessionCommandStatus::Applied, None)
-        );
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                let completed = handle
-                    .doc
-                    .collaboration_snapshot()
-                    .unwrap()
-                    .sessions
-                    .into_iter()
-                    .find(|session| session.session_id == "session-a")
-                    .is_some_and(|session| session.status == Some(SessionStatus::Idle));
-                if completed {
-                    break;
+            assert_eq!(
+                host.execute(&sessions, &handle, &command).await.unwrap(),
+                (SessionCommandStatus::Applied, None)
+            );
+            let running = workspace.doc().read_sessions().unwrap();
+            assert_eq!(running.len(), 1);
+            assert_eq!(running[0].chat_id, "session-a");
+            assert_eq!(running[0].status, SessionStatus::Working);
+            assert_eq!(running[0].device_id, "comet-scaffold-smoke-001-e1");
+            let published = handle.doc.collaboration_snapshot().unwrap().sessions;
+            assert_eq!(published[0].owner_device_id, running[0].device_id);
+            assert_eq!(published[0].status, Some(SessionStatus::Working));
+            assert!(published[0].updated_at.unwrap() >= now);
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    let completed = handle
+                        .doc
+                        .collaboration_snapshot()
+                        .unwrap()
+                        .sessions
+                        .into_iter()
+                        .find(|session| session.session_id == "session-a")
+                        .is_some_and(|session| session.status == Some(SessionStatus::Idle));
+                    if completed {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
+            })
+            .await
+            .expect("completed owner runs must publish their terminal session status");
+            assert_eq!(
+                workspace.doc().read_sessions().unwrap()[0].status,
+                SessionStatus::Idle
+            );
+
+            // Resume the persisted room on a new epoch, then Queue without Start.
+            host.flush_all();
+            drop(handle);
+            drop(sessions);
+            drop(host);
+            let host = DocHost::new(
+                store,
+                DocHostConfig {
+                    device_id: "comet-scaffold-smoke-001-e3".into(),
+                    default_harness: HarnessId::Mock,
+                    edge: None,
+                },
+            );
+            host.set_workspace(workspace.clone());
+            let handle = host
+                .open_projection("session-a", Some(&projection))
+                .unwrap();
+            let sessions = SessionsEngine::new(
+                host.device_id().into(),
+                Arc::new(crate::RunJournal::open(dir.path().join("journal-e3")).unwrap()),
+                registry,
+                27654,
+            );
+            sessions.set_doc_host(host.clone());
+            assert_eq!(
+                handle.doc.collaboration_snapshot().unwrap().sessions[0].owner_device_id,
+                "comet-scaffold-smoke-001-e1"
+            );
+            let envelope = VerifiedCapabilityGrantEnvelope {
+                grant: CapabilityGrant {
+                    id: "epoch-grant".into(),
+                    principal_subject: "accounts.google.com:owner@example.com".into(),
+                    scope: comet_proto::CollaborationScope {
+                        project_id: "project-a".into(),
+                        deployment_id: Some("deployment-a".into()),
+                        session_id: Some("session-a".into()),
+                        unknown: Default::default(),
+                    },
+                    capabilities: vec![comet_proto::CAPABILITY_SESSION_CHAT.into()],
+                    sandbox_id: Some("smoke-001".into()),
+                    device_id: Some(host.device_id().into()),
+                    lifecycle_epoch: Some(3),
+                    granted_by: "comet-edge-device-room".into(),
+                    granted_at: now,
+                    expires_at: Some(now + 60_000),
+                    revoked_at: None,
+                    unknown: Default::default(),
+                },
+                room_id: "s4/project-a/deployment-a/session-a".into(),
+                target_device_id: host.device_id().into(),
+                target_session_id: "session-a".into(),
+                unknown: Default::default(),
+            };
+            host.adopt_scaffold_session_owners(&handle).unwrap();
+            assert_eq!(
+                handle.doc.collaboration_snapshot().unwrap().sessions[0].owner_device_id,
+                "comet-scaffold-smoke-001-e1",
+                "device prefix alone cannot authorize takeover"
+            );
+            let mut foreign_grant = envelope.clone();
+            foreign_grant.grant.principal_subject = "accounts.google.com:other@example.com".into();
+            host.ingest_verified_grant("session-a", &serde_json::to_vec(&foreign_grant).unwrap())
+                .unwrap();
+            host.adopt_scaffold_session_owners(&handle).unwrap();
+            assert_eq!(
+                handle.doc.collaboration_snapshot().unwrap().sessions[0].owner_device_id,
+                "comet-scaffold-smoke-001-e1",
+                "a different principal cannot take ownership"
+            );
+            host.ingest_verified_grant("session-a", &serde_json::to_vec(&envelope).unwrap())
+                .unwrap();
+
+            // A follow-up Control command starts a new turn without another Start
+            // publication or a command-specific terminal monitor.
+            let mut followup = command.clone();
+            followup.id = "command-followup".into();
+            let SessionCommandPayload::Control {
+                action,
+                owner_device_id,
+                ..
+            } = &mut followup.payload
+            else {
+                unreachable!();
+            };
+            *owner_device_id = host.device_id().into();
+            *action = Box::new(match continuation {
+                "steer" => SessionControlAction::Steer {
+                    prompt: "continue".into(),
+                    message_id: Some("message-followup".into()),
+                },
+                _ => SessionControlAction::Queue {
+                    prompt: "continue".into(),
+                    message_id: Some("message-followup".into()),
+                },
+            });
+            if continuation == "peer" {
+                followup.payload = SessionCommandPayload::PeerMessage {
+                    text: "continue".into(),
+                    source_chat_id: "source-chat".into(),
+                    thread_id: "thread".into(),
+                    reply_to: None,
+                    hop_count: 0,
+                };
             }
-        })
-        .await
-        .expect("completed owner runs must publish their terminal session status");
+            assert_eq!(
+                host.execute(&sessions, &handle, &followup).await.unwrap().0,
+                SessionCommandStatus::Applied
+            );
+            let published = handle.doc.collaboration_snapshot().unwrap().sessions;
+            assert_eq!(published[0].status, Some(SessionStatus::Working));
+            assert_eq!(published[0].owner_device_id, "comet-scaffold-smoke-001-e3");
+            let running = workspace.doc().read_sessions().unwrap();
+            assert!(running.iter().any(|row| row.chat_id == "session-a"
+                && row.device_id == host.device_id()
+                && row.status == SessionStatus::Working));
+            let mut rows = workspace.watch_session_rows();
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    let finished = rows
+                        .borrow_and_update()
+                        .iter()
+                        .any(|row| row.chat_id == "session-a" && row.status == SessionStatus::Idle);
+                    if finished
+                        && handle.doc.collaboration_snapshot().unwrap().sessions[0].status
+                            == Some(SessionStatus::Idle)
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("terminal Control status must reach workspace list consumers");
+            assert_eq!(
+                handle.doc.collaboration_snapshot().unwrap().sessions[0].status,
+                Some(SessionStatus::Idle)
+            );
+        }
     }
 
     #[tokio::test]
