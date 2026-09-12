@@ -14,6 +14,21 @@ struct DeviceRow: Identifiable, Hashable {
     var lastSeenAt: Int64?
     var createdAt: Int64?
 }
+
+/// Sandbox hosts execute commands but cannot control Scaffold's lifecycle.
+func selectScaffoldControllerDeviceId(devices: [DeviceRow], preferred: [String],
+                                isOnline: (String) -> Bool) -> String? {
+    func eligible(_ device: DeviceRow) -> Bool {
+        device.platform != "ios" && !device.id.hasPrefix("comet-scaffold-")
+    }
+    let preferredController = preferred.first { id in
+        devices.contains { $0.id == id && eligible($0) && isOnline(id) }
+    }
+    return preferredController
+        ?? devices.first(where: { eligible($0) && isOnline($0.id) })?.id
+        ?? preferred.first(where: { id in devices.contains { $0.id == id && eligible($0) } })
+        ?? devices.first(where: eligible)?.id
+}
 struct CollaborationScope: Codable, Hashable {
     var projectId: String
     var deploymentId: String?

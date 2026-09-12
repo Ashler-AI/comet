@@ -178,6 +178,16 @@ distinct Crew chat. The receipt contains `chatId`, `sandboxId`, `commandId`, and
 `environment`; it confirms command admission, not remote task completion.
 Monitor the returned chat in Crew, not standalone `handoff.*` lifecycle tools.
 
+Handoff chats publish running, waiting, and terminal status under their chat ID,
+including follow-up turns. Mobile follow-ups use a desktop controller, not the
+ephemeral sandbox host: attachment resumes a paused sandbox and confirms its
+current host authority before admitting the message. A reachable desktop
+controller is required.
+On the next command after an epoch change, the sandbox host transfers prior
+session ownership only with a live, edge-verified grant for the same sandbox,
+room, and principal. Queue, steer, and peer-message continuations do not
+require another Start command to restore status publication.
+
 Native transfer reads the sandbox checkout's exact HEAD before capture. When it
 is a known source ancestor and the only bundle boundary, the archive contains only
 the Git delta after that commit; matching HEADs transfer no Git objects. Dirty and untracked files remain

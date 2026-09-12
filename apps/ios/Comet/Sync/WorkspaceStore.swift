@@ -729,6 +729,15 @@ final class WorkspaceStore {
         let attachment = try await attachScaffoldEnvironment(
             controllerDeviceId: controllerDeviceId, sandboxId: sandboxId, scope: scope
         )
+        guard attachment.environment.source.kind == "scaffold",
+              attachment.environment.source.sandboxId == sandboxId,
+              attachment.environment.scope == environment.scope,
+              attachment.environment.ownerPrincipal == environment.ownerPrincipal,
+              attachment.roomProjection?.projectId == environment.scope.projectId,
+              attachment.roomProjection?.deploymentId == environment.scope.deploymentId,
+              attachment.roomProjection?.sessionId == environment.scope.sessionId else {
+            throw MobileSessionError.unavailable("Scaffold returned a different session identity")
+        }
         guard let ownerDeviceId = attachment.attachedDeviceId,
               let projection = attachment.roomProjection,
               let grant = attachment.controlGrant,
@@ -778,7 +787,7 @@ final class WorkspaceStore {
     private func attachScaffoldEnvironment(controllerDeviceId: String, sandboxId: String,
                                            scope: [String: Any]) async throws -> ScaffoldEnvironmentControlResult {
         try Task.checkCancellation()
-        // The engine owns authoritative provisioning and bounds each HTTP request.
+        // Attach resumes a paused sandbox and confirms its current host authority.
         // A second mobile deadline must not abandon a healthy remote startup.
         return try await relay(for: controllerDeviceId).call(
             method: "ControlScaffoldEnvironment",
