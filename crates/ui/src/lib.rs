@@ -150,10 +150,12 @@ pub fn run_app(config: UiConfig) {
         cx.set_app_identity("comet", "Crew");
         // NB: pinned-rev API — `gpui_tokio::init(cx)` free function (not `Tokio::init`).
         gpui_tokio::init(cx);
-        // Standalone staging must not take over production invitation links.
-        if option_env!("COMET_PACKAGE_ENVIRONMENT") != Some("staging") {
-            cx.register_url_scheme("comet").detach();
-        }
+        let scheme = if option_env!("COMET_PACKAGE_ENVIRONMENT") == Some("staging") {
+            "comet-staging"
+        } else {
+            "comet"
+        };
+        cx.register_url_scheme(scheme).detach();
         register_fonts(cx);
         // Appearance before anything paints: the theme global has to be the
         // final one on the very first frame, or the window flashes the wrong
@@ -169,25 +171,21 @@ pub fn run_app(config: UiConfig) {
         app_menus::init(cx);
 
         let state = cx.new(|_| state::AppState::new());
-        notifications::init(state.clone(), &settings::UiSettings::load(&config.boot().data_dir), cx);
+        notifications::init(
+            state.clone(),
+            &settings::UiSettings::load(&config.boot().data_dir),
+            cx,
+        );
         state::AppState::bootstrap(state.clone(), config.boot(), cx);
-        if let Some(invitation) = config
-            .initial_url
-            .as_deref()
-            .and_then(comet_proto::CometInvitation::parse_deep_link)
-        {
-            state.update(cx, |state, cx| state.open_invitation(invitation, cx));
+        if let Some(url) = config.initial_url.as_deref() {
+            state.update(cx, |state, cx| state.open_url(url, cx));
         }
         let invitation_state = state.clone();
         let invitation_boot = config.boot();
         cx.spawn(async move |cx| {
             while let Some(url) = open_url_rx.next().await {
-                let Some(invitation) = comet_proto::CometInvitation::parse_deep_link(&url) else {
-                    tracing::warn!(%url, "ignored invalid Comet invitation URL");
-                    continue;
-                };
                 cx.update(|cx| {
-                    invitation_state.update(cx, |state, cx| state.open_invitation(invitation, cx));
+                    invitation_state.update(cx, |state, cx| state.open_url(&url, cx));
                     if cx.windows().is_empty() {
                         open_main_window(invitation_state.clone(), invitation_boot.clone(), cx);
                     }

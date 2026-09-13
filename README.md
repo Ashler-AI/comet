@@ -8,6 +8,12 @@ Crew is Ashler's internal, multi-device controller for coding-agent sessions. Th
 Scaffold sandbox: empty and active conversation states, streamed messages, tool
 details, model/reasoning selection, attachments, input answers, and send/steer/stop.
 It deliberately has no session creation, session list, settings, or checkout controls.
+User messages are right-aligned; Crew responses remain left-aligned. **Open in Crew**
+continues the assigned session in the installed desktop or mobile app using a
+credential-free, deployment-specific link. The app authenticates the attachment
+with its own identity; execution stays in Scaffold. Mobile currently requires an
+online desktop Crew controller. This is not a transfer of execution or files onto
+the local device, and requires app builds containing the new Scaffold link handler.
 
 The dependency-free Node service connects to the assigned engine's loopback IPC.
 Scaffold's authenticated attach proxy supplies a dedicated server-side credential;

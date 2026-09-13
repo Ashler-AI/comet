@@ -462,6 +462,18 @@ export async function createServer(config, viewport = new Viewport(config)) {
       if (req.method === 'GET' && (['/api/session', '/api/events', '/api/messages'].includes(path) || path.startsWith('/api/tool/'))) await viewport.readAuthority();
       if (req.method === 'GET' && path === '/health') return respond(res, 200, { service: 'crew-web', sessionId: config.sessionId, sandboxId: config.sandboxId });
       if (req.method === 'GET' && path === '/api/session') return respond(res, 200, viewport.state());
+      if (req.method === 'GET' && path === '/api/native-open') {
+        const authority = await viewport.readAuthority();
+        const scope = authority.scope;
+        const segments = [scope?.projectId, scope?.deploymentId, scope?.sessionId, config.sandboxId];
+        requireValue(segments.every(value => typeof value === 'string' && /^[A-Za-z0-9._-]{1,256}$/.test(value))
+          && scope.sessionId === config.sessionId && authority.sandboxId === config.sandboxId,
+        'Crew native session binding unavailable', 503);
+        const scheme = scope.deploymentId === 'ashler-staging' ? 'comet-staging'
+          : scope.deploymentId === 'ashler-production' ? 'comet' : null;
+        requireValue(scheme && scope.projectId === scope.deploymentId, 'Crew deployment is not installed', 503);
+        return respond(res, 200, { url: `${scheme}://scaffold/${segments.join('/')}` });
+      }
       if (req.method === 'GET' && path === '/api/models') {
         await viewport.readAuthority();
         if (!viewport.models.length) viewport.models = await viewport.rpc.call('ListSessionModels', { chatId: config.sessionId });
