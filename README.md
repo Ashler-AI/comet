@@ -74,10 +74,11 @@ exact uploaded IPAs passed strict deep signature verification. Uploaded SHA-256:
 - Staging: `e976185e6544632e0c04e0363a5b45f0de50515d85f351efe73dc667215b0fe0`
 - Production: `acafadc2c4f95fc67418123dbf8cb64d466fc3b803c0b1cfc4688fdf868e2a7c`
 
-Final processing and internal-group availability remain unverified because App
-Store Connect requires browser sign-in. No tester groups were changed. Native URL
-launch on installed devices and live Anthropic completion remain unverified;
-local typechecks were intentionally not run.
+Authenticated App Store Connect readback confirmed both uploads **Complete** and
+both builds **Testing**, internal-only, in their existing **Ashler Internal**
+groups (staging: one invite; production: two). No tester groups were changed.
+Device installation, notification receipt, native URL launch on installed devices,
+and live Anthropic completion remain unverified; local typechecks were not run.
 
 ## Crew 0.1.90 release
 
