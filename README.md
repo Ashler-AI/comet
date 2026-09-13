@@ -45,6 +45,30 @@ the sandbox image, and deploying the coordinated provider/control-plane changes.
 Existing images are not upgraded by editing this repository. No rollout is implied
 by the presence of this code.
 
+## Crew 0.1.99 release
+
+Source `4b4b7bcd12ba90780f89c6c8e9488cc86730838b` is merged into `main`.
+[Staging release](https://github.com/Ashler-AI/comet/actions/runs/34772456440)
+built and verified the desktop and Linux artifacts; [production promotion](https://github.com/Ashler-AI/comet/actions/runs/34773638162)
+reused the exact candidate and passed both channel readbacks. Standalone Crew
+Staging.app is included in the build's separate staging artifact.
+
+Scaffold [PR #6330](https://github.com/Ashler-AI/ashler-platform/pull/6330) merged
+the Anthropic credential projection fix and native-open list action. Its
+[staging rollout](https://github.com/Ashler-AI/ashler-platform/actions/runs/34773638333)
+and [primary rollout](https://github.com/Ashler-AI/ashler-platform/actions/runs/34774708243)
+passed sandbox-provider verification and promotion. Effective and fallback pins
+select 0.1.99; Linux x86_64 SHA-256 is
+`620fcb8b3858410114a5342a88977f526956a431e8edacb3a4a0649cf4eb748e`.
+Existing running sandboxes are not claimed to have been restarted or upgraded.
+
+Mobile [staging 1.0 (21)](https://github.com/Ashler-AI/comet/actions/runs/34772456221)
+and [production 1.0 (15)](https://github.com/Ashler-AI/comet/actions/runs/34772456098)
+passed simulator and archive verification; downloaded checksums and source
+provenance match. These are ad-hoc-signed candidate archives, not TestFlight
+uploads. Native URL launch on installed devices and live Anthropic completion
+remain unverified; local typechecks were intentionally not run.
+
 ## Crew 0.1.90 release
 
 Release source `356ccff31934f5eca6310d7a128345a13daa7456` is merged into `main`
