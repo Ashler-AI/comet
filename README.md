@@ -65,9 +65,19 @@ Existing running sandboxes are not claimed to have been restarted or upgraded.
 Mobile [staging 1.0 (21)](https://github.com/Ashler-AI/comet/actions/runs/34772456221)
 and [production 1.0 (15)](https://github.com/Ashler-AI/comet/actions/runs/34772456098)
 passed simulator and archive verification; downloaded checksums and source
-provenance match. These are ad-hoc-signed candidate archives, not TestFlight
-uploads. Native URL launch on installed devices and live Anthropic completion
-remain unverified; local typechecks were intentionally not run.
+provenance match. Both were subsequently distribution-exported and uploaded on
+2026-09-13 for internal TestFlight only, without local compilation. Apple accepted
+staging upload `eabb0795-1470-4c17-9705-ea2f00bfc2bc` and production upload
+`af77bb1d-2dfd-413c-87fa-ef983f0aeaac`; both entered processing. Inspection and
+exact uploaded IPAs passed strict deep signature verification. Uploaded SHA-256:
+
+- Staging: `e976185e6544632e0c04e0363a5b45f0de50515d85f351efe73dc667215b0fe0`
+- Production: `acafadc2c4f95fc67418123dbf8cb64d466fc3b803c0b1cfc4688fdf868e2a7c`
+
+Final processing and internal-group availability remain unverified because App
+Store Connect requires browser sign-in. No tester groups were changed. Native URL
+launch on installed devices and live Anthropic completion remain unverified;
+local typechecks were intentionally not run.
 
 ## Crew 0.1.90 release
 
