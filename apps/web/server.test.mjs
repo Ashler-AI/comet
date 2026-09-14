@@ -68,6 +68,41 @@ async function fixture(t) {
 
 const message = { requestId: 'request-a', text: 'Continue', model: 'openai-codex/gpt-example', reasoning: 'high', attachments: [] };
 
+test('native opening rechecks authority and binds the installed deployment without credentials', async t => {
+  const f = await fixture(t);
+  const original = f.rpc.call;
+  const authority = await original('ReadSessionAuthority', {});
+  authority.scope.projectId = authority.scope.deploymentId = 'ashler-staging';
+  f.rpc.call = async (method, params) => method === 'ReadSessionAuthority' ? authority : original(method, params);
+  const get = (headers = f.headers) => fetch(f.url + '/api/native-open', { headers });
+  assert.equal((await get({})).status, 401);
+  let response = await get();
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { url: 'comet-staging://scaffold/ashler-staging/ashler-staging/session-a/sandbox-a' });
+  assert.equal(f.commands.size, 0);
+  authority.capabilities = [];
+  assert.equal((await get()).status, 403);
+  authority.capabilities = ['session.read'];
+  f.viewport.currentAuthority = null;
+  authority.scope.projectId = authority.scope.deploymentId = 'ashler-production';
+  response = await get();
+  assert.deepEqual(await response.json(), { url: 'comet://scaffold/ashler-production/ashler-production/session-a/sandbox-a' });
+  for (const scope of [
+    { projectId: 'other-project' },
+    { deploymentId: 'unknown' },
+    { sessionId: 'different-session' },
+    { sessionId: 'session-a?token=secret' },
+  ]) {
+    f.viewport.currentAuthority = null;
+    authority.scope = { projectId: 'ashler-production', deploymentId: 'ashler-production', sessionId: 'session-a', ...scope };
+    assert.equal((await get()).status, 503);
+  }
+  f.viewport.currentAuthority = null;
+  authority.scope.sessionId = 'session-a';
+  authority.sandboxId = 'another-sandbox';
+  assert.equal((await get()).status, 503);
+});
+
 test('SSE waits for drain and coalesces transcript updates with fresh authority', async t => {
   const f = await fixture(t);
   const client = new EventEmitter();
@@ -298,7 +333,7 @@ test('browser restores the authorized route after failed admission or rejection 
       crypto: { randomUUID },
       Option: class { constructor(label, value) { this.label = label; this.value = value; } },
       fetch: async (path, options) => {
-        if (path === './api/session' || path === './api/models') return new Promise(() => {});
+        if (path === './api/session' || path === './api/models' || path === './api/native-open') return new Promise(() => {});
         const body = options.body && JSON.parse(options.body);
         calls.push({ path, body });
         let status = 200;

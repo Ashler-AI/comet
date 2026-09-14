@@ -662,19 +662,12 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
     .await;
 
     let entries = entries_now(&core);
-    // The aborted entry SAYS why it ended — and that the run is resuming.
+    // Recovery retains the interrupted history rather than replacing it.
     let aborted = entries
         .iter()
         .find(|e| e.status == Some(MessageStatus::Aborted))
         .expect("crashed entry stays, stamped aborted");
-    assert!(
-        aborted.parts.iter().any(|p| matches!(
-            p,
-            MessagePart::Error { message, .. }
-                if message.contains("engine restart") && message.contains("resuming")
-        )),
-        "aborted entry carries the visible interruption note"
-    );
+    assert_eq!(aborted.id, "msg-assistant-1");
     // Re-dispatch reuses the original user message id — never a duplicate.
     assert_eq!(
         entries
@@ -934,4 +927,140 @@ async fn steer_after_restart_dispatches_new_turn_with_resume() {
         );
     }
     core.shutdown().await;
+}
+
+struct InterruptedHarness {
+    requests: RequestLog,
+}
+
+#[async_trait]
+impl Harness for InterruptedHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "Interrupted"
+    }
+    fn supports_steering(&self) -> bool {
+        false
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::TurnBoundary
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        request: RunRequest,
+        _controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.requests.lock().unwrap().push(request.clone());
+        Ok(futures::stream::iter([
+            Ok(AgentEvent::SessionStarted {
+                harness: HarnessId::Mock,
+                model: "test".into(),
+                tools: vec![],
+                cwd: request.cwd,
+                session_id: "native-interrupted".into(),
+                assistant_message_id: "answer".into(),
+            }),
+            Ok(AgentEvent::TextDelta {
+                text: "partial answer".into(),
+            }),
+        ])
+        .chain(futures::stream::pending())
+        .boxed())
+    }
+}
+
+#[tokio::test]
+async fn graceful_shutdown_recovers_exact_active_request_across_two_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let registry = Arc::new(HarnessRegistry::for_profile(RuntimeProfile::Mock));
+    registry.register(Arc::new(InterruptedHarness {
+        requests: requests.clone(),
+    }));
+    let mut request = run_request("finish the original work", "/tmp");
+    request.model = Some("chosen-model".into());
+    request.reasoning = Some(ReasoningLevel::High);
+    request.attachments = vec!["/tmp/original-image.png".into()];
+    request
+        .model_options
+        .insert("effort".into(), serde_json::json!("high"));
+    for generation in 0..3 {
+        let core = assemble_registry(dir.path(), registry.clone());
+        if generation == 0 {
+            pre_title(&core);
+            core.sessions
+                .dispatch(
+                    CHAT,
+                    HarnessId::Mock,
+                    request.clone(),
+                    Some("original-user".into()),
+                )
+                .await
+                .unwrap();
+        }
+        wait_for(
+            || requests.lock().unwrap().len() == generation + 1,
+            "active request resumes once",
+        )
+        .await;
+        wait_for(
+            || {
+                entries_now(&core)
+                    .iter()
+                    .any(|entry| entry.status == Some(MessageStatus::Streaming))
+            },
+            "partial answer streams",
+        )
+        .await;
+        let mut expected = request.clone();
+        if generation > 0 {
+            expected.resume = Some("native-interrupted".into());
+        }
+        assert_eq!(requests.lock().unwrap()[generation], expected);
+        assert_eq!(
+            entries_now(&core)
+                .iter()
+                .filter(|entry| entry.id == "original-user")
+                .count(),
+            1
+        );
+        core.sessions.recover_stale().unwrap();
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            generation + 1,
+            "live runtime must not replay"
+        );
+        core.shutdown().await;
+        assert!(!core.sessions.any_active());
+        assert!(
+            entries_now(&core)
+                .iter()
+                .all(|entry| entry.status != Some(MessageStatus::Streaming))
+        );
+        assert!(
+            core.sessions
+                .dispatch(
+                    CHAT,
+                    HarnessId::Mock,
+                    request.clone(),
+                    Some("rejected-after-shutdown".into())
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            entries_now(&core)
+                .iter()
+                .all(|entry| entry.id != "rejected-after-shutdown")
+        );
+        drop(core);
+    }
 }

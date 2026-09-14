@@ -155,9 +155,8 @@ sed "s/__VERSION__/$VERSION/" "$ROOT/dist/macos/Info.plist" >"$APP/Contents/Info
 /usr/libexec/PlistBuddy -c "Set :CFBundleName $APP_NAME" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $APP_NAME" "$APP/Contents/Info.plist"
 if [[ "$PACKAGE_ENVIRONMENT" == staging ]]; then
-  # The shared comet:// protocol has no environment discriminator. Do not steal
-  # production invitation links when both native apps are installed.
-  /usr/libexec/PlistBuddy -c "Delete :CFBundleURLTypes" "$APP/Contents/Info.plist"
+  # Keep production and staging app links bound to their respective installs.
+  /usr/libexec/PlistBuddy -c "Set :CFBundleURLTypes:0:CFBundleURLSchemes:0 comet-staging" "$APP/Contents/Info.plist"
 fi
 plutil -lint "$APP/Contents/Info.plist"
 

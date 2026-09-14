@@ -87,6 +87,12 @@ export class AuthGrant extends StoredAuthGrant {
           )
         },
         {
+          kind: "workspace",
+          stub: this.authorityEnv.SESSION_ROOMS.get(
+            this.authorityEnv.SESSION_ROOMS.idFromName(`ws4/${record.projectId}`)
+          )
+        },
+        {
           kind: "device",
           stub: this.authorityEnv.DEVICE_ROOMS.get(
             this.authorityEnv.DEVICE_ROOMS.idFromName(

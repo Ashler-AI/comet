@@ -38,8 +38,10 @@ pub mod methods {
     pub const LIST_HARNESS_COMMANDS: &str = "ListHarnessCommands";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
     /// Stop a verified external OMP writer and retry the blocked prompt under
-    /// the target Comet engine.
+    /// the target Crew engine.
     pub const TAKE_OVER_OMP_SESSION: &str = "TakeOverOmpSession";
+    /// Current OMP recovery phase followed by event-driven updates for one chat.
+    pub const WATCH_OMP_RECOVERY: &str = "WatchOmpRecovery";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
     /// Read one older transcript page before an opaque raw-list cursor.
     pub const READ_DOC_MESSAGES: &str = "ReadDocMessages";

@@ -27,6 +27,9 @@ if [ "${1:-}" = "-F" ]; then
 fi
 : "${OMP_ARGV_LOG:?}"
 printf '%s\n' "$@" > "$OMP_ARGV_LOG"
+if [ "${1:-}" = "--profile" ] && [ "${2:-}" = "scaffold-host" ]; then
+  shift 2
+fi
 if [ "${1:-}" = "models" ]; then
   printf '%s\n' '{"models":[{"selector":"openai-codex/gpt-5.6-sol","name":"GPT-5.6 Sol","provider":"openai-codex","providerName":"OpenAI Codex","contextWindow":1000000,"maxTokens":262144,"thinking":["low","high","xhigh"]}]}'
   exit 0
@@ -45,6 +48,10 @@ for arg in "$@"; do
   fi
   prev="$arg"
 done
+if [ -f "$SESSION_ID" ]; then
+  SESSION_ID=$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$SESSION_ID" | sed -n '1p')
+fi
+SESSION_ID="${OMP_REPORTED_SESSION_ID:-$SESSION_ID}"
 ACTIVE_GOAL="${OMP_ACTIVE_GOAL:-}"
 
 

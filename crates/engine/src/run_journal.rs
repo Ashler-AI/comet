@@ -72,10 +72,25 @@ impl RunJournal {
         self.dir.join(format!("{}.resume", sanitize_id(chat_id)))
     }
 
-    pub(crate) fn save_context<T: Serialize>(&self, chat_id: &str, context: &T) -> Result<(), JournalError> {
+    pub(crate) fn save_context<T: Serialize>(
+        &self,
+        chat_id: &str,
+        context: &T,
+    ) -> Result<(), JournalError> {
+        self.save_record(chat_id, "context", context)
+    }
+
+    fn save_record<T: Serialize>(
+        &self,
+        chat_id: &str,
+        extension: &str,
+        context: &T,
+    ) -> Result<(), JournalError> {
         let _guard = self.lock();
-        let path = self.dir.join(format!("{}.context", sanitize_id(chat_id)));
-        let temporary = path.with_extension("context.tmp");
+        let path = self
+            .dir
+            .join(format!("{}.{}", sanitize_id(chat_id), extension));
+        let temporary = path.with_extension(format!("{extension}.tmp"));
         let bytes = serde_json::to_vec(&(chat_id, context))?;
         let mut file = File::create(&temporary)?;
         file.write_all(&bytes)?;
@@ -85,8 +100,21 @@ impl RunJournal {
         Ok(())
     }
 
-    pub(crate) fn read_context<T: serde::de::DeserializeOwned>(&self, chat_id: &str) -> Result<Option<T>, JournalError> {
-        let path = self.dir.join(format!("{}.context", sanitize_id(chat_id)));
+    pub(crate) fn read_context<T: serde::de::DeserializeOwned>(
+        &self,
+        chat_id: &str,
+    ) -> Result<Option<T>, JournalError> {
+        self.read_record(chat_id, "context")
+    }
+
+    fn read_record<T: serde::de::DeserializeOwned>(
+        &self,
+        chat_id: &str,
+        extension: &str,
+    ) -> Result<Option<T>, JournalError> {
+        let path = self
+            .dir
+            .join(format!("{}.{}", sanitize_id(chat_id), extension));
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -97,6 +125,68 @@ impl RunJournal {
             return Err(std::io::Error::other("session_context_binding_mismatch").into());
         }
         Ok(Some(context))
+    }
+
+    pub(crate) fn save_recovery<T: Serialize>(
+        &self,
+        chat_id: &str,
+        recovery: &T,
+    ) -> Result<(), JournalError> {
+        self.save_record(chat_id, "recovery", recovery)
+    }
+
+    pub(crate) fn read_recovery<T: serde::de::DeserializeOwned>(
+        &self,
+        chat_id: &str,
+    ) -> Result<Option<T>, JournalError> {
+        Ok(self
+            .read_record::<Option<T>>(chat_id, "recovery")?
+            .flatten())
+    }
+
+    pub(crate) fn recovery_retired(&self, chat_id: &str) -> Result<bool, JournalError> {
+        Ok(matches!(
+            self.read_record::<Option<serde_json::Value>>(chat_id, "recovery")?,
+            Some(None)
+        ))
+    }
+
+    pub(crate) fn retire_recovery(&self, chat_id: &str) -> Result<(), JournalError> {
+        self.save_record(chat_id, "recovery", &Option::<serde_json::Value>::None)
+    }
+
+    fn clear_recovery(&self, chat_id: &str) -> Result<(), JournalError> {
+        let _guard = self.lock();
+        match std::fs::remove_file(self.dir.join(format!("{}.recovery", sanitize_id(chat_id)))) {
+            Ok(()) => File::open(&self.dir)?.sync_all()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn recovery_sessions(&self) -> Result<Vec<String>, JournalError> {
+        let mut ids = Vec::new();
+        for entry in std::fs::read_dir(&self.dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|extension| extension.to_str()) == Some("recovery") {
+                match self.chat_id_for(&path) {
+                    Ok(Some(chat_id)) => match self.recovery_retired(&chat_id) {
+                        Ok(false) => ids.push(chat_id),
+                        Ok(true) => {}
+                        Err(error) => {
+                            tracing::error!(%chat_id, %error, "skipping invalid Crew recovery record")
+                        }
+                    },
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::error!(path = %path.display(), %error, "skipping invalid Crew recovery record")
+                    }
+                }
+            }
+        }
+        ids.sort();
+        Ok(ids)
     }
 
     /// Auto-resume revival budget (comet `resumeAttempt`/`MAX_AUTO_RESUME`):
@@ -166,6 +256,9 @@ impl RunJournal {
         buf.push(b'\n');
         journal.file.write_all(&buf)?;
         journal.file.flush()?;
+        if matches!(event, AgentEvent::Done { .. }) {
+            journal.file.sync_all()?;
+        }
         journal.needs_newline = false;
         journal.next_seq = seq + 1;
         Ok(seq)
@@ -197,6 +290,30 @@ impl RunJournal {
         Ok(read_lines(&path)?.into_iter().next_back())
     }
 
+    fn chat_id_for(&self, path: &Path) -> Result<Option<String>, JournalError> {
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            return Ok(None);
+        };
+        // Filenames are sanitized; execution keys can contain ::session::. The
+        // bound sidecar retains the actual key needed to open the same history.
+        for extension in ["recovery", "context"] {
+            match std::fs::read(path.with_extension(extension)) {
+                Ok(bytes) => {
+                    let (chat_id, _): (String, serde_json::Value) = serde_json::from_slice(&bytes)?;
+                    if sanitize_id(&chat_id) != stem {
+                        return Err(
+                            std::io::Error::other("session_context_binding_mismatch").into()
+                        );
+                    }
+                    return Ok(Some(chat_id));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(Some(stem.to_string()))
+    }
+
     /// Crash-recovery scan: chat ids whose journal's last event is NOT a `Done` — their
     /// runs died mid-stream and need recovery (stamp `aborted`, close the journal).
     pub fn stale_sessions(&self) -> Result<Vec<String>, JournalError> {
@@ -207,13 +324,24 @@ impl RunJournal {
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            let Some(chat_id) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
+            let chat_id = match self.chat_id_for(&path) {
+                Ok(Some(chat_id)) => chat_id,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::error!(path = %path.display(), %error, "skipping invalid Crew journal binding");
+                    continue;
+                }
             };
-            let last = read_lines(&path)?.into_iter().next_back();
+            let last = match read_lines(&path) {
+                Ok(events) => events.into_iter().next_back(),
+                Err(error) => {
+                    tracing::error!(path = %path.display(), %error, "skipping unreadable Crew journal");
+                    continue;
+                }
+            };
             match last {
                 Some((_, AgentEvent::Done { .. })) | None => {}
-                Some(_) => stale.push(chat_id.to_string()),
+                Some(_) => stale.push(chat_id),
             }
         }
         stale.sort();
@@ -229,8 +357,12 @@ impl RunJournal {
             if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
                 continue;
             }
-            if let Some(chat_id) = path.file_stem().and_then(|stem| stem.to_str()) {
-                ids.push(chat_id.to_string());
+            match self.chat_id_for(&path) {
+                Ok(Some(chat_id)) => ids.push(chat_id),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(path = %path.display(), %error, "skipping invalid Crew journal binding")
+                }
             }
         }
         ids.sort();
@@ -241,6 +373,7 @@ impl RunJournal {
     /// Remove a chat's journal file entirely (tests / future compaction).
     pub fn discard(&self, chat_id: &str) -> Result<(), JournalError> {
         self.lock().remove(chat_id);
+        self.clear_recovery(chat_id)?;
         let context_path = self.dir.join(format!("{}.context", sanitize_id(chat_id)));
         match std::fs::remove_file(context_path) {
             Ok(()) => {}
@@ -321,13 +454,68 @@ mod tests {
     fn context_recovery_rejects_aliases_corruption_and_discarded_evidence() {
         let dir = tempfile::tempdir().unwrap();
         let journal = RunJournal::open(dir.path()).unwrap();
-        journal.save_context("chat::session::chat", &"accepted").unwrap();
-        assert!(journal.read_context::<String>("chat__session__chat").is_err());
+        journal
+            .save_context("chat::session::chat", &"accepted")
+            .unwrap();
+        assert!(
+            journal
+                .read_context::<String>("chat__session__chat")
+                .is_err()
+        );
         std::fs::write(dir.path().join("chat__session__chat.context"), b"truncated").unwrap();
-        assert!(journal.read_context::<String>("chat::session::chat").is_err());
-        journal.save_context("chat::session::chat", &"replacement").unwrap();
+        assert!(
+            journal
+                .read_context::<String>("chat::session::chat")
+                .is_err()
+        );
+        journal
+            .save_context("chat::session::chat", &"replacement")
+            .unwrap();
         journal.discard("chat::session::chat").unwrap();
-        assert!(journal.read_context::<String>("chat::session::chat").unwrap().is_none());
+        assert!(
+            journal
+                .read_context::<String>("chat::session::chat")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pending_recovery_survives_done_and_reopen_until_retired() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        let request = serde_json::json!({"messageId": "original", "resume": "native-id", "attachments": ["/tmp/image.png"]});
+        journal
+            .save_recovery("chat::session::chat", &request)
+            .unwrap();
+        journal.append("chat::session::chat", &done()).unwrap();
+        drop(journal);
+        let journal = RunJournal::open(dir.path()).unwrap();
+        assert_eq!(journal.session_ids().unwrap(), vec!["chat::session::chat"]);
+        assert_eq!(
+            journal.recovery_sessions().unwrap(),
+            vec!["chat::session::chat"]
+        );
+        assert_eq!(
+            journal
+                .read_recovery::<serde_json::Value>("chat::session::chat")
+                .unwrap(),
+            Some(request)
+        );
+        assert!(
+            journal
+                .read_recovery::<serde_json::Value>("chat__session__chat")
+                .is_err()
+        );
+        journal.retire_recovery("chat::session::chat").unwrap();
+        drop(journal);
+        assert!(
+            RunJournal::open(dir.path())
+                .unwrap()
+                .recovery_sessions()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn done() -> AgentEvent {

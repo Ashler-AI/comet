@@ -1,9 +1,9 @@
 //! OMP harness adapter over OMP's native RPC mode (`omp --mode rpc`).
 //!
-//! Comet owns execution through JSONL frames on the child's stdio; OMP's
-//! read-only `models --json` command supplies the selectable provider/model
-//! catalog. One persistent child serves every turn, and mid-turn followups
-//! steer the live turn between tool calls (step-boundary semantics) instead
+//! Comet owns execution through JSONL frames on the child's stdio. Desktop
+//! catalogs combine Scaffold defaults with local `models --json` entries;
+//! Scaffold hosts retain their authority-scoped catalog. One persistent child
+//! serves every turn, and followups steer between tool calls instead
 //! of queueing behind it — the reason this adapter left ACP, whose
 //! `session/prompt` is strictly turn-serial. The ACP client in [`rpc`] and
 //! the [`run_acp`] loop remain solely for Prime Agent.
@@ -93,60 +93,244 @@ pub fn run_supervisor_from_env() -> Option<Result<(), HarnessError>> {
 }
 
 #[cfg(unix)]
-fn run_omp_supervisor(mut args: impl Iterator<Item = OsString>) -> Result<(), HarnessError> {
-    use std::os::unix::process::ExitStatusExt as _;
+static SUPERVISOR_STOPPING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(unix)]
+static STOPPING_GROUPS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<i32, String>>,
+> = std::sync::LazyLock::new(Default::default);
 
+#[cfg(unix)]
+fn mark_group_stopping(group: i32) {
+    let mut groups = STOPPING_GROUPS.lock();
+    groups.retain(|pid, birth| process_birth(*pid as u32).as_ref() == Some(birth));
+    if let Some(birth) = process_birth(group as u32) {
+        groups.insert(group, birth);
+    }
+}
+
+#[cfg(unix)]
+extern "C" fn supervisor_stop(_: libc::c_int) {
+    SUPERVISOR_STOPPING.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(unix)]
+fn process_parent_and_birth(pid: u32) -> Option<(u32, String)> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
+        if fields.next()? == "Z" {
+            return None;
+        }
+        let parent = fields.next()?.parse().ok()?;
+        return Some((parent, fields.nth(17)?.to_owned()));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        // SAFETY: proc_pidinfo initializes this exact fixed-size native structure.
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid as i32,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if read != size {
+            return None;
+        }
+        let info = unsafe { info.assume_init() };
+        if info.pbi_status == 5 {
+            return None;
+        } // SZOMB
+        return Some((
+            info.pbi_ppid,
+            format!("{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec),
+        ));
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+#[cfg(unix)]
+fn process_birth(pid: u32) -> Option<String> {
+    process_parent_and_birth(pid).map(|(_, birth)| birth)
+}
+
+#[cfg(unix)]
+fn process_children(pid: u32) -> Vec<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut children = Vec::new();
+        // Children can be spawned by any runtime thread, not just the main one.
+        // This scans only our process tree, never the host's entire /proc table.
+        if let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) {
+            for task in tasks.flatten() {
+                if let Ok(pids) = std::fs::read_to_string(task.path().join("children")) {
+                    children.extend(
+                        pids.split_whitespace()
+                            .filter_map(|pid| pid.parse::<u32>().ok()),
+                    );
+                }
+            }
+        }
+        return children;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // libproc returns PID counts (not bytes), including for the size query.
+        // Leave headroom for children forked between the two calls.
+        let count = unsafe { libc::proc_listchildpids(pid as i32, std::ptr::null_mut(), 0) };
+        if count <= 0 {
+            return Vec::new();
+        }
+        let mut children = vec![0_u32; count as usize + 32];
+        loop {
+            let bytes = children
+                .len()
+                .checked_mul(std::mem::size_of::<u32>())
+                .and_then(|bytes| i32::try_from(bytes).ok());
+            let Some(bytes) = bytes else {
+                return Vec::new();
+            };
+            // SAFETY: writable PID buffer with exactly the advertised byte size.
+            let count = unsafe {
+                libc::proc_listchildpids(pid as i32, children.as_mut_ptr().cast(), bytes)
+            };
+            if count <= 0 {
+                return Vec::new();
+            }
+            if (count as usize) < children.len() {
+                children.truncate(count as usize);
+                children.retain(|pid| *pid > 1);
+                return children;
+            }
+            children.resize(children.len() * 2, 0);
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        Vec::new()
+    }
+}
+
+#[cfg(unix)]
+fn supervised_descendants(root: u32, known: &mut Vec<(u32, String)>) {
+    known.retain(|(pid, birth)| process_birth(*pid).as_ref() == Some(birth));
+    let mut cursor = 0;
+    loop {
+        let parent = if cursor == 0 {
+            root
+        } else {
+            known[cursor - 1].0
+        };
+        for pid in process_children(parent) {
+            if pid != root
+                && !known.iter().any(|(existing, _)| *existing == pid)
+                && let Some((actual_parent, birth)) = process_parent_and_birth(pid)
+                && actual_parent == parent
+            {
+                known.push((pid, birth));
+            }
+        }
+        if cursor == known.len() {
+            break;
+        }
+        cursor += 1;
+    }
+}
+
+#[cfg(unix)]
+fn signal_owned_process(pid: u32, birth: &str, signal: i32) {
+    if pid > 1 && process_birth(pid).as_deref() == Some(birth) {
+        // SAFETY: a previously observed descendant with the same birth identity.
+        unsafe {
+            libc::kill(pid as i32, signal);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn run_omp_supervisor(mut args: impl Iterator<Item = OsString>) -> Result<(), HarnessError> {
+    use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
     let parent_pid = args
         .next()
         .and_then(|value| value.to_str().and_then(|value| value.parse::<u32>().ok()))
-        .ok_or_else(|| HarnessError::Protocol("OMP supervisor has no valid parent PID".into()))?;
+        .filter(|pid| *pid > 1)
+        .ok_or_else(|| HarnessError::Protocol("Crew supervisor has no valid parent PID".into()))?;
     let executable = args
         .next()
-        .ok_or_else(|| HarnessError::Protocol("OMP supervisor has no child executable".into()))?;
-    let mut child = ProcessCommand::new(executable)
-        .args(args)
-        .spawn()
-        .map_err(HarnessError::Io)?;
-
-    // Installed after spawn so OMP keeps the default disposition. The
-    // supervisor must survive the group's graceful SIGTERM long enough to reap
-    // OMP and escalate if OMP ignores it.
-    // SAFETY: installing SIG_IGN for SIGTERM has no pointer or lifetime input.
-    unsafe {
-        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+        .ok_or_else(|| HarnessError::Protocol("Crew supervisor has no child executable".into()))?;
+    let root = std::process::id();
+    // Never trust invocation alone to authorize a process-group signal.
+    if unsafe { libc::getpgrp() } != root as i32 {
+        return Err(HarnessError::Protocol(
+            "Crew supervisor requires its own process group".into(),
+        ));
     }
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            supervisor_stop as *const () as libc::sighandler_t,
+        );
+    }
+    let mut command = ProcessCommand::new(executable);
+    command.args(args);
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
+            Ok(())
+        });
+    }
+    let mut child = command.spawn()?;
+    let mut descendants = Vec::new();
     loop {
-        if let Some(status) = child.try_wait()? {
-            std::process::exit(
-                status
-                    .code()
-                    .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)),
-            );
-        }
-        // A Unix child is never attached to a reused PID. Once reparented, an
-        // equal numeric PID cannot make this relationship live again.
-        // SAFETY: getppid/getpgrp have no preconditions.
-        let parent_changed = unsafe { libc::getppid() } != parent_pid as libc::pid_t;
-        if parent_changed {
-            // SAFETY: the engine launched this supervisor as the process-group
-            // leader; a negative id targets only that dedicated group.
-            let group = unsafe { libc::getpgrp() };
+        supervised_descendants(root, &mut descendants);
+        let status = child.try_wait()?;
+        if status.is_some()
+            || SUPERVISOR_STOPPING.load(std::sync::atomic::Ordering::Relaxed)
+            || unsafe { libc::getppid() } != parent_pid as i32
+        {
             unsafe {
-                libc::kill(-group, libc::SIGTERM);
+                libc::kill(-(root as i32), libc::SIGTERM);
             }
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            while std::time::Instant::now() < deadline {
-                if child.try_wait()?.is_some() {
-                    std::process::exit(0);
+            loop {
+                supervised_descendants(root, &mut descendants);
+                for (pid, birth) in &descendants {
+                    signal_owned_process(*pid, birth, libc::SIGTERM);
+                }
+                let _ = child.try_wait();
+                if descendants.is_empty() || std::time::Instant::now() >= deadline {
+                    break;
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
-            // SAFETY: same dedicated group; SIGKILL intentionally includes the
-            // supervisor itself so no guardian can become the next orphan.
-            unsafe {
-                libc::kill(-group, libc::SIGKILL);
+            for (pid, birth) in &descendants {
+                signal_owned_process(*pid, birth, libc::SIGKILL);
             }
-            std::process::abort();
+            let _ = child.kill();
+            let _ = child.wait();
+            // Keep the leader alive through escalation so this group cannot be reused.
+            // The final group signal catches children forked during shutdown too.
+            if !descendants.is_empty() {
+                unsafe {
+                    libc::kill(-(root as i32), libc::SIGKILL);
+                }
+            }
+            std::process::exit(status.map_or(0, |status| {
+                status
+                    .code()
+                    .unwrap_or_else(|| 128 + status.signal().unwrap_or(1))
+            }));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -875,10 +1059,67 @@ fn omp_ancestor(mut identity: ProcessIdentity, omp_executable: &Path) -> Option<
 }
 
 #[cfg(unix)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StopTarget {
-    Process(u32),
-    Group(i32),
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StopTarget {
+    pid: u32,
+    birth: String,
+    group: bool,
+}
+
+#[cfg(unix)]
+fn crew_supervisor(root: &ProcessIdentity, executable: &Path) -> Option<ProcessIdentity> {
+    let supervisor = process_identity(root.ppid)?;
+    (supervisor.pid == root.pgid as u32
+        && supervisor.pgid == root.pgid
+        && supervisor.uid == root.uid
+        && same_executable(&supervisor.executable, executable)
+        && supervisor
+            .command
+            .split_whitespace()
+            .any(|arg| arg == OMP_SUPERVISOR_MARKER))
+    .then_some(supervisor)
+}
+
+#[cfg(unix)]
+fn teardown_writers(
+    path: &Path,
+    executable: &Path,
+    supervisor_executable: &Path,
+    known: &[(u32, String)],
+) -> Option<Vec<(u32, String)>> {
+    session_writer_pids(path)?
+        .into_iter()
+        .map(|pid| {
+            let birth = process_birth(pid)?;
+            if known
+                .iter()
+                .any(|(old_pid, old_birth)| *old_pid == pid && *old_birth == birth)
+            {
+                return Some((pid, birth));
+            }
+            let mut identity = process_identity(pid)?;
+            for _ in 0..64 {
+                if same_executable(&identity.executable, executable)
+                    && let Some(supervisor) = crew_supervisor(&identity, supervisor_executable)
+                    && supervisor.uid == unsafe { libc::geteuid() }
+                    && (supervisor.ppid == 1
+                        || STOPPING_GROUPS
+                            .lock()
+                            .get(&supervisor.pgid)
+                            .is_some_and(|birth| {
+                                process_birth(supervisor.pid).as_ref() == Some(birth)
+                            }))
+                {
+                    return Some((pid, birth));
+                }
+                if identity.ppid <= 1 {
+                    return None;
+                }
+                identity = process_identity(identity.ppid)?;
+            }
+            None
+        })
+        .collect()
 }
 
 #[cfg(unix)]
@@ -914,14 +1155,9 @@ fn stop_plan(files: &[PathBuf], omp_executable: &Path) -> Result<Vec<StopTarget>
         ));
     }
 
-    // A tool can inherit OMP's append descriptor while moving into another
-    // process group. Resolve the configured OMP executable through ancestry,
-    // not only among the processes that still hold the descriptor. If OMP has
-    // already died, accept only a same-user holder orphaned directly under PID
-    // 1: the exact write-capable journal descriptor is then the surviving
-    // ownership proof. A live unrelated process still fails closed.
+    // A write descriptor alone does not prove an orphan was ever an OMP tool.
+    // Require a live executable-verified OMP ancestor before signaling anything.
     let mut roots = Vec::<ProcessIdentity>::new();
-    let mut writer_roots = Vec::with_capacity(identities.len());
     for identity in &identities {
         match omp_ancestor(identity.clone(), omp_executable) {
             Some(root) => {
@@ -930,15 +1166,18 @@ fn stop_plan(files: &[PathBuf], omp_executable: &Path) -> Result<Vec<StopTarget>
                         "The OMP session writer belongs to another user".into(),
                     ));
                 }
-                writer_roots.push(Some(root.pid));
+                if root.pid == std::process::id() {
+                    return Err(HarnessError::Protocol(
+                        "Refusing to stop the Crew engine itself".into(),
+                    ));
+                }
                 if !roots.iter().any(|existing| existing.pid == root.pid) {
                     roots.push(root);
                 }
             }
-            None if identity.ppid == 1 => writer_roots.push(None),
             None => {
                 return Err(HarnessError::Protocol(
-                    "The write-capable holder is not OMP or an orphaned OMP tool".into(),
+                    "The write-capable holder has no verified OMP owner".into(),
                 ));
             }
         }
@@ -946,41 +1185,29 @@ fn stop_plan(files: &[PathBuf], omp_executable: &Path) -> Result<Vec<StopTarget>
 
     let mut targets = Vec::new();
     for root in &roots {
-        let supervised_group = root.pgid > 1
-            && root.pgid != current_group
-            && (root.pgid == root.pid as i32
-                || (root.ppid == root.pgid as u32
-                    && process_identity(root.ppid).is_some_and(|supervisor| {
-                        supervisor.command.contains(OMP_SUPERVISOR_MARKER)
-                    })));
-        let target = if supervised_group {
-            StopTarget::Group(root.pgid)
-        } else {
-            StopTarget::Process(root.pid)
-        };
-        if !targets.contains(&target) {
-            targets.push(target);
+        let supervisor = std::env::current_exe()
+            .ok()
+            .and_then(|exe| crew_supervisor(root, &exe));
+        let leader = supervisor.as_ref().unwrap_or(root);
+        let group =
+            leader.pgid == leader.pid as i32 && leader.pgid > 1 && leader.pgid != current_group;
+        let mut descendants = Vec::new();
+        supervised_descendants(leader.pid, &mut descendants);
+        for (pid, birth) in descendants.into_iter().rev() {
+            targets.push(StopTarget {
+                pid,
+                birth,
+                group: false,
+            });
         }
-    }
-    // Terminate inherited write holders before their OMP root. An orphaned
-    // group leader is itself the only safely attributable root left, so stop
-    // its isolated group; otherwise signal only the exact holder process.
-    for (identity, root_pid) in identities.iter().zip(writer_roots).rev() {
-        if root_pid == Some(identity.pid) {
-            continue;
-        }
-        let target = if root_pid.is_none()
-            && identity.pgid == identity.pid as i32
-            && identity.pgid > 1
-            && identity.pgid != current_group
-        {
-            StopTarget::Group(identity.pgid)
-        } else {
-            StopTarget::Process(identity.pid)
-        };
-        if !targets.contains(&target) {
-            targets.insert(0, target);
-        }
+        let birth = process_birth(leader.pid).ok_or_else(|| {
+            HarnessError::Protocol("Crew writer exited during takeover verification".into())
+        })?;
+        targets.push(StopTarget {
+            pid: leader.pid,
+            birth,
+            group,
+        });
     }
     Ok(targets)
 }
@@ -988,12 +1215,16 @@ fn stop_plan(files: &[PathBuf], omp_executable: &Path) -> Result<Vec<StopTarget>
 #[cfg(unix)]
 fn signal_stop_plan(targets: &[StopTarget], signal: i32) -> Result<(), HarnessError> {
     for target in targets {
-        let pid = match *target {
-            StopTarget::Process(pid) => pid as i32,
-            StopTarget::Group(group) => -group,
+        if process_birth(target.pid).as_ref() != Some(&target.birth) {
+            continue;
+        }
+        let pid = if target.group {
+            -(target.pid as i32)
+        } else {
+            target.pid as i32
         };
-        // SAFETY: targets were re-resolved from exact journal writers and
-        // verified against uid, executable identity, ancestry, and group.
+        // SAFETY: exact verified owner or descendant, with birth identity checked
+        // again immediately before signaling to reject reused PIDs/groups.
         if unsafe { libc::kill(pid, signal) } != 0 {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::ESRCH) {
@@ -1004,7 +1235,6 @@ fn signal_stop_plan(targets: &[StopTarget], signal: i32) -> Result<(), HarnessEr
     Ok(())
 }
 
-#[cfg(unix)]
 fn session_has_writer(files: &[PathBuf]) -> Result<bool, HarnessError> {
     let mut active = false;
     for file in files {
@@ -1023,11 +1253,19 @@ fn session_has_writer(files: &[PathBuf]) -> Result<bool, HarnessError> {
 
 #[cfg(unix)]
 fn stop_session_writer(files: Vec<PathBuf>, omp_executable: PathBuf) -> Result<(), HarnessError> {
-    let graceful = stop_plan(&files, &omp_executable)?;
+    let graceful = match stop_plan(&files, &omp_executable) {
+        Ok(plan) => plan,
+        Err(_) if !session_has_writer(&files)? => return Ok(()),
+        Err(error) => return Err(error),
+    };
     signal_stop_plan(&graceful, libc::SIGTERM)?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
     while std::time::Instant::now() < deadline {
-        if !session_has_writer(&files)? {
+        if !session_has_writer(&files)?
+            && graceful
+                .iter()
+                .all(|target| process_birth(target.pid).as_ref() != Some(&target.birth))
+        {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -1035,11 +1273,36 @@ fn stop_session_writer(files: Vec<PathBuf>, omp_executable: PathBuf) -> Result<(
 
     // Rebuild from the still-open exact descriptors before escalation. PID
     // reuse or a newly introduced unrelated writer therefore fails closed.
-    let forced = stop_plan(&files, &omp_executable)?;
+    let forced = match stop_plan(&files, &omp_executable) {
+        Ok(plan) => plan,
+        Err(error) => {
+            let holders_known = files.iter().all(|file| {
+                session_writer_pids(file).is_some_and(|pids| {
+                    pids.into_iter().all(|pid| {
+                        graceful.iter().any(|target| {
+                            target.pid == pid && process_birth(pid).as_ref() == Some(&target.birth)
+                        })
+                    })
+                })
+            });
+            if !holders_known {
+                return Err(error);
+            }
+            Vec::new()
+        }
+    };
     signal_stop_plan(&forced, libc::SIGKILL)?;
+    // The writer can close the journal before its owned tools finish exiting.
+    // Retain the original birth-verified descendants for that case too.
+    signal_stop_plan(&graceful, libc::SIGKILL)?;
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while std::time::Instant::now() < deadline {
-        if !session_has_writer(&files)? {
+        if !session_has_writer(&files)?
+            && graceful
+                .iter()
+                .chain(&forced)
+                .all(|target| process_birth(target.pid).as_ref() != Some(&target.birth))
+        {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -1145,21 +1408,54 @@ fn configure_inference_gateway(
     Ok(())
 }
 
-fn session_file_has_id(path: &Path, session_id: &str) -> bool {
-    let Ok(file) = std::fs::File::open(path) else {
-        return false;
-    };
+fn session_file_id(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
     let mut reader = BufReader::new(file.take(OMP_SESSION_HEADER_BYTES));
     let mut line = String::new();
     while reader.read_line(&mut line).is_ok_and(|bytes| bytes > 0) {
         if let Ok(value) = serde_json::from_str::<Value>(&line)
             && value.get("type").and_then(Value::as_str) == Some("session")
         {
-            return value.get("id").and_then(Value::as_str) == Some(session_id);
+            return value
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty() && Path::new(id).components().count() == 1)
+                .map(str::to_owned);
         }
         line.clear();
     }
-    false
+    None
+}
+
+fn session_file_has_id(path: &Path, session_id: &str) -> bool {
+    session_file_id(path).as_deref() == Some(session_id)
+}
+
+fn resolve_session(
+    session_dirs: &[PathBuf],
+    selector: &str,
+) -> Result<(String, Option<PathBuf>), HarnessError> {
+    let (files, exhaustive) = matching_session_files(session_dirs, selector);
+    if !exhaustive || files.len() > 1 {
+        return Err(HarnessError::Protocol(
+            "Could not resolve exactly one Crew session journal".into(),
+        ));
+    }
+    if let Some(path) = files.into_iter().next() {
+        let path = std::fs::canonicalize(path)?;
+        let id = session_file_id(&path).ok_or_else(|| {
+            HarnessError::Protocol("Crew session journal has no valid identity".into())
+        })?;
+        return Ok((id, Some(path)));
+    }
+    if Path::new(selector).components().count() > 1 {
+        return Err(HarnessError::Protocol(
+            "Crew session journal does not exist".into(),
+        ));
+    }
+    // Preserve native UUID lookup when the journal is outside our configured roots;
+    // the RPC handshake must still return exactly this identity.
+    Ok((selector.to_owned(), None))
 }
 
 fn matching_session_files(session_dirs: &[PathBuf], session_id: &str) -> (Vec<PathBuf>, bool) {
@@ -1173,6 +1469,7 @@ fn matching_session_files(session_dirs: &[PathBuf], session_id: &str) -> (Vec<Pa
     let mut pending: VecDeque<PathBuf> = session_dirs.iter().cloned().collect();
     let mut matches = Vec::new();
     while let Some(dir) = pending.pop_front() {
+
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1276,13 +1573,11 @@ fn fork_session_file(
     session_dirs: &[PathBuf],
     source_session_id: &str,
 ) -> Result<String, HarnessError> {
-    let (matches, exhaustive) = matching_session_files(session_dirs, source_session_id);
-    if !exhaustive || matches.len() != 1 {
-        return Err(HarnessError::Protocol(
-            "Could not resolve exactly one OMP session journal to fork".into(),
-        ));
-    }
-    let source_path = &matches[0];
+    let (source_session_id, source_path) = resolve_session(session_dirs, source_session_id)?;
+    let source_path = source_path.ok_or_else(|| {
+        HarnessError::Protocol("Could not resolve exactly one Crew session journal to fork".into())
+    })?;
+    let source_path = &source_path;
     let source = std::fs::File::open(source_path)?;
     let byte_count = source.metadata()?.len();
     if byte_count == 0 {
@@ -1351,7 +1646,7 @@ fn fork_session_file(
                 let mut value: Value = serde_json::from_slice(body).map_err(|_| {
                     HarnessError::Protocol("Could not decode OMP session header".into())
                 })?;
-                if value.get("id").and_then(Value::as_str) != Some(source_session_id) {
+                if value.get("id").and_then(Value::as_str) != Some(source_session_id.as_str()) {
                     return Err(HarnessError::Protocol(
                         "OMP session journal identity changed before fork".into(),
                     ));
@@ -1602,43 +1897,42 @@ impl OmpHarness {
         )
     }
 
-    fn ensure_resume_has_no_writer(&self, resume: Option<&str>) -> Result<(), HarnessError> {
-        let Some(session_id) = resume else {
+    async fn ensure_resume_has_no_writer(
+        &self,
+        resume: Option<&str>,
+        file: Option<&Path>,
+        executable: &Path,
+    ) -> Result<(), HarnessError> {
+        let (Some(session_id), Some(file)) = (resume, file) else {
             return Ok(());
         };
-        let session_dirs = self
-            .session_dirs
-            .clone()
-            .unwrap_or_else(|| omp_session_dirs(self.scaffold_host));
-        let (files, exhaustive) = matching_session_files(&session_dirs, session_id);
-        if files.is_empty() {
-            return if exhaustive {
-                Ok(())
-            } else {
-                Err(HarnessError::Protocol(
-                    "Could not verify that this OMP session is inactive, so it was not resumed."
+        let deadline = Instant::now() + Duration::from_secs(5);
+        #[cfg(unix)]
+        let mut verified = Vec::new();
+        loop {
+            match self.writer_state(file) {
+                SessionWriterState::Inactive => return Ok(()),
+                SessionWriterState::Unknown => return Err(HarnessError::Protocol(
+                    "Could not verify that this Crew session is inactive, so it was not resumed."
                         .into(),
-                ))
-            };
-        }
-        let mut state = SessionWriterState::Inactive;
-        for file in files {
-            match self.writer_state(&file) {
+                )),
                 SessionWriterState::Active => {
+                    #[cfg(unix)]
+                    if Instant::now() < deadline
+                        && let Some(supervisor) = self.supervisor_executable.as_deref()
+                        && let Some(writers) =
+                            teardown_writers(file, executable, supervisor, &verified)
+                    {
+                        verified = writers;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
                     return Err(HarnessError::SessionBusy {
-                        session_id: session_id.to_string(),
+                        session_id: session_id.to_owned(),
                     });
                 }
-                SessionWriterState::Unknown => state = SessionWriterState::Unknown,
-                SessionWriterState::Inactive => {}
             }
         }
-        if state == SessionWriterState::Unknown {
-            return Err(HarnessError::Protocol(
-                "Could not verify that this OMP session is inactive, so it was not resumed.".into(),
-            ));
-        }
-        Ok(())
     }
 
     fn resolve_executable(&self) -> Result<PathBuf, HarnessError> {
@@ -1687,7 +1981,7 @@ impl OmpHarness {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .kill_on_drop(!(supervised && self.supervisor_executable.is_some()));
         command
     }
 
@@ -1954,6 +2248,23 @@ fn models_from_catalog(bytes: &[u8]) -> Result<Vec<Model>, HarnessError> {
         .collect())
 }
 
+fn desktop_models(mut local: Vec<Model>) -> Vec<Model> {
+    #[derive(Deserialize)]
+    struct Catalog {
+        models: Vec<Model>,
+    }
+    let bundled: Catalog = serde_json::from_str(include_str!("scaffold-models.json"))
+        .expect("checked-in Scaffold model catalog must be valid");
+    let local_ids: HashSet<_> = local.iter().map(|model| model.id.as_str()).collect();
+    let defaults: Vec<_> = bundled
+        .models
+        .into_iter()
+        .filter(|model| !local_ids.contains(model.id.as_str()))
+        .collect();
+    local.extend(defaults);
+    local
+}
+
 #[async_trait]
 impl Harness for OmpHarness {
     fn id(&self) -> HarnessId {
@@ -1980,11 +2291,14 @@ impl Harness for OmpHarness {
             .session_dirs
             .clone()
             .unwrap_or_else(|| omp_session_dirs(self.scaffold_host));
-        let (files, exhaustive) = matching_session_files(&session_dirs, session_id);
-        if files.is_empty() || !exhaustive {
-            return Err(HarnessError::Protocol(
-                "Could not resolve the exact OMP session journal for takeover".into(),
-            ));
+        let (_, file) = resolve_session(&session_dirs, session_id)?;
+        let files = vec![file.ok_or_else(|| {
+            HarnessError::Protocol(
+                "Could not resolve the exact Crew session journal for takeover".into(),
+            )
+        })?];
+        if !session_has_writer(&files)? {
+            return Ok(());
         }
         let executable = self.resolve_executable()?;
         #[cfg(unix)]
@@ -2023,7 +2337,12 @@ impl Harness for OmpHarness {
                 &tail,
             )));
         }
-        models_from_catalog(&output.stdout)
+        let models = models_from_catalog(&output.stdout)?;
+        Ok(if self.scaffold_host {
+            models
+        } else {
+            desktop_models(models)
+        })
     }
 
     async fn commands(&self, cwd: &str) -> Result<Vec<HarnessCommand>, HarnessError> {
@@ -2064,7 +2383,7 @@ impl Harness for OmpHarness {
                 frames,
                 stderr_tail,
                 process_group: None,
-                process_group_guard: rpc_mode::ProcessGroupGuard::new(None),
+                process_group_guard: rpc_mode::ProcessGroupGuard::new(None, false),
                 run_config: None,
             },
             RPC_COMMAND_CATALOG_DEADLINE,
@@ -2094,8 +2413,39 @@ impl Harness for OmpHarness {
                 .unwrap_or_else(|| omp_session_dirs(self.scaffold_host));
             request.resume = Some(fork_session_file(&session_dirs, fork_from)?);
         }
-        self.ensure_resume_has_no_writer(request.resume.as_deref())?;
+        let session_dirs = self
+            .session_dirs
+            .clone()
+            .unwrap_or_else(|| omp_session_dirs(self.scaffold_host));
+        let resume_file = if let Some(resume) = request.resume.as_deref() {
+            let (id, file) = resolve_session(&session_dirs, resume)?;
+            request.resume = Some(id);
+            file
+        } else {
+            None
+        };
+        self.ensure_resume_has_no_writer(
+            request.resume.as_deref(),
+            resume_file.as_deref(),
+            &executable,
+        )
+        .await?;
+        // Native lookup gets the exact journal; the request and handshake retain
+        // its canonical header ID rather than comparing a path to a UUID.
+        let canonical_resume = request.resume.clone();
+        if let Some(file) = resume_file {
+            request.resume = Some(
+                file.to_str()
+                    .ok_or_else(|| {
+                        HarnessError::Protocol(
+                            "Crew session journal path is not valid UTF-8".into(),
+                        )
+                    })?
+                    .to_owned(),
+            );
+        }
         let mut command = self.run_command(&executable, &request);
+        request.resume = canonical_resume;
         let run_config = OmpRunConfig::create()?;
         run_config.apply(&mut command)?;
         crate::apply_run_context(&mut command, controls.context.as_ref());
@@ -2124,7 +2474,8 @@ impl Harness for OmpHarness {
         let process_group = child.id().map(|pid| pid as i32);
         #[cfg(not(unix))]
         let process_group = None;
-        let process_group_guard = rpc_mode::ProcessGroupGuard::new(process_group);
+        let process_group_guard =
+            rpc_mode::ProcessGroupGuard::new(process_group, self.supervisor_executable.is_some());
         let stdin = child
             .stdin
             .take()
@@ -4033,33 +4384,43 @@ mod tests {
     }
 
     #[test]
-    fn catalog_descriptions_do_not_claim_verified_availability() {
-        let models = models_from_catalog(
-            br#"{"models":[{"selector":"openai-codex/gpt-5.6-sol","name":"GPT-5.6 Sol","contextWindow":1000,"maxTokens":100,"thinking":[]}]}"#,
+    fn desktop_catalog_has_scaffold_defaults_without_local_credentials() {
+        let models = desktop_models(models_from_catalog(br#"{"models":[]}"#).unwrap());
+        assert!(
+            models
+                .iter()
+                .any(|model| model.id == "openai-codex/gpt-6-astra")
+        );
+        assert!(
+            models
+                .iter()
+                .any(|model| model.id == "anthropic/claude-fable-5-1")
+        );
+    }
+
+    #[test]
+    fn desktop_catalog_preserves_local_overrides_and_custom_models() {
+        let local = models_from_catalog(
+            br#"{"models":[
+            {"selector":"openai-codex/gpt-6-astra","name":"Local Astra","thinking":["xhigh"]},
+            {"selector":"custom/private","name":"Private model","thinking":[]}
+        ]}"#,
         )
         .unwrap();
-
-        for model in models {
-            assert!(
-                model
-                    .description
-                    .as_deref()
-                    .unwrap()
-                    .contains("does not verify run availability")
-                    || model
-                        .description
-                        .as_deref()
-                        .unwrap()
-                        .contains("run availability is not verified")
-            );
-            assert!(
-                model
-                    .description
-                    .as_deref()
-                    .unwrap()
-                    .contains("authorization")
-            );
-        }
+        let models = desktop_models(local.clone());
+        assert_eq!(&models[..2], local.as_slice());
+        assert_eq!(
+            models
+                .iter()
+                .filter(|model| model.id == local[0].id)
+                .count(),
+            1
+        );
+        assert!(
+            models
+                .iter()
+                .any(|model| model.id == "anthropic/claude-fable-5-1")
+        );
     }
 
     #[test]
@@ -4145,6 +4506,244 @@ mod tests {
 
         assert!(exhaustive);
         assert_eq!(matches, vec![expected]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess helper"]
+    fn recovery_engine_helper() {
+        use std::os::unix::process::CommandExt as _;
+        if std::env::var_os("CREW_TEST_JOURNAL").is_none() {
+            return;
+        }
+        let supervisor = ProcessCommand::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "omp::tests::recovery_supervisor_helper",
+            ])
+            .env("CREW_TEST_PARENT", std::process::id().to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        std::fs::write(
+            std::env::var_os("CREW_TEST_SUPERVISOR").unwrap(),
+            supervisor.id().to_string(),
+        )
+        .unwrap();
+        loop {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovery_supervisor_cleans_detached_tools_after_engine_death() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = temp.path().join("session.jsonl");
+        let ready = temp.path().join("ready");
+        let supervisor_file = temp.path().join("supervisor");
+        std::fs::write(
+            &journal,
+            "{\"type\":\"session\",\"id\":\"restart-session\"}\n",
+        )
+        .unwrap();
+        let mut engine = ProcessCommand::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "omp::tests::recovery_engine_helper"])
+            .env("CREW_TEST_JOURNAL", &journal)
+            .env("CREW_TEST_READY", &ready)
+            .env("CREW_TEST_SUPERVISOR", &supervisor_file)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(ready.exists(), "writer tool starts before engine restart");
+        let tool = std::fs::read_to_string(&ready)
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        let supervisor = std::fs::read_to_string(&supervisor_file)
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        let tool_birth = process_birth(tool).unwrap();
+        let supervisor_birth = process_birth(supervisor).unwrap();
+        // Give the guardian one scan to observe the detached descendant.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        engine.kill().unwrap();
+        engine.wait().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while (process_birth(tool).is_some() || process_birth(supervisor).is_some())
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let tool_stopped = process_birth(tool).as_ref() != Some(&tool_birth);
+        let supervisor_stopped = process_birth(supervisor).as_ref() != Some(&supervisor_birth);
+        signal_owned_process(tool, &tool_birth, libc::SIGKILL);
+        signal_owned_process(supervisor, &supervisor_birth, libc::SIGKILL);
+        assert!(
+            tool_stopped && supervisor_stopped,
+            "guardian and detached tool must exit after engine death"
+        );
+        assert_eq!(session_writer_state(&journal), SessionWriterState::Inactive);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess helper"]
+    fn recovery_supervisor_helper() {
+        let Ok(parent) = std::env::var("CREW_TEST_PARENT") else {
+            return;
+        };
+        run_omp_supervisor(
+            [
+                OsString::from(parent),
+                std::env::current_exe().unwrap().into_os_string(),
+                "--ignored".into(),
+                "--exact".into(),
+                "omp::tests::recovery_writer_helper".into(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess helper"]
+    fn recovery_writer_helper() {
+        use std::os::unix::process::CommandExt as _;
+        let Ok(path) = std::env::var("CREW_TEST_JOURNAL") else {
+            return;
+        };
+        let _journal = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        if std::env::var_os("CREW_TEST_TOOL").is_none() {
+            unsafe {
+                libc::signal(
+                    libc::SIGTERM,
+                    supervisor_stop as *const () as libc::sighandler_t,
+                );
+            }
+            ProcessCommand::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", "omp::tests::recovery_writer_helper"])
+                .env("CREW_TEST_TOOL", "1")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            while !SUPERVISOR_STOPPING.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            return;
+        }
+        unsafe {
+            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+        }
+        std::fs::write(
+            std::env::var_os("CREW_TEST_READY").unwrap(),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        loop {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovery_waits_for_supervisor_and_reaps_detached_writer_twice() {
+        use std::os::unix::process::CommandExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let journal = temp.path().join("session.jsonl");
+        std::fs::write(
+            &journal,
+            "{\"type\":\"session\",\"id\":\"recovery-session\"}\n",
+        )
+        .unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let harness = OmpHarness::new()
+            .with_executable(&executable)
+            .with_supervisor_executable(&executable);
+        for attempt in 0..2 {
+            let ready = temp.path().join(format!("ready-{attempt}"));
+            let mut supervisor = ProcessCommand::new(&executable)
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "omp::tests::recovery_supervisor_helper",
+                ])
+                .arg("--skip")
+                .arg(OMP_SUPERVISOR_MARKER)
+                .env("CREW_TEST_PARENT", std::process::id().to_string())
+                .env("CREW_TEST_JOURNAL", &journal)
+                .env("CREW_TEST_READY", &ready)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !ready.exists() && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert!(ready.exists(), "detached tool must start");
+            let tool = std::fs::read_to_string(&ready)
+                .unwrap()
+                .parse::<u32>()
+                .unwrap();
+            let tool_birth = process_birth(tool).unwrap();
+            let group = supervisor.id() as i32;
+            // A live owner must remain busy, not be waited out or stopped.
+            assert!(matches!(
+                harness
+                    .ensure_resume_has_no_writer(
+                        Some("recovery-session"),
+                        Some(&journal),
+                        &executable
+                    )
+                    .await,
+                Err(HarnessError::SessionBusy { .. })
+            ));
+            mark_group_stopping(group);
+            // Capture the exact writer identities before the root exits and its
+            // detached child is reparented. Subsequent probes retain birth proof.
+            let writers = teardown_writers(&journal, &executable, &executable, &[]).unwrap();
+            assert!(!writers.is_empty());
+            unsafe {
+                libc::kill(group, libc::SIGTERM);
+            }
+            let result = harness
+                .ensure_resume_has_no_writer(Some("recovery-session"), Some(&journal), &executable)
+                .await;
+            STOPPING_GROUPS.lock().remove(&group);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while supervisor.try_wait().unwrap().is_none() && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            let exited = supervisor.try_wait().unwrap().is_some();
+            let tool_stopped = process_birth(tool).as_ref() != Some(&tool_birth);
+            signal_owned_process(tool, &tool_birth, libc::SIGKILL);
+            if !exited {
+                let _ = supervisor.kill();
+            }
+            assert!(exited, "supervisor must exit after cleanup");
+            assert!(
+                result.is_ok(),
+                "verified teardown should permit resume: {result:?}"
+            );
+            assert_eq!(session_writer_state(&journal), SessionWriterState::Inactive);
+            assert!(
+                tool_stopped,
+                "detached writer must exit before takeover completes"
+            );
+        }
     }
 
     #[test]

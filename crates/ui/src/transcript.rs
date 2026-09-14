@@ -45,7 +45,7 @@ use crate::markdown::parser::{Block, BlockTree, IncrementalParser, parse_full};
 use crate::markdown::render::{self, RenderCache, RenderOptions};
 use crate::markdown::veil::RowVeil;
 use crate::motion::{self, AnimationExt as _, RESIZE};
-use crate::state::{AppState, TranscriptEntriesChange};
+use crate::state::{AppState, OmpRecoveryPhase, OmpRecoveryState, TranscriptEntriesChange};
 use crate::theme::Theme;
 
 // ---------------------------------------------------------------------------
@@ -440,7 +440,10 @@ pub fn rows_for_entry(
                 turn_start: true,
                 kind: RowKind::PeerMessage {
                     text: raw.into(),
-                    truncated: entry.parts.iter().any(|part| matches!(part, MessagePart::TextWindow { .. })),
+                    truncated: entry
+                        .parts
+                        .iter()
+                        .any(|part| matches!(part, MessagePart::TextWindow { .. })),
                 },
                 entry_id,
                 timestamp: Some(entry.created_at),
@@ -1049,7 +1052,10 @@ impl PeerMessageVisibility {
     fn body<'a>(&self, row: &'a Row) -> Option<&'a SharedString> {
         match &row.kind {
             RowKind::PeerMessage { text, .. }
-                if self.revealed.get(&row.id) == Some(&row.version) => Some(text),
+                if self.revealed.get(&row.id) == Some(&row.version) =>
+            {
+                Some(text)
+            }
             _ => None,
         }
     }
@@ -1065,7 +1071,8 @@ impl PeerMessageVisibility {
     fn retain_rows(&mut self, rows: &[Row]) {
         self.revealed.retain(|id, version| {
             rows.iter().any(|row| {
-                &row.id == id && row.version == *version
+                &row.id == id
+                    && row.version == *version
                     && matches!(&row.kind, RowKind::PeerMessage { .. })
             })
         });
@@ -1146,6 +1153,7 @@ pub struct Transcript {
     chat_id: Option<String>,
     /// Last app-state transcript revision reconciled into `rows`.
     state_revision: u64,
+    omp_recovery: Option<OmpRecoveryState>,
     row_cache: HashMap<String, CachedRows>,
     live_parsers: HashMap<String, IncrementalParser>,
     tree_cache: HashMap<String, (usize, Arc<BlockTree>)>,
@@ -1256,6 +1264,7 @@ impl Transcript {
             echo_row_counts: Vec::new(),
             chat_id: None,
             state_revision: u64::MAX,
+            omp_recovery: None,
             row_cache: HashMap::new(),
             live_parsers: HashMap::new(),
             tree_cache: HashMap::new(),
@@ -1679,9 +1688,19 @@ impl Transcript {
         let state = self.state.clone();
         let state = state.read(cx);
         let selected = state.selected_chat.clone();
+        let recovery = selected
+            .as_deref()
+            .and_then(|chat_id| state.omp_recovery(chat_id));
+        let recovery_changed = self.omp_recovery.as_ref() != recovery;
+        if recovery_changed {
+            self.omp_recovery = recovery.cloned();
+        }
         let attached = selected != self.chat_id;
         let revision = state.transcript_revision();
         if !attached && revision == self.state_revision {
+            if recovery_changed {
+                cx.notify();
+            }
             return;
         }
         let change = state.transcript_change().clone();
@@ -1866,14 +1885,19 @@ impl Transcript {
         }
 
         self.peer_visibility.retain_rows(&self.rows);
-        self.peer_message_details.retain(|id, _| self.peer_visibility.revealed.contains_key(id));
-        self.peer_message_loads.retain(|id, _| self.peer_visibility.revealed.contains_key(id));
+        self.peer_message_details
+            .retain(|id, _| self.peer_visibility.revealed.contains_key(id));
+        self.peer_message_loads
+            .retain(|id, _| self.peer_visibility.revealed.contains_key(id));
         let visibility_changed = self.peer_visibility.revealed.len() != revealed_before;
         if visibility_changed {
             crate::markdown::selection::clear();
             self.list.remeasure_items(0..self.rows.len());
         }
         if !changed && !visibility_changed {
+            if recovery_changed {
+                cx.notify();
+            }
             return;
         }
         if self.pinned {
@@ -2536,9 +2560,7 @@ impl Transcript {
                 }
                 column.into_any_element()
             }
-            RowKind::PeerMessage { .. } => {
-                self.render_peer_message(&row, &theme, cx)
-            }
+            RowKind::PeerMessage { .. } => self.render_peer_message(&row, &theme, cx),
             RowKind::Markdown { tree, block_ix } => {
                 let Some(top) = tree.blocks.get(*block_ix) else {
                     return gpui::Empty.into_any_element();
@@ -2649,24 +2671,7 @@ impl Transcript {
             RowKind::InputChip { header, resolved } => {
                 input_chip(header.clone(), *resolved, &theme)
             }
-            RowKind::ErrorChip { message } => {
-                let takeover = if is_omp_session_busy_error(message.as_ref()) {
-                    self.chat_id.clone().and_then(|chat_id| {
-                        let error_id = row.id.to_string();
-                        let state = self.state.read(cx);
-                        (!state.omp_takeover_completed(&error_id)).then(|| OmpTakeoverChip {
-                            chat_id,
-                            error_id: error_id.clone(),
-                            in_progress: state.omp_takeover_in_progress(&error_id),
-                            error: state.omp_takeover_error(&error_id).map(Into::into),
-                            state: self.state.clone(),
-                        })
-                    })
-                } else {
-                    None
-                };
-                error_chip(message.clone(), &theme, takeover, cx)
-            }
+            RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
         };
 
         // Hover-revealed timestamp strip (comet chat-view.tsx `Timestamp`):
@@ -2898,7 +2903,9 @@ impl Transcript {
     }
 
     fn load_peer_message(&mut self, row: &Row, cx: &mut Context<Self>) {
-        let Some(chat_id) = self.chat_id.clone() else { return; };
+        let Some(chat_id) = self.chat_id.clone() else {
+            return;
+        };
         let state = self.state.read(cx);
         let Some(engine) = state.engine().cloned() else {
             self.peer_message_details.insert(row.id.clone(), Err(()));
@@ -2919,25 +2926,43 @@ impl Transcript {
                     "roomProjection": projection,
                 }),
                 Duration::from_secs(20),
-            ).await;
-            let text = reply.ok()
+            )
+            .await;
+            let text = reply
+                .ok()
                 .and_then(|value| serde_json::from_value::<SessionMessageEntry>(value).ok())
                 .filter(|entry| entry.is_peer_message() && entry.id == message_id.as_ref())
-                .map(|entry| SharedString::from(entry.parts.into_iter().filter_map(|part| {
-                    if let MessagePart::Text { text, .. } = part { Some(text) } else { None }
-                }).collect::<Vec<_>>().join("\n\n")))
+                .map(|entry| {
+                    SharedString::from(
+                        entry
+                            .parts
+                            .into_iter()
+                            .filter_map(|part| {
+                                if let MessagePart::Text { text, .. } = part {
+                                    Some(text)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n\n"),
+                    )
+                })
                 .ok_or(());
             this.update(cx, |transcript, cx| {
                 if transcript.chat_id.as_deref() != Some(chat_id.as_str())
                     || transcript.peer_visibility.revealed.get(&id) != Some(&version)
-                { return; }
+                {
+                    return;
+                }
                 transcript.peer_message_loads.remove(&id);
                 transcript.peer_message_details.insert(id.clone(), text);
                 if let Some(ix) = transcript.rows.iter().position(|row| row.id == id) {
                     transcript.list.remeasure_items(ix..ix + 1);
                 }
                 cx.notify();
-            }).ok();
+            })
+            .ok();
         });
         self.peer_message_loads.insert(row.id.clone(), task);
     }
@@ -2950,11 +2975,20 @@ impl Transcript {
     ) -> AnyElement {
         let revealed = self.peer_visibility.body(row).cloned();
         let open = revealed.is_some();
-        let truncated = matches!(&row.kind, RowKind::PeerMessage { truncated: true, .. });
+        let truncated = matches!(
+            &row.kind,
+            RowKind::PeerMessage {
+                truncated: true,
+                ..
+            }
+        );
         let (body, feedback) = if open && truncated {
             match self.peer_message_details.get(&row.id) {
                 Some(Ok(text)) => (Some(text.clone()), None),
-                Some(Err(())) => (None, Some("Original message unavailable. Collapse and reveal to retry.")),
+                Some(Err(())) => (
+                    None,
+                    Some("Original message unavailable. Collapse and reveal to retry."),
+                ),
                 None => (None, Some("Loading original message…")),
             }
         } else {
@@ -2976,7 +3010,13 @@ impl Transcript {
                 if let Some(ix) = this.rows.iter().position(|row| row.id == toggle_id) {
                     this.peer_visibility.toggle(&this.rows[ix]);
                     if this.peer_visibility.body(&this.rows[ix]).is_some() {
-                        if matches!(&this.rows[ix].kind, RowKind::PeerMessage { truncated: true, .. }) {
+                        if matches!(
+                            &this.rows[ix].kind,
+                            RowKind::PeerMessage {
+                                truncated: true,
+                                ..
+                            }
+                        ) {
                             let row = this.rows[ix].clone();
                             this.load_peer_message(&row, cx);
                         }
@@ -3014,7 +3054,12 @@ impl Transcript {
             .flex_col()
             .child(header)
             .when_some(feedback, |el, feedback| {
-                el.child(div().text_size(px(12.0)).text_color(theme.text_muted).child(feedback))
+                el.child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .child(feedback),
+                )
             })
             .when_some(body, |el, text| {
                 el.child(
@@ -3378,37 +3423,16 @@ fn user_mention_text(
         .into_any_element()
 }
 
-fn is_omp_session_busy_error(message: &str) -> bool {
-    message.contains("OMP session is already running")
-}
-
-struct OmpTakeoverChip {
-    chat_id: String,
-    error_id: String,
-    in_progress: bool,
-    error: Option<SharedString>,
-    state: Entity<AppState>,
-}
-
 /// The transcript ErrorChip — an exact port of comet chat-view.tsx
 /// `ErrorChip`: a 34px row (`rounded-[10px] border border-red-400/[0.16]
 /// bg-red-400/[0.05] px-2 text-[12px]`) with a 20px red-washed tile holding a
 /// 12px DangerTriangle (`bg-red-400/[0.12] text-red-300/80`), a medium
 /// "Error" label, then the human message truncating at `text-foreground/80` —
 /// a subtle red-tinted wash, never a bare red-stroke box.
-fn error_chip(
-    message: SharedString,
-    theme: &Theme,
-    takeover: Option<OmpTakeoverChip>,
-    cx: &mut Context<Transcript>,
-) -> AnyElement {
+fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
     let red_300 = theme.danger_muted; // tailwind red-300
     let danger = theme.danger; // red-400
-    let visible_message = takeover
-        .as_ref()
-        .and_then(|takeover| takeover.error.clone())
-        .unwrap_or(message);
-    let mut chip = div()
+    let chip = div()
         .h(px(34.0))
         .w_full()
         .flex()
@@ -3449,47 +3473,80 @@ fn error_chip(
                 .flex_1()
                 .truncate()
                 .text_color(theme.text.opacity(0.8))
-                .child(visible_message),
+                .child(message),
         );
-    if let Some(takeover) = takeover {
-        let label = if takeover.in_progress {
-            "Stopping OMP…"
-        } else if takeover.error.is_some() {
-            "Retry takeover"
-        } else {
-            "Stop & resume in Comet"
-        };
-        let button_id = fnv1a(takeover.error_id.as_bytes());
-        let state = takeover.state.clone();
-        let chat_id = takeover.chat_id.clone();
-        let error_id = takeover.error_id.clone();
-        chip = chip.child(
-            div()
-                .id(("omp-takeover", button_id))
-                .flex_none()
-                .h(px(24.0))
-                .px(px(8.0))
-                .rounded(px(6.0))
-                .border_1()
-                .border_color(theme.accent.opacity(0.24))
-                .bg(theme.accent.opacity(0.1))
-                .text_color(theme.accent)
-                .flex()
-                .items_center()
-                .when(!takeover.in_progress, |button| {
-                    button
+    div().py(px(4.0)).w_full().child(chip).into_any_element()
+}
+
+/// Recovery is current engine state, never an action attached to old transcript errors.
+fn omp_recovery_banner(
+    chat_id: String,
+    recovery: &OmpRecoveryState,
+    state: Entity<AppState>,
+    theme: &Theme,
+    cx: &mut Context<Transcript>,
+) -> Option<AnyElement> {
+    let disconnected = recovery.watch_error.is_some();
+    if recovery.phase == OmpRecoveryPhase::Idle {
+        return None;
+    }
+    let label = if disconnected {
+        "Recovery status disconnected"
+    } else {
+        match recovery.phase {
+            OmpRecoveryPhase::Idle => return None,
+            OmpRecoveryPhase::Waiting => "Waiting for OMP…",
+            OmpRecoveryPhase::Stopping => "Stopping OMP…",
+            OmpRecoveryPhase::Resuming => "Resuming in Crew…",
+            OmpRecoveryPhase::Failed => "Crew could not recover this session",
+            OmpRecoveryPhase::Completed => "Session resumed in Crew",
+        }
+    };
+    let detail = recovery.watch_error.as_ref().or(recovery.error.as_ref());
+    let actionable = disconnected || recovery.can_take_over();
+    Some(
+        div()
+            .flex_none()
+            .mx(px(12.0))
+            .my(px(6.0))
+            .p(px(10.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(theme.accent.opacity(0.24))
+            .bg(theme.accent.opacity(0.08))
+            .text_size(px(12.0))
+            .text_color(theme.text)
+            .child(div().child(label))
+            .children(detail.map(|message| div().mt(px(4.0)).child(message.clone())))
+            .when(actionable, |banner| {
+                banner.child(
+                    div()
+                        .id("omp-recovery-action")
+                        .mt(px(6.0))
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .rounded(px(6.0))
+                        .text_color(theme.accent)
                         .cursor_pointer()
                         .hover(|button| button.bg(theme.accent.opacity(0.16)))
                         .on_click(cx.listener(move |_, _, _, cx| {
                             state.update(cx, |state, cx| {
-                                state.take_over_omp_session(chat_id.clone(), error_id.clone(), cx);
-                            })
+                                if disconnected {
+                                    state.watch_omp_recovery(&chat_id, cx);
+                                } else {
+                                    state.take_over_omp_session(chat_id.clone(), cx);
+                                }
+                            });
                         }))
-                })
-                .child(label),
-        );
-    }
-    div().py(px(4.0)).w_full().child(chip).into_any_element()
+                        .child(if disconnected {
+                            "Retry status"
+                        } else {
+                            "Stop & resume in Crew"
+                        }),
+                )
+            })
+            .into_any_element(),
+    )
 }
 
 /// A passive one-line chip marking a question the agent asked — the
@@ -3713,7 +3770,11 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
                 MessagePart::Text { text, .. } => {
                     acc.extend_from_slice(&fnv1a(text.as_bytes()).to_le_bytes());
                 }
-                MessagePart::TextWindow { text, omitted_prefix_bytes, .. } => {
+                MessagePart::TextWindow {
+                    text,
+                    omitted_prefix_bytes,
+                    ..
+                } => {
                     acc.extend_from_slice(&fnv1a(text.as_bytes()).to_le_bytes());
                     acc.extend_from_slice(&omitted_prefix_bytes.to_le_bytes());
                 }
@@ -3764,6 +3825,14 @@ impl Render for Transcript {
             });
         }
         let rail = self.render_rail(cx);
+        let theme = Theme::of(cx).clone();
+        let recovery_banner = self
+            .chat_id
+            .clone()
+            .zip(self.omp_recovery.clone())
+            .and_then(|(chat_id, recovery)| {
+                omp_recovery_banner(chat_id, &recovery, self.state.clone(), &theme, cx)
+            });
         // The scroll-to-bottom pill is rendered by the SHELL (conversation
         // region overlay): it must float just above the composer and paint
         // OVER the bottom fade gradient, which is a later sibling of this
@@ -3771,6 +3840,8 @@ impl Render for Transcript {
         let root = div()
             .relative()
             .size_full()
+            .flex()
+            .flex_col()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseDownEvent, window, _| {
@@ -3825,13 +3896,16 @@ impl Render for Transcript {
                 }),
             )
             .min_h_0()
+            .children(recovery_banner)
             // FIRST child ⇒ paints first: clears the frame's markdown text-
             // selection registry before any row's text elements re-register
             // (document paint order = selection order; see markdown/render.rs).
             .child(crate::markdown::render::selection_frame_reset())
             .child(
                 list(self.list.clone(), cx.processor(Self::render_row))
-                    .size_full()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
                     .with_sizing_behavior(gpui::ListSizingBehavior::Auto),
             )
             .child(crate::markdown::render::selection_frame_finalize())
@@ -3941,17 +4015,6 @@ mod tests {
         );
         assert_eq!(rows[1].identity(), first_identity);
         assert_eq!(rows[2].identity(), tail_identity);
-    }
-
-    #[test]
-    fn only_omp_busy_errors_offer_takeover() {
-        assert!(is_omp_session_busy_error(
-            "harness protocol error: This OMP session is already running. Close it before resuming here."
-        ));
-        assert!(is_omp_session_busy_error(
-            "This OMP session is already running. Stop it before resuming in Comet."
-        ));
-        assert!(!is_omp_session_busy_error("OMP exited with status 1"));
     }
 
     // ---- streaming parse wiring (the transcript side, not the parser) ----
@@ -4414,7 +4477,11 @@ mod tests {
     }
 
     fn peer_entry(text: &str) -> SessionMessageEntry {
-        let mut entry = assistant("peer-command", MessageStatus::Complete, vec![text_part("t0", text)]);
+        let mut entry = assistant(
+            "peer-command",
+            MessageStatus::Complete,
+            vec![text_part("t0", text)],
+        );
         entry.role = MessageRole::User;
         entry.peer_message = Some(comet_proto::PeerMessageProvenance {
             command_id: entry.id.clone(),
@@ -4440,7 +4507,10 @@ mod tests {
         let mut visibility = PeerMessageVisibility::default();
         assert!(visibility.body(&rows[0]).is_none());
         visibility.toggle(&rows[0]);
-        assert_eq!(visibility.body(&rows[0]).map(|text| text.as_ref()), Some(raw.as_str()));
+        assert_eq!(
+            visibility.body(&rows[0]).map(|text| text.as_ref()),
+            Some(raw.as_str())
+        );
         visibility.toggle(&rows[0]);
         assert!(visibility.body(&rows[0]).is_none());
     }
@@ -4470,11 +4540,15 @@ mod tests {
         let mut entry = peer_entry(text);
         entry.peer_message = None;
         let ordinary = rows_for_entry(&entry, false, &mut parse);
-        assert!(matches!(&ordinary[0].kind, RowKind::User { text: body, .. } if body.as_ref() == text));
+        assert!(
+            matches!(&ordinary[0].kind, RowKind::User { text: body, .. } if body.as_ref() == text)
+        );
         entry = peer_entry(text);
         entry.peer_message.as_mut().unwrap().command_id = "different".into();
         let invalid = rows_for_entry(&entry, false, &mut parse);
-        assert!(matches!(&invalid[0].kind, RowKind::User { text: body, .. } if body.as_ref() == text));
+        assert!(
+            matches!(&invalid[0].kind, RowKind::User { text: body, .. } if body.as_ref() == text)
+        );
         entry = peer_entry(text);
         let peer = rows_for_entry(&entry, false, &mut parse);
         assert!(diff_rows(&ordinary, &peer).is_some());
@@ -4613,11 +4687,19 @@ mod tests {
         // the row so its click target is rebuilt rather than left stale.
         entry.parts = vec![text_part("t0", &raw.replace("crates/ui/", "crates/ux/"))];
         let replaced = rows_for_entry(&entry, false, &mut parse);
-        let RowKind::User { text: replaced_text, mentions: replaced_mentions, .. } = &replaced[0].kind else {
+        let RowKind::User {
+            text: replaced_text,
+            mentions: replaced_mentions,
+            ..
+        } = &replaced[0].kind
+        else {
             panic!("expected a user row");
         };
         assert_eq!(replaced_text, text);
-        assert_eq!(replaced_mentions[0].path.as_ref(), "crates/ux/src/composer.rs");
+        assert_eq!(
+            replaced_mentions[0].path.as_ref(),
+            "crates/ux/src/composer.rs"
+        );
         assert_eq!(diff_rows(&rows, &replaced), Some((0..1, 1)));
 
         entry.parts = vec![text_part("t0", "no mentions here")];

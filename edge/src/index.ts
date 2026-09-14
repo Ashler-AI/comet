@@ -208,8 +208,8 @@ export default {
     }
 
 
-    // A sandbox credential is a single-session, single-device host identity.
-    // Every route must opt in below; project-wide resources deny by default.
+    // Sandbox credentials share their project workspace but remain scoped to
+    // one session and device; other routes must opt in below.
     const deviceCredential = identity.credential === "device";
 
     if (url.pathname === "/notifications/device") {
@@ -259,7 +259,6 @@ export default {
 
     if (parts[0] === "workspace" && parts[1] && ID_RE.test(parts[1])) {
       if (
-        deviceCredential ||
         parts[1] !== identity.projectScope ||
         !hasCapability(identity, "session.read")
       ) {
@@ -273,7 +272,7 @@ export default {
       if (parts[2] === "tail" && request.method === "GET") return forward(env.SESSION_ROOMS, room, request, identity, "/tail", "", "workspace");
       if (parts[2] === "stats" && request.method === "GET") return forward(env.SESSION_ROOMS, room, request, identity, "/stats", "", "workspace");
       if (parts[2] === "reset-log" && request.method === "POST") {
-        if (!hasCapability(identity, "session.control")) return json({ error: "forbidden" }, 403);
+        if (deviceCredential || !hasCapability(identity, "session.control")) return json({ error: "forbidden" }, 403);
         return forward(env.SESSION_ROOMS, room, request, identity, "/reset-log", "", "workspace");
       }
     }

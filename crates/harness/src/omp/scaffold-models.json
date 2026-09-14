@@ -1,0 +1,145 @@
+{
+  "source": {
+    "repository": "Ashler-AI/ashler-platform",
+    "revision": "a9d27fc871877242952bded20136bf44f8679139",
+    "path": "internal/scaffold/control-plane/worker/src/omp-auth-broker.ts"
+  },
+  "models": [
+    {
+      "id": "openai-codex/gpt-6-astra",
+      "label": "gpt-6-astra",
+      "description": "Scaffold model · account access checked when starting a run",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    {
+      "id": "openai-codex/gpt-5.6-terra",
+      "label": "gpt-5.6-terra",
+      "description": "Scaffold model · account access checked when starting a run",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    {
+      "id": "openai-codex/gpt-5.6-sol",
+      "label": "gpt-5.6-sol",
+      "description": "Scaffold model · account access checked when starting a run",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    {
+      "id": "openai-codex/gpt-5.6-luna",
+      "label": "gpt-5.6-luna",
+      "description": "Scaffold model · account access checked when starting a run",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    {
+      "id": "openai-codex/gpt-5.3-codex-spark",
+      "label": "gpt-5.3-codex-spark",
+      "description": "Scaffold model · account access checked when starting a run",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    {
+      "id": "anthropic/claude-opus-4-6",
+      "label": "claude-opus-4-6",
+      "description": "Scaffold model · account access checked when starting a run",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    {
+      "id": "anthropic/claude-sonnet-4-6",
+      "label": "claude-sonnet-4-6",
+      "description": "Scaffold model · account access checked when starting a run",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    {
+      "id": "anthropic/claude-opus-4-7",
+      "label": "claude-opus-4-7",
+      "description": "Scaffold model · account access checked when starting a run",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    {
+      "id": "anthropic/claude-haiku-4-5",
+      "label": "claude-haiku-4-5",
+      "description": "Scaffold model · account access checked when starting a run",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    {
+      "id": "anthropic/claude-3-5-sonnet",
+      "label": "claude-3-5-sonnet",
+      "description": "Scaffold model · account access checked when starting a run",
+      "reasoningLevels": []
+    },
+    {
+      "id": "anthropic/claude-opus-4-5",
+      "label": "claude-opus-4-5",
+      "description": "Scaffold model · account access checked when starting a run",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    {
+      "id": "anthropic/claude-opus-4-8",
+      "label": "claude-opus-4-8",
+      "description": "Scaffold model · account access checked when starting a run",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    {
+      "id": "anthropic/claude-opus-5",
+      "label": "claude-opus-5",
+      "description": "Scaffold model · account access checked when starting a run",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    {
+      "id": "anthropic/claude-fable-5-1",
+      "label": "claude-fable-5-1",
+      "description": "Scaffold model · account access checked when starting a run",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high"
+      ]
+    }
+  ]
+}

@@ -8,6 +8,12 @@ Crew is Ashler's internal, multi-device controller for coding-agent sessions. Th
 Scaffold sandbox: empty and active conversation states, streamed messages, tool
 details, model/reasoning selection, attachments, input answers, and send/steer/stop.
 It deliberately has no session creation, session list, settings, or checkout controls.
+User messages are right-aligned; Crew responses remain left-aligned. **Open in Crew**
+continues the assigned session in the installed desktop or mobile app using a
+credential-free, deployment-specific link. The app authenticates the attachment
+with its own identity; execution stays in Scaffold. Mobile currently requires an
+online desktop Crew controller. This is not a transfer of execution or files onto
+the local device, and requires app builds containing the new Scaffold link handler.
 
 The dependency-free Node service connects to the assigned engine's loopback IPC.
 Scaffold's authenticated attach proxy supplies a dedicated server-side credential;
@@ -38,6 +44,92 @@ assets, selecting its verified release tuple in the platform repository, rebuild
 the sandbox image, and deploying the coordinated provider/control-plane changes.
 Existing images are not upgraded by editing this repository. No rollout is implied
 by the presence of this code.
+
+## Crew 0.1.103 OMP model discovery
+
+Desktop OMP catalogs now include Scaffold's shared model roster even when local
+OMP has no provider credentials. Local entries retain their labels, reasoning
+options, and precedence; custom providers remain selectable. Mobile consumes
+the same host `ListModels` response. Scaffold hosts keep their authority-scoped
+catalog, and every run still passes the existing Agent Auth checks.
+
+The bundled `crates/harness/src/omp/scaffold-models.json` is generated from the
+canonical Platform `ompInferenceModelCatalog`, with its source commit recorded
+in the file. It is a release snapshot, not a live availability promise. Refresh
+it with `node scripts/sync-omp-model-catalog.mjs <platform commit SHA>`; do not
+hand-edit the model list. Unknown source formats fail regeneration.
+
+Catalog regressions cover credential-free defaults, local overrides/custom
+providers, deduplication, and preservation of the Scaffold-scoped catalog.
+
+## Crew 0.1.102 restart recovery
+
+Crew preserves the exact interrupted request and native OMP session across a
+planned restart, including attachments, model options, and the original user
+message ID. Shutdown closes admission before draining owned runtimes. Completed
+requests carry a durable retirement marker so another restart cannot replay them.
+
+OMP journal paths and session IDs resolve to the same canonical native identity.
+Resume waits briefly for verified Crew-owned teardown; unrelated writers remain
+blocked. Explicit takeover survives another restart, is safe to retry, and resumes
+without stopping anything when the original writer has already exited. Native
+identity and process ownership checks remain fail-closed.
+
+The desktop shows current waiting, stopping, resuming, failed, and completed
+recovery states. Recovery actions no longer depend on historical error text.
+Detached tools are cleaned up only when their ancestry and process birth identity
+were observed; an unprovable orphan is not automatically killed.
+
+This release changes the desktop and Linux runtime without changing the Scaffold
+runtime compatibility contract. Publication does not upgrade existing sandboxes.
+
+[Linux and macOS verification](https://github.com/Ashler-AI/comet/actions/runs/34902878407)
+passed for `dc6725992beb312f134607c0bc0bfd5b8a6c10b0`, including real supervisor
+process cleanup, two consecutive active-turn restarts, retired-request replay
+prevention, 547 desktop tests, and isolated native CLI restart smoke checks.
+Local release-contract checks passed 31 tests; local typechecks were intentionally
+not run.
+
+[Staging publication](https://github.com/Ashler-AI/comet/actions/runs/34903937027)
+published 0.1.102 from merged `e57761d`. Downloaded desktop checksums, strict
+signature validation, and Gatekeeper acceptance passed. An isolated signed-client
+smoke displayed the actionable recovery failure banner; the live staging updater
+reported 0.1.102 available. Production publication was not requested.
+
+## Crew 0.1.99 release
+
+Source `4b4b7bcd12ba90780f89c6c8e9488cc86730838b` is merged into `main`.
+[Staging release](https://github.com/Ashler-AI/comet/actions/runs/34772456440)
+built and verified the desktop and Linux artifacts; [production promotion](https://github.com/Ashler-AI/comet/actions/runs/34773638162)
+reused the exact candidate and passed both channel readbacks. Standalone Crew
+Staging.app is included in the build's separate staging artifact.
+
+Scaffold [PR #6330](https://github.com/Ashler-AI/ashler-platform/pull/6330) merged
+the Anthropic credential projection fix and native-open list action. Its
+[staging rollout](https://github.com/Ashler-AI/ashler-platform/actions/runs/34773638333)
+and [primary rollout](https://github.com/Ashler-AI/ashler-platform/actions/runs/34774708243)
+passed sandbox-provider verification and promotion. Effective and fallback pins
+select 0.1.99; Linux x86_64 SHA-256 is
+`620fcb8b3858410114a5342a88977f526956a431e8edacb3a4a0649cf4eb748e`.
+Existing running sandboxes are not claimed to have been restarted or upgraded.
+
+Mobile [staging 1.0 (21)](https://github.com/Ashler-AI/comet/actions/runs/34772456221)
+and [production 1.0 (15)](https://github.com/Ashler-AI/comet/actions/runs/34772456098)
+passed simulator and archive verification; downloaded checksums and source
+provenance match. Both were subsequently distribution-exported and uploaded on
+2026-09-13 for internal TestFlight only, without local compilation. Apple accepted
+staging upload `eabb0795-1470-4c17-9705-ea2f00bfc2bc` and production upload
+`af77bb1d-2dfd-413c-87fa-ef983f0aeaac`; both entered processing. Inspection and
+exact uploaded IPAs passed strict deep signature verification. Uploaded SHA-256:
+
+- Staging: `e976185e6544632e0c04e0363a5b45f0de50515d85f351efe73dc667215b0fe0`
+- Production: `acafadc2c4f95fc67418123dbf8cb64d466fc3b803c0b1cfc4688fdf868e2a7c`
+
+Authenticated App Store Connect readback confirmed both uploads **Complete** and
+both builds **Testing**, internal-only, in their existing **Ashler Internal**
+groups (staging: one invite; production: two). No tester groups were changed.
+Device installation, notification receipt, native URL launch on installed devices,
+and live Anthropic completion remain unverified; local typechecks were not run.
 
 ## Crew 0.1.90 release
 
@@ -182,6 +274,16 @@ attach its host, transfer OMP history and the worktree, then queue the task in a
 distinct Crew chat. The receipt contains `chatId`, `sandboxId`, `commandId`, and
 `environment`; it confirms command admission, not remote task completion.
 Monitor the returned chat in Crew, not standalone `handoff.*` lifecycle tools.
+
+Handoff chats publish running, waiting, and terminal status under their chat ID,
+including follow-up turns. Mobile follow-ups use a desktop controller, not the
+ephemeral sandbox host: attachment resumes a paused sandbox and confirms its
+current host authority before admitting the message. A reachable desktop
+controller is required.
+On the next command after an epoch change, the sandbox host transfers prior
+session ownership only with a live, edge-verified grant for the same sandbox,
+room, and principal. Queue, steer, and peer-message continuations do not
+require another Start command to restore status publication.
 
 Native transfer reads the sandbox checkout's exact HEAD before capture. When it
 is a known source ancestor and the only bundle boundary, the archive contains only
@@ -421,6 +523,17 @@ CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... npx wrangler deploy --env sta
 Never reuse production credentials for the staging command.
 
 ## Release
+
+Crew **0.1.101** ships the expanded 1,536-name AEC worktree pool and exhaustive
+allocation from merged source `64913c5019ee28e98f4abd411f9990bbee863676`.
+[Build and staging publication](https://github.com/Ashler-AI/comet/actions/runs/34877909631)
+passed the desktop/runtime tests and produced notarized Crew and Crew Staging apps.
+[Production promotion](https://github.com/Ashler-AI/comet/actions/runs/34880371590)
+reused the exact candidate and verified published desktop and Scaffold channels.
+Both downloaded macOS distributions passed checksum, strict signature, stapler,
+and Gatekeeper checks. Mobile staging **1.0 (22)** and production **1.0 (16)** are
+available through their existing internal TestFlight groups; see
+[mobile release evidence](apps/ios/README.md#crew-01101-upload-evidence).
 
 Manual releases choose an explicit surface:
 

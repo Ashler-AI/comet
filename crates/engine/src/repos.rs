@@ -36,12 +36,46 @@ const FILE_SEARCH_MAX_RESULTS: usize = 8;
 const FILE_SEARCH_TIMEOUT: Duration = Duration::from_secs(6);
 
 const ADJECTIVES: &[&str] = &[
-    "swift", "calm", "bright", "bold", "keen", "brave", "clever", "lucky", "quiet", "warm", "cool",
-    "sharp", "gentle", "vivid", "amber", "cobalt",
+    "swift",
+    "calm",
+    "bright",
+    "bold",
+    "keen",
+    "brave",
+    "clever",
+    "lucky",
+    "quiet",
+    "warm",
+    "cool",
+    "sharp",
+    "gentle",
+    "vivid",
+    "amber",
+    "cobalt",
+    "arched",
+    "braced",
+    "cantilevered",
+    "chamfered",
+    "coffered",
+    "fluted",
+    "framed",
+    "gabled",
+    "glazed",
+    "grooved",
+    "loadbearing",
+    "modular",
+    "pitched",
+    "precast",
+    "ribbed",
+    "vaulted",
 ];
 const NOUNS: &[&str] = &[
     "otter", "harbor", "falcon", "cedar", "meadow", "comet", "delta", "ember", "lynx", "maple",
-    "onyx", "quartz", "raven", "summit", "willow", "aspen",
+    "onyx", "quartz", "raven", "summit", "willow", "aspen", "atrium", "beam", "belfry", "brace",
+    "buttress", "canopy", "column", "cornice", "dome", "facade", "footing", "girder", "joist",
+    "lintel", "mullion", "parapet", "pavilion", "pilaster", "plinth", "portal", "rafter", "ramp",
+    "ridge", "skylight", "soffit", "spire", "stair", "terrace", "truss", "vault", "viaduct",
+    "wing",
 ];
 
 /// Canonical identity shared by every chat operating in this exact worktree.
@@ -554,23 +588,20 @@ impl Repos {
         let base = self.inner.worktrees_root.join(&repo_name);
         std::fs::create_dir_all(&base)?;
         // Auto-generate a name colliding with neither an existing dir nor branch.
-        let existing: HashSet<String> = self
-            .branches(repo_path)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
+        let existing: HashSet<String> = self.branches(repo_path).await?.into_iter().collect();
         let mut name = None;
-        for attempt in 0..50u64 {
-            let seed = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos() as u64)
-                .unwrap_or(attempt)
-                .wrapping_add(attempt.wrapping_mul(0x9E37_79B9));
+        let capacity = ADJECTIVES.len() * NOUNS.len();
+        let start = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as usize % capacity)
+            .unwrap_or(0);
+        // Visit every pair once; collisions must not cause false exhaustion.
+        for attempt in 0..capacity {
+            let index = (start + attempt) % capacity;
             let candidate = format!(
                 "{}-{}",
-                ADJECTIVES[(seed % ADJECTIVES.len() as u64) as usize],
-                NOUNS[((seed / 31) % NOUNS.len() as u64) as usize]
+                ADJECTIVES[index / NOUNS.len()],
+                NOUNS[index % NOUNS.len()]
             );
             if !base.join(&candidate).exists() && !existing.contains(&format!("comet/{candidate}"))
             {
@@ -1096,6 +1127,64 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn worktree_allocation_uses_last_available_name() {
+        let data = tempfile::tempdir().unwrap();
+        let repo = data.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "seed",
+            ],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&repo)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let worktrees = data.path().join("worktrees");
+        let base = worktrees.join("repo");
+        let available = format!("{}-{}", ADJECTIVES.last().unwrap(), NOUNS.last().unwrap());
+        let mut names = HashSet::new();
+        for adjective in ADJECTIVES {
+            for noun in NOUNS {
+                let name = format!("{adjective}-{noun}");
+                assert!(names.insert(name.clone()));
+                if name != available {
+                    std::fs::create_dir_all(base.join(name)).unwrap();
+                }
+            }
+        }
+        assert!(names.len() > 1000);
+        let repos = Repos::with_worktrees_root(data.path(), "device", worktrees);
+        let worktree = repos.create_worktree(&repo, "main").await.unwrap();
+        assert_eq!(worktree.name, available);
+        assert_eq!(
+            repos
+                .current_branch(Path::new(&worktree.path))
+                .await
+                .unwrap(),
+            worktree.branch
+        );
+        assert!(repos.create_worktree(&repo, "main").await.is_err());
+    }
 
     #[test]
     fn fuzzy_score_matches_a_path_subsequence() {

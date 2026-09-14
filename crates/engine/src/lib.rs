@@ -268,11 +268,7 @@ impl EngineCore {
                 platform: std::env::consts::OS.to_string(),
                 project_scope: context.project_scope.to_string(),
                 user_id: context.user_id.to_string(),
-                edge: context
-                    .runtime_profile
-                    .allows_workspace_room()
-                    .then(|| edge.clone())
-                    .flatten(),
+                edge: edge.clone(),
             },
             &journal,
         )?;
@@ -629,6 +625,10 @@ impl Engine {
                         .unwrap_or_else(|| project_scope.clone()),
                 ),
             );
+        }
+        // Auth-bound restart requests must wait for both identity and inference routing.
+        if let Err(error) = core.sessions.recover_stale() {
+            tracing::error!(%error, "authenticated Crew recovery failed");
         }
         // Release checker: polls {edge}/releases on a 6h cadence; headless
         // installs with COMET_AUTO_UPDATE=1 apply + restart themselves — gated

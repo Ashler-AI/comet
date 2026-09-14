@@ -218,7 +218,7 @@ fn main() -> anyhow::Result<()> {
     let initial_url = args
         .get(1)
         .and_then(|value| value.to_str())
-        .filter(|value| value.starts_with("comet://invite/"))
+        .filter(|value| value.starts_with("comet://") || value.starts_with("comet-staging://"))
         .map(str::to_owned);
     if initial_url.is_some() {
         args.remove(1);
