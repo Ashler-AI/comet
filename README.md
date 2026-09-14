@@ -468,6 +468,17 @@ Never reuse production credentials for the staging command.
 
 ## Release
 
+Crew **0.1.101** ships the expanded 1,536-name AEC worktree pool and exhaustive
+allocation from merged source `64913c5019ee28e98f4abd411f9990bbee863676`.
+[Build and staging publication](https://github.com/Ashler-AI/comet/actions/runs/34877909631)
+passed the desktop/runtime tests and produced notarized Crew and Crew Staging apps.
+[Production promotion](https://github.com/Ashler-AI/comet/actions/runs/34880371590)
+reused the exact candidate and verified published desktop and Scaffold channels.
+Both downloaded macOS distributions passed checksum, strict signature, stapler,
+and Gatekeeper checks. Mobile staging **1.0 (22)** and production **1.0 (16)** are
+available through their existing internal TestFlight groups; see
+[mobile release evidence](apps/ios/README.md#crew-01101-upload-evidence).
+
 Manual releases choose an explicit surface:
 
 - `desktop` builds and promotes only `comet-<version>-macos-arm64.dmg` and the macOS app tarball. It advances `desktop-manifest.json` and `desktop-latest.txt` only.

@@ -31,11 +31,11 @@ Production and staging use the same Swift target with separate checked-in scheme
 bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
 
 ```sh
-# Crew 0.1.99 production candidate: Crew, ai.ashler.crew, version 1.0 build 15
+# Crew 0.1.101 production: Crew, ai.ashler.crew, version 1.0 build 16
 xcodebuild -project Comet.xcodeproj -scheme Comet \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 
-# Crew 0.1.99 staging candidate: Crew Staging, ai.ashler.crew.staging, version 1.0 build 21
+# Crew 0.1.101 staging: Crew Staging, ai.ashler.crew.staging, version 1.0 build 22
 xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 ```
@@ -65,8 +65,8 @@ The artifact `crew-mobile-<environment>-<source SHA>` contains:
 
 | Environment | Device archive | Simulator app package |
 | --- | --- | --- |
-| staging | `Crew-Staging-1.0-21-unsigned.xcarchive.tar.gz` | `Crew-Staging-1.0-21-simulator-arm64.tar.gz` |
-| production | `Crew-1.0-15-unsigned.xcarchive.tar.gz` | `Crew-1.0-15-simulator-arm64.tar.gz` |
+| staging | `Crew-Staging-1.0-22-unsigned.xcarchive.tar.gz` | `Crew-Staging-1.0-22-simulator-arm64.tar.gz` |
+| production | `Crew-1.0-16-unsigned.xcarchive.tar.gz` | `Crew-1.0-16-simulator-arm64.tar.gz` |
 
 Both also include `SHA256SUMS`, `source-sha.txt`, `provenance.json`, `e2e.log`,
 and `archive-signed.entitlements`. Artifacts originate in
@@ -91,6 +91,23 @@ produce these build candidates.
 `native-verification.yml` is a separate Rust/desktop verification workflow. It
 has no dispatch inputs and runs only on pushes to `verify/native-lifecycle-*`
 or `verify/native-startup-*`; it neither creates nor signs mobile archives.
+
+### Crew 0.1.101 upload evidence
+
+Source `64913c5019ee28e98f4abd411f9990bbee863676` passed
+[staging CI](https://github.com/Ashler-AI/comet/actions/runs/34877909744) and
+[production CI](https://github.com/Ashler-AI/comet/actions/runs/34877912710).
+Staging **1.0 (22)** and production **1.0 (16)** were exported without local
+compilation, verified against archive checksums/provenance, and uploaded with
+internal-only distribution. Both exact uploaded IPAs passed strict deep signature,
+bundle/build, provisioning-profile, and production APNs entitlement checks.
+
+Apple accepted staging upload `56284ce6-8dab-4daf-ba90-d37e67592194` and production
+upload `322eb427-c5cc-473f-aceb-e1e07a968e25`. Authenticated readback confirmed
+`COMPLETE`, `VALID`, `IN_BETA_TESTING`, and access through each existing
+**Ashler Internal** group, with no processing errors or warnings. No membership
+changes or public App Store submissions occurred. Notification receipt and
+physical-device installation were not verified.
 
 ### Crew 0.1.90 upload evidence
 
