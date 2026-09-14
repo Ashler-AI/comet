@@ -377,7 +377,6 @@ fn configure_scaffold_inference_profile_at(
     Ok(())
 }
 
-const OMP_SESSION_DIRECTORY_SCAN_LIMIT: usize = 10_000;
 const OMP_SESSION_HEADER_BYTES: u64 = 64 * 1024;
 
 fn acp_assistant_message_id(session_id: &str, run_nonce: &uuid::Uuid, turn_number: u64) -> String {
@@ -1164,38 +1163,27 @@ fn session_file_has_id(path: &Path, session_id: &str) -> bool {
 }
 
 fn matching_session_files(session_dirs: &[PathBuf], session_id: &str) -> (Vec<PathBuf>, bool) {
-    matching_session_files_with_limit(session_dirs, session_id, OMP_SESSION_DIRECTORY_SCAN_LIMIT)
-}
-
-fn matching_session_files_with_limit(
-    session_dirs: &[PathBuf],
-    session_id: &str,
-    directory_limit: usize,
-) -> (Vec<PathBuf>, bool) {
     let direct = Path::new(session_id);
     if direct.is_file() {
         return (vec![direct.to_path_buf()], true);
     }
 
-    // Bound directory traversal, not directory entries. OMP keeps many session
-    // journals beside a small number of cwd directories, so counting files can
-    // exhaust the budget before reaching the directory that owns the requested
-    // session. Every regular file in each visited directory must remain
-    // eligible for an exact header match.
+    // Scan the complete local store: accumulated session artifacts must not make
+    // an otherwise unique journal unresolvable. Entry types do not follow symlinks.
     let mut pending: VecDeque<PathBuf> = session_dirs.iter().cloned().collect();
-    let mut visited_directories = 0;
     let mut matches = Vec::new();
     while let Some(dir) = pending.pop_front() {
-        if visited_directories >= directory_limit {
-            return (matches, false);
-        }
-        visited_directories += 1;
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return (matches, false),
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return (matches, false);
+            };
             let Ok(file_type) = entry.file_type() else {
-                continue;
+                return (matches, false);
             };
             let path = entry.path();
             if file_type.is_dir() {
@@ -1800,7 +1788,9 @@ fn omp_config_command(cwd: &str) -> Result<Command, HarnessError> {
 async fn run_omp_config(cwd: &str, args: &[&str]) -> Result<Value, HarnessError> {
     let output = omp_config_command(cwd)?
         .env("ASHLER_INCREMENTAL_TSC_CHECKS", "false")
-        .args(args).output().await?;
+        .args(args)
+        .output()
+        .await?;
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(HarnessError::Protocol(if message.is_empty() {
@@ -3646,7 +3636,9 @@ mod tests {
         );
 
         assert_eq!(
-            scaffold_inference_profile_at(runtime_dir.path()).unwrap().model,
+            scaffold_inference_profile_at(runtime_dir.path())
+                .unwrap()
+                .model,
             "scaffold-openai/gpt-5.6-sol"
         );
         std::fs::write(
@@ -4133,13 +4125,13 @@ mod tests {
     }
 
     #[test]
-    fn session_matcher_does_not_spend_directory_budget_on_journals() {
+    fn session_matcher_resolves_journals_in_large_stores() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("sessions");
         let cwd_dir = root.join("workspace");
         std::fs::create_dir_all(&cwd_dir).unwrap();
-        for index in 0..4 {
-            std::fs::write(root.join(format!("unrelated-{index}.jsonl")), "{}\n").unwrap();
+        for index in 0..10_001 {
+            std::fs::create_dir(root.join(format!("artifact-{index}"))).unwrap();
         }
         let session_id = "019fc051-d259-7000-992c-40d61e37b213";
         let expected = cwd_dir.join(format!("timestamp_{session_id}.jsonl"));
@@ -4149,8 +4141,7 @@ mod tests {
         )
         .unwrap();
 
-        let (matches, exhaustive) =
-            matching_session_files_with_limit(std::slice::from_ref(&root), session_id, 2);
+        let (matches, exhaustive) = matching_session_files(std::slice::from_ref(&root), session_id);
 
         assert!(exhaustive);
         assert_eq!(matches, vec![expected]);

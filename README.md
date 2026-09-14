@@ -123,6 +123,11 @@ comet update
 comet daemon start|stop|restart|status
 ```
 
+OMP journal lookup scans the complete configured session store without a directory-count
+cutoff. Large stores must not block resume, takeover, or fork merely because accumulated
+session artifacts exceed 10,000 directories. Filesystem scan failures still prevent an
+incomplete lookup from being treated as exhaustive.
+
 Download the macOS DMG from the same release feed. For OMP transport details, see [the harness architecture](ARCHITECTURE.md#5-engine-plan). The installer bootstraps any missing agent CLI (OMP, Claude Code, Codex) after the comet install — failures there never abort the install, and `COMET_SKIP_AGENT_BOOTSTRAP=1` skips the phase for managed environments. An existing `omp` is never silently replaced; to bootstrap or validate it explicitly:
 
 ```bash
