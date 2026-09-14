@@ -7,11 +7,15 @@ import { LoroDoc } from "loro-crdt";
 import type { VersionVector } from "loro-crdt";
 import {
   AUTH_CAPABILITIES_HEADER,
+  AUTH_GRANT_HEADER,
   AUTH_PROJECT_HEADER,
   AUTH_USER_HEADER,
+  GRANT_EVENT_HEADER,
+  ROOM_KIND_HEADER,
   type Env
 } from "./env";
 import { canonicalSessionId, SessionRoom } from "./session-room";
+import worker from "./index";
 
 type SqlRow = Record<string, SqlStorageValue>;
 
@@ -303,6 +307,120 @@ describe("SessionRoom chat authorization", () => {
     await join(room, "user-a", "shared-chat");
     await join(room, "user-b", "shared-chat");
     expect(sql.meta.get("owner")).toBe(PROJECT_SCOPE);
+  });
+
+  it("syncs sandbox project workspaces without widening session, device, or capability authority", async () => {
+    const NativeResponse = Response;
+    vi.stubGlobal("Response", class extends NativeResponse {
+      constructor(body?: BodyInit | null, init?: ResponseInit) {
+        super(body, init?.status === 101 ? { ...init, status: 200 } : init);
+        if (init?.status === 101) Object.defineProperty(this, "status", { value: 101 });
+      }
+    });
+    vi.stubGlobal("WebSocketPair", class {
+      0 = new CapturingSocket();
+      1 = new CapturingSocket();
+    });
+    const grant = {
+      userId: "user-a", email: "user-a@example.com", grantId: "1".repeat(32),
+      projectId: PROJECT_SCOPE, deploymentId: "deployment-a", sessionId: "assigned-chat",
+      sandboxId: "sandbox-a", targetDeviceId: "comet-scaffold-sandbox-a-e1",
+      lifecycleEpoch: 1, capabilities: [...CAPABILITIES],
+      grantedAt: Date.now() - 1, expiresAt: Date.now() + 600_000, revokedAt: null
+    };
+    const workspaceRoom = makeRoom();
+    const env = {
+      SCAFFOLD_PROJECT_SCOPE: PROJECT_SCOPE,
+      AUTH_GRANTS: {
+        idFromName: (id: string) => id,
+        get: () => ({ fetch: async () => Response.json(grant) })
+      },
+      SESSION_ROOMS: {
+        idFromName: (id: string) => id,
+        get: () => ({ fetch: (request: Request) => workspaceRoom.room.fetch(request) })
+      }
+    } as unknown as Env;
+    const request = (path: string, method = "GET") => worker.fetch(new Request(`https://edge.test${path}`, {
+      method,
+      headers: { authorization: `Bearer cs1.${grant.grantId}.${"a".repeat(64)}`, upgrade: "websocket" }
+    }), env);
+    const roomId = `ws4/${PROJECT_SCOPE}`;
+    expect((await request(`/workspace/${PROJECT_SCOPE}/ws`)).status).toBe(101);
+    const { room, sockets } = workspaceRoom;
+    const publisher = sockets[0] as unknown as CapturingSocket;
+    const send = (socket: CapturingSocket, message: ProtocolMessage) =>
+      room.webSocketMessage(socket as unknown as WebSocket, Uint8Array.from(encode(message)).buffer);
+    await send(publisher, joinRequest(roomId));
+    expect(publisher.sent.map((bytes) => decode(bytes))).toContainEqual(expect.objectContaining({
+      type: MessageType.JoinResponseOk, permission: "write"
+    }));
+    const source = new LoroDoc();
+    const mirror = new LoroDoc();
+    try {
+      source.getMap("metadata").set("sandboxStatus", "working");
+      const update: ProtocolMessage = {
+        type: MessageType.DocUpdate, crdt: CrdtType.Loro, roomId,
+        batchId: "0x0000000000000001", updates: [source.export({ mode: "snapshot" })]
+      };
+      await send(publisher, update);
+      expect(publisher.sent.map((bytes) => decode(bytes))).toContainEqual(expect.objectContaining({
+        type: MessageType.Ack, status: UpdateStatusCode.Ok
+      }));
+      // Another deployment/session shares the workspace, but a read grant cannot publish.
+      grant.grantId = "2".repeat(32);
+      grant.deploymentId = "deployment-b";
+      grant.sessionId = "another-chat";
+      grant.capabilities = ["session.read"];
+      expect((await request(`/workspace/${PROJECT_SCOPE}/ws`)).status).toBe(101);
+      const reader = sockets[1] as unknown as CapturingSocket;
+      await send(reader, joinRequest(roomId));
+      for (const bytes of reader.sent) {
+        const message = decode(bytes);
+        if (message.type === MessageType.DocUpdate) mirror.importBatch(message.updates);
+      }
+      expect(mirror.getMap("metadata").get("sandboxStatus")).toBe("working");
+      reader.sent.length = 0;
+      await send(reader, update);
+      expect(reader.sent.map((bytes) => decode(bytes))).toContainEqual(expect.objectContaining({
+        type: MessageType.Ack, status: UpdateStatusCode.PermissionDenied
+      }));
+      await room.fetch(new Request("https://room.test/grant-revoked", {
+        method: "POST", headers: { [GRANT_EVENT_HEADER]: "revoke" },
+        body: JSON.stringify({ grantId: "1".repeat(32) })
+      }));
+      expect(publisher.closed).toContainEqual({ code: 4403, reason: "device grant revoked" });
+      expect(reader.closed).toEqual([]);
+    } finally {
+      source.free();
+      mirror.free();
+    }
+    grant.capabilities = [...CAPABILITIES];
+    for (const [path, method] of [
+      ["/workspace/other-project/ws", "GET"],
+      ["/session/00000000-0000-4000-8000-000000000099/ws", "GET"],
+      ["/device/unrelated-device/ws?role=host", "GET"],
+      ["/notifications/device", "PUT"],
+      [`/workspace/${PROJECT_SCOPE}/reset-log`, "POST"],
+      [`/attachments/${"a".repeat(64)}`, "GET"],
+      ["/auth/device-grants", "POST"]
+    ] as const) expect((await request(path, method)).status, path).toBe(403);
+    grant.capabilities = ["session.chat"];
+    expect((await request(`/workspace/${PROJECT_SCOPE}/ws`)).status).toBe(403);
+
+    const encodedGrant = JSON.stringify({
+      ...grant, subject: grant.userId,
+      scope: { projectId: PROJECT_SCOPE, deploymentId: grant.deploymentId,
+        sessionId: grant.sessionId, lifecycleEpoch: grant.lifecycleEpoch }
+    });
+    for (const [chatId, workspace] of [["unrelated-chat", false], ["ws4/other-project", true]] as const) {
+      expect((await makeRoom().room.fetch(authedRequest(`/ws?chatId=${chatId}`, grant.userId, {
+        headers: { [AUTH_GRANT_HEADER]: encodedGrant, ...(workspace ? { [ROOM_KIND_HEADER]: "workspace" } : {}) }
+      }))).status).toBe(403);
+    }
+    vi.advanceTimersByTime(600_000);
+    const reader = sockets[1] as unknown as CapturingSocket;
+    await send(reader, joinRequest(roomId));
+    expect(reader.closed).toContainEqual({ code: 4403, reason: "device grant invalid" });
   });
 
   it("preserves durable state when four readers cold-start the same room", async () => {

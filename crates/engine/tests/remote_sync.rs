@@ -838,3 +838,37 @@ async fn two_authenticated_engines_sync_workspace_streams_and_reconnect_backfill
     b.shutdown().await;
     relay_task.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scaffold_host_joins_project_workspace_and_publishes_status() {
+    let (edge_url, _, relay_task) = start_relay().await;
+    let dirs = tempfile::tempdir().unwrap();
+    let controller = assemble_remote(&dirs.path().join("controller"), "controller", &edge_url);
+    std::fs::create_dir_all(dirs.path().join("sandbox")).unwrap();
+    std::fs::write(dirs.path().join("sandbox/device-id"), "sandbox").unwrap();
+    let sandbox = EngineCore::assemble_with_identity(
+        &dirs.path().join("sandbox"),
+        Arc::new(HarnessRegistry::for_profile(RuntimeProfile::ScaffoldHost)),
+        HarnessId::Omp,
+        Some(EdgeConfig::with_static_token(&edge_url, TEST_BEARER).with_device("sandbox").with_deployment(DEPLOYMENT)),
+        PROJECT, USER, RuntimeProfile::ScaffoldHost,
+    ).unwrap();
+    wait_for(|| controller.workspace.connected() && sandbox.workspace.connected(), "sandbox workspace join").await;
+    sandbox.workspace.claim_chat("sandbox-chat", Some("/workspace")).unwrap();
+    let mut status = comet_proto::Session {
+        chat_id: "sandbox-chat".into(), device_id: sandbox.device_id.clone(),
+        status: comet_proto::SessionStatus::Working,
+        started_at: Some(chrono::Utc::now()), updated_at: chrono::Utc::now(),
+    };
+    sandbox.workspace.record_session(&status);
+    wait_for(|| controller.workspace.watch_session_rows().borrow().iter().any(|row|
+        row.chat_id == "sandbox-chat" && row.status == comet_proto::SessionStatus::Working), "sandbox working status").await;
+    status.status = comet_proto::SessionStatus::Idle;
+    status.updated_at = chrono::Utc::now();
+    sandbox.workspace.record_session(&status);
+    wait_for(|| controller.workspace.watch_session_rows().borrow().iter().any(|row|
+        row.chat_id == "sandbox-chat" && row.status == comet_proto::SessionStatus::Idle), "sandbox completed status").await;
+    controller.shutdown().await;
+    sandbox.shutdown().await;
+    relay_task.abort();
+}

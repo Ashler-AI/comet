@@ -1626,17 +1626,15 @@ impl Inner {
             }
             entry.updated_at = now;
             let session = entry.clone();
-            let mut list: Vec<Session> = statuses.values().cloned().collect();
-            list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
-            self.sessions_tx.send_replace(list);
+            self.publish_sessions(&statuses);
             session
         };
-        self.record_session(session);
+        self.mirror_session(session);
     }
 
     fn set_status(&self, chat_id: &str, status: SessionStatus, fresh_start: bool) {
         let now = Utc::now();
-        let session = {
+        let (session, finished) = {
             let mut statuses = lock(&self.statuses);
             let entry = statuses
                 .entry(chat_id.to_string())
@@ -1647,6 +1645,8 @@ impl Inner {
                     started_at: None,
                     updated_at: now,
                 });
+            let finished = matches!(entry.status, SessionStatus::Working | SessionStatus::AwaitingInput)
+                && matches!(status, SessionStatus::Idle | SessionStatus::Errored);
             entry.status = status;
             entry.updated_at = now;
             if fresh_start {
@@ -1655,25 +1655,44 @@ impl Inner {
                 }));
             }
             let session = entry.clone();
-            let mut list: Vec<Session> = statuses.values().cloned().collect();
-            list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
-            // send_replace: keep the current value fresh even with no receivers,
-            // so late WatchSessions subscribers see the last transition.
-            self.sessions_tx.send_replace(list);
-            session
+            self.publish_sessions(&statuses);
+            (session, finished)
         };
-        // Mirror the transition into the workspace doc's session-status row so
-        // remote devices' sidebars show this run (staleness-checked client-side).
-        self.record_session(session);
+        self.mirror_session(session);
+        // A tool-only turn also becomes unread on completion. Repeated idle
+        // teardown and freshness heartbeats must not manufacture new activity.
+        if finished && let Some(workspace) = self.workspace() {
+            let chat_id = self.workspace_continuation_id(chat_id);
+            if let Err(error) = workspace.set_chat_activity(&chat_id, Some(now.timestamp_millis()), None) {
+                tracing::warn!(chat = %chat_id, %error, "completion activity write failed");
+            }
+        }
     }
 
-    fn record_session(&self, mut session: Session) {
+    fn publish_sessions(&self, statuses: &HashMap<String, Session>) {
+        let mut list: Vec<Session> = statuses.values().cloned().collect();
+        for session in statuses.values() {
+            let canonical_id = self.workspace_continuation_id(&session.chat_id);
+            if canonical_id != session.chat_id {
+                let mut canonical = session.clone();
+                canonical.chat_id = canonical_id;
+                list.push(canonical);
+            }
+        }
+        list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id).then_with(|| b.updated_at.cmp(&a.updated_at)));
+        list.dedup_by(|a, b| a.chat_id == b.chat_id);
+        // Keep private execution identities for turn guards and session monitors,
+        // plus the assigned chat identity for local workspace/sidebar consumers.
+        self.sessions_tx.send_replace(list);
+    }
+
+    fn mirror_session(&self, mut session: Session) {
         if let Some(host) = self.doc_host.get() {
             host.record_session_status(&session);
-            if let Some(workspace) = host.workspace() {
-                session.chat_id = host.workspace_continuation_id(&session.chat_id);
-                workspace.record_session(&session);
-            }
+        }
+        if let Some(ws) = self.workspace() {
+            session.chat_id = self.workspace_continuation_id(&session.chat_id);
+            ws.record_session(&session);
         }
     }
 

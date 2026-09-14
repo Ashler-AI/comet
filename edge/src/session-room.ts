@@ -393,10 +393,12 @@ export class SessionRoom implements DurableObject {
         encodedGrant === null
           ? undefined
           : parseTrustedDeviceGrant(encodedGrant, userId, projectScope, Date.now());
-      if (encodedGrant !== null && (!grant || grant.scope.sessionId !== chatId)) {
+      if (encodedGrant !== null && (!grant || (workspace
+        ? chatId !== `ws4/${projectScope}`
+        : grant.scope.sessionId !== chatId))) {
         return new Response("forbidden", { status: 403 });
       }
-      if (grant) {
+      if (grant && !workspace) {
         const boundDeploymentId = this.getMeta("deploymentId");
         const boundSessionId = this.getMeta("scopedSessionId");
         if (

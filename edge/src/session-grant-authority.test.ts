@@ -153,7 +153,7 @@ describe("grant revocation delivery", () => {
     expect((await authority.fetch(statusRequest)).status).toBe(401);
   });
 
-  it("notifies the exact session and device rooms after revocation is durable", async () => {
+  it("notifies the exact session, project workspace, and device rooms after revocation is durable", async () => {
     const records = new Map<string, unknown>();
     records.set("grant", {
       grantId: "grant-1",
@@ -203,15 +203,19 @@ describe("grant revocation delivery", () => {
 
     expect(response.status).toBe(200);
     expect(records.get("grant")).toMatchObject({ revokedAt: expect.any(Number) });
-    expect(notifySession).toHaveBeenCalledOnce();
+    expect(notifySession).toHaveBeenCalledTimes(2);
     expect(notifyDevice).toHaveBeenCalledOnce();
     expect(sessionIdFromName).toHaveBeenCalledWith("s4/ashler-staging/candidate/session-1");
+    expect(sessionIdFromName).toHaveBeenCalledWith("ws4/ashler-staging");
     expect(deviceIdFromName).toHaveBeenCalledWith("d3/ashler-staging/device-1");
     const sessionNotification = notifySession.mock.calls[0]?.[0];
+    const workspaceNotification = notifySession.mock.calls[1]?.[0];
     const deviceNotification = notifyDevice.mock.calls[0]?.[0];
     expect(sessionNotification?.headers.get(GRANT_EVENT_HEADER)).toBe("revoke");
+    expect(workspaceNotification?.headers.get(GRANT_EVENT_HEADER)).toBe("revoke");
     expect(deviceNotification?.headers.get(GRANT_EVENT_HEADER)).toBe("revoke");
     await expect(sessionNotification?.json()).resolves.toEqual({ grantId: "grant-1" });
+    await expect(workspaceNotification?.json()).resolves.toEqual({ grantId: "grant-1" });
     await expect(deviceNotification?.json()).resolves.toEqual({ grantId: "grant-1" });
   });
 });
