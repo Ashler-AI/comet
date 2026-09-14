@@ -135,6 +135,42 @@ impl CometInvitation {
     }
 }
 
+/// Route hints only: the installed client must authenticate and attach before
+/// accepting the room or its authority. No grant or credential travels in a URL.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScaffoldSessionLink {
+    pub scope: CollaborationScope,
+    pub sandbox_id: String,
+}
+
+impl ScaffoldSessionLink {
+    pub fn parse_deep_link(value: &str, scheme: &str) -> Option<Self> {
+        let path = value.strip_prefix(scheme)?.strip_prefix("://scaffold/")?;
+        let mut parts = path.split('/');
+        let segments = [parts.next()?, parts.next()?, parts.next()?, parts.next()?];
+        if parts.next().is_some()
+            || !segments.iter().all(|value| {
+                !value.is_empty()
+                    && value.len() <= 256
+                    && value.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    })
+            })
+        {
+            return None;
+        }
+        Some(Self {
+            scope: CollaborationScope {
+                project_id: segments[0].into(),
+                deployment_id: Some(segments[1].into()),
+                session_id: Some(segments[2].into()),
+                unknown: Default::default(),
+            },
+            sandbox_id: segments[3].into(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CapabilityGrant {
@@ -1121,6 +1157,29 @@ mod tests {
         assert!(
             CometInvitation::parse_deep_link("comet://invite/chat-a/session-b/grant%2Fc").is_none()
         );
+    }
+
+    #[test]
+    fn scaffold_links_preserve_scope_and_reject_ambiguous_routes() {
+        let link = super::ScaffoldSessionLink::parse_deep_link(
+            "comet-staging://scaffold/project/deployment/session/sandbox",
+            "comet-staging",
+        )
+        .unwrap();
+        assert_eq!(link.scope.project_id, "project");
+        assert_eq!(link.scope.deployment_id.as_deref(), Some("deployment"));
+        assert_eq!(link.scope.session_id.as_deref(), Some("session"));
+        assert_eq!(link.sandbox_id, "sandbox");
+        for value in [
+            "comet://scaffold/project/deployment/session/sandbox",
+            "comet-staging://scaffold/project/deployment/session/sandbox/extra",
+            "comet-staging://scaffold/project//session/sandbox",
+            "comet-staging://scaffold/project/deployment/session/sandbox?token=secret",
+            "comet-staging://scaffold/project/deployment/session/sandbox%2Fother",
+            "comet-staging://scaffold/project/deployment/session/sandbox#fragment",
+        ] {
+            assert!(super::ScaffoldSessionLink::parse_deep_link(value, "comet-staging").is_none());
+        }
     }
 
     #[test]

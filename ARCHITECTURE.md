@@ -129,6 +129,15 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
    arbitrary cached transcript. Removed memberships retain their tombstones and are not restored
    by migration. Another principal's refs remain excluded from the local watch.
 
+   Scaffold hosts join the same project workspace room as controllers. Sandbox credentials
+   are trusted to read project-wide workspace metadata and publish workspace updates, subject
+   to their existing read/publish capabilities and grant expiry/revocation. Other session and
+   device routes remain scoped to the assigned session/device; cross-project access and
+   workspace reset-log stay denied. Native handoffs publish status under the canonical chat
+   identity while retaining private execution IDs for turn guards. Terminal transitions advance
+   `lastMessageAt`, including tool-only turns; heartbeats and repeated idle teardown do not
+   manufacture unread activity. No per-session sidebar subscription or activity side channel.
+
    *Why a workspace doc and not N tiny docs:* the sidebar needs one subscription for the whole
    list (grouping, resort animations, unseen markers); one doc = one room connection + one mirror.
    Workspace history uses **lossless snapshot folding**, not age- or size-based shallow trimming:

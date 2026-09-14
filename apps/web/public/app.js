@@ -78,6 +78,11 @@ async function api(path, options = {}) {
   if (payload === null) throw new Error('Crew returned an unexpected response. Check the connection and try again.');
   return payload;
 }
+api('native-open').then(({ url }) => {
+  if (typeof url !== 'string' || !/^comet(?:-staging)?:\/\/scaffold\/(?:[A-Za-z0-9._-]{1,256}\/){3}[A-Za-z0-9._-]{1,256}$/.test(url)) throw new Error('Crew returned an invalid session link.');
+  $('native-open').href = url;
+  $('native-open').hidden = false;
+}).catch(showError);
 async function command(path, payload, scope = '') {
   const key = `${path}:${JSON.stringify(payload)}${scope}`;
   let requestId = commandIds.get(key);

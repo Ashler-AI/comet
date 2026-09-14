@@ -1389,6 +1389,15 @@ fn merge_sessions(device_id: &str, rows: &[Session], local: &[Session]) -> Vec<S
         .map(|s| (s.chat_id.clone(), s.clone()))
         .collect();
     for session in local {
+        // Native handoffs use the chat UUID as their assigned agent session.
+        // Keep the private execution row for turn identity as well as the list row.
+        if let Some((chat_id, session_id)) = session.chat_id.split_once("::session::")
+            && chat_id == session_id
+        {
+            let mut projected = session.clone();
+            projected.chat_id = chat_id.to_string();
+            merged.insert(projected.chat_id.clone(), projected);
+        }
         merged.insert(session.chat_id.clone(), session.clone());
     }
     let mut list: Vec<Session> = merged.into_values().collect();
@@ -1523,7 +1532,10 @@ async fn workspace_task(weak: Weak<WorkspaceHostInner>, mut changed_rx: watch::R
 mod tests {
     use chrono::{TimeZone as _, Utc};
 
-    use super::{WorkspaceHost, WorkspaceHostConfig, retain_visible_sessions, send_if_changed};
+    use super::{
+        WorkspaceHost, WorkspaceHostConfig, merge_sessions, retain_visible_sessions,
+        send_if_changed,
+    };
     use comet_proto::{
         AgentSessionRecord, AgentSessionSource, COLLABORATION_SCHEMA_VERSION, Chat,
         PublicationRecord, PublicationValue, Session, SessionRef, SessionStatus,
@@ -1558,6 +1570,27 @@ mod tests {
             started_at: None,
             updated_at: Utc.timestamp_millis_opt(1).unwrap(),
         }
+    }
+
+    #[test]
+    fn merged_statuses_include_native_handoff_without_collapsing_child_sessions() {
+        let mut live = session("chat-a::session::chat-a", "device-a");
+        live.status = SessionStatus::Working;
+        let child = session("chat-a::session::child", "device-a");
+        let merged = merge_sessions("device-a", &[], &[live.clone(), child.clone()]);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(
+            merged
+                .iter()
+                .find(|row| row.chat_id == "chat-a")
+                .unwrap()
+                .status,
+            SessionStatus::Working
+        );
+        assert!(merged.contains(&live));
+        assert!(merged.contains(&child));
+        let only_child = merge_sessions("device-a", &[], &[child.clone()]);
+        assert_eq!(only_child, vec![child]);
     }
 
     #[test]

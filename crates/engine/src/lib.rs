@@ -268,11 +268,7 @@ impl EngineCore {
                 platform: std::env::consts::OS.to_string(),
                 project_scope: context.project_scope.to_string(),
                 user_id: context.user_id.to_string(),
-                edge: context
-                    .runtime_profile
-                    .allows_workspace_room()
-                    .then(|| edge.clone())
-                    .flatten(),
+                edge: edge.clone(),
             },
             &journal,
         )?;

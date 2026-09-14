@@ -20,10 +20,17 @@ struct CometApp: App {
                 // for status/markdown, never chrome.
                 .tint(Theme.text)
                 .background(Theme.bg)
-                // One-click session invitations (`comet://invite/…`) — the
-                // same deep link the desktop copies from the invite dialog.
+                // Invitations and authenticated remote-session attachment.
                 .onOpenURL { url in
                     model.openInvitation(url: url)
+                }
+                .alert("Couldn’t open Crew session", isPresented: Binding(
+                    get: { model.openSessionError != nil },
+                    set: { if !$0 { model.openSessionError = nil } }
+                )) {
+                    Button("OK") { model.openSessionError = nil }
+                } message: {
+                    Text(model.openSessionError ?? "")
                 }
                 .onChange(of: scenePhase) { _, phase in
                     if phase == .background {

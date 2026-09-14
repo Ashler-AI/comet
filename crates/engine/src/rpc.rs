@@ -603,6 +603,32 @@ pub struct EngineRpc {
 }
 
 impl EngineRpc {
+    async fn fresh_session_context(&self, chat_id: &str, chat: Option<&Chat>) -> Result<(String, serde_json::Value), RpcError> {
+        let execution_key = format!("{chat_id}::session::{chat_id}");
+        let handle = self.doc_host.open(chat_id).map_err(|error| RpcError::Failed(error.to_string()))?;
+        if self.sessions.last_request(&execution_key).is_some()
+            || self.sessions.last_request(chat_id).is_some()
+            || chat.is_some_and(|chat| chat.harness_session_id.is_some() || chat.fork_from.is_some())
+            || self.doc_host.chat_has_commands(chat_id).map_err(|error| RpcError::Failed(error.to_string()))?
+            || !handle.doc().read_entry_window(None, 1).map_err(|error| RpcError::Failed(error.to_string()))?.entries.is_empty()
+        {
+            return Err(RpcError::Failed("session_context_recovery_missing".into()));
+        }
+        let cwd = match chat.and_then(|chat| chat.cwd.clone()) {
+            Some(cwd) => cwd,
+            None => std::env::current_dir().map_err(|error| RpcError::Failed(error.to_string()))?
+                .into_os_string().into_string().map_err(|_| RpcError::Failed("session_context_cwd_invalid".into()))?,
+        };
+        let config = match chat.and_then(|chat| chat.config.as_ref()) {
+            Some(config) if config.harness == HarnessId::Omp => serde_json::to_value(config)
+                .map_err(|error| RpcError::Failed(error.to_string()))?,
+            Some(_) => return Err(RpcError::Failed("session_context_binding_mismatch".into())),
+            None => comet_harness::omp::read_session_config(&cwd).await
+                .map_err(|error| RpcError::Failed(error.to_string()))?,
+        };
+        Ok((cwd, config))
+    }
+
     #[allow(clippy::too_many_arguments)] // engine assembly seam, not a public API
     pub fn new(
         sessions: SessionsEngine,
@@ -1664,18 +1690,21 @@ impl RpcService for EngineRpc {
                 }
                 if method == "ReadSessionContext" {
                     let execution_key = format!("{}::session::{}", p.chat_id, p.chat_id);
-                    let request = self.sessions.recovered_context(&execution_key)
+                    let request = self.sessions.recovered_context_if_present(&execution_key)
                         .map_err(|error| RpcError::Failed(error.to_string()))?;
                     let chat = self.workspace.doc().chat(&p.chat_id)
                         .map_err(|error| RpcError::Failed(error.to_string()))?
                         .filter(|chat| chat.device_id == authority.device_id);
-                    let cwd = request.cwd.as_str();
-                    let mut config = serde_json::json!({
+                    let (cwd, mut config) = if let Some(request) = request {
+                        (request.cwd, serde_json::json!({
                             "harness": "omp", "model": request.model,
                             "agentAccountId": request.agent_account_id,
                             "reasoning": request.reasoning, "modelOptions": request.model_options,
                             "sandbox": request.sandbox,
-                        });
+                        }))
+                    } else {
+                        self.fresh_session_context(&p.chat_id, chat.as_ref()).await?
+                    };
                     config["model"] = config["model"].as_str()
                         .and_then(crate::local_sessions::canonical_omp_model_selector)
                         .map(serde_json::Value::String).unwrap_or(serde_json::Value::Null);
@@ -2740,6 +2769,27 @@ impl RpcService for EngineRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fresh_web_context_initializes_but_existing_transcript_requires_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = crate::EngineCore::assemble_with_identity(
+            dir.path(), std::sync::Arc::new(crate::default_registry(RuntimeProfile::Mock)),
+            HarnessId::Mock, None, "project-a", "owner-a", RuntimeProfile::Mock,
+        ).unwrap();
+        let rpc = core.rpc_service();
+        let chat: Chat = serde_json::from_value(serde_json::json!({
+            "id": "fresh", "deviceId": "device-a", "archived": false,
+            "createdAt": "1970-01-01T00:00:00Z", "cwd": dir.path().to_str().unwrap(),
+            "config": { "harness": "omp", "model": "openai-codex/gpt-6-astra", "sandbox": "workspace-write" }
+        })).unwrap();
+        let (cwd, config) = rpc.fresh_session_context("fresh", Some(&chat)).await.unwrap();
+        assert_eq!(cwd, dir.path().to_str().unwrap());
+        assert_eq!(config["harness"], "omp");
+        rpc.doc_host.open("fresh").unwrap().write_user_message("message-a", "existing conversation", 1).unwrap();
+        assert!(rpc.fresh_session_context("fresh", None).await.is_err());
+        core.shutdown().await;
+    }
 
     #[test]
     fn scaffold_catalog_normalizes_routed_models_before_filtering() {

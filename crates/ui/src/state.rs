@@ -886,7 +886,15 @@ pub(crate) async fn prepare_scaffold_session(
     database_environment: ScaffoldDatabaseEnvironment,
     agent_route: &AgentRoute,
     omp_handoff: Option<&ScaffoldOmpHandoffDraft>,
-) -> Result<(ScaffoldSessionAttachment, Option<String>, Option<String>, ScaffoldPreparationGuard), RpcError> {
+) -> Result<
+    (
+        ScaffoldSessionAttachment,
+        Option<String>,
+        Option<String>,
+        ScaffoldPreparationGuard,
+    ),
+    RpcError,
+> {
     let value = handle
         .client()
         .call_cancellable(
@@ -906,14 +914,16 @@ pub(crate) async fn prepare_scaffold_session(
         .await?;
     // Capture the receipt before decoding/validating the remaining response:
     // malformed attachment or handoff metadata still abandons this generation.
-    let generation = value.get("preparationGeneration")
+    let generation = value
+        .get("preparationGeneration")
         .and_then(serde_json::Value::as_str)
         .filter(|generation| !generation.is_empty())
         .ok_or_else(|| RpcError::Failed("Scaffold preparation returned no generation".into()))?;
     let preparation = ScaffoldPreparationGuard {
         engine: handle.clone(),
-        chat_id: scope.session_id.clone()
-            .ok_or_else(|| RpcError::Failed("Scaffold preparation has no session identity".into()))?,
+        chat_id: scope.session_id.clone().ok_or_else(|| {
+            RpcError::Failed("Scaffold preparation has no session identity".into())
+        })?,
         generation: generation.to_string(),
         admitted: false,
     };
@@ -1125,6 +1135,7 @@ pub struct AppState {
     pub selected_agent_session: Option<String>,
     /// Installed-app invitation awaiting the exact session/grant projection.
     pending_invitation: Option<comet_proto::CometInvitation>,
+    pending_scaffold_link: Option<comet_proto::ScaffoldSessionLink>,
     /// Grant named by the accepted deep link. It remains a routing identity;
     /// command authority is still checked against the verified projection.
     pub selected_invitation_grant: Option<String>,
@@ -1246,6 +1257,7 @@ impl AppState {
             collaboration: None,
             selected_agent_session: None,
             pending_invitation: None,
+            pending_scaffold_link: None,
             selected_invitation_grant: None,
             pending_session_pin: None,
             room_projections: HashMap::new(),
@@ -2089,6 +2101,59 @@ impl AppState {
         });
     }
 
+    pub fn open_url(&mut self, url: &str, cx: &mut Context<Self>) {
+        let scheme = if option_env!("COMET_PACKAGE_ENVIRONMENT") == Some("staging") {
+            "comet-staging"
+        } else {
+            "comet"
+        };
+        if let Some(link) = comet_proto::ScaffoldSessionLink::parse_deep_link(url, scheme) {
+            self.pending_scaffold_link = Some(link);
+            self.drain_scaffold_link(cx);
+        } else if let Some(invitation) = comet_proto::CometInvitation::parse_deep_link(url) {
+            self.open_invitation(invitation, cx);
+        }
+    }
+
+    fn drain_scaffold_link(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.auth.as_ref(), Some(AuthState::SignedIn { .. })) {
+            return;
+        }
+        let Some(handle) = self.engine().cloned() else {
+            return;
+        };
+        let Some(link) = self.pending_scaffold_link.take() else {
+            return;
+        };
+        if !self
+            .scaffold_scope
+            .as_ref()
+            .is_some_and(|(project, deployment)| {
+                project == &link.scope.project_id
+                    && Some(deployment.as_str()) == link.scope.deployment_id.as_deref()
+            })
+        {
+            self.scaffold_session_error =
+                Some("Open this session in Crew for its project and deployment".into());
+            cx.notify();
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let result = attach_scaffold_session(&handle, &link.sandbox_id, link.scope).await;
+            let _ = this.update(cx, |state, cx| {
+                match result {
+                    Ok(attachment) => state.install_scaffold_session(&attachment, cx),
+                    Err(error) => {
+                        state.scaffold_session_error =
+                            Some(format!("Could not open Crew session: {error}"))
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub fn open_invitation(
         &mut self,
         invitation: comet_proto::CometInvitation,
@@ -2401,6 +2466,7 @@ impl AppState {
     fn attach_engine(&mut self, handle: EngineHandle, cx: &mut Context<Self>) {
         self.connection = ConnectionStatus::Ready;
         self.engine = Some(handle.clone());
+        self.drain_scaffold_link(cx);
         self.watch_tasks = vec![
             spawn_watch(
                 cx,
@@ -3042,7 +3108,10 @@ impl AppState {
         .detach();
     }
 
-    pub(crate) fn transcript_room_projection(&self, chat_id: &str) -> Option<SessionRoomProjection> {
+    pub(crate) fn transcript_room_projection(
+        &self,
+        chat_id: &str,
+    ) -> Option<SessionRoomProjection> {
         self.room_projections.get(chat_id).cloned()
     }
 
@@ -3397,6 +3466,9 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
                 }
                 first_frame = false;
                 apply(state, parsed);
+                if method == methods::AUTH_STATUS {
+                    state.drain_scaffold_link(cx);
+                }
                 cx.notify();
             });
             if alive.is_err() {
@@ -3784,10 +3856,16 @@ mod tests {
         ) -> Result<RpcReply, RpcError> {
             match method {
                 methods::PREPARE_SCAFFOLD_SESSION => {
-                    let RpcReply::Value(mut result) = self.ready.handle(
-                        methods::CONTROL_SCAFFOLD_ENVIRONMENT,
-                        serde_json::json!({ "operation": "attach", "scope": params["scope"] }),
-                    ).await? else { panic!("unary attachment") };
+                    let RpcReply::Value(mut result) = self
+                        .ready
+                        .handle(
+                            methods::CONTROL_SCAFFOLD_ENVIRONMENT,
+                            serde_json::json!({ "operation": "attach", "scope": params["scope"] }),
+                        )
+                        .await?
+                    else {
+                        panic!("unary attachment")
+                    };
                     let generation = self.generation.fetch_add(1, Ordering::SeqCst);
                     result["preparationGeneration"] = format!("generation-{generation}").into();
                     if self.malformed_attachment {
@@ -3806,7 +3884,10 @@ mod tests {
 
     fn preparation_client(
         malformed_attachment: bool,
-    ) -> (EngineHandle, tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>) {
+    ) -> (
+        EngineHandle,
+        tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+    ) {
         let (reports, received) = tokio::sync::mpsc::unbounded_channel();
         let handle = EngineHandle::for_test(Arc::new(PreparedScaffoldRpc {
             ready: ReadyScaffoldRpc {
@@ -3825,19 +3906,33 @@ mod tests {
 
     async fn prepare_test_session(
         handle: &EngineHandle,
-    ) -> Result<(ScaffoldSessionAttachment, Option<String>, Option<String>, ScaffoldPreparationGuard), RpcError> {
+    ) -> Result<
+        (
+            ScaffoldSessionAttachment,
+            Option<String>,
+            Option<String>,
+            ScaffoldPreparationGuard,
+        ),
+        RpcError,
+    > {
         let scope = CollaborationScope {
             project_id: "ashler-staging".into(),
             deployment_id: Some("ashler-staging".into()),
             session_id: Some("session-ready".into()),
             unknown: Default::default(),
         };
-        let route = comet_proto::AgentRoute::automatic(
-            comet_proto::AgentProvider::OpenAi, "gpt-6-astra",
-        );
+        let route =
+            comet_proto::AgentRoute::automatic(comet_proto::AgentProvider::OpenAi, "gpt-6-astra");
         prepare_scaffold_session(
-            handle, &scope, None, None, ScaffoldDatabaseEnvironment::Local, &route, None,
-        ).await
+            handle,
+            &scope,
+            None,
+            None,
+            ScaffoldDatabaseEnvironment::Local,
+            &route,
+            None,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -3845,10 +3940,15 @@ mod tests {
         let (handle, mut reports) = preparation_client(true);
         assert!(prepare_test_session(&handle).await.is_err());
         let report = tokio::time::timeout(std::time::Duration::from_secs(3), reports.recv())
-            .await.unwrap().unwrap();
-        assert_eq!(report, serde_json::json!({
-            "chatId": "session-ready", "generation": "generation-1",
-        }));
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            report,
+            serde_json::json!({
+                "chatId": "session-ready", "generation": "generation-1",
+            })
+        );
     }
 
     #[tokio::test]
@@ -3860,13 +3960,21 @@ mod tests {
         // upload) must report the old receipt, even after a newer Prepare.
         drop(first);
         let report = tokio::time::timeout(std::time::Duration::from_secs(3), reports.recv())
-            .await.unwrap().unwrap();
-        assert_eq!(report, serde_json::json!({
-            "chatId": "session-ready", "generation": "generation-1",
-        }));
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            report,
+            serde_json::json!({
+                "chatId": "session-ready", "generation": "generation-1",
+            })
+        );
         second.disarm();
         drop(second);
-        assert!(matches!(reports.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)));
+        assert!(matches!(
+            reports.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     /// A localhost port that was just free — picked OUTSIDE the OS ephemeral
@@ -4547,7 +4655,8 @@ mod tests {
                     },
                     "ownerPrincipal": "owner@example.com",
                     "scope": scope,
-                })).unwrap(),
+                }))
+                .unwrap(),
                 projection: SessionRoomProjection {
                     project_id: "project-a".into(),
                     deployment_id: "deployment-a".into(),
@@ -4558,32 +4667,57 @@ mod tests {
                 actor_subject: "owner@example.com".into(),
                 source_ref: Some("master".into()),
                 control_target: ScaffoldControlTarget {
-                    sandbox_id: "sandbox-a".into(), scope: scope.clone(),
+                    sandbox_id: "sandbox-a".into(),
+                    scope: scope.clone(),
                 },
             };
             state.install_scaffold_session(&attachment, cx);
-            assert_eq!(state.scaffold_session_draft().unwrap().collaboration_scope(), scope);
+            assert_eq!(
+                state
+                    .scaffold_session_draft()
+                    .unwrap()
+                    .collaboration_scope(),
+                scope
+            );
 
             state.clear_scaffold_chat_starting("chat-a", cx);
             state.select_chat(None, cx);
             state.select_space_source("other-space".into(), Vec::new(), cx);
             state.select_space(None, cx);
             state.select_chat(Some("chat-a".into()), cx);
-            assert_eq!(state.scaffold_session_draft().unwrap().collaboration_scope(), scope);
-            assert_eq!(state.scaffold_control_target("chat-a"), Some(&attachment.control_target));
+            assert_eq!(
+                state
+                    .scaffold_session_draft()
+                    .unwrap()
+                    .collaboration_scope(),
+                scope
+            );
+            assert_eq!(
+                state.scaffold_control_target("chat-a"),
+                Some(&attachment.control_target)
+            );
 
             // An upload can fail after Attach has installed the room and grant.
             state.scaffold_session_error = Some("upload failed".into());
             state.select_chat(None, cx);
             state.select_chat(Some("chat-a".into()), cx);
-            assert_eq!(state.scaffold_session_draft().unwrap().collaboration_scope(), scope);
+            assert_eq!(
+                state
+                    .scaffold_session_draft()
+                    .unwrap()
+                    .collaboration_scope(),
+                scope
+            );
 
             state.complete_scaffold_session_startup("another-chat");
             assert!(state.scaffold_session_draft().is_some());
             state.complete_scaffold_session_startup("chat-a");
             assert!(state.scaffold_session_draft().is_none());
             assert!(state.scaffold_session_error.is_none());
-            assert_eq!(state.scaffold_control_target("chat-a"), Some(&attachment.control_target));
+            assert_eq!(
+                state.scaffold_control_target("chat-a"),
+                Some(&attachment.control_target)
+            );
         });
     }
 
@@ -5792,8 +5926,12 @@ mod tests {
             "ownerPrincipal": "owner@example.com",
             "scope": { "projectId": "project-a", "deploymentId": "deployment-a", "sessionId": chat_id },
         })).unwrap();
-        let session_ref = SessionRef { chat_id: chat_id.into(),
-        added_at: Utc::now(), environment: Some(persisted.clone()), startup: None };
+        let session_ref = SessionRef {
+            chat_id: chat_id.into(),
+            added_at: Utc::now(),
+            environment: Some(persisted.clone()),
+            startup: None,
+        };
         state.apply_session_refs(vec![session_ref.clone()]);
         let mut live = persisted;
         if let SessionEnvironmentSource::Scaffold {
@@ -5858,8 +5996,12 @@ mod tests {
             "scope": { "projectId": "project", "deploymentId": "deployment", "sessionId": "chat" }
         }))
         .unwrap();
-        state.session_refs.push(SessionRef { chat_id: chat.id.clone(),
-        added_at: Utc::now(), environment: Some(environment.clone()), startup: None });
+        state.session_refs.push(SessionRef {
+            chat_id: chat.id.clone(),
+            added_at: Utc::now(),
+            environment: Some(environment.clone()),
+            startup: None,
+        });
         environment.name = Some("  Canonical name  ".into());
         state
             .scaffold_environments
@@ -5917,7 +6059,10 @@ mod tests {
             text: "private peer payload".into(),
         }];
         state.apply_transcript(vec![peer.clone()]);
-        assert_eq!(state.shared_session_preview(chat_id), Some("private peer payload"));
+        assert_eq!(
+            state.shared_session_preview(chat_id),
+            Some("private peer payload")
+        );
         peer.peer_message = Some(comet_proto::PeerMessageProvenance {
             command_id: peer.id.clone(),
             source_chat_id: "source".into(),
@@ -5933,11 +6078,20 @@ mod tests {
             text: "[Peer message] ordinary prompt".into(),
         }];
         state.apply_transcript(vec![peer.clone(), ordinary]);
-        assert_eq!(state.shared_session_preview(chat_id), Some("[Peer message] ordinary prompt"));
+        assert_eq!(
+            state.shared_session_preview(chat_id),
+            Some("[Peer message] ordinary prompt")
+        );
         peer.peer_message.as_mut().unwrap().command_id = "mismatch".into();
-        assert_eq!(shared_session_preview(&[peer]), Some(("peer".into(), "private peer payload".into())));
+        assert_eq!(
+            shared_session_preview(&[peer]),
+            Some(("peer".into(), "private peer payload".into()))
+        );
         state.apply_transcript(vec![transcript_entry("later-window")]);
-        assert_eq!(state.shared_session_preview(chat_id), Some("[Peer message] ordinary prompt"));
+        assert_eq!(
+            state.shared_session_preview(chat_id),
+            Some("[Peer message] ordinary prompt")
+        );
     }
 
     #[test]

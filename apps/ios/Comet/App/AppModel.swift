@@ -69,6 +69,8 @@ final class AppModel {
     /// Invitation accepted before the workspace connected (cold-start URL);
     /// pinned and routed the moment `phase` reaches `.ready`.
     private var pendingInviteChatId: String?
+    private var pendingScaffoldLink: (scope: CollaborationScope, sandboxId: String)?
+    var openSessionError: String?
     /// Screenshot rig: "newsession" / "newspace" presents that sheet on arrival.
     var launchSheet: String?
     /// Screenshot rig: auto-send a canned prompt from the new-session canvas.
@@ -261,6 +263,7 @@ final class AppModel {
                 return self.sessionTitle(for: chat, fallbackTitle: "Session \(chatId.prefix(8))")
             }
             self.preloadSessionMetadata()
+            self.drainPendingScaffoldLink()
         }
         workspace = store
         store.start()
@@ -331,6 +334,12 @@ final class AppModel {
     /// segments route engine authority; this viewport only needs the chat id
     /// to pin membership and open the session.
     func openInvitation(url: URL) {
+        if let segments = Self.linkSegments(url, route: "scaffold", count: 4) {
+            pendingScaffoldLink = (CollaborationScope(projectId: segments[0], deploymentId: segments[1],
+                                                       sessionId: segments[2]), segments[3])
+            drainPendingScaffoldLink()
+            return
+        }
         guard let chatId = Self.invitationChatId(url) else { return }
         pendingInviteChatId = chatId
         drainPendingInvite()
@@ -345,21 +354,47 @@ final class AppModel {
         launchRoute = .chat(chatId)
     }
 
+    private func drainPendingScaffoldLink() {
+        guard phase == .ready, let workspace, workspace.connected,
+              let link = pendingScaffoldLink else { return }
+        pendingScaffoldLink = nil
+        guard let controller = scaffoldControllerDeviceId(chatId: link.scope.sessionId!) else {
+            openSessionError = "Connect a desktop Crew controller for this project, then open the link again. Execution stays in the remote session."
+            return
+        }
+        Task { [weak self] in
+            do {
+                let route = try await workspace.openScaffoldSession(controllerDeviceId: controller,
+                                                                    sandboxId: link.sandboxId, scope: link.scope)
+                guard let self, self.workspace === workspace else { return }
+                self.scaffoldRoutes[route.projection.sessionId] = route
+                self.launchRoute = .chat(route.projection.sessionId)
+            } catch {
+                guard let self, self.workspace === workspace else { return }
+                self.openSessionError = error.localizedDescription
+            }
+        }
+    }
+
     /// Mirrors `comet_proto::CometInvitation::parse_deep_link`: exactly three
     /// non-empty `[A-Za-z0-9._-]{1,256}` segments, no query or fragment.
     static func invitationChatId(_ url: URL) -> String? {
-        let prefix = "\(ReleaseConfig.inviteScheme)://invite/"
+        linkSegments(url, route: "invite", count: 3)?.first
+    }
+
+    private static func linkSegments(_ url: URL, route: String, count: Int) -> [String]? {
+        let prefix = "\(ReleaseConfig.inviteScheme)://\(route)/"
         guard url.absoluteString.hasPrefix(prefix) else { return nil }
         let path = String(url.absoluteString.dropFirst(prefix.count))
         guard !path.contains("?"), !path.contains("#") else { return nil }
         let segments = path.split(separator: "/", omittingEmptySubsequences: false)
-        let valid = segments.count == 3 && segments.allSatisfy { segment in
+        let valid = segments.count == count && segments.allSatisfy { segment in
             !segment.isEmpty && segment.count <= 256 && segment.allSatisfy {
                 ($0.isASCII && ($0.isLetter || $0.isNumber)) || $0 == "-" || $0 == "_" || $0 == "."
             }
         }
         guard valid else { return nil }
-        return String(segments[0])
+        return segments.map(String.init)
     }
 
 
@@ -651,9 +686,7 @@ final class AppModel {
         guard let workspace else { throw MobileSessionError.unavailable("Not connected") }
         let deviceId: String
         if let environment = scaffoldEnvironment(chatId: chatId), environment.source.kind == "scaffold" {
-            guard let controller = scaffoldRoutes[chatId]?.controllerDeviceId
-                ?? workspace.chat(id: chatId)?.deviceId
-                ?? scaffoldControllerDeviceId() else {
+            guard let controller = scaffoldControllerDeviceId(chatId: chatId) else {
                 throw MobileSessionError.unavailable("This session has no Scaffold controller")
             }
             var route = try await workspace.scaffoldRoute(controllerDeviceId: controller, environment: environment)
@@ -837,11 +870,14 @@ final class AppModel {
             ?? workspace?.sessionRef(id: chatId)?.environment
     }
 
-    private func scaffoldControllerDeviceId() -> String? {
+    private func scaffoldControllerDeviceId(chatId: String) -> String? {
         guard let workspace else { return nil }
-        return workspace.devices.first(where: {
-            $0.platform != "ios" && workspace.deviceOnline($0.id)
-        })?.id ?? workspace.devices.first(where: { $0.platform != "ios" })?.id
+        return selectScaffoldControllerDeviceId(
+            devices: workspace.devices,
+            preferred: [scaffoldRoutes[chatId]?.controllerDeviceId,
+                        workspace.chat(id: chatId)?.deviceId].compactMap { $0 },
+            isOnline: workspace.deviceOnline
+        )
     }
 
     private func configureSessionTransport(store: SessionStore,
@@ -867,9 +903,7 @@ final class AppModel {
             // a cached transcript was first opened.
             let environment = self.scaffoldEnvironment(chatId: chatId) ?? environment
             if let environment, environment.source.kind == "scaffold" {
-                guard let controllerDeviceId = self.scaffoldRoutes[chatId]?.controllerDeviceId
-                    ?? workspace.chat(id: chatId)?.deviceId
-                    ?? self.scaffoldControllerDeviceId() else {
+                guard let controllerDeviceId = self.scaffoldControllerDeviceId(chatId: chatId) else {
                     throw MobileSessionError.unavailable("This session has no Scaffold controller")
                 }
                 try await workspace.sendScaffoldCommand(
