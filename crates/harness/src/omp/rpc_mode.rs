@@ -277,10 +277,6 @@ impl ProcessGroupGuard {
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
         #[cfg(unix)]
-        if let Some(group) = self.group {
-            super::STOPPING_GROUPS.lock().remove(&group);
-        }
-        #[cfg(unix)]
         if let Some(group) = self.group.filter(|group| {
             self.birth.is_some()
                 && super::process_birth(*group as u32) == self.birth
@@ -292,9 +288,6 @@ impl Drop for ProcessGroupGuard {
         }) {
             // Leave the verified supervisor alive to reap OMP and detached tools.
             // Unsupervised children still need the dedicated group's hard stop.
-            if self.supervised {
-                super::mark_group_stopping(group);
-            }
             unsafe {
                 libc::kill(
                     -group,
@@ -342,9 +335,6 @@ async fn kill_rpc_process(
             *group != unsafe { libc::getpgrp() }
         }
     }) {
-        // Mark only this owned group as stopping; resume may wait for it, never
-        // for an unrelated writer or another live Crew engine's session.
-        super::mark_group_stopping(group);
         // The supervisor needs its two-second grace even if the RPC grace is shorter.
         unsafe {
             libc::kill(-group, libc::SIGTERM);

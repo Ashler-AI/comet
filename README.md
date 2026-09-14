@@ -62,6 +62,14 @@ hand-edit the model list. Unknown source formats fail regeneration.
 Catalog regressions cover credential-free defaults, local overrides/custom
 providers, deduplication, and preservation of the Scaffold-scoped catalog.
 
+## Crew 0.1.104 journal recovery
+
+Journal lookup no longer stops after 10,000 directories. Existing sessions retain
+their native identities and histories. Resume waits up to five seconds for a
+writer to release its journal, without relying on ancestry that may disappear
+during teardown; an active or unverifiable writer still prevents resume. Waiting
+does not terminate any process or relax explicit takeover ownership checks.
+
 ## Crew 0.1.102 restart recovery
 
 Crew preserves the exact interrupted request and native OMP session across a

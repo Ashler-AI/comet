@@ -95,19 +95,6 @@ pub fn run_supervisor_from_env() -> Option<Result<(), HarnessError>> {
 #[cfg(unix)]
 static SUPERVISOR_STOPPING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-#[cfg(unix)]
-static STOPPING_GROUPS: std::sync::LazyLock<
-    parking_lot::Mutex<std::collections::HashMap<i32, String>>,
-> = std::sync::LazyLock::new(Default::default);
-
-#[cfg(unix)]
-fn mark_group_stopping(group: i32) {
-    let mut groups = STOPPING_GROUPS.lock();
-    groups.retain(|pid, birth| process_birth(*pid as u32).as_ref() == Some(birth));
-    if let Some(birth) = process_birth(group as u32) {
-        groups.insert(group, birth);
-    }
-}
 
 #[cfg(unix)]
 extern "C" fn supervisor_stop(_: libc::c_int) {
@@ -1081,48 +1068,6 @@ fn crew_supervisor(root: &ProcessIdentity, executable: &Path) -> Option<ProcessI
 }
 
 #[cfg(unix)]
-fn teardown_writers(
-    path: &Path,
-    executable: &Path,
-    supervisor_executable: &Path,
-    known: &[(u32, String)],
-) -> Option<Vec<(u32, String)>> {
-    session_writer_pids(path)?
-        .into_iter()
-        .map(|pid| {
-            let birth = process_birth(pid)?;
-            if known
-                .iter()
-                .any(|(old_pid, old_birth)| *old_pid == pid && *old_birth == birth)
-            {
-                return Some((pid, birth));
-            }
-            let mut identity = process_identity(pid)?;
-            for _ in 0..64 {
-                if same_executable(&identity.executable, executable)
-                    && let Some(supervisor) = crew_supervisor(&identity, supervisor_executable)
-                    && supervisor.uid == unsafe { libc::geteuid() }
-                    && (supervisor.ppid == 1
-                        || STOPPING_GROUPS
-                            .lock()
-                            .get(&supervisor.pgid)
-                            .is_some_and(|birth| {
-                                process_birth(supervisor.pid).as_ref() == Some(birth)
-                            }))
-                {
-                    return Some((pid, birth));
-                }
-                if identity.ppid <= 1 {
-                    return None;
-                }
-                identity = process_identity(identity.ppid)?;
-            }
-            None
-        })
-        .collect()
-}
-
-#[cfg(unix)]
 fn stop_plan(files: &[PathBuf], omp_executable: &Path) -> Result<Vec<StopTarget>, HarnessError> {
     let mut writer_pids = Vec::new();
     for file in files {
@@ -1469,7 +1414,6 @@ fn matching_session_files(session_dirs: &[PathBuf], session_id: &str) -> (Vec<Pa
     let mut pending: VecDeque<PathBuf> = session_dirs.iter().cloned().collect();
     let mut matches = Vec::new();
     while let Some(dir) = pending.pop_front() {
-
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1901,14 +1845,11 @@ impl OmpHarness {
         &self,
         resume: Option<&str>,
         file: Option<&Path>,
-        executable: &Path,
     ) -> Result<(), HarnessError> {
         let (Some(session_id), Some(file)) = (resume, file) else {
             return Ok(());
         };
         let deadline = Instant::now() + Duration::from_secs(5);
-        #[cfg(unix)]
-        let mut verified = Vec::new();
         loop {
             match self.writer_state(file) {
                 SessionWriterState::Inactive => return Ok(()),
@@ -1917,13 +1858,9 @@ impl OmpHarness {
                         .into(),
                 )),
                 SessionWriterState::Active => {
-                    #[cfg(unix)]
-                    if Instant::now() < deadline
-                        && let Some(supervisor) = self.supervisor_executable.as_deref()
-                        && let Some(writers) =
-                            teardown_writers(file, executable, supervisor, &verified)
-                    {
-                        verified = writers;
+                    // A writer may exit or be reparented between process probes.
+                    // Waiting grants no ownership: only an inactive journal may resume.
+                    if Instant::now() < deadline {
                         tokio::time::sleep(Duration::from_millis(50)).await;
                         continue;
                     }
@@ -2424,12 +2361,8 @@ impl Harness for OmpHarness {
         } else {
             None
         };
-        self.ensure_resume_has_no_writer(
-            request.resume.as_deref(),
-            resume_file.as_deref(),
-            &executable,
-        )
-        .await?;
+        self.ensure_resume_has_no_writer(request.resume.as_deref(), resume_file.as_deref())
+            .await?;
         // Native lookup gets the exact journal; the request and handshake retain
         // its canonical header ID rather than comparing a path to a UUID.
         let canonical_resume = request.resume.clone();
@@ -4703,26 +4636,16 @@ mod tests {
             // A live owner must remain busy, not be waited out or stopped.
             assert!(matches!(
                 harness
-                    .ensure_resume_has_no_writer(
-                        Some("recovery-session"),
-                        Some(&journal),
-                        &executable
-                    )
+                    .ensure_resume_has_no_writer(Some("recovery-session"), Some(&journal),)
                     .await,
                 Err(HarnessError::SessionBusy { .. })
             ));
-            mark_group_stopping(group);
-            // Capture the exact writer identities before the root exits and its
-            // detached child is reparented. Subsequent probes retain birth proof.
-            let writers = teardown_writers(&journal, &executable, &executable, &[]).unwrap();
-            assert!(!writers.is_empty());
             unsafe {
                 libc::kill(group, libc::SIGTERM);
             }
             let result = harness
-                .ensure_resume_has_no_writer(Some("recovery-session"), Some(&journal), &executable)
+                .ensure_resume_has_no_writer(Some("recovery-session"), Some(&journal))
                 .await;
-            STOPPING_GROUPS.lock().remove(&group);
             let deadline = Instant::now() + Duration::from_secs(5);
             while supervisor.try_wait().unwrap().is_none() && Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(25)).await;
