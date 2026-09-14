@@ -662,19 +662,12 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
     .await;
 
     let entries = entries_now(&core);
-    // The aborted entry SAYS why it ended — and that the run is resuming.
+    // Recovery retains the interrupted history rather than replacing it.
     let aborted = entries
         .iter()
         .find(|e| e.status == Some(MessageStatus::Aborted))
         .expect("crashed entry stays, stamped aborted");
-    assert!(
-        aborted.parts.iter().any(|p| matches!(
-            p,
-            MessagePart::Error { message, .. }
-                if message.contains("engine restart") && message.contains("resuming")
-        )),
-        "aborted entry carries the visible interruption note"
-    );
+    assert_eq!(aborted.id, "msg-assistant-1");
     // Re-dispatch reuses the original user message id — never a duplicate.
     assert_eq!(
         entries

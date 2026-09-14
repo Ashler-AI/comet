@@ -139,10 +139,23 @@ impl RunJournal {
         &self,
         chat_id: &str,
     ) -> Result<Option<T>, JournalError> {
-        self.read_record(chat_id, "recovery")
+        Ok(self
+            .read_record::<Option<T>>(chat_id, "recovery")?
+            .flatten())
     }
 
-    pub(crate) fn clear_recovery(&self, chat_id: &str) -> Result<(), JournalError> {
+    pub(crate) fn recovery_retired(&self, chat_id: &str) -> Result<bool, JournalError> {
+        Ok(matches!(
+            self.read_record::<Option<serde_json::Value>>(chat_id, "recovery")?,
+            Some(None)
+        ))
+    }
+
+    pub(crate) fn retire_recovery(&self, chat_id: &str) -> Result<(), JournalError> {
+        self.save_record(chat_id, "recovery", &Option::<serde_json::Value>::None)
+    }
+
+    fn clear_recovery(&self, chat_id: &str) -> Result<(), JournalError> {
         let _guard = self.lock();
         match std::fs::remove_file(self.dir.join(format!("{}.recovery", sanitize_id(chat_id)))) {
             Ok(()) => File::open(&self.dir)?.sync_all()?,
@@ -158,7 +171,13 @@ impl RunJournal {
             let path = entry?.path();
             if path.extension().and_then(|extension| extension.to_str()) == Some("recovery") {
                 match self.chat_id_for(&path) {
-                    Ok(Some(chat_id)) => ids.push(chat_id),
+                    Ok(Some(chat_id)) => match self.recovery_retired(&chat_id) {
+                        Ok(false) => ids.push(chat_id),
+                        Ok(true) => {}
+                        Err(error) => {
+                            tracing::error!(%chat_id, %error, "skipping invalid Crew recovery record")
+                        }
+                    },
                     Ok(None) => {}
                     Err(error) => {
                         tracing::error!(path = %path.display(), %error, "skipping invalid Crew recovery record")
@@ -237,6 +256,9 @@ impl RunJournal {
         buf.push(b'\n');
         journal.file.write_all(&buf)?;
         journal.file.flush()?;
+        if matches!(event, AgentEvent::Done { .. }) {
+            journal.file.sync_all()?;
+        }
         journal.needs_newline = false;
         journal.next_seq = seq + 1;
         Ok(seq)
@@ -485,7 +507,7 @@ mod tests {
                 .read_recovery::<serde_json::Value>("chat__session__chat")
                 .is_err()
         );
-        journal.clear_recovery("chat::session::chat").unwrap();
+        journal.retire_recovery("chat::session::chat").unwrap();
         drop(journal);
         assert!(
             RunJournal::open(dir.path())
