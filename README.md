@@ -45,6 +45,27 @@ the sandbox image, and deploying the coordinated provider/control-plane changes.
 Existing images are not upgraded by editing this repository. No rollout is implied
 by the presence of this code.
 
+## Crew 0.1.102 restart recovery
+
+Crew preserves the exact interrupted request and native OMP session across a
+planned restart, including attachments, model options, and the original user
+message ID. Shutdown closes admission before draining owned runtimes. Completed
+requests carry a durable retirement marker so another restart cannot replay them.
+
+OMP journal paths and session IDs resolve to the same canonical native identity.
+Resume waits briefly for verified Crew-owned teardown; unrelated writers remain
+blocked. Explicit takeover survives another restart, is safe to retry, and resumes
+without stopping anything when the original writer has already exited. Native
+identity and process ownership checks remain fail-closed.
+
+The desktop shows current waiting, stopping, resuming, failed, and completed
+recovery states. Recovery actions no longer depend on historical error text.
+Detached tools are cleaned up only when their ancestry and process birth identity
+were observed; an unprovable orphan is not automatically killed.
+
+This release changes the desktop and Linux runtime without changing the Scaffold
+runtime compatibility contract. Publication does not upgrade existing sandboxes.
+
 ## Crew 0.1.99 release
 
 Source `4b4b7bcd12ba90780f89c6c8e9488cc86730838b` is merged into `main`.

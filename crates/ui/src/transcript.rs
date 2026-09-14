@@ -1691,13 +1691,16 @@ impl Transcript {
         let recovery = selected
             .as_deref()
             .and_then(|chat_id| state.omp_recovery(chat_id));
-        if self.omp_recovery.as_ref() != recovery {
+        let recovery_changed = self.omp_recovery.as_ref() != recovery;
+        if recovery_changed {
             self.omp_recovery = recovery.cloned();
-            cx.notify();
         }
         let attached = selected != self.chat_id;
         let revision = state.transcript_revision();
         if !attached && revision == self.state_revision {
+            if recovery_changed {
+                cx.notify();
+            }
             return;
         }
         let change = state.transcript_change().clone();
@@ -1892,6 +1895,9 @@ impl Transcript {
             self.list.remeasure_items(0..self.rows.len());
         }
         if !changed && !visibility_changed {
+            if recovery_changed {
+                cx.notify();
+            }
             return;
         }
         if self.pinned {
