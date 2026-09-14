@@ -903,8 +903,8 @@ async fn prepared_handoff_routes_peer_messages_and_interrupts_to_the_remote_nati
         comet_doc::SessionCommandStatus::Pending,
     );
 
-    // A fresh scoped host receives only the session document and its verified
-    // authority, not the controller's project-wide workspace document.
+    // The sandbox joins the same project workspace and receives the session
+    // document separately with its verified writer authority.
     let remote_dir = tempfile::tempdir().unwrap();
     std::fs::write(remote_dir.path().join("device-id"), &owner_device_id).unwrap();
     let (requests_tx, mut requests_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -928,6 +928,12 @@ async fn prepared_handoff_routes_peer_messages_and_interrupts_to_the_remote_nati
         RuntimeProfile::ScaffoldHost,
     )
     .unwrap();
+    remote_core
+        .workspace
+        .doc()
+        .doc()
+        .import(&core.workspace.doc().export_snapshot().unwrap())
+        .unwrap();
     let grant = core
         .doc_host
         .collaboration_grants("owner@example.com", &[receipt.chat_id.clone()])
@@ -952,6 +958,44 @@ async fn prepared_handoff_routes_peer_messages_and_interrupts_to_the_remote_nati
             .unwrap()
             .unwrap();
     assert_eq!(started.resume.as_deref(), Some("native-source"));
+    // Sidebar state travels through the workspace, without a transcript watch.
+    async fn sync_sidebar_workspace(
+        controller: &crate::EngineCore,
+        remote: &crate::EngineCore,
+        chat_id: &str,
+        status: SessionStatus,
+    ) -> (Chat, comet_proto::Session) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let chat = remote.workspace.doc().chat(chat_id).unwrap().unwrap();
+                let session = remote.workspace.doc().read_sessions().unwrap()
+                    .into_iter().find(|session| session.chat_id == chat_id);
+                if let Some(session) = session
+                    && session.status == status
+                    && chat.last_message_at.is_some_and(|at| at.timestamp_millis()
+                        >= match status {
+                            SessionStatus::Idle | SessionStatus::Errored => session.updated_at,
+                            _ => session.started_at.unwrap(),
+                        }.timestamp_millis())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        controller.workspace.doc().doc()
+            .import(&remote.workspace.doc().export_snapshot().unwrap()).unwrap();
+        let chat = controller.workspace.doc().chat(chat_id).unwrap().unwrap();
+        let session = controller.workspace.doc().read_sessions().unwrap()
+            .into_iter().find(|session| session.chat_id == chat_id).unwrap();
+        assert_eq!(session.status, status);
+        (chat, session)
+    }
+    let (working_chat, working) = sync_sidebar_workspace(
+        &core, &remote_core, &receipt.chat_id, SessionStatus::Working,
+    ).await;
+    assert_eq!(comet_proto::view::display_status(&working_chat, Some(&working), chrono::Utc::now()),
+        comet_proto::ChatIndicator::Working);
     assert_eq!(started.cwd, "/workspace/ashler-platform");
     remote_handle
         .doc()
@@ -1058,6 +1102,12 @@ async fn prepared_handoff_routes_peer_messages_and_interrupts_to_the_remote_nati
     })
     .await
     .unwrap();
+    let (waiting_chat, waiting) = sync_sidebar_workspace(
+        &core, &remote_core, &receipt.chat_id, SessionStatus::AwaitingInput,
+    ).await;
+    assert_eq!(comet_proto::view::display_status(&waiting_chat, Some(&waiting), chrono::Utc::now()),
+        comet_proto::ChatIndicator::AwaitingInput);
+    core.workspace.mark_chat_seen(&receipt.chat_id, chrono::Utc::now()).unwrap();
     remote_client
         .call(
             methods::QUEUE_COMMAND,
@@ -1112,6 +1162,35 @@ async fn prepared_handoff_routes_peer_messages_and_interrupts_to_the_remote_nati
             .unwrap(),
         "native-source",
     );
+    let (completed_chat, completed) = sync_sidebar_workspace(
+        &core, &remote_core, &receipt.chat_id, SessionStatus::Idle,
+    ).await;
+    assert_eq!(comet_proto::view::display_status(&completed_chat, Some(&completed), chrono::Utc::now()),
+        comet_proto::ChatIndicator::Completed);
+    core.workspace.mark_chat_seen(&receipt.chat_id, chrono::Utc::now()).unwrap();
+    let seen_chat = core.workspace.doc().chat(&receipt.chat_id).unwrap().unwrap();
+    assert_eq!(comet_proto::view::display_status(&seen_chat, Some(&completed), chrono::Utc::now()),
+        comet_proto::ChatIndicator::Idle);
+    assert_eq!(comet_proto::view::effective_indicator(Some(&working),
+        working.updated_at + chrono::Duration::milliseconds(comet_proto::view::SESSION_STALE_MS + 1)),
+        comet_proto::view::Indicator::None);
+    // The persisted workspace alone retains completion and seen state; no
+    // session document or scoped follower is needed after restart.
+    let restored_dir = tempfile::tempdir().unwrap();
+    let restored_store = std::sync::Arc::new(comet_sync::DocsStore::open(restored_dir.path()).unwrap());
+    restored_store.save_snapshot(crate::workspace_host::WORKSPACE_DOC_ID,
+        &core.workspace.doc().export_snapshot().unwrap()).unwrap();
+    let restored_workspace = crate::WorkspaceHost::open(restored_store, crate::WorkspaceHostConfig {
+        device_id: core.device_id.clone(), device_name: "restored".into(), platform: "test".into(),
+        project_scope: "project-a".into(), user_id: "owner@example.com".into(), edge: None,
+    }).unwrap();
+    let restored_session = restored_workspace.doc().read_sessions().unwrap()
+        .into_iter().find(|session| session.chat_id == receipt.chat_id).unwrap();
+    assert_eq!(restored_session.status, SessionStatus::Idle);
+    let restored_chat = restored_workspace.doc().chat(&receipt.chat_id).unwrap().unwrap();
+    assert_eq!(restored_chat.last_message_at, completed_chat.last_message_at);
+    assert_eq!(comet_proto::view::display_status(&restored_chat, Some(&restored_session), chrono::Utc::now()),
+        comet_proto::ChatIndicator::Idle);
 
     // Chats without an assigned agent session still use the bare chat writer.
     let bare_chat_id = "00000000-0000-4000-8000-000000000003";
