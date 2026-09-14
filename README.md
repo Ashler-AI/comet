@@ -73,6 +73,12 @@ prevention, 547 desktop tests, and isolated native CLI restart smoke checks.
 Local release-contract checks passed 31 tests; local typechecks were intentionally
 not run.
 
+[Staging publication](https://github.com/Ashler-AI/comet/actions/runs/34903937027)
+published 0.1.102 from merged `e57761d`. Downloaded desktop checksums, strict
+signature validation, and Gatekeeper acceptance passed. An isolated signed-client
+smoke displayed the actionable recovery failure banner; the live staging updater
+reported 0.1.102 available. Production publication was not requested.
+
 ## Crew 0.1.99 release
 
 Source `4b4b7bcd12ba90780f89c6c8e9488cc86730838b` is merged into `main`.
