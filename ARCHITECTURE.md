@@ -279,6 +279,9 @@ Direct ports of comet behaviors (spec: feature-inventory §3):
   cases); worktrees under `~/.comet-native/worktrees`; fs watchers (`notify`) + 2min repair; diff
   capture (patch + numstat + untracked, 3MiB cap, sha256) → workspace doc summary + DO diff
   sidecar.
+  Managed checkout names combine 32 adjectives and 48 nouns (1,536 pairs), including
+  architecture/construction terms. Allocation starts at a time-derived offset and checks
+  every pair once before reporting exhaustion; existing directories and branches reserve names.
 - **Agent accounts**: credential-slot swap (macOS Keychain via `security-framework`, files
   elsewhere), plan labels, usage probes, paste-code/browser-poll OAuth flows.
 - **Auth**: verified Google Cloud IAP principals and Scaffold-scoped grants; local development uses an explicit mock principal and never production credentials.
