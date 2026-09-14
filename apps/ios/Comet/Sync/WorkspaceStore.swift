@@ -259,12 +259,12 @@ final class WorkspaceStore {
                 if self.roomEpoch == epoch, self.doc === document,
                    self.localProjectionGeneration == localGeneration, let decoded {
                     self.purgeLegacyMobileDevices(decoded.legacyMobileIds)
-                    self.applyProjection(decoded)
                     // Do not report initial/reconnect readiness while the UI
                     // still holds an older cached projection of this replica.
                     if let readyGeneration = self.roomReadyGeneration, generation >= readyGeneration {
                         self.connected = true
                     }
+                    self.applyProjection(decoded)
                 }
                 if self.projectionGeneration == generation {
                     self.projectionTask = nil
@@ -725,10 +725,29 @@ final class WorkspaceStore {
               let sandboxId = environment.source.sandboxId else {
             throw MobileSessionError.unavailable("This session has no Scaffold route")
         }
-        let scope = encodableDictionary(environment.scope)
+        return try await openScaffoldSession(controllerDeviceId: controllerDeviceId,
+                                             sandboxId: sandboxId, scope: environment.scope,
+                                             ownerPrincipal: environment.ownerPrincipal)
+    }
+
+    func openScaffoldSession(controllerDeviceId: String, sandboxId: String,
+                             scope: CollaborationScope, ownerPrincipal: String? = nil) async throws -> ScaffoldControlRoute {
+        guard scope.projectId == config.projectScope, scope.deploymentId == config.projectScope,
+              scope.sessionId != nil else {
+            throw MobileSessionError.unavailable("Open this session in Crew for its project and deployment")
+        }
         let attachment = try await attachScaffoldEnvironment(
-            controllerDeviceId: controllerDeviceId, sandboxId: sandboxId, scope: scope
+            controllerDeviceId: controllerDeviceId, sandboxId: sandboxId, scope: encodableDictionary(scope)
         )
+        guard attachment.environment.source.kind == "scaffold",
+              attachment.environment.source.sandboxId == sandboxId,
+              attachment.environment.scope == scope,
+              ownerPrincipal == nil || attachment.environment.ownerPrincipal == ownerPrincipal,
+              attachment.roomProjection?.projectId == scope.projectId,
+              attachment.roomProjection?.deploymentId == scope.deploymentId,
+              attachment.roomProjection?.sessionId == scope.sessionId else {
+            throw MobileSessionError.unavailable("Scaffold returned a different session identity")
+        }
         guard let ownerDeviceId = attachment.attachedDeviceId,
               let projection = attachment.roomProjection,
               let grant = attachment.controlGrant,
@@ -778,7 +797,7 @@ final class WorkspaceStore {
     private func attachScaffoldEnvironment(controllerDeviceId: String, sandboxId: String,
                                            scope: [String: Any]) async throws -> ScaffoldEnvironmentControlResult {
         try Task.checkCancellation()
-        // The engine owns authoritative provisioning and bounds each HTTP request.
+        // Attach resumes a paused sandbox and confirms its current host authority.
         // A second mobile deadline must not abandon a healthy remote startup.
         return try await relay(for: controllerDeviceId).call(
             method: "ControlScaffoldEnvironment",

@@ -8,6 +8,12 @@ Crew is Ashler's internal, multi-device controller for coding-agent sessions. Th
 Scaffold sandbox: empty and active conversation states, streamed messages, tool
 details, model/reasoning selection, attachments, input answers, and send/steer/stop.
 It deliberately has no session creation, session list, settings, or checkout controls.
+User messages are right-aligned; Crew responses remain left-aligned. **Open in Crew**
+continues the assigned session in the installed desktop or mobile app using a
+credential-free, deployment-specific link. The app authenticates the attachment
+with its own identity; execution stays in Scaffold. Mobile currently requires an
+online desktop Crew controller. This is not a transfer of execution or files onto
+the local device, and requires app builds containing the new Scaffold link handler.
 
 The dependency-free Node service connects to the assigned engine's loopback IPC.
 Scaffold's authenticated attach proxy supplies a dedicated server-side credential;
@@ -38,6 +44,41 @@ assets, selecting its verified release tuple in the platform repository, rebuild
 the sandbox image, and deploying the coordinated provider/control-plane changes.
 Existing images are not upgraded by editing this repository. No rollout is implied
 by the presence of this code.
+
+## Crew 0.1.99 release
+
+Source `4b4b7bcd12ba90780f89c6c8e9488cc86730838b` is merged into `main`.
+[Staging release](https://github.com/Ashler-AI/comet/actions/runs/34772456440)
+built and verified the desktop and Linux artifacts; [production promotion](https://github.com/Ashler-AI/comet/actions/runs/34773638162)
+reused the exact candidate and passed both channel readbacks. Standalone Crew
+Staging.app is included in the build's separate staging artifact.
+
+Scaffold [PR #6330](https://github.com/Ashler-AI/ashler-platform/pull/6330) merged
+the Anthropic credential projection fix and native-open list action. Its
+[staging rollout](https://github.com/Ashler-AI/ashler-platform/actions/runs/34773638333)
+and [primary rollout](https://github.com/Ashler-AI/ashler-platform/actions/runs/34774708243)
+passed sandbox-provider verification and promotion. Effective and fallback pins
+select 0.1.99; Linux x86_64 SHA-256 is
+`620fcb8b3858410114a5342a88977f526956a431e8edacb3a4a0649cf4eb748e`.
+Existing running sandboxes are not claimed to have been restarted or upgraded.
+
+Mobile [staging 1.0 (21)](https://github.com/Ashler-AI/comet/actions/runs/34772456221)
+and [production 1.0 (15)](https://github.com/Ashler-AI/comet/actions/runs/34772456098)
+passed simulator and archive verification; downloaded checksums and source
+provenance match. Both were subsequently distribution-exported and uploaded on
+2026-09-13 for internal TestFlight only, without local compilation. Apple accepted
+staging upload `eabb0795-1470-4c17-9705-ea2f00bfc2bc` and production upload
+`af77bb1d-2dfd-413c-87fa-ef983f0aeaac`; both entered processing. Inspection and
+exact uploaded IPAs passed strict deep signature verification. Uploaded SHA-256:
+
+- Staging: `e976185e6544632e0c04e0363a5b45f0de50515d85f351efe73dc667215b0fe0`
+- Production: `acafadc2c4f95fc67418123dbf8cb64d466fc3b803c0b1cfc4688fdf868e2a7c`
+
+Authenticated App Store Connect readback confirmed both uploads **Complete** and
+both builds **Testing**, internal-only, in their existing **Ashler Internal**
+groups (staging: one invite; production: two). No tester groups were changed.
+Device installation, notification receipt, native URL launch on installed devices,
+and live Anthropic completion remain unverified; local typechecks were not run.
 
 ## Crew 0.1.90 release
 
@@ -177,6 +218,16 @@ attach its host, transfer OMP history and the worktree, then queue the task in a
 distinct Crew chat. The receipt contains `chatId`, `sandboxId`, `commandId`, and
 `environment`; it confirms command admission, not remote task completion.
 Monitor the returned chat in Crew, not standalone `handoff.*` lifecycle tools.
+
+Handoff chats publish running, waiting, and terminal status under their chat ID,
+including follow-up turns. Mobile follow-ups use a desktop controller, not the
+ephemeral sandbox host: attachment resumes a paused sandbox and confirms its
+current host authority before admitting the message. A reachable desktop
+controller is required.
+On the next command after an epoch change, the sandbox host transfers prior
+session ownership only with a live, edge-verified grant for the same sandbox,
+room, and principal. Queue, steer, and peer-message continuations do not
+require another Start command to restore status publication.
 
 Native transfer reads the sandbox checkout's exact HEAD before capture. When it
 is a known source ancestor and the only bundle boundary, the archive contains only

@@ -2461,11 +2461,27 @@ impl ScaffoldRuntime {
                 None,
             ),
             ScaffoldEnvironmentControl::Attach { sandbox_id, scope } => {
-                let environment = self
+                let mut environment = self
                     .inner
                     .client
                     .inspect(&sandbox_id, &scope, cancellation)
                     .await?;
+                if scaffold_source(&environment)?.0 == comet_proto::ScaffoldLifecycle::Paused {
+                    let resumed = self
+                        .inner
+                        .client
+                        .resume(&sandbox_id, &scope, cancellation)
+                        .await?;
+                    if environment_sandbox_id(&resumed)? != sandbox_id
+                        || resumed.scope != environment.scope
+                        || resumed.owner_principal != environment.owner_principal
+                    {
+                        return Err(ScaffoldError::InvalidResponse(
+                            "sandbox identity changed while resuming".into(),
+                        ));
+                    }
+                    environment = resumed;
+                }
                 let (device_id, run_id, grant) = self
                     .attach(&sandbox_id, &scope, &environment, cancellation)
                     .await?;
@@ -3663,6 +3679,69 @@ mod tests {
             })
         );
     }
+    #[tokio::test]
+    async fn attach_resumes_existing_sandbox_and_uses_new_epoch_authority() {
+        let grant_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let authority = host_authority(grant_id, now_ms() + 60_000)
+            .replace("sandbox-a-e1", "sandbox-a-e3")
+            .replace(r#"\"lifecycleEpoch\":1"#, r#"\"lifecycleEpoch\":3"#);
+        let current =
+            |status| comet_sandbox(status).replace("\"lifecycleEpoch\":1", "\"lifecycleEpoch\":3");
+        let (origin, captured) = mock_server_with_status(vec![
+            (200, comet_sandbox("paused")),
+            (200, current("resuming")),
+            (503, r#"{"error":"sandbox_runtime_starting"}"#.into()),
+            (200, current("starting")),
+            (200, authority.clone()),
+            (200, current("ready")),
+            (200, authority),
+        ])
+        .await;
+        let runtime = ScaffoldRuntime::new(
+            ScaffoldClient::new(&origin, "project-a", Arc::new(StaticToken("token".into())))
+                .unwrap(),
+            "https://comet-edge.example",
+            Arc::new(UnavailableDeviceJoinGrantProvider),
+        );
+        for _ in 0..2 {
+            let result = runtime
+                .control(
+                    ScaffoldEnvironmentControl::Attach {
+                        sandbox_id: "sandbox-a".into(),
+                        scope: scope(),
+                    },
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                result.attached_device_id.as_deref(),
+                Some("comet-scaffold-sandbox-a-e3")
+            );
+            assert_eq!(result.environment.scope, scope());
+            assert_eq!(scaffold_source(&result.environment).unwrap().1, Some(3));
+            assert_eq!(
+                result.room_projection.unwrap().session_id,
+                scope().session_id.unwrap()
+            );
+            assert_eq!(result.control_grant.unwrap().id, grant_id);
+            assert!(result.run_id.is_none());
+        }
+        let requests = captured.await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.starts_with("POST /api/code-sandboxes/sandbox-a/resume "))
+                .count(),
+            1
+        );
+        assert!(!requests.iter().any(|request| {
+            request.starts_with("POST /api/code-sandboxes HTTP")
+                || request.contains("/auth/device-grants")
+                || request.contains("--device-bootstrap-file")
+        }));
+    }
+
     #[tokio::test]
     async fn attach_keeps_credentials_out_of_process_arguments() {
         let join_expires_at = now_ms() + 60_000;

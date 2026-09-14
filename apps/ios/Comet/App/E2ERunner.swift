@@ -434,6 +434,22 @@ enum E2ERunner {
     /// even if the session becomes working or the message arrives later.
     static func runMobileParity() async {
         guard await runScaffoldPreparationOutcomes() else { return }
+        let sandbox = DeviceRow(id: "comet-scaffold-existing-e1", name: "Sandbox", platform: "linux")
+        let currentSandbox = DeviceRow(id: "comet-scaffold-existing-e3", name: "Sandbox", platform: "linux")
+        let offlineDesktop = DeviceRow(id: "offline-desktop", name: "Desktop", platform: "macos")
+        let onlineDesktop = DeviceRow(id: "online-desktop", name: "Desktop", platform: "macos")
+        let phone = DeviceRow(id: "phone", name: "Phone", platform: "ios")
+        let controllers = [sandbox, currentSandbox, offlineDesktop, phone, onlineDesktop]
+        guard selectScaffoldControllerDeviceId(devices: controllers,
+                  preferred: [sandbox.id, offlineDesktop.id], isOnline: { $0 != offlineDesktop.id }) == onlineDesktop.id,
+              selectScaffoldControllerDeviceId(devices: controllers,
+                  preferred: [offlineDesktop.id], isOnline: { _ in false }) == offlineDesktop.id,
+              selectScaffoldControllerDeviceId(devices: [sandbox, currentSandbox, phone],
+                  preferred: [sandbox.id], isOnline: { _ in true }) == nil else {
+            log("FAIL Crew Scaffold controller selected a sandbox host or ignored desktop availability")
+            return
+        }
+        log("OK Crew Scaffold follow-up selects a desktop controller, never a stale/current sandbox epoch")
         let config = AppConfig(edgeURL: URL(string: "http://127.0.0.1:1")!, mode: .dev,
                                userId: "parity-\(UUID().uuidString)", projectScope: "parity",
                                deviceId: "viewer", deviceName: "Crew regression")
