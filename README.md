@@ -66,6 +66,13 @@ were observed; an unprovable orphan is not automatically killed.
 This release changes the desktop and Linux runtime without changing the Scaffold
 runtime compatibility contract. Publication does not upgrade existing sandboxes.
 
+[Linux and macOS verification](https://github.com/Ashler-AI/comet/actions/runs/34902878407)
+passed for `dc6725992beb312f134607c0bc0bfd5b8a6c10b0`, including real supervisor
+process cleanup, two consecutive active-turn restarts, retired-request replay
+prevention, 547 desktop tests, and isolated native CLI restart smoke checks.
+Local release-contract checks passed 31 tests; local typechecks were intentionally
+not run.
+
 ## Crew 0.1.99 release
 
 Source `4b4b7bcd12ba90780f89c6c8e9488cc86730838b` is merged into `main`.
