@@ -45,6 +45,10 @@ for arg in "$@"; do
   fi
   prev="$arg"
 done
+if [ -f "$SESSION_ID" ]; then
+  SESSION_ID=$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$SESSION_ID" | sed -n '1p')
+fi
+SESSION_ID="${OMP_REPORTED_SESSION_ID:-$SESSION_ID}"
 ACTIVE_GOAL="${OMP_ACTIVE_GOAL:-}"
 
 

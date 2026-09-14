@@ -436,12 +436,12 @@ async fn selected_model_and_reasoning_ride_the_spawn_flags() {
 }
 
 #[tokio::test]
-async fn resume_pins_the_requested_session_at_spawn() {
+async fn resume_path_and_id_use_the_same_canonical_handshake() {
     let _env = env_lock().await;
     let temp = tempfile::tempdir().unwrap();
     let argv_log = temp.path().join("argv");
     let session_dir = temp.path().join("sessions");
-    write_omp_session(&session_dir, "resume-session");
+    let journal = write_omp_session(&session_dir, "resume-session");
     unsafe {
         std::env::set_var("OMP_ARGV_LOG", &argv_log);
         std::env::set_var("OMP_WRITER_STATE", "inactive");
@@ -450,32 +450,96 @@ async fn resume_pins_the_requested_session_at_spawn() {
         .with_executable(fixture_path())
         .with_session_dir(session_dir)
         .with_session_writer_probe(fixture_path());
-    let stream = harness
-        .run(request(Some("resume-session")), controls())
+    for selector in ["resume-session", journal.to_str().unwrap()] {
+        let stream = harness
+            .run(request(Some(selector)), controls())
+            .await
+            .expect("resume starts");
+        let events = tokio::time::timeout(
+            Duration::from_secs(10),
+            stream
+                .map(|event| event.expect("valid RPC event"))
+                .collect::<Vec<_>>(),
+        )
         .await
-        .expect("resume starts");
-    let events = tokio::time::timeout(
-        Duration::from_secs(10),
-        stream
-            .map(|event| event.expect("valid RPC event"))
-            .collect::<Vec<_>>(),
-    )
-    .await
-    .expect("fake completes");
-    assert!(
-        events.iter().any(|event| matches!(event,
-            AgentEvent::SessionStarted { session_id, .. } if session_id == "resume-session"
-        )),
-        "events: {events:?}"
-    );
-    let argv = std::fs::read_to_string(argv_log).unwrap();
-    assert!(
-        argv.contains("--resume\nresume-session\n"),
-        "resume must be pinned at spawn: {argv}"
-    );
+        .expect("fake completes");
+        assert!(
+            events.iter().any(|event| matches!(event,
+                AgentEvent::SessionStarted { session_id, .. } if session_id == "resume-session"
+            )),
+            "events: {events:?}"
+        );
+    }
     unsafe {
         std::env::remove_var("OMP_WRITER_STATE");
     }
+}
+
+#[tokio::test]
+async fn inactive_takeover_is_idempotent_and_invalid_or_ambiguous_journals_fail() {
+    let temp = tempfile::tempdir().unwrap();
+    let journal = write_omp_session(temp.path(), "inactive-session");
+    let harness = OmpHarness::new()
+        .with_executable("/missing/omp")
+        .with_session_dir(temp.path());
+    harness
+        .stop_session(journal.to_str().unwrap())
+        .await
+        .unwrap();
+    harness.stop_session("inactive-session").await.unwrap();
+    let unrelated_writer = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&journal)
+        .unwrap();
+    assert!(harness.stop_session("inactive-session").await.is_err());
+    assert!(
+        unrelated_writer.metadata().is_ok(),
+        "unrelated holder must remain untouched"
+    );
+    drop(unrelated_writer);
+    harness.stop_session("inactive-session").await.unwrap();
+    let invalid = temp.path().join("invalid.jsonl");
+    std::fs::write(&invalid, "{}\n").unwrap();
+    assert!(
+        harness
+            .stop_session(invalid.to_str().unwrap())
+            .await
+            .is_err()
+    );
+    std::fs::copy(&journal, temp.path().join("duplicate.jsonl")).unwrap();
+    assert!(harness.stop_session("inactive-session").await.is_err());
+}
+
+#[tokio::test]
+async fn resume_path_still_rejects_a_different_native_session() {
+    let _env = env_lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let journal = write_omp_session(temp.path(), "expected-session");
+    unsafe {
+        std::env::set_var("OMP_ARGV_LOG", temp.path().join("argv"));
+        std::env::set_var("OMP_WRITER_STATE", "inactive");
+        std::env::set_var("OMP_REPORTED_SESSION_ID", "wrong-session");
+    }
+    let stream = OmpHarness::new()
+        .with_executable(fixture_path())
+        .with_session_dir(temp.path())
+        .with_session_writer_probe(fixture_path())
+        .run(request(Some(journal.to_str().unwrap())), controls())
+        .await
+        .unwrap();
+    let events = tokio::time::timeout(Duration::from_secs(10), stream.collect::<Vec<_>>())
+        .await
+        .unwrap();
+    unsafe {
+        std::env::remove_var("OMP_REPORTED_SESSION_ID");
+        std::env::remove_var("OMP_WRITER_STATE");
+    }
+    assert!(events.iter().any(Result::is_err));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Ok(AgentEvent::SessionStarted { .. })))
+    );
 }
 
 #[tokio::test]
@@ -978,7 +1042,7 @@ async fn verified_takeover_stops_exact_writer_and_releases_journal() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn verified_takeover_stops_orphaned_tool_holding_the_journal() {
+async fn takeover_rejects_unproven_orphan_writer() {
     use std::os::unix::process::CommandExt as _;
 
     let temp = tempfile::tempdir().unwrap();
@@ -1023,22 +1087,15 @@ async fn verified_takeover_stops_orphaned_tool_holding_the_journal() {
         .with_session_dir(&session_dir)
         .stop_session("orphaned-takeover-session")
         .await;
-    if let Err(error) = result {
-        // SAFETY: the test created this exact process and recorded its PID.
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-        }
-        panic!("orphaned writer takeover failed: {error}");
-    }
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while process_exists(pid) && std::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(!process_exists(pid), "orphaned tool survived takeover");
-    assert_eq!(
-        comet_harness::omp::session_writer_state(&journal),
-        comet_harness::omp::SessionWriterState::Inactive
+    assert!(
+        result.is_err(),
+        "an orphan descriptor is not ownership proof"
     );
+    assert!(process_exists(pid), "unrelated orphan must not be signaled");
+    // This test created the helper; explicit test cleanup is not takeover.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
 }
 #[cfg(unix)]
 #[tokio::test]

@@ -1060,6 +1060,70 @@ pub(crate) struct TranscriptChange {
     pub echoes_changed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum OmpRecoveryPhase {
+    Idle,
+    Waiting,
+    Stopping,
+    Resuming,
+    Failed,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub(crate) struct OmpRecoveryState {
+    pub phase: OmpRecoveryPhase,
+    pub error: Option<String>,
+    #[serde(skip)]
+    pub watch_error: Option<String>,
+    #[serde(skip)]
+    request_generation: u64,
+}
+
+impl OmpRecoveryState {
+    pub fn busy(&self) -> bool {
+        self.watch_error.is_none()
+            && matches!(
+                self.phase,
+                OmpRecoveryPhase::Waiting | OmpRecoveryPhase::Stopping | OmpRecoveryPhase::Resuming
+            )
+    }
+
+    pub fn can_take_over(&self) -> bool {
+        !self.busy() && self.watch_error.is_none() && self.phase == OmpRecoveryPhase::Failed
+    }
+
+    fn disconnected(&mut self, error: String) {
+        self.watch_error = Some(error);
+        self.request_generation = self.request_generation.wrapping_add(1);
+    }
+
+    fn finish_request(&mut self, generation: u64, result: Result<(), String>) {
+        if self.request_generation != generation
+            || self.watch_error.is_some()
+            || matches!(
+                self.phase,
+                OmpRecoveryPhase::Completed | OmpRecoveryPhase::Failed
+            )
+        {
+            return;
+        }
+        match result {
+            Ok(()) => {
+                self.phase = OmpRecoveryPhase::Completed;
+                self.error = None;
+            }
+            Err(error) => {
+                self.phase = OmpRecoveryPhase::Failed;
+                self.error = Some(format!(
+                    "Crew could not resume this session: {error}. Resolve the issue, then retry recovery."
+                ));
+            }
+        }
+    }
+}
+
 /// Root application state. Reducer methods (`apply_*`, [`Self::session_for`], …)
 /// are plain `&mut self` functions so tests construct the struct directly; gpui
 /// glue ([`Self::bootstrap`], [`Self::select_chat`]) layers subscriptions on top.
@@ -1075,11 +1139,9 @@ pub struct AppState {
     /// Harness-native session metadata discovered on this device. Transcripts
     /// remain engine-private until the user attaches one candidate explicitly.
     pub local_session_candidates: Vec<LocalSessionCandidate>,
-    /// OMP takeover state is keyed by the exact transcript error row, not only
-    /// by chat, so a resolved historical error never becomes actionable again.
-    omp_takeovers: HashSet<String>,
-    omp_takeover_errors: HashMap<String, String>,
-    omp_takeover_completed: HashSet<String>,
+    /// Current engine authority, never inferred from historical transcript errors.
+    omp_recovery: HashMap<String, OmpRecoveryState>,
+    omp_recovery_request_generation: u64,
     pub local_sessions_loading: bool,
     pub local_sessions_error: Option<String>,
     pub local_session_attaching: HashSet<String>,
@@ -1195,6 +1257,7 @@ pub struct AppState {
     watch_tasks: Vec<Task<()>>,
     transcript_task: Option<Task<()>>,
     collaboration_task: Option<Task<()>>,
+    omp_recovery_task: Option<Task<()>>,
 }
 
 impl Default for AppState {
@@ -1220,9 +1283,8 @@ impl AppState {
             devices: Vec::new(),
             spaces: Vec::new(),
             chats: Vec::new(),
-            omp_takeovers: HashSet::new(),
-            omp_takeover_errors: HashMap::new(),
-            omp_takeover_completed: HashSet::new(),
+            omp_recovery: HashMap::new(),
+            omp_recovery_request_generation: 0,
             local_session_candidates: Vec::new(),
             local_sessions_loading: false,
             local_sessions_error: None,
@@ -1282,6 +1344,7 @@ impl AppState {
             watch_tasks: Vec::new(),
             transcript_task: None,
             collaboration_task: None,
+            omp_recovery_task: None,
             auto_selected: false,
         }
     }
@@ -1460,6 +1523,7 @@ impl AppState {
         self.selected_chat = None;
         self.restore_transcript(None);
         self.transcript_task = None;
+        self.omp_recovery_task = None;
         self.transcript_history_task = None;
         self.transcript_history_loading = false;
         self.collaboration = None;
@@ -2519,6 +2583,7 @@ impl AppState {
         // Both retain their last good content until replacement frames arrive.
         if let Some(chat_id) = self.selected_chat.clone() {
             let projection = self.room_projections.get(&chat_id).cloned();
+            self.watch_omp_recovery(&chat_id, cx);
             self.transcript_task = Some(spawn_transcript_watch(
                 cx,
                 handle.clone(),
@@ -2538,6 +2603,11 @@ impl AppState {
     /// standing watches end silently and the transcript watch retries a dead
     /// socket every 2s forever.
     fn on_engine_closed(&mut self, cx: &mut Context<Self>) {
+        for recovery in self.omp_recovery.values_mut() {
+            recovery
+                .disconnected("Crew disconnected. Reconnect the engine, then retry status.".into());
+        }
+        cx.notify();
         let Some(config) = self.reconnect_config() else {
             return;
         };
@@ -2856,6 +2926,7 @@ impl AppState {
         }
         self.restore_transcript(None);
         self.transcript_task = None;
+        self.omp_recovery_task = None;
         self.transcript_history_task = None;
         self.transcript_history_loading = false;
         self.collaboration = None;
@@ -2864,6 +2935,7 @@ impl AppState {
         self.selected_invitation_grant = None;
         if let Some(handle) = self.engine.clone() {
             let projection = Some(attachment.projection.clone());
+            self.watch_omp_recovery(&chat_id, cx);
             self.transcript_task = Some(spawn_transcript_watch(
                 cx,
                 handle.clone(),
@@ -2896,6 +2968,7 @@ impl AppState {
             return;
         };
         let projection = self.room_projections.get(chat_id).cloned();
+        self.watch_omp_recovery(chat_id, cx);
         self.transcript_task = Some(spawn_transcript_watch(
             cx,
             handle.clone(),
@@ -3030,53 +3103,93 @@ impl AppState {
         })
         .detach();
     }
-    pub(crate) fn omp_takeover_in_progress(&self, error_id: &str) -> bool {
-        self.omp_takeovers.contains(error_id)
+    pub(crate) fn omp_recovery(&self, chat_id: &str) -> Option<&OmpRecoveryState> {
+        self.omp_recovery.get(chat_id)
     }
 
-    pub(crate) fn omp_takeover_error(&self, error_id: &str) -> Option<String> {
-        self.omp_takeover_errors.get(error_id).cloned()
+    fn apply_omp_recovery(&mut self, chat_id: &str, mut snapshot: OmpRecoveryState) {
+        if let Some(previous) = self.omp_recovery.get(chat_id) {
+            snapshot.request_generation = previous.request_generation;
+        }
+        self.omp_recovery.insert(chat_id.to_string(), snapshot);
     }
 
-    pub(crate) fn omp_takeover_completed(&self, error_id: &str) -> bool {
-        self.omp_takeover_completed.contains(error_id)
+    fn omp_recovery_disconnected(&mut self, chat_id: &str, error: String) {
+        self.omp_recovery
+            .entry(chat_id.to_string())
+            .or_insert(OmpRecoveryState {
+                phase: OmpRecoveryPhase::Idle,
+                error: None,
+                watch_error: None,
+                request_generation: 0,
+            })
+            .disconnected(error);
     }
 
-    pub(crate) fn take_over_omp_session(
-        &mut self,
-        chat_id: String,
-        error_id: String,
-        cx: &mut Context<Self>,
-    ) {
-        if self.omp_takeovers.contains(&error_id) || self.omp_takeover_completed.contains(&error_id)
+    fn omp_recovery_target(&self, chat_id: &str) -> Option<&str> {
+        self.chat_host_device_id(chat_id).or_else(|| {
+            self.sessions
+                .iter()
+                .find(|session| session.chat_id == chat_id)
+                .map(|session| session.device_id.as_str())
+        })
+    }
+
+    pub(crate) fn watch_omp_recovery(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        self.omp_recovery_task = None;
+        // Cached phases are not authoritative after navigation/reconnection.
+        self.omp_recovery.remove(chat_id);
+        if let Some(handle) = self.engine.clone() {
+            let target_device_id = self.omp_recovery_target(chat_id).map(str::to_string);
+            let projection = self.room_projections.get(chat_id).cloned();
+            self.omp_recovery_task = Some(spawn_omp_recovery_watch(
+                cx,
+                handle,
+                chat_id.to_string(),
+                target_device_id,
+                projection,
+            ));
+        } else {
+            self.omp_recovery_disconnected(
+                chat_id,
+                "Crew is disconnected. Reconnect the engine, then retry status.".into(),
+            );
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn take_over_omp_session(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        if !self
+            .omp_recovery
+            .get(&chat_id)
+            .is_some_and(OmpRecoveryState::can_take_over)
         {
             return;
         }
         let Some(engine) = self.engine.clone() else {
-            self.omp_takeover_errors
-                .insert(error_id, "Engine not connected".into());
-            cx.notify();
-            return;
-        };
-        let target_device_id = self
-            .chat_host_device_id(&chat_id)
-            .map(str::to_string)
-            .or_else(|| {
-                self.sessions
-                    .iter()
-                    .find(|session| session.chat_id == chat_id)
-                    .map(|session| session.device_id.clone())
-            });
-        let Some(target_device_id) = target_device_id else {
-            self.omp_takeover_errors.insert(
-                error_id,
-                "The device running this OMP session is unavailable".into(),
+            self.omp_recovery_disconnected(
+                &chat_id,
+                "Crew is disconnected. Reconnect the engine, then retry status.".into(),
             );
             cx.notify();
             return;
         };
-        self.omp_takeovers.insert(error_id.clone());
-        self.omp_takeover_errors.remove(&error_id);
+        let target_device_id = self.omp_recovery_target(&chat_id).map(str::to_string);
+        let Some(target_device_id) = target_device_id else {
+            self.omp_recovery_disconnected(
+                &chat_id,
+                "The device running this session is unavailable. Reconnect it, then retry status."
+                    .into(),
+            );
+            cx.notify();
+            return;
+        };
+        self.omp_recovery_request_generation = self.omp_recovery_request_generation.wrapping_add(1);
+        let recovery = self.omp_recovery.get_mut(&chat_id).unwrap();
+        recovery.phase = OmpRecoveryPhase::Waiting;
+        recovery.error = None;
+        recovery.request_generation = self.omp_recovery_request_generation;
+        let generation = recovery.request_generation;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = engine
@@ -3089,21 +3202,19 @@ impl AppState {
                     }),
                 )
                 .await;
+            let closed = matches!(&result, Err(RpcError::Closed));
             let _ = this.update(cx, |state, cx| {
-                state.omp_takeovers.remove(&error_id);
-                match result {
-                    Ok(_) => {
-                        state.omp_takeover_errors.remove(&error_id);
-                        state.omp_takeover_completed.insert(error_id);
-                    }
-                    Err(error) => {
-                        state
-                            .omp_takeover_errors
-                            .insert(error_id, format!("Takeover failed: {error}"));
-                    }
+                if let Some(recovery) = state.omp_recovery.get_mut(&chat_id) {
+                    recovery.finish_request(
+                        generation,
+                        result.map(|_| ()).map_err(|error| error.to_string()),
+                    );
+                    cx.notify();
                 }
-                cx.notify();
             });
+            if closed {
+                AppState::engine_connection_lost(&this, cx);
+            }
         })
         .detach();
     }
@@ -3191,6 +3302,7 @@ impl AppState {
         self.auto_selected = true;
         self.restore_transcript(chat_id.as_deref());
         self.transcript_task = None;
+        self.omp_recovery_task = None;
         self.transcript_history_task = None;
         self.transcript_history_loading = false;
         self.collaboration = None;
@@ -3228,6 +3340,7 @@ impl AppState {
                 .is_some_and(|draft| draft.chat_id == chat_id)
         {
             let projection = self.room_projections.get(&chat_id).cloned();
+            self.watch_omp_recovery(&chat_id, cx);
             self.transcript_task = Some(spawn_transcript_watch(
                 cx,
                 handle.clone(),
@@ -3544,6 +3657,54 @@ fn spawn_scaffold_environment_refresh(
     })
 }
 
+fn spawn_omp_recovery_watch(
+    cx: &mut Context<AppState>,
+    handle: EngineHandle,
+    chat_id: String,
+    target_device_id: Option<String>,
+    room_projection: Option<SessionRoomProjection>,
+) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        let result = handle.client().subscribe(methods::WATCH_OMP_RECOVERY, serde_json::json!({
+            "chatId": chat_id,
+            "targetDeviceId": target_device_id,
+            "roomProjection": room_projection,
+        })).await;
+        let error = match result {
+            Ok(mut rx) => loop {
+                match rx.recv().await {
+                    Some(value) => match serde_json::from_value::<OmpRecoveryState>(value) {
+                        Ok(snapshot) => {
+                            if this.update(cx, |state, cx| {
+                                if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
+                                    state.apply_omp_recovery(&chat_id, snapshot);
+                                    cx.notify();
+                                }
+                            }).is_err() {
+                                return;
+                            }
+                        }
+                        Err(error) => break format!("Invalid recovery status: {error}. Update Crew, then retry status."),
+                    },
+                    None => break "Recovery updates disconnected. Reconnect the session device, then retry status.".into(),
+                }
+            },
+            Err(error) => format!("Recovery status unavailable: {error}. Reconnect or update Crew, then retry status."),
+        };
+        let _ = this.update(cx, |state, cx| {
+            if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
+                state.omp_recovery_disconnected(&chat_id, error);
+                cx.notify();
+            }
+        });
+        // A remote room ending need not mean the local engine died. Probe once,
+        // handing transport recovery to the existing supervisor, never polling.
+        if matches!(handle.client().call(methods::LOCAL_DEVICE, serde_json::json!({})).await, Err(RpcError::Closed)) {
+            AppState::engine_connection_lost(&this, cx);
+        }
+    })
+}
+
 fn spawn_transcript_watch(
     cx: &mut Context<AppState>,
     handle: EngineHandle,
@@ -3702,6 +3863,89 @@ fn spawn_collaboration_watch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn omp_recovery_transitions_clear_busy_and_do_not_reactivate_resolved_errors() {
+        let mut state = AppState::new();
+        let snapshot = |phase, error| {
+            serde_json::from_value(serde_json::json!({
+                "phase": phase, "error": error,
+            }))
+            .unwrap()
+        };
+        for phase in ["waiting", "stopping", "resuming"] {
+            state.apply_omp_recovery("chat-a", snapshot(phase, None::<&str>));
+            let recovery = state.omp_recovery("chat-a").unwrap();
+            assert!(recovery.busy());
+            assert!(!recovery.can_take_over());
+        }
+        state.apply_omp_recovery(
+            "chat-a",
+            snapshot("failed", Some("Writer could not be stopped")),
+        );
+        let recovery = state.omp_recovery("chat-a").unwrap();
+        assert!(!recovery.busy());
+        assert!(recovery.can_take_over());
+        assert_eq!(
+            recovery.error.as_deref(),
+            Some("Writer could not be stopped")
+        );
+        state.apply_omp_recovery("chat-a", snapshot("completed", None));
+        let recovery = state.omp_recovery.get_mut("chat-a").unwrap();
+        // A delayed request failure cannot resurrect an already resolved action.
+        recovery.finish_request(0, Err("late transport error".into()));
+        assert_eq!(recovery.phase, OmpRecoveryPhase::Completed);
+        assert!(!recovery.busy());
+        assert!(!recovery.can_take_over());
+        state.apply_omp_recovery("chat-a", snapshot("idle", None));
+        assert!(!state.omp_recovery("chat-a").unwrap().can_take_over());
+    }
+
+    #[test]
+    fn omp_recovery_disconnect_clears_busy_until_authoritative_reconnect() {
+        let mut state = AppState::new();
+        let snapshot = |phase| {
+            serde_json::from_value(serde_json::json!({
+                "phase": phase, "error": null,
+            }))
+            .unwrap()
+        };
+        state.apply_omp_recovery("chat-a", snapshot("stopping"));
+        state.omp_recovery_disconnected("chat-a", "Connection closed".into());
+        let recovery = state.omp_recovery.get_mut("chat-a").unwrap();
+        recovery.finish_request(0, Ok(()));
+        assert!(!recovery.busy());
+        assert!(!recovery.can_take_over());
+        assert_eq!(recovery.watch_error.as_deref(), Some("Connection closed"));
+        state.apply_omp_recovery("chat-a", snapshot("failed"));
+        let recovery = state.omp_recovery("chat-a").unwrap();
+        assert!(recovery.watch_error.is_none());
+        assert!(recovery.can_take_over());
+        assert!(!recovery.busy());
+    }
+
+    #[test]
+    fn omp_recovery_request_success_and_failure_both_release_busy() {
+        let mut recovery: OmpRecoveryState = serde_json::from_value(serde_json::json!({
+            "phase": "waiting", "error": null,
+        }))
+        .unwrap();
+        recovery.finish_request(0, Err("permission denied".into()));
+        assert!(!recovery.busy());
+        assert!(recovery.can_take_over());
+        assert!(
+            recovery
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("permission denied")
+        );
+        recovery.phase = OmpRecoveryPhase::Resuming;
+        recovery.finish_request(0, Ok(()));
+        assert!(!recovery.busy());
+        assert!(!recovery.can_take_over());
+        assert!(recovery.error.is_none());
+    }
     use chrono::TimeDelta;
     use comet_engine::{EngineCore, default_registry};
     use gpui::AppContext;

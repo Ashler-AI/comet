@@ -258,27 +258,52 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<RpcFr
 
 pub(crate) struct ProcessGroupGuard {
     group: Option<i32>,
+    #[cfg(unix)]
+    birth: Option<String>,
+    supervised: bool,
 }
 
 impl ProcessGroupGuard {
-    pub(crate) fn new(group: Option<i32>) -> Self {
-        Self { group }
+    pub(crate) fn new(group: Option<i32>, supervised: bool) -> Self {
+        Self {
+            #[cfg(unix)]
+            birth: group.and_then(|pid| super::process_birth(pid as u32)),
+            group,
+            supervised,
+        }
     }
 }
 
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
         #[cfg(unix)]
+        if let Some(group) = self.group {
+            super::STOPPING_GROUPS.lock().remove(&group);
+        }
+        #[cfg(unix)]
         if let Some(group) = self.group.filter(|group| {
-            *group > 1 && {
-                // SAFETY: getpgrp has no preconditions.
-                *group != unsafe { libc::getpgrp() }
-            }
+            self.birth.is_some()
+                && super::process_birth(*group as u32) == self.birth
+                && *group > 1
+                && {
+                    // SAFETY: getpgrp has no preconditions.
+                    *group != unsafe { libc::getpgrp() }
+                }
         }) {
-            // SAFETY: this guard is created only for an OMP command launched
-            // into its own process group. ESRCH after explicit teardown is fine.
+            // Leave the verified supervisor alive to reap OMP and detached tools.
+            // Unsupervised children still need the dedicated group's hard stop.
+            if self.supervised {
+                super::mark_group_stopping(group);
+            }
             unsafe {
-                libc::kill(-group, libc::SIGKILL);
+                libc::kill(
+                    -group,
+                    if self.supervised {
+                        libc::SIGTERM
+                    } else {
+                        libc::SIGKILL
+                    },
+                );
             }
         }
     }
@@ -305,22 +330,26 @@ async fn kill_rpc_process(
     #[cfg(not(unix))]
     let _ = (process_group, interrupt_grace);
     #[cfg(unix)]
+    if process_group.is_some() && child.id() != process_group.map(|group| group as u32) {
+        return;
+    }
+    #[cfg(unix)]
+    let birth = process_group.and_then(|pid| super::process_birth(pid as u32));
+    #[cfg(unix)]
     if let Some(group) = process_group.filter(|group| {
-        *group > 1 && {
+        birth.is_some() && super::process_birth(*group as u32) == birth && *group > 1 && {
             // SAFETY: getpgrp has no preconditions.
             *group != unsafe { libc::getpgrp() }
         }
     }) {
-        // Let OMP run its normal shutdown first. Immediate SIGKILL skipped its
-        // tool cleanup, so helpers that created their own process group could
-        // survive with the session journal still open after Comet disconnected.
-        // The supervisor ignores SIGTERM while OMP and ordinary descendants do
-        // not; it exits after reaping OMP.
-        // SAFETY: OMP run commands create this dedicated group before exec.
+        // Mark only this owned group as stopping; resume may wait for it, never
+        // for an unrelated writer or another live Crew engine's session.
+        super::mark_group_stopping(group);
+        // The supervisor needs its two-second grace even if the RPC grace is shorter.
         unsafe {
             libc::kill(-group, libc::SIGTERM);
         }
-        let deadline = Instant::now() + interrupt_grace;
+        let deadline = Instant::now() + interrupt_grace.max(Duration::from_secs(3));
         loop {
             match child.try_wait() {
                 Ok(Some(_)) => return,
@@ -330,8 +359,10 @@ async fn kill_rpc_process(
                 _ => break,
             }
         }
-        unsafe {
-            libc::kill(-group, libc::SIGKILL);
+        if super::process_birth(group as u32) == birth {
+            unsafe {
+                libc::kill(-group, libc::SIGKILL);
+            }
         }
         let _ = child.wait().await;
         return;
@@ -806,8 +837,8 @@ fn handle_ui_request(frame: &Value, client: &RpcModeClient, request_input: &supe
 
 pub(crate) struct RpcRunOptions {
     pub process_label: &'static str,
-    /// The resume id the caller passed to `--resume`; the reported session id
-    /// must resolve to it or the run fails (the engine then retries fresh).
+    /// Canonical header identity of the journal selected by `--resume`; native RPC
+    /// must resolve to the canonical journal header ID or the run fails closed.
     pub expected_resume: Option<String>,
 }
 #[derive(Debug)]
@@ -1046,7 +1077,7 @@ pub(crate) async fn run_rpc(
                         if let Some(event) = tool_progress_from_update(&frame)
                             && events.send(Ok(event)).await.is_err()
                         {
-                            let _ = child.kill().await;
+                            kill_rpc_process(&mut child, process_group, interrupt_grace).await;
                             return Ok(());
                         }
                     }
@@ -1388,7 +1419,7 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .process_group(0);
         let mut child = command.spawn().unwrap();
-        let guard = ProcessGroupGuard::new(Some(child.id() as i32));
+        let guard = ProcessGroupGuard::new(Some(child.id() as i32), false);
         drop(guard);
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {

@@ -626,6 +626,10 @@ impl Engine {
                 ),
             );
         }
+        // Auth-bound restart requests must wait for both identity and inference routing.
+        if let Err(error) = core.sessions.recover_stale() {
+            tracing::error!(%error, "authenticated Crew recovery failed");
+        }
         // Release checker: polls {edge}/releases on a 6h cadence; headless
         // installs with COMET_AUTO_UPDATE=1 apply + restart themselves — gated
         // on quiescence so a restart never lands under a live run or open PTY.

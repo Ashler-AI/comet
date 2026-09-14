@@ -2,7 +2,7 @@ name: native-verification
 
 on:
   push:
-    branches: ["verify/native-lifecycle-*", "verify/native-startup-*"]
+    branches: ["verify/native-lifecycle-*", "verify/native-startup-*", "verify/native-recovery-*"]
 
 permissions:
   contents: read
@@ -61,6 +61,16 @@ jobs:
           cargo test --locked -p comet-engine --test peer_messages --test restart_resume --test workspace_sync --test remote_sync 2>&1 | tee native-evidence/native-integration.log
           cargo test --locked -p comet-engine --test e2e queued_run_command_executes_end_to_end 2>&1 | tee native-evidence/queued-run.log
           cargo test --locked -p comet --bin comet session 2>&1 | tee native-evidence/cli.log
+      - name: Verify OMP restart and takeover recovery
+        if: startsWith(github.ref_name, 'verify/native-recovery-')
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p comet-harness --lib omp:: -- --nocapture 2>&1 | tee native-evidence/omp-recovery.log
+          cargo test --locked -p comet-harness --test omp -- --nocapture 2>&1 | tee native-evidence/omp-integration.log
+          cargo test --locked -p comet-engine --lib sessions:: -- --nocapture 2>&1 | tee native-evidence/session-recovery.log
+          cargo test --locked -p comet-engine --lib run_journal:: -- --nocapture 2>&1 | tee native-evidence/recovery-records.log
       - name: Verify worker lifecycle and asynchronous admission
         if: startsWith(github.ref_name, 'verify/native-lifecycle-')
         timeout-minutes: 10

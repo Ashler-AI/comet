@@ -222,9 +222,16 @@ fn session_catalog_binding_allowed(
 ) -> bool {
     authority.scope.session_id.as_deref() == Some(chat_id)
         && authority.device_id == device_id
-        && authority.scope.deployment_id.as_deref().is_some_and(|id| !id.is_empty())
+        && authority
+            .scope
+            .deployment_id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty())
         && authority.expires_at > crate::now_ms()
-        && authority.capabilities.iter().any(|capability| capability == comet_proto::CAPABILITY_SESSION_READ)
+        && authority
+            .capabilities
+            .iter()
+            .any(|capability| capability == comet_proto::CAPABILITY_SESSION_READ)
 }
 
 fn session_viewport_models(models: Vec<comet_proto::Model>) -> Vec<comet_proto::Model> {
@@ -243,37 +250,49 @@ fn session_viewport_authority(
     chat_id: &str,
 ) -> Result<crate::auth::DeviceGrantAuthority, RpcError> {
     if rpc.runtime_profile != RuntimeProfile::ScaffoldHost {
-        return Err(RpcError::Failed("session_viewport_requires_scaffold_host".into()));
+        return Err(RpcError::Failed(
+            "session_viewport_requires_scaffold_host".into(),
+        ));
     }
     // Scaffold sessions are hosted through their deployment-bound grant, not a
     // legacy workspace chat row; a newly attached session has no such row.
-    let mut authority = rpc.auth()?.device_grant_authority()
+    let mut authority = rpc
+        .auth()?
+        .device_grant_authority()
         .ok_or_else(|| RpcError::Failed("scaffold_host_authority_unavailable".into()))?;
-    if !session_catalog_binding_allowed(
-        &authority, chat_id, rpc.doc_host.device_id(),
-    ) {
+    if !session_catalog_binding_allowed(&authority, chat_id, rpc.doc_host.device_id()) {
         return Err(RpcError::Failed("session_viewport_binding_mismatch".into()));
     }
     // Auth's stored bootstrap token does not establish that the relay still
     // grants access. This projection excludes expired/revoked grants and is
     // cleared when the edge grant stream disconnects.
-    let grant = rpc.doc_host.collaboration_grants(
-        &authority.principal_subject, &[chat_id.to_owned()],
-    ).into_iter().find(|grant| {
-        grant.id == authority.grant_id
-            && grant.principal_subject == authority.principal_subject
-            && grant.scope.session_id == authority.scope.session_id
-            && grant.revoked_at.is_none()
-            && grant.expires_at.is_none_or(|expires| expires > crate::now_ms())
-            && grant.scope.project_id == authority.scope.project_id
-            && grant.scope.deployment_id == authority.scope.deployment_id
-            && grant.device_id.as_deref() == Some(authority.device_id.as_str())
-            && grant.sandbox_id.as_deref() == Some(authority.sandbox_id.as_str())
-            && grant.lifecycle_epoch == Some(authority.lifecycle_epoch)
-            && grant.capabilities.iter().any(|capability| capability == comet_proto::CAPABILITY_SESSION_READ)
-    }).ok_or_else(|| RpcError::Failed("session_viewport_read_grant_unavailable".into()))?;
+    let grant = rpc
+        .doc_host
+        .collaboration_grants(&authority.principal_subject, &[chat_id.to_owned()])
+        .into_iter()
+        .find(|grant| {
+            grant.id == authority.grant_id
+                && grant.principal_subject == authority.principal_subject
+                && grant.scope.session_id == authority.scope.session_id
+                && grant.revoked_at.is_none()
+                && grant
+                    .expires_at
+                    .is_none_or(|expires| expires > crate::now_ms())
+                && grant.scope.project_id == authority.scope.project_id
+                && grant.scope.deployment_id == authority.scope.deployment_id
+                && grant.device_id.as_deref() == Some(authority.device_id.as_str())
+                && grant.sandbox_id.as_deref() == Some(authority.sandbox_id.as_str())
+                && grant.lifecycle_epoch == Some(authority.lifecycle_epoch)
+                && grant
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == comet_proto::CAPABILITY_SESSION_READ)
+        })
+        .ok_or_else(|| RpcError::Failed("session_viewport_read_grant_unavailable".into()))?;
     authority.expires_at = authority.expires_at.min(grant.expires_at.unwrap_or(0));
-    authority.capabilities.retain(|capability| grant.capabilities.contains(capability));
+    authority
+        .capabilities
+        .retain(|capability| grant.capabilities.contains(capability));
     Ok(authority)
 }
 
@@ -603,27 +622,48 @@ pub struct EngineRpc {
 }
 
 impl EngineRpc {
-    async fn fresh_session_context(&self, chat_id: &str, chat: Option<&Chat>) -> Result<(String, serde_json::Value), RpcError> {
+    async fn fresh_session_context(
+        &self,
+        chat_id: &str,
+        chat: Option<&Chat>,
+    ) -> Result<(String, serde_json::Value), RpcError> {
         let execution_key = format!("{chat_id}::session::{chat_id}");
-        let handle = self.doc_host.open(chat_id).map_err(|error| RpcError::Failed(error.to_string()))?;
+        let handle = self
+            .doc_host
+            .open(chat_id)
+            .map_err(|error| RpcError::Failed(error.to_string()))?;
         if self.sessions.last_request(&execution_key).is_some()
             || self.sessions.last_request(chat_id).is_some()
-            || chat.is_some_and(|chat| chat.harness_session_id.is_some() || chat.fork_from.is_some())
-            || self.doc_host.chat_has_commands(chat_id).map_err(|error| RpcError::Failed(error.to_string()))?
-            || !handle.doc().read_entry_window(None, 1).map_err(|error| RpcError::Failed(error.to_string()))?.entries.is_empty()
+            || chat
+                .is_some_and(|chat| chat.harness_session_id.is_some() || chat.fork_from.is_some())
+            || self
+                .doc_host
+                .chat_has_commands(chat_id)
+                .map_err(|error| RpcError::Failed(error.to_string()))?
+            || !handle
+                .doc()
+                .read_entry_window(None, 1)
+                .map_err(|error| RpcError::Failed(error.to_string()))?
+                .entries
+                .is_empty()
         {
             return Err(RpcError::Failed("session_context_recovery_missing".into()));
         }
         let cwd = match chat.and_then(|chat| chat.cwd.clone()) {
             Some(cwd) => cwd,
-            None => std::env::current_dir().map_err(|error| RpcError::Failed(error.to_string()))?
-                .into_os_string().into_string().map_err(|_| RpcError::Failed("session_context_cwd_invalid".into()))?,
+            None => std::env::current_dir()
+                .map_err(|error| RpcError::Failed(error.to_string()))?
+                .into_os_string()
+                .into_string()
+                .map_err(|_| RpcError::Failed("session_context_cwd_invalid".into()))?,
         };
         let config = match chat.and_then(|chat| chat.config.as_ref()) {
-            Some(config) if config.harness == HarnessId::Omp => serde_json::to_value(config)
-                .map_err(|error| RpcError::Failed(error.to_string()))?,
+            Some(config) if config.harness == HarnessId::Omp => {
+                serde_json::to_value(config).map_err(|error| RpcError::Failed(error.to_string()))?
+            }
             Some(_) => return Err(RpcError::Failed("session_context_binding_mismatch".into())),
-            None => comet_harness::omp::read_session_config(&cwd).await
+            None => comet_harness::omp::read_session_config(&cwd)
+                .await
                 .map_err(|error| RpcError::Failed(error.to_string()))?,
         };
         Ok((cwd, config))
@@ -1289,6 +1329,7 @@ fn forwardable(method: &str) -> bool {
             | methods::LIST_MODELS
             | methods::LIST_HARNESS_COMMANDS
             | methods::TAKE_OVER_OMP_SESSION
+            | methods::WATCH_OMP_RECOVERY
             | methods::WATCH_DOC_MESSAGES
             | methods::READ_DOC_MESSAGES
             | methods::READ_DOC_MESSAGE
@@ -1339,6 +1380,7 @@ fn is_stream_method(method: &str) -> bool {
     matches!(
         method,
         methods::WATCH_DOC_MESSAGES
+            | methods::WATCH_OMP_RECOVERY
             | "WatchCollaboration"
             | methods::SUBSCRIBE_TERMINAL
             | methods::WATCH_CHECKOUT_DIFFS
@@ -1679,10 +1721,15 @@ impl RpcService for EngineRpc {
             }
             // The browser viewport may discover models only for the exact
             // deployment-bound session. Generic harness discovery stays disabled.
-            "ListSessionModels" | "ReadSessionSelection" | "ReadSessionAuthority" | "ReadSessionContext" => {
+            "ListSessionModels"
+            | "ReadSessionSelection"
+            | "ReadSessionAuthority"
+            | "ReadSessionContext" => {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-                struct Params { chat_id: String }
+                struct Params {
+                    chat_id: String,
+                }
                 let p: Params = parse_params(params)?;
                 let authority = session_viewport_authority(self, &p.chat_id)?;
                 if method == "ReadSessionAuthority" {
@@ -1690,26 +1737,38 @@ impl RpcService for EngineRpc {
                 }
                 if method == "ReadSessionContext" {
                     let execution_key = format!("{}::session::{}", p.chat_id, p.chat_id);
-                    let request = self.sessions.recovered_context_if_present(&execution_key)
+                    let request = self
+                        .sessions
+                        .recovered_context_if_present(&execution_key)
                         .map_err(|error| RpcError::Failed(error.to_string()))?;
-                    let chat = self.workspace.doc().chat(&p.chat_id)
+                    let chat = self
+                        .workspace
+                        .doc()
+                        .chat(&p.chat_id)
                         .map_err(|error| RpcError::Failed(error.to_string()))?
                         .filter(|chat| chat.device_id == authority.device_id);
                     let (cwd, mut config) = if let Some(request) = request {
-                        (request.cwd, serde_json::json!({
-                            "harness": "omp", "model": request.model,
-                            "agentAccountId": request.agent_account_id,
-                            "reasoning": request.reasoning, "modelOptions": request.model_options,
-                            "sandbox": request.sandbox,
-                        }))
+                        (
+                            request.cwd,
+                            serde_json::json!({
+                                "harness": "omp", "model": request.model,
+                                "agentAccountId": request.agent_account_id,
+                                "reasoning": request.reasoning, "modelOptions": request.model_options,
+                                "sandbox": request.sandbox,
+                            }),
+                        )
                     } else {
-                        self.fresh_session_context(&p.chat_id, chat.as_ref()).await?
+                        self.fresh_session_context(&p.chat_id, chat.as_ref())
+                            .await?
                     };
-                    config["model"] = config["model"].as_str()
+                    config["model"] = config["model"]
+                        .as_str()
                         .and_then(crate::local_sessions::canonical_omp_model_selector)
-                        .map(serde_json::Value::String).unwrap_or(serde_json::Value::Null);
+                        .map(serde_json::Value::String)
+                        .unwrap_or(serde_json::Value::Null);
                     let current = session_viewport_authority(self, &p.chat_id)?;
-                    if current.scope != authority.scope || current.device_id != authority.device_id
+                    if current.scope != authority.scope
+                        || current.device_id != authority.device_id
                         || current.sandbox_id != authority.sandbox_id
                         || current.lifecycle_epoch != authority.lifecycle_epoch
                         || current.grant_id != authority.grant_id
@@ -1725,17 +1784,25 @@ impl RpcService for EngineRpc {
                 }
                 if method == "ReadSessionSelection" {
                     let execution_key = format!("{}::session::{}", p.chat_id, p.chat_id);
-                    let request = self.sessions.last_request(&execution_key)
+                    let request = self
+                        .sessions
+                        .last_request(&execution_key)
                         .or_else(|| self.sessions.last_request(&p.chat_id));
-                    let selection = request.map(|request| serde_json::json!({
-                        "model": request.model,
-                        "reasoning": request.reasoning,
-                    }));
+                    let selection = request.map(|request| {
+                        serde_json::json!({
+                            "model": request.model,
+                            "reasoning": request.reasoning,
+                        })
+                    });
                     return RpcReply::value(&serde_json::json!({ "selection": selection }));
                 }
-                let harness = self.registry.resolve(HarnessId::Omp)
+                let harness = self
+                    .registry
+                    .resolve(HarnessId::Omp)
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
-                let models = harness.models().await
+                let models = harness
+                    .models()
+                    .await
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
                 let models = session_viewport_models(models);
                 RpcReply::value(&models)
@@ -1743,16 +1810,23 @@ impl RpcService for EngineRpc {
             "ReadSessionCommand" => {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-                struct Params { chat_id: String, command_id: String }
+                struct Params {
+                    chat_id: String,
+                    command_id: String,
+                }
                 let p: Params = parse_params(params)?;
                 session_viewport_authority(self, &p.chat_id)?;
-                let command = self.doc_host.command_entry(&p.chat_id, &p.command_id)
+                let command = self
+                    .doc_host
+                    .command_entry(&p.chat_id, &p.command_id)
                     .map_err(|error| RpcError::Failed(error.to_string()))?
-                    .map(|entry| serde_json::json!({
-                        "commandId": entry.id,
-                        "status": entry.status,
-                        "resolution": entry.resolution,
-                    }));
+                    .map(|entry| {
+                        serde_json::json!({
+                            "commandId": entry.id,
+                            "status": entry.status,
+                            "resolution": entry.resolution,
+                        })
+                    });
                 RpcReply::value(&serde_json::json!({ "command": command }))
             }
             methods::LIST_HARNESS_COMMANDS
@@ -1914,9 +1988,13 @@ impl RpcService for EngineRpc {
                         if matches!(action.as_ref(), comet_doc::SessionControlAction::Start { .. }));
                 let mut startup = if starts_session {
                     scaffold_session::PreparationOutcome::for_command(
-                        self, &p.chat_id, p.preparation_generation.as_deref(),
+                        self,
+                        &p.chat_id,
+                        p.preparation_generation.as_deref(),
                     )?
-                } else { None };
+                } else {
+                    None
+                };
                 let activates_chat = match &p.command {
                     SessionCommandPayload::Run { .. }
                     | SessionCommandPayload::Steer { .. }
@@ -1938,13 +2016,50 @@ impl RpcService for EngineRpc {
                     self.doc_host.queue_command(&p.chat_id, p.command)
                 }
                 .map_err(|e| RpcError::Failed(e.to_string()))?;
-                if let Some(startup) = startup.as_mut() { startup.admitted(&command_id)?; }
+                if let Some(startup) = startup.as_mut() {
+                    startup.admitted(&command_id)?;
+                }
                 if activates_chat {
                     self.workspace
                         .set_chat_archived(&p.chat_id, false)
                         .map_err(|e| RpcError::Failed(e.to_string()))?;
                 }
                 RpcReply::value(&serde_json::json!({ "commandId": command_id }))
+            }
+            methods::WATCH_OMP_RECOVERY => {
+                let p: ChatParams = parse_params(params)?;
+                // Use the same room access/projection gate as transcript watches.
+                self.doc_host
+                    .open_projection(&p.chat_id, p.room_projection.as_ref())
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                // Subscribe first so a transition during the initial read cannot be lost.
+                let rx = self.sessions.subscribe_omp_recovery();
+                let sessions = self.sessions.clone();
+                Ok(RpcReply::Stream(
+                    futures::stream::unfold(
+                        (rx, sessions, p.chat_id, false),
+                        |(mut rx, sessions, chat_id, emitted)| async move {
+                            if emitted {
+                                loop {
+                                    match rx.recv().await {
+                                        Ok((changed_chat, _)) if changed_chat == chat_id => break,
+                                        Ok(_) => continue,
+                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(
+                                            _,
+                                        )) => break,
+                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                            return None;
+                                        }
+                                    }
+                                }
+                            }
+                            // Read current authority, not buffered phases predating the snapshot.
+                            let value = sessions.omp_recovery_state(&chat_id);
+                            Some((value, (rx, sessions, chat_id, true)))
+                        },
+                    )
+                    .boxed(),
+                ))
             }
             methods::TAKE_OVER_OMP_SESSION => {
                 let p: ChatParams = parse_params(params)?;
@@ -2171,8 +2286,12 @@ impl RpcService for EngineRpc {
                 let p: ReadDocMessageParams = parse_params(params)?;
                 let doc_host = self.doc_host.clone();
                 let entry = tokio::task::spawn_blocking(move || {
-                    let handle = doc_host.open_projection(&p.chat_id, p.room_projection.as_ref())?;
-                    handle.doc().read_message(&p.message_id).map_err(crate::EngineError::from)
+                    let handle =
+                        doc_host.open_projection(&p.chat_id, p.room_projection.as_ref())?;
+                    handle
+                        .doc()
+                        .read_message(&p.message_id)
+                        .map_err(crate::EngineError::from)
                 })
                 .await
                 .map_err(|e| RpcError::Failed(format!("message read task failed: {e}")))?
@@ -2306,7 +2425,8 @@ impl RpcService for EngineRpc {
             }
             methods::REPORT_SCAFFOLD_PREPARATION_FAILURE => {
                 let p: comet_rpc::ReportScaffoldPreparationFailureParams = parse_params(params)?;
-                self.workspace.report_scaffold_preparation_failure(&p.chat_id, &p.generation)
+                self.workspace
+                    .report_scaffold_preparation_failure(&p.chat_id, &p.generation)
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "reported": true }))
             }
@@ -2771,22 +2891,92 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn omp_recovery_watch_scopes_initial_snapshot_and_matching_chat_updates() {
+        use futures::FutureExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let core = crate::EngineCore::assemble_with_identity(
+            dir.path(),
+            std::sync::Arc::new(crate::default_registry(RuntimeProfile::Mock)),
+            HarnessId::Mock,
+            None,
+            "project-a",
+            "owner-a",
+            RuntimeProfile::Mock,
+        )
+        .unwrap();
+        let rpc = core.rpc_service();
+        let denied = rpc.handle(methods::WATCH_OMP_RECOVERY, serde_json::json!({
+            "chatId": "chat-a",
+            "roomProjection": {
+                "projectId": "other-project", "deploymentId": "deployment-a", "sessionId": "chat-a",
+            },
+        })).await;
+        assert!(denied.is_err());
+        let RpcReply::Stream(mut stream) = rpc
+            .handle(
+                methods::WATCH_OMP_RECOVERY,
+                serde_json::json!({ "chatId": "chat-a" }),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("recovery watch must stream");
+        };
+        assert_eq!(
+            stream.next().await.unwrap(),
+            serde_json::json!({ "phase": "idle", "error": null })
+        );
+        assert!(rpc.sessions.take_over_omp_session("chat-b").await.is_err());
+        assert!(
+            stream.next().now_or_never().is_none(),
+            "another chat must not leak into this watch"
+        );
+        let error = rpc
+            .sessions
+            .take_over_omp_session("chat-a")
+            .await
+            .unwrap_err();
+        let failure = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failure["phase"], "failed");
+        assert_eq!(failure["error"], error.to_string());
+        drop(stream);
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn fresh_web_context_initializes_but_existing_transcript_requires_recovery() {
         let dir = tempfile::tempdir().unwrap();
         let core = crate::EngineCore::assemble_with_identity(
-            dir.path(), std::sync::Arc::new(crate::default_registry(RuntimeProfile::Mock)),
-            HarnessId::Mock, None, "project-a", "owner-a", RuntimeProfile::Mock,
-        ).unwrap();
+            dir.path(),
+            std::sync::Arc::new(crate::default_registry(RuntimeProfile::Mock)),
+            HarnessId::Mock,
+            None,
+            "project-a",
+            "owner-a",
+            RuntimeProfile::Mock,
+        )
+        .unwrap();
         let rpc = core.rpc_service();
         let chat: Chat = serde_json::from_value(serde_json::json!({
             "id": "fresh", "deviceId": "device-a", "archived": false,
             "createdAt": "1970-01-01T00:00:00Z", "cwd": dir.path().to_str().unwrap(),
             "config": { "harness": "omp", "model": "openai-codex/gpt-6-astra", "sandbox": "workspace-write" }
         })).unwrap();
-        let (cwd, config) = rpc.fresh_session_context("fresh", Some(&chat)).await.unwrap();
+        let (cwd, config) = rpc
+            .fresh_session_context("fresh", Some(&chat))
+            .await
+            .unwrap();
         assert_eq!(cwd, dir.path().to_str().unwrap());
         assert_eq!(config["harness"], "omp");
-        rpc.doc_host.open("fresh").unwrap().write_user_message("message-a", "existing conversation", 1).unwrap();
+        rpc.doc_host
+            .open("fresh")
+            .unwrap()
+            .write_user_message("message-a", "existing conversation", 1)
+            .unwrap();
         assert!(rpc.fresh_session_context("fresh", None).await.is_err());
         core.shutdown().await;
     }
@@ -2828,19 +3018,49 @@ mod tests {
             lifecycle_epoch: 1,
             capabilities: vec![comet_proto::CAPABILITY_SESSION_READ.into()],
         };
-        assert!(session_catalog_binding_allowed(&authority, "session-a", "device-a"));
+        assert!(session_catalog_binding_allowed(
+            &authority,
+            "session-a",
+            "device-a"
+        ));
         let deployment = authority.scope.deployment_id.take();
-        assert!(!session_catalog_binding_allowed(&authority, "session-a", "device-a"));
+        assert!(!session_catalog_binding_allowed(
+            &authority,
+            "session-a",
+            "device-a"
+        ));
         authority.scope.deployment_id = Some(String::new());
-        assert!(!session_catalog_binding_allowed(&authority, "session-a", "device-a"));
+        assert!(!session_catalog_binding_allowed(
+            &authority,
+            "session-a",
+            "device-a"
+        ));
         authority.scope.deployment_id = deployment;
-        assert!(!session_catalog_binding_allowed(&authority, "session-b", "device-a"));
-        assert!(!session_catalog_binding_allowed(&authority, "session-a", "device-b"));
+        assert!(!session_catalog_binding_allowed(
+            &authority,
+            "session-b",
+            "device-a"
+        ));
+        assert!(!session_catalog_binding_allowed(
+            &authority,
+            "session-a",
+            "device-b"
+        ));
         authority.capabilities.clear();
-        assert!(!session_catalog_binding_allowed(&authority, "session-a", "device-a"));
-        authority.capabilities.push(comet_proto::CAPABILITY_SESSION_READ.into());
+        assert!(!session_catalog_binding_allowed(
+            &authority,
+            "session-a",
+            "device-a"
+        ));
+        authority
+            .capabilities
+            .push(comet_proto::CAPABILITY_SESSION_READ.into());
         authority.expires_at = 0;
-        assert!(!session_catalog_binding_allowed(&authority, "session-a", "device-a"));
+        assert!(!session_catalog_binding_allowed(
+            &authority,
+            "session-a",
+            "device-a"
+        ));
     }
 
     #[test]
