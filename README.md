@@ -45,6 +45,23 @@ the sandbox image, and deploying the coordinated provider/control-plane changes.
 Existing images are not upgraded by editing this repository. No rollout is implied
 by the presence of this code.
 
+## Crew 0.1.103 OMP model discovery
+
+Desktop OMP catalogs now include Scaffold's shared model roster even when local
+OMP has no provider credentials. Local entries retain their labels, reasoning
+options, and precedence; custom providers remain selectable. Mobile consumes
+the same host `ListModels` response. Scaffold hosts keep their authority-scoped
+catalog, and every run still passes the existing Agent Auth checks.
+
+The bundled `crates/harness/src/omp/scaffold-models.json` is generated from the
+canonical Platform `ompInferenceModelCatalog`, with its source commit recorded
+in the file. It is a release snapshot, not a live availability promise. Refresh
+it with `node scripts/sync-omp-model-catalog.mjs <platform commit SHA>`; do not
+hand-edit the model list. Unknown source formats fail regeneration.
+
+Catalog regressions cover credential-free defaults, local overrides/custom
+providers, deduplication, and preservation of the Scaffold-scoped catalog.
+
 ## Crew 0.1.102 restart recovery
 
 Crew preserves the exact interrupted request and native OMP session across a
