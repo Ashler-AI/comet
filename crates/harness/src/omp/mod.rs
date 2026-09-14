@@ -1,9 +1,9 @@
 //! OMP harness adapter over OMP's native RPC mode (`omp --mode rpc`).
 //!
-//! Comet owns execution through JSONL frames on the child's stdio; OMP's
-//! read-only `models --json` command supplies the selectable provider/model
-//! catalog. One persistent child serves every turn, and mid-turn followups
-//! steer the live turn between tool calls (step-boundary semantics) instead
+//! Comet owns execution through JSONL frames on the child's stdio. Desktop
+//! catalogs combine Scaffold defaults with local `models --json` entries;
+//! Scaffold hosts retain their authority-scoped catalog. One persistent child
+//! serves every turn, and followups steer between tool calls instead
 //! of queueing behind it — the reason this adapter left ACP, whose
 //! `session/prompt` is strictly turn-serial. The ACP client in [`rpc`] and
 //! the [`run_acp`] loop remain solely for Prime Agent.
@@ -2264,6 +2264,23 @@ fn models_from_catalog(bytes: &[u8]) -> Result<Vec<Model>, HarnessError> {
         .collect())
 }
 
+fn desktop_models(mut local: Vec<Model>) -> Vec<Model> {
+    #[derive(Deserialize)]
+    struct Catalog {
+        models: Vec<Model>,
+    }
+    let bundled: Catalog = serde_json::from_str(include_str!("scaffold-models.json"))
+        .expect("checked-in Scaffold model catalog must be valid");
+    let local_ids: HashSet<_> = local.iter().map(|model| model.id.as_str()).collect();
+    let defaults: Vec<_> = bundled
+        .models
+        .into_iter()
+        .filter(|model| !local_ids.contains(model.id.as_str()))
+        .collect();
+    local.extend(defaults);
+    local
+}
+
 #[async_trait]
 impl Harness for OmpHarness {
     fn id(&self) -> HarnessId {
@@ -2336,7 +2353,12 @@ impl Harness for OmpHarness {
                 &tail,
             )));
         }
-        models_from_catalog(&output.stdout)
+        let models = models_from_catalog(&output.stdout)?;
+        Ok(if self.scaffold_host {
+            models
+        } else {
+            desktop_models(models)
+        })
     }
 
     async fn commands(&self, cwd: &str) -> Result<Vec<HarnessCommand>, HarnessError> {
@@ -4378,33 +4400,43 @@ mod tests {
     }
 
     #[test]
-    fn catalog_descriptions_do_not_claim_verified_availability() {
-        let models = models_from_catalog(
-            br#"{"models":[{"selector":"openai-codex/gpt-5.6-sol","name":"GPT-5.6 Sol","contextWindow":1000,"maxTokens":100,"thinking":[]}]}"#,
+    fn desktop_catalog_has_scaffold_defaults_without_local_credentials() {
+        let models = desktop_models(models_from_catalog(br#"{"models":[]}"#).unwrap());
+        assert!(
+            models
+                .iter()
+                .any(|model| model.id == "openai-codex/gpt-6-astra")
+        );
+        assert!(
+            models
+                .iter()
+                .any(|model| model.id == "anthropic/claude-fable-5-1")
+        );
+    }
+
+    #[test]
+    fn desktop_catalog_preserves_local_overrides_and_custom_models() {
+        let local = models_from_catalog(
+            br#"{"models":[
+            {"selector":"openai-codex/gpt-6-astra","name":"Local Astra","thinking":["xhigh"]},
+            {"selector":"custom/private","name":"Private model","thinking":[]}
+        ]}"#,
         )
         .unwrap();
-
-        for model in models {
-            assert!(
-                model
-                    .description
-                    .as_deref()
-                    .unwrap()
-                    .contains("does not verify run availability")
-                    || model
-                        .description
-                        .as_deref()
-                        .unwrap()
-                        .contains("run availability is not verified")
-            );
-            assert!(
-                model
-                    .description
-                    .as_deref()
-                    .unwrap()
-                    .contains("authorization")
-            );
-        }
+        let models = desktop_models(local.clone());
+        assert_eq!(&models[..2], local.as_slice());
+        assert_eq!(
+            models
+                .iter()
+                .filter(|model| model.id == local[0].id)
+                .count(),
+            1
+        );
+        assert!(
+            models
+                .iter()
+                .any(|model| model.id == "anthropic/claude-fable-5-1")
+        );
     }
 
     #[test]

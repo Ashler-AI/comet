@@ -133,7 +133,18 @@ async fn model_and_command_catalogs_come_from_omp() {
     }
     let harness = OmpHarness::new().with_executable(fixture_path());
     let models = harness.models().await.expect("model catalog");
-    assert_eq!(models.len(), 1);
+    assert!(
+        models
+            .iter()
+            .any(|model| model.id == "anthropic/claude-fable-5-1")
+    );
+    assert_eq!(
+        models
+            .iter()
+            .filter(|model| model.id == "openai-codex/gpt-5.6-sol")
+            .count(),
+        1
+    );
     assert_eq!(models[0].id, "openai-codex/gpt-5.6-sol");
     assert_eq!(
         models[0].reasoning_levels,
@@ -143,6 +154,13 @@ async fn model_and_command_catalogs_come_from_omp() {
             ReasoningLevel::XHigh,
         ]
     );
+
+    let scoped = OmpHarness::scaffold_host()
+        .with_executable(fixture_path())
+        .models()
+        .await
+        .expect("scoped model catalog");
+    assert_eq!(scoped, vec![models[0].clone()]);
 
     let commands = harness.commands("").await.expect("command catalog");
     assert_eq!(commands.len(), 3);
