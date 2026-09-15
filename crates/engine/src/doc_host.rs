@@ -1223,6 +1223,54 @@ impl DocHost {
         Ok(())
     }
 
+    /// Mirror only an owned, bound agent execution into its shared session room.
+    /// Called synchronously under the engine status lock to preserve turn order.
+    pub(crate) fn record_agent_session(
+        &self,
+        status: &comet_proto::Session,
+    ) -> Result<(), EngineError> {
+        let Some(handle) = lock(&self.inner.handles).get(&status.chat_id).cloned() else {
+            return Ok(());
+        };
+        let Some(session_id) = status
+            .chat_id
+            .strip_prefix(handle.chat_id.as_str())
+            .and_then(|suffix| suffix.strip_prefix("::session::"))
+        else {
+            return Ok(());
+        };
+        let Some(mut session) = handle
+            .doc
+            .collaboration_snapshot()?
+            .sessions
+            .into_iter()
+            .find(|session| {
+                session.session_id == session_id
+                    && session.owner_device_id == self.device_id()
+                    && session.owner_device_id == status.device_id
+            })
+        else {
+            return Ok(());
+        };
+        let updated_at = status.updated_at.timestamp_millis();
+        if session.status == Some(status.status) && session.updated_at == Some(updated_at) {
+            return Ok(());
+        }
+        session.status = Some(status.status);
+        session.updated_at = Some(updated_at);
+        // Publication ids are immutable replay keys, not upsert keys. The engine
+        // already throttles heartbeats; only changed owner snapshots append here.
+        handle.doc.append_publication(&PublicationRecord {
+            id: format!("session/{session_id}/status/{}/{:?}", status.updated_at, status.status),
+            schema_version: COLLABORATION_SCHEMA_VERSION,
+            published_at: updated_at,
+            published_by: session.owner_subject.clone(),
+            value: PublicationValue::AgentSession(Box::new(session)),
+            unknown: Default::default(),
+        })?;
+        Ok(())
+    }
+
     // A native handoff assigns the chat UUID as its agent session. Legacy
     // chat-addressed commands must reach that writer, not a second bare-chat run.
     fn chat_execution_key(&self, handle: &Arc<ChatDocHandle>) -> Result<String, EngineError> {
@@ -2093,37 +2141,6 @@ impl DocHost {
             tracing::warn!(chat = %handle.chat_id, command = %entry.id, error = %err,
                 "command audit publication failed");
         }
-        if status == SessionCommandStatus::Applied
-            && let SessionCommandPayload::Control {
-                session_id, action, ..
-            } = &entry.payload
-            && let Some(next_status) = match action.as_ref() {
-                SessionControlAction::Pause {} | SessionControlAction::Stop { .. } => {
-                    Some(comet_proto::SessionStatus::Idle)
-                }
-                _ => None,
-            }
-            && let Ok(snapshot) = handle.doc.collaboration_snapshot()
-            && let Some(mut session) = snapshot
-                .sessions
-                .into_iter()
-                .find(|session| session.session_id == *session_id)
-        {
-            session.status = Some(next_status);
-            session.updated_at = Some(at);
-            let state = PublicationRecord {
-                id: format!("session/{session_id}/command/{}", entry.id),
-                schema_version: COLLABORATION_SCHEMA_VERSION,
-                published_at: at,
-                published_by: entry.actor_subject().to_string(),
-                value: PublicationValue::AgentSession(Box::new(session)),
-                unknown: Default::default(),
-            };
-            if let Err(err) = handle.doc.append_publication(&state) {
-                tracing::warn!(chat = %handle.chat_id, command = %entry.id, error = %err,
-                    "session state publication failed");
-            }
-        }
     }
     async fn execute(
         &self,
@@ -2896,6 +2913,79 @@ mod authority_tests {
     use super::*;
     use comet_proto::{AgentSessionSource, SessionStatus};
     use loro::LoroMap;
+
+    #[tokio::test]
+    async fn owned_session_status_tracks_heartbeat_input_and_followup_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = DocHost::new(
+            Arc::new(DocsStore::open(dir.path()).unwrap()),
+            DocHostConfig {
+                device_id: "device-a".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        let handle = host.open("chat-a").unwrap();
+        let execution_key = host.bind_session_execution_key(&handle, "chat-a");
+        let other_key = host.bind_session_execution_key(&handle, "agent-b");
+        for (session_id, owner_device_id) in [("chat-a", "device-a"), ("agent-b", "device-b")] {
+            handle.doc.append_publication(&PublicationRecord {
+                id: format!("session/{session_id}/start"),
+                schema_version: COLLABORATION_SCHEMA_VERSION,
+                published_at: 1,
+                published_by: "owner".into(),
+                value: PublicationValue::AgentSession(Box::new(AgentSessionRecord {
+                    session_id: session_id.into(),
+                    chat_id: "chat-a".into(),
+                    owner_subject: "owner".into(),
+                    owner_device_id: owner_device_id.into(),
+                    source: AgentSessionSource::Scaffold,
+                    environment: None,
+                    harness: Some(HarnessId::Mock),
+                    model: None,
+                    harness_session_id: None,
+                    status: Some(SessionStatus::Working),
+                    updated_at: Some(1),
+                    created_at: 1,
+                    unknown: Default::default(),
+                })),
+                unknown: Default::default(),
+            }).unwrap();
+        }
+        let mut source = comet_proto::Session {
+            chat_id: execution_key,
+            device_id: "device-a".into(),
+            status: SessionStatus::Working,
+            started_at: None,
+            updated_at: chrono::DateTime::from_timestamp_millis(1).unwrap(),
+        };
+        for (status, at) in [
+            (SessionStatus::Working, 10_001),
+            (SessionStatus::Working, 20_001),
+            (SessionStatus::AwaitingInput, 20_002),
+            (SessionStatus::Working, 20_003),
+            (SessionStatus::Idle, 20_004),
+            (SessionStatus::Working, 20_005),
+            (SessionStatus::Errored, 20_006),
+        ] {
+            source.status = status;
+            source.updated_at = chrono::DateTime::from_timestamp_millis(at).unwrap();
+            host.record_agent_session(&source).unwrap();
+            let snapshot = handle.doc.collaboration_snapshot().unwrap();
+            let assigned = snapshot.sessions.iter().find(|row| row.session_id == "chat-a").unwrap();
+            assert_eq!((assigned.status, assigned.updated_at), (Some(status), Some(at)));
+            let other = snapshot.sessions.iter().find(|row| row.session_id == "agent-b").unwrap();
+            assert_eq!((other.status, other.updated_at), (Some(SessionStatus::Working), Some(1)));
+
+            // Replay, a bare chat key, and another device's agent cannot append.
+            host.record_agent_session(&source).unwrap();
+            for chat_id in ["chat-a", other_key.as_str()] {
+                let unrelated = comet_proto::Session { chat_id: chat_id.into(), ..source.clone() };
+                host.record_agent_session(&unrelated).unwrap();
+            }
+            assert_eq!(handle.doc.read_publications().unwrap(), snapshot.publications);
+        }
+    }
 
     #[tokio::test]
     async fn stop_admission_rejects_missing_live_turn_without_appending() {

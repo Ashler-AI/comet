@@ -2040,6 +2040,11 @@ impl Inner {
             }
             entry.updated_at = now;
             let session = entry.clone();
+            if let Some(host) = self.doc_host.get()
+                && let Err(error) = host.record_agent_session(&session)
+            {
+                tracing::warn!(chat = %chat_id, %error, "session state publication failed");
+            }
             self.publish_sessions(&statuses);
             session
         };
@@ -2071,6 +2076,11 @@ impl Inner {
                 }));
             }
             let session = entry.clone();
+            if let Some(host) = self.doc_host.get()
+                && let Err(error) = host.record_agent_session(&session)
+            {
+                tracing::warn!(chat = %chat_id, %error, "session state publication failed");
+            }
             self.publish_sessions(&statuses);
             (session, finished)
         };
