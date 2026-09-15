@@ -688,9 +688,26 @@ fn handle_control_request(
     });
 }
 
+fn claude_option_label(option: &Value) -> Option<&str> {
+    option.as_str().or_else(|| {
+        option
+            .get("label")
+            .or_else(|| option.get("value"))
+            .and_then(Value::as_str)
+    })
+}
+
+fn claude_option_display(option: &Value) -> Option<String> {
+    let label = claude_option_label(option)?;
+    Some(match option.get("description").and_then(Value::as_str) {
+        Some(description) if !description.is_empty() => format!("{label} — {description}"),
+        _ => label.to_string(),
+    })
+}
+
 /// Parse Claude's `AskUserQuestion` tool input into [`UserInputQuestion`]s
-/// (tolerant of `header`/`title`, `question`/`prompt`, string or object
-/// options — option descriptions are dropped, the wire type carries labels).
+/// (tolerant of `header`/`title`, `question`/`prompt`, and string or object
+/// options).
 fn parse_questions(input: &Value) -> Vec<UserInputQuestion> {
     let raw = input.get("questions").and_then(Value::as_array);
     raw.map(|a| a.as_slice())
@@ -713,15 +730,7 @@ fn parse_questions(input: &Value) -> Vec<UserInputQuestion> {
                     .map(|a| a.as_slice())
                     .unwrap_or_default()
                     .iter()
-                    .map(|op| match op {
-                        Value::String(s) => s.clone(),
-                        other => other
-                            .get("label")
-                            .or_else(|| other.get("value"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .into(),
-                    })
+                    .filter_map(claude_option_display)
                     .collect(),
             }
         })
@@ -740,11 +749,37 @@ fn updated_input_with_answers(
         _ => serde_json::Map::new(),
     };
     let mut by_question = serde_json::Map::new();
-    for q in questions {
+    let raw_questions = input
+        .get("questions")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for (question_index, q) in questions.iter().enumerate() {
+        let raw_options = raw_questions
+            .get(question_index)
+            .and_then(|question| question.get("options"))
+            .and_then(Value::as_array);
         let labels: Vec<String> = answers
             .iter()
             .find(|a| a.question_id == q.id)
-            .map(|a| a.labels.clone())
+            .map(|answer| {
+                answer
+                    .labels
+                    .iter()
+                    .map(|selected| {
+                        raw_options
+                            .and_then(|options| {
+                                options.iter().find(|option| {
+                                    claude_option_display(option).as_deref()
+                                        == Some(selected.as_str())
+                                })
+                            })
+                            .and_then(claude_option_label)
+                            .unwrap_or(selected)
+                            .to_string()
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         let value = if q.multi_select {
             Value::Array(labels.into_iter().map(Value::String).collect())
@@ -807,7 +842,10 @@ mod tests {
         let qs = parse_questions(&input);
         assert_eq!(qs.len(), 2);
         assert_eq!(qs[0].header, "Choice");
-        assert_eq!(qs[0].options, vec!["A".to_string(), "B".to_string()]);
+        assert_eq!(
+            qs[0].options,
+            vec!["A".to_string(), "B — second".to_string()]
+        );
         assert!(!qs[0].multi_select);
         assert_eq!(qs[1].header, "Alt");
         assert_eq!(qs[1].question, "Pick many");
@@ -816,12 +854,15 @@ mod tests {
 
     #[test]
     fn answers_key_by_question_text() {
-        let input =
-            json!({"questions": [{"header": "H", "question": "Pick one", "options": ["A", "B"]}]});
+        let input = json!({"questions": [{
+            "header": "H",
+            "question": "Pick one",
+            "options": ["A", {"label": "B", "description": "second"}]
+        }]});
         let qs = parse_questions(&input);
         let answers = vec![UserInputAnswer {
             question_id: qs[0].id.clone(),
-            labels: vec!["B".into()],
+            labels: vec!["B — second".into()],
         }];
         let updated = updated_input_with_answers(&input, &qs, &answers);
         assert_eq!(updated["answers"]["Pick one"], json!("B"));
