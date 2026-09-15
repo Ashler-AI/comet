@@ -70,6 +70,15 @@ writer to release its journal, without relying on ancestry that may disappear
 during teardown; an active or unverifiable writer still prevents resume. Waiting
 does not terminate any process or relax explicit takeover ownership checks.
 
+[Staging publication](https://github.com/Ashler-AI/comet/actions/runs/34909996223)
+passed for `6af6c6ec6b32010c58724b8b949b5f5560b899f6`, including macOS recovery
+and restart gates, Linux artifacts, and signed candidate verification. Local harness
+and integration checks passed 128 tests. All seven incident sessions returned a
+health reply through exact-path resume with their original native IDs. The signed
+0.1.104 app was installed and its updater confirmed the staging version; the running
+client was not restarted because recovered sessions were executing new work.
+Production publication was not requested. Local typechecks were intentionally skipped.
+
 ## Crew 0.1.102 restart recovery
 
 Crew preserves the exact interrupted request and native OMP session across a
