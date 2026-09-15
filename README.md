@@ -45,6 +45,14 @@ the sandbox image, and deploying the coordinated provider/control-plane changes.
 Existing images are not upgraded by editing this repository. No rollout is implied
 by the presence of this code.
 
+## Crew 0.1.106 manual updates
+
+Installed macOS builds now expose **Settings → Crew update** for an ad hoc
+release check. The page reuses the signed download, verification, replacement,
+and relaunch path from the update notice, and reports a current installation as
+success instead of an error. Source builds remain report-only because they
+cannot safely replace their own installation.
+
 ## Crew 0.1.103 OMP model discovery
 
 Desktop OMP catalogs now include Scaffold's shared model roster even when local
