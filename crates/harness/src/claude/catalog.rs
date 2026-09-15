@@ -143,11 +143,18 @@ fn model(
 
 /// The curated model list, mirroring claude.ts's `claudeEffortsFor` /
 /// `claudeOptionsFor` ladders: full ladder (through ultracode/ultrathink) on
-/// Fable 5, `max`-topped ladders on Opus/Sonnet, no efforts but a thinking
+/// Fable 5.x, `max`-topped ladders on Opus/Sonnet, no efforts but a thinking
 /// toggle on Haiku; context-window select on the long-context families and
 /// fast mode on Opus 4.5+.
 pub(crate) fn static_models() -> Vec<Model> {
     vec![
+        model(
+            "claude-fable-5-1",
+            "Fable 5.1",
+            "Most capable model for long-running agentic work",
+            FULL_LADDER,
+            vec![context_window()],
+        ),
         model(
             "claude-fable-5",
             "Fable 5",
@@ -220,6 +227,12 @@ mod tests {
             Some("max")
         );
         assert_eq!(to_effort(Some(ReasoningLevel::XHigh), None), Some("max"));
+    }
+
+    #[test]
+    fn catalog_includes_fable_5_1() {
+        assert_eq!(static_models()[0].id, "claude-fable-5-1");
+        assert_eq!(static_models()[0].label, "Fable 5.1");
     }
 
     #[test]

@@ -179,7 +179,7 @@ async fn model_and_command_catalogs_come_from_omp() {
 }
 
 #[tokio::test]
-async fn slash_command_output_is_visible() {
+async fn slash_command_output_is_visible_and_preformatted() {
     let _env = env_lock().await;
     let temp = tempfile::tempdir().unwrap();
     unsafe {
@@ -187,7 +187,7 @@ async fn slash_command_output_is_visible() {
     }
     let harness = OmpHarness::new().with_executable(fixture_path());
     let mut run_request = request(None);
-    run_request.prompt = "/model".into();
+    run_request.prompt = "/mcp".into();
     let events = harness
         .run(run_request, controls())
         .await
@@ -197,7 +197,7 @@ async fn slash_command_output_is_visible() {
         .await;
 
     assert!(events.contains(&AgentEvent::TextDelta {
-        text: "Current model: openai-codex/gpt-5.6-sol".into()
+        text: "    MCP server management\n    \n    /mcp list                       List configured servers\n    /mcp enable <name>              Enable a server\n    /mcp disable <name>             Disable a server\n    /mcp remove <name>              Remove a server\n    /mcp resources                  List resources from all servers\n    /mcp prompts                    List prompts from all servers\n    /mcp test <name>                Test connection to a server\n    /mcp help                       Show this help".into()
     }));
     assert!(events.iter().any(|event| matches!(
         event,

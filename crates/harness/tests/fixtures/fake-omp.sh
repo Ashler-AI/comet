@@ -113,8 +113,8 @@ while IFS= read -r line; do
         printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"prompt\",\"success\":false,\"error\":\"$OMP_PROMPT_ERROR_DETAILS\"}"
         continue
       fi
-      if has "$line" '/model'; then
-        printf '%s\n' '{"type":"command_output","text":"Current model: openai-codex/gpt-5.6-sol"}'
+      if has "$line" '/mcp'; then
+        printf '%s\n' '{"type":"command_output","text":"MCP server management\n\n/mcp list                       List configured servers\n/mcp enable <name>              Enable a server\n/mcp disable <name>             Disable a server\n/mcp remove <name>              Remove a server\n/mcp resources                  List resources from all servers\n/mcp prompts                    List prompts from all servers\n/mcp test <name>                Test connection to a server\n/mcp help                       Show this help"}'
         printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"prompt\",\"success\":true,\"data\":{\"agentInvoked\":false}}"
         continue
       fi

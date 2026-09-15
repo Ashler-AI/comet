@@ -42,7 +42,7 @@ case "$first" in
     ;;
   esac
   # AskUserQuestion: must be intercepted and answered via updatedInput.answers.
-  emit '{"type":"control_request","request_id":"cr-1","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[{"header":"Choice","question":"Pick one","options":["A","B"],"multiSelect":false}]}}}'
+  emit '{"type":"control_request","request_id":"cr-1","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[{"header":"Choice","question":"Pick one","options":[{"label":"A","description":"Use the existing implementation"},{"label":"B","description":"Recommended for production"}],"multiSelect":false}]}}}'
   read -r resp1 || exit 1
   case "$resp1" in
   *'"behavior":"allow"'*)

@@ -49,6 +49,8 @@ enum HarnessCatalog {
             ]
         case "claude-code", "mock":
             return [
+                ModelInfo(id: "claude-fable-5-1", label: "Fable 5.1",
+                          description: "Most capable model for long-running agentic work", reasoningLevels: fullLadder),
                 ModelInfo(id: "claude-fable-5", label: "Fable 5",
                           description: "Most intelligent model for building agents", reasoningLevels: fullLadder),
                 ModelInfo(id: "claude-opus-5", label: "Opus 5",

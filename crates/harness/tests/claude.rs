@@ -206,7 +206,7 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
                 .iter()
                 .map(|q| UserInputAnswer {
                     question_id: q.id.clone(),
-                    labels: vec!["B".into()],
+                    labels: vec!["B — Recommended for production".into()],
                 })
                 .collect();
             let _ = tx.send(answers);
@@ -222,7 +222,13 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
     assert_eq!(asked.len(), 1);
     assert_eq!(asked[0].header, "Choice");
     assert_eq!(asked[0].question, "Pick one");
-    assert_eq!(asked[0].options, vec!["A".to_string(), "B".to_string()]);
+    assert_eq!(
+        asked[0].options,
+        vec![
+            "A — Use the existing implementation".to_string(),
+            "B — Recommended for production".to_string()
+        ]
+    );
     assert!(
         !events.iter().any(|e| matches!(
             e,
