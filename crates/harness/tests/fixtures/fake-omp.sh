@@ -106,6 +106,11 @@ while IFS= read -r line; do
         printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"prompt\",\"success\":false,\"error\":\"$OMP_PROMPT_ERROR_DETAILS\"}"
         continue
       fi
+      if has "$line" '/model'; then
+        printf '%s\n' '{"type":"command_output","text":"Current model: openai-codex/gpt-5.6-sol"}'
+        printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"prompt\",\"success\":true,\"data\":{\"agentInvoked\":false}}"
+        continue
+      fi
       if has "$line" '/goal set'; then
         ACTIVE_GOAL="Persistent editor indicator"
         printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"prompt\",\"success\":true,\"data\":{\"agentInvoked\":false}}"
