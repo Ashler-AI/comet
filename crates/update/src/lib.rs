@@ -1035,11 +1035,12 @@ impl Updater {
     }
 
     /// Download and verify a macOS app update through the authenticated edge.
-    pub async fn stage_mac_update(&self) -> anyhow::Result<PathBuf> {
+    /// `None` means the installed version is already current.
+    pub async fn stage_mac_update(&self) -> anyhow::Result<Option<PathBuf>> {
         let manifest_token = self.current_access_token().await;
         let manifest = fetch_latest(&self.edge_url, manifest_token.as_deref()).await?;
         if !version_newer(&manifest.version, current_version()) {
-            bail!("already up to date ({})", current_version());
+            return Ok(None);
         }
         let artifact_token = self.current_access_token().await;
         stage_mac_app(
@@ -1049,6 +1050,7 @@ impl Updater {
             &self.data_dir,
         )
         .await
+        .map(Some)
     }
 
     /// Effective post-update agent refresh switch: the persisted toggle,

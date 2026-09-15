@@ -173,18 +173,20 @@ pub enum SettingsSection {
     Advisor,
     Appearance,
     Notifications,
+    Updates,
     Shortcuts,
     Archived,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 8] = [
+    pub const ALL: [SettingsSection; 9] = [
         SettingsSection::Devices,
         SettingsSection::Permissions,
         SettingsSection::Agents,
         SettingsSection::Advisor,
         SettingsSection::Appearance,
         SettingsSection::Notifications,
+        SettingsSection::Updates,
         SettingsSection::Shortcuts,
         SettingsSection::Archived,
     ];
@@ -199,6 +201,7 @@ impl SettingsSection {
             SettingsSection::Advisor => "Advisor",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Notifications => "Crew notifications",
+            SettingsSection::Updates => "Crew update",
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Archived => "Settled sessions",
         }
@@ -688,6 +691,7 @@ struct ControlFeedback {
 /// In-app update lifecycle (macOS bundle installs; see `render_update_strip`).
 enum UpdateFlow {
     Idle,
+    Current,
     Downloading,
     /// Staged bundle ready to swap in — one click restarts into it.
     Ready(PathBuf),
@@ -1720,6 +1724,7 @@ impl Shell {
             Some("settings/permissions") => Route::Settings(SettingsSection::Permissions),
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
             Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
+            Some("settings/updates") => Route::Settings(SettingsSection::Updates),
             Some("settings/advisor") => Route::Settings(SettingsSection::Advisor),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
@@ -3221,6 +3226,80 @@ impl Shell {
             .into_any_element()
     }
 
+    fn render_update_settings(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        use crate::settings::widgets;
+
+        let theme = Theme::of(cx).clone();
+        let status = self.state.read(cx).update.clone();
+        let current = status
+            .as_ref()
+            .map(|status| status.current_version.as_str())
+            .unwrap_or(env!("CARGO_PKG_VERSION"));
+        let description: SharedString = match &self.update_flow {
+            UpdateFlow::Current => "Crew is up to date.".into(),
+            UpdateFlow::Failed(message) => format!("Update failed: {message}").into(),
+            UpdateFlow::Ready(_) => "The update is ready. Restart Crew to apply it.".into(),
+            _ => status
+                .as_ref()
+                .filter(|status| status.update_available)
+                .and_then(|status| status.latest_version.as_deref())
+                .map(|latest| format!("Version {latest} is available."))
+                .unwrap_or_else(|| "Check for and install the latest Crew release.".into())
+                .into(),
+        };
+        let label = match &self.update_flow {
+            UpdateFlow::Downloading => "Updating…",
+            UpdateFlow::Ready(_) => "Restart to update",
+            UpdateFlow::Current => "Check again",
+            UpdateFlow::Failed(_) => "Retry update",
+            UpdateFlow::Idle => "Update Crew",
+        };
+        let busy = matches!(self.update_flow, UpdateFlow::Downloading);
+        let mac_app = matches!(self.install, comet_update::InstallKind::MacApp { .. });
+
+        widgets::page_column()
+            .child(widgets::page_header(&theme, "Crew update", None))
+            .child(widgets::page_subtitle(
+                &theme,
+                format!("Crew {current} is installed on this device."),
+            ))
+            .child(
+                widgets::section_card(&theme).child(
+                    widgets::card_row(&theme, true)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(widgets::row_title(&theme, "App updates"))
+                                .child(
+                                    div()
+                                        .mt(px(3.0))
+                                        .text_size(px(11.5))
+                                        .text_color(theme.text_muted.opacity(0.7))
+                                        .child(description),
+                                ),
+                        )
+                        .child(
+                            popover::btn_primary(&theme, label)
+                                .id("crew-update-now")
+                                .when(busy || !mac_app, |button| button.opacity(0.5))
+                                .when(mac_app && !busy, |button| {
+                                    button.on_click(cx.listener(|this, _, _, cx| {
+                                        this.on_update_strip_click(cx);
+                                    }))
+                                }),
+                        ),
+                ),
+            )
+            .when(!mac_app, |page| {
+                page.child(widgets::page_subtitle(
+                    &theme,
+                    "This source build is updated outside Crew.",
+                ))
+            })
+            .into_any_element()
+    }
+
     /// Lazily create the entity for a settings section and return it renderable.
     fn settings_outlet(&mut self, section: SettingsSection, cx: &mut Context<Self>) -> AnyElement {
         match section {
@@ -3273,6 +3352,7 @@ impl Shell {
                 }
             }
             SettingsSection::Notifications => self.render_notification_settings(cx),
+            SettingsSection::Updates => self.render_update_settings(cx),
             SettingsSection::Shortcuts => {
                 if self.shortcuts_page.is_none() {
                     let state = self.state.clone();
@@ -3792,6 +3872,7 @@ impl Shell {
             SettingsSection::Advisor => icons::CHAT_ROUND_LINE,
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Notifications => icons::CHAT_ROUND_LINE,
+            SettingsSection::Updates => icons::RESTART,
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
         };
@@ -5211,7 +5292,9 @@ impl Shell {
 
         let (label, clickable): (SharedString, bool) = if mac_app {
             match &self.update_flow {
-                UpdateFlow::Idle => (format!("Update available — v{latest}").into(), true),
+                UpdateFlow::Idle | UpdateFlow::Current => {
+                    (format!("Update available — v{latest}").into(), true)
+                }
                 UpdateFlow::Downloading => (format!("Downloading v{latest}…").into(), false),
                 UpdateFlow::Ready(_) => ("Update ready — restart to apply".into(), true),
                 UpdateFlow::Failed(message) => (format!("Update failed: {message}").into(), true),
@@ -5282,7 +5365,9 @@ impl Shell {
             return;
         }
         match std::mem::replace(&mut self.update_flow, UpdateFlow::Idle) {
-            UpdateFlow::Idle | UpdateFlow::Failed(_) => self.begin_update_download(cx),
+            UpdateFlow::Idle | UpdateFlow::Current | UpdateFlow::Failed(_) => {
+                self.begin_update_download(cx)
+            }
             UpdateFlow::Downloading => self.update_flow = UpdateFlow::Downloading,
             UpdateFlow::Ready(staged) => self.apply_staged_update(staged, cx),
         }
@@ -5304,11 +5389,15 @@ impl Shell {
                 .call(methods::STAGE_UPDATE, serde_json::json!({}))
                 .await
                 .map_err(|error| error.to_string())?;
-            value
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .map(PathBuf::from)
-                .ok_or_else(|| "Could not stage update".to_string())
+            match value.get("path") {
+                Some(serde_json::Value::Null) => Ok(None),
+                Some(path) => path
+                    .as_str()
+                    .map(PathBuf::from)
+                    .map(Some)
+                    .ok_or_else(|| "Could not stage update".to_string()),
+                None => Err("Could not stage update".to_string()),
+            }
         });
         self.update_task = Some(cx.spawn(async move |this, cx| {
             let outcome = match download.await {
@@ -5318,7 +5407,8 @@ impl Shell {
             };
             this.update(cx, |shell, cx| {
                 shell.update_flow = match outcome {
-                    Ok(staged) => UpdateFlow::Ready(staged),
+                    Ok(Some(staged)) => UpdateFlow::Ready(staged),
+                    Ok(None) => UpdateFlow::Current,
                     Err(message) => {
                         tracing::warn!(%message, "update download failed");
                         UpdateFlow::Failed(message.into())
