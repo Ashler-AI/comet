@@ -852,7 +852,8 @@ impl WorkspaceHost {
     }
 
     pub fn record_session(&self, session: &Session) {
-        if session.device_id == self.inner.config.device_id
+        if comet_proto::parse_scaffold_device_id(&self.inner.config.device_id).is_none()
+            && session.device_id == self.inner.config.device_id
             && self.inner.doc.session_ref(&self.inner.config.user_id, &session.chat_id)
                 .ok().flatten().is_some_and(|reference| {
                     crate::session_activity::projection(&reference, self.project_scope()).is_some()
@@ -1455,6 +1456,7 @@ fn merge_sessions(
     refs: &[SessionRef],
 ) -> Vec<Session> {
     let remote: std::collections::HashSet<&str> = refs.iter().filter(|reference| {
+        comet_proto::parse_scaffold_device_id(device_id).is_none() &&
         reference.environment.as_ref().is_some_and(|environment| matches!(
             environment.source, comet_proto::SessionEnvironmentSource::Scaffold { .. }
         ))

@@ -2119,9 +2119,6 @@ impl Inner {
     }
 
     fn mirror_session(&self, mut session: Session) {
-        if let Some(host) = self.doc_host.get() {
-            host.record_session_status(&session);
-        }
         if let Some(ws) = self.workspace() {
             session.chat_id = self.workspace_continuation_id(&session.chat_id);
             ws.record_session(&session);

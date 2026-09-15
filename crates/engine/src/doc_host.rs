@@ -1299,57 +1299,6 @@ impl DocHost {
         execution_key.to_string()
     }
 
-    /// Mirror every owner transition and throttled heartbeat into the shared room,
-    /// including turns started by steer/queue after the initial command completes.
-    pub(crate) fn record_session_status(&self, status: &comet_proto::Session) {
-        let handle = lock(&self.inner.handles).get(&status.chat_id).cloned();
-        let Some(handle) = handle else { return };
-        let Some(session_id) = status
-            .chat_id
-            .strip_prefix(&handle.chat_id)
-            .and_then(|suffix| suffix.strip_prefix("::session::"))
-        else {
-            return;
-        };
-        let result = (|| -> Result<(), EngineError> {
-            let Some(mut session) = handle
-                .doc
-                .collaboration_snapshot()?
-                .sessions
-                .into_iter()
-                .find(|session| {
-                    session.session_id == session_id && session.owner_device_id == status.device_id
-                })
-            else {
-                return Ok(());
-            };
-            let at = status.updated_at.timestamp_millis();
-            if session.status == Some(status.status)
-                && (session.updated_at == Some(at)
-                    || matches!(
-                        status.status,
-                        comet_proto::SessionStatus::Idle | comet_proto::SessionStatus::Errored
-                    ))
-            {
-                return Ok(());
-            }
-            session.status = Some(status.status);
-            session.updated_at = Some(at);
-            handle.doc.append_publication(&PublicationRecord {
-                id: new_id(),
-                schema_version: COLLABORATION_SCHEMA_VERSION,
-                published_at: at,
-                published_by: session.owner_subject.clone(),
-                value: PublicationValue::AgentSession(Box::new(session)),
-                unknown: Default::default(),
-            })?;
-            Ok(())
-        })();
-        if let Err(error) = result {
-            tracing::warn!(chat = %handle.chat_id, session = %session_id, %error,
-                "session state publication failed");
-        }
-    }
 
     /// LRU eviction: while the warm set exceeds [`WARM_DOC_CAP`] or the
     /// resident estimate exceeds `DOC_LRU_BYTE_BUDGET`, close the
