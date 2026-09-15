@@ -179,7 +179,7 @@ async fn slash_command_output_is_visible() {
         .await;
 
     assert!(events.contains(&AgentEvent::TextDelta {
-        text: "Current model: openai-codex/gpt-5.6-sol".into()
+        text: "    Current model: openai-codex/gpt-5.6-sol".into()
     }));
     assert!(events.iter().any(|event| matches!(
         event,

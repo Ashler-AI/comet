@@ -527,7 +527,9 @@ fn command_output_event(frame: &Value) -> Option<AgentEvent> {
         .get("text")
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty())
-        .map(|text| AgentEvent::TextDelta { text: text.into() })
+        .map(|text| AgentEvent::TextDelta {
+            text: format!("    {}", text.replace('\n', "\n    ")),
+        })
 }
 
 fn tool_progress_from_update(frame: &Value) -> Option<AgentEvent> {
@@ -1613,14 +1615,14 @@ mod tests {
     }
 
     #[test]
-    fn maps_slash_command_output_to_visible_text() {
+    fn maps_slash_command_output_to_preformatted_text() {
         assert_eq!(
             command_output_event(&json!({
                 "type": "command_output",
-                "text": "Current model: openai-codex/gpt-5.6-sol"
+                "text": "MCP server management\n/mcp list    List configured servers"
             })),
             Some(AgentEvent::TextDelta {
-                text: "Current model: openai-codex/gpt-5.6-sol".into()
+                text: "    MCP server management\n    /mcp list    List configured servers".into()
             })
         );
         assert_eq!(command_output_event(&json!({ "text": "" })), None);
