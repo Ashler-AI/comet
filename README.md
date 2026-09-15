@@ -39,6 +39,19 @@ the sandbox image, and deploying the coordinated provider/control-plane changes.
 Existing images are not upgraded by editing this repository. No rollout is implied
 by the presence of this code.
 
+## Scaffold sidebar activity
+
+Local Crew controllers observe the exact Scaffold session rooms referenced by their
+workspace, including sessions that are not selected. Remote owner status and
+heartbeats feed the normal sidebar indicators; explicit completion updates
+`lastMessageAt` with the source completion time, moving the session to the top of
+the recency-sorted list. Reconnecting does not manufacture new activity or unread
+state, and removing a session reference stops its activity observer.
+
+Scaffold hosts remain excluded from workspace-room access. Status publication
+changes require an updated sandbox runtime; local projection changes require an
+updated Crew controller. These source changes do not upgrade running installations.
+
 ## Crew 0.1.90 release
 
 Release source `356ccff31934f5eca6310d7a128345a13daa7456` is merged into `main`

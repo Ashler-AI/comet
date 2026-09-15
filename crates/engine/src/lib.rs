@@ -25,6 +25,7 @@ pub mod repos;
 pub mod rpc;
 pub mod run_journal;
 pub mod scaffold;
+mod session_activity;
 pub mod sessions;
 pub mod spaces;
 pub mod terminals;
@@ -167,6 +168,7 @@ pub struct EngineCore {
     updater: std::sync::Mutex<Option<comet_update::Updater>>,
     /// Optional Scaffold control-plane integration, exposed over the native RPC service.
     scaffold: std::sync::Mutex<Option<ScaffoldRuntime>>,
+    session_activity: Option<session_activity::SessionActivity>,
     /// Exclusive data-dir lock — held for the engine's lifetime (single-instance).
     _instance_lock: InstanceLock,
 }
@@ -302,6 +304,8 @@ impl EngineCore {
         );
         let diff_sync = CheckoutDiffSync::start(repos.clone(), workspace.clone(), &device_id, edge);
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
+        let session_activity = (context.runtime_profile == RuntimeProfile::LocalController)
+            .then(|| session_activity::SessionActivity::start(doc_host.clone(), workspace.clone()));
         Ok(Self {
             sessions,
             doc_host,
@@ -320,6 +324,7 @@ impl EngineCore {
             links: std::sync::Mutex::new(None),
             updater: std::sync::Mutex::new(None),
             scaffold: std::sync::Mutex::new(None),
+            session_activity,
             _instance_lock: lock,
         })
     }
@@ -481,6 +486,9 @@ impl EngineCore {
     /// kill live PTYs, stamp our workspace `lastSeenAt`, and flush every open doc
     /// snapshot.
     pub async fn shutdown(&self) {
+        if let Some(activity) = &self.session_activity {
+            activity.stop();
+        }
         self.sessions.shutdown().await;
         self.terminals.shutdown();
         self.agent_accounts.shutdown();

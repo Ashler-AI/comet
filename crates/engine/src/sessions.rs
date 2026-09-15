@@ -1622,6 +1622,11 @@ impl Inner {
             }
             entry.updated_at = now;
             let session = entry.clone();
+            if let Some(host) = self.doc_host.get()
+                && let Err(error) = host.record_agent_session(&session)
+            {
+                tracing::warn!(chat = %chat_id, %error, "session state publication failed");
+            }
             let mut list: Vec<Session> = statuses.values().cloned().collect();
             list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
             self.sessions_tx.send_replace(list);
@@ -1653,6 +1658,11 @@ impl Inner {
                 }));
             }
             let session = entry.clone();
+            if let Some(host) = self.doc_host.get()
+                && let Err(error) = host.record_agent_session(&session)
+            {
+                tracing::warn!(chat = %chat_id, %error, "session state publication failed");
+            }
             let mut list: Vec<Session> = statuses.values().cloned().collect();
             list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
             // send_replace: keep the current value fresh even with no receivers,
