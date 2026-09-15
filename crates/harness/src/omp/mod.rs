@@ -1923,8 +1923,8 @@ impl OmpHarness {
     }
 
     /// The persistent RPC-mode child that owns a run: JSONL frames on stdio,
-    /// hardened the same way the ACP lane was (yolo approvals; scaffold hosts
-    /// run the isolated profile with discovery disabled).
+    /// hardened the same way the ACP lane was. Scaffold hosts use their isolated
+    /// profile while retaining profile-configured skills.
     fn rpc_mode_command(
         &self,
         executable: &Path,
@@ -1957,7 +1957,6 @@ impl OmpHarness {
                 "--profile",
                 SCAFFOLD_PROFILE,
                 "--no-extensions",
-                "--no-skills",
                 "--no-rules",
             ]);
         }
@@ -3753,11 +3752,11 @@ mod tests {
             "--profile",
             SCAFFOLD_PROFILE,
             "--no-extensions",
-            "--no-skills",
             "--no-rules",
         ] {
             assert!(args.iter().any(|argument| argument == required));
         }
+        assert!(!args.iter().any(|argument| argument == "--no-skills"));
         assert!(
             !args.iter().any(|argument| argument == "claude"
                 || argument == "codex"
@@ -4045,7 +4044,6 @@ mod tests {
                 "--profile",
                 SCAFFOLD_PROFILE,
                 "--no-extensions",
-                "--no-skills",
                 "--no-rules"
             ]
         );
