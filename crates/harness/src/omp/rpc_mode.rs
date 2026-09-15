@@ -543,6 +543,14 @@ fn assistant_message_event(frame: &Value) -> Option<AgentEvent> {
     }
 }
 
+fn command_output_event(frame: &Value) -> Option<AgentEvent> {
+    frame
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(|text| AgentEvent::TextDelta { text: text.into() })
+}
+
 fn tool_progress_from_update(frame: &Value) -> Option<AgentEvent> {
     let id = frame
         .get("toolCallId")
@@ -1036,6 +1044,14 @@ pub(crate) async fn run_rpc(
                     }
                     "message_update" => {
                         if let Some(event) = assistant_message_event(&frame)
+                            && events.send(Ok(event)).await.is_err()
+                        {
+                            kill_rpc_process(&mut child, process_group, interrupt_grace).await;
+                            return Ok(());
+                        }
+                    }
+                    "command_output" => {
+                        if let Some(event) = command_output_event(&frame)
                             && events.send(Ok(event)).await.is_err()
                         {
                             kill_rpc_process(&mut child, process_group, interrupt_grace).await;
@@ -1615,6 +1631,20 @@ mod tests {
                 text: "private".into(),
             })
         );
+    }
+
+    #[test]
+    fn maps_slash_command_output_to_visible_text() {
+        assert_eq!(
+            command_output_event(&json!({
+                "type": "command_output",
+                "text": "Current model: openai-codex/gpt-5.6-sol"
+            })),
+            Some(AgentEvent::TextDelta {
+                text: "Current model: openai-codex/gpt-5.6-sol".into()
+            })
+        );
+        assert_eq!(command_output_event(&json!({ "text": "" })), None);
     }
 
     #[test]

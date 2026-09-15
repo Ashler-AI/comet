@@ -179,6 +179,39 @@ async fn model_and_command_catalogs_come_from_omp() {
 }
 
 #[tokio::test]
+async fn slash_command_output_is_visible() {
+    let _env = env_lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("OMP_ARGV_LOG", temp.path().join("argv"));
+    }
+    let harness = OmpHarness::new().with_executable(fixture_path());
+    let mut run_request = request(None);
+    run_request.prompt = "/model".into();
+    let events = harness
+        .run(run_request, controls())
+        .await
+        .expect("run starts")
+        .map(|event| event.expect("valid RPC event"))
+        .collect::<Vec<_>>()
+        .await;
+
+    assert!(events.contains(&AgentEvent::TextDelta {
+        text: "Current model: openai-codex/gpt-5.6-sol".into()
+    }));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        }
+    )));
+    unsafe {
+        std::env::remove_var("OMP_ARGV_LOG");
+    }
+}
+
+#[tokio::test]
 async fn goal_command_ack_refreshes_state_without_goal_updated() {
     let _env = env_lock().await;
     let temp = tempfile::tempdir().unwrap();
