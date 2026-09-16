@@ -7,8 +7,8 @@
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    AnyElement, Context, Entity, Hsla, SharedString, Subscription, Task, Window, div, prelude::*,
-    px,
+    AnyElement, Context, Entity, EventEmitter, Hsla, SharedString, Subscription, Task, Window, div,
+    prelude::*, px,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -184,6 +184,10 @@ impl LoginFlow {
         }
     }
 }
+#[derive(Debug, Clone)]
+pub(crate) enum AccountsEvent {
+    Updated(AgentAccountsSnapshot),
+}
 
 pub struct AccountsPage {
     state: Entity<AppState>,
@@ -210,6 +214,8 @@ pub struct AccountsPage {
     _observe: Subscription,
     _code_events: Subscription,
 }
+
+impl EventEmitter<AccountsEvent> for AccountsPage {}
 
 impl AccountsPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
@@ -256,7 +262,10 @@ impl AccountsPage {
             this.update(cx, |page, cx| {
                 page.snapshot = match result {
                     Ok(value) => match serde_json::from_value::<AgentAccountsSnapshot>(value) {
-                        Ok(snapshot) => Loadable::Ready(snapshot),
+                        Ok(snapshot) => {
+                            cx.emit(AccountsEvent::Updated(snapshot.clone()));
+                            Loadable::Ready(snapshot)
+                        }
                         Err(err) => Loadable::Error(err.to_string()),
                     },
                     Err(err) => Loadable::Error(err.to_string()),
