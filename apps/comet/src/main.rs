@@ -175,9 +175,8 @@ fn scaffold_url_from_env(edge_token: &Option<String>) -> Option<String> {
         .or_else(|| Some(release_defaults().1.into()))
 }
 
-/// mimalloc: system malloc (macOS libmalloc especially) never returns the
-/// streaming churn's high-water pages, so transient allocation became
-/// permanent RSS (docs/memory-plan.md §1).
+/// Keep transient streaming allocations reclaimable with mimalloc v2 on macOS.
+#[cfg(target_os = "macos")]
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -428,6 +427,10 @@ fn harness_from_env() -> comet_engine::HarnessId {
         Ok("mock") => comet_engine::HarnessId::Mock,
         Ok("codex") => comet_engine::HarnessId::Codex,
         Ok("cursor") => comet_engine::HarnessId::Cursor,
+        Ok("devin") => comet_engine::HarnessId::Devin,
+        Ok("grok") => comet_engine::HarnessId::Grok,
+        Ok("hermes") => comet_engine::HarnessId::Hermes,
+        Ok("pi") => comet_engine::HarnessId::Pi,
         _ => comet_engine::HarnessId::ClaudeCode,
     }
 }

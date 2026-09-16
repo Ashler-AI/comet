@@ -182,8 +182,27 @@ pub async fn fetch_latest(edge_url: &str, access_token: Option<&str>) -> anyhow:
 fn http_client() -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(concat!("comet/", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::custom(
+            |attempt| match validate_release_redirect(attempt.url(), attempt.previous()) {
+                Ok(()) => attempt.follow(),
+                Err(error) => attempt.error(error),
+            },
+        ))
         .build()
         .context("building release HTTP client")
+}
+
+fn validate_release_redirect(
+    next: &reqwest::Url,
+    previous: &[reqwest::Url],
+) -> Result<(), &'static str> {
+    if previous.len() >= 10 {
+        return Err("too many update redirects");
+    }
+    if previous.iter().any(|url| url.scheme() == "https") && next.scheme() != "https" {
+        return Err("update redirect would downgrade HTTPS");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1244,6 +1263,22 @@ mod tests {
             releases_base("http://127.0.0.1:8787").unwrap(),
             "http://127.0.0.1:8787/api/releases"
         );
+    }
+
+    #[test]
+    fn release_redirects_preserve_https_and_allow_loopback_development() {
+        let secure = reqwest::Url::parse("https://comet.internal.ashler.com/api/releases").unwrap();
+        let insecure =
+            reqwest::Url::parse("http://comet.internal.ashler.com/api/releases").unwrap();
+        let local = reqwest::Url::parse("http://127.0.0.1:8787/api/releases").unwrap();
+        assert!(validate_release_redirect(&insecure, std::slice::from_ref(&secure)).is_err());
+        assert!(validate_release_redirect(&local, std::slice::from_ref(&secure)).is_err());
+        assert!(validate_release_redirect(&secure, std::slice::from_ref(&secure)).is_ok());
+        assert!(validate_release_redirect(&local, std::slice::from_ref(&local)).is_ok());
+        assert!(validate_release_redirect(&secure, std::slice::from_ref(&local)).is_ok());
+        assert!(validate_release_redirect(&local, &[local.clone(), secure.clone()]).is_err());
+        assert!(validate_release_redirect(&secure, &vec![secure.clone(); 9]).is_ok());
+        assert!(validate_release_redirect(&secure, &vec![secure.clone(); 10]).is_err());
     }
 
     #[test]

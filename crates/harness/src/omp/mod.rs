@@ -2465,73 +2465,197 @@ impl Harness for OmpHarness {
     }
 }
 
-fn advertised_config_id(state: &Value, candidates: &[&str]) -> Option<String> {
-    state
-        .get("configOptions")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|option| {
-            option
-                .get("id")
-                .or_else(|| option.get("configId"))
-                .and_then(Value::as_str)
-        })
-        .find(|id| candidates.contains(id))
-        .map(str::to_string)
+async fn request_acp_startup(
+    client: &RpcClient,
+    incoming: &mut mpsc::Receiver<Incoming>,
+    controls: &RunControls,
+    method: &str,
+    params: Value,
+) -> Result<Value, HarnessError> {
+    let requested_session = params.get("sessionId").cloned();
+    let request = client.request(method, params);
+    tokio::pin!(request);
+    let mut latest_config: Option<(Value, Value)> = None;
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut request => {
+                let mut result = result?;
+                while let Ok(item) = incoming.try_recv() {
+                    if matches!(item, Incoming::Eof) {
+                        return Err(HarnessError::Protocol("ACP agent exited during startup".into()));
+                    }
+                    if let Some(config) = startup_incoming(client, controls, item) {
+                        latest_config = Some(config);
+                    }
+                }
+                if let Some((session_id, config)) = latest_config
+                    && result.get("sessionId").or(requested_session.as_ref()) == Some(&session_id)
+                {
+                    result["configOptions"] = config;
+                }
+                return Ok(result);
+            }
+            _ = controls.interrupt.cancelled() => return Err(HarnessError::Protocol("ACP startup cancelled".into())),
+            item = incoming.recv() => match item {
+                Some(Incoming::Eof) | None => return Err(HarnessError::Protocol("ACP agent exited during startup".into())),
+                Some(item) => {
+                    if let Some(config) = startup_incoming(client, controls, item) {
+                        latest_config = Some(config);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn startup_incoming(
+    client: &RpcClient,
+    controls: &RunControls,
+    incoming: Incoming,
+) -> Option<(Value, Value)> {
+    match incoming {
+        Incoming::Request { id, method, params } if method == "session/request_permission" => {
+            handle_permission_request(id, params, client.clone(), &controls.request_input)
+        }
+        Incoming::Request { id, method, params } if method == "elicitation/create" => {
+            handle_elicitation_request(id, params, client.clone(), &controls.request_input)
+        }
+        Incoming::Request { id, .. } => {
+            client.respond_error(&id, -32601, "unsupported ACP client method")
+        }
+        Incoming::Notification { method, params }
+            if method == "session/update"
+                && params["update"]["sessionUpdate"] == "config_option_update"
+                && params["update"]["configOptions"].is_array() =>
+        {
+            return Some((
+                params["sessionId"].clone(),
+                params["update"]["configOptions"].clone(),
+            ));
+        }
+        // session/load replays history; Crew already has that transcript.
+        _ => {}
+    }
+    None
 }
 
 async fn set_config_option(
     client: &RpcClient,
+    incoming: &mut mpsc::Receiver<Incoming>,
+    controls: &RunControls,
     session_id: &str,
     config_id: &str,
     value: Value,
 ) -> Result<(), HarnessError> {
-    client
-        .request(
-            "session/set_config_option",
-            json!({
-                "sessionId": session_id,
-                "configId": config_id,
-                "value": value,
-            }),
-        )
-        .await?;
+    request_acp_startup(
+        client,
+        incoming,
+        controls,
+        "session/set_config_option",
+        json!({
+            "sessionId": session_id,
+            "configId": config_id,
+            "value": value,
+        }),
+    )
+    .await?;
     Ok(())
 }
 
 async fn configure_session(
     client: &RpcClient,
+    incoming: &mut mpsc::Receiver<Incoming>,
+    controls: &RunControls,
     session_id: &str,
     state: &Value,
     request: &RunRequest,
 ) -> Result<(), HarnessError> {
     if let Some(model) = request.model.as_deref().filter(|model| *model != "default") {
-        let config_id = advertised_config_id(state, &["model"]).ok_or_else(|| {
-            HarnessError::Protocol("OMP ACP did not advertise model configuration".into())
-        })?;
-        set_config_option(
-            client,
-            session_id,
-            &config_id,
-            Value::String(model.to_string()),
-        )
-        .await?;
+        if let Some(option) = crate::acp::config_option(state, "model", &["model"]) {
+            let config_id = option
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| HarnessError::Protocol("ACP model option has no id".into()))?;
+            let advertised = crate::acp::models_from_session(state);
+            if !advertised.iter().any(|candidate| candidate.id == model) {
+                return Err(HarnessError::Protocol(format!(
+                    "ACP agent does not advertise requested model {model}"
+                )));
+            }
+            set_config_option(
+                client,
+                incoming,
+                controls,
+                session_id,
+                config_id,
+                Value::String(model.into()),
+            )
+            .await?;
+        } else if state
+            .pointer("/models/availableModels")
+            .and_then(Value::as_array)
+            .is_some_and(|models| models.iter().any(|candidate| candidate["modelId"] == model))
+        {
+            request_acp_startup(
+                client,
+                incoming,
+                controls,
+                "session/set_model",
+                json!({"sessionId": session_id, "modelId": model}),
+            )
+            .await?;
+        } else {
+            return Err(HarnessError::Protocol(format!(
+                "ACP agent does not advertise requested model {model}"
+            )));
+        }
     }
     if let Some(reasoning) = request.reasoning {
-        let config_id =
-            advertised_config_id(state, &["thinking", "reasoning"]).ok_or_else(|| {
-                HarnessError::Protocol("OMP ACP did not advertise reasoning configuration".into())
-            })?;
-        let value = serde_json::to_value(reasoning).map_err(|error| {
-            HarnessError::Protocol(format!("Could not encode OMP reasoning: {error}"))
+        let option = crate::acp::config_option(
+            state,
+            "thought_level",
+            &["thinking", "reasoning", "thought_level"],
+        )
+        .ok_or_else(|| {
+            HarnessError::Protocol("ACP agent did not advertise reasoning configuration".into())
         })?;
-        set_config_option(client, session_id, &config_id, value).await?;
+        let config_id = option
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| HarnessError::Protocol("ACP reasoning option has no id".into()))?;
+        let value = serde_json::to_value(reasoning).map_err(|error| {
+            HarnessError::Protocol(format!("Could not encode ACP reasoning: {error}"))
+        })?;
+        set_config_option(client, incoming, controls, session_id, config_id, value).await?;
     }
     for (option_id, value) in &request.model_options {
-        if advertised_config_id(state, &[option_id.as_str()]).is_some() {
-            set_config_option(client, session_id, option_id, value.clone()).await?;
+        let option =
+            crate::acp::config_option(state, "", &[option_id.as_str()]).ok_or_else(|| {
+                HarnessError::Protocol(format!(
+                    "ACP agent does not advertise requested option {option_id}"
+                ))
+            })?;
+        if matches!(
+            option.get("category").and_then(Value::as_str),
+            Some("model" | "thought_level" | "mode")
+        ) || matches!(
+            option_id.as_str(),
+            "model" | "thinking" | "reasoning" | "thought_level" | "mode"
+        ) {
+            return Err(HarnessError::Protocol(format!(
+                "ACP option {option_id} cannot override the selected model, reasoning or approval policy"
+            )));
         }
+        set_config_option(
+            client,
+            incoming,
+            controls,
+            session_id,
+            option_id,
+            value.clone(),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -2669,7 +2793,10 @@ pub(crate) async fn run_acp(
         options.process_label,
         "initialize",
         ACP_INITIALIZE_DEADLINE,
-        client.request(
+        request_acp_startup(
+            &client,
+            &mut incoming,
+            &controls,
             "initialize",
             json!({
                 "protocolVersion": ACP_PROTOCOL_VERSION,
@@ -2683,19 +2810,21 @@ pub(crate) async fn run_acp(
     .await?;
     if initialized.get("protocolVersion").and_then(Value::as_i64) != Some(ACP_PROTOCOL_VERSION) {
         return Err(HarnessError::Protocol(format!(
-            "{} protocol version mismatch — this OMP and Comet are out of step; \
-             run `omp update` (or update it from Settings → Agents) or update Comet",
+            "{} protocol version mismatch — update the agent CLI or Crew",
             options.process_label
         )));
     }
 
-    let (session_id, reported_session_id, session_state) =
+    let (session_id, reported_session_id, mut session_state) =
         if let Some(reported_session_id) = options.preloaded_session_id.clone() {
             let state = run_stage(
                 options.process_label,
                 "session/new",
                 ACP_SESSION_DEADLINE,
-                client.request(
+                request_acp_startup(
+                    &client,
+                    &mut incoming,
+                    &controls,
                     "session/new",
                     json!({ "cwd": request.cwd, "mcpServers": [] }),
                 ),
@@ -2734,7 +2863,10 @@ pub(crate) async fn run_acp(
                 options.process_label,
                 method,
                 ACP_SESSION_DEADLINE,
-                client.request(
+                request_acp_startup(
+                    &client,
+                    &mut incoming,
+                    &controls,
                     method,
                     json!({ "sessionId": session_id, "cwd": request.cwd, "mcpServers": [] }),
                 ),
@@ -2746,7 +2878,10 @@ pub(crate) async fn run_acp(
                 options.process_label,
                 "session/new",
                 ACP_SESSION_DEADLINE,
-                client.request(
+                request_acp_startup(
+                    &client,
+                    &mut incoming,
+                    &controls,
                     "session/new",
                     json!({ "cwd": request.cwd, "mcpServers": [] }),
                 ),
@@ -2764,12 +2899,69 @@ pub(crate) async fn run_acp(
                 .to_string();
             (session_id.clone(), session_id, state)
         };
+    if options.harness == HarnessId::Devin
+        && let Some(model) = request.model.as_deref().filter(|model| *model != "default")
+        && !crate::acp::models_from_session(&session_state)
+            .iter()
+            .any(|candidate| candidate.id == model)
+    {
+        // Devin refreshes its bundled catalog after session/new. Wait for the
+        // exact selected variant rather than silently choosing a family alias.
+        run_stage(
+            options.process_label,
+            "model refresh",
+            Duration::from_secs(10),
+            async {
+                loop {
+                    match incoming.recv().await {
+                        Some(Incoming::Notification { method, params })
+                            if method == "session/update"
+                                && params["sessionId"] == session_id
+                                && params["update"]["sessionUpdate"] == "config_option_update" =>
+                        {
+                            session_state["configOptions"] =
+                                params["update"]["configOptions"].clone();
+                            if crate::acp::models_from_session(&session_state)
+                                .iter()
+                                .any(|candidate| candidate.id == model)
+                            {
+                                return Ok(());
+                            }
+                        }
+                        Some(Incoming::Eof) | None => {
+                            return Err(HarnessError::Protocol(
+                                "Devin exited while refreshing models".into(),
+                            ));
+                        }
+                        Some(item) => {
+                            handle_session_incoming(
+                                item,
+                                &client,
+                                options.harness,
+                                &controls.request_input,
+                                &events,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            },
+        )
+        .await?;
+    }
     if options.configure_session {
         run_stage(
             options.process_label,
             "session/configure",
             ACP_CONFIGURE_DEADLINE,
-            configure_session(&client, &session_id, &session_state, &request),
+            configure_session(
+                &client,
+                &mut incoming,
+                &controls,
+                &session_id,
+                &session_state,
+                &request,
+            ),
         )
         .await?;
     }
@@ -2847,12 +3039,20 @@ pub(crate) async fn run_acp(
             inactivity_log_interval_ms = ACP_PROMPT_INACTIVITY_LOG_INTERVAL.as_millis() as u64,
             "ACP stage started"
         );
-        let prompt = client.request(
-            "session/prompt",
-            json!({ "sessionId": session_id, "prompt": prompt_blocks }),
-        );
+        let prompt_id =
+            (options.harness == HarnessId::Grok).then(|| uuid::Uuid::new_v4().to_string());
+        let mut prompt_params = json!({ "sessionId": session_id, "prompt": prompt_blocks });
+        if let Some(id) = &prompt_id {
+            prompt_params["_meta"] = json!({ "promptId": id, "requestId": id });
+        }
+        let prompt = client.request("session/prompt", prompt_params);
         tokio::pin!(prompt);
-        let inactivity = tokio::time::sleep(ACP_PROMPT_INACTIVITY_LOG_INTERVAL);
+        let mut awaiting_first_activity = options.harness == HarnessId::Grok;
+        let inactivity = tokio::time::sleep(if awaiting_first_activity {
+            Duration::from_secs(30)
+        } else {
+            ACP_PROMPT_INACTIVITY_LOG_INTERVAL
+        });
         tokio::pin!(inactivity);
 
         let response = loop {
@@ -2901,9 +3101,17 @@ pub(crate) async fn run_acp(
                     return Ok(());
                 }
                 item = incoming.recv() => {
+                    awaiting_first_activity = false;
                     inactivity.as_mut().reset(Instant::now() + ACP_PROMPT_INACTIVITY_LOG_INTERVAL);
                     match item {
                         Some(item) => {
+                            if let Incoming::Notification { method, params } = &item
+                                && method == "_x.ai/session/prompt_complete"
+                                && params["sessionId"] == session_id
+                                && prompt_id.as_deref().is_some_and(|id| params["promptId"].as_str() == Some(id))
+                            {
+                                break params.clone();
+                            }
                             if !handle_session_incoming(
                                 item,
                                 &client,
@@ -2930,6 +3138,9 @@ pub(crate) async fn run_acp(
                     }
                 }
                 _ = &mut inactivity => {
+                    if awaiting_first_activity {
+                        return Err(HarnessError::Protocol("Grok ACP did not respond within 30 seconds; check the agent CLI's startup and authentication".into()));
+                    }
                     tracing::warn!(
                         target: "comet_harness::omp",
                         process = options.process_label,
@@ -3119,8 +3330,8 @@ async fn handle_session_incoming(
             true
         }
         Incoming::Request { id, method, params } if method == "session/request_permission" => {
-            // The ACP child already runs in YOLO mode. Any permission request
-            // that survives that policy is an explicit provider safety gate.
+            // Never auto-answer an agent's permission request. Even when the
+            // run requests auto-approval, provider safety gates stay interactive.
             handle_permission_request(id, params, client.clone(), request_input);
             true
         }
@@ -3159,7 +3370,7 @@ fn handle_permission_request(
     let title = params
         .pointer("/toolCall/title")
         .and_then(Value::as_str)
-        .unwrap_or("OMP tool");
+        .unwrap_or("agent tool");
     let receiver = request_input(vec![UserInputQuestion {
         id: "permission".into(),
         header: "Permission".into(),
@@ -3216,7 +3427,17 @@ fn content_text(content: &Value) -> Option<&str> {
 /// INPUT first, so `rawOutput` is the clean source). Non-conforming shapes
 /// degrade to the raw JSON so an unfamiliar tool still shows something.
 fn tool_output_text(update: &Value) -> Option<String> {
-    let raw = update.get("rawOutput")?;
+    let Some(raw) = update.get("rawOutput").filter(|raw| !raw.is_null()) else {
+        let text = update
+            .get("content")?
+            .as_array()?
+            .iter()
+            .filter(|block| block["type"] == "content")
+            .filter_map(|block| block.get("content").and_then(content_text))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return (!text.is_empty()).then_some(text);
+    };
     if let Some(text) = raw.as_str() {
         return (!text.is_empty()).then(|| text.to_string());
     }
@@ -3348,7 +3569,7 @@ fn normalize_update(params: &Value, harness: HarnessId) -> Option<AgentEvent> {
             let title = update
                 .get("title")
                 .and_then(Value::as_str)
-                .unwrap_or("OMP tool");
+                .unwrap_or("Agent tool");
             let call = if let Some(agents) = pending_agent_activities(update) {
                 ToolCall::Agent { agents }
             } else if harness == HarnessId::PrimeAgent && title == "IPython cell" {

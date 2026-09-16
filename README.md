@@ -2,6 +2,34 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Unreleased: compatible upstream integration
+
+Selected upstream improvements are adapted to Crew, not a wholesale upstream merge:
+
+- Transcript watchers share immutable bounded snapshots, retaining Crew's paging
+  cursors. Streaming Markdown shares completed blocks; cosmetic animation leases
+  expire and settled scroll springs stop requesting idle frames.
+- macOS uses mimalloc v2; other platforms keep the system allocator. Release
+  downloads reject HTTPS downgrade redirects; Rustls is updated to 0.23.45.
+- Local controllers offer Devin (`devin acp`), Grok (`grok --no-auto-update agent
+  --no-leader stdio`), Hermes (`hermes acp`), and Pi (installed `pi-acp` adapter).
+  Install and authenticate each agent separately; opening Crew never installs
+  adapters. Executable overrides are `DEVIN_EXECUTABLE`, `GROK_EXECUTABLE`,
+  `HERMES_EXECUTABLE`, and `PI_ACP_EXECUTABLE`. Pi also requires its underlying CLI.
+  The selected host supplies live models, reasoning options, and slash commands.
+  New agents queue followups at turn boundaries and resume through ACP when the
+  agent advertises support. Permission requests always require an interactive
+  response, even for auto-approve runs; missing approval cancels the request.
+
+These ACP agents use their own CLI credentials, not Crew's shared Agent Auth
+accounts. Unsupported shared-account routing, native forks, and read-only sandbox
+requests fail closed. Scaffold hosts remain OMP-only; existing native OMP/Scaffold
+handoff and mid-turn steering are unchanged. Existing clients must be upgraded
+before sharing sessions containing the new harness identities. This change does
+not migrate workspace/session sync, rename storage or services, change release
+channels, or deploy a new build. Protocol-fixture and isolated native-UI checks do
+not establish live-provider compatibility or a measured CPU/memory improvement.
+
 ## Scaffold session web view
 
 `apps/web` provides the browser surface for one existing Crew/OMP session in a

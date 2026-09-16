@@ -1908,6 +1908,10 @@ fn harness_key(harness: HarnessId) -> &'static str {
         HarnessId::PrimeAgent => "prime-agent",
         HarnessId::OpenCode => "opencode",
         HarnessId::Cursor => "cursor",
+        HarnessId::Devin => "devin",
+        HarnessId::Grok => "grok",
+        HarnessId::Hermes => "hermes",
+        HarnessId::Pi => "pi",
         HarnessId::Mock => "mock",
     }
 }
@@ -1920,6 +1924,10 @@ fn harness_label(harness: HarnessId) -> &'static str {
         HarnessId::PrimeAgent => "Prime Agent",
         HarnessId::OpenCode => "OpenCode",
         HarnessId::Cursor => "Cursor",
+        HarnessId::Devin => "Devin",
+        HarnessId::Grok => "Grok",
+        HarnessId::Hermes => "Hermes",
+        HarnessId::Pi => "Pi",
         HarnessId::Mock => "Test",
     }
 }

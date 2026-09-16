@@ -3,10 +3,10 @@ mod tests {
     use super::*;
     use crate::scaffold::AgentInferenceAuthority;
     use async_trait::async_trait;
+    use futures::stream;
     use http_body_util::{BodyExt, Full, StreamBody};
     use hyper::{body::Frame, body::Incoming, service::service_fn};
     use serde_json::Value;
-    use futures::stream;
     use std::io;
     use tokio::sync::mpsc;
 
@@ -63,7 +63,10 @@ mod tests {
             comet_harness::CancellationToken::new(),
             "request-complete",
         );
-        assert_eq!(complete.next().await.unwrap().unwrap(), Bytes::from_static(b"abc"));
+        assert_eq!(
+            complete.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"abc")
+        );
         assert!(complete.next().await.is_none());
 
         let cancellation = comet_harness::CancellationToken::new();
@@ -81,7 +84,10 @@ mod tests {
             comet_harness::CancellationToken::new(),
             "request-failed",
         );
-        assert_eq!(failed.next().await.unwrap().unwrap_err().to_string(), "body closed");
+        assert_eq!(
+            failed.next().await.unwrap().unwrap_err().to_string(),
+            "body closed"
+        );
 
         drop(InstrumentedRelayStream::new(
             Box::pin(stream::pending()),
@@ -105,7 +111,10 @@ mod tests {
             assert!(line.contains("status=200"), "{line}");
             assert!(line.contains("bytes_received="), "{line}");
         }
-        assert!(logs.lines().any(|line| line.contains("request-failed") && line.contains("body closed")));
+        assert!(
+            logs.lines()
+                .any(|line| line.contains("request-failed") && line.contains("body closed"))
+        );
     }
 
     struct StaticToken;
@@ -152,7 +161,8 @@ mod tests {
                             let bytes = request.into_body().collect().await.unwrap().to_bytes();
                             let response = match path.as_str() {
                                 "/api/agent-auth/v2/authority" => {
-                                    let authority_id = next_authority.fetch_add(1, Ordering::SeqCst) + 1;
+                                    let authority_id =
+                                        next_authority.fetch_add(1, Ordering::SeqCst) + 1;
                                     json!({
                                         "contractVersion": 2,
                                         "token": format!("remote-agent-auth-authority-{authority_id}"),
@@ -175,10 +185,11 @@ mod tests {
                                                 .get("x-api-key")
                                                 .and_then(|value| value.to_str().ok())
                                                 .map(str::to_string),
-                                            conversation_id: headers["x-agent-auth-conversation-id"]
-                                                .to_str()
-                                                .unwrap()
-                                                .to_string(),
+                                            conversation_id:
+                                                headers["x-agent-auth-conversation-id"]
+                                                    .to_str()
+                                                    .unwrap()
+                                                    .to_string(),
                                             request_id: headers["x-agent-auth-request-id"]
                                                 .to_str()
                                                 .unwrap()
@@ -270,9 +281,7 @@ mod tests {
         origin
     }
 
-    async fn streaming_control_plane(
-        captured: mpsc::UnboundedSender<CapturedRequest>,
-    ) -> String {
+    async fn streaming_control_plane(captured: mpsc::UnboundedSender<CapturedRequest>) -> String {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
@@ -350,12 +359,7 @@ mod tests {
         let client = ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap();
         let relay = InferenceRelay::start(client).unwrap();
         let route = relay
-            .prepare(
-                "session-1",
-                HarnessId::Codex,
-                Some("gpt-5.6-sol"),
-                None,
-            )
+            .prepare("session-1", HarnessId::Codex, Some("gpt-5.6-sol"), None)
             .await
             .unwrap()
             .unwrap();
@@ -401,7 +405,10 @@ mod tests {
         );
 
         let captured = captured_rx.recv().await.unwrap();
-        assert_eq!(captured.authorization, "Bearer remote-agent-auth-authority-1");
+        assert_eq!(
+            captured.authorization,
+            "Bearer remote-agent-auth-authority-1"
+        );
         assert_eq!(captured.conversation_id, "session-1");
         assert_eq!(captured.request_id, "request-1");
         assert_eq!(captured.account_id, None);
@@ -464,7 +471,6 @@ mod tests {
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert_eq!(captured_rx.recv().await.unwrap(), BODY_BYTES as u64);
     }
-
 
     #[test]
     fn projects_only_local_import_ids_to_stable_agent_auth_uuids() {
@@ -563,7 +569,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
-        assert_eq!(captured_rx.recv().await.unwrap().conversation_id, "persistent-session");
+        assert_eq!(
+            captured_rx.recv().await.unwrap().conversation_id,
+            "persistent-session"
+        );
 
         let unrelated = relay
             .prepare(
@@ -680,7 +689,10 @@ mod tests {
             .unwrap();
         assert_eq!(rebound.status(), reqwest::StatusCode::OK);
         let captured = captured_rx.recv().await.unwrap();
-        assert_eq!(captured.authorization, "Bearer remote-agent-auth-authority-2");
+        assert_eq!(
+            captured.authorization,
+            "Bearer remote-agent-auth-authority-2"
+        );
         assert_eq!(captured.conversation_id, "persistent-session");
         assert!(matches!(
             expired_routes.try_recv(),
@@ -704,12 +716,7 @@ mod tests {
         let client = ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap();
         let relay = InferenceRelay::start(client).unwrap();
         let route = relay
-            .prepare(
-                "session-1",
-                HarnessId::Codex,
-                Some("gpt-5.6-sol"),
-                None,
-            )
+            .prepare("session-1", HarnessId::Codex, Some("gpt-5.6-sol"), None)
             .await
             .unwrap()
             .unwrap();
@@ -726,9 +733,11 @@ mod tests {
         captured_rx.recv().await.unwrap();
 
         relay.remove(&route_to_remove.token);
-        assert_eq!(response.bytes().await.unwrap(), Bytes::from_static(b"data: first\n\n"));
+        assert_eq!(
+            response.bytes().await.unwrap(),
+            Bytes::from_static(b"data: first\n\n")
+        );
     }
-
 
     #[tokio::test]
     async fn authenticates_anthropic_sdk_requests_without_forwarding_the_loopback_token() {
@@ -763,12 +772,14 @@ mod tests {
 
         let captured = captured_rx.recv().await.unwrap();
         assert_eq!(captured.path, "/api/agent-auth/v2/messages?beta=true");
-        assert_eq!(captured.authorization, "Bearer remote-agent-auth-authority-1");
+        assert_eq!(
+            captured.authorization,
+            "Bearer remote-agent-auth-authority-1"
+        );
         assert_eq!(captured.api_key, None);
         assert_eq!(captured.conversation_id, "session-anthropic");
         assert_eq!(captured.body["model"], "claude-opus-5");
     }
-
 
     #[test]
     fn accepts_scoped_and_legacy_unscoped_v2_principal_authorities() {
@@ -840,15 +851,27 @@ mod tests {
             None
         );
         assert_eq!(
-            inference_binding(
-                HarnessId::Omp,
-                Some("prime-inference/moonshotai/kimi-k3")
-            ),
+            inference_binding(HarnessId::Omp, Some("prime-inference/moonshotai/kimi-k3")),
             None
         );
         assert_eq!(
             inference_binding(HarnessId::ClaudeCode, Some("opus")),
             Some(("anthropic", "opus".into()))
+        );
+    }
+
+    #[test]
+    fn acp_provider_model_does_not_request_shared_inference_authority() {
+        assert!(
+            inference_route_request(
+                "session-acp",
+                HarnessId::Hermes,
+                Some("anthropic/claude-fable-5-1"),
+                None,
+                1,
+            )
+            .unwrap()
+            .is_none()
         );
     }
 
@@ -874,7 +897,10 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(pinned.provider, "anthropic");
-        assert_eq!(pinned.requested_account_id.as_deref(), Some("opaque-account-id"));
+        assert_eq!(
+            pinned.requested_account_id.as_deref(),
+            Some("opaque-account-id")
+        );
         assert_eq!(pinned.lifecycle_epoch, 2);
     }
 

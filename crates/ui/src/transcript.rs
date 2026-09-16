@@ -136,8 +136,8 @@ pub const SPRING_GROWTH_EMA: f32 = 0.12;
 pub const SPRING_CHASE_MAX_LEAD: f32 = 32.0;
 /// Treat as exactly pinned within this distance of the bottom.
 pub const AT_BOTTOM_PX: f32 = 2.0;
-/// Keep the spring loop warm this long after landing, so a streaming pause
-/// resumes at cruise instead of re-accelerating from zero.
+/// Retain the spring's state this long after landing, so a streaming pause
+/// resumes at cruise. Retaining state does not require drawing idle frames.
 pub const SPRING_SETTLE_GRACE_MS: u64 = 500;
 /// Teleport when farther than this many viewports from the end; glide the rest.
 pub const GLIDE_MAX_VIEWPORTS: f32 = 2.5;
@@ -177,10 +177,10 @@ impl StickSpring {
         *self = Self::new();
     }
 
-    /// Residual motion below mugen's settle thresholds (`v < .05 && targetVel
-    /// < .05`)?
-    pub fn is_idle(&self) -> bool {
-        self.velocity < 0.05 && self.target_vel < 0.05
+    fn needs_frame(distance: f32) -> bool {
+        // Residual velocity cannot move a viewport already at its target;
+        // virtual-list estimates can keep that velocity nonzero indefinitely.
+        distance > 0.5
     }
 
     #[cfg(test)]
@@ -1519,17 +1519,20 @@ impl Transcript {
     /// Arm the per-frame spring driver — `render` schedules the next frame
     /// while [`Self::spring_should_run`].
     fn wake_spring(&mut self) {
+        if self.spring_settled_at.is_some_and(|settled| {
+            settled.elapsed() >= Duration::from_millis(SPRING_SETTLE_GRACE_MS)
+        }) {
+            self.spring.reset();
+            self.spring_last_tick = None;
+        }
         self.spring_settled_at = None;
         self.spring_kick = true;
     }
 
-    /// Whether the spring loop needs another frame: off the bottom, carrying
-    /// residual motion, or inside the post-landing settle grace.
+    /// A layout kick needs one observation; otherwise only unfinished motion
+    /// needs another frame. The settle grace retains state without repainting.
     fn spring_should_run(&self) -> bool {
-        self.spring_kick
-            || self.distance_from_bottom() > 0.5
-            || !self.spring.is_idle()
-            || self.spring_settled_at.is_some()
+        self.spring_kick || StickSpring::needs_frame(self.distance_from_bottom())
     }
 
     /// Whether the scroll offset is in a bottom-glued representation (`None`
@@ -1540,7 +1543,7 @@ impl Transcript {
     }
 
     /// One spring frame: observe target growth, step the stepper, apply the
-    /// delta, park after the settle grace. Runs from `window.on_next_frame`,
+    /// delta, and park on landing. Runs from `window.on_next_frame`,
     /// i.e. after layout — measurements are fresh.
     fn step_spring(&mut self, cx: &mut Context<Self>) {
         self.spring_kick = false;
@@ -1549,6 +1552,13 @@ impl Transcript {
             return;
         }
         let now = Instant::now();
+        if self.spring_settled_at.is_some_and(|settled| {
+            now.duration_since(settled) >= Duration::from_millis(SPRING_SETTLE_GRACE_MS)
+        }) {
+            self.spring.reset();
+            self.spring_last_tick = None;
+            self.spring_settled_at = None;
+        }
         let frames = match self.spring_last_tick {
             Some(last) => (now.duration_since(last).as_secs_f32() * 1000.0 / SPRING_FRAME_MS)
                 .min(SPRING_MAX_CATCHUP_FRAMES),
@@ -1573,20 +1583,18 @@ impl Transcript {
         self.last_scroll_distance = (target - next).max(0.0);
 
         if target - next <= 0.5 {
-            let settled = *self.spring_settled_at.get_or_insert(now);
-            if now.duration_since(settled) >= Duration::from_millis(SPRING_SETTLE_GRACE_MS)
-                && self.spring.is_idle()
-            {
-                // Park: stop scheduling frames until the next wake.
-                self.spring.reset();
-                self.spring_last_tick = None;
-                self.spring_settled_at = None;
-                return;
-            }
+            // Anchor the final row instead of chasing changing virtual-row
+            // height estimates after every landing.
+            self.list.scroll_to_end();
+            self.spring_settled_at.get_or_insert(now);
         } else {
             self.spring_settled_at = None;
         }
-        cx.notify();
+        // Preserve the final movement's paint, but do not repaint a stationary
+        // viewport during the grace period. Layout kicks wake it as needed.
+        if next > pos || StickSpring::needs_frame(self.last_scroll_distance) {
+            cx.notify();
+        }
     }
     fn build_entry_rows(
         &mut self,
@@ -2647,11 +2655,10 @@ impl Transcript {
                 if let Some(veil) = &veil {
                     veil.borrow_mut().finish_seeding();
                 }
-                // Drive the veil clock: while any chunk is still dissolving,
-                // repaint next frame (self-limiting — one callback per frame).
+                // Share the loaders' bounded clock instead of requesting a
+                // display-rate frame for every dissolving row.
                 if veil.is_some_and(|v| v.borrow().is_fading()) {
-                    let id = cx.entity_id();
-                    window.on_next_frame(move |_, cx| cx.notify(id));
+                    motion::pulse_lease(cx.entity_id(), cx);
                 }
                 el
             }
@@ -4085,6 +4092,34 @@ mod tests {
     // ---- stick-to-bottom spring ----
 
     #[test]
+    fn stationary_spring_parks_and_growth_resumes_motion() {
+        let mut spring = StickSpring::new();
+        // Virtual-list estimates may grow while the viewport stays anchored
+        // to the final row. Their feed-forward velocity must not keep it hot.
+        for frame in 0..120 {
+            let target = 10000.0 + frame as f32 * 400.0;
+            let next = spring.step(target, target, 1.0);
+            assert_eq!(next, target);
+            assert!(!StickSpring::needs_frame(target - next));
+        }
+        assert!(spring.target_vel() > 1.0);
+
+        spring.reset();
+        let mut pos = 600.0;
+        let target = 900.0;
+        for _ in 0..600 {
+            if !StickSpring::needs_frame(target - pos) {
+                break;
+            }
+            let next = spring.step(pos, target, 1.0);
+            assert!(next >= pos && next <= target);
+            pos = next;
+        }
+        assert_eq!(pos, target);
+        assert!(!StickSpring::needs_frame(target - pos));
+    }
+
+    #[test]
     fn spring_converges_to_a_fixed_target() {
         let mut spring = StickSpring::new();
         let target = 400.0;
@@ -4099,12 +4134,12 @@ mod tests {
             frames < 300,
             "400px should converge within 5s of frames, took {frames}"
         );
-        // Once landed it stays landed (and idles out).
+        // Once landed it stays landed without requesting another frame.
         for _ in 0..120 {
             pos = spring.step(pos, target, 1.0);
             assert_eq!(pos, target);
         }
-        assert!(spring.is_idle(), "no residual motion at rest");
+        assert!(!StickSpring::needs_frame(target - pos));
     }
 
     #[test]

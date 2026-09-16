@@ -243,6 +243,14 @@ fn inference_binding(
     harness: HarnessId,
     selected_model: Option<&str>,
 ) -> Option<(&'static str, String)> {
+    // ACP agents own their CLI credentials. A provider-prefixed model id is
+    // not evidence that they implement Crew's Agent Auth relay contract.
+    if matches!(
+        harness,
+        HarnessId::Devin | HarnessId::Grok | HarnessId::Hermes | HarnessId::Pi
+    ) {
+        return None;
+    }
     let selected = selected_model
         .map(str::trim)
         .filter(|value| !value.is_empty() && *value != "default")

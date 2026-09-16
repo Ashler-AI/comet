@@ -13,6 +13,10 @@ pub enum HarnessId {
     #[serde(rename = "opencode")]
     OpenCode,
     Cursor,
+    Devin,
+    Grok,
+    Hermes,
+    Pi,
     /// Test harness; never shown in production pickers.
     Mock,
 }

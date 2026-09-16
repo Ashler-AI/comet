@@ -1410,22 +1410,23 @@ where
 /// full `reset` first, then only changed entries per commit — the whole-Vec
 /// serialization here was the per-tick cost that scaled with transcript size.
 fn doc_messages_stream(
-    rx: watch::Receiver<comet_doc::SessionEntryWindow>,
+    rx: watch::Receiver<std::sync::Arc<comet_doc::SessionEntryWindow>>,
 ) -> BoxStream<'static, serde_json::Value> {
     use comet_doc::transcript_delta::{TranscriptFrame, diff_transcript};
     futures::stream::unfold(
-        (rx, None::<Vec<comet_doc::SessionMessageEntry>>),
+        (rx, None::<std::sync::Arc<comet_doc::SessionEntryWindow>>),
         |(mut rx, mut prev)| async move {
             loop {
                 if prev.is_some() {
                     rx.changed().await.ok()?;
                 }
+                // Retain the shared immutable tail instead of copying entries per watcher.
                 let current = rx.borrow_and_update().clone();
                 let frame = match prev.as_deref() {
                     None => TranscriptFrame::reset(&current.entries, current.before),
-                    Some(prev) => diff_transcript(prev, &current.entries, current.before),
+                    Some(prev) => diff_transcript(&prev.entries, &current.entries, current.before),
                 };
-                prev = Some(current.entries);
+                prev = Some(current);
                 // No-op commits (a second watcher attaching, command-only
                 // changes) produce empty deltas — skip the frame entirely.
                 if frame.is_empty_delta() {
@@ -1540,7 +1541,7 @@ fn merge_participant_presence(current: &mut ParticipantPresence, candidate: &Par
 }
 
 fn collaboration_stream(
-    messages_rx: watch::Receiver<comet_doc::SessionEntryWindow>,
+    messages_rx: watch::Receiver<std::sync::Arc<comet_doc::SessionEntryWindow>>,
     authority_rx: watch::Receiver<u64>,
     doc: std::sync::Arc<comet_doc::SessionDoc>,
     doc_host: DocHost,

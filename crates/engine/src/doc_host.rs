@@ -371,7 +371,7 @@ pub struct ChatDocHandle {
     chat_id: String,
     device_id: String,
     doc: Arc<SessionDoc>,
-    messages_tx: watch::Sender<SessionEntryWindow>,
+    messages_tx: watch::Sender<Arc<SessionEntryWindow>>,
     /// True when the doc changed while nobody watched: the bounded tail mirror
     /// is rebuilt on the next `watch_messages` attach.
     mirror_dirty: AtomicBool,
@@ -418,7 +418,7 @@ impl ChatDocHandle {
     /// Attach-time refresh: the mirror is only maintained while watched, so a
     /// doc that changed unwatched materializes here, once, instead of on every
     /// commit it sat through in the background.
-    pub fn watch_messages(&self) -> watch::Receiver<SessionEntryWindow> {
+    pub fn watch_messages(&self) -> watch::Receiver<Arc<SessionEntryWindow>> {
         self.touch();
         // Attach is a user signal: verify a quiet room is actually alive
         // (a doc-wedged DO keeps answering pings while delivering nothing,
@@ -582,7 +582,7 @@ impl ChatDocHandle {
             Ok(window) => {
                 // send_replace: update the watch even with no subscribers yet,
                 // so a late subscriber's first borrow sees the current tail.
-                self.messages_tx.send_replace(window);
+                self.messages_tx.send_replace(Arc::new(window));
             }
             Err(err) => {
                 tracing::warn!(chat = %self.chat_id, error = %err, "transcript read failed");
@@ -1112,10 +1112,10 @@ impl DocHost {
         }));
         // The mirror starts dirty and empty: many opens never watch a
         // transcript, and the first attach materializes the bounded tail.
-        let (messages_tx, _) = watch::channel(SessionEntryWindow {
+        let (messages_tx, _) = watch::channel(Arc::new(SessionEntryWindow {
             entries: Vec::new(),
             before: None,
-        });
+        }));
         let handle = Arc::new(ChatDocHandle {
             chat_id: chat_id.to_string(),
             device_id: self.inner.config.device_id.clone(),
@@ -1261,7 +1261,10 @@ impl DocHost {
         // Publication ids are immutable replay keys, not upsert keys. The engine
         // already throttles heartbeats; only changed owner snapshots append here.
         handle.doc.append_publication(&PublicationRecord {
-            id: format!("session/{session_id}/status/{}/{:?}", status.updated_at, status.status),
+            id: format!(
+                "session/{session_id}/status/{}/{:?}",
+                status.updated_at, status.status
+            ),
             schema_version: COLLABORATION_SCHEMA_VERSION,
             published_at: updated_at,
             published_by: session.owner_subject.clone(),
@@ -1298,7 +1301,6 @@ impl DocHost {
         }
         execution_key.to_string()
     }
-
 
     /// LRU eviction: while the warm set exceeds [`WARM_DOC_CAP`] or the
     /// resident estimate exceeds `DOC_LRU_BYTE_BUDGET`, close the
@@ -1599,12 +1601,23 @@ impl DocHost {
             turn_id: Some(id),
             frontier: None,
         });
-        if let SessionCommandPayload::Control { session_id, owner_device_id, action, .. } = &payload
+        if let SessionCommandPayload::Control {
+            session_id,
+            owner_device_id,
+            action,
+            ..
+        } = &payload
             && owner_device_id == &self.inner.config.device_id
-            && let SessionControlAction::Stop { expected_turn_id: Some(expected) } = action.as_ref()
+            && let SessionControlAction::Stop {
+                expected_turn_id: Some(expected),
+            } = action.as_ref()
         {
             let execution_key = self.bind_session_execution_key(&handle, session_id);
-            let sessions = self.inner.sessions.get().ok_or_else(|| EngineError::Other("Stop target is no longer active".into()))?;
+            let sessions = self
+                .inner
+                .sessions
+                .get()
+                .ok_or_else(|| EngineError::Other("Stop target is no longer active".into()))?;
             sessions.require_turn(&execution_key, expected)?;
         }
         let entry = SessionCommandEntry {
@@ -2395,7 +2408,9 @@ impl DocHost {
                         Ok((SessionCommandStatus::Applied, Some("resumed".into())))
                     }
                     SessionControlAction::Stop { expected_turn_id } => {
-                        sessions.interrupt_turn(&execution_key, expected_turn_id.as_deref()).await?;
+                        sessions
+                            .interrupt_turn(&execution_key, expected_turn_id.as_deref())
+                            .await?;
                         Ok((SessionCommandStatus::Applied, None))
                     }
                     SessionControlAction::Focus { .. } => {
@@ -2864,6 +2879,73 @@ mod authority_tests {
     use loro::LoroMap;
 
     #[tokio::test]
+    async fn transcript_watch_retains_bounded_snapshots_and_paging() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = DocHost::new(
+            Arc::new(DocsStore::open(dir.path()).unwrap()),
+            DocHostConfig {
+                device_id: "device-a".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        let handle = host.open("chat-a").unwrap();
+        for index in 0..=TAIL_MESSAGE_COUNT {
+            handle
+                .write_user_message(&format!("m{index}"), "original", index as i64)
+                .unwrap();
+        }
+        let first = handle.watch_messages();
+        let retained = first.borrow().clone();
+        assert_eq!(retained.entries.len(), TAIL_MESSAGE_COUNT);
+        assert_eq!(retained.entries.first().unwrap().id, "m1");
+        assert_eq!(retained.before, Some(1));
+        let older = handle
+            .doc()
+            .read_entry_window(retained.before, TAIL_MESSAGE_COUNT)
+            .unwrap();
+        assert_eq!(
+            older
+                .entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["m0"]
+        );
+        assert_eq!(older.before, None);
+
+        let second = handle.watch_messages();
+        handle
+            .write_user_message("new", "new content", 1000)
+            .unwrap();
+        handle.publish_messages_if_watched();
+        for receiver in [&first, &second] {
+            let current = receiver.borrow();
+            assert_eq!(current.entries.len(), TAIL_MESSAGE_COUNT);
+            assert_eq!(current.entries.first().unwrap().id, "m2");
+            assert_eq!(current.entries.last().unwrap().id, "new");
+            assert_eq!(current.before, Some(2));
+        }
+        // Retaining a prior snapshot must not let later publication mutate it.
+        assert_eq!(retained.entries.first().unwrap().id, "m1");
+        assert_eq!(
+            retained.entries.last().unwrap().id,
+            format!("m{TAIL_MESSAGE_COUNT}")
+        );
+        assert_eq!(retained.before, Some(1));
+
+        drop(first);
+        drop(second);
+        handle
+            .write_user_message("unwatched", "while detached", 1001)
+            .unwrap();
+        handle.publish_messages_if_watched();
+        let reattached = handle.watch_messages();
+        assert_eq!(reattached.borrow().entries.last().unwrap().id, "unwatched");
+        assert_eq!(reattached.borrow().before, Some(3));
+    }
+
+    #[tokio::test]
     async fn owned_session_status_tracks_heartbeat_input_and_followup_turn() {
         let dir = tempfile::tempdir().unwrap();
         let host = DocHost::new(
@@ -2878,28 +2960,31 @@ mod authority_tests {
         let execution_key = host.bind_session_execution_key(&handle, "chat-a");
         let other_key = host.bind_session_execution_key(&handle, "agent-b");
         for (session_id, owner_device_id) in [("chat-a", "device-a"), ("agent-b", "device-b")] {
-            handle.doc.append_publication(&PublicationRecord {
-                id: format!("session/{session_id}/start"),
-                schema_version: COLLABORATION_SCHEMA_VERSION,
-                published_at: 1,
-                published_by: "owner".into(),
-                value: PublicationValue::AgentSession(Box::new(AgentSessionRecord {
-                    session_id: session_id.into(),
-                    chat_id: "chat-a".into(),
-                    owner_subject: "owner".into(),
-                    owner_device_id: owner_device_id.into(),
-                    source: AgentSessionSource::Scaffold,
-                    environment: None,
-                    harness: Some(HarnessId::Mock),
-                    model: None,
-                    harness_session_id: None,
-                    status: Some(SessionStatus::Working),
-                    updated_at: Some(1),
-                    created_at: 1,
+            handle
+                .doc
+                .append_publication(&PublicationRecord {
+                    id: format!("session/{session_id}/start"),
+                    schema_version: COLLABORATION_SCHEMA_VERSION,
+                    published_at: 1,
+                    published_by: "owner".into(),
+                    value: PublicationValue::AgentSession(Box::new(AgentSessionRecord {
+                        session_id: session_id.into(),
+                        chat_id: "chat-a".into(),
+                        owner_subject: "owner".into(),
+                        owner_device_id: owner_device_id.into(),
+                        source: AgentSessionSource::Scaffold,
+                        environment: None,
+                        harness: Some(HarnessId::Mock),
+                        model: None,
+                        harness_session_id: None,
+                        status: Some(SessionStatus::Working),
+                        updated_at: Some(1),
+                        created_at: 1,
+                        unknown: Default::default(),
+                    })),
                     unknown: Default::default(),
-                })),
-                unknown: Default::default(),
-            }).unwrap();
+                })
+                .unwrap();
         }
         let mut source = comet_proto::Session {
             chat_id: execution_key,
@@ -2921,18 +3006,38 @@ mod authority_tests {
             source.updated_at = chrono::DateTime::from_timestamp_millis(at).unwrap();
             host.record_agent_session(&source).unwrap();
             let snapshot = handle.doc.collaboration_snapshot().unwrap();
-            let assigned = snapshot.sessions.iter().find(|row| row.session_id == "chat-a").unwrap();
-            assert_eq!((assigned.status, assigned.updated_at), (Some(status), Some(at)));
-            let other = snapshot.sessions.iter().find(|row| row.session_id == "agent-b").unwrap();
-            assert_eq!((other.status, other.updated_at), (Some(SessionStatus::Working), Some(1)));
+            let assigned = snapshot
+                .sessions
+                .iter()
+                .find(|row| row.session_id == "chat-a")
+                .unwrap();
+            assert_eq!(
+                (assigned.status, assigned.updated_at),
+                (Some(status), Some(at))
+            );
+            let other = snapshot
+                .sessions
+                .iter()
+                .find(|row| row.session_id == "agent-b")
+                .unwrap();
+            assert_eq!(
+                (other.status, other.updated_at),
+                (Some(SessionStatus::Working), Some(1))
+            );
 
             // Replay, a bare chat key, and another device's agent cannot append.
             host.record_agent_session(&source).unwrap();
             for chat_id in ["chat-a", other_key.as_str()] {
-                let unrelated = comet_proto::Session { chat_id: chat_id.into(), ..source.clone() };
+                let unrelated = comet_proto::Session {
+                    chat_id: chat_id.into(),
+                    ..source.clone()
+                };
                 host.record_agent_session(&unrelated).unwrap();
             }
-            assert_eq!(handle.doc.read_publications().unwrap(), snapshot.publications);
+            assert_eq!(
+                handle.doc.read_publications().unwrap(),
+                snapshot.publications
+            );
         }
     }
 
@@ -2941,7 +3046,11 @@ mod authority_tests {
         let dir = tempfile::tempdir().unwrap();
         let host = DocHost::new(
             Arc::new(DocsStore::open(dir.path()).unwrap()),
-            DocHostConfig { device_id: "device-a".into(), default_harness: HarnessId::Mock, edge: None },
+            DocHostConfig {
+                device_id: "device-a".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
         );
         host.set_sessions(SessionsEngine::new(
             "device-a".into(),
@@ -2957,11 +3066,24 @@ mod authority_tests {
             grant_id: "grant".into(),
             source: AgentSessionSource::Scaffold,
             action: Box::new(SessionControlAction::Stop {
-                expected_turn_id: Some(serde_json::json!(["chat::session::session-a", "device-a", "2026-09-11T10:00:00Z"]).to_string()),
+                expected_turn_id: Some(
+                    serde_json::json!([
+                        "chat::session::session-a",
+                        "device-a",
+                        "2026-09-11T10:00:00Z"
+                    ])
+                    .to_string(),
+                ),
             }),
         };
-        let error = host.queue_command_with_id("chat", "stop", command).unwrap_err();
-        assert!(error.to_string().contains("Stop target is no longer active"));
+        let error = host
+            .queue_command_with_id("chat", "stop", command)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Stop target is no longer active")
+        );
         assert!(host.command_entry("chat", "stop").unwrap().is_none());
     }
 

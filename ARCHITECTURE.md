@@ -275,6 +275,9 @@ Direct ports of comet behaviors (spec: feature-inventory §3):
   segments at 120ms commits, drain commands host-only with processed-ledger idempotence, publish
   diff sidecar, presence); warm-open recent chats (14d/cap 30); nudge-driven cold open; SQLite
   snapshot store.
+  Watchers retain `Arc<SessionEntryWindow>` snapshots so each subscriber avoids
+  copying the bounded transcript tail; older snapshots and paging cursors remain
+  immutable across subsequent publications.
 - **Harness**: one `Harness` trait over Claude Code stream-json, Codex app-server JSON-RPC, and
   persistent OMP native RPC. Persistent OMP runs launch under a separate Comet supervisor and
   process group on macOS and Linux. Explicit interrupts send `SIGTERM`, poll the child through the
@@ -284,6 +287,12 @@ Direct ports of comet behaviors (spec: feature-inventory §3):
   write/append journal descriptors; verified takeover accepts configured OMP ancestry or a
   same-user holder orphaned directly under PID 1, while unrelated live holders
   fail closed.
+  Prime Agent and local Devin/Grok/Hermes/Pi reuse the shared ACP transport and
+  persistent turn loop. Startup drains replay without duplicating history; model
+  selection prefers live config options, with legacy `session/set_model` support.
+  Grok completion notifications must match the current session and prompt ID;
+  cancelled/timed-out requests release pending RPC state. New ACP agents never
+  inherit a Crew inference route or gain Scaffold-host capabilities.
 - **Repos/diffs**: git2 or `git` subprocess (subprocess — matches comet, avoids libgit2 edge
   cases); worktrees under `~/.comet-native/worktrees`; fs watchers (`notify`) + 2min repair; diff
   capture (patch + numstat + untracked, 3MiB cap, sha256) → workspace doc summary + DO diff

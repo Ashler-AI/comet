@@ -286,6 +286,17 @@ pub fn default_registry_with_omp_supervisor(
             },
             Box::new(|| Ok(Arc::new(comet_harness::PrimeAgentHarness::new()) as Arc<dyn Harness>)),
         );
+        for factory in [
+            comet_harness::AcpHarness::devin,
+            comet_harness::AcpHarness::grok,
+            comet_harness::AcpHarness::hermes,
+            comet_harness::AcpHarness::pi,
+        ] {
+            registry.register_lazy(
+                describe(&factory()),
+                Box::new(move || Ok(Arc::new(factory()) as Arc<dyn Harness>)),
+            );
+        }
     }
     registry
 }
@@ -336,6 +347,10 @@ mod tests {
                 HarnessId::Codex,
                 HarnessId::Omp,
                 HarnessId::PrimeAgent,
+                HarnessId::Devin,
+                HarnessId::Grok,
+                HarnessId::Hermes,
+                HarnessId::Pi,
             ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_err());

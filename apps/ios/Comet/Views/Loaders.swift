@@ -138,6 +138,8 @@ struct HarnessBadge: View {
         Group {
             if harness == "omp" || harness == "prime-agent" {
                 CrewMark(color: neutral)
+            } else if ["devin", "grok", "hermes", "pi", "opencode"].contains(harness) {
+                Image(systemName: "terminal").resizable().scaledToFit().foregroundStyle(neutral)
             } else {
                 BrandMarkShape(mark: BrandMark.forHarness(harness))
                     .fill(BrandMark.brandTint(for: harness) ?? neutral)

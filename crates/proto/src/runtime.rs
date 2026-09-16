@@ -23,7 +23,14 @@ impl RuntimeProfile {
         match self {
             Self::LocalController => matches!(
                 harness,
-                HarnessId::ClaudeCode | HarnessId::Codex | HarnessId::Omp | HarnessId::PrimeAgent
+                HarnessId::ClaudeCode
+                    | HarnessId::Codex
+                    | HarnessId::Omp
+                    | HarnessId::PrimeAgent
+                    | HarnessId::Devin
+                    | HarnessId::Grok
+                    | HarnessId::Hermes
+                    | HarnessId::Pi
             ),
             Self::ScaffoldHost => harness == HarnessId::Omp,
             Self::Mock => harness == HarnessId::Mock,
@@ -65,8 +72,15 @@ mod tests {
             HarnessId::Codex,
             HarnessId::Omp,
             HarnessId::PrimeAgent,
+            HarnessId::Devin,
+            HarnessId::Grok,
+            HarnessId::Hermes,
+            HarnessId::Pi,
         ] {
             assert!(RuntimeProfile::LocalController.allows_harness(harness));
+            assert!(
+                !RuntimeProfile::ScaffoldHost.allows_harness(harness) || harness == HarnessId::Omp
+            );
         }
         assert!(!RuntimeProfile::LocalController.allows_harness(HarnessId::OpenCode));
         assert!(!RuntimeProfile::LocalController.allows_harness(HarnessId::Mock));

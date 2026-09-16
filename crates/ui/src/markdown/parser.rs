@@ -11,7 +11,7 @@
 //! containing one drops to full reparses. The parity unit tests stream corpora
 //! through both paths and assert equality.
 
-use std::{borrow::Cow, ops::Range};
+use std::{borrow::Cow, ops::Range, sync::Arc};
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag};
 
@@ -101,7 +101,9 @@ pub struct TopBlock {
 /// The parse result: top-level blocks in document order.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct BlockTree {
-    pub blocks: Vec<TopBlock>,
+    // Canonical/display trees and retained transcript frames share immutable
+    // completed blocks; streaming replaces only the reparsed tail.
+    pub blocks: Vec<Arc<TopBlock>>,
 }
 
 impl BlockTree {
@@ -208,17 +210,17 @@ pub fn parse_full(source: &str) -> BlockTree {
         match event {
             Event::Rule => {
                 cur.bump();
-                blocks.push(TopBlock {
+                blocks.push(Arc::new(TopBlock {
                     range,
                     block: Block::Rule,
-                });
+                }));
             }
             Event::Start(_) => {
                 for block in parse_started_block(&mut cur) {
-                    blocks.push(TopBlock {
+                    blocks.push(Arc::new(TopBlock {
                         range: range.clone(),
                         block,
-                    });
+                    }));
                 }
             }
             // Stray inline events at top level (shouldn't happen): skip.
@@ -617,7 +619,7 @@ pub struct IncrementalParser {
     /// has hanging inline markers ([`super::mend`]): `None` means the display
     /// tree is exactly [`Self::tree`]. Never fed back into the incremental
     /// state — the canonical tree stays parity-exact with `parse_full`.
-    display_tail: Option<Vec<TopBlock>>,
+    display_tail: Option<Vec<Arc<TopBlock>>>,
     /// Link-reference definitions act at a distance — full reparses only.
     full_only: bool,
     /// Bytes fed through `parse_full` by the most recent `set_text`/`append`/
@@ -645,7 +647,7 @@ impl IncrementalParser {
     /// The tree to render while streaming: the canonical tree with the last
     /// block swapped for its mended parse when inline markers hang (an
     /// unclosed `**bold`, a half-streamed `[link](url…`). Same shape and cost
-    /// as `tree().clone()` — the stable prefix is copied either way; only a
+    /// as `tree().clone()` — the stable prefix shares its blocks; only a
     /// hanging tail adds one O(tail) reparse, done at append time.
     pub fn display_tree(&self) -> BlockTree {
         let Some(tail) = &self.display_tail else {
@@ -740,8 +742,9 @@ impl IncrementalParser {
         self.tree.blocks.truncate(stable);
         self.stable_prefix_blocks = self.tree.blocks.len();
         for mut top in tail.blocks {
-            top.range.start += boundary;
-            top.range.end += boundary;
+            let block = Arc::make_mut(&mut top);
+            block.range.start += boundary;
+            block.range.end += boundary;
             self.tree.blocks.push(top);
         }
         self.remend();
@@ -775,6 +778,7 @@ impl IncrementalParser {
         self.last_parse_bytes += mended.len();
         let mut tail = parse_full(&mended).blocks;
         for top in &mut tail {
+            let top = Arc::make_mut(top);
             // Display ranges point back into the unmended source; synthetic
             // closers at the end clamp away.
             top.range.start += start;
@@ -796,6 +800,41 @@ fn has_link_defs(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_snapshots_share_stable_blocks_without_mutating_old_frames() {
+        let mut parser = IncrementalParser::new();
+        let source = "first **bold** paragraph\n\nsecond paragraph\n\nlast **open";
+        parser.set_text(source);
+        let canonical = parser.tree().clone();
+        let before = parser.display_tree();
+        let expected_canonical = parse_full(source);
+        let expected_display = parse_full(&format!("{source}**"));
+        assert!(Arc::ptr_eq(&before.blocks[0], &canonical.blocks[0]));
+
+        parser.append(" tail**\n\nnext paragraph");
+        let after = parser.display_tree();
+        assert!(Arc::ptr_eq(&before.blocks[0], &after.blocks[0]));
+        assert_eq!(parser.tree(), &parse_full(parser.source()));
+        assert_eq!(canonical, expected_canonical);
+        // Mended ranges clamp synthetic closing markers to the source length.
+        for (actual, expected) in before.blocks.iter().zip(&expected_display.blocks) {
+            assert_eq!(actual.block, expected.block);
+            assert_eq!(actual.range.start, expected.range.start);
+            assert_eq!(actual.range.end, expected.range.end.min(source.len()));
+        }
+        let frozen: Vec<TopBlock> = before.blocks.iter().map(|b| b.as_ref().clone()).collect();
+        parser.reset("replacement");
+        for (actual, expected) in before.blocks.iter().zip(frozen) {
+            assert_eq!(
+                actual.as_ref(),
+                &expected,
+                "reset cannot alter an old frame"
+            );
+        }
+        assert_eq!(canonical, expected_canonical);
+        assert_eq!(parser.tree(), &parse_full("replacement"));
+    }
 
     fn stream(chunks: usize, text: &str) -> IncrementalParser {
         let mut p = IncrementalParser::new();

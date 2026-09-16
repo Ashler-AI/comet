@@ -110,6 +110,7 @@ pub trait Harness: Send + Sync {
     }
 }
 
+pub mod acp;
 mod approval;
 mod auth_gateway;
 pub mod claude;
@@ -326,6 +327,7 @@ pub(crate) fn crash_message(
     }
 }
 
+pub use acp::AcpHarness;
 pub use claude::ClaudeHarness;
 pub use codex::CodexHarness;
 pub use omp::OmpHarness;
