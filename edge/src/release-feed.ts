@@ -9,7 +9,7 @@ type AccessTokenSource = (env: ReleaseFeedEnv) => Promise<string>;
 const encoder = new TextEncoder();
 const TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
 const STORAGE_SCOPE = "https://www.googleapis.com/auth/devstorage.read_only";
-const LATEST_ALIAS_RE = /^(?:(?:desktop|scaffold)-(?:manifest\.json|SHA256SUMS|latest\.txt)|manifest\.json|SHA256SUMS|install\.sh|latest\.txt)$/;
+const LATEST_ALIAS_RE = /^(?:(?:desktop(?:-staging)?|scaffold)-(?:manifest\.json|SHA256SUMS|latest\.txt)|manifest\.json|SHA256SUMS|install\.sh|latest\.txt)$/;
 
 const base64Url = (bytes: Uint8Array): string => {
   let binary = "";

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
@@ -52,6 +52,10 @@ function reusableCandidate(overrides = {}) {
     desktopManifest: releaseManifest("desktop", [
       `comet-${VERSION}-macos-arm64.dmg`,
       `comet-${VERSION}-macos-arm64-app.tar.gz`,
+    ]),
+    desktopStagingManifest: releaseManifest("desktop-staging", [
+      `comet-staging-${VERSION}-macos-arm64.dmg`,
+      `comet-staging-${VERSION}-macos-arm64-app.tar.gz`,
     ]),
     scaffoldManifest: releaseManifest("scaffold", [
       `comet-${VERSION}-linux-aarch64.tar.gz`,
@@ -160,7 +164,7 @@ function runVersion(script, { checkout, sha }, overrides = {}) {
 
 const digest = (data) => createHash("sha256").update(data).digest("hex");
 
-function candidateArchive(t, { corrupt, archiveCorrupt = false, branch = "release-fixture" } = {}) {
+function candidateArchive(t, { corrupt, missingStaging = false, archiveCorrupt = false, branch = "release-fixture" } = {}) {
   const dir = scratch(t);
   const payload = path.join(dir, "payload");
   for (const name of ["payload", "reused", "scripts", "bin"]) mkdirSync(path.join(dir, name));
@@ -168,11 +172,12 @@ function candidateArchive(t, { corrupt, archiveCorrupt = false, branch = "releas
   const candidate = reusableCandidate();
   candidate.run.head_branch = branch;
   writeFileSync(path.join(dir, "candidate-source-run.json"), JSON.stringify(candidate.run));
-  for (const name of Object.keys(candidate.unifiedManifest.files)) {
+  for (const name of [...Object.keys(candidate.unifiedManifest.files), ...Object.keys(candidate.desktopStagingManifest.files)]) {
     writeFileSync(path.join(payload, name), `release artifact ${name}\n`);
   }
   for (const [manifestName, sumsName, manifest] of [
     ["desktop-manifest.json", "desktop-SHA256SUMS", candidate.desktopManifest],
+    ["desktop-staging-manifest.json", "desktop-staging-SHA256SUMS", candidate.desktopStagingManifest],
     ["scaffold-manifest.json", "scaffold-SHA256SUMS", candidate.scaffoldManifest],
     ["manifest.json", "SHA256SUMS", candidate.unifiedManifest],
   ]) {
@@ -184,6 +189,8 @@ function candidateArchive(t, { corrupt, archiveCorrupt = false, branch = "releas
     writeFileSync(path.join(payload, manifestName), JSON.stringify(manifest));
     writeFileSync(path.join(payload, sumsName), sums);
   }
+  writeFileSync(path.join(payload, "install.sh"), "#!/bin/sh\n");
+  if (missingStaging) rmSync(path.join(payload, "desktop-staging-manifest.json"));
   const archive = path.join(dir, "reused/release-candidate.tar.gz");
   fixtureCommand(dir, "tar", "-czf", archive, "-C", payload, ".");
   const sha = digest(readFileSync(archive));
@@ -306,7 +313,7 @@ describe("executable release gates", () => {
     assert.equal(result.output, "");
   });
 
-  for (const sums of ["desktop-SHA256SUMS", "scaffold-SHA256SUMS", "SHA256SUMS"]) {
+  for (const sums of ["desktop-SHA256SUMS", "desktop-staging-SHA256SUMS", "scaffold-SHA256SUMS", "SHA256SUMS"]) {
     it(`rejects bad ${sums} even with a valid archive digest`, async (t) => {
       const script = shellStep(await read(".github/workflows/release.yml"), "candidate", "reuse");
       const result = runReuse(script, candidateArchive(t, { corrupt: sums }));
@@ -314,6 +321,104 @@ describe("executable release gates", () => {
       assert.equal(result.output, "");
     });
   }
+
+  it("rejects old candidates without a staging manifest", async (t) => {
+    const script = shellStep(await read(".github/workflows/release.yml"), "candidate", "reuse");
+    const result = runReuse(script, candidateArchive(t, { missingStaging: true }));
+    assert.notEqual(result.status, 0);
+    assert.equal(result.output, "");
+  });
+});
+
+function publicationFixture(t) {
+  const fixture = candidateArchive(t);
+  const { dir } = fixture;
+  mkdirSync(path.join(dir, "candidate"));
+  fixtureCommand(dir, "tar", "-xzf", path.join(dir, "reused/release-candidate.tar.gz"), "-C", path.join(dir, "candidate"));
+  copyFileSync(path.join(root, "scripts/guard-scaffold-runtime-release.mjs"), path.join(dir, "scripts/guard-scaffold-runtime-release.mjs"));
+  const bucket = path.join(dir, "bucket");
+  mkdirSync(bucket);
+  // Only the storage boundary is simulated; execute the actual publisher scripts.
+  writeFileSync(path.join(dir, "bin/gcloud"), `#!${process.execPath}
+const fs = require("node:fs");
+const path = require("node:path");
+const [service, action, ...args] = process.argv.slice(2);
+const local = value => value.startsWith("gs://fixture/") ? path.join(process.env.FIXTURE_BUCKET, value.slice("gs://fixture/".length)) : value;
+try {
+  if (service !== "storage") throw new Error("unexpected service");
+  if (action === "cat") process.stdout.write(fs.readFileSync(local(args[0])));
+  else if (action === "cp") {
+    const immutable = args[0] === "--if-generation-match=0";
+    const [source, target] = args.slice(immutable ? 1 : 0).map(local);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(source, target, immutable ? fs.constants.COPYFILE_EXCL : 0);
+  } else throw new Error("unexpected action");
+} catch (error) { console.error(error.message); process.exit(1); }
+`, { mode: 0o755 });
+  const env = {
+    PATH: `${path.join(dir, "bin")}${path.delimiter}${process.env.PATH}`,
+    FIXTURE_BUCKET: bucket, COMET_RELEASES_GCS_BUCKET: "fixture", RUNNER_TEMP: dir,
+    VERSION, RELEASE_SURFACE: "desktop-and-scaffold", PROMOTION_TARGET: "staging",
+    SCAFFOLD_RUNTIME_DEPLOYMENT: "production-deployed",
+  };
+  return { dir, bucket, env };
+}
+
+describe("release channel publication", () => {
+  it("publishes both staging channels but keeps staging files out of production", async (t) => {
+    const workflow = await read(".github/workflows/release.yml");
+    for (const target of ["staging", "production"]) {
+      const { dir, bucket, env } = publicationFixture(t);
+      const result = command(dir, "bash", ["-c", shellStep(workflow, `publish-${target}`, "publish")], env);
+      assert.equal(result.status, 0, result.stderr);
+      const releases = path.join(bucket, "releases");
+      const expected = readdirSync(path.join(dir, "candidate")).filter(name =>
+        target === "staging" || !/^(comet-staging-|desktop-staging-)/.test(name));
+      assert.deepEqual(readdirSync(path.join(releases, VERSION)).sort(), expected.sort());
+      for (const name of expected) {
+        assert.deepEqual(readFileSync(path.join(releases, VERSION, name)), readFileSync(path.join(dir, "candidate", name)));
+        assert.deepEqual(readFileSync(path.join(releases, name)), readFileSync(path.join(dir, "candidate", name)));
+      }
+      assert.equal(readFileSync(path.join(releases, "desktop-latest.txt"), "utf8"), VERSION);
+      assert.equal(existsSync(path.join(releases, "desktop-staging-latest.txt")), target === "staging");
+      if (target === "production") {
+        assert.deepEqual(readdirSync(releases).filter(name => /^(comet-staging-|desktop-staging-)/.test(name)), []);
+      } else {
+        const readback = shellStep(workflow, "publish-staging", "readback");
+        assert.equal(command(dir, "bash", ["-c", readback], env).status, 0);
+        writeFileSync(path.join(releases, "desktop-staging-latest.txt"), "0.0.1");
+        assert.notEqual(command(dir, "bash", ["-c", readback], env).status, 0);
+        writeFileSync(path.join(releases, "desktop-staging-latest.txt"), VERSION);
+        writeFileSync(path.join(releases, "desktop-staging-manifest.json"), "{}");
+        assert.notEqual(command(dir, "bash", ["-c", readback], env).status, 0);
+      }
+    }
+  });
+
+  it("keeps private candidates immutable without moving either desktop channel", async (t) => {
+    const { dir, bucket, env } = publicationFixture(t);
+    const script = shellStep(await read(".github/workflows/release.yml"), "publish-staging", "publish");
+    const result = command(dir, "bash", ["-c", script], { ...env, PROMOTION_TARGET: "staging-candidate" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(readdirSync(path.join(bucket, "releases")), [VERSION]);
+    assert.deepEqual(readdirSync(path.join(bucket, "releases", VERSION)).sort(), readdirSync(path.join(dir, "candidate")).sort());
+  });
+
+  it("does not move either desktop channel when staging would move backwards", async (t) => {
+    const { dir, bucket, env } = publicationFixture(t);
+    const releases = path.join(bucket, "releases");
+    mkdirSync(releases);
+    writeFileSync(path.join(releases, "desktop-latest.txt"), VERSION);
+    writeFileSync(path.join(releases, "desktop-staging-latest.txt"), "9.0.0");
+    // dpkg reports that the proposed version is not newer than the existing one.
+    writeFileSync(path.join(dir, "bin/dpkg"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    const script = shellStep(await read(".github/workflows/release.yml"), "publish-staging", "publish");
+    const result = command(dir, "bash", ["-c", script], env);
+    assert.notEqual(result.status, 0);
+    assert.equal(readFileSync(path.join(releases, "desktop-staging-latest.txt"), "utf8"), "9.0.0");
+    assert.equal(existsSync(path.join(releases, "desktop-manifest.json")), false);
+    assert.equal(existsSync(path.join(releases, "desktop-staging-manifest.json")), false);
+  });
 });
 
 describe("Crew edge deployment", () => {
@@ -406,6 +511,22 @@ describe("release candidate reuse validation", () => {
       commit: RUN_SHA,
       workflowRun: RUN_URL,
     });
+  });
+
+  it("requires staging artifacts from the same source, version, and runtime", () => {
+    const missing = reusableCandidate({ desktopStagingManifest: undefined });
+    assert.throws(() => validateReleaseCandidateReuse(missing), /desktop staging manifest/);
+    for (const mutate of [
+      (staging, candidate) => { staging.files = candidate.desktopManifest.files; },
+      (staging) => { staging.source.commit = "c".repeat(40); },
+      (staging) => { staging.version = "9.0.0"; },
+      (staging) => { staging.scaffoldRuntimeVersion = "scaffold.comet-runtime.v2"; },
+      (staging) => { staging.releaseSurface = "desktop"; },
+    ]) {
+      const candidate = reusableCandidate();
+      mutate(candidate.desktopStagingManifest, candidate);
+      assert.throws(() => validateReleaseCandidateReuse(candidate), /desktop staging manifest/);
+    }
   });
 
   it("accepts a candidate branch commit only after main contains it", () => {

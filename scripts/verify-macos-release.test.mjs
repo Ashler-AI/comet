@@ -16,7 +16,11 @@ function run(command, args, cwd) {
   return result;
 }
 
-test("valid release checksums cannot authorize an ad-hoc signed update", { skip: process.platform !== "darwin" }, () => {
+for (const [bundleId, rejection] of [
+  ["ai.ashler.comet", /codesign|requirement|Requirement|signature/],
+  ["ai.ashler.comet.staging", /bundle identifier mismatch/],
+]) {
+test(`valid release checksums cannot authorize an untrusted ${bundleId} update`, { skip: process.platform !== "darwin" }, () => {
   const temp = mkdtempSync(path.join(tmpdir(), "crew-candidate-trust-"));
   try {
     const app = path.join(temp, "Crew.app");
@@ -25,7 +29,7 @@ test("valid release checksums cannot authorize an ad-hoc signed update", { skip:
     copyFileSync("/usr/bin/true", path.join(macos, "comet"));
     writeFileSync(path.join(app, "Contents", "Info.plist"), `<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict>
-<key>CFBundleIdentifier</key><string>ai.ashler.comet</string>
+<key>CFBundleIdentifier</key><string>${bundleId}</string>
 <key>CFBundleExecutable</key><string>comet</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleVersion</key><string>1.2.3</string>
@@ -48,8 +52,9 @@ test("valid release checksums cannot authorize an ad-hoc signed update", { skip:
     assert.ifError(result.error);
     assert.notEqual(result.status, null);
     assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /codesign|requirement|Requirement|signature/);
+    assert.match(result.stderr, rejection);
   } finally {
     rmSync(temp, { recursive: true, force: true });
   }
 });
+}

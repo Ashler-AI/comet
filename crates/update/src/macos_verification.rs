@@ -5,7 +5,13 @@ use std::process::{Command, Output};
 
 use anyhow::{Context as _, bail};
 
-const BUNDLE_ID: &str = "ai.ashler.comet";
+fn bundle_id() -> &'static str {
+    if super::staging_mac_app() {
+        "ai.ashler.comet.staging"
+    } else {
+        "ai.ashler.comet"
+    }
+}
 
 pub(super) fn expected_team() -> anyhow::Result<&'static str> {
     validate_team(option_env!("COMET_MACOS_SIGNING_TEAM_ID"))
@@ -33,8 +39,9 @@ impl Policy {
 
     fn for_team(team: &str) -> anyhow::Result<Self> {
         let team = validate_team(Some(team))?;
+        let bundle_id = bundle_id();
         let requirement = format!(
-            "identifier \"{BUNDLE_ID}\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"{team}\""
+            "identifier \"{bundle_id}\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"{team}\""
         );
         let compiled_requirement = compile_requirement(&requirement)?;
         Ok(Self {
@@ -102,7 +109,7 @@ impl Policy {
         {
             return Err(identity_error).context("installed Crew bundle has an untrusted identity");
         }
-        verify_signature(bundle, &format!("identifier \"{BUNDLE_ID}\""))?;
+        verify_signature(bundle, &format!("identifier \"{}\"", bundle_id()))?;
         let executable =
             std::env::current_exe().context("locating the running Crew distribution")?;
         let super::InstallKind::MacApp { bundle: running } =
@@ -140,10 +147,11 @@ fn verify_bundle_shape(bundle: &Path) -> anyhow::Result<()> {
     // Crew actually launches, not a different plist-selected main executable.
     if !String::from_utf8_lossy(&identity.stdout)
         .lines()
-        .eq([BUNDLE_ID, "comet"])
+        .eq([bundle_id(), "comet"])
     {
         bail!(
-            "Crew update bundle must have CFBundleIdentifier {BUNDLE_ID} and CFBundleExecutable comet"
+            "Crew update bundle must have CFBundleIdentifier {} and CFBundleExecutable comet",
+            bundle_id()
         );
     }
     Ok(())
@@ -205,13 +213,13 @@ mod tests {
     #[test]
     fn intact_adhoc_bundle_cannot_be_a_distribution_or_authorize_migration() {
         let tmp = tempfile::tempdir().unwrap();
-        let bundle = tmp.path().join("Crew.app");
+        let bundle = tmp.path().join(super::super::mac_app_name());
         let binary = bundle.join("Contents/MacOS/comet");
         std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
         std::fs::copy("/usr/bin/true", &binary).unwrap();
         std::fs::write(
             bundle.join("Contents/Info.plist"),
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>CFBundleIdentifier</key><string>ai.ashler.comet</string><key>CFBundleExecutable</key><string>comet</string><key>CFBundlePackageType</key><string>APPL</string></dict></plist>",
+            format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>CFBundleIdentifier</key><string>{}</string><key>CFBundleExecutable</key><string>comet</string><key>CFBundlePackageType</key><string>APPL</string></dict></plist>", bundle_id()),
         )
         .unwrap();
         let resource = bundle.join("Contents/Resources/sealed.txt");
@@ -219,18 +227,19 @@ mod tests {
         std::fs::write(&resource, b"original").unwrap();
         checked(
             Command::new("/usr/bin/codesign")
-                .args(["--force", "--sign", "-", "--identifier", BUNDLE_ID])
+                .args(["--force", "--sign", "-", "--identifier", bundle_id()])
                 .arg(&bundle),
         )
         .unwrap();
-        verify_signature(&bundle, "identifier \"ai.ashler.comet\"").unwrap();
+        let identity_requirement = format!("identifier \"{}\"", bundle_id());
+        verify_signature(&bundle, &identity_requirement).unwrap();
         let policy = Policy::for_team("ABCDE12345").unwrap();
         assert!(policy.verify_distribution(&bundle).is_err());
         assert!(policy.verify_installed(&bundle).is_err());
         // An intact legacy ad-hoc app is not enough to authorize migration;
         // tampering must also fail integrity verification, even before trust.
         std::fs::write(&resource, b"tampered").unwrap();
-        assert!(verify_signature(&bundle, "identifier \"ai.ashler.comet\"").is_err());
+        assert!(verify_signature(&bundle, &identity_requirement).is_err());
         assert!(policy.verify_installed(&bundle).is_err());
         assert_eq!(std::fs::read(&resource).unwrap(), b"tampered");
     }
