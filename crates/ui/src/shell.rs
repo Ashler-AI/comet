@@ -33,7 +33,9 @@ use crate::loaders;
 use crate::motion::{self, AnimationExt as _, COMET_PULSE, MotionSpec, RESIZE, SPLASH_OUT};
 use crate::popover::{self};
 use crate::rail;
-use crate::settings::accounts::{AccountsPage, format_reset, usage_color, usage_level};
+use crate::settings::accounts::{
+    AccountsEvent, AccountsPage, format_reset, usage_color, usage_level,
+};
 use crate::settings::advisor::AdvisorPage;
 use crate::settings::appearance::AppearancePage;
 use crate::settings::archived::ArchivedPage;
@@ -1511,6 +1513,7 @@ pub struct Shell {
     appearance_page: Option<Entity<AppearancePage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
+    accounts_sub: Option<Subscription>,
     shortcuts_sub: Option<Subscription>,
     /// Session-row context menu: (chat id, window position).
     chat_menu: Option<(String, Point<Pixels>)>,
@@ -1558,7 +1561,6 @@ pub struct Shell {
     account_usage: Option<comet_proto::AgentAccountsSnapshot>,
     account_usage_error: Option<SharedString>,
     account_usage_loading: bool,
-    account_usage_loaded_at: Option<Instant>,
     account_usage_task: Option<Task<()>>,
     active_account_chat_id: Option<String>,
     active_account_id: Option<String>,
@@ -1765,6 +1767,7 @@ impl Shell {
             appearance_page: None,
             shortcuts_page: None,
             accounts_page: None,
+            accounts_sub: None,
             advisor_page: None,
             shortcuts_sub: None,
             chat_menu: None,
@@ -1792,7 +1795,6 @@ impl Shell {
             account_usage: None,
             account_usage_error: None,
             account_usage_loading: false,
-            account_usage_loaded_at: None,
             account_usage_task: None,
             active_account_chat_id: None,
             active_account_id: None,
@@ -1923,7 +1925,10 @@ impl Shell {
     }
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
-        if self.account_usage_loaded_at.is_none() && !self.account_usage_loading {
+        if self.account_usage.is_none()
+            && self.account_usage_error.is_none()
+            && !self.account_usage_loading
+        {
             self.refresh_account_usage(cx);
         }
         self.refresh_active_agent_account(cx);
@@ -2158,7 +2163,6 @@ impl Shell {
                 .await;
             this.update(cx, |shell, cx| {
                 shell.account_usage_loading = false;
-                shell.account_usage_loaded_at = Some(Instant::now());
                 match result {
                     Ok(value) => {
                         match serde_json::from_value::<comet_proto::AgentAccountsSnapshot>(value) {
@@ -3325,7 +3329,17 @@ impl Shell {
             SettingsSection::Agents => {
                 if self.accounts_page.is_none() {
                     let state = self.state.clone();
-                    self.accounts_page = Some(cx.new(|cx| AccountsPage::new(state, cx)));
+                    let page = cx.new(|cx| AccountsPage::new(state, cx));
+                    self.accounts_sub = Some(cx.subscribe(
+                        &page,
+                        |this: &mut Shell, _, event: &AccountsEvent, cx| {
+                            let AccountsEvent::Updated(snapshot) = event;
+                            this.account_usage = Some(snapshot.clone());
+                            this.account_usage_error = None;
+                            cx.notify();
+                        },
+                    ));
+                    self.accounts_page = Some(page);
                 }
                 match &self.accounts_page {
                     Some(page) => page.clone().into_any_element(),
