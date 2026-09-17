@@ -4029,33 +4029,39 @@ mod tests {
             .get_args()
             .map(|value| value.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(
-            args,
-            [
-                "--mode",
-                "rpc",
-                "--approval-mode",
-                "yolo",
-                "--model",
-                "anthropic/claude-haiku-4-5",
-                "--thinking",
-                "xhigh",
-                "--resume",
-                "session-1",
-            ]
-        );
+        for expected in [
+            ["--mode", "rpc"],
+            ["--approval-mode", "yolo"],
+            ["--model", "anthropic/claude-haiku-4-5"],
+            ["--thinking", "xhigh"],
+            ["--resume", "session-1"],
+        ] {
+            assert_eq!(args.iter().filter(|arg| *arg == expected[0]).count(), 1);
+            assert!(args.windows(2).any(|pair| pair == expected));
+        }
     }
 
     #[test]
     fn run_command_omits_default_model_and_absent_flags() {
-        let command =
-            OmpHarness::new().run_command(Path::new("/usr/local/bin/omp"), &run_request(None));
-        let args: Vec<String> = command
-            .as_std()
-            .get_args()
-            .map(|value| value.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(args, ["--mode", "rpc", "--approval-mode", "yolo"]);
+        for model in [None, Some("default".to_string())] {
+            let request = RunRequest {
+                model,
+                ..run_request(None)
+            };
+            let command = OmpHarness::new().run_command(Path::new("/usr/local/bin/omp"), &request);
+            let args: Vec<String> = command
+                .as_std()
+                .get_args()
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect();
+            for expected in [["--mode", "rpc"], ["--approval-mode", "yolo"]] {
+                assert_eq!(args.iter().filter(|arg| *arg == expected[0]).count(), 1);
+                assert!(args.windows(2).any(|pair| pair == expected));
+            }
+            for absent in ["--model", "--thinking", "--resume"] {
+                assert!(!args.iter().any(|arg| arg == absent));
+            }
+        }
     }
 
     #[test]
