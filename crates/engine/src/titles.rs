@@ -536,7 +536,6 @@ fn project(bytes: &[u8]) -> Result<Projection, EngineError> {
     let mut turn = String::new();
     let mut completed = None;
     let mut completed_assistant_turns = 0;
-    let mut completed_is_first = false;
     for index in 0..doc.directory_entry_count() {
         let Some(entry) = doc.directory_entry(index)? else {
             continue;
@@ -599,14 +598,13 @@ fn project(bytes: &[u8]) -> Result<Projection, EngineError> {
                 .is_none_or(|marker| marker == entry.id)
         {
             completed = Some(entry.id);
-            completed_is_first = completed_assistant_turns == 1;
             recent.clone_from(&turn);
         }
     }
     Ok(Projection {
         source_version: version(&doc)?,
         completed,
-        completed_is_first,
+        completed_is_first: completed_assistant_turns == 1,
         input: format!(
             "Initial request:\n{initial}\nRecent completed response and tools:\n{recent}"
         ),
@@ -748,6 +746,37 @@ mod tests {
             "https://team.slack.com/archives/C123/p1234567890123456?thread_ts=1234567890.123456".to_string(),
             "https://www.notion.so/abc-12345678901234567890123456789012".to_string(),
         ]));
+    }
+
+    #[test]
+    fn projection_counts_completions_after_the_marked_entry() {
+        let doc = SessionDoc::init("10000000-0000-4000-8000-000000000001").unwrap();
+        let entry = |id: &str| comet_doc::SessionMessageEntry {
+            id: id.into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Text {
+                id: "text".into(),
+                text: "Investigation completed".into(),
+            }],
+            created_at: 1,
+            device_id: "device-a".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+            peer_message: None,
+        };
+        doc.push_message(&entry("assistant-1")).unwrap();
+        doc.doc()
+            .get_map("meta")
+            .insert("directoryCompletedTurn", "assistant-1")
+            .unwrap();
+        let first = project(&doc.export_snapshot().unwrap()).unwrap();
+        assert_eq!(first.completed.as_deref(), Some("assistant-1"));
+        assert!(first.completed_is_first);
+
+        doc.push_message(&entry("assistant-2")).unwrap();
+        let later = project(&doc.export_snapshot().unwrap()).unwrap();
+        assert_eq!(later.completed.as_deref(), Some("assistant-1"));
+        assert!(!later.completed_is_first);
     }
 
     #[tokio::test]
