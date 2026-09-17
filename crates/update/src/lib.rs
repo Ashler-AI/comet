@@ -1152,8 +1152,8 @@ impl Updater {
     }
 
     /// Run `id`'s own self-updater and fold its refreshed row into the current
-    /// status frame. The child inherits this process's env, so a configured
-    /// `GITHUB_TOKEN` reaches `omp update`'s release-metadata requests.
+    /// status frame. The resolved executable's directory is prepended to PATH
+    /// because some updaters locate their installed binary by name.
     pub async fn update_harness(&self, id: &str) -> anyhow::Result<HarnessStatus> {
         let spec = self
             .harnesses
@@ -1162,16 +1162,11 @@ impl Updater {
             .with_context(|| format!("unknown harness '{id}'"))?;
         let exe = (spec.resolve)()
             .with_context(|| format!("{} is not installed on this device", spec.name))?;
-        let output = tokio::time::timeout(
-            SELF_UPDATE_TIMEOUT,
-            tokio::process::Command::new(&exe)
-                .args(spec.self_update_args)
-                .stdin(std::process::Stdio::null())
-                .output(),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("{} self-update timed out", spec.name))?
-        .with_context(|| format!("spawning {}", exe.display()))?;
+        let mut command = harness_update_command(&exe, spec.self_update_args);
+        let output = tokio::time::timeout(SELF_UPDATE_TIMEOUT, command.output())
+            .await
+            .map_err(|_| anyhow::anyhow!("{} self-update timed out", spec.name))?
+            .with_context(|| format!("spawning {}", exe.display()))?;
         if !output.status.success() {
             bail!(
                 "{} self-update failed ({}): {}",
@@ -1231,6 +1226,20 @@ fn now_ms() -> i64 {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
+fn harness_update_command(exe: &Path, args: &[&str]) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(exe);
+    command.args(args).stdin(std::process::Stdio::null());
+    if let Some(dir) = exe.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        let mut paths = vec![dir.to_path_buf()];
+        if let Some(path) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&path));
+        }
+        if let Ok(path) = std::env::join_paths(paths) {
+            command.env("PATH", path);
+        }
+    }
+    command
+}
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -1249,6 +1258,24 @@ fn output_tail(output: &std::process::Output) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn harness_updater_can_find_itself_by_name() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let exe = temp.path().join("crew-path-test-updater");
+        std::fs::write(
+            &exe,
+            "#!/bin/sh\ncommand -v crew-path-test-updater >/dev/null\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let output = harness_update_command(&exe, &[]).output().await.unwrap();
+
+        assert!(output.status.success());
+    }
 
     #[test]
     fn version_compare() {
