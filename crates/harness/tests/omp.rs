@@ -29,10 +29,8 @@ fn run_config_path(session_log: &str) -> PathBuf {
         .lines()
         .next()
         .and_then(|line| line.strip_prefix("config:"))
-        .expect("fixture config environment");
-    std::env::split_paths(value)
-        .last()
-        .expect("Comet retry overlay path")
+        .expect("fixture config argument");
+    PathBuf::from(value)
 }
 
 fn write_omp_session(session_dir: &std::path::Path, session_id: &str) -> PathBuf {
@@ -305,12 +303,15 @@ async fn fake_omp_proves_rpc_mode_execution_and_event_mapping() {
             "spawned forbidden harness: {argv}"
         );
     }
-    assert!(
-        !argv.lines().any(|argument| argument == "--config"),
-        "Comet should use the process-only PI_CONFIG_FILES interface: {argv}"
-    );
     let session_log = std::fs::read_to_string(session_log).unwrap();
     let run_config = run_config_path(&session_log);
+    assert!(
+        argv.lines()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|args| { args == ["--config", run_config.to_str().unwrap()] }),
+        "Crew must pass its overlay as a config argument: {argv}"
+    );
     assert!(
         run_config.is_absolute(),
         "overlay path must be absolute: {session_log}"
@@ -975,11 +976,14 @@ async fn persistent_run_steers_the_live_turn() {
         "one RPC session must serve the whole run without mutating OMP settings"
     );
     let argv = std::fs::read_to_string(argv_log).unwrap();
-    assert!(
-        !argv.lines().any(|argument| argument == "--config"),
-        "persistent runs should use PI_CONFIG_FILES: {argv}"
-    );
     let run_config = run_config_path(&session_log);
+    assert!(
+        argv.lines()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|args| { args == ["--config", run_config.to_str().unwrap()] }),
+        "persistent runs must pass their overlay as a config argument: {argv}"
+    );
     assert!(
         !run_config.exists(),
         "persistent run overlay must be removed after OMP exits: {}",

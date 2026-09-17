@@ -359,27 +359,26 @@ impl OmpRunConfig {
         Ok(Self { path })
     }
 
-    fn apply(&self, command: &mut Command) -> Result<(), HarnessError> {
-        let value =
-            config_overlay_paths(std::env::var_os(PI_CONFIG_FILES_ENV).as_deref(), &self.path)?;
-        command.env(PI_CONFIG_FILES_ENV, value);
-        Ok(())
+    fn apply(&self, command: &mut Command, inherited: Option<&std::ffi::OsStr>) {
+        // Keep run-owned paths out of descendants that can outlive this overlay.
+        // OMP supports repeatable --config at our pinned 17.2.9 floor.
+        command.env_remove(PI_CONFIG_FILES_ENV);
+        for path in config_overlay_paths(inherited, &self.path) {
+            command.arg("--config").arg(path);
+        }
     }
 }
 
-fn config_overlay_paths(
-    inherited: Option<&std::ffi::OsStr>,
-    run_config: &Path,
-) -> Result<OsString, HarnessError> {
+fn config_overlay_paths(inherited: Option<&std::ffi::OsStr>, run_config: &Path) -> Vec<PathBuf> {
     let mut paths = inherited
-        .map(|value| std::env::split_paths(value).collect::<Vec<_>>())
+        .map(|value| {
+            std::env::split_paths(value)
+                .filter(|path| path.is_file())
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     paths.push(run_config.to_path_buf());
-    std::env::join_paths(paths).map_err(|error| {
-        HarnessError::Protocol(format!(
-            "Could not construct OMP config overlay path: {error}"
-        ))
-    })
+    paths
 }
 
 impl Drop for OmpRunConfig {
@@ -2395,7 +2394,10 @@ impl Harness for OmpHarness {
         let mut command = self.run_command(&executable, &request);
         request.resume = canonical_resume;
         let run_config = OmpRunConfig::create()?;
-        run_config.apply(&mut command)?;
+        run_config.apply(
+            &mut command,
+            std::env::var_os(PI_CONFIG_FILES_ENV).as_deref(),
+        );
         crate::apply_run_context(&mut command, controls.context.as_ref());
         if let Some(inference) = controls
             .context
@@ -3880,20 +3882,37 @@ mod tests {
         );
     }
 
-    #[test]
-    fn run_config_preserves_inherited_overlays_and_wins_last() {
-        let inherited =
-            std::env::join_paths([Path::new("/tmp/user-a.yml"), Path::new("/tmp/user-b.yml")])
-                .unwrap();
-        let combined =
-            config_overlay_paths(Some(&inherited), Path::new("/tmp/comet-retry.yml")).unwrap();
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_config_preserves_existing_overlays_and_scrubs_inherited_environment() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_a = temp.path().join("user a.yml");
+        let user_b = temp.path().join("user-b.yml");
+        let stale = temp.path().join("missing.yml");
+        std::fs::write(&user_a, "").unwrap();
+        std::fs::write(&user_b, "").unwrap();
+        let inherited = std::env::join_paths([&user_a, &stale, &user_b]).unwrap();
+        let config = OmpRunConfig::create().unwrap();
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("test \"${PI_CONFIG_FILES+x}\" != x || exit 1; printf '%s\\n' \"$@\"")
+            .arg("overlay-probe")
+            .env(PI_CONFIG_FILES_ENV, &inherited);
+        config.apply(&mut command, Some(&inherited));
+        let output = command.output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "overlay environment leaked to child"
+        );
         assert_eq!(
-            std::env::split_paths(&combined).collect::<Vec<_>>(),
-            [
-                PathBuf::from("/tmp/user-a.yml"),
-                PathBuf::from("/tmp/user-b.yml"),
-                PathBuf::from("/tmp/comet-retry.yml"),
-            ]
+            String::from_utf8(output.stdout).unwrap(),
+            format!(
+                "--config\n{}\n--config\n{}\n--config\n{}\n",
+                user_a.display(),
+                user_b.display(),
+                config.path.display()
+            )
         );
     }
 
