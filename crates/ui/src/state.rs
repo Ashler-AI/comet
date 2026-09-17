@@ -1198,6 +1198,7 @@ pub struct AppState {
     /// Installed-app invitation awaiting the exact session/grant projection.
     pending_invitation: Option<comet_proto::CometInvitation>,
     pending_scaffold_link: Option<comet_proto::ScaffoldSessionLink>,
+    pending_directory_link: Option<comet_proto::CrewSessionLink>,
     /// Grant named by the accepted deep link. It remains a routing identity;
     /// command authority is still checked against the verified projection.
     pub selected_invitation_grant: Option<String>,
@@ -1320,6 +1321,7 @@ impl AppState {
             selected_agent_session: None,
             pending_invitation: None,
             pending_scaffold_link: None,
+            pending_directory_link: None,
             selected_invitation_grant: None,
             pending_session_pin: None,
             room_projections: HashMap::new(),
@@ -2171,12 +2173,55 @@ impl AppState {
         } else {
             "comet"
         };
+        if let Some(link) = comet_proto::CrewSessionLink::parse_deep_link(url, scheme) {
+            self.pending_directory_link = Some(link);
+            self.drain_directory_link(cx);
+            return;
+        }
         if let Some(link) = comet_proto::ScaffoldSessionLink::parse_deep_link(url, scheme) {
             self.pending_scaffold_link = Some(link);
             self.drain_scaffold_link(cx);
         } else if let Some(invitation) = comet_proto::CometInvitation::parse_deep_link(url) {
             self.open_invitation(invitation, cx);
         }
+    }
+
+    fn drain_directory_link(&mut self, cx: &mut Context<Self>) {
+        let Some(AuthState::SignedIn { project_scope, .. }) = self.auth.as_ref() else {
+            return;
+        };
+        let Some(link) = self.pending_directory_link.take() else {
+            return;
+        };
+        if project_scope != &link.project_id {
+            self.scaffold_session_error = Some("Open this session in Crew for its project".into());
+            cx.notify();
+            return;
+        }
+        if self.engine().is_none() {
+            self.pending_directory_link = Some(link);
+            return;
+        }
+        if let Some(deployment_id) = link.deployment_id {
+            let projection = SessionRoomProjection {
+                project_id: link.project_id,
+                deployment_id,
+                session_id: link.session_id.clone(),
+            };
+            if self.room_projections.get(&link.session_id) != Some(&projection) {
+                if self.selected_chat.as_deref() == Some(link.session_id.as_str()) {
+                    self.select_chat(None, cx);
+                }
+                self.room_projections.insert(link.session_id.clone(), projection);
+            }
+        }
+        // A directory link grants no access. Membership and selection use the
+        // same authenticated room path as an explicit session-id import.
+        self.pending_invitation = None;
+        self.selected_invitation_grant = None;
+        self.pending_session_pin = Some(link.session_id.clone());
+        self.drain_session_pin(cx);
+        self.select_chat(Some(link.session_id), cx);
     }
 
     fn drain_scaffold_link(&mut self, cx: &mut Context<Self>) {
@@ -2531,6 +2576,7 @@ impl AppState {
         self.connection = ConnectionStatus::Ready;
         self.engine = Some(handle.clone());
         self.drain_scaffold_link(cx);
+        self.drain_directory_link(cx);
         self.watch_tasks = vec![
             spawn_watch(
                 cx,
@@ -3581,6 +3627,7 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
                 apply(state, parsed);
                 if method == methods::AUTH_STATUS {
                     state.drain_scaffold_link(cx);
+                    state.drain_directory_link(cx);
                 }
                 cx.notify();
             });
@@ -5892,6 +5939,31 @@ mod tests {
         assert_eq!(state.transcript_tail_start, 3);
         assert_eq!(state.transcript_tail_before, Some(3));
         assert!(!state.transcript_restored_from_cache);
+    }
+
+    #[gpui::test]
+    fn directory_link_waits_for_sign_in_and_rejects_foreign_project(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            state.selected_chat = Some("existing-chat".into());
+            state.pending_directory_link = Some(comet_proto::CrewSessionLink {
+                project_id: "other-project".into(),
+                session_id: "011664b5-3660-4fe6-83a2-3647fa6a2f65".into(),
+                deployment_id: Some("deployment".into()),
+            });
+            state.auth = Some(AuthState::SignedOut);
+            state.drain_directory_link(cx);
+            assert!(state.pending_directory_link.is_some());
+            state.auth = Some(AuthState::SignedIn {
+                user: UserProfile { id: "u".into(), email: "u@example.com".into(), name: None },
+                project_scope: "my-project".into(),
+            });
+            state.drain_directory_link(cx);
+            assert!(state.pending_directory_link.is_none());
+            assert!(state.pending_session_pin.is_none());
+            assert!(state.room_projections.is_empty());
+            assert_eq!(state.selected_chat.as_deref(), Some("existing-chat"));
+        });
     }
 
     #[test]

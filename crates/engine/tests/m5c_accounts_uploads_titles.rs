@@ -1,4 +1,4 @@
-//! M5c integration: uploads, deterministic local chat titling, and RPC
+//! M5c integration: uploads, one-shot branch naming, and RPC
 //! dispatch over the memory transport.
 
 use std::path::{Path, PathBuf};
@@ -206,7 +206,7 @@ async fn uploads_chunk_commit_readback_and_jail() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn titling_e2e_names_chat_and_renames_worktree_branch() {
+async fn initial_branch_is_named_once_and_harness_cannot_replace_manual_title() {
     let tmp = tempfile::tempdir().expect("tempdir");
     // Worktree root must be inside the tempdir (EngineCore reads the env-less
     // default otherwise) — create the worktree with a dedicated Repos handle.
@@ -273,22 +273,19 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         .await
         .expect("dispatch");
 
-    // The first prompt supplies Comet's immediate provisional title and branch.
-    // A later ACP session-info update replaces only that provisional chat title.
-    let chat = wait_for("harness chat title", || {
+    // Background title generation is independent of the harness. The initial
+    // prompt still names the branch once, without adopting harness title events.
+    let chat = wait_for("initial branch name", || {
         core.workspace
             .doc()
             .chat(chat_id)
             .ok()
             .flatten()
-            .filter(|c| {
-                c.title.as_deref() == Some("OMP Generated Name")
-                    && c.branch.as_deref() == Some("comet/please-fix-the-login-flow")
-            })
+            .filter(|c| c.branch.as_deref() == Some("comet/please-fix-the-login-flow"))
     })
     .await;
-    assert_eq!(chat.title.as_deref(), Some("OMP Generated Name"));
-    // Branch renamed from the title, chat row updated to match.
+    assert_eq!(chat.title, None);
+    // The chat row and worktree agree on the initial branch.
     assert_eq!(
         chat.branch.as_deref(),
         Some("comet/please-fix-the-login-flow")
@@ -304,7 +301,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         "comet/please-fix-the-login-flow"
     );
 
-    // A titled chat is never re-titled: rename, run again, title sticks.
+    // Later turns preserve both the manual title and the first branch name.
     core.workspace
         .rename_chat(chat_id, "My Custom Name")
         .expect("rename");
@@ -321,7 +318,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         resume: None,
     };
     core.sessions
-        .dispatch(chat_id, HarnessId::Mock, request, None)
+        .dispatch(chat_id, HarnessId::Mock, request.clone(), None)
         .await
         .expect("second dispatch");
     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -332,6 +329,39 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         .expect("chat")
         .expect("row");
     assert_eq!(chat.title.as_deref(), Some("My Custom Name"));
+    assert_eq!(
+        chat.branch.as_deref(),
+        Some("comet/please-fix-the-login-flow")
+    );
+    // An existing transcript without the new once marker models an upgraded
+    // session: its first post-upgrade run must not rename the established branch.
+    let legacy_id = "chat-before-directory-upgrade";
+    core.workspace
+        .create_chat(legacy_id, "space-title", None, Some(worktree.path.clone()))
+        .unwrap();
+    core.workspace
+        .set_chat_branch(legacy_id, "comet/please-fix-the-login-flow")
+        .unwrap();
+    core.doc_host
+        .open(legacy_id)
+        .unwrap()
+        .write_user_message("historical-user", "old request", 1)
+        .unwrap();
+    core.sessions
+        .dispatch(legacy_id, HarnessId::Mock, request, None)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        core.workspace
+            .doc()
+            .chat(legacy_id)
+            .unwrap()
+            .unwrap()
+            .branch
+            .as_deref(),
+        Some("comet/please-fix-the-login-flow")
+    );
     core.shutdown().await;
 }
 

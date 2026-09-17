@@ -70,6 +70,8 @@ final class AppModel {
     /// pinned and routed the moment `phase` reaches `.ready`.
     private var pendingInviteChatId: String?
     private var pendingScaffoldLink: (scope: CollaborationScope, sandboxId: String)?
+    private var pendingDirectoryLink: (projectId: String, sessionId: String, deploymentId: String?)?
+    private var directoryRoomProjections: [String: SessionRoomProjection] = [:]
     var openSessionError: String?
     /// Screenshot rig: "newsession" / "newspace" presents that sheet on arrival.
     var launchSheet: String?
@@ -264,6 +266,7 @@ final class AppModel {
             }
             self.preloadSessionMetadata()
             self.drainPendingScaffoldLink()
+            self.drainPendingDirectoryLink()
         }
         workspace = store
         store.start()
@@ -334,6 +337,11 @@ final class AppModel {
     /// segments route engine authority; this viewport only needs the chat id
     /// to pin membership and open the session.
     func openInvitation(url: URL) {
+        if let link = Self.directoryLink(url) {
+            pendingDirectoryLink = link
+            drainPendingDirectoryLink()
+            return
+        }
         if let segments = Self.linkSegments(url, route: "scaffold", count: 4) {
             pendingScaffoldLink = (CollaborationScope(projectId: segments[0], deploymentId: segments[1],
                                                        sessionId: segments[2]), segments[3])
@@ -342,6 +350,24 @@ final class AppModel {
         }
         guard let chatId = Self.invitationChatId(url) else { return }
         pendingInviteChatId = chatId
+        drainPendingInvite()
+    }
+
+    private func drainPendingDirectoryLink() {
+        guard phase == .ready, let workspace, workspace.connected,
+              let config, let link = pendingDirectoryLink else { return }
+        pendingDirectoryLink = nil
+        guard config.projectScope == link.projectId else {
+            openSessionError = "Open this session in Crew for its project"
+            return
+        }
+        if let deploymentId = link.deploymentId {
+            directoryRoomProjections[link.sessionId] = SessionRoomProjection(
+                projectId: link.projectId, deploymentId: deploymentId, sessionId: link.sessionId)
+        }
+        // This is a membership pointer, never a session grant. Room access
+        // continues through the signed-in workspace's authenticated transport.
+        pendingInviteChatId = link.sessionId
         drainPendingInvite()
     }
 
@@ -395,6 +421,29 @@ final class AppModel {
         }
         guard valid else { return nil }
         return segments.map(String.init)
+    }
+
+    static func directoryLink(_ url: URL) -> (projectId: String, sessionId: String, deploymentId: String?)? {
+        guard let parts = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              parts.scheme == ReleaseConfig.inviteScheme, parts.host == "session",
+              parts.user == nil, parts.password == nil, parts.port == nil, parts.fragment == nil else { return nil }
+        let segments = parts.percentEncodedPath.split(separator: "/", omittingEmptySubsequences: false)
+        guard segments.count == 3, segments[0].isEmpty,
+              let projectId = String(segments[1]).removingPercentEncoding,
+              validDirectoryIdentifier(projectId),
+              let sessionId = UUID(uuidString: String(segments[2])) else { return nil }
+        var deploymentId: String?
+        if let query = parts.percentEncodedQuery {
+            guard query.hasPrefix("deploymentId="), !query.contains("&"), !query.contains("?"),
+                  let value = String(query.dropFirst("deploymentId=".count)).removingPercentEncoding,
+                  validDirectoryIdentifier(value) else { return nil }
+            deploymentId = value
+        }
+        return (projectId, sessionId.uuidString.lowercased(), deploymentId)
+    }
+
+    private static func validDirectoryIdentifier(_ value: String) -> Bool {
+        !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && value.utf8.count <= 256 && !value.contains("\0")
     }
 
 
@@ -832,6 +881,9 @@ final class AppModel {
             return store
         }
         guard let config else { return nil }
+        let directoryProjection = directoryRoomProjections[chatId]
+        let deploymentId = deploymentId ?? (directoryProjection?.projectId == config.projectScope
+            ? directoryProjection?.deploymentId : nil)
         let store: SessionStore
         if let existing = sessionStores[chatId] {
             store = existing

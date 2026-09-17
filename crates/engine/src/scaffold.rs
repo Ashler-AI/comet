@@ -291,6 +291,54 @@ impl ScaffoldClient {
         &self.project_scope
     }
 
+    pub async fn search_crew_sessions(&self, input: &Value) -> Result<Value, ScaffoldError> {
+        self.crew_directory_request("search", input).await
+    }
+
+    pub async fn get_crew_session(&self, session_id: &str, deployment_id: Option<&str>) -> Result<Value, ScaffoldError> {
+        self.crew_directory_request("get", &serde_json::json!({"sessionId": session_id, "deploymentId": deployment_id})).await
+    }
+
+    pub async fn upsert_crew_session(&self, input: &Value) -> Result<Value, ScaffoldError> {
+        self.crew_directory_request("upsert", input).await
+    }
+
+    async fn crew_directory_request(&self, operation: &str, input: &Value) -> Result<Value, ScaffoldError> {
+        let body = serde_json::to_vec(input).map_err(|_| ScaffoldError::InvalidResponse("invalid directory request".into()))?;
+        if body.len() > 60 * 1024 {
+            return Err(ScaffoldError::InvalidResponse("directory request exceeds 60 KiB".into()));
+        }
+        let bearer = self.bearer.token().await.filter(|value| !value.trim().is_empty()).ok_or(ScaffoldError::AuthUnavailable)?;
+        let response = self.http.post(self.origin.join(&format!("/api/crew-directory/{operation}")).expect("directory API path"))
+            .bearer_auth(bearer).header(reqwest::header::CONTENT_TYPE, "application/json").body(body).send().await?;
+        Self::bounded_json(response).await
+    }
+
+    async fn bounded_json(mut response: reqwest::Response) -> Result<Value, ScaffoldError> {
+        let status = response.status();
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if body.len() + chunk.len() > 128 * 1024 {
+                return Err(ScaffoldError::InvalidResponse("response exceeds 128 KiB".into()));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        if !status.is_success() { return Err(api_error(status, &body)); }
+        serde_json::from_slice(&body).map_err(|_| ScaffoldError::InvalidResponse("invalid JSON response".into()))
+    }
+
+    pub(crate) async fn generate_crew_title(&self, session_id: &str, deployment_id: Option<&str>, input: &str) -> Result<String, ScaffoldError> {
+        // The authenticated gateway fixes gpt-5.6-luna and a session-isolated
+        // authority/conversation; device grants cannot obtain general inference.
+        let value = self.crew_directory_request("title", &serde_json::json!({
+            "sessionId": session_id, "deploymentId": deployment_id, "input": input,
+        })).await?;
+        let title = value.get("title").and_then(Value::as_str).unwrap_or_default();
+        let title = title.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(140).collect::<String>();
+        if title.is_empty() { return Err(ScaffoldError::InvalidResponse("title response is empty".into())); }
+        Ok(title)
+    }
+
     pub(crate) async fn list_agent_accounts(
         &self,
     ) -> Result<Vec<RemoteAgentAccount>, ScaffoldError> {

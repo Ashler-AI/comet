@@ -843,6 +843,24 @@ mod session_parser_tests {
     use clap::Parser;
 
     #[test]
+    fn session_search_requires_a_filter_and_bounded_page_size() {
+        assert!(Cli::try_parse_from(["comet", "session", "search"]).is_err());
+        for limit in ["0", "51"] {
+            assert!(Cli::try_parse_from([
+                "comet", "session", "search", "--query", "bridge", "--limit", limit,
+            ]).is_err());
+        }
+        for filter in ["--query", "--source-url"] {
+            let parsed = Cli::try_parse_from([
+                "comet", "session", "search", filter, "bridge", "--limit", "50",
+            ]).unwrap();
+            assert!(matches!(parsed.command, Some(Command::Session {
+                command: super::session_cli::SessionCommand::Search { limit: Some(50), .. },
+            })));
+        }
+    }
+
+    #[test]
     fn parses_session_send_with_explicit_source_and_wait_options() {
         let cli = Cli::try_parse_from([
             "comet",

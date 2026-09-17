@@ -135,6 +135,55 @@ impl CometInvitation {
     }
 }
 
+/// Directory route only; opening still uses authenticated session-room access.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrewSessionLink {
+    pub project_id: String,
+    pub session_id: String,
+    pub deployment_id: Option<String>,
+}
+
+impl CrewSessionLink {
+    pub fn parse_deep_link(value: &str, scheme: &str) -> Option<Self> {
+        let path = value.strip_prefix(scheme)?.strip_prefix("://session/")?;
+        if path.contains('#') {
+            return None;
+        }
+        let (path, deployment_id) = match path.split_once('?') {
+            Some((path, query)) => {
+                let encoded = query.strip_prefix("deploymentId=")?;
+                if encoded.contains('&') || encoded.contains('?') {
+                    return None;
+                }
+                (path, Some(Self::decode_identifier(encoded)?))
+            }
+            None => (path, None),
+        };
+        let (project_id, session_id) = path.split_once('/')?;
+        if session_id.contains('/') {
+            return None;
+        }
+        Some(Self {
+            project_id: Self::decode_identifier(project_id)?,
+            session_id: uuid::Uuid::parse_str(session_id).ok()?.to_string(),
+            deployment_id,
+        })
+    }
+
+    fn decode_identifier(encoded: &str) -> Option<String> {
+        let bytes = encoded.as_bytes();
+        if bytes.iter().enumerate().any(|(index, byte)| {
+            *byte == b'%' && !bytes.get(index + 1..index + 3)
+                .is_some_and(|pair| pair.iter().all(u8::is_ascii_hexdigit))
+        }) {
+            return None;
+        }
+        let decoded = percent_encoding::percent_decode_str(encoded).decode_utf8().ok()?;
+        (!decoded.trim().is_empty() && decoded.len() <= 256 && !decoded.contains('\0'))
+            .then(|| decoded.into_owned())
+    }
+}
+
 /// Route hints only: the installed client must authenticate and attach before
 /// accepting the room or its authority. No grant or credential travels in a URL.
 #[derive(Debug, Clone, PartialEq)]
@@ -1157,6 +1206,31 @@ mod tests {
         assert!(
             CometInvitation::parse_deep_link("comet://invite/chat-a/session-b/grant%2Fc").is_none()
         );
+    }
+
+    #[test]
+    fn directory_links_preserve_project_and_reject_ambiguous_routes() {
+        let base = "comet-staging://session/project-a/011664b5-3660-4fe6-83a2-3647fa6a2f65";
+        let link = super::CrewSessionLink::parse_deep_link(base, "comet-staging").unwrap();
+        assert_eq!(link.project_id, "project-a");
+        assert_eq!(link.session_id, "011664b5-3660-4fe6-83a2-3647fa6a2f65");
+        assert!(super::CrewSessionLink::parse_deep_link(base, "comet").is_none());
+        let scoped = super::CrewSessionLink::parse_deep_link(
+            "comet-staging://session/project%2Fa/011664b5-3660-4fe6-83a2-3647fa6a2f65?deploymentId=deploy%20%C3%A9",
+            "comet-staging",
+        ).unwrap();
+        assert_eq!(scoped.project_id, "project/a");
+        assert_eq!(scoped.deployment_id.as_deref(), Some("deploy é"));
+        for suffix in ["/extra", "?token=secret", "#fragment", "%2Fother", "?deploymentId=", "?deploymentId=a&deploymentId=b", "?deploymentId=%FF", "?deploymentId=%zz"] {
+            assert!(super::CrewSessionLink::parse_deep_link(
+                &format!("{base}{suffix}"), "comet-staging",
+            ).is_none());
+        }
+        for path in ["/011664b5-3660-4fe6-83a2-3647fa6a2f65", "project/not-a-uuid", "project%00a/011664b5-3660-4fe6-83a2-3647fa6a2f65"] {
+            assert!(super::CrewSessionLink::parse_deep_link(
+                &format!("comet-staging://session/{path}"), "comet-staging",
+            ).is_none());
+        }
     }
 
     #[test]

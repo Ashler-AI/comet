@@ -259,6 +259,7 @@ impl SessionDoc {
         let meta = doc.get_map("meta");
         meta.insert("chatId", chat_id)?;
         meta.insert("schemaVersion", SESSION_SCHEMA_VERSION as i64)?;
+        meta.insert("directoryCompletedTurn", "")?;
         doc.commit();
         Ok(Self { doc })
     }
@@ -312,6 +313,58 @@ impl SessionDoc {
             }
         }
         ids
+    }
+
+    pub fn directory_entry_count(&self) -> usize {
+        self.doc.get_list("messages").len()
+    }
+
+    /// Bounded title projection; link extraction uses directory_visit_text so
+    /// oversized text is scanned fully rather than silently omitted.
+    pub fn directory_entry(&self, index: usize) -> Result<Option<SessionMessageEntry>, DocError> {
+        let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) = self.doc.get_list("messages").get(index) else {
+            return Err(DocError::Schema("malformed directory transcript row".into()));
+        };
+        if optional_string(&row, "role").as_deref() == Some("system") { return Ok(None); }
+        let mut budget = 256 * 1024;
+        let entry = entry_from_map_window(&row, &mut budget)?;
+        if entry.parts.iter().filter(|part| !matches!(part, MessagePart::TextWindow { .. } | MessagePart::Text { .. }))
+            .map(MessagePart::byte_len).sum::<usize>() > 256 * 1024
+        {
+            return Err(DocError::Schema("directory transcript row exceeds scan budget".into()));
+        }
+        Ok(Some(entry))
+    }
+
+    pub fn directory_visit_text(&self, index: usize, mut visit: impl FnMut(&str, bool) -> Result<(), DocError>) -> Result<(), DocError> {
+        let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) = self.doc.get_list("messages").get(index) else {
+            return Err(DocError::Schema("malformed directory transcript row".into()));
+        };
+        if optional_string(&row, "role").as_deref() == Some("system") { return Ok(()); }
+        let Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) = row.get("parts") else { return Ok(()) };
+        for index in 0..parts.len() {
+            let Some(loro::ValueOrContainer::Container(loro::Container::Map(part))) = parts.get(index) else { continue };
+            if optional_string(&part, "kind").as_deref() != Some("text") { continue; }
+            let Some(loro::ValueOrContainer::Container(loro::Container::Text(text))) = part.get("text") else { continue };
+            let total = text.len_utf8();
+            let mut start = 0;
+            while start < total {
+                let mut end = (start + 64 * 1024).min(total);
+                let delta = loop {
+                    match text.slice_delta(start, end, PosType::Bytes) {
+                        Ok(delta) => break delta,
+                        Err(_) if end > start + 1 => { end -= 1; },
+                        Err(_) => return Err(DocError::Schema("invalid directory text boundary".into())),
+                    }
+                };
+                for delta in delta {
+                    if let TextDelta::Insert { insert, .. } = delta { visit(&insert, false)?; }
+                }
+                start = end;
+            }
+            visit("", true)?;
+        }
+        Ok(())
     }
 
     /// Read all entries (continuations NOT joined — see `join_continuation_entries`).

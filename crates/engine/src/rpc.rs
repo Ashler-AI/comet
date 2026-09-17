@@ -10,6 +10,8 @@
 //! - `ListLocalSessions` → metadata-only recent Claude Code, Codex, OMP,
 //!   Prime Agent, and OpenCode histories; `AttachLocalSession {candidateId}`
 //!   imports one transcript idempotently
+//! - `SearchSessions {query?, sourceUrl?, ownerId?, limit?, cursor?}` → compact
+//!   project directory results; authenticated through Scaffold, never transcripts
 //! - `WatchCollaboration {chatId}` → typed versioned sessions, provenance,
 //!   publications, participants, principal, and verified grants
 //! - `WatchChats` / `WatchDevices` → streams of the workspace doc's entity rows
@@ -2383,6 +2385,20 @@ impl RpcService for EngineRpc {
             methods::WATCH_SESSION_REFS => Ok(RpcReply::Stream(watch_stream(
                 self.workspace.watch_session_refs(),
             ))),
+            methods::SEARCH_SESSIONS => {
+                let input: comet_rpc::SearchSessionsParams = parse_params(params)?;
+                let input = serde_json::to_value(input)
+                    .map_err(|_| RpcError::Failed("invalid_session_search".into()))?;
+                let result = self
+                    .scaffold()?
+                    .client()
+                    .search_crew_sessions(&input)
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let result: comet_rpc::SearchSessionsResult = serde_json::from_value(result)
+                    .map_err(|_| RpcError::Failed("invalid_session_search_response".into()))?;
+                RpcReply::value(&result)
+            }
             methods::ADD_SESSION_REF => {
                 let p: SessionRefParams = parse_params(params)?;
                 let chat_id = canonical_session_id(&p.chat_id)

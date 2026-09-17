@@ -13,6 +13,24 @@ pub enum SessionCommand {
     Remove { chat_id: String },
     /// Read the current transcript snapshot for a session.
     Read { chat_id: String },
+    /// Search Crew session titles or exact Slack/Notion links. Prints JSON, not transcripts.
+    Search {
+        /// Title words to search (at most 512 UTF-8 bytes); required unless --source-url is set.
+        #[arg(long, value_name = "TEXT", required_unless_present = "source_url")]
+        query: Option<String>,
+        /// Exact Slack message/thread or Notion page URL; can also filter a title query.
+        #[arg(long, value_name = "URL", required_unless_present = "query")]
+        source_url: Option<String>,
+        /// Filter by the owner's exact account ID.
+        #[arg(long, value_name = "ID")]
+        owner_id: Option<String>,
+        /// Maximum results per page (1–50, default 10).
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..=50))]
+        limit: Option<u8>,
+        /// Opaque nextCursor from the previous page; keep the same filters.
+        #[arg(long, value_name = "CURSOR")]
+        cursor: Option<String>,
+    },
     /// Fork a Crew session, preserving its context and harness/model configuration.
     Fork { chat_id: Option<String> },
     /// Transfer a session's native context to Scaffold and queue a remote task.
@@ -130,6 +148,29 @@ pub async fn run(command: SessionCommand, ipc_port: u16) -> anyhow::Result<()> {
                 .await
                 .context("ForkSession failed")?;
             print_json(&value)?;
+        }
+        SessionCommand::Search {
+            query,
+            source_url,
+            owner_id,
+            limit,
+            cursor,
+        } => {
+            let params = comet_rpc::SearchSessionsParams {
+                query,
+                source_url,
+                owner_id,
+                limit,
+                cursor,
+            };
+            let result: comet_rpc::SearchSessionsResult = client
+                .call_as(
+                    comet_rpc::methods::SEARCH_SESSIONS,
+                    serde_json::to_value(params)?,
+                )
+                .await
+                .context("Crew session search failed")?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
         }
         SessionCommand::Read { chat_id } => {
             let mut snapshots = client

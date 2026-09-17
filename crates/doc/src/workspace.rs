@@ -350,8 +350,37 @@ impl WorkspaceDoc {
             return Ok(false);
         };
         row.insert("title", title)?;
+        row.insert("titleSource", "manual")?;
         self.doc.commit();
         Ok(true)
+    }
+
+    /// Unknown legacy titles are deliberately treated as manual, never guessed.
+    pub fn generated_chat_title(&self, chat_id: &str) -> Option<String> {
+        let row = self.existing_row("chats", chat_id)?;
+        match row.get("generatedTitle") {
+            Some(loro::ValueOrContainer::Value(LoroValue::String(value))) => Some(value.to_string()),
+            _ => None,
+        }
+    }
+
+    pub fn set_generated_chat_title(&self, chat_id: &str, title: &str) -> Result<bool, DocError> {
+        let Some(row) = self.existing_row("chats", chat_id) else { return Ok(false) };
+        let current = self.chat(chat_id)?.and_then(|chat| chat.title);
+        let source = match row.get("titleSource") {
+            Some(loro::ValueOrContainer::Value(LoroValue::String(value))) => Some(value.to_string()),
+            _ => None,
+        };
+        let replace = source.as_deref() != Some("manual")
+            && (current.as_deref().is_none_or(|title| title.trim().is_empty())
+                || (source.as_deref() == Some("generated") && current == self.generated_chat_title(chat_id)));
+        row.insert("generatedTitle", title)?;
+        if replace {
+            row.insert("title", title)?;
+            row.insert("titleSource", "generated")?;
+        }
+        self.doc.commit();
+        Ok(replace)
     }
 
     /// LWW archived flag from any device. `false` when no such row.
@@ -1046,6 +1075,26 @@ mod tests {
             .expect("export b");
         b.doc().import(&a_update).expect("import into b");
         a.doc().import(&b_update).expect("import into a");
+    }
+
+    #[test]
+    fn generated_titles_preserve_manual_and_legacy_names_after_restart() {
+        let ws = WorkspaceDoc::new();
+        let mut row = chat("chat-title", "dev-a");
+        row.title = None;
+        ws.upsert_chat(&row).unwrap();
+        assert!(ws.set_generated_chat_title(&row.id, "Generated").unwrap());
+        ws.rename_chat(&row.id, "Chosen by user").unwrap();
+        let restored = LoroDoc::new();
+        restored.import(&ws.export_snapshot().unwrap()).unwrap();
+        let restored = WorkspaceDoc::from_doc(restored);
+        assert!(!restored.set_generated_chat_title(&row.id, "Refresh").unwrap());
+        assert_eq!(restored.chat(&row.id).unwrap().unwrap().title.as_deref(), Some("Chosen by user"));
+        row.id = "legacy-title".into();
+        row.title = Some("Existing name with unknown provenance".into());
+        restored.upsert_chat(&row).unwrap();
+        assert!(!restored.set_generated_chat_title(&row.id, "Replacement").unwrap());
+        assert_eq!(restored.chat(&row.id).unwrap().unwrap().title, row.title);
     }
 
     #[test]

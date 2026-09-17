@@ -353,7 +353,7 @@ struct Inner {
     /// One local live waiter per `(source chat, thread)`. Intentionally process-local:
     /// the command ledger remains the only durable outbox.
     peer_waiters: Mutex<HashMap<(String, String), LivePeerWaiter>>,
-    /// Deterministic local auto-titler, wired at engine assembly; absent in bare tests.
+    /// Durable title/link producer, wired at engine assembly; absent in bare tests.
     titles: OnceLock<crate::titles::TitleGenerator>,
     /// Per-run loopback inference routes backed by centrally held Agent Auth credentials.
     inference_relay: OnceLock<crate::inference_relay::InferenceRelay>,
@@ -414,9 +414,13 @@ impl SessionsEngine {
         let _ = self.inner.doc_host.set(host);
     }
 
-    /// Wire the local chat auto-titler (called once at engine assembly).
+    /// Wire the durable title/link producer once at engine assembly.
     pub fn set_titles(&self, titles: crate::titles::TitleGenerator) {
         let _ = self.inner.titles.set(titles);
+    }
+
+    pub(crate) fn set_title_client(&self, client: crate::scaffold::ScaffoldClient) {
+        if let Some(titles) = self.inner.titles.get() { titles.set_client(client); }
     }
 
     pub(crate) fn set_inference_relay(&self, relay: crate::inference_relay::InferenceRelay) {
@@ -1191,10 +1195,9 @@ impl SessionsEngine {
         self.inner
             .note_message(chat_id, user_message_preview(&request.prompt, peer_message));
 
-        // Name the chat immediately from its first prompt. This is entirely
-        // local and never starts an auxiliary harness/model session.
-        if !peer_message && let Some(titles) = self.inner.titles.get() {
-            titles.maybe_generate(chat_id, &request.prompt);
+        if !peer_message && handle.doc().directory_entry_count() == 1
+            && let Some(titles) = self.inner.titles.get() {
+            titles.name_initial_branch(chat_id, &request.prompt);
         }
         // Starting the harness is part of dispatch, not background run
         // consumption. A spawn/transport error must return to the durable
@@ -2430,7 +2433,6 @@ async fn drive_run(
     let device_id = inner.device_id.clone();
     // Retained for resume ownership and the one-shot failed-resume retry.
     let harness_id = harness.id();
-    let user_prompt = request.prompt.clone();
     let run_cwd = request.cwd.clone();
     // Kept whole for the failed-resume retry (fresh session, same user entry).
     // Option so the retry branch (inside the event loop) can take ownership.
@@ -2585,17 +2587,8 @@ async fn drive_run(
             inner.note_route_restart_progress(&chat_id, &run_id);
         }
 
-        // ACP session names are workspace metadata, not transcript content.
-        // Adopt them only while Comet's local title remains provisional; the
-        // title generator preserves any later manual rename.
-        if let AgentEvent::SessionTitleChanged { title } = &event {
-            if let Some(titles) = inner.titles.get()
-                && let Err(err) = titles.adopt_harness_title(&chat_id, title)
-            {
-                tracing::warn!(chat = %chat_id, error = %err, "harness session title update failed");
-            }
-            continue;
-        }
+        // Harness display names are not Crew titles. Generated/manual provenance
+        // belongs to the workspace and must survive harness resume and restart.
 
         // Failed-resume fallback: an engine-injected `--resume` naming a session
         // the harness no longer knows dies before ever starting (claude exits
@@ -2806,12 +2799,15 @@ async fn drive_run(
                 // budget: only consecutive crash-revive-crash cycles spend it.
                 inner.journal.clear_resume_attempts(&chat_id);
             }
-            // Retry local titling after a completed exchange in case the
-            // dispatch-time task could not observe the chat row yet.
-            if *status == DoneStatus::Completed
-                && let Some(titles) = inner.titles.get()
-            {
-                titles.maybe_generate(&chat_id, &user_prompt);
+            if *status == DoneStatus::Completed && !nothing_streamed {
+                if let (Some(titles), Some(host)) = (inner.titles.get(), inner.doc_host.get()) {
+                    if let Err(error) = doc_ref.doc().get_map("meta").insert("directoryCompletedTurn", entry_id.as_str()) {
+                        tracing::warn!(%error, "completed title marker failed");
+                    } else {
+                        doc_ref.doc().commit();
+                        titles.completed(chat_id.clone(), host.clone());
+                    }
+                }
             }
             let persistent_boundary = *status == DoneStatus::Completed
                 && steerable

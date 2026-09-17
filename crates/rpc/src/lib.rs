@@ -50,6 +50,8 @@ pub mod methods {
     pub const SEND_PEER_MESSAGE: &str = "SendPeerMessage";
     pub const REPLY_PEER_MESSAGE: &str = "ReplyPeerMessage";
     pub const WAIT_PEER_REPLY: &str = "WaitPeerReply";
+    /// Search project-scoped Crew titles and source links using the signed-in account.
+    pub const SEARCH_SESSIONS: &str = "SearchSessions";
     /// Create a distinct Crew chat from an existing session's native context.
     pub const FORK_SESSION: &str = "ForkSession";
     /// Transfer native context to Scaffold and queue its initial remote command.
@@ -195,6 +197,53 @@ pub struct ReadCheckoutDiffResult {
 #[serde(rename_all = "camelCase")]
 pub struct SessionRefParams {
     pub chat_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SearchSessionsParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchSessionsResult {
+    pub sessions: Vec<SessionSearchMatch>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSearchMatch {
+    pub session_id: String,
+    pub title: String,
+    pub owner: SessionSearchOwner,
+    pub session_url: String,
+    pub matched_by: Vec<SessionSearchMatchKind>,
+    pub matched_sources: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSearchOwner {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionSearchMatchKind {
+    Title,
+    SlackThread,
+    SlackMessage,
+    NotionPage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

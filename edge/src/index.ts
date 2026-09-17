@@ -18,6 +18,7 @@ import {
   DEVICE_HOST_AUTH_HEADER,
   NOTIFICATION_BEARER_HEADER,
   ROOM_KIND_HEADER,
+  SESSION_OWNER_AUTH_HEADER,
   stripTrustedAuthHeaders,
   type Env
 } from "./env";
@@ -219,6 +220,35 @@ export default {
     }
 
     const sessionId = canonicalSessionId(parts[1]);
+    if (parts[0] === "session" && parts[2] === "directory-authority" && parts.length === 3) {
+      if (request.method !== "GET") return json({ error: "method_not_allowed" }, 405);
+      if (!hasCapability(identity, "session.control") || !sessionId || !deviceCredentialAllows(identity, "session", sessionId)) return json({ error: "forbidden" }, 403);
+      if (!sessionId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(sessionId)) {
+        return json({ error: "invalid_session" }, 400);
+      }
+      const deploymentId = url.searchParams.get("deploymentId");
+      if (deploymentId !== null && !ID_RE.test(deploymentId)) return json({ error: "invalid_deployment" }, 400);
+      if (deviceCredential) {
+        const grant = identity as Verified & { deploymentId?: string };
+        if (!deploymentId || deploymentId !== grant.deploymentId) return json({ error: "forbidden" }, 403);
+      }
+      try {
+        const room = env.SESSION_ROOMS.get(env.SESSION_ROOMS.idFromName(sessionRoomKey(identity, sessionId, deploymentId)));
+        const response = await room.fetch(new Request("https://session.internal/authorize-owner", {
+          headers: {
+            [AUTH_USER_HEADER]: identity.userId,
+            [AUTH_PROJECT_HEADER]: identity.projectScope,
+            [SESSION_OWNER_AUTH_HEADER]: "verify"
+          }
+        }));
+        if (!response.ok) return json({ error: "directory_authority_unavailable" }, 503);
+        const result = await response.json() as { ownsSession?: unknown };
+        if (typeof result.ownsSession !== "boolean") return json({ error: "directory_authority_unavailable" }, 503);
+        return json({ ownsSession: result.ownsSession, projectId: identity.projectScope, actorId: identity.email, subject: identity.userId });
+      } catch {
+        return json({ error: "directory_authority_unavailable" }, 503);
+      }
+    }
     if (parts[0] === "session" && sessionId && ID_RE.test(sessionId) && parts[2] === "ws") {
       if (!hasCapability(identity, "session.read") || !deviceCredentialAllows(identity, "session", sessionId)) {
         return json({ error: "forbidden" }, 403);

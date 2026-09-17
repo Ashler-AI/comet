@@ -40,6 +40,15 @@ const MIGRATIONS: &[&str] = &[
         name TEXT PRIMARY KEY,
         applied_at INTEGER NOT NULL
      ) STRICT;",
+    "CREATE TABLE crew_directory_jobs (
+        session_id TEXT PRIMARY KEY,
+        generation INTEGER NOT NULL DEFAULT 1,
+        state TEXT NOT NULL DEFAULT '{}',
+        deleted INTEGER NOT NULL DEFAULT 0,
+        due_at INTEGER NOT NULL DEFAULT 0,
+        retry_at INTEGER NOT NULL DEFAULT 0
+     ) STRICT;
+     CREATE INDEX crew_directory_jobs_due ON crew_directory_jobs(due_at, session_id);",
 ];
 
 /// SQLite-backed store under a data directory (`{data_dir}/docs.sqlite3`).
@@ -49,6 +58,7 @@ const MIGRATIONS: &[&str] = &[
 /// that gives command execution mark-BEFORE-execute idempotence.
 pub struct DocsStore {
     conn: Mutex<Connection>,
+    directory_changed: tokio::sync::watch::Sender<u64>,
 }
 
 impl DocsStore {
@@ -62,6 +72,7 @@ impl DocsStore {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         migrate(&mut conn)?;
         Ok(Self {
+            directory_changed: tokio::sync::watch::channel(0).0,
             conn: Mutex::new(conn),
         })
     }
@@ -81,11 +92,25 @@ impl DocsStore {
 
     /// Save (upsert) the snapshot for `doc_id`.
     pub fn save_snapshot(&self, doc_id: &str, bytes: &[u8]) -> Result<(), StoreError> {
-        self.conn().execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT INTO snapshots (doc_id, bytes, saved_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(doc_id) DO UPDATE SET bytes = excluded.bytes, saved_at = excluded.saved_at",
             params![doc_id, bytes, now_ms()],
         )?;
+        // Only global room-shaped ids enter discovery; the engine verifies UUID
+        // and authenticated ownership before reading or transmitting their data.
+        if doc_id.len() == 36 {
+            tx.execute(
+                "INSERT INTO crew_directory_jobs(session_id, due_at) VALUES (?1, ?2)
+                 ON CONFLICT(session_id) DO UPDATE SET generation = generation + 1,
+                 due_at = MAX(retry_at, MIN(due_at, excluded.due_at)) WHERE deleted = 0",
+                params![doc_id, now_ms() + 30_000],
+            )?;
+        }
+        tx.commit()?;
+        self.directory_changed.send_modify(|value| *value = value.wrapping_add(1));
         Ok(())
     }
 
@@ -173,6 +198,87 @@ impl DocsStore {
         Ok(())
     }
 
+    /// Keyset inventory: never reopen rooms or retain all snapshots for backfill.
+    pub fn snapshot_ids_after(&self, after: &str) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn();
+        let mut query = conn.prepare("SELECT doc_id FROM snapshots WHERE doc_id > ?1 ORDER BY doc_id LIMIT 32")?;
+        Ok(query.query_map(params![after], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn load_bounded_snapshot(&self, id: &str, max_bytes: usize) -> Result<Option<Vec<u8>>, StoreError> {
+        let conn = self.conn();
+        let size: Option<usize> = conn.query_row("SELECT length(bytes) FROM snapshots WHERE doc_id = ?1", params![id], |row| row.get(0)).optional()?;
+        if size.is_some_and(|size| size > max_bytes) {
+            return Err(std::io::Error::other("session snapshot exceeds directory scan budget").into());
+        }
+        conn.query_row("SELECT bytes FROM snapshots WHERE doc_id = ?1", params![id], |row| row.get(0)).optional().map_err(Into::into)
+    }
+
+    pub fn queue_directory(&self, id: &str, deleted: bool) -> Result<(), StoreError> {
+        self.conn().execute(
+            "INSERT INTO crew_directory_jobs(session_id, deleted) VALUES (?1, ?2)
+             ON CONFLICT(session_id) DO UPDATE SET generation = generation + 1,
+             deleted = MAX(deleted, excluded.deleted), due_at = retry_at",
+            params![id, deleted],
+        )?;
+        self.directory_changed.send_modify(|value| *value = value.wrapping_add(1));
+        Ok(())
+    }
+
+    pub fn claim_directory(&self) -> Result<Option<(String, i64, String, bool)>, StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let job = tx.query_row(
+            "SELECT session_id, generation, state, deleted FROM crew_directory_jobs WHERE due_at <= ?1 ORDER BY due_at, session_id LIMIT 1",
+            params![now_ms()], |row| Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional()?;
+        if let Some((id, _, _, _)) = &job {
+            tx.execute("UPDATE crew_directory_jobs SET due_at = ?2 WHERE session_id = ?1", params![id, now_ms() + 120_000])?;
+        }
+        tx.commit()?;
+        Ok(job)
+    }
+
+    pub fn save_directory_state(&self, id: &str, state: &str, deleted: bool) -> Result<(), StoreError> {
+        self.conn().execute("UPDATE crew_directory_jobs SET state = ?2 WHERE session_id = ?1 AND deleted = ?3", params![id, state, deleted])?;
+        Ok(())
+    }
+
+    pub fn queue_directory_deletion(&self, id: &str, state: &str) -> Result<(), StoreError> {
+        self.conn().execute(
+            "INSERT INTO crew_directory_jobs(session_id, deleted, state) VALUES (?1, 1, ?2)
+             ON CONFLICT(session_id) DO UPDATE SET generation = generation + 1, deleted = 1, due_at = 0, state = excluded.state",
+            params![id, state],
+        )?;
+        self.directory_changed.send_modify(|value| *value = value.wrapping_add(1));
+        Ok(())
+    }
+
+    pub fn watch_directory(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.directory_changed.subscribe()
+    }
+
+    pub fn directory_retry_delay(&self) -> Result<Option<std::time::Duration>, StoreError> {
+        let due: Option<i64> = self.conn().query_row(
+            "SELECT MIN(due_at) FROM crew_directory_jobs WHERE due_at < 9223372036854775807", [], |row| row.get(0))?;
+        Ok(due.map(|at| std::time::Duration::from_millis(at.saturating_sub(now_ms()).max(0) as u64)))
+    }
+
+    pub fn settle_directory(&self, id: &str, generation: i64, success: bool) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE crew_directory_jobs SET
+             due_at = CASE WHEN ?3 THEN CASE WHEN generation = ?2 THEN 9223372036854775807 ELSE due_at END ELSE ?4 END,
+             retry_at = CASE WHEN ?3 THEN 0 ELSE ?4 END WHERE session_id = ?1",
+            params![id, generation, success, now_ms() + 30_000],
+        )?;
+        Ok(())
+    }
+
+    pub fn defer_directory_title(&self, id: &str, generation: i64, deadline: i64) -> Result<(), StoreError> {
+        self.conn().execute("UPDATE crew_directory_jobs SET due_at = ?3 WHERE session_id = ?1 AND generation = ?2 AND deleted = 0", params![id, generation, deadline])?;
+        Ok(())
+    }
+
     fn conn(&self) -> MutexGuard<'_, Connection> {
         // A poisoned lock only means another thread panicked mid-query; the
         // connection itself is still usable.
@@ -218,6 +324,47 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_snapshots_coalesce_without_postponing_deadline_or_bypassing_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DocsStore::open(dir.path()).unwrap();
+        let id = "10000000-0000-4000-8000-000000000001";
+        store.save_snapshot(id, b"first").unwrap();
+        assert!(store.claim_directory().unwrap().is_none());
+        let first_due: i64 = store.conn().query_row("SELECT due_at FROM crew_directory_jobs WHERE session_id = ?1", params![id], |row| row.get(0)).unwrap();
+        store.save_snapshot(id, b"newest").unwrap();
+        let next_due: i64 = store.conn().query_row("SELECT due_at FROM crew_directory_jobs WHERE session_id = ?1", params![id], |row| row.get(0)).unwrap();
+        assert_eq!(next_due, first_due);
+        store.queue_directory(id, false).unwrap();
+        let (_, generation, _, _) = store.claim_directory().unwrap().unwrap();
+        store.save_snapshot(id, b"raced").unwrap();
+        store.settle_directory(id, generation, false).unwrap();
+        store.save_snapshot(id, b"later").unwrap();
+        store.queue_directory(id, false).unwrap();
+        assert!(store.claim_directory().unwrap().is_none());
+    }
+
+    #[test]
+    fn directory_acknowledgement_cannot_drop_newer_work_or_resurrect_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "10000000-0000-4000-8000-000000000001";
+        let store = DocsStore::open(dir.path()).unwrap();
+        store.queue_directory(id, false).unwrap();
+        let (_, generation, _, _) = store.claim_directory().unwrap().unwrap();
+        store.queue_directory(id, false).unwrap();
+        store.settle_directory(id, generation, true).unwrap();
+        let (_, newer, _, _) = store.claim_directory().unwrap().unwrap();
+        assert!(newer > generation);
+        store.queue_directory_deletion(id, r#"{"sourceVersion":{"s:1":4},"deploymentId":"staging"}"#).unwrap();
+        store.save_directory_state(id, "{}", false).unwrap();
+        drop(store);
+        let restarted = DocsStore::open(dir.path()).unwrap();
+        restarted.queue_directory(id, false).unwrap();
+        let (_, _, state, deleted) = restarted.claim_directory().unwrap().unwrap();
+        assert!(deleted);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&state).unwrap()["deploymentId"], "staging");
+    }
 
     #[test]
     fn snapshot_roundtrip_and_overwrite() {

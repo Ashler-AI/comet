@@ -263,7 +263,7 @@ impl EngineCore {
             },
         );
         let workspace = WorkspaceHost::open_with_journal(
-            store,
+            store.clone(),
             WorkspaceHostConfig {
                 device_id: device_id.clone(),
                 device_name: local_device_name(),
@@ -286,7 +286,7 @@ impl EngineCore {
         let terminals = Terminals::new();
         let uploads = Uploads::new(data_dir, edge.clone());
         let agent_accounts = AgentAccounts::new(AgentAccountsConfig::detect(data_dir));
-        sessions.set_titles(TitleGenerator::new(workspace.clone(), repos.clone()));
+        sessions.set_titles(TitleGenerator::new(workspace.clone(), store, repos.clone()));
         let cleanup_quiescent: worktree_cleanup::QuiescentCheck = {
             let sessions = sessions.clone();
             let terminals = terminals.clone();
@@ -385,6 +385,7 @@ impl EngineCore {
 
     pub fn set_scaffold_runtime(&self, scaffold: ScaffoldRuntime) {
         self.agent_accounts.set_remote(scaffold.client());
+        self.sessions.set_title_client(scaffold.client());
         *self
             .scaffold
             .lock()
@@ -616,6 +617,11 @@ impl Engine {
             },
         )?;
         core.set_auth(auth.clone());
+        if let Some(scaffold_url) = config.scaffold_url.as_deref() && auth.device_mode() {
+            // Exact-session directory production is not general Scaffold control.
+            core.sessions.set_title_client(ScaffoldClient::new(
+                scaffold_url, project_scope.clone(), Arc::new(auth.clone()))?);
+        }
         if let Some(scaffold_url) = config.scaffold_url.as_deref()
             && !auth.device_mode()
             && config.runtime_profile.allows_scaffold_control()

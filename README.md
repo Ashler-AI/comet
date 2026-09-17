@@ -2,6 +2,36 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Unreleased: shared session discovery
+
+`comet session search --query "upload retries"` searches generated and display
+titles. `--source-url` accepts a Slack message/thread or Notion page link;
+`--owner-id`, `--limit` (1–50), and `--cursor` narrow or page the same search.
+Results contain title, owner, matched sources, and a credential-free Crew link,
+never transcript contents or an assertion that the owner is currently working.
+Opening a result preserves its project and deployment scope and requires sign-in.
+
+Completed turns queue fixed-model `gpt-5.6-luna` title generation through Agent
+Auth, independently of the conversation harness. Manual and legacy titles survive
+refresh; generated titles update sidebar metadata, not existing branch names.
+The first prompt still names a new managed branch once. The durable local outbox
+coalesces snapshot metadata to a 30-second maximum scheduling delay; completed
+turns get priority, but model calls are limited to one per session per minute.
+One background worker bounds concurrent inference; retry deadlines survive restart.
+Slack/Notion link extraction does not depend on successful title generation.
+
+Available persisted owned sessions are backfilled in bounded pages without
+opening their rooms. Archived and offline sessions do not expire; explicit
+deletion durably queues a permanent tombstone before local source removal. Oversized
+sources remain pending with a diagnostic rather than acknowledging partial links.
+The server indexes project, deployment, and session together, so identical UUIDs
+in distinct rooms do not overwrite or delete each other.
+
+This requires coordinated Crew edge and Scaffold provider/control-plane rollout,
+the dedicated `crew`/`crew_staging` database, and the search-only Forge credential.
+Source changes alone do not provision or deploy those resources. A failed or empty
+lookup is not evidence that nobody is working; search does not suppress triage.
+
 ## Unreleased: compatible upstream integration
 
 Selected upstream improvements are adapted to Crew, not a wholesale upstream merge:
