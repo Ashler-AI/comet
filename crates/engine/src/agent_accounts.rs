@@ -539,6 +539,12 @@ impl AgentAccounts {
             self.cancel_login(&id);
         }
 
+        let mut command = comet_harness::codex::installed_command().ok_or_else(|| {
+            EngineError::Other(
+                "The `codex` CLI was not found on this device — install it first.".into(),
+            )
+        })?;
+
         let login_id = new_id();
         // A throwaway CODEX_HOME isolates the new login completely. Agent Auth
         // receives the credential before this directory is reclaimed.
@@ -548,7 +554,8 @@ impl AgentAccounts {
             .root_dir()
             .join(format!(".login-{login_id}"));
         std::fs::create_dir_all(&home)?;
-        let mut child = match tokio::process::Command::new("codex")
+
+        let mut child = match command
             .arg("login")
             .env("CODEX_HOME", &home)
             .stdin(std::process::Stdio::null())
