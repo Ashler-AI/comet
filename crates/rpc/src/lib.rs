@@ -37,6 +37,8 @@ pub mod methods {
     pub const LIST_MODELS: &str = "ListModels";
     pub const LIST_HARNESS_COMMANDS: &str = "ListHarnessCommands";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
+    /// Relay-only admission for one peer command on its exact owning device.
+    pub const DELIVER_PEER_MESSAGE: &str = "DeliverPeerMessage";
     /// Stop a verified external OMP writer and retry the blocked prompt under
     /// the target Crew engine.
     pub const TAKE_OVER_OMP_SESSION: &str = "TakeOverOmpSession";

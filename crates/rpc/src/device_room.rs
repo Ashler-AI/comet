@@ -179,6 +179,39 @@ pub fn device_room_ws_url(
     format!("{ws_base}/device/{device_id}/ws?role={role}{conn}&token={token}")
 }
 
+fn peer_session_ws_url(
+    edge_url: &str,
+    conn_id: &str,
+    token: &str,
+    session_id: &str,
+    deployment_id: Option<&str>,
+) -> String {
+    let ws_base = edge_url.replacen("http", "ws", 1);
+    let ws_base = ws_base.trim_end_matches('/');
+    let deployment = deployment_id
+        .map(|value| format!("&deploymentId={value}"))
+        .unwrap_or_default();
+    format!("{ws_base}/peer/{session_id}/ws?connId={conn_id}&token={token}{deployment}")
+}
+
+fn peer_device_ws_url(
+    edge_url: &str,
+    conn_id: &str,
+    token: &str,
+    session_id: &str,
+    deployment_id: Option<&str>,
+    device_id: &str,
+) -> String {
+    let ws_base = edge_url.replacen("http", "ws", 1);
+    let ws_base = ws_base.trim_end_matches('/');
+    let deployment = deployment_id
+        .map(|value| format!("&peerDeploymentId={value}"))
+        .unwrap_or_default();
+    format!(
+        "{ws_base}/device/{device_id}/ws?role=client&connId={conn_id}&token={token}&purpose=peer-reply&peerSessionId={session_id}{deployment}"
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Token source — the auth seam
 // ---------------------------------------------------------------------------
@@ -784,6 +817,94 @@ impl LinkCache {
         lock(&self.links).remove(device_id);
     }
 
+    /// Deliver one command through the relay owned by `session_id`'s host.
+    pub async fn peer_call(
+        &self,
+        session_id: &str,
+        deployment_id: Option<&str>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, RpcError> {
+        let token = self
+            .config
+            .token
+            .token()
+            .await
+            .ok_or_else(|| RpcError::Transport("not signed in".into()))?;
+        let url = peer_session_ws_url(
+            &self.config.edge_url,
+            &uuid::Uuid::new_v4().to_string(),
+            &token,
+            session_id,
+            deployment_id,
+        );
+        let link = DeviceLink::connect(&url).await?;
+        let client = link.client();
+        tokio::time::timeout(
+            self.config.probe_timeout,
+            client.call(crate::methods::LOCAL_DEVICE, serde_json::json!({})),
+        )
+        .await
+        .map_err(|_| {
+            RpcError::Transport(format!(
+                "peer session {session_id}: readiness check timed out"
+            ))
+        })?
+        .map_err(|error| {
+            RpcError::Transport(format!(
+                "peer session {session_id}: readiness check failed: {error}"
+            ))
+        })?;
+        tokio::time::timeout(self.config.probe_timeout, client.call(method, params))
+            .await
+            .map_err(|_| {
+                RpcError::Transport(format!("peer session {session_id}: delivery timed out"))
+            })?
+    }
+
+    /// Deliver a reply to the exact device recorded on the incoming peer command.
+    /// The target engine still verifies that it owns `session_id` before admission.
+    pub async fn peer_device_call(
+        &self,
+        device_id: &str,
+        session_id: &str,
+        deployment_id: Option<&str>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, RpcError> {
+        let token = self
+            .config
+            .token
+            .token()
+            .await
+            .ok_or_else(|| RpcError::Transport("not signed in".into()))?;
+        let url = peer_device_ws_url(
+            &self.config.edge_url,
+            &uuid::Uuid::new_v4().to_string(),
+            &token,
+            session_id,
+            deployment_id,
+            device_id,
+        );
+        let link = DeviceLink::connect(&url).await?;
+        let client = link.client();
+        tokio::time::timeout(
+            self.config.probe_timeout,
+            client.call(crate::methods::LOCAL_DEVICE, serde_json::json!({})),
+        )
+        .await
+        .map_err(|_| {
+            RpcError::Transport(format!(
+                "peer device {device_id}: readiness check timed out"
+            ))
+        })??;
+        tokio::time::timeout(self.config.probe_timeout, client.call(method, params))
+            .await
+            .map_err(|_| {
+                RpcError::Transport(format!("peer device {device_id}: delivery timed out"))
+            })?
+    }
+
     /// Data-driven cooldown reset: called when out-of-band evidence says the
     /// peer is alive again (fresh workspace presence heartbeat). The next call
     /// dials immediately instead of waiting out the backoff window.
@@ -1014,5 +1135,27 @@ mod tests {
         );
         let host = device_room_ws_url("http://localhost:26640", "d", "host", None, "t");
         assert_eq!(host, "ws://localhost:26640/device/d/ws?role=host&token=t");
+
+        assert_eq!(
+            peer_session_ws_url(
+                "https://edge.example/",
+                "c1",
+                "tok",
+                "session-1",
+                Some("deployment-1"),
+            ),
+            "wss://edge.example/peer/session-1/ws?connId=c1&token=tok&deploymentId=deployment-1"
+        );
+        assert_eq!(
+            peer_device_ws_url(
+                "https://edge.example/",
+                "c1",
+                "tok",
+                "session-1",
+                Some("deployment-1"),
+                "device-1",
+            ),
+            "wss://edge.example/device/device-1/ws?role=client&connId=c1&token=tok&purpose=peer-reply&peerSessionId=session-1&peerDeploymentId=deployment-1"
+        );
     }
 }

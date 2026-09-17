@@ -157,6 +157,8 @@ interface SocketState {
   connId: string;
   grant?: TrustedDeviceGrant;
   hostAuthorization?: DeviceHostAuthorization;
+  peerSessionId?: string;
+  peerReply?: boolean;
   /** Accept time — the liveness floor until the socket's first auto-pong. */
   joinedAt?: number;
   /** A newer socket claimed this logical connection id. */
@@ -166,18 +168,21 @@ interface SocketState {
 const HOST_TAG = "host";
 const clientTag = (connId: string) => `client:${connId}`;
 export type DeviceHostAuthorization = "local" | "sandbox";
-
 export const authorizedDeviceSocketRole = (
   requestedRole: string | null,
   hasDeviceGrant: boolean,
-  hostAuthorization?: DeviceHostAuthorization
+  hostAuthorization?: DeviceHostAuthorization,
+  peerClient = false,
+  peerReply = false
 ): "host" | "client" | undefined => {
   if (requestedRole === "host") {
     const requiredAuthorization = hasDeviceGrant ? "sandbox" : "local";
     return hostAuthorization === requiredAuthorization ? "host" : undefined;
   }
   if (requestedRole === null || requestedRole === "client") {
-    return hasDeviceGrant || hostAuthorization !== undefined ? undefined : "client";
+    if (peerReply) return hostAuthorization === undefined ? "client" : undefined;
+    if (peerClient) return hasDeviceGrant && hostAuthorization === undefined ? "client" : undefined;
+    return !hasDeviceGrant && hostAuthorization === undefined ? "client" : undefined;
   }
   return undefined;
 };
@@ -326,7 +331,7 @@ export class DeviceRoom implements DurableObject {
 
   async revokeGrant(grantId: string): Promise<void> {
     this.revokedGrants.add(grantId);
-    for (const ws of this.ctx.getWebSockets(HOST_TAG)) {
+    for (const ws of this.ctx.getWebSockets()) {
       const state = ws.deserializeAttachment() as SocketState | null;
       if (state?.grant?.grantId !== grantId) continue;
       try {
@@ -349,6 +354,33 @@ export class DeviceRoom implements DurableObject {
       );
       return response.status === 204 && !this.revokedGrants.has(grantId);
     });
+  }
+
+  private async authorizePeerClient(ws: WebSocket, state: SocketState): Promise<boolean> {
+    if (!state.peerSessionId) return true;
+    if (state.peerReply && !state.grant) return true;
+    const grant = state.grant;
+    if (
+      !grant ||
+      grant.expiresAt <= Date.now() ||
+      this.revokedGrants.has(grant.grantId)
+    ) {
+      ws.close(4403, "device grant invalid");
+      return false;
+    }
+    try {
+      const stub = this.env.AUTH_GRANTS.get(this.env.AUTH_GRANTS.idFromName(grant.grantId));
+      const response = await stub.fetch(
+        new Request(`https://grant.internal/status?grantId=${encodeURIComponent(grant.grantId)}`, {
+          headers: { [GRANT_EVENT_HEADER]: "status" }
+        })
+      );
+      if (response.status === 204 && !this.revokedGrants.has(grant.grantId)) return true;
+    } catch {
+      /* fail closed */
+    }
+    ws.close(4403, "device grant invalid");
+    return false;
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -400,21 +432,36 @@ export class DeviceRoom implements DurableObject {
       if (grant.capabilities.some((capability) => !capabilities.includes(capability))) {
         return new Response("forbidden", { status: 403 });
       }
-      const boundDevice = this.getMeta("targetDeviceId");
-      if (!boundDevice) this.setMeta("targetDeviceId", grant.targetDeviceId);
-      else if (boundDevice !== grant.targetDeviceId) {
-        return new Response("forbidden", { status: 403 });
-      }
     }
     const owner = this.getMeta("owner");
 
     if (url.pathname === "/ws") {
+      const requestedPeerSessionId = url.searchParams.get("peerSessionId");
+      const peerSessionId =
+        requestedPeerSessionId &&
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestedPeerSessionId)
+          ? requestedPeerSessionId.toLowerCase()
+          : undefined;
+      const peerReply = url.searchParams.get("purpose") === "peer-reply";
       const role = authorizedDeviceSocketRole(
         url.searchParams.get("role"),
         grant !== undefined,
-        hostAuthorization
+        hostAuthorization,
+        peerSessionId !== undefined && !peerReply,
+        peerReply
       );
       if (!role) return new Response("forbidden", { status: 403 });
+      if (grant && role === "host") {
+        const targetDeviceId = url.searchParams.get("targetDeviceId");
+        if (targetDeviceId !== grant.targetDeviceId) {
+          return new Response("forbidden", { status: 403 });
+        }
+        const boundDevice = this.getMeta("targetDeviceId");
+        if (!boundDevice) this.setMeta("targetDeviceId", grant.targetDeviceId);
+        else if (boundDevice !== grant.targetDeviceId) {
+          return new Response("forbidden", { status: 403 });
+        }
+      }
       if (role === "host") {
         if (!hasCapability(capabilities, "session.environment")) {
           return new Response("forbidden", { status: 403 });
@@ -444,7 +491,9 @@ export class DeviceRoom implements DurableObject {
         connId,
         joinedAt: Date.now(),
         ...(role === "host" ? { hostAuthorization } : {}),
-        ...(grant ? { grant } : {})
+        ...(grant ? { grant } : {}),
+        ...(peerSessionId ? { peerSessionId } : {}),
+        ...(peerReply ? { peerReply } : {})
       };
       pair[1].serializeAttachment(state);
       if (role === "client") {
@@ -578,6 +627,7 @@ export class DeviceRoom implements DurableObject {
       ws.close(1008, "Missing socket authority");
       return;
     }
+    if (state.role === "client" && !(await this.authorizePeerClient(ws, state))) return;
     if (state.superseded) return;
     if (state.role === "host" && !(await this.authorizeHost(ws))) return;
     if (typeof message === "string") return; // ping/pong auto-response
@@ -593,6 +643,34 @@ export class DeviceRoom implements DurableObject {
         frame.header.k === "rpc" ? controlActorForRpc(frame.payload) : undefined;
       if (actorSubject !== undefined && actorSubject !== state.userId) {
         this.rejectRequest(ws, frame, "actor_mismatch");
+        return;
+      }
+      if (!state.peerSessionId) {
+        try {
+          const value = JSON.parse(new TextDecoder().decode(frame.payload)) as { method?: string };
+          if (value.method === "DeliverPeerMessage") {
+            this.rejectRequest(ws, frame, "session_scope_denied");
+            return;
+          }
+        } catch {
+          /* the capability gate below rejects malformed RPC */
+        }
+      }
+      if (
+        state.peerSessionId &&
+        (frame.header.k !== "rpc" ||
+          (state.peerReply && !state.grant
+            ? !rpcAllowedForDirectPeerReply(frame.payload, state.peerSessionId)
+            : !state.grant ||
+              !rpcAllowedForPeerSession(
+                frame.payload,
+                state.grant.scope.sessionId,
+                state.grant.scope.deploymentId,
+                state.grant.targetDeviceId,
+                state.peerSessionId
+              )))
+      ) {
+        this.rejectRequest(ws, frame, "session_scope_denied");
         return;
       }
       const required = requiredCapabilityForRpc(frame.header, frame.payload);
@@ -722,7 +800,6 @@ export const controlActorForRpc = (payload: Uint8Array): string | undefined => {
   }
 };
 
-
 export const rpcAllowedForScopedHost = (
   header: DeviceFrameHeader,
   payload: Uint8Array,
@@ -733,7 +810,9 @@ export const rpcAllowedForScopedHost = (
   try {
     const value = JSON.parse(new TextDecoder().decode(payload)) as {
       method?: string;
-      params?: Record<string, unknown> & { command?: { sessionId?: string } };
+      params?: Record<string, unknown> & {
+        command?: { kind?: string; sessionId?: string };
+      };
     };
     if (
       value.method === "LocalDevice" &&
@@ -749,9 +828,123 @@ export const rpcAllowedForScopedHost = (
           value.params.targetDeviceId === grant.targetDeviceId)
       );
     }
+    if (value.method === "DeliverPeerMessage") {
+      return (
+        grant.capabilities.includes("session.chat") &&
+        value.params?.chatId === grant.scope.sessionId &&
+        value.params.command?.kind === "peerMessage"
+      );
+    }
     return (
       value.method === "QueueCommand" &&
       value.params?.command?.sessionId === grant.scope.sessionId
+    );
+  } catch {
+    return false;
+  }
+};
+
+export const rpcAllowedForDirectPeerReply = (
+  payload: Uint8Array,
+  targetSessionId: string
+): boolean => {
+  try {
+    const value = JSON.parse(new TextDecoder().decode(payload)) as {
+      method?: string;
+      params?: {
+        chatId?: string;
+        commandId?: string;
+        command?: {
+          kind?: string;
+          text?: string;
+          sourceChatId?: string;
+          sourceDeviceId?: string;
+          threadId?: string;
+          replyTo?: string | null;
+          hopCount?: number;
+        };
+      };
+    };
+    if (value.method === "LocalDevice") {
+      return !value.params || Object.keys(value.params).length === 0;
+    }
+    const command = value.params?.command;
+    return value.method === "DeliverPeerMessage"
+      && value.params?.chatId === targetSessionId
+      && typeof value.params.commandId === "string"
+      && value.params.commandId.length > 0
+      && command?.kind === "peerMessage"
+      && typeof command.sourceChatId === "string"
+      && command.sourceChatId.length > 0
+      && typeof command.sourceDeviceId === "string"
+      && command.sourceDeviceId.length > 0
+      && typeof command.threadId === "string"
+      && command.threadId.length > 0
+      && command.threadId.length <= 256
+      && typeof command.replyTo === "string"
+      && command.replyTo.length > 0
+      && command.replyTo.length <= 256
+      && Number.isSafeInteger(command.hopCount)
+      && (command.hopCount as number) > 0
+      && (command.hopCount as number) <= 8
+      && typeof command.text === "string"
+      && command.text.trim().length > 0
+      && command.text.length <= 256 * 1024;
+  } catch {
+    return false;
+  }
+};
+
+export const rpcAllowedForPeerSession = (
+  payload: Uint8Array,
+  sourceSessionId: string,
+  sourceDeploymentId: string,
+  sourceDeviceId: string,
+  targetSessionId: string
+): boolean => {
+  try {
+    const value = JSON.parse(new TextDecoder().decode(payload)) as {
+      method?: string;
+      params?: {
+        chatId?: string;
+        commandId?: string;
+        command?: {
+          kind?: string;
+          sourceChatId?: string;
+          sourceDeploymentId?: string;
+          sourceDeviceId?: string;
+          threadId?: string;
+          replyTo?: string | null;
+          hopCount?: number;
+          text?: string;
+        };
+      };
+    };
+    if (value.method === "LocalDevice") {
+      return !value.params || Object.keys(value.params).length === 0;
+    }
+    return (
+      value.method === "DeliverPeerMessage" &&
+      value.params?.chatId === targetSessionId &&
+      typeof value.params.commandId === "string" &&
+      value.params.commandId.length > 0 &&
+      value.params.command?.kind === "peerMessage" &&
+      value.params.command.sourceChatId === sourceSessionId &&
+      value.params.command.sourceDeploymentId === sourceDeploymentId &&
+      value.params.command.sourceDeviceId === sourceDeviceId &&
+      typeof value.params.command.threadId === "string" &&
+      value.params.command.threadId.length > 0 &&
+      value.params.command.threadId.length <= 256 &&
+      (value.params.command.replyTo === null ||
+        (typeof value.params.command.replyTo === "string" &&
+          value.params.command.replyTo.length > 0 &&
+          value.params.command.replyTo.length <= 256)) &&
+      Number.isSafeInteger(value.params.command.hopCount) &&
+      (value.params.command.hopCount as number) >= 0 &&
+      (value.params.command.hopCount as number) <= 8 &&
+      typeof value.params.command.text === "string" &&
+      value.params.command.text.trim().length > 0 &&
+      value.params.command.text.length <= 256 * 1024
     );
   } catch {
     return false;
@@ -772,6 +965,8 @@ export const requiredCapabilityForRpc = (
   } catch {
     return "session.control";
   }
+  if (value.method === "DeliverPeerMessage") return "session.chat";
+  if (value.method === "LocalDevice") return SESSION_READ;
   if (value.method === "QueueCommand") {
     const command = value.params?.command;
     if (command?.kind !== "control") return "session.control";

@@ -10,9 +10,9 @@ use comet_doc::{
     MessagePart, MessageRole, MessageStatus, SessionCommandEntry, SessionCommandPayload,
     SessionCommandStatus, SessionMessageEntry,
 };
+use comet_engine::doc_host::peer_message_prompt;
 use comet_engine::{EngineCore, HarnessRegistry};
 use comet_harness::{Harness, HarnessError, RunControls, SteerMessage};
-use comet_engine::doc_host::peer_message_prompt;
 use comet_proto::{
     AgentEvent, ChatConfig, DoneStatus, HarnessId, Model, PeerMessageProvenance, ReasoningLevel,
     RunRequest, RuntimeProfile, SandboxLevel, SteeringMode,
@@ -32,7 +32,10 @@ type RequestLog = Arc<Mutex<Vec<RunRequest>>>;
 struct RecordingHarness {
     requests: RequestLog,
     run_number: AtomicU64,
-    steering: Option<(SteeringMode, tokio::sync::mpsc::UnboundedSender<SteerMessage>)>,
+    steering: Option<(
+        SteeringMode,
+        tokio::sync::mpsc::UnboundedSender<SteerMessage>,
+    )>,
 }
 
 #[async_trait]
@@ -50,7 +53,9 @@ impl Harness for RecordingHarness {
     }
 
     fn steering_mode(&self) -> SteeringMode {
-        self.steering.as_ref().map_or(SteeringMode::TurnBoundary, |(mode, _)| *mode)
+        self.steering
+            .as_ref()
+            .map_or(SteeringMode::TurnBoundary, |(mode, _)| *mode)
     }
 
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
@@ -99,7 +104,8 @@ impl Harness for RecordingHarness {
             });
             return Ok(futures::stream::unfold(rx, |mut rx| async move {
                 rx.recv().await.map(|event| (event, rx))
-            }).boxed());
+            })
+            .boxed());
         }
         let events = vec![
             Ok(AgentEvent::SessionStarted {
@@ -128,7 +134,10 @@ fn assemble(dir: &std::path::Path) -> (EngineCore, RequestLog) {
 
 fn assemble_with_steering(
     dir: &std::path::Path,
-    steering: Option<(SteeringMode, tokio::sync::mpsc::UnboundedSender<SteerMessage>)>,
+    steering: Option<(
+        SteeringMode,
+        tokio::sync::mpsc::UnboundedSender<SteerMessage>,
+    )>,
 ) -> (EngineCore, RequestLog) {
     std::fs::create_dir_all(dir).expect("create data dir");
     std::fs::write(dir.join("device-id"), "peer-test-device").expect("write device id");
@@ -268,16 +277,83 @@ async fn send_auto_refs_foreign_target_and_dedupes_caller_command_id() {
         SessionCommandPayload::PeerMessage {
             text,
             source_chat_id,
+            source_deployment_id: None,
+            source_device_id,
             thread_id,
             reply_to: None,
             hop_count: 0,
-        } if text == "review the patch" && source_chat_id == SOURCE && thread_id == COMMAND
+        } if text == "review the patch" && source_chat_id == SOURCE
+            && source_device_id.as_deref() == Some("peer-test-device") && thread_id == COMMAND
     ));
     assert!(
         requests.lock().await.is_empty(),
         "an importer is not the target host"
     );
 
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn relay_peer_delivery_requires_owned_target_and_dedupes_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, requests) = assemble(dir.path());
+    host_chats(&core, &[TARGET]);
+    let client = comet_rpc::memory_client(core.rpc_service());
+    let payload = serde_json::json!({
+        "kind": "peerMessage", "text": "relay delivery", "sourceChatId": SOURCE,
+        "sourceDeviceId": "peer-source-device", "threadId": COMMAND,
+        "replyTo": null, "hopCount": 0,
+    });
+    let params = serde_json::json!({
+        "chatId": TARGET, "commandId": COMMAND, "command": payload,
+    });
+
+    let first = client
+        .call(methods::DELIVER_PEER_MESSAGE, params.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        first,
+        client
+            .call(methods::DELIVER_PEER_MESSAGE, params)
+            .await
+            .unwrap()
+    );
+    let mut different = payload.clone();
+    different["text"] = serde_json::json!("different");
+    let conflict = client
+        .call(
+            methods::DELIVER_PEER_MESSAGE,
+            serde_json::json!({
+                "chatId": TARGET, "commandId": COMMAND, "command": different,
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.to_string(), "command_id_conflict");
+    let foreign = client
+        .call(
+            methods::DELIVER_PEER_MESSAGE,
+            serde_json::json!({
+                "chatId": HOP_COMMAND, "commandId": "foreign-delivery", "command": payload,
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(foreign.to_string(), "invalid_peer_delivery");
+
+    let delivered = peer_message_prompt(SOURCE, COMMAND, TARGET, COMMAND, "relay delivery");
+    wait_for(
+        || {
+            command(&core, TARGET, COMMAND)
+                .is_some_and(|entry| entry.status == SessionCommandStatus::Applied)
+                && requests
+                    .try_lock()
+                    .is_ok_and(|logged| logged.iter().any(|request| request.prompt == delivered))
+        },
+        "relay peer delivery",
+    )
+    .await;
     core.shutdown().await;
 }
 
@@ -321,14 +397,20 @@ async fn peer_message_provenance_preserves_delivery_reply_correlation_and_restar
             .any(|request| request.prompt == delivered),
         "the harness and transcript must receive the same original prompt"
     );
-    let target_entry = entries(&core, TARGET).into_iter().find(|e| e.id == COMMAND).unwrap();
+    let target_entry = entries(&core, TARGET)
+        .into_iter()
+        .find(|e| e.id == COMMAND)
+        .unwrap();
     assert!(target_entry.is_peer_message());
-    assert_eq!(target_entry.peer_message, Some(PeerMessageProvenance {
-        command_id: COMMAND.into(),
-        source_chat_id: SOURCE.into(),
-        thread_id: COMMAND.into(),
-        reply_to: None,
-    }));
+    assert_eq!(
+        target_entry.peer_message,
+        Some(PeerMessageProvenance {
+            command_id: COMMAND.into(),
+            source_chat_id: SOURCE.into(),
+            thread_id: COMMAND.into(),
+            reply_to: None,
+        })
+    );
 
     let reply = client
         .call(
@@ -358,11 +440,14 @@ async fn peer_message_provenance_preserves_delivery_reply_correlation_and_restar
         SessionCommandPayload::PeerMessage {
             text,
             source_chat_id,
+            source_deployment_id: None,
+            source_device_id,
             thread_id,
             reply_to: Some(reply_to),
             hop_count: 1,
         } if text == "the patch is clean"
             && source_chat_id == TARGET
+            && source_device_id.as_deref() == Some("peer-test-device")
             && thread_id == COMMAND
             && reply_to == COMMAND
     ));
@@ -378,26 +463,41 @@ async fn peer_message_provenance_preserves_delivery_reply_correlation_and_restar
             .iter()
             .any(|request| request.prompt == reply_prompt)
     );
-    let source_entry = entries(&core, SOURCE).into_iter().find(|e| e.id == reply_id).unwrap();
+    let source_entry = entries(&core, SOURCE)
+        .into_iter()
+        .find(|e| e.id == reply_id)
+        .unwrap();
     assert!(source_entry.is_peer_message());
-    assert_eq!(source_entry.peer_message, Some(PeerMessageProvenance {
-        command_id: reply_id.into(),
-        source_chat_id: TARGET.into(),
-        thread_id: COMMAND.into(),
-        reply_to: Some(COMMAND.into()),
-    }));
+    assert_eq!(
+        source_entry.peer_message,
+        Some(PeerMessageProvenance {
+            command_id: reply_id.into(),
+            source_chat_id: TARGET.into(),
+            thread_id: COMMAND.into(),
+            reply_to: Some(COMMAND.into()),
+        })
+    );
 
     core.shutdown().await;
     drop(client);
     drop(core);
     let (restarted, restart_requests) = assemble(dir.path());
     for (chat_id, expected) in [(TARGET, target_entry), (SOURCE, source_entry)] {
-        let restored = entries(&restarted, chat_id).into_iter().find(|e| e.id == expected.id).unwrap();
+        let restored = entries(&restarted, chat_id)
+            .into_iter()
+            .find(|e| e.id == expected.id)
+            .unwrap();
         assert_eq!(restored, expected);
         assert!(restored.is_peer_message());
-        assert_eq!(command(&restarted, chat_id, &restored.id).unwrap().status, SessionCommandStatus::Applied);
+        assert_eq!(
+            command(&restarted, chat_id, &restored.id).unwrap().status,
+            SessionCommandStatus::Applied
+        );
     }
-    assert!(restart_requests.lock().await.is_empty(), "restart must not redeliver settled peer commands");
+    assert!(
+        restart_requests.lock().await.is_empty(),
+        "restart must not redeliver settled peer commands"
+    );
     restarted.shutdown().await;
 }
 
@@ -413,6 +513,8 @@ async fn peer_reply_rejects_a_delivered_hop_eight_command() {
             SessionCommandPayload::PeerMessage {
                 text: "final hop".into(),
                 source_chat_id: SOURCE.into(),
+                source_deployment_id: None,
+                source_device_id: Some("peer-source-device".into()),
                 thread_id: COMMAND.into(),
                 reply_to: Some(COMMAND.into()),
                 hop_count: 8,
@@ -537,7 +639,8 @@ async fn live_waiter_returns_reply_without_double_delivering_to_harness() {
         "waiter reply status",
     )
     .await;
-    let reply_prompt = peer_message_prompt(TARGET, WAIT_COMMAND, SOURCE, &reply_id, "waiter answer");
+    let reply_prompt =
+        peer_message_prompt(TARGET, WAIT_COMMAND, SOURCE, &reply_id, "waiter answer");
     let transcript = entries(&core, SOURCE);
     assert_eq!(
         transcript
@@ -551,9 +654,15 @@ async fn live_waiter_returns_reply_without_double_delivering_to_harness() {
         message_text(&core, SOURCE, &reply_id).as_deref(),
         Some(reply_prompt.as_str())
     );
-    let peer = transcript.iter().find(|entry| entry.id == reply_id).unwrap();
+    let peer = transcript
+        .iter()
+        .find(|entry| entry.id == reply_id)
+        .unwrap();
     assert!(peer.is_peer_message());
-    assert_eq!(peer.peer_message.as_ref().unwrap().reply_to.as_deref(), Some(WAIT_COMMAND));
+    assert_eq!(
+        peer.peer_message.as_ref().unwrap().reply_to.as_deref(),
+        Some(WAIT_COMMAND)
+    );
     {
         let logged = requests.lock().await;
         assert_eq!(
@@ -573,11 +682,13 @@ async fn timed_out_waiter_allows_a_late_reply_to_deliver_normally() {
     let (core, requests) = assemble(dir.path());
     host_chats(&core, &[SOURCE, TARGET]);
     let client = comet_rpc::memory_client(core.rpc_service());
-    let target_prompt = peer_message_prompt(SOURCE,
-    LATE_COMMAND,
-    TARGET,
-    LATE_COMMAND,
-    "answer after timeout",);
+    let target_prompt = peer_message_prompt(
+        SOURCE,
+        LATE_COMMAND,
+        TARGET,
+        LATE_COMMAND,
+        "answer after timeout",
+    );
 
     let timed_out = client
         .call(
@@ -635,7 +746,13 @@ async fn timed_out_waiter_allows_a_late_reply_to_deliver_normally() {
         2,
         "target delivery plus the post-timeout source delivery"
     );
-    assert!(entries(&core, SOURCE).iter().find(|entry| entry.id == reply_id).unwrap().is_peer_message());
+    assert!(
+        entries(&core, SOURCE)
+            .iter()
+            .find(|entry| entry.id == reply_id)
+            .unwrap()
+            .is_peer_message()
+    );
 
     core.shutdown().await;
 }
@@ -650,70 +767,138 @@ async fn peer_visibility_preserves_active_steering_and_turn_boundary_delivery() 
         let (received, mut steering) = tokio::sync::mpsc::unbounded_channel();
         let (core, requests) = assemble_with_steering(dir.path(), Some((mode, received)));
         host_chats(&core, &[SOURCE, TARGET]);
-        let lookalike = peer_message_prompt(SOURCE, COMMAND, TARGET, COMMAND, "ordinary typed message");
-        core.sessions.dispatch(TARGET, HarnessId::Mock, RunRequest {
-            prompt: lookalike.clone(),
-            model: None,
-            agent_account_id: None,
-            reasoning: None,
-            model_options: Default::default(),
-            cwd: "/tmp/peer".into(),
-            sandbox: SandboxLevel::WorkspaceWrite,
-            auto_approve: true,
-            attachments: Vec::new(),
-            resume: None,
-        }, Some("ordinary-user".into())).await.unwrap();
-        let ordinary = entries(&core, TARGET).into_iter().find(|e| e.id == "ordinary-user").unwrap();
+        let lookalike =
+            peer_message_prompt(SOURCE, COMMAND, TARGET, COMMAND, "ordinary typed message");
+        core.sessions
+            .dispatch(
+                TARGET,
+                HarnessId::Mock,
+                RunRequest {
+                    prompt: lookalike.clone(),
+                    model: None,
+                    agent_account_id: None,
+                    reasoning: None,
+                    model_options: Default::default(),
+                    cwd: "/tmp/peer".into(),
+                    sandbox: SandboxLevel::WorkspaceWrite,
+                    auto_approve: true,
+                    attachments: Vec::new(),
+                    resume: None,
+                },
+                Some("ordinary-user".into()),
+            )
+            .await
+            .unwrap();
+        let ordinary = entries(&core, TARGET)
+            .into_iter()
+            .find(|e| e.id == "ordinary-user")
+            .unwrap();
         assert!(!ordinary.is_peer_message());
         assert!(ordinary.peer_message.is_none());
-        assert_eq!(message_text(&core, TARGET, "ordinary-user"), Some(lookalike.clone()));
+        assert_eq!(
+            message_text(&core, TARGET, "ordinary-user"),
+            Some(lookalike.clone())
+        );
         assert_eq!(requests.lock().await[0].prompt, lookalike);
 
         let client = comet_rpc::memory_client(core.rpc_service());
-        client.call(methods::SEND_PEER_MESSAGE, serde_json::json!({
-            "sourceChatId": SOURCE,
-            "targetChatId": TARGET,
-            "text": "private-peer-body",
-            "commandId": COMMAND,
-        })).await.unwrap();
+        client
+            .call(
+                methods::SEND_PEER_MESSAGE,
+                serde_json::json!({
+                    "sourceChatId": SOURCE,
+                    "targetChatId": TARGET,
+                    "text": "private-peer-body",
+                    "commandId": COMMAND,
+                }),
+            )
+            .await
+            .unwrap();
         let delivered = tokio::time::timeout(Duration::from_secs(5), steering.recv())
-            .await.unwrap().unwrap();
-        wait_for(|| command(&core, TARGET, COMMAND)
-            .is_some_and(|entry| entry.status == SessionCommandStatus::Applied), "active peer delivery").await;
-        let peer = entries(&core, TARGET).into_iter().find(|e| e.id == COMMAND).unwrap();
+            .await
+            .unwrap()
+            .unwrap();
+        wait_for(
+            || {
+                command(&core, TARGET, COMMAND)
+                    .is_some_and(|entry| entry.status == SessionCommandStatus::Applied)
+            },
+            "active peer delivery",
+        )
+        .await;
+        let peer = entries(&core, TARGET)
+            .into_iter()
+            .find(|e| e.id == COMMAND)
+            .unwrap();
         assert!(peer.is_peer_message());
         assert_eq!(peer.status, Some(expected_status));
         assert_eq!(delivered.message_id.as_deref(), Some(COMMAND));
         assert_eq!(Some(delivered.prompt), message_text(&core, TARGET, COMMAND));
-        assert_eq!(requests.lock().await.len(), 1, "steering must not dispatch a replacement run");
+        assert_eq!(
+            requests.lock().await.len(),
+            1,
+            "steering must not dispatch a replacement run"
+        );
         let chat = core.workspace.doc().chat(TARGET).unwrap().unwrap();
         let preview = chat.last_message_preview.unwrap();
         assert!(!preview.contains("private-peer-body"));
-        assert!(chat.last_message_at.is_some(), "peer activity freshness remains intact");
+        assert!(
+            chat.last_message_at.is_some(),
+            "peer activity freshness remains intact"
+        );
         // A later large output can consume the bounded window's entire budget.
         // Explicit reveal must still retrieve the unchanged original peer prompt.
-        core.doc_host.open(TARGET).unwrap().doc().push_message(&SessionMessageEntry {
-            id: "large-output".into(),
-            role: MessageRole::Assistant,
-            parts: vec![MessagePart::Text { id: "t0".into(), text: "x".repeat(comet_doc::TAIL_TEXT_BYTE_BUDGET) }],
-            created_at: 2,
-            device_id: core.device_id.clone(),
-            status: Some(MessageStatus::Complete),
-            continuation_of: None,
-            peer_message: None,
-        }).unwrap();
+        core.doc_host
+            .open(TARGET)
+            .unwrap()
+            .doc()
+            .push_message(&SessionMessageEntry {
+                id: "large-output".into(),
+                role: MessageRole::Assistant,
+                parts: vec![MessagePart::Text {
+                    id: "t0".into(),
+                    text: "x".repeat(comet_doc::TAIL_TEXT_BYTE_BUDGET),
+                }],
+                created_at: 2,
+                device_id: core.device_id.clone(),
+                status: Some(MessageStatus::Complete),
+                continuation_of: None,
+                peer_message: None,
+            })
+            .unwrap();
         let handle = core.doc_host.open(TARGET).unwrap();
         let window = handle.doc().read_entry_window(None, 64).unwrap();
-        let projected = window.entries.iter().find(|entry| entry.id == COMMAND).unwrap();
-        assert!(projected.parts.iter().any(|part| matches!(part, MessagePart::TextWindow { .. })));
-        let original: SessionMessageEntry = serde_json::from_value(client.call(
-            methods::READ_DOC_MESSAGE,
-            serde_json::json!({ "chatId": TARGET, "messageId": COMMAND }),
-        ).await.unwrap()).unwrap();
+        let projected = window
+            .entries
+            .iter()
+            .find(|entry| entry.id == COMMAND)
+            .unwrap();
+        assert!(
+            projected
+                .parts
+                .iter()
+                .any(|part| matches!(part, MessagePart::TextWindow { .. }))
+        );
+        let original: SessionMessageEntry = serde_json::from_value(
+            client
+                .call(
+                    methods::READ_DOC_MESSAGE,
+                    serde_json::json!({ "chatId": TARGET, "messageId": COMMAND }),
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(original, peer);
-        assert!(client.call(methods::READ_DOC_MESSAGE,
-            serde_json::json!({ "chatId": TARGET, "messageId": "missing" }),
-        ).await.is_err());
+        assert!(
+            client
+                .call(
+                    methods::READ_DOC_MESSAGE,
+                    serde_json::json!({ "chatId": TARGET, "messageId": "missing" }),
+                )
+                .await
+                .is_err()
+        );
         core.shutdown().await;
     }
 }
@@ -724,11 +909,20 @@ async fn historical_peer_command_identity_never_retrofits_unmarked_messages() {
     let (core, _) = assemble(dir.path());
     host_chats(&core, &[SOURCE, TARGET]);
     let handle = core.doc_host.open(TARGET).unwrap();
-    let prompt = peer_message_prompt(SOURCE, COMMAND, TARGET, COMMAND, "retained historical context");
+    let prompt = peer_message_prompt(
+        SOURCE,
+        COMMAND,
+        TARGET,
+        COMMAND,
+        "retained historical context",
+    );
     let original = SessionMessageEntry {
         id: COMMAND.into(),
         role: MessageRole::User,
-        parts: vec![MessagePart::Text { id: "t0".into(), text: prompt.clone() }],
+        parts: vec![MessagePart::Text {
+            id: "t0".into(),
+            text: prompt.clone(),
+        }],
         created_at: 1,
         device_id: core.device_id.clone(),
         status: Some(MessageStatus::Complete),
@@ -736,22 +930,27 @@ async fn historical_peer_command_identity_never_retrofits_unmarked_messages() {
         peer_message: None,
     };
     handle.doc().push_message(&original).unwrap();
-    handle.doc().queue_command(&SessionCommandEntry {
-        id: COMMAND.into(),
-        payload: SessionCommandPayload::PeerMessage {
-            text: "retained historical context".into(),
-            source_chat_id: SOURCE.into(),
-            thread_id: COMMAND.into(),
-            reply_to: None,
-            hop_count: 0,
-        },
-        issued_by: core.device_id.clone(),
-        issued_at: 1,
-        based_on: None,
-        expires_at: None,
-        status: SessionCommandStatus::Applied,
-        resolution: None,
-    }).unwrap();
+    handle
+        .doc()
+        .queue_command(&SessionCommandEntry {
+            id: COMMAND.into(),
+            payload: SessionCommandPayload::PeerMessage {
+                text: "retained historical context".into(),
+                source_chat_id: SOURCE.into(),
+                source_deployment_id: None,
+                source_device_id: Some("peer-source-device".into()),
+                thread_id: COMMAND.into(),
+                reply_to: None,
+                hop_count: 0,
+            },
+            issued_by: core.device_id.clone(),
+            issued_at: 1,
+            based_on: None,
+            expires_at: None,
+            status: SessionCommandStatus::Applied,
+            resolution: None,
+        })
+        .unwrap();
     assert!(!handle.write_user_message(COMMAND, &prompt, 2).unwrap());
     assert_eq!(entries(&core, TARGET), vec![original]);
     core.shutdown().await;

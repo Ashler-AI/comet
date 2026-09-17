@@ -3674,7 +3674,9 @@ fn mention_error_message(err: &RpcError) -> SharedString {
             "The session's device runs an older comet — update it to search its files".into()
         }
         RpcError::Transport(_) | RpcError::Closed => "The session's device is unreachable".into(),
-        RpcError::BadParams(_) | RpcError::Failed(_) | RpcError::ScaffoldAuthUnavailable => "File search failed".into(),
+        RpcError::BadParams(_) | RpcError::Failed(_) | RpcError::ScaffoldAuthUnavailable => {
+            "File search failed".into()
+        }
     }
 }
 
@@ -4835,7 +4837,13 @@ impl Composer {
     }
 
     fn button_mode(&self, cx: &App) -> SendButtonMode {
-        if self.state.read(cx).selected_chat.as_ref().is_some_and(|id| self.scaffold_preparations.contains_key(id)) {
+        if self
+            .state
+            .read(cx)
+            .selected_chat
+            .as_ref()
+            .is_some_and(|id| self.scaffold_preparations.contains_key(id))
+        {
             return SendButtonMode::Stop;
         }
         let startup_in_progress = {
@@ -5129,7 +5137,9 @@ impl Composer {
             let (sender, receiver) = futures::channel::oneshot::channel();
             self.scaffold_preparations.insert(chat_id.clone(), sender);
             Some(receiver)
-        } else { None };
+        } else {
+            None
+        };
         cx.emit(ComposerEvent::Sent {
             chat_id: chat_id.clone(),
         });
@@ -5825,7 +5835,9 @@ impl Composer {
             cx.notify();
             return;
         }
-        let action = Box::new(SessionControlAction::Stop { expected_turn_id: None });
+        let action = Box::new(SessionControlAction::Stop {
+            expected_turn_id: None,
+        });
         let params = match self.control_route(action.required_capability(), cx) {
             Ok(Some(route)) => serde_json::json!({
                 "chatId": chat_id,
@@ -8207,7 +8219,9 @@ mod tests {
             comet_proto::CAPABILITY_SESSION_CHAT,
             comet_proto::CAPABILITY_SESSION_CONTROL,
         ]);
-        let action = SessionControlAction::Stop { expected_turn_id: None };
+        let action = SessionControlAction::Stop {
+            expected_turn_id: None,
+        };
         assert_eq!(
             control_route_grant_id(
                 &snapshot,
@@ -8243,7 +8257,9 @@ mod tests {
     #[test]
     fn chat_only_authority_cannot_route_stop() {
         let snapshot = route_snapshot(&[comet_proto::CAPABILITY_SESSION_CHAT]);
-        let action = SessionControlAction::Stop { expected_turn_id: None };
+        let action = SessionControlAction::Stop {
+            expected_turn_id: None,
+        };
         assert!(
             control_route_grant_id(
                 &snapshot,

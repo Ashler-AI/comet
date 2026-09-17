@@ -651,7 +651,10 @@ impl WorkspaceHost {
         let mut refs = self.watch_session_refs();
         let device_id = self.inner.config.device_id.clone();
         let (tx, rx) = watch::channel(merge_sessions(
-            &device_id, &rows.borrow(), &local.borrow(), &refs.borrow(),
+            &device_id,
+            &rows.borrow(),
+            &local.borrow(),
+            &refs.borrow(),
         ));
         tokio::spawn(async move {
             loop {
@@ -854,10 +857,16 @@ impl WorkspaceHost {
     pub fn record_session(&self, session: &Session) {
         if comet_proto::parse_scaffold_device_id(&self.inner.config.device_id).is_none()
             && session.device_id == self.inner.config.device_id
-            && self.inner.doc.session_ref(&self.inner.config.user_id, &session.chat_id)
-                .ok().flatten().is_some_and(|reference| {
+            && self
+                .inner
+                .doc
+                .session_ref(&self.inner.config.user_id, &session.chat_id)
+                .ok()
+                .flatten()
+                .is_some_and(|reference| {
                     crate::session_activity::projection(&reference, self.project_scope()).is_some()
-                }) {
+                })
+        {
             return;
         }
         if let Err(err) = self.inner.doc.upsert_session(session) {
@@ -874,27 +883,44 @@ impl WorkspaceHost {
         last_message_at: Option<i64>,
     ) -> Result<(), EngineError> {
         let _updates = lock(&self.inner.session_ref_updates);
-        let Some(reference) = self.inner.doc.session_ref(&self.inner.config.user_id, &session.chat_id)? else {
+        let Some(reference) = self
+            .inner
+            .doc
+            .session_ref(&self.inner.config.user_id, &session.chat_id)?
+        else {
             return Ok(());
         };
-        if crate::session_activity::projection(&reference, self.project_scope()).as_ref() != Some(projection) {
+        if crate::session_activity::projection(&reference, self.project_scope()).as_ref()
+            != Some(projection)
+        {
             return Ok(());
         }
-        if self.inner.sessions_tx.borrow().iter().find(|row| row.chat_id == session.chat_id) != Some(session) {
+        if self
+            .inner
+            .sessions_tx
+            .borrow()
+            .iter()
+            .find(|row| row.chat_id == session.chat_id)
+            != Some(session)
+        {
             self.record_session(session);
         }
         if self.inner.doc.chat(&session.chat_id)?.is_none() {
             self.inner.doc.upsert_chat(&Chat {
                 id: session.chat_id.clone(),
                 device_id: session.device_id.clone(),
-                title: reference.environment.as_ref().and_then(|environment| environment.name.clone()),
+                title: reference
+                    .environment
+                    .as_ref()
+                    .and_then(|environment| environment.name.clone()),
                 archived: false,
                 cwd: None,
                 branch: None,
                 checkout_id: None,
                 config: None,
                 last_message_preview: None,
-                last_message_at: last_message_at.and_then(chrono::DateTime::<Utc>::from_timestamp_millis),
+                last_message_at: last_message_at
+                    .and_then(chrono::DateTime::<Utc>::from_timestamp_millis),
                 created_at: reference.added_at,
                 harness_session_id: None,
                 harness_session_cwd: None,
@@ -904,17 +930,23 @@ impl WorkspaceHost {
             })?;
             return Ok(());
         }
-        let Some(at) = last_message_at.filter(|at| chrono::DateTime::<Utc>::from_timestamp_millis(*at).is_some()) else {
+        let Some(at) = last_message_at
+            .filter(|at| chrono::DateTime::<Utc>::from_timestamp_millis(*at).is_some())
+        else {
             return Ok(());
         };
         let raw = self.inner.doc.doc();
-        let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) = raw.get_map("chats").get(&session.chat_id) else {
+        let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) =
+            raw.get_map("chats").get(&session.chat_id)
+        else {
             return Ok(());
         };
-        if matches!(row.get("lastMessageAt"), Some(loro::ValueOrContainer::Value(loro::LoroValue::I64(current))) if current >= at) {
+        if matches!(row.get("lastMessageAt"), Some(loro::ValueOrContainer::Value(loro::LoroValue::I64(current))) if current >= at)
+        {
             return Ok(());
         }
-        row.insert("lastMessageAt", at).map_err(comet_doc::DocError::from)?;
+        row.insert("lastMessageAt", at)
+            .map_err(comet_doc::DocError::from)?;
         raw.commit();
         Ok(())
     }
@@ -1500,18 +1532,28 @@ fn merge_sessions(
     local: &[Session],
     refs: &[SessionRef],
 ) -> Vec<Session> {
-    let remote: std::collections::HashSet<&str> = refs.iter().filter(|reference| {
-        comet_proto::parse_scaffold_device_id(device_id).is_none() &&
-        reference.environment.as_ref().is_some_and(|environment| matches!(
-            environment.source, comet_proto::SessionEnvironmentSource::Scaffold { .. }
-        ))
-    }).map(|reference| reference.chat_id.as_str()).collect();
+    let remote: std::collections::HashSet<&str> = refs
+        .iter()
+        .filter(|reference| {
+            comet_proto::parse_scaffold_device_id(device_id).is_none()
+                && reference.environment.as_ref().is_some_and(|environment| {
+                    matches!(
+                        environment.source,
+                        comet_proto::SessionEnvironmentSource::Scaffold { .. }
+                    )
+                })
+        })
+        .map(|reference| reference.chat_id.as_str())
+        .collect();
     let mut merged: std::collections::HashMap<String, Session> = rows
         .iter()
         .filter(|s| s.device_id != device_id || remote.contains(s.chat_id.as_str()))
         .map(|s| (s.chat_id.clone(), s.clone()))
         .collect();
-    for session in local.iter().filter(|s| !remote.contains(s.chat_id.as_str())) {
+    for session in local
+        .iter()
+        .filter(|s| !remote.contains(s.chat_id.as_str()))
+    {
         // Native handoffs retain their private execution row for turn identity.
         if let Some((chat_id, session_id)) = session.chat_id.split_once("::session::")
             && chat_id == session_id

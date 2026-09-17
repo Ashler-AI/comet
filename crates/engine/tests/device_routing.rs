@@ -366,6 +366,136 @@ async fn target_device_id_routes_over_the_relay() {
     core_b.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_command_reaches_its_target_device() {
+    const SOURCE: &str = "00000000-0000-4000-8000-000000000001";
+    const TARGET: &str = "00000000-0000-4000-8000-000000000002";
+    const COMMAND: &str = "peer-command";
+
+    let (relay_url, _relay) = fake_device_room().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let target = assemble(&dir.path().join("target"), "device-target");
+    target
+        .workspace
+        .create_space("peer-space", "device-target", "/tmp", None, false)
+        .expect("create target space");
+    target
+        .workspace
+        .create_chat(TARGET, "peer-space", None, None)
+        .expect("create target chat");
+    let _host = target.start_host_relay(&relay_url);
+
+    let mut config = LinkCacheConfig::new(relay_url, Arc::new(StaticToken("test-user".into())));
+    config.probe_timeout = Duration::from_secs(5);
+    let links = LinkCache::new(config);
+    let params = serde_json::json!({
+        "chatId": TARGET,
+        "commandId": COMMAND,
+        "command": {
+            "kind": "peerMessage",
+            "text": "relay this",
+            "sourceChatId": SOURCE,
+            "sourceDeviceId": "device-source",
+            "threadId": COMMAND,
+            "replyTo": null,
+            "hopCount": 0,
+        },
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match links
+            .peer_call(TARGET, None, methods::DELIVER_PEER_MESSAGE, params.clone())
+            .await
+        {
+            Ok(receipt) => {
+                assert_eq!(receipt["commandId"], COMMAND);
+                break;
+            }
+            Err(error) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "peer relay never came up: {error}"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+    let delivered = target
+        .doc_host
+        .command_entry(TARGET, COMMAND)
+        .expect("read target command")
+        .expect("target command exists");
+    assert!(matches!(
+        delivered.payload,
+        SessionCommandPayload::PeerMessage {
+            ref text,
+            ref source_chat_id,
+            ..
+        } if text == "relay this" && source_chat_id == SOURCE
+    ));
+    target.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_reply_reaches_its_recorded_target_device() {
+    const SOURCE: &str = "00000000-0000-4000-8000-000000000001";
+    const TARGET: &str = "00000000-0000-4000-8000-000000000002";
+    const COMMAND: &str = "reply:peer-command";
+
+    let (relay_url, _relay) = fake_device_room().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let target = assemble(&dir.path().join("target"), "device-target");
+    target
+        .workspace
+        .create_space("peer-space", "device-target", "/tmp", None, false)
+        .expect("create target space");
+    target
+        .workspace
+        .create_chat(TARGET, "peer-space", None, None)
+        .expect("create target chat");
+    let _host = target.start_host_relay(&relay_url);
+
+    let mut config = LinkCacheConfig::new(relay_url, Arc::new(StaticToken("test-user".into())));
+    config.probe_timeout = Duration::from_secs(5);
+    let links = LinkCache::new(config);
+    let params = serde_json::json!({
+        "chatId": TARGET,
+        "commandId": COMMAND,
+        "command": {
+            "kind": "peerMessage",
+            "text": "reply over exact device route",
+            "sourceChatId": SOURCE,
+            "sourceDeviceId": "device-source",
+            "threadId": "peer-command",
+            "replyTo": "peer-command",
+            "hopCount": 1,
+        },
+    });
+    links
+        .peer_device_call(
+            "device-target",
+            TARGET,
+            None,
+            methods::DELIVER_PEER_MESSAGE,
+            params,
+        )
+        .await
+        .expect("exact-device peer reply");
+
+    let delivered = target
+        .doc_host
+        .command_entry(TARGET, COMMAND)
+        .expect("read target command")
+        .expect("target command exists");
+    assert!(matches!(
+        delivered.payload,
+        SessionCommandPayload::PeerMessage { ref text, ref reply_to, .. }
+            if text == "reply over exact device route"
+                && reply_to.as_deref() == Some("peer-command")
+    ));
+    target.shutdown().await;
+}
+
 /// M5: terminals are device-addressable — OpenTerminal/WriteTerminal forward as
 /// unary calls and SubscribeTerminal proxies its stream through the relay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

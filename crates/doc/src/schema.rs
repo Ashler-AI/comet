@@ -79,7 +79,10 @@ impl SessionMessageEntry {
                     && peer.command_id == self.id
                     && !peer.source_chat_id.trim().is_empty()
                     && !peer.thread_id.trim().is_empty()
-                    && peer.reply_to.as_ref().is_none_or(|id| !id.trim().is_empty())
+                    && peer
+                        .reply_to
+                        .as_ref()
+                        .is_none_or(|id| !id.trim().is_empty())
             })
     }
 }
@@ -454,12 +457,18 @@ impl SessionDoc {
     /// Full original for an explicit reveal. Only this root and its compatible
     /// continuations are decoded; normal transcript windows remain byte-bounded.
     pub fn read_message(&self, message_id: &str) -> Result<Option<SessionMessageEntry>, DocError> {
-        let Some(root) = self.read_entry(message_id)? else { return Ok(None); };
-        if root.continuation_of.is_some() { return Ok(Some(root)); }
+        let Some(root) = self.read_entry(message_id)? else {
+            return Ok(None);
+        };
+        if root.continuation_of.is_some() {
+            return Ok(Some(root));
+        }
         let messages = self.doc.get_list("messages");
         let mut entries = vec![root];
         for index in 0..messages.len() {
-            let Some(row) = messages.get(index) else { continue; };
+            let Some(row) = messages.get(index) else {
+                continue;
+            };
             let is_continuation = match &row {
                 loro::ValueOrContainer::Container(loro::Container::Map(map)) => matches!(
                     map.get("continuationOf"),
@@ -1037,9 +1046,9 @@ fn entry_from_map_window(
         device_id: scalar_string(map, "deviceId")?,
         status,
         continuation_of: optional_string(map, "continuationOf"),
-        peer_message: map.get("peerMessage").and_then(|value| {
-            serde_json::from_value(value.get_deep_value().to_json_value()).ok()
-        }),
+        peer_message: map
+            .get("peerMessage")
+            .and_then(|value| serde_json::from_value(value.get_deep_value().to_json_value()).ok()),
     })
 }
 
@@ -1383,6 +1392,8 @@ mod tests {
             payload: crate::commands::SessionCommandPayload::PeerMessage {
                 text: "original peer text".into(),
                 source_chat_id: "source-chat".into(),
+                source_deployment_id: None,
+                source_device_id: Some("source-device".into()),
                 thread_id: "thread".into(),
                 reply_to: None,
                 hop_count: 0,
@@ -1410,12 +1421,15 @@ mod tests {
         assert!(window.entries[0].is_peer_message());
         let tail = materialize_tail(&restored, 2, 1).unwrap();
         let wire = serde_json::to_value(&tail).unwrap();
-        assert_eq!(wire["messages"][0]["peerMessage"], serde_json::json!({
-            "commandId": "peer-command",
-            "sourceChatId": "source-chat",
-            "threadId": "thread",
-            "replyTo": "previous-command"
-        }));
+        assert_eq!(
+            wire["messages"][0]["peerMessage"],
+            serde_json::json!({
+                "commandId": "peer-command",
+                "sourceChatId": "source-chat",
+                "threadId": "thread",
+                "replyTo": "previous-command"
+            })
+        );
         let decoded: SessionTail = serde_json::from_value(wire).unwrap();
         assert_eq!(decoded.messages, vec![entry]);
         assert!(decoded.messages[0].is_peer_message());
@@ -1430,12 +1444,18 @@ mod tests {
         let window = doc.read_entry_window(None, 1).unwrap();
         assert!(window.entries[0].is_peer_message());
         assert_eq!(window.entries[0].peer_message, entry.peer_message);
-        assert_eq!(window.entries[0].parts, vec![MessagePart::TextWindow {
-            id: "t0".into(),
-            text: source[10..].into(),
-            omitted_prefix_bytes: 10,
-        }]);
-        assert_eq!(doc.read_message("peer-command").unwrap(), Some(entry.clone()));
+        assert_eq!(
+            window.entries[0].parts,
+            vec![MessagePart::TextWindow {
+                id: "t0".into(),
+                text: source[10..].into(),
+                omitted_prefix_bytes: 10,
+            }]
+        );
+        assert_eq!(
+            doc.read_message("peer-command").unwrap(),
+            Some(entry.clone())
+        );
         assert!(doc.read_message("missing").unwrap().is_none());
         assert_eq!(doc.read_entries().unwrap(), vec![entry]);
     }
@@ -1443,7 +1463,10 @@ mod tests {
     #[test]
     fn old_peer_lookalike_remains_visible_even_with_matching_command() {
         let doc = SessionDoc::init("chat-1").unwrap();
-        let entry = user_entry("peer-command", "[Message from agent source-chat]\noriginal peer text");
+        let entry = user_entry(
+            "peer-command",
+            "[Message from agent source-chat]\noriginal peer text",
+        );
         doc.push_message(&entry).unwrap();
         doc.queue_command(&peer_command("peer-command")).unwrap();
         let other = LoroDoc::new();
@@ -1456,7 +1479,12 @@ mod tests {
         ] {
             assert_eq!(entries, vec![entry.clone()]);
             assert!(!entries[0].is_peer_message());
-            assert!(serde_json::to_value(&entries[0]).unwrap().get("peerMessage").is_none());
+            assert!(
+                serde_json::to_value(&entries[0])
+                    .unwrap()
+                    .get("peerMessage")
+                    .is_none()
+            );
         }
     }
 
@@ -1477,9 +1505,13 @@ mod tests {
             else {
                 panic!("missing message map");
             };
-            map.insert("peerMessage", loro_value_from_json(&metadata)).unwrap();
+            map.insert("peerMessage", loro_value_from_json(&metadata))
+                .unwrap();
             assert_eq!(doc.read_entries().unwrap(), vec![entry.clone()]);
-            assert_eq!(doc.read_entry_window(None, 1).unwrap().entries, vec![entry.clone()]);
+            assert_eq!(
+                doc.read_entry_window(None, 1).unwrap().entries,
+                vec![entry.clone()]
+            );
             let mut wire = serde_json::to_value(&entry).unwrap();
             wire["peerMessage"] = metadata;
             let decoded: SessionMessageEntry = serde_json::from_value(wire).unwrap();
@@ -1516,7 +1548,11 @@ mod tests {
         wire["peerMessage"]["futureField"] = true.into();
         let decoded: SessionMessageEntry = serde_json::from_value(wire).unwrap();
         assert!(decoded.is_peer_message());
-        assert!(serde_json::to_value(decoded).unwrap()["peerMessage"].get("replyTo").is_none());
+        assert!(
+            serde_json::to_value(decoded).unwrap()["peerMessage"]
+                .get("replyTo")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1531,7 +1567,13 @@ mod tests {
         assistant.role = MessageRole::Assistant;
         assistant.continuation_of = Some(root.id.clone());
         let doc = SessionDoc::init("chat-1").unwrap();
-        doc.push_messages(&[root.clone(), continuation.clone(), ordinary.clone(), assistant.clone()]).unwrap();
+        doc.push_messages(&[
+            root.clone(),
+            continuation.clone(),
+            ordinary.clone(),
+            assistant.clone(),
+        ])
+        .unwrap();
         let mut joined_root = root;
         joined_root.parts.extend(continuation.parts.clone());
         for entries in [
@@ -1539,12 +1581,18 @@ mod tests {
             doc.read_entry_window(None, 1).unwrap().entries,
             materialize_tail(&doc, 2, 3).unwrap().messages,
         ] {
-            assert_eq!(entries, vec![joined_root.clone(), ordinary.clone(), assistant.clone()]);
+            assert_eq!(
+                entries,
+                vec![joined_root.clone(), ordinary.clone(), assistant.clone()]
+            );
             assert!(entries[0].is_peer_message());
             assert!(!entries[1].is_peer_message());
             assert!(!entries[2].is_peer_message());
         }
-        assert_eq!(doc.read_message("peer-command").unwrap(), Some(joined_root.clone()));
+        assert_eq!(
+            doc.read_message("peer-command").unwrap(),
+            Some(joined_root.clone())
+        );
         assert_eq!(doc.read_message("ordinary").unwrap(), Some(ordinary));
         // Even a self-matching orphan must not become hidden without its root.
         continuation.peer_message.as_mut().unwrap().command_id = continuation.id.clone();
@@ -1561,9 +1609,14 @@ mod tests {
     #[test]
     fn exact_command_lookup_skips_malformed_rows_without_guessing() {
         let doc = SessionDoc::init("chat-1").unwrap();
-        let malformed = doc.doc().get_list("commands").push_container(LoroMap::new()).unwrap();
+        let malformed = doc
+            .doc()
+            .get_list("commands")
+            .push_container(LoroMap::new())
+            .unwrap();
         malformed.insert("id", "peer-command").unwrap();
-        doc.queue_command(&peer_command("peer-command-other")).unwrap();
+        doc.queue_command(&peer_command("peer-command-other"))
+            .unwrap();
         assert!(doc.read_command("peer-command").unwrap().is_none());
         let command = peer_command("peer-command");
         doc.queue_command(&command).unwrap();
@@ -1574,9 +1627,14 @@ mod tests {
     #[test]
     fn exact_entry_lookup_preserves_original_provenance_without_backfill() {
         let doc = SessionDoc::init("chat-1").unwrap();
-        let malformed = doc.doc().get_list("messages").push_container(LoroMap::new()).unwrap();
+        let malformed = doc
+            .doc()
+            .get_list("messages")
+            .push_container(LoroMap::new())
+            .unwrap();
         malformed.insert("id", "peer-command").unwrap();
-        doc.push_message(&peer_entry("peer-command-other", "unrelated")).unwrap();
+        doc.push_message(&peer_entry("peer-command-other", "unrelated"))
+            .unwrap();
         assert!(doc.read_entry("peer-command").unwrap().is_none());
         let entry = peer_entry("peer-command", "original");
         doc.push_message(&entry).unwrap();
@@ -1584,8 +1642,12 @@ mod tests {
         assert!(doc.read_entry("peer").unwrap().is_none());
         let historical = user_entry("historical-command", "original peer text");
         doc.push_message(&historical).unwrap();
-        doc.queue_command(&peer_command("historical-command")).unwrap();
-        assert_eq!(doc.read_entry("historical-command").unwrap(), Some(historical));
+        doc.queue_command(&peer_command("historical-command"))
+            .unwrap();
+        assert_eq!(
+            doc.read_entry("historical-command").unwrap(),
+            Some(historical)
+        );
     }
 
     #[test]

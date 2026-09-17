@@ -167,6 +167,39 @@ export const sessionRoomKey = (
   return scopedSessionRoomKey(scoped.projectId, scoped.deploymentId, sessionId);
 };
 
+const peerSessionOwnerDevice = async (
+  env: Env,
+  identity: Verified,
+  sessionId: string,
+  deploymentId?: string
+): Promise<string | undefined> => {
+  const room = deploymentId
+    ? scopedSessionRoomKey(identity.projectScope, deploymentId, sessionId)
+    : `s3/${identity.projectScope}/${sessionId}`;
+  try {
+    const stub = env.SESSION_ROOMS.get(env.SESSION_ROOMS.idFromName(room));
+    const response = await stub.fetch(
+      new Request("https://session.internal/authorize-owner", {
+        headers: {
+          [AUTH_USER_HEADER]: identity.userId,
+          [AUTH_PROJECT_HEADER]: identity.projectScope,
+          [SESSION_OWNER_AUTH_HEADER]: "verify"
+        }
+      })
+    );
+    if (!response.ok) return undefined;
+    const value = (await response.json().catch(() => null)) as {
+      ownsSession?: unknown;
+      deviceId?: unknown;
+    } | null;
+    return value?.ownsSession === true && typeof value.deviceId === "string" && ID_RE.test(value.deviceId)
+      ? value.deviceId
+      : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -307,13 +340,50 @@ export default {
       }
     }
 
+    if (parts[0] === "peer" && sessionId && parts[2] === "ws") {
+      const deploymentId = url.searchParams.get("deploymentId") ?? undefined;
+      if (
+        !deviceCredential ||
+        request.method !== "GET" ||
+        request.headers.get("upgrade")?.toLowerCase() !== "websocket" ||
+        !hasCapability(identity, "session.chat") ||
+        (deploymentId !== undefined && !ID_RE.test(deploymentId))
+      ) {
+        return json({ error: "forbidden" }, 403);
+      }
+      const deviceId = await peerSessionOwnerDevice(env, identity, sessionId, deploymentId)
+        ?? (deploymentId ? await peerSessionOwnerDevice(env, identity, sessionId) : undefined);
+      if (!deviceId) return json({ error: "target_session_not_found" }, 404);
+      const connId = url.searchParams.get("connId") ?? crypto.randomUUID();
+      return forward(
+        env.DEVICE_ROOMS,
+        `d3/${identity.projectScope}/${deviceId}`,
+        request,
+        identity,
+        "/ws",
+        `?role=client&connId=${encodeURIComponent(connId)}&purpose=peer&peerSessionId=${encodeURIComponent(sessionId)}&targetDeviceId=${encodeURIComponent(deviceId)}`
+      );
+    }
+
     if (parts[0] === "device" && parts[1] && ID_RE.test(parts[1])) {
       const deviceId = parts[1];
-      if (!deviceCredentialAllows(identity, "device", deviceId)) return json({ error: "forbidden" }, 403);
+      const requestedRole = url.searchParams.get("role");
+      const peerSessionId = canonicalSessionId(url.searchParams.get("peerSessionId") ?? undefined);
+      const peerDeploymentId = url.searchParams.get("peerDeploymentId") ?? undefined;
+      const peerPurpose = url.searchParams.get("purpose");
+      const directPeerReply = peerPurpose === "peer-reply";
+      const peerClient =
+        parts[2] === "ws" &&
+        requestedRole === "client" &&
+        ((deviceCredential && peerPurpose === "peer") || directPeerReply) &&
+        peerSessionId !== undefined &&
+        (peerDeploymentId === undefined || ID_RE.test(peerDeploymentId));
+      if (!deviceCredentialAllows(identity, "device", deviceId) && !(deviceCredential && peerClient)) {
+        return json({ error: "forbidden" }, 403);
+      }
       const room = `d3/${identity.projectScope}/${deviceId}`;
       if (parts[2] === "ws") {
         if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") return json({ error: "expected_websocket" }, 426);
-        const requestedRole = url.searchParams.get("role");
         let hostAuthorization: DeviceHostAuthorization | undefined;
         if (requestedRole === "host") {
           if (deviceCredential) {
@@ -325,25 +395,41 @@ export default {
         const role = authorizedDeviceSocketRole(
           requestedRole,
           deviceCredential,
-          hostAuthorization
+          hostAuthorization,
+          peerClient && !directPeerReply,
+          directPeerReply
         );
         if (!role) return json({ error: "forbidden" }, 403);
         if (
           role === "host"
             ? !hasCapability(identity, "session.environment")
-            : !hasCapability(identity, "session.control") &&
-              !hasCapability(identity, "session.environment")
+            : peerClient
+              ? !hasCapability(identity, "session.chat")
+              : !hasCapability(identity, "session.control") &&
+                !hasCapability(identity, "session.environment")
         ) {
           return json({ error: "forbidden" }, 403);
         }
+        if (peerClient && !directPeerReply) {
+          const ownerDeviceId = await peerSessionOwnerDevice(
+            env,
+            identity,
+            peerSessionId!,
+            peerDeploymentId
+          );
+          if (ownerDeviceId !== deviceId) return json({ error: "forbidden" }, 403);
+        }
         const connId = url.searchParams.get("connId") ?? crypto.randomUUID();
+        const peer = peerClient
+          ? `&purpose=${encodeURIComponent(peerPurpose!)}&peerSessionId=${encodeURIComponent(peerSessionId!)}&targetDeviceId=${encodeURIComponent(deviceId)}`
+          : `&targetDeviceId=${encodeURIComponent(deviceId)}`;
         return forward(
           env.DEVICE_ROOMS,
           room,
           request,
           identity,
           "/ws",
-          `?role=${role}&connId=${encodeURIComponent(connId)}`,
+          `?role=${role}&connId=${encodeURIComponent(connId)}${peer}`,
           undefined,
           hostAuthorization
         );

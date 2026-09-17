@@ -363,7 +363,20 @@ export class SessionRoom implements DurableObject {
       const ownsSession =
         this.getMeta("projectScope") === candidateProjectScope &&
         this.getMeta("ownerUserId") === candidateUserId;
-      return json({ ownsSession });
+      if (!ownsSession) return json({ ownsSession: false });
+      let deviceId = this.getMeta("hostDeviceId");
+      if (!deviceId) {
+        const liveDevices = new Set(
+          this.ctx.getWebSockets()
+            .map((socket) => (socket.deserializeAttachment() as SocketState | null)?.deviceId)
+            .filter((value): value is string => typeof value === "string" && GRANT_ID_RE.test(value))
+        );
+        if (liveDevices.size === 1) {
+          deviceId = liveDevices.values().next().value;
+          if (deviceId) this.setMeta("hostDeviceId", deviceId);
+        }
+      }
+      return json({ ownsSession: true, ...(deviceId ? { deviceId } : {}) });
     }
     const userId = request.headers.get(AUTH_USER_HEADER);
     if (!userId) return new Response("unauthenticated", { status: 401 });
@@ -420,6 +433,9 @@ export class SessionRoom implements DurableObject {
       if (!currentOwnerUserId && ownerUserId) this.setMeta("ownerUserId", ownerUserId);
       if (chatId && !this.getMeta("chatId")) this.setMeta("chatId", chatId);
       const deviceId = url.searchParams.get("device") ?? undefined;
+      if (!workspace && ownerUserId && deviceId && GRANT_ID_RE.test(deviceId) && !this.getMeta("hostDeviceId")) {
+        this.setMeta("hostDeviceId", deviceId);
+      }
       const pair = new WebSocketPair();
       this.ctx.acceptWebSocket(pair[1]);
       const state: SocketState = {

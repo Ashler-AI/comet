@@ -4015,6 +4015,8 @@ mod authority_tests {
                 followup.payload = SessionCommandPayload::PeerMessage {
                     text: "continue".into(),
                     source_chat_id: "source-chat".into(),
+                    source_deployment_id: None,
+                    source_device_id: Some("source-device".into()),
                     thread_id: "thread".into(),
                     reply_to: None,
                     hop_count: 0,
