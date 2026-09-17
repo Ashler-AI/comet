@@ -499,7 +499,7 @@ fn scaffold_inference_selection_at(
             )
         })?;
     let routed_provider = match requested_provider {
-        "openai-codex" => "scaffold-openai",
+        "openai" | "openai-codex" => "scaffold-openai",
         "anthropic" => "scaffold-anthropic",
         _ => {
             return Err(HarnessError::Protocol(
@@ -4141,16 +4141,22 @@ mod tests {
         let profile_path = profile_dir.join("profile.json");
         std::fs::write(
             &profile_path,
-            r#"{"profile":"scaffold-host","model":"scaffold-openai/gpt-5.6-sol"}"#,
+            r#"{"profile":"scaffold-host","model":"scaffold-openai/gpt-6-astra"}"#,
         )
         .unwrap();
 
         let selection =
-            scaffold_inference_selection_at(runtime_dir.path(), Some("openai-codex/gpt-5.6-sol"))
+            scaffold_inference_selection_at(runtime_dir.path(), Some("openai-codex/gpt-6-astra"))
                 .unwrap();
 
-        assert_eq!(selection.model, "scaffold-openai/gpt-5.6-sol");
+        assert_eq!(selection.model, "scaffold-openai/gpt-6-astra");
         assert!(selection.extension_path.is_none());
+        assert_eq!(
+            scaffold_inference_selection_at(runtime_dir.path(), Some("openai/gpt-6-astra"))
+                .unwrap()
+                .model,
+            "scaffold-openai/gpt-6-astra"
+        );
         assert!(
             scaffold_inference_selection_at(
                 runtime_dir.path(),
@@ -4165,7 +4171,7 @@ mod tests {
             scaffold_inference_profile_at(runtime_dir.path())
                 .unwrap()
                 .model,
-            "scaffold-openai/gpt-5.6-sol"
+            "scaffold-openai/gpt-6-astra"
         );
         std::fs::write(
             &profile_path,
