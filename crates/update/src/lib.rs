@@ -11,7 +11,7 @@
 //!   installer): download the headless tarball into a new versioned dir, flip
 //!   the symlink, restart the service. Same flow the installer script performs,
 //!   natively.
-//! - **MacApp** (running out of `Crew.app`): download the app tarball, swap the
+//! - **MacApp** (running out of `Crew.app` or `Crew Staging.app`): download the app tarball, swap the
 //!   bundle directory, relaunch. Driven by the UI.
 //! - **Unmanaged** (source builds, hand-copied binaries): report only.
 //!
@@ -33,6 +33,18 @@ use tokio::sync::watch;
 
 #[cfg(target_os = "macos")]
 mod macos_verification;
+
+fn staging_mac_app() -> bool {
+    cfg!(target_os = "macos") && option_env!("COMET_PACKAGE_ENVIRONMENT") == Some("staging")
+}
+
+fn mac_app_name() -> &'static str {
+    if staging_mac_app() {
+        "Crew Staging.app"
+    } else {
+        "Crew.app"
+    }
+}
 
 /// The version compiled into this binary (the workspace version).
 pub const fn current_version() -> &'static str {
@@ -95,10 +107,15 @@ pub fn headless_artifact(version: &str) -> String {
     format!("comet-{version}-{os}-{arch}.tar.gz")
 }
 
-/// `comet-<ver>-macos-<arch>-app.tar.gz` — the packaged `Crew.app` bundle.
+/// The packaged app tarball for this binary's compile-time package environment.
 pub fn mac_app_artifact(version: &str) -> String {
     let (_, arch) = platform_key();
-    format!("comet-{version}-macos-{arch}-app.tar.gz")
+    let prefix = if staging_mac_app() {
+        "comet-staging"
+    } else {
+        "comet"
+    };
+    format!("{prefix}-{version}-macos-{arch}-app.tar.gz")
 }
 
 /// Strictly-newer dotted-numeric compare (`0.1.10` > `0.1.9` > `0.1`).
@@ -120,7 +137,9 @@ pub fn version_newer(latest: &str, current: &str) -> bool {
     }
 }
 fn release_manifest_name() -> &'static str {
-    if cfg!(target_os = "macos") {
+    if staging_mac_app() {
+        "desktop-staging-manifest.json"
+    } else if cfg!(target_os = "macos") {
         "desktop-manifest.json"
     } else {
         "scaffold-manifest.json"
@@ -217,16 +236,11 @@ pub enum InstallKind {
     Managed { app_root: PathBuf },
     /// Running out of a macOS `.app` bundle.
     MacApp { bundle: PathBuf },
-    /// Source, standalone staging, or hand-copied build — updates are report-only.
+    /// Source or hand-copied build — updates are report-only.
     Unmanaged,
 }
 
 pub fn detect_install() -> InstallKind {
-    // Both promoted release feeds distribute the production bundle. A standalone
-    // staging build must retain its separate macOS permission identity.
-    if option_env!("COMET_PACKAGE_ENVIRONMENT") == Some("staging") {
-        return InstallKind::Unmanaged;
-    }
     let Ok(exe) = std::env::current_exe() else {
         return InstallKind::Unmanaged;
     };
@@ -421,18 +435,13 @@ pub fn restart_service() -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 fn ensure_mac_app_updates_supported() -> anyhow::Result<()> {
-    if option_env!("COMET_PACKAGE_ENVIRONMENT") == Some("staging") {
-        bail!(
-            "Crew Staging requires a separately packaged staging update; the release feed contains Crew, not Crew Staging"
-        );
-    }
     #[cfg(target_os = "macos")]
     macos_verification::expected_team()?;
     Ok(())
 }
 
-/// Download + unpack the app tarball into `{data_dir}/updates/<ver>/Crew.app`
-/// (idempotent). Returns the staged bundle path.
+/// Download + unpack the app tarball into `{data_dir}/updates/<ver>/<app-name>`
+/// for this binary's package environment (idempotent). Returns the staged bundle path.
 pub async fn stage_mac_app(
     edge_url: &str,
     access_token: Option<&str>,
@@ -442,7 +451,8 @@ pub async fn stage_mac_app(
     ensure_mac_app_updates_supported()?;
     let version = &manifest.version;
     let dir = data_dir.join("updates").join(version);
-    let staged = dir.join("Crew.app");
+    let app_name = mac_app_name();
+    let staged = dir.join(app_name);
     if staged.exists() {
         #[cfg(target_os = "macos")]
         macos_verification::Policy::pinned()?
@@ -469,7 +479,7 @@ pub async fn stage_mac_app(
     )?;
     std::fs::remove_file(&tarball).ok();
     if !staged.join("Contents/MacOS/comet").exists() {
-        bail!("app tarball {file} did not contain Crew.app");
+        bail!("app tarball {file} did not contain {app_name}");
     }
     #[cfg(target_os = "macos")]
     macos_verification::Policy::pinned()?
@@ -479,7 +489,7 @@ pub async fn stage_mac_app(
 }
 
 /// Install the staged bundle next to the current app, preserving metadata and
-/// migrating legacy `Comet.app` installs to the user-facing `Crew.app` name.
+/// migrating renamed installs to `Crew.app` or `Crew Staging.app` as appropriate.
 /// Incoming, copied, and installed macOS bundles are authenticated before any
 /// installed bundle is moved. Legacy ad-hoc migration requires the updater itself
 /// to run from an already trusted distribution; it never re-signs an old app.
@@ -493,6 +503,9 @@ pub fn apply_mac_app(staged: &Path, bundle: &Path) -> anyhow::Result<PathBuf> {
     let parent = bundle
         .parent()
         .context("app bundle has no parent directory")?;
+    #[cfg(target_os = "macos")]
+    let target_name = std::ffi::OsStr::new(mac_app_name());
+    #[cfg(not(target_os = "macos"))]
     let target_name = staged
         .file_name()
         .context("staged app bundle has no name")?;
@@ -1285,7 +1298,11 @@ mod tests {
     fn release_manifest_matches_the_installed_platform() {
         assert_eq!(
             release_manifest_name(),
-            if cfg!(target_os = "macos") {
+            if cfg!(target_os = "macos")
+                && option_env!("COMET_PACKAGE_ENVIRONMENT") == Some("staging")
+            {
+                "desktop-staging-manifest.json"
+            } else if cfg!(target_os = "macos") {
                 "desktop-manifest.json"
             } else {
                 "scaffold-manifest.json"
@@ -1322,6 +1339,15 @@ mod tests {
                 bundle: PathBuf::from("/Applications/Crew.app")
             }
         );
+        assert_eq!(
+            detect_install_from(
+                Path::new("/Applications/Crew Staging.app/Contents/MacOS/comet"),
+                Some(Path::new("/Users/u")),
+            ),
+            InstallKind::MacApp {
+                bundle: PathBuf::from("/Applications/Crew Staging.app")
+            }
+        );
         // A path merely containing `.app` without the bundle layout is not a bundle.
         assert_eq!(
             detect_install_from(Path::new("/tmp/foo.app/comet"), None),
@@ -1346,7 +1372,9 @@ mod tests {
         };
         let binary = tmp
             .path()
-            .join("updates/1.2.3/Crew.app/Contents/MacOS/comet");
+            .join("updates/1.2.3")
+            .join(mac_app_name())
+            .join("Contents/MacOS/comet");
         std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
         std::fs::write(&binary, b"untrusted cached binary").unwrap();
 
@@ -1363,7 +1391,7 @@ mod tests {
     fn app_update_refuses_unsigned_legacy_migration_without_changing_install() {
         let tmp = tempfile::tempdir().unwrap();
         let legacy = tmp.path().join("Comet.app");
-        let staged = tmp.path().join("updates").join("Crew.app");
+        let staged = tmp.path().join("updates").join(mac_app_name());
         let legacy_binary = legacy.join("Contents/MacOS/comet");
         let staged_binary = staged.join("Contents/MacOS/comet");
         std::fs::create_dir_all(legacy_binary.parent().unwrap()).unwrap();
@@ -1374,7 +1402,7 @@ mod tests {
         assert!(apply_mac_app(&staged, &legacy).is_err());
         assert_eq!(std::fs::read(&legacy_binary).unwrap(), b"old");
         assert_eq!(std::fs::read(&staged_binary).unwrap(), b"new");
-        assert!(!tmp.path().join("Crew.app").exists());
+        assert!(!tmp.path().join(mac_app_name()).exists());
     }
 
     #[cfg(target_os = "macos")]
@@ -1382,8 +1410,8 @@ mod tests {
     fn app_update_refuses_unsigned_migration_without_displacing_target() {
         let tmp = tempfile::tempdir().unwrap();
         let legacy = tmp.path().join("Comet.app");
-        let target = tmp.path().join("Crew.app");
-        let staged = tmp.path().join("updates").join("Crew.app");
+        let target = tmp.path().join(mac_app_name());
+        let staged = tmp.path().join("updates").join(mac_app_name());
         for (bundle, contents) in [
             (&legacy, b"legacy".as_slice()),
             (&target, b"stale".as_slice()),
@@ -1415,7 +1443,17 @@ mod tests {
             headless_artifact("0.2.0"),
             format!("comet-0.2.0-{os}-{arch}.tar.gz")
         );
-        assert!(mac_app_artifact("0.2.0").ends_with("-app.tar.gz"));
+        let prefix = if cfg!(target_os = "macos")
+            && option_env!("COMET_PACKAGE_ENVIRONMENT") == Some("staging")
+        {
+            "comet-staging"
+        } else {
+            "comet"
+        };
+        assert_eq!(
+            mac_app_artifact("0.2.0"),
+            format!("{prefix}-0.2.0-macos-{arch}-app.tar.gz")
+        );
     }
 
     #[test]

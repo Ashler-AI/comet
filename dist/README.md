@@ -133,26 +133,31 @@ macOS permission grants. Its bundle deliberately does
 not register the shared `comet://` invitation scheme, which has no environment
 discriminator, so installing it cannot steal production invitation links.
 
-**Standalone staging is not the release staging channel.** On a fresh build
-(`candidate_run_id` empty), the release workflow's `macos` job packages, signs,
-notarizes, and verifies both the production-default, production-identity
-`Crew.app` and standalone `Crew Staging.app`, using the same CI credentials below.
-Production artifacts remain in `macos-arm64`; standalone staging is uploaded
-separately as the Actions artifact `macos-staging-arm64`, containing:
+**Standalone staging and production keep separate update identities.** On a fresh
+build (`candidate_run_id` empty), the release workflow packages, signs, notarizes,
+and verifies both `Crew.app` and `Crew Staging.app` with the same independently
+pinned Apple team. The Actions artifacts remain `macos-arm64` and
+`macos-staging-arm64`; the latter contains:
 
 - `comet-staging-<version>-macos-arm64.dmg`
 - `comet-staging-<version>-macos-arm64-app.tar.gz` (contains `Crew Staging.app`)
 - `SHA256SUMS`
 
-Candidate assembly downloads only production desktop and selected Linux
-artifacts, never standalone staging. Release staging promotion tests the exact
-production candidate before the same bytes are promoted to production; neither
-release feed publishes `Crew Staging.app` or changes updater filenames. Reusing
-`candidate_run_id` skips the entire `macos` job, including standalone staging:
-download that app from the original fresh build's `macos-staging-arm64` artifact.
-The standalone staging executable is unmanaged by the release updater and rejects
-update staging/application, preventing the production bundle from replacing its
-identity. Install a newly packaged standalone staging artifact to update it.
+Immutable candidates include both macOS variants and the selected Linux artifacts.
+Staging publication advances `desktop-staging-manifest.json`,
+`desktop-staging-SHA256SUMS`, and `desktop-staging-latest.txt` for `Crew Staging.app`.
+The existing `desktop-*` channel remains the production-identity candidate, so
+production promotion can reuse those exact bytes. Production publication excludes
+all standalone staging artifacts and aliases. Candidate reuse requires both
+verified macOS variants; older candidates without staging metadata must be rebuilt.
+
+Both installed apps use Settings → Crew update to download their own signed bundle,
+then **Restart to update** to apply it. The package environment is pinned at build
+time: staging accepts only `ai.ashler.comet.staging`, production accepts only
+`ai.ashler.comet`. The updater verifies downloaded, cached, copied, and installed
+bundles before replacing anything; environment variables or feed contents cannot
+switch identities. Versions through 0.1.110 disabled standalone staging updates
+and need one manual installation of the fixed signed staging build to bootstrap.
 
 ### Explicit local-only ad-hoc packaging
 

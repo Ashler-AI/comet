@@ -42,6 +42,7 @@ function validateSource(source, { repository, runId, runSha, runUrl }, label) {
 export function validateReleaseCandidateReuse({
   run,
   desktopManifest,
+  desktopStagingManifest,
   scaffoldManifest,
   unifiedManifest,
   requestedVersion,
@@ -89,6 +90,17 @@ export function validateReleaseCandidateReuse({
     `comet-${requestedVersion}-macos-arm64.dmg`,
     `comet-${requestedVersion}-macos-arm64-app.tar.gz`,
   ], "desktop manifest");
+
+  const staging = requireObject(desktopStagingManifest, "desktop staging manifest");
+  requireEqual(staging.schemaVersion, 2, "desktop staging manifest schemaVersion");
+  requireEqual(staging.releaseSurface, "desktop-staging", "desktop staging manifest releaseSurface");
+  requireEqual(staging.version, requestedVersion, "desktop staging manifest version");
+  validateSource(staging.source, source, "desktop staging manifest");
+  requireEqual(staging.scaffoldRuntimeVersion, desktop.scaffoldRuntimeVersion, "desktop staging manifest runtime version");
+  requireExactFiles(staging, [
+    `comet-staging-${requestedVersion}-macos-arm64.dmg`,
+    `comet-staging-${requestedVersion}-macos-arm64-app.tar.gz`,
+  ], "desktop staging manifest");
 
   if (releaseSurface === "desktop") {
     if (scaffoldManifest !== undefined || unifiedManifest !== undefined) {
@@ -150,6 +162,7 @@ async function main() {
   const result = validateReleaseCandidateReuse({
     run: await readJson(runPath),
     desktopManifest: await readJson(path.join(candidateDir, "desktop-manifest.json")),
+    desktopStagingManifest: await readJson(path.join(candidateDir, "desktop-staging-manifest.json")),
     scaffoldManifest: hasScaffold
       ? await readJson(path.join(candidateDir, "scaffold-manifest.json"))
       : undefined,
@@ -162,6 +175,16 @@ async function main() {
     runId,
     sourceCommitReachable: sourceCommitReachable === "true",
   });
+  for (const channel of ["desktop", "desktop-staging", ...(hasScaffold ? ["scaffold", ""] : [])]) {
+    const prefix = channel ? `${channel}-` : "";
+    const manifest = await readJson(path.join(candidateDir, `${prefix}manifest.json`));
+    const sums = await readFile(path.join(candidateDir, `${prefix}SHA256SUMS`), "utf8");
+    requireEqual(
+      sums.trimEnd().split("\n").sort().join("\n"),
+      Object.entries(manifest.files).map(([name, file]) => `${file.sha256}  ${name}`).sort().join("\n"),
+      `${prefix}SHA256SUMS manifest checksums`,
+    );
+  }
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }
 

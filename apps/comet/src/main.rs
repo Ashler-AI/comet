@@ -131,15 +131,19 @@ fn is_standalone_staging() -> bool {
     option_env!("COMET_PACKAGE_ENVIRONMENT") == Some("staging")
 }
 
+fn default_ipc_port() -> u16 {
+    if is_standalone_staging() {
+        27655
+    } else {
+        27654
+    }
+}
+
 fn ipc_port_from_env() -> u16 {
     std::env::var("COMET_IPC_PORT")
         .ok()
         .and_then(|port| port.parse().ok())
-        .unwrap_or(if is_standalone_staging() {
-            27655
-        } else {
-            27654
-        })
+        .unwrap_or_else(default_ipc_port)
 }
 
 fn release_defaults() -> (&'static str, &'static str, &'static str) {
@@ -348,25 +352,49 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-fn run_headed(initial_url: Option<String>) {
-    let edge_token = std::env::var("COMET_EDGE_TOKEN").ok();
-    // Headed: the UI probes COMET_IPC_PORT and connects to a running daemon,
-    // or embeds the engine in-process (ARCHITECTURE §1).
-    comet_ui::run_app(comet_ui::UiConfig {
-        data_dir: std::env::var_os("COMET_DATA_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(dirs_data_dir),
-        ipc_port: ipc_port_from_env(),
-        edge_url: edge_url_from_env(),
-        scaffold_url: scaffold_url_from_env(&edge_token),
+/// Packaged apps own an immutable environment identity. Ignore inherited
+/// COMET_* routing so Crew and Crew Staging cannot attach across deployments.
+fn headed_config(initial_url: Option<String>) -> comet_ui::UiConfig {
+    let packaged = option_env!("COMET_PACKAGE_ENVIRONMENT").is_some();
+    let edge_token = (!packaged)
+        .then(|| std::env::var("COMET_EDGE_TOKEN").ok())
+        .flatten();
+    let (edge_url, scaffold_url, project_scope) = if packaged {
+        let (edge, scaffold, project) = release_defaults();
+        (edge.into(), Some(scaffold.into()), project.into())
+    } else {
+        (
+            edge_url_from_env(),
+            scaffold_url_from_env(&edge_token),
+            std::env::var("COMET_PROJECT_SCOPE").unwrap_or_else(|_| release_defaults().2.into()),
+        )
+    };
+    comet_ui::UiConfig {
+        data_dir: if packaged {
+            dirs_data_dir()
+        } else {
+            std::env::var_os("COMET_DATA_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(dirs_data_dir)
+        },
+        ipc_port: if packaged {
+            default_ipc_port()
+        } else {
+            ipc_port_from_env()
+        },
+        edge_url,
+        scaffold_url,
         edge_token,
-        project_scope: std::env::var("COMET_PROJECT_SCOPE")
-            .unwrap_or_else(|_| release_defaults().2.into()),
+        project_scope,
         deployment_id: None,
         initial_url,
         default_harness: comet_ui::HarnessId::ClaudeCode,
         runtime_profile: comet_ui::RuntimeProfile::LocalController,
-    });
+    }
+}
+
+fn run_headed(initial_url: Option<String>) {
+    comet_ui::run_app(headed_config(initial_url));
 }
 
 /// Local installs select either the production-local or deterministic mock
@@ -601,7 +629,7 @@ fn open_log_file_in(dir: &std::path::Path, mode: &str) -> Option<std::fs::File> 
 
 #[cfg(all(test, unix))]
 mod device_bootstrap_tests {
-    use super::{Cli, HeadlessArgs, apply_device_bootstrap_policy};
+    use super::{Cli, HeadlessArgs, apply_device_bootstrap_policy, headed_config};
     use clap::Parser as _;
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -637,6 +665,46 @@ mod device_bootstrap_tests {
                 .is_err(),
             "join credentials must never be accepted in process argv"
         );
+    }
+
+    #[test]
+    fn packaged_app_ignores_inherited_environment_routing() {
+        if option_env!("COMET_PACKAGE_ENVIRONMENT").is_none() {
+            return;
+        }
+        const CHILD: &str = "COMET_TEST_PACKAGED_BOUNDARY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "device_bootstrap_tests::packaged_app_ignores_inherited_environment_routing",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("COMET_DATA_DIR", "/tmp/wrong-crew-data")
+                .env("COMET_IPC_PORT", "1")
+                .env("COMET_EDGE_URL", "https://wrong-edge.invalid")
+                .env("COMET_EDGE_TOKEN", "poison")
+                .env("COMET_PROJECT_SCOPE", "wrong-project")
+                .env("COMET_SCAFFOLD_URL", "https://wrong-scaffold.invalid")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let config = headed_config(None);
+        let (edge, scaffold, project) = super::release_defaults();
+        assert_eq!(config.data_dir, super::dirs_data_dir());
+        assert_eq!(config.ipc_port, super::default_ipc_port());
+        assert_eq!(config.edge_url, edge);
+        assert_eq!(config.scaffold_url.as_deref(), Some(scaffold));
+        assert_eq!(config.project_scope, project);
+        assert!(config.edge_token.is_none());
     }
 
     #[test]

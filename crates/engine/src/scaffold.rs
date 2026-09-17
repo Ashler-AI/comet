@@ -1356,14 +1356,13 @@ impl ScaffoldSandbox {
         if self.id.trim().is_empty() {
             return Err(ScaffoldError::InvalidResponse("sandbox id is empty".into()));
         }
-        if self
-            .kind
+        if self.kind.as_deref().is_some_and(|kind| {
+            kind != "remote_code"
+                && !(kind == "agent" && self.runtime_profile.as_deref() == Some("comet_remote"))
+        }) || self
+            .runtime_profile
             .as_deref()
-            .is_some_and(|kind| kind != "remote_code")
-            || self
-                .runtime_profile
-                .as_deref()
-                .is_some_and(|profile| !matches!(profile, "remote_code" | "comet_remote"))
+            .is_some_and(|profile| !matches!(profile, "remote_code" | "comet_remote"))
         {
             return Err(ScaffoldError::InvalidResponse(format!(
                 "{} is not a Crew-compatible remote sandbox",
@@ -3233,6 +3232,14 @@ mod tests {
             environment.scope.session_id.as_deref(),
             Some("011664b5-3660-4fe6-83a2-3647fa6a2f65")
         );
+    }
+
+    #[test]
+    fn accepts_forge_agent_with_comet_remote_profile() {
+        let sandbox =
+            comet_sandbox("ready").replace(r#""kind":"remote_code""#, r#""kind":"agent""#);
+        let envelope: SandboxEnvelope = serde_json::from_str(&sandbox).unwrap();
+        assert!(envelope.sandbox.into_environment(scope()).is_ok());
     }
 
     async fn mock_server(responses: Vec<String>) -> (String, tokio::task::JoinHandle<Vec<String>>) {

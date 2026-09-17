@@ -258,6 +258,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Verify desktop session and attachment behavior
         run: cargo test --locked -p comet-ui --lib
+      - name: Verify production and staging updater identities
+        run: |
+          cargo test --locked -p comet-update --lib
+          COMET_PACKAGE_ENVIRONMENT=staging cargo test --locked -p comet-update --lib
       - name: Verify OMP restart and takeover recovery
         run: |
           cargo test --locked -p comet-harness --lib omp::
@@ -360,6 +364,11 @@ jobs:
           name: macos-arm64
           path: incoming/macos-arm64
       - uses: actions/download-artifact@v4
+        if: ${{ inputs.candidate_run_id == '' }}
+        with:
+          name: macos-staging-arm64
+          path: incoming/macos-staging-arm64
+      - uses: actions/download-artifact@v4
         if: ${{ inputs.candidate_run_id == '' && needs.version.outputs.release_surface == 'desktop-and-scaffold' }}
         with:
           pattern: linux-*
@@ -384,25 +393,28 @@ jobs:
           set -euo pipefail
           scaffold_runtime_version="$(cat scaffold-runtime-version.txt)"
           mkdir -p candidate
-          # Only release-feed artifacts are downloaded; standalone staging stays
-          # in its own Actions artifact and must never enter this candidate.
           find incoming -type f -name 'comet-*' -exec cp '{}' candidate/ \;
 
-          desktop_files=(
-            "comet-$VERSION-macos-arm64.dmg"
-            "comet-$VERSION-macos-arm64-app.tar.gz"
-          )
-          for file in "${desktop_files[@]}"; do test -f "candidate/$file"; done
-          (cd candidate && sha256sum "${desktop_files[@]}" > desktop-SHA256SUMS)
-          jq -n \
-            --arg version "$VERSION" \
-            --arg commit "$GITHUB_SHA" \
-            --arg repository "$GITHUB_REPOSITORY" \
-            --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            --arg scaffoldRuntimeVersion "$scaffold_runtime_version" \
-            --rawfile sums candidate/desktop-SHA256SUMS \
-            '{schemaVersion:2,releaseSurface:"desktop",scaffoldRuntimeVersion:$scaffoldRuntimeVersion,version:$version,source:{repository:$repository,commit:$commit,workflowRun:$run},files:($sums|split("\n")|map(select(length>0)|capture("^(?<sha256>[0-9a-f]{64})  (?<name>.+)$"))|map({key:.name,value:{sha256:.sha256}})|from_entries)}' \
-            > candidate/desktop-manifest.json
+          for channel in desktop desktop-staging; do
+            prefix=comet
+            if [[ "$channel" == desktop-staging ]]; then prefix=comet-staging; fi
+            desktop_files=(
+              "$prefix-$VERSION-macos-arm64.dmg"
+              "$prefix-$VERSION-macos-arm64-app.tar.gz"
+            )
+            for file in "${desktop_files[@]}"; do test -f "candidate/$file"; done
+            (cd candidate && sha256sum "${desktop_files[@]}" > "$channel-SHA256SUMS")
+            jq -n \
+              --arg version "$VERSION" \
+              --arg releaseSurface "$channel" \
+              --arg commit "$GITHUB_SHA" \
+              --arg repository "$GITHUB_REPOSITORY" \
+              --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              --arg scaffoldRuntimeVersion "$scaffold_runtime_version" \
+              --rawfile sums "candidate/$channel-SHA256SUMS" \
+              '{schemaVersion:2,releaseSurface:$releaseSurface,scaffoldRuntimeVersion:$scaffoldRuntimeVersion,version:$version,source:{repository:$repository,commit:$commit,workflowRun:$run},files:($sums|split("\n")|map(select(length>0)|capture("^(?<sha256>[0-9a-f]{64})  (?<name>.+)$"))|map({key:.name,value:{sha256:.sha256}})|from_entries)}' \
+              > "candidate/$channel-manifest.json"
+          done
 
           if [[ "$RELEASE_SURFACE" == "desktop-and-scaffold" ]]; then
             scaffold_files=(
@@ -480,6 +492,7 @@ jobs:
             "$CANDIDATE_RUN_ID" \
             "$source_commit_reachable"
           (cd candidate && sha256sum --check desktop-SHA256SUMS)
+          (cd candidate && sha256sum --check desktop-staging-SHA256SUMS)
           if [[ "$RELEASE_SURFACE" == "desktop-and-scaffold" ]]; then
             (cd candidate && sha256sum --check scaffold-SHA256SUMS)
             (cd candidate && sha256sum --check SHA256SUMS)
@@ -576,7 +589,8 @@ jobs:
             echo "::error::release bucket must not grant public or all-authenticated-user access"
             exit 1
           fi
-      - name: Publish immutable staging release and selected moving channels
+      - id: publish
+        name: Publish immutable staging release and selected moving channels
         env:
           VERSION: ${{ needs.version.outputs.version }}
           SCAFFOLD_RUNTIME_DEPLOYMENT: ${{ inputs.scaffold_runtime_deployment || 'unchanged' }}
@@ -638,10 +652,13 @@ jobs:
             esac
           done
           require_forward_version desktop
-          gcloud storage cp candidate/desktop-manifest.json "gs://$COMET_RELEASES_GCS_BUCKET/releases/desktop-manifest.json"
-          gcloud storage cp candidate/desktop-SHA256SUMS "gs://$COMET_RELEASES_GCS_BUCKET/releases/desktop-SHA256SUMS"
-          printf '%s' "$VERSION" > desktop-latest.txt
-          gcloud storage cp desktop-latest.txt "gs://$COMET_RELEASES_GCS_BUCKET/releases/desktop-latest.txt"
+          require_forward_version desktop-staging
+          for channel in desktop desktop-staging; do
+            gcloud storage cp "candidate/$channel-manifest.json" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$channel-manifest.json"
+            gcloud storage cp "candidate/$channel-SHA256SUMS" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$channel-SHA256SUMS"
+            printf '%s' "$VERSION" > "$channel-latest.txt"
+            gcloud storage cp "$channel-latest.txt" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$channel-latest.txt"
+          done
 
           if [[ "$RELEASE_SURFACE" == "desktop-and-scaffold" ]]; then
             require_forward_version scaffold
@@ -655,6 +672,50 @@ jobs:
             gcloud storage cp candidate/manifest.json "gs://$COMET_RELEASES_GCS_BUCKET/releases/manifest.json"
             gcloud storage cp candidate/SHA256SUMS "gs://$COMET_RELEASES_GCS_BUCKET/releases/SHA256SUMS"
             gcloud storage cp scaffold-latest.txt "gs://$COMET_RELEASES_GCS_BUCKET/releases/latest.txt"
+          fi
+      - id: readback
+        name: Verify published staging channels
+        if: ${{ needs.version.outputs.promotion_target != 'staging-candidate' }}
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          readback="$(mktemp -d)"
+          trap 'rm -rf "$readback"' EXIT
+
+          verify_object() {
+            source="$1"
+            name="$2"
+            gcloud storage cp \
+              "gs://$COMET_RELEASES_GCS_BUCKET/releases/$name" \
+              "$readback/$name" >/dev/null
+            if ! cmp -s "$source" "$readback/$name"; then
+              echo "::error::published staging release object $name differs from the promoted candidate"
+              return 1
+            fi
+          }
+          verify_pointer() {
+            name="$1"
+            actual="$(gcloud storage cat "gs://$COMET_RELEASES_GCS_BUCKET/releases/$name")"
+            if [[ "$actual" != "$VERSION" ]]; then
+              echo "::error::published staging release pointer $name is $actual, expected $VERSION"
+              return 1
+            fi
+          }
+
+          for channel in desktop desktop-staging; do
+            verify_object "candidate/$channel-manifest.json" "$channel-manifest.json"
+            verify_object "candidate/$channel-SHA256SUMS" "$channel-SHA256SUMS"
+            verify_pointer "$channel-latest.txt"
+          done
+          if [[ "$RELEASE_SURFACE" == "desktop-and-scaffold" ]]; then
+            verify_object candidate/scaffold-manifest.json scaffold-manifest.json
+            verify_object candidate/scaffold-SHA256SUMS scaffold-SHA256SUMS
+            verify_object candidate/manifest.json manifest.json
+            verify_object candidate/SHA256SUMS SHA256SUMS
+            verify_object candidate/install.sh install.sh
+            verify_pointer scaffold-latest.txt
+            verify_pointer latest.txt
           fi
 
   publish-production:
@@ -713,7 +774,8 @@ jobs:
             echo "::error::release bucket must not grant public or all-authenticated-user access"
             exit 1
           fi
-      - name: Promote immutable production release and selected moving channels
+      - id: publish
+        name: Promote immutable production release and selected moving channels
         env:
           VERSION: ${{ needs.version.outputs.version }}
           SCAFFOLD_RUNTIME_DEPLOYMENT: ${{ inputs.scaffold_runtime_deployment || 'unchanged' }}
@@ -761,6 +823,7 @@ jobs:
             "$RELEASE_SURFACE"
           for file in candidate/*; do
             name="$(basename "$file")"
+            case "$name" in comet-staging-*|desktop-staging-*) continue ;; esac
             publish_immutable "$file" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$VERSION/$name"
             case "$name" in
               *manifest.json|*SHA256SUMS|install.sh) ;;

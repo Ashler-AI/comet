@@ -52,6 +52,9 @@ describe("authenticated release feed", () => {
       "desktop-manifest.json",
       "desktop-SHA256SUMS",
       "desktop-latest.txt",
+      "desktop-staging-manifest.json",
+      "desktop-staging-SHA256SUMS",
+      "desktop-staging-latest.txt",
       "scaffold-manifest.json",
       "scaffold-SHA256SUMS",
       "scaffold-latest.txt"

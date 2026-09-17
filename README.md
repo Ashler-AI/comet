@@ -633,7 +633,7 @@ available through their existing internal TestFlight groups; see
 
 Manual releases choose an explicit surface:
 
-- `desktop` builds and promotes only `comet-<version>-macos-arm64.dmg` and the macOS app tarball. It advances `desktop-manifest.json` and `desktop-latest.txt` only.
+- `desktop` builds both signed macOS app variants. Staging advances `desktop-*` for the production-identity candidate and `desktop-staging-*` for Crew Staging; production promotion publishes only `comet-<version>-macos-arm64*` and advances only `desktop-*`. Both apps support in-app download and restart without changing bundle identity.
 - `desktop-and-scaffold` also builds both Linux archives, emits a `scaffold.comet-runtime.v1` compatibility manifest, and advances `scaffold-manifest.json` plus `scaffold-latest.txt`. Use this whenever headless engine, auth, relay, OMP, or Scaffold-host behavior changed.
 
 Version tags remain complete `desktop-and-scaffold` releases for backward compatibility. CI verifies the tag or dispatch version against both `[workspace.package].version` and Cargo metadata. Every `releases/<version>/…` object and version-named root artifact is create-only; a byte-identical re-publish is a no-op and differing bytes fail. Moving desktop and Scaffold channel aliases are independent. All objects remain private.
