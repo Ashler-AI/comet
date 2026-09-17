@@ -102,6 +102,15 @@ pub fn installed_executable() -> Option<PathBuf> {
     resolve_codex_executable()
 }
 
+/// A command for the installed Codex CLI with the same executable resolution
+/// and child PATH used by normal Codex runs.
+pub fn installed_command() -> Option<Command> {
+    let executable = resolve_codex_executable()?;
+    let mut command = Command::new(&executable);
+    crate::compose_child_path(&mut command, &executable);
+    Some(command)
+}
+
 /// True when `cwd` is a LINKED git worktree whose checked-out branch name
 /// contains '/' — the exact shape that trips codex's sandbox worktree-mount
 /// derivation (see the escalation in [`CodexHarness::run`]). Pure filesystem
