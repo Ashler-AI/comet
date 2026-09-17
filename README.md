@@ -19,6 +19,9 @@ coalesces snapshot metadata to a 30-second maximum scheduling delay; completed
 turns get priority, but model calls are limited to one per session per minute.
 One background worker bounds concurrent inference; retry deadlines survive restart.
 Slack/Notion link extraction does not depend on successful title generation.
+Title synchronization tracks this chat's metadata editors, not every device that
+has touched the workspace; unrelated workspace peers cannot exhaust the title
+update's causal-vector budget. Previously acknowledged edits remain fenced.
 
 Available persisted owned sessions are backfilled in bounded pages without
 opening their rooms. Archived and offline sessions do not expire; explicit
