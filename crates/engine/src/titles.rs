@@ -229,18 +229,19 @@ impl TitleGenerator {
             .get_crew_session(id, pending.deployment_id.as_deref())
             .await
             .map_err(|_| failure("directory revision lookup failed"))?;
-        let previous = if let Some(session) = remote.get("session").filter(|session| !session.is_null()) {
-            if session.get("deleted").and_then(Value::as_bool) == Some(true) {
-                return Ok(None);
-            }
-            let version: Version = serde_json::from_value(session["sourceVersion"].clone())
-                .map_err(|_| failure("invalid server source version"))?;
-            pending.revision = session.get("revision").and_then(Value::as_u64);
-            Some(version)
-        } else {
-            pending.revision = None;
-            None
-        };
+        let previous =
+            if let Some(session) = remote.get("session").filter(|session| !session.is_null()) {
+                if session.get("deleted").and_then(Value::as_bool) == Some(true) {
+                    return Ok(None);
+                }
+                let version: Version = serde_json::from_value(session["sourceVersion"].clone())
+                    .map_err(|_| failure("invalid server source version"))?;
+                pending.revision = session.get("revision").and_then(Value::as_u64);
+                Some(version)
+            } else {
+                pending.revision = None;
+                None
+            };
         let title = if let Some(projection) = &projection {
             let metadata = title_metadata(
                 &self.inner.workspace,
@@ -259,7 +260,10 @@ impl TitleGenerator {
             )?;
             String::new()
         };
-        if previous.as_ref().is_some_and(|version| !dominates(&pending.source_version, version)) {
+        if previous
+            .as_ref()
+            .is_some_and(|version| !dominates(&pending.source_version, version))
+        {
             return Err(failure(
                 "directory source is older or concurrent; awaiting synchronized snapshot",
             ));
@@ -435,17 +439,32 @@ fn with_workspace_version(
     }
     // Fence this chat's metadata, not every peer that ever touched the workspace.
     for peer in editors {
-        source.insert(format!("w:{peer}"), version.get(&peer).copied().unwrap_or(0) as u64);
+        source.insert(
+            format!("w:{peer}"),
+            version.get(&peer).copied().unwrap_or(0) as u64,
+        );
     }
     // Keep acknowledged fences only when our actual workspace has observed them.
     // Copying an unseen server counter would allow stale titles to overwrite renames.
     for (key, counter) in previous.into_iter().flatten() {
-        let Some(peer) = key.strip_prefix("w:") else { continue };
-        let observed = peer.parse::<u64>().ok().and_then(|peer| version.get(&peer)).copied().unwrap_or(0) as u64;
+        let Some(peer) = key.strip_prefix("w:") else {
+            continue;
+        };
+        let observed = peer
+            .parse::<u64>()
+            .ok()
+            .and_then(|peer| version.get(&peer))
+            .copied()
+            .unwrap_or(0) as u64;
         if observed < *counter {
-            return Err(failure("workspace metadata is older or concurrent; awaiting synchronized snapshot"));
+            return Err(failure(
+                "workspace metadata is older or concurrent; awaiting synchronized snapshot",
+            ));
         }
-        source.entry(key.clone()).and_modify(|value| *value = (*value).max(*counter)).or_insert(*counter);
+        source
+            .entry(key.clone())
+            .and_modify(|value| *value = (*value).max(*counter))
+            .or_insert(*counter);
     }
     if source.len() > 128 {
         return Err(failure("directory source version exceeds 128 peers"));
@@ -740,7 +759,10 @@ mod tests {
         let local_peer = workspace_doc.peer_id();
         for peer in 1..=130 {
             workspace_doc.set_peer_id(peer).unwrap();
-            workspace_doc.get_map("unrelated").insert(&peer.to_string(), true).unwrap();
+            workspace_doc
+                .get_map("unrelated")
+                .insert(&peer.to_string(), true)
+                .unwrap();
             workspace_doc.commit();
         }
         workspace_doc.set_peer_id(local_peer).unwrap();
@@ -856,7 +878,8 @@ mod tests {
                             json!(revision)
                         }
                     );
-                    let next: Version = serde_json::from_value(body["sourceVersion"].clone()).unwrap();
+                    let next: Version =
+                        serde_json::from_value(body["sourceVersion"].clone()).unwrap();
                     let previous: Version = serde_json::from_value(source.clone()).unwrap();
                     assert!(next.len() <= 128);
                     assert!(dominates(&next, &previous));
