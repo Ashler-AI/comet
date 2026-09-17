@@ -26,6 +26,7 @@ struct Pending {
 struct Projection {
     source_version: Version,
     completed: Option<String>,
+    completed_is_first: bool,
     input: String,
     links: Vec<String>,
 }
@@ -294,6 +295,11 @@ impl TitleGenerator {
         let Some(completed) = projection.completed else {
             return Ok(None);
         };
+        if !projection.completed_is_first {
+            // ponytail: transcript order is the intentional once gate; persist a marker
+            // only if old one-turn transcripts must remain unnamed.
+            return Ok(None);
+        }
         if pending.generated_for.as_deref() == Some(completed.as_str())
             && pending.generated_title.is_none()
         {
@@ -529,6 +535,8 @@ fn project(bytes: &[u8]) -> Result<Projection, EngineError> {
     let mut recent = String::new();
     let mut turn = String::new();
     let mut completed = None;
+    let mut completed_assistant_turns = 0;
+    let mut completed_is_first = false;
     for index in 0..doc.directory_entry_count() {
         let Some(entry) = doc.directory_entry(index)? else {
             continue;
@@ -576,23 +584,29 @@ fn project(bytes: &[u8]) -> Result<Projection, EngineError> {
                 turn.drain(..start);
             }
         }
-        if entry.role == MessageRole::Assistant
+        let clean_completion = entry.role == MessageRole::Assistant
             && entry.status == Some(MessageStatus::Complete)
-            && completed_marker
-                .as_deref()
-                .is_none_or(|marker| marker == entry.id)
             && !entry
                 .parts
                 .iter()
-                .any(|part| matches!(part, MessagePart::Error { .. }))
+                .any(|part| matches!(part, MessagePart::Error { .. }));
+        if clean_completion {
+            completed_assistant_turns += 1;
+        }
+        if clean_completion
+            && completed_marker
+                .as_deref()
+                .is_none_or(|marker| marker == entry.id)
         {
             completed = Some(entry.id);
+            completed_is_first = completed_assistant_turns == 1;
             recent.clone_from(&turn);
         }
     }
     Ok(Projection {
         source_version: version(&doc)?,
         completed,
+        completed_is_first,
         input: format!(
             "Initial request:\n{initial}\nRecent completed response and tools:\n{recent}"
         ),
@@ -737,7 +751,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn titles_ignore_unrelated_workspace_peers_and_preserve_manual_renames() {
+    async fn titles_generate_once_and_preserve_manual_renames() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let dir = tempfile::tempdir().unwrap();
         let id = "10000000-0000-4000-8000-000000000001";
@@ -805,7 +820,9 @@ mod tests {
         .unwrap();
         let (initial_tx, initial_rx) = tokio::sync::oneshot::channel();
         let (generated_tx, generated_rx) = tokio::sync::oneshot::channel();
+        let title_requests = Arc::new(AtomicUsize::new(0));
         let target = workspace.clone();
+        let server_title_requests = title_requests.clone();
         let server = tokio::spawn(async move {
             let mut initial_tx = Some(initial_tx);
             let mut generated_tx = Some(generated_tx);
@@ -856,17 +873,19 @@ mod tests {
                         initial_tx.is_none(),
                         "model cannot precede persisted metadata"
                     );
-                    assert!(
-                        body["input"]
-                            .as_str()
-                            .unwrap()
-                            .contains("Investigation completed")
-                    );
-                    let raw = target.doc().doc();
-                    let previous_peer = raw.peer_id();
-                    raw.set_peer_id(131).unwrap();
-                    target.rename_chat(id, "My manual title").unwrap();
-                    raw.set_peer_id(previous_peer).unwrap();
+                    if server_title_requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                        assert!(
+                            body["input"]
+                                .as_str()
+                                .unwrap()
+                                .contains("Investigation completed")
+                        );
+                        let raw = target.doc().doc();
+                        let previous_peer = raw.peer_id();
+                        raw.set_peer_id(131).unwrap();
+                        target.rename_chat(id, "My manual title").unwrap();
+                        raw.set_peer_id(previous_peer).unwrap();
+                    }
                     json!({"title": "Generated incident investigation"})
                 } else {
                     assert!(headers.starts_with("POST /api/crew-directory/upsert "));
@@ -938,6 +957,42 @@ mod tests {
             workspace.doc().chat(id).unwrap().unwrap().title.as_deref(),
             Some("My manual title")
         );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while store.directory_retry_delay().unwrap().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        doc.push_message(&entry(
+            "user-2",
+            MessageRole::User,
+            "Investigate another issue",
+        ))
+        .unwrap();
+        doc.push_message(&entry(
+            "assistant-2",
+            MessageRole::Assistant,
+            "Second investigation completed",
+        ))
+        .unwrap();
+        doc.doc()
+            .get_map("meta")
+            .insert("directoryCompletedTurn", "assistant-2")
+            .unwrap();
+        doc.doc().commit();
+        store
+            .save_snapshot(id, &doc.export_snapshot().unwrap())
+            .unwrap();
+        store.queue_directory(id, false).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while store.directory_retry_delay().unwrap().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(title_requests.load(Ordering::SeqCst), 1);
         server.abort();
     }
 }
