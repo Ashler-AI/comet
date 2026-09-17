@@ -113,14 +113,31 @@ mod stop_contract_tests {
 
     #[test]
     fn stop_preserves_legacy_and_expected_turn_contracts() {
-        let legacy: SessionControlAction = serde_json::from_value(serde_json::json!({ "action": "stop" })).unwrap();
-        assert_eq!(legacy, SessionControlAction::Stop { expected_turn_id: None });
-        assert_eq!(serde_json::to_value(&legacy).unwrap(), serde_json::json!({ "action": "stop" }));
-        let targeted = SessionControlAction::Stop { expected_turn_id: Some("engine-turn".into()) };
+        let legacy: SessionControlAction =
+            serde_json::from_value(serde_json::json!({ "action": "stop" })).unwrap();
+        assert_eq!(
+            legacy,
+            SessionControlAction::Stop {
+                expected_turn_id: None
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&legacy).unwrap(),
+            serde_json::json!({ "action": "stop" })
+        );
+        let targeted = SessionControlAction::Stop {
+            expected_turn_id: Some("engine-turn".into()),
+        };
         let wire = serde_json::to_value(&targeted).unwrap();
         assert_eq!(wire["expected_turn_id"], "engine-turn");
-        assert_eq!(serde_json::from_value::<SessionControlAction>(wire).unwrap(), targeted);
-        assert_eq!(targeted.required_capability(), comet_proto::CAPABILITY_SESSION_CONTROL);
+        assert_eq!(
+            serde_json::from_value::<SessionControlAction>(wire).unwrap(),
+            targeted
+        );
+        assert_eq!(
+            targeted.required_capability(),
+            comet_proto::CAPABILITY_SESSION_CONTROL
+        );
     }
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -152,6 +169,10 @@ pub enum SessionCommandPayload {
     PeerMessage {
         text: String,
         source_chat_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_deployment_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_device_id: Option<String>,
         thread_id: String,
         reply_to: Option<String>,
         hop_count: u8,
@@ -484,6 +505,8 @@ mod tests {
         let payload = SessionCommandPayload::PeerMessage {
             text: "review this".into(),
             source_chat_id: "source".into(),
+            source_deployment_id: Some("source-deployment".into()),
+            source_device_id: Some("source-device".into()),
             thread_id: "thread".into(),
             reply_to: Some("previous".into()),
             hop_count: 3,
@@ -491,6 +514,8 @@ mod tests {
         let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["kind"], "peerMessage");
         assert_eq!(json["sourceChatId"], "source");
+        assert_eq!(json["sourceDeploymentId"], "source-deployment");
+        assert_eq!(json["sourceDeviceId"], "source-device");
         assert_eq!(json["threadId"], "thread");
         assert_eq!(json["replyTo"], "previous");
         assert_eq!(json["hopCount"], 3);

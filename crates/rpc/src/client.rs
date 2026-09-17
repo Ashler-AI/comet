@@ -110,27 +110,47 @@ impl RpcClient {
     }
 
     /// A provisioning call whose caller owns cancellation, unlike durable command admission.
-    pub async fn call_cancellable(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, RpcError> {
+    pub async fn call_cancellable(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, RpcError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.shared.lock().insert(id, Pending::Call(tx));
-        struct CancelOnDrop<'a> { client: &'a RpcClient, id: u64 }
+        struct CancelOnDrop<'a> {
+            client: &'a RpcClient,
+            id: u64,
+        }
         impl Drop for CancelOnDrop<'_> {
             fn drop(&mut self) {
                 if self.client.shared.lock().remove(&self.id).is_some() {
                     if let Ok(frame) = serde_json::to_string(&ClientFrame {
-                        id: self.id, method: None, params: serde_json::Value::Null, cancel: true,
+                        id: self.id,
+                        method: None,
+                        params: serde_json::Value::Null,
+                        cancel: true,
                     }) {
-                        if let Err(mpsc::error::TrySendError::Full(frame)) = self.client.out.try_send(frame) {
+                        if let Err(mpsc::error::TrySendError::Full(frame)) =
+                            self.client.out.try_send(frame)
+                        {
                             let out = self.client.out.clone();
-                            self.client.runtime.spawn(async move { let _ = out.send(frame).await; });
+                            self.client.runtime.spawn(async move {
+                                let _ = out.send(frame).await;
+                            });
                         }
                     }
                 }
             }
         }
         let _cancel = CancelOnDrop { client: self, id };
-        self.send(ClientFrame { id, method: Some(method.into()), params, cancel: false }).await?;
+        self.send(ClientFrame {
+            id,
+            method: Some(method.into()),
+            params,
+            cancel: false,
+        })
+        .await?;
         rx.await.map_err(|_| RpcError::Closed)?
     }
 
@@ -306,7 +326,9 @@ mod cancellation_tests {
         let client = Arc::new(RpcClient::new(out.clone(), incoming));
         let pending_client = client.clone();
         let task = tokio::spawn(async move {
-            pending_client.call_cancellable("PrepareScaffoldSession", serde_json::json!({})).await
+            pending_client
+                .call_cancellable("PrepareScaffoldSession", serde_json::json!({}))
+                .await
         });
         let request: ClientFrame = serde_json::from_str(&frames.recv().await.unwrap()).unwrap();
         out.send("queued".into()).await.unwrap();
@@ -315,8 +337,11 @@ mod cancellation_tests {
         assert_eq!(frames.recv().await.as_deref(), Some("queued"));
         let cancel: ClientFrame = serde_json::from_str(
             &tokio::time::timeout(std::time::Duration::from_secs(1), frames.recv())
-                .await.unwrap().unwrap(),
-        ).unwrap();
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
         assert!(cancel.cancel);
         assert_eq!(cancel.id, request.id);
         assert!(client.shared.lock().is_empty());

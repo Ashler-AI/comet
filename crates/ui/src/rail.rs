@@ -611,14 +611,21 @@ mod tests {
             thread_id: "thread".into(),
             reply_to: None,
         });
-        let ordinary = entry("ordinary", MessageRole::User, "[Peer message] ordinary prompt");
+        let ordinary = entry(
+            "ordinary",
+            MessageRole::User,
+            "[Peer message] ordinary prompt",
+        );
         let reply = entry("reply", MessageRole::Assistant, "visible answer");
         let ticks = rail_ticks(&[peer.clone(), ordinary.clone(), reply], &[peer.clone()]);
-        assert_eq!(ticks, vec![RailTick {
-            message_id: ordinary.id.clone(),
-            prompt: "[Peer message] ordinary prompt".into(),
-            reply: Some("visible answer".into()),
-        }]);
+        assert_eq!(
+            ticks,
+            vec![RailTick {
+                message_id: ordinary.id.clone(),
+                prompt: "[Peer message] ordinary prompt".into(),
+                reply: Some("visible answer".into()),
+            }]
+        );
         assert!(rail_ticks(&[peer.clone()], &[peer.clone()]).is_empty());
         peer.peer_message.as_mut().unwrap().command_id = "mismatch".into();
         let ticks = rail_ticks(&[peer], &[]);

@@ -119,4 +119,61 @@ describe("trusted device host forwarding", () => {
     expect(response.status).toBe(403);
     expect(forwardedRequests).toHaveLength(0);
   });
+
+  it("lets a sandbox peer client reach only a session owned by its principal", async () => {
+    const grant = {
+      userId: "owner@example.com",
+      email: "owner@example.com",
+      grantId: "a".repeat(32),
+      projectId: "ashler-staging",
+      deploymentId: "source-deployment",
+      sandboxId: "source-sandbox",
+      targetDeviceId: "comet-scaffold-source-sandbox-e1",
+      sessionId: "11111111-1111-4111-8111-111111111111",
+      lifecycleEpoch: 1,
+      capabilities: ["session.read", "session.chat"],
+      grantedAt: Date.now() - 1,
+      expiresAt: Date.now() + 60_000,
+      revokedAt: null
+    };
+    let ownsSession = true;
+    const env = {
+      ...edgeEnv("scaffold", "staging"),
+      SCAFFOLD_REQUIRED_CAPABILITIES: "session.read session.chat",
+      AUTH_GRANTS: {
+        idFromName: (id: string) => id,
+        get: () => ({ fetch: async () => Response.json(grant) })
+      },
+      SESSION_ROOMS: {
+        idFromName: (id: string) => id,
+        get: (room: string) => ({ fetch: async () => Response.json({
+          ownsSession: ownsSession && !room.includes(grant.deploymentId),
+          deviceId: "local-engine"
+        }) })
+      }
+    } as unknown as Env;
+    const targetSession = "22222222-2222-4222-8222-222222222222";
+    const fallbackResolvedRequest = () => worker.fetch(new Request(
+      `https://comet.example/peer/${targetSession}/ws?deploymentId=${grant.deploymentId}`,
+      { headers: { authorization: `Bearer cs1.${grant.grantId}.${"b".repeat(64)}`, upgrade: "websocket" } }
+    ), env);
+    const directRequest = () => worker.fetch(new Request(
+      `https://comet.example/device/local-engine/ws?role=client&purpose=peer&peerSessionId=${targetSession}`,
+      { headers: { authorization: `Bearer cs1.${grant.grantId}.${"b".repeat(64)}`, upgrade: "websocket" } }
+    ), env);
+    const resolvedRequest = () => worker.fetch(new Request(
+      `https://comet.example/peer/${targetSession}/ws`,
+      { headers: { authorization: `Bearer cs1.${grant.grantId}.${"b".repeat(64)}`, upgrade: "websocket" } }
+    ), env);
+
+    expect((await directRequest()).status).toBe(204);
+    expect((await resolvedRequest()).status).toBe(204);
+    expect(new URL(forwardedRequests[1]!.url).searchParams.get("targetDeviceId")).toBe("local-engine");
+    expect((await fallbackResolvedRequest()).status).toBe(204);
+    expect(new URL(forwardedRequests[2]!.url).searchParams.get("targetDeviceId")).toBe("local-engine");
+    ownsSession = false;
+    expect((await directRequest()).status).toBe(403);
+    expect((await resolvedRequest()).status).toBe(404);
+    expect(forwardedRequests).toHaveLength(3);
+  });
 });

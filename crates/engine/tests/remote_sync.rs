@@ -850,24 +850,65 @@ async fn scaffold_host_joins_project_workspace_and_publishes_status() {
         &dirs.path().join("sandbox"),
         Arc::new(HarnessRegistry::for_profile(RuntimeProfile::ScaffoldHost)),
         HarnessId::Omp,
-        Some(EdgeConfig::with_static_token(&edge_url, TEST_BEARER).with_device("sandbox").with_deployment(DEPLOYMENT)),
-        PROJECT, USER, RuntimeProfile::ScaffoldHost,
-    ).unwrap();
-    wait_for(|| controller.workspace.connected() && sandbox.workspace.connected(), "sandbox workspace join").await;
-    sandbox.workspace.claim_chat("sandbox-chat", Some("/workspace")).unwrap();
+        Some(
+            EdgeConfig::with_static_token(&edge_url, TEST_BEARER)
+                .with_device("sandbox")
+                .with_deployment(DEPLOYMENT),
+        ),
+        PROJECT,
+        USER,
+        RuntimeProfile::ScaffoldHost,
+    )
+    .unwrap();
+    wait_for(
+        || controller.workspace.connected() && sandbox.workspace.connected(),
+        "sandbox workspace join",
+    )
+    .await;
+    sandbox
+        .workspace
+        .claim_chat("sandbox-chat", Some("/workspace"))
+        .unwrap();
     let mut status = comet_proto::Session {
-        chat_id: "sandbox-chat".into(), device_id: sandbox.device_id.clone(),
+        chat_id: "sandbox-chat".into(),
+        device_id: sandbox.device_id.clone(),
         status: comet_proto::SessionStatus::Working,
-        started_at: Some(chrono::Utc::now()), updated_at: chrono::Utc::now(),
+        started_at: Some(chrono::Utc::now()),
+        updated_at: chrono::Utc::now(),
     };
     sandbox.workspace.record_session(&status);
-    wait_for(|| controller.workspace.watch_session_rows().borrow().iter().any(|row|
-        row.chat_id == "sandbox-chat" && row.status == comet_proto::SessionStatus::Working), "sandbox working status").await;
+    wait_for(
+        || {
+            controller
+                .workspace
+                .watch_session_rows()
+                .borrow()
+                .iter()
+                .any(|row| {
+                    row.chat_id == "sandbox-chat"
+                        && row.status == comet_proto::SessionStatus::Working
+                })
+        },
+        "sandbox working status",
+    )
+    .await;
     status.status = comet_proto::SessionStatus::Idle;
     status.updated_at = chrono::Utc::now();
     sandbox.workspace.record_session(&status);
-    wait_for(|| controller.workspace.watch_session_rows().borrow().iter().any(|row|
-        row.chat_id == "sandbox-chat" && row.status == comet_proto::SessionStatus::Idle), "sandbox completed status").await;
+    wait_for(
+        || {
+            controller
+                .workspace
+                .watch_session_rows()
+                .borrow()
+                .iter()
+                .any(|row| {
+                    row.chat_id == "sandbox-chat" && row.status == comet_proto::SessionStatus::Idle
+                })
+        },
+        "sandbox completed status",
+    )
+    .await;
     controller.shutdown().await;
     sandbox.shutdown().await;
     relay_task.abort();

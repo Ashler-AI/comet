@@ -1,14 +1,17 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  DeviceRoom,
   authorizedDeviceSocketRole,
   canonicalGrantEnvelope,
   deviceGrantTargetsRoom,
   decodeDeviceFrame,
   encodeDeviceFrame,
-  DeviceRoom,
   enforceDeviceHostGrantAuthority,
   parseTrustedDeviceGrant,
-  rpcAllowedForScopedHost
+  rpcAllowedForDirectPeerReply,
+  rpcAllowedForPeerSession,
+  rpcAllowedForScopedHost,
+  requiredCapabilityForRpc,
 } from "./device-room";
 import { DEVICE_HOST_AUTH_HEADER, stripTrustedAuthHeaders } from "./env";
 
@@ -82,11 +85,15 @@ describe("device host authentication", () => {
     expect(authorizedDeviceSocketRole("client", false, "local")).toBeUndefined();
   });
 
-  it("requires sandbox host grants and rejects device grants as clients", () => {
+  it("requires sandbox host grants and allows only explicit peer clients", () => {
     expect(authorizedDeviceSocketRole("host", true, "sandbox")).toBe("host");
     expect(authorizedDeviceSocketRole("host", true, "local")).toBeUndefined();
     expect(authorizedDeviceSocketRole("host", false, "sandbox")).toBeUndefined();
     expect(authorizedDeviceSocketRole("client", true)).toBeUndefined();
+    expect(authorizedDeviceSocketRole("client", true, undefined, true)).toBe("client");
+    expect(authorizedDeviceSocketRole("client", false, undefined, true)).toBeUndefined();
+    expect(authorizedDeviceSocketRole("client", false, undefined, false, true)).toBe("client");
+    expect(authorizedDeviceSocketRole("client", true, undefined, false, true)).toBe("client");
     expect(deviceGrantTargetsRoom(rawGrant.targetDeviceId, rawGrant.targetDeviceId)).toBe(true);
     expect(deviceGrantTargetsRoom(rawGrant.targetDeviceId, "another-device")).toBe(false);
   });
@@ -224,6 +231,66 @@ describe("session-scoped host RPC", () => {
         grant
       )
     ).toBe(false);
+  });
+
+  it("accepts peer delivery only with chat authority for the granted host session", () => {
+    const chatGrant = { ...grant, capabilities: [...grant.capabilities, "session.chat"] };
+    const request = payload({
+      method: "DeliverPeerMessage",
+      params: { chatId: rawGrant.scope.sessionId, command: { kind: "peerMessage" } }
+    });
+    expect(rpcAllowedForScopedHost(rpc, request, chatGrant)).toBe(true);
+    expect(rpcAllowedForScopedHost(rpc, request, grant)).toBe(false);
+    expect(
+      rpcAllowedForScopedHost(
+        rpc,
+        payload({
+          method: "DeliverPeerMessage",
+          params: { chatId: "other-session", command: { kind: "peerMessage" } }
+        }),
+        chatGrant
+      )
+    ).toBe(false);
+  });
+
+  it("binds a sandbox peer client to its source and target sessions", () => {
+    const source = "11111111-1111-4111-8111-111111111111";
+    const target = "22222222-2222-4222-8222-222222222222";
+    const sourceDevice = "scaffold-source-device";
+    const command = {
+      method: "DeliverPeerMessage",
+      params: {
+        chatId: target,
+        commandId: "command-1",
+        command: {
+          kind: "peerMessage",
+          sourceChatId: source,
+          sourceDeploymentId: "source-deployment",
+          sourceDeviceId: sourceDevice,
+          threadId: "command-1",
+          replyTo: null,
+          hopCount: 0,
+          text: "status"
+        }
+      }
+    };
+    expect(rpcAllowedForPeerSession(payload({ method: "LocalDevice", params: {} }), source, "source-deployment", sourceDevice, target)).toBe(true);
+    expect(rpcAllowedForPeerSession(payload(command), source, "source-deployment", sourceDevice, target)).toBe(true);
+    expect(rpcAllowedForPeerSession(payload({ ...command, params: { ...command.params, chatId: source } }), source, "source-deployment", sourceDevice, target)).toBe(false);
+    expect(rpcAllowedForPeerSession(payload({ ...command, params: { ...command.params, command: { ...command.params.command, sourceChatId: target } } }), source, "source-deployment", sourceDevice, target)).toBe(false);
+    expect(rpcAllowedForPeerSession(payload({ ...command, params: { ...command.params, command: { ...command.params.command, sourceDeploymentId: "other" } } }), source, "source-deployment", sourceDevice, target)).toBe(false);
+    expect(rpcAllowedForPeerSession(payload({ ...command, params: { ...command.params, command: { ...command.params.command, sourceDeviceId: "other" } } }), source, "source-deployment", sourceDevice, target)).toBe(false);
+    expect(rpcAllowedForDirectPeerReply(payload(command), target)).toBe(false);
+    const reply = {
+      ...command,
+      params: {
+        ...command.params,
+        command: { ...command.params.command, replyTo: "original-command", hopCount: 1 }
+      }
+    };
+    expect(rpcAllowedForDirectPeerReply(payload(reply), target)).toBe(true);
+    expect(rpcAllowedForDirectPeerReply(payload({ ...reply, params: { ...reply.params, chatId: source } }), target)).toBe(false);
+    expect(requiredCapabilityForRpc(rpc, payload(command))).toBe("session.chat");
   });
 
   it("allows only the non-mutating exact-device readiness probe", () => {

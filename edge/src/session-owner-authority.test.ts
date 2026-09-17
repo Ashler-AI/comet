@@ -11,6 +11,7 @@ const roomWithMeta = (values: Record<string, string>): SessionRoom => {
   const room = Object.create(SessionRoom.prototype) as SessionRoom;
   Object.defineProperty(room, "ctx", {
     value: {
+      getWebSockets: () => [],
       storage: {
         sql: {
           exec: (query: string, key: string) => {
@@ -54,11 +55,15 @@ describe("session owner authority", () => {
 
   it("authorizes the durable owner of the exact project session", async () => {
     const response = await ownerCheck(
-      roomWithMeta({ projectScope: "project-a", ownerUserId: "owner@example.com" }),
+      roomWithMeta({
+        projectScope: "project-a",
+        ownerUserId: "owner@example.com",
+        hostDeviceId: "owner-device"
+      }),
       "owner@example.com"
     );
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ ownsSession: true });
+    expect(await response.json()).toEqual({ ownsSession: true, deviceId: "owner-device" });
   });
 
   it("denies an alternate authenticated user", async () => {
