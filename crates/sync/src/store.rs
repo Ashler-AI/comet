@@ -49,6 +49,8 @@ const MIGRATIONS: &[&str] = &[
         retry_at INTEGER NOT NULL DEFAULT 0
      ) STRICT;
      CREATE INDEX crew_directory_jobs_due ON crew_directory_jobs(due_at, session_id);",
+    // v5 — completed turns outrank backfill once their retry deadline has passed.
+    "ALTER TABLE crew_directory_jobs ADD COLUMN completed_turn_pending INTEGER NOT NULL DEFAULT 0;",
 ];
 
 /// SQLite-backed store under a data directory (`{data_dir}/docs.sqlite3`).
@@ -92,6 +94,15 @@ impl DocsStore {
 
     /// Save (upsert) the snapshot for `doc_id`.
     pub fn save_snapshot(&self, doc_id: &str, bytes: &[u8]) -> Result<(), StoreError> {
+        self.save_snapshot_with_priority(doc_id, bytes, false)
+    }
+
+    /// Persist a completed turn and prioritize its next directory claim atomically.
+    pub fn save_completed_snapshot(&self, doc_id: &str, bytes: &[u8]) -> Result<(), StoreError> {
+        self.save_snapshot_with_priority(doc_id, bytes, true)
+    }
+
+    fn save_snapshot_with_priority(&self, doc_id: &str, bytes: &[u8], completed: bool) -> Result<(), StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         tx.execute(
@@ -103,10 +114,11 @@ impl DocsStore {
         // and authenticated ownership before reading or transmitting their data.
         if doc_id.len() == 36 {
             tx.execute(
-                "INSERT INTO crew_directory_jobs(session_id, due_at) VALUES (?1, ?2)
+                "INSERT INTO crew_directory_jobs(session_id, due_at, completed_turn_pending) VALUES (?1, ?2, ?3)
                  ON CONFLICT(session_id) DO UPDATE SET generation = generation + 1,
-                 due_at = MAX(retry_at, MIN(due_at, excluded.due_at)) WHERE deleted = 0",
-                params![doc_id, now_ms() + 30_000],
+                 due_at = MAX(retry_at, MIN(due_at, excluded.due_at)),
+                 completed_turn_pending = MAX(completed_turn_pending, excluded.completed_turn_pending) WHERE deleted = 0",
+                params![doc_id, if completed { 0 } else { now_ms() + 30_000 }, completed],
             )?;
         }
         tx.commit()?;
@@ -229,11 +241,12 @@ impl DocsStore {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let job = tx.query_row(
-            "SELECT session_id, generation, state, deleted FROM crew_directory_jobs WHERE due_at <= ?1 ORDER BY due_at, session_id LIMIT 1",
+            "SELECT session_id, generation, state, deleted FROM crew_directory_jobs WHERE due_at <= ?1 ORDER BY completed_turn_pending DESC, due_at, session_id LIMIT 1",
             params![now_ms()], |row| Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         ).optional()?;
         if let Some((id, _, _, _)) = &job {
-            tx.execute("UPDATE crew_directory_jobs SET due_at = ?2 WHERE session_id = ?1", params![id, now_ms() + 120_000])?;
+            // Consume only this claim's priority; a completion arriving in flight sets it again.
+            tx.execute("UPDATE crew_directory_jobs SET due_at = ?2, completed_turn_pending = 0 WHERE session_id = ?1", params![id, now_ms() + 120_000])?;
         }
         tx.commit()?;
         Ok(job)
@@ -343,6 +356,85 @@ mod tests {
         store.save_snapshot(id, b"later").unwrap();
         store.queue_directory(id, false).unwrap();
         assert!(store.claim_directory().unwrap().is_none());
+    }
+
+    #[test]
+    fn completed_snapshot_prioritizes_failed_job_durably_without_resetting_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DocsStore::open(dir.path()).unwrap();
+        let id = "90000000-0000-4000-8000-000000000001";
+        let backlog = "10000000-0000-4000-8000-000000000001";
+        store.queue_directory(id, false).unwrap();
+        let (_, generation, _, _) = store.claim_directory().unwrap().unwrap();
+        store.settle_directory(id, generation, false).unwrap();
+        let state = r#"{"nextTitleAt":9223372036854775807}"#;
+        store.save_directory_state(id, state, false).unwrap();
+        store.save_completed_snapshot(id, b"completed").unwrap();
+        assert!(store.claim_directory().unwrap().is_none());
+        // Advance past transport backoff without sleeping or resetting inference state.
+        store.conn().execute("UPDATE crew_directory_jobs SET due_at = 1, retry_at = 1 WHERE session_id = ?1", params![id]).unwrap();
+        store.queue_directory(backlog, false).unwrap();
+        drop(store);
+
+        let store = DocsStore::open(dir.path()).unwrap();
+        // Restart backfill and later debounced saves must not demote a completion.
+        store.queue_directory(id, false).unwrap();
+        store.save_snapshot(id, b"latest").unwrap();
+        let (claimed, _, saved, _) = store.claim_directory().unwrap().unwrap();
+        assert_eq!(claimed, id);
+        assert_eq!(saved, state);
+        assert_eq!(store.load_snapshot(id).unwrap().as_deref(), Some(&b"latest"[..]));
+    }
+
+    #[test]
+    fn completed_priority_is_consumed_before_retry_or_title_deferral() {
+        for deferred in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = DocsStore::open(dir.path()).unwrap();
+            let id = "90000000-0000-4000-8000-000000000001";
+            let backlog = "10000000-0000-4000-8000-000000000001";
+            store.save_completed_snapshot(id, b"completed").unwrap();
+            let (_, generation, _, _) = store.claim_directory().unwrap().unwrap();
+            if deferred {
+                store.defer_directory_title(id, generation, i64::MAX - 1).unwrap();
+            } else {
+                store.settle_directory(id, generation, false).unwrap();
+            }
+            assert!(store.claim_directory().unwrap().is_none());
+            // Once due again, the failed/deferred completion no longer jumps the backlog.
+            store.conn().execute("UPDATE crew_directory_jobs SET due_at = 1, retry_at = 1 WHERE session_id = ?1", params![id]).unwrap();
+            store.queue_directory(backlog, false).unwrap();
+            let (claimed, generation, _, _) = store.claim_directory().unwrap().unwrap();
+            assert_eq!(claimed, backlog);
+            store.settle_directory(backlog, generation, true).unwrap();
+            assert_eq!(store.claim_directory().unwrap().unwrap().0, id);
+        }
+    }
+
+    #[test]
+    fn completion_during_claim_survives_success_failure_and_title_deferral() {
+        for outcome in ["success", "failure", "deferred"] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = DocsStore::open(dir.path()).unwrap();
+            let id = "90000000-0000-4000-8000-000000000001";
+            let backlog = "10000000-0000-4000-8000-000000000001";
+            store.save_completed_snapshot(id, b"first").unwrap();
+            let (_, generation, _, _) = store.claim_directory().unwrap().unwrap();
+            store.save_completed_snapshot(id, b"new completion").unwrap();
+            match outcome {
+                "deferred" => store.defer_directory_title(id, generation, i64::MAX - 1).unwrap(),
+                _ => store.settle_directory(id, generation, outcome == "success").unwrap(),
+            }
+            if outcome == "failure" {
+                assert!(store.claim_directory().unwrap().is_none());
+                store.conn().execute("UPDATE crew_directory_jobs SET due_at = 1, retry_at = 1 WHERE session_id = ?1", params![id]).unwrap();
+            }
+            store.queue_directory(backlog, false).unwrap();
+            let (claimed, newer, _, _) = store.claim_directory().unwrap().unwrap();
+            assert_eq!(claimed, id, "{outcome}");
+            assert!(newer > generation);
+            assert_eq!(store.load_snapshot(id).unwrap().as_deref(), Some(&b"new completion"[..]));
+        }
     }
 
     #[test]

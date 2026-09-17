@@ -18,6 +18,10 @@ The first prompt still names a new managed branch once. The durable local outbox
 coalesces snapshot metadata to a 30-second maximum scheduling delay; completed
 turns get priority, but model calls are limited to one per session per minute.
 One background worker bounds concurrent inference; retry deadlines survive restart.
+Completed snapshots persist their priority atomically. Each claim consumes that
+priority so failed jobs cannot repeatedly jump the backlog; retry deadlines still
+apply. Jobs queued before this upgrade retain ordinary scheduling until their next
+completed turn.
 Slack/Notion link extraction does not depend on successful title generation.
 Title synchronization tracks this chat's metadata editors, not every device that
 has touched the workspace; unrelated workspace peers cannot exhaust the title

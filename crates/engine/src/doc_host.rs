@@ -2759,8 +2759,7 @@ impl DocHost {
     pub(crate) fn persist_completed_turn(&self, chat_id: &str) -> Result<(), EngineError> {
         let handle = lock(&self.inner.handles).get(chat_id).cloned()
             .ok_or_else(|| EngineError::Other("completed turn document unavailable".into()))?;
-        self.inner.store.save_snapshot(chat_id, &handle.doc.export_snapshot()?)?;
-        self.inner.store.queue_directory(chat_id, false)?;
+        self.inner.store.save_completed_snapshot(chat_id, &handle.doc.export_snapshot()?)?;
         Ok(())
     }
 
