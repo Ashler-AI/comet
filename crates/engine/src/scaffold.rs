@@ -36,6 +36,8 @@ use crate::worktree_handoff::{MAX_HANDOFF_ARCHIVE_BYTES, WorktreeHandoffArchive}
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const RUNTIME_START_POLL: Duration = Duration::from_millis(500);
+// At 30 seconds per request, two retries cap a persistent timeout at about
+// 90 seconds plus two lifecycle-validation poll delays.
 const ATTACH_PROBE_TRANSPORT_RETRIES: usize = 2;
 const JOIN_GRANT_TTL_SECONDS: u32 = 15 * 60;
 const DEVICE_ACCESS_TTL_MS: i64 = 12 * 60 * 60 * 1000;
@@ -176,6 +178,7 @@ pub enum ScaffoldError {
     #[error("scaffold_request_failed: {cause}")]
     Transport {
         cause: ScaffoldTransportCause,
+        before_response: bool,
         #[source]
         source: reqwest::Error,
     },
@@ -209,16 +212,26 @@ impl fmt::Display for ScaffoldApiErrorDisplay {
         Ok(())
     }
 }
+
 impl From<reqwest::Error> for ScaffoldError {
     fn from(source: reqwest::Error) -> Self {
         Self::Transport {
             cause: classify_transport_error(&source),
+            before_response: false,
             source: source.without_url(),
         }
     }
 }
 
 impl ScaffoldError {
+    fn request_send_failure(source: reqwest::Error) -> Self {
+        Self::Transport {
+            cause: classify_transport_error(&source),
+            before_response: true,
+            source: source.without_url(),
+        }
+    }
+
     pub(crate) fn transport_cause(&self) -> Option<ScaffoldTransportCause> {
         match self {
             Self::Transport { cause, .. } => Some(*cause),
@@ -228,11 +241,14 @@ impl ScaffoldError {
 
     pub(crate) fn is_attach_probe_transport_retryable(&self) -> bool {
         matches!(
-            self.transport_cause(),
-            Some(
-                ScaffoldTransportCause::RequestTimeout
-                    | ScaffoldTransportCause::ConnectionResetOrClosed
-            )
+            self,
+            Self::Transport {
+                cause:
+                    ScaffoldTransportCause::RequestTimeout
+                    | ScaffoldTransportCause::ConnectionResetOrClosed,
+                before_response: true,
+                ..
+            }
         )
     }
 
@@ -933,7 +949,7 @@ impl ScaffoldClient {
             response = &mut send => match response {
                 Ok(response) => response,
                 Err(error) => {
-                    let error = ScaffoldError::from(error);
+                    let error = ScaffoldError::request_send_failure(error);
                     tracing::warn!(
                         transport_cause = %error.transport_cause().expect("transport error"),
                         "Scaffold request send failed"
@@ -3347,6 +3363,7 @@ mod tests {
     enum MockResponse {
         Http { status: u16, body: String },
         Close,
+        HeadersThenClose,
     }
 
     async fn mock_server(responses: Vec<String>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
@@ -3405,15 +3422,26 @@ mod tests {
                     }
                 }
                 requests.push(String::from_utf8(bytes).unwrap());
-                let MockResponse::Http { status, body } = response else {
-                    continue;
-                };
-                let response = format!(
-                    "HTTP/1.1 {status} Response\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    body.len(),
-                    body,
-                );
-                stream.write_all(response.as_bytes()).await.unwrap();
+                match response {
+                    MockResponse::Close => continue,
+                    MockResponse::HeadersThenClose => {
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 1\r\nconnection: close\r\n\r\n",
+                            )
+                            .await
+                            .unwrap();
+                        continue;
+                    }
+                    MockResponse::Http { status, body } => {
+                        let response = format!(
+                            "HTTP/1.1 {status} Response\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(),
+                            body,
+                        );
+                        stream.write_all(response.as_bytes()).await.unwrap();
+                    }
+                }
             }
             requests
         });
@@ -4013,6 +4041,43 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.api_error().unwrap().status, 403);
+        assert_eq!(captured.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn attach_does_not_retry_reset_after_response_headers() {
+        let (origin, captured) = mock_server_steps(vec![
+            MockResponse::Http {
+                status: 200,
+                body: comet_sandbox("starting"),
+            },
+            MockResponse::HeadersThenClose,
+        ])
+        .await;
+        let runtime = ScaffoldRuntime::new(
+            ScaffoldClient::new(&origin, "project-a", Arc::new(StaticToken("token".into())))
+                .unwrap(),
+            "https://comet-edge.example",
+            Arc::new(UnavailableDeviceJoinGrantProvider),
+        );
+        let error = runtime
+            .control(
+                ScaffoldEnvironmentControl::Attach {
+                    sandbox_id: "sandbox-a".into(),
+                    scope: scope(),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ScaffoldError::Transport {
+                cause: ScaffoldTransportCause::ConnectionResetOrClosed,
+                before_response: false,
+                ..
+            }
+        ));
         assert_eq!(captured.await.unwrap().len(), 2);
     }
 
