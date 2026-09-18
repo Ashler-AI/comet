@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import net from "node:net";
 import os from "node:os";
@@ -424,6 +424,89 @@ const expectRelayDenial = (socket, id, method, params = {}) =>
     `${method} relay denial`
   );
 
+const localRpc = async (port, method, params = {}) => {
+  const socket = await openWebSocket(`ws://127.0.0.1:${port}`, "local IPC");
+  try {
+    return await withTimeout(new Promise((resolve, reject) => {
+      socket.addEventListener("message", (event) => {
+        const reply = JSON.parse(event.data);
+        if (reply.id !== 1) return;
+        if (Object.hasOwn(reply, "err")) reject(new Error(reply.err));
+        else if (Object.hasOwn(reply, "ok")) resolve(reply.ok);
+        else if (Object.hasOwn(reply, "item")) resolve(reply.item);
+      });
+      socket.send(JSON.stringify({ id: 1, method, params }));
+    }), `${method} local RPC`);
+  } finally { await closeWebSocket(socket, "local IPC"); }
+};
+
+const ordinaryDeviceSmoke = async (edgeOrigin, scaffoldOrigin) => {
+  const ports = [await reservePort(), await reservePort()];
+  for (const [index, port] of ports.entries()) {
+    const dataDir = path.join(tempDir, `ordinary-${index}`);
+    await mkdir(dataDir);
+    await writeFile(path.join(dataDir, "session.json"), JSON.stringify({
+      accessToken: OWNER_TOKEN, user: { id: OWNER_SUBJECT, email: OWNER_SUBJECT, name: "Owner" },
+      projectScope: PROJECT_ID, capabilities: CAPABILITIES
+    }), { mode: 0o600 });
+    const child = spawnTracked(`ordinary Crew device ${index}`, COMET_BIN,
+      ["headless", "--edge-url", edgeOrigin], { cwd: ROOT, env: {
+        ...process.env, COMET_DATA_DIR: dataDir, COMET_IPC_PORT: String(port),
+        COMET_PROJECT_SCOPE: PROJECT_ID, COMET_SCAFFOLD_URL: scaffoldOrigin,
+        COMET_HARNESS: "mock", COMET_MOCK_REPEAT: "30", COMET_MOCK_DELAY_MS: "200",
+        RUST_LOG: "info"
+      } });
+    await waitFor(`ordinary device ${index} IPC`, async () => {
+      if (child.spawnError || child.exitCode !== null) throw new Error(child.outputSummary());
+      return localRpc(port, "LocalDevice");
+    });
+  }
+  const [desktop, devbox] = ports;
+  const { deviceId } = await localRpc(devbox, "LocalDevice");
+  await waitFor("ordinary Devbox relay", async () => {
+    const result = await ownerFetch(edgeOrigin, `/device/${deviceId}/status`);
+    return result.body?.hostConnected;
+  });
+  const chatId = crypto.randomUUID();
+  const spaceId = crypto.randomUUID();
+  await localRpc(devbox, "Mutate", { op: "createSpace", spaceId, deviceId, path: tempDir });
+  await localRpc(devbox, "Mutate", { op: "createChat", chatId, spaceId, config: {
+    harness: "mock", model: "fable-5", reasoning: null, sandbox: "workspace-write"
+  } });
+  await waitFor("remote workspace ownership sync", async () =>
+    (await localRpc(desktop, "WatchChats")).some((chat) => chat.id === chatId && chat.deviceId === deviceId));
+  const request = { prompt: "remote smoke", model: null, reasoning: null, cwd: tempDir,
+    sandbox: "workspace-write", resume: null };
+  const send = (command) => localRpc(desktop, "QueueCommand", { chatId, commandId: crypto.randomUUID(), command });
+  await send({ kind: "run", messageId: crypto.randomUUID(), request });
+  await waitFor("remote legacy response synced to desktop", async () =>
+    JSON.stringify(await localRpc(desktop, "WatchDocMessages", { chatId })).includes("Streaming pipeline"));
+  await send({ kind: "interrupt" });
+  await waitFor("legacy remote stop", async () =>
+    (await localRpc(devbox, "WatchSessions")).some((session) => session.chatId === chatId && session.status === "idle"));
+  const sessionId = crypto.randomUUID();
+  const typed = (action) => ({ kind: "control", source: "local", sessionId,
+    ownerDeviceId: deviceId, actorDeviceId: "desktop", actorSubject: OWNER_SUBJECT, grantId: "", action });
+  await send(typed({ action: "start", message_id: crypto.randomUUID(), request }));
+  await waitFor("ordinary Local session publication", async () =>
+    (await localRpc(desktop, "WatchCollaboration", { chatId })).sessions.some((session) =>
+      session.sessionId === sessionId && session.ownerDeviceId === deviceId && session.source === "local"));
+  await send(typed({ action: "steer", prompt: "continue", message_id: crypto.randomUUID() }));
+  await send(typed({ action: "stop" }));
+  await waitFor("typed remote stop", async () =>
+    (await localRpc(devbox, "WatchCollaboration", { chatId })).sessions.some((session) =>
+      session.sessionId === sessionId && session.status === "idle"));
+  const attacker = await openWebSocket(
+    `${edgeOrigin.replace("http:", "ws:")}/device/${deviceId}/ws?role=client&purpose=control&controlSessionId=${chatId}&token=${CLIENT_A_TOKEN}`,
+    "foreign principal control"
+  );
+  await assert.rejects(rpcCall(attacker, 1, "AdmitPeerCommand", {
+    chatId, commandId: crypto.randomUUID(), command: { kind: "interrupt" }
+  }), { message: "peer_command_scope_denied" });
+  await closeWebSocket(attacker, "foreign principal");
+  console.log("PASS ordinary two-device legacy start/response/stop and Local typed start/steer/stop; foreign principal denied");
+};
+
 const main = async () => {
   tempDir = await mkdtemp(path.join(os.tmpdir(), "comet-integration-smoke-"));
   const scaffoldPort = await reservePort();
@@ -465,6 +548,7 @@ const main = async () => {
     return result.response.ok ? result.body : undefined;
   });
   assert.deepEqual(health, { ok: true, auth: "scaffold", environment: "local" });
+  await ordinaryDeviceSmoke(edgeOrigin, fake.origin);
   const ipcPort = await reservePort();
   const roomProbe = await ownerFetch(
     edgeOrigin,

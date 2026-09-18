@@ -8213,6 +8213,64 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    fn published_remote_local_session_defers_grants_to_admission(cx: &mut gpui::TestAppContext) {
+        let mut snapshot = route_snapshot(&[
+            comet_proto::CAPABILITY_SESSION_CHAT,
+            comet_proto::CAPABILITY_SESSION_CONTROL,
+            comet_proto::CAPABILITY_SESSION_ANNOTATE,
+        ]);
+        snapshot.sessions[0].source = AgentSessionSource::Local;
+        snapshot.grants.clear();
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, _| {
+            state.local_device_id = Some("device-viewer".into());
+            state.selected_chat = Some("chat-a".into());
+            state.apply_collaboration(snapshot.clone());
+        });
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        composer.update(cx, |composer, cx| {
+            composer.on_state_changed(cx);
+            for capability in [
+                comet_proto::CAPABILITY_SESSION_CHAT,
+                comet_proto::CAPABILITY_SESSION_CONTROL,
+                comet_proto::CAPABILITY_SESSION_ANNOTATE,
+            ] {
+                let route = composer
+                    .control_route(capability, cx)
+                    .expect("remote Local control must reach authenticated admission")
+                    .expect("publication must select typed Control, not legacy commands");
+                assert_eq!(route.source, AgentSessionSource::Local);
+                assert_eq!(route.owner_device_id, "device-owner");
+                assert_eq!(route.session_id, "session-a");
+                assert!(route.grant_id.is_empty());
+            }
+        });
+
+        snapshot.principal.as_mut().unwrap().capabilities.clear();
+        state.update(cx, |state, _| state.apply_collaboration(snapshot.clone()));
+        composer.update(cx, |composer, cx| {
+            assert!(
+                composer
+                    .control_route(comet_proto::CAPABILITY_SESSION_CONTROL, cx)
+                    .is_err()
+            );
+        });
+
+        snapshot.principal.as_mut().unwrap().capabilities =
+            vec![comet_proto::CAPABILITY_SESSION_CONTROL.into()];
+        snapshot.sessions[0].source = AgentSessionSource::Scaffold;
+        state.update(cx, |state, _| state.apply_collaboration(snapshot));
+        composer.update(cx, |composer, cx| {
+            assert!(
+                composer
+                    .control_route(comet_proto::CAPABILITY_SESSION_CONTROL, cx)
+                    .is_err(),
+                "Scaffold still requires its scoped grant or verified reconnect target"
+            );
+        });
+    }
+
     #[test]
     fn stop_route_selects_session_control_grant() {
         let snapshot = route_snapshot(&[

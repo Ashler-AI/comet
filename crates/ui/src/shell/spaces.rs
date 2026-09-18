@@ -282,13 +282,12 @@ fn source_picker_spaces(spaces: Vec<Space>, local_device_id: Option<&str>) -> Ve
     })
 }
 fn sidebar_session_source(
-    local_device_id: Option<&str>,
     chat_device_id: &str,
     scaffold_session: bool,
     agent_source: Option<comet_proto::AgentSessionSource>,
 ) -> comet_proto::AgentSessionSource {
     agent_source.unwrap_or_else(|| {
-        if scaffold_session || local_device_id != Some(chat_device_id) {
+        if scaffold_session || comet_proto::parse_scaffold_device_id(chat_device_id).is_some() {
             comet_proto::AgentSessionSource::Scaffold
         } else {
             comet_proto::AgentSessionSource::Local
@@ -1015,7 +1014,6 @@ impl Shell {
                     let title = state.chat_display_name(chat).unwrap_or("New session");
                     let agent_session = state.collaboration_sessions(&id).next();
                     let source = sidebar_session_source(
-                        state.local_device_id.as_deref(),
                         &chat.device_id,
                         state.chat_is_scaffold(&id),
                         agent_session.map(|session| session.source),
@@ -2234,14 +2232,34 @@ mod tests {
     }
 
     #[test]
-    fn staged_scaffold_session_labels_a_local_chat_remote() {
+    fn sidebar_session_source_uses_scaffold_identity_until_publication() {
         assert_eq!(
-            sidebar_session_source(Some("device-current"), "device-current", true, None),
+            sidebar_session_source("device-current", true, None),
             AgentSessionSource::Scaffold
         );
         assert_eq!(
-            sidebar_session_source(Some("device-current"), "device-current", false, None),
+            sidebar_session_source("device-current", false, None),
             AgentSessionSource::Local
+        );
+        assert_eq!(
+            sidebar_session_source("device-devbox", false, None),
+            AgentSessionSource::Local
+        );
+        assert_eq!(
+            sidebar_session_source("comet-scaffold-sandbox-a-e2", false, None),
+            AgentSessionSource::Scaffold
+        );
+        assert_eq!(
+            sidebar_session_source(
+                "comet-scaffold-sandbox-a-e2",
+                true,
+                Some(AgentSessionSource::Local),
+            ),
+            AgentSessionSource::Local
+        );
+        assert_eq!(
+            sidebar_session_source("device-devbox", false, Some(AgentSessionSource::Scaffold)),
+            AgentSessionSource::Scaffold
         );
     }
 

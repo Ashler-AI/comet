@@ -433,10 +433,31 @@ impl RpcReply {
     }
 }
 
+/// One-shot authority emitted by the edge, never accepted from RPC parameters.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PeerCommandAuthority {
+    pub subject: String,
+    pub project_id: String,
+    pub device_id: String,
+    pub chat_id: String,
+    pub expires_at: i64,
+}
+
 /// Server-side dispatch: one implementation serves every transport.
 #[async_trait]
 pub trait RpcService: Send + Sync + 'static {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError>;
+
+    /// Only the authenticated host relay invokes this seam. Ordinary JSON RPC
+    /// dispatch cannot manufacture a verified principal by claiming its fields.
+    async fn admit_peer_command(
+        &self,
+        _authority: PeerCommandAuthority,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, RpcError> {
+        Err(RpcError::Failed("peer_command_authority_required".into()))
+    }
 }
 
 /// Deserialize typed params out of the envelope's `params` value.

@@ -102,7 +102,12 @@ impl DocsStore {
         self.save_snapshot_with_priority(doc_id, bytes, true)
     }
 
-    fn save_snapshot_with_priority(&self, doc_id: &str, bytes: &[u8], completed: bool) -> Result<(), StoreError> {
+    fn save_snapshot_with_priority(
+        &self,
+        doc_id: &str,
+        bytes: &[u8],
+        completed: bool,
+    ) -> Result<(), StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         tx.execute(
@@ -122,7 +127,8 @@ impl DocsStore {
             )?;
         }
         tx.commit()?;
-        self.directory_changed.send_modify(|value| *value = value.wrapping_add(1));
+        self.directory_changed
+            .send_modify(|value| *value = value.wrapping_add(1));
         Ok(())
     }
 
@@ -180,6 +186,15 @@ impl DocsStore {
         Ok(hit.is_some())
     }
 
+    /// Bound durable admission receipts without touching execution deduplication.
+    pub fn prune_local_commands(&self, created_before: i64) -> Result<(), StoreError> {
+        self.conn().execute(
+            "DELETE FROM trusted_local_commands WHERE created_at < ?1",
+            params![created_before],
+        )?;
+        Ok(())
+    }
+
     pub fn forget_local_command(&self, command_id: &str) -> Result<(), StoreError> {
         self.conn().execute(
             "DELETE FROM trusted_local_commands WHERE command_id = ?1",
@@ -213,17 +228,38 @@ impl DocsStore {
     /// Keyset inventory: never reopen rooms or retain all snapshots for backfill.
     pub fn snapshot_ids_after(&self, after: &str) -> Result<Vec<String>, StoreError> {
         let conn = self.conn();
-        let mut query = conn.prepare("SELECT doc_id FROM snapshots WHERE doc_id > ?1 ORDER BY doc_id LIMIT 32")?;
-        Ok(query.query_map(params![after], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?)
+        let mut query = conn
+            .prepare("SELECT doc_id FROM snapshots WHERE doc_id > ?1 ORDER BY doc_id LIMIT 32")?;
+        Ok(query
+            .query_map(params![after], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
-    pub fn load_bounded_snapshot(&self, id: &str, max_bytes: usize) -> Result<Option<Vec<u8>>, StoreError> {
+    pub fn load_bounded_snapshot(
+        &self,
+        id: &str,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
         let conn = self.conn();
-        let size: Option<usize> = conn.query_row("SELECT length(bytes) FROM snapshots WHERE doc_id = ?1", params![id], |row| row.get(0)).optional()?;
+        let size: Option<usize> = conn
+            .query_row(
+                "SELECT length(bytes) FROM snapshots WHERE doc_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
         if size.is_some_and(|size| size > max_bytes) {
-            return Err(std::io::Error::other("session snapshot exceeds directory scan budget").into());
+            return Err(
+                std::io::Error::other("session snapshot exceeds directory scan budget").into(),
+            );
         }
-        conn.query_row("SELECT bytes FROM snapshots WHERE doc_id = ?1", params![id], |row| row.get(0)).optional().map_err(Into::into)
+        conn.query_row(
+            "SELECT bytes FROM snapshots WHERE doc_id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     pub fn queue_directory(&self, id: &str, deleted: bool) -> Result<(), StoreError> {
@@ -233,7 +269,8 @@ impl DocsStore {
              deleted = MAX(deleted, excluded.deleted), due_at = retry_at",
             params![id, deleted],
         )?;
-        self.directory_changed.send_modify(|value| *value = value.wrapping_add(1));
+        self.directory_changed
+            .send_modify(|value| *value = value.wrapping_add(1));
         Ok(())
     }
 
@@ -252,8 +289,16 @@ impl DocsStore {
         Ok(job)
     }
 
-    pub fn save_directory_state(&self, id: &str, state: &str, deleted: bool) -> Result<(), StoreError> {
-        self.conn().execute("UPDATE crew_directory_jobs SET state = ?2 WHERE session_id = ?1 AND deleted = ?3", params![id, state, deleted])?;
+    pub fn save_directory_state(
+        &self,
+        id: &str,
+        state: &str,
+        deleted: bool,
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE crew_directory_jobs SET state = ?2 WHERE session_id = ?1 AND deleted = ?3",
+            params![id, state, deleted],
+        )?;
         Ok(())
     }
 
@@ -263,7 +308,8 @@ impl DocsStore {
              ON CONFLICT(session_id) DO UPDATE SET generation = generation + 1, deleted = 1, due_at = 0, state = excluded.state",
             params![id, state],
         )?;
-        self.directory_changed.send_modify(|value| *value = value.wrapping_add(1));
+        self.directory_changed
+            .send_modify(|value| *value = value.wrapping_add(1));
         Ok(())
     }
 
@@ -273,11 +319,20 @@ impl DocsStore {
 
     pub fn directory_retry_delay(&self) -> Result<Option<std::time::Duration>, StoreError> {
         let due: Option<i64> = self.conn().query_row(
-            "SELECT MIN(due_at) FROM crew_directory_jobs WHERE due_at < 9223372036854775807", [], |row| row.get(0))?;
-        Ok(due.map(|at| std::time::Duration::from_millis(at.saturating_sub(now_ms()).max(0) as u64)))
+            "SELECT MIN(due_at) FROM crew_directory_jobs WHERE due_at < 9223372036854775807",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(due
+            .map(|at| std::time::Duration::from_millis(at.saturating_sub(now_ms()).max(0) as u64)))
     }
 
-    pub fn settle_directory(&self, id: &str, generation: i64, success: bool) -> Result<(), StoreError> {
+    pub fn settle_directory(
+        &self,
+        id: &str,
+        generation: i64,
+        success: bool,
+    ) -> Result<(), StoreError> {
         self.conn().execute(
             "UPDATE crew_directory_jobs SET
              due_at = CASE WHEN ?3 THEN CASE WHEN generation = ?2 THEN 9223372036854775807 ELSE due_at END ELSE ?4 END,
@@ -287,7 +342,12 @@ impl DocsStore {
         Ok(())
     }
 
-    pub fn defer_directory_title(&self, id: &str, generation: i64, deadline: i64) -> Result<(), StoreError> {
+    pub fn defer_directory_title(
+        &self,
+        id: &str,
+        generation: i64,
+        deadline: i64,
+    ) -> Result<(), StoreError> {
         self.conn().execute("UPDATE crew_directory_jobs SET due_at = ?3 WHERE session_id = ?1 AND generation = ?2 AND deleted = 0", params![id, generation, deadline])?;
         Ok(())
     }
@@ -345,9 +405,23 @@ mod tests {
         let id = "10000000-0000-4000-8000-000000000001";
         store.save_snapshot(id, b"first").unwrap();
         assert!(store.claim_directory().unwrap().is_none());
-        let first_due: i64 = store.conn().query_row("SELECT due_at FROM crew_directory_jobs WHERE session_id = ?1", params![id], |row| row.get(0)).unwrap();
+        let first_due: i64 = store
+            .conn()
+            .query_row(
+                "SELECT due_at FROM crew_directory_jobs WHERE session_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
         store.save_snapshot(id, b"newest").unwrap();
-        let next_due: i64 = store.conn().query_row("SELECT due_at FROM crew_directory_jobs WHERE session_id = ?1", params![id], |row| row.get(0)).unwrap();
+        let next_due: i64 = store
+            .conn()
+            .query_row(
+                "SELECT due_at FROM crew_directory_jobs WHERE session_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(next_due, first_due);
         store.queue_directory(id, false).unwrap();
         let (_, generation, _, _) = store.claim_directory().unwrap().unwrap();
@@ -372,7 +446,13 @@ mod tests {
         store.save_completed_snapshot(id, b"completed").unwrap();
         assert!(store.claim_directory().unwrap().is_none());
         // Advance past transport backoff without sleeping or resetting inference state.
-        store.conn().execute("UPDATE crew_directory_jobs SET due_at = 1, retry_at = 1 WHERE session_id = ?1", params![id]).unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE crew_directory_jobs SET due_at = 1, retry_at = 1 WHERE session_id = ?1",
+                params![id],
+            )
+            .unwrap();
         store.queue_directory(backlog, false).unwrap();
         drop(store);
 
@@ -383,7 +463,10 @@ mod tests {
         let (claimed, _, saved, _) = store.claim_directory().unwrap().unwrap();
         assert_eq!(claimed, id);
         assert_eq!(saved, state);
-        assert_eq!(store.load_snapshot(id).unwrap().as_deref(), Some(&b"latest"[..]));
+        assert_eq!(
+            store.load_snapshot(id).unwrap().as_deref(),
+            Some(&b"latest"[..])
+        );
     }
 
     #[test]
@@ -396,13 +479,21 @@ mod tests {
             store.save_completed_snapshot(id, b"completed").unwrap();
             let (_, generation, _, _) = store.claim_directory().unwrap().unwrap();
             if deferred {
-                store.defer_directory_title(id, generation, i64::MAX - 1).unwrap();
+                store
+                    .defer_directory_title(id, generation, i64::MAX - 1)
+                    .unwrap();
             } else {
                 store.settle_directory(id, generation, false).unwrap();
             }
             assert!(store.claim_directory().unwrap().is_none());
             // Once due again, the failed/deferred completion no longer jumps the backlog.
-            store.conn().execute("UPDATE crew_directory_jobs SET due_at = 1, retry_at = 1 WHERE session_id = ?1", params![id]).unwrap();
+            store
+                .conn()
+                .execute(
+                    "UPDATE crew_directory_jobs SET due_at = 1, retry_at = 1 WHERE session_id = ?1",
+                    params![id],
+                )
+                .unwrap();
             store.queue_directory(backlog, false).unwrap();
             let (claimed, generation, _, _) = store.claim_directory().unwrap().unwrap();
             assert_eq!(claimed, backlog);
@@ -420,10 +511,16 @@ mod tests {
             let backlog = "10000000-0000-4000-8000-000000000001";
             store.save_completed_snapshot(id, b"first").unwrap();
             let (_, generation, _, _) = store.claim_directory().unwrap().unwrap();
-            store.save_completed_snapshot(id, b"new completion").unwrap();
+            store
+                .save_completed_snapshot(id, b"new completion")
+                .unwrap();
             match outcome {
-                "deferred" => store.defer_directory_title(id, generation, i64::MAX - 1).unwrap(),
-                _ => store.settle_directory(id, generation, outcome == "success").unwrap(),
+                "deferred" => store
+                    .defer_directory_title(id, generation, i64::MAX - 1)
+                    .unwrap(),
+                _ => store
+                    .settle_directory(id, generation, outcome == "success")
+                    .unwrap(),
             }
             if outcome == "failure" {
                 assert!(store.claim_directory().unwrap().is_none());
@@ -433,7 +530,10 @@ mod tests {
             let (claimed, newer, _, _) = store.claim_directory().unwrap().unwrap();
             assert_eq!(claimed, id, "{outcome}");
             assert!(newer > generation);
-            assert_eq!(store.load_snapshot(id).unwrap().as_deref(), Some(&b"new completion"[..]));
+            assert_eq!(
+                store.load_snapshot(id).unwrap().as_deref(),
+                Some(&b"new completion"[..])
+            );
         }
     }
 
@@ -448,14 +548,22 @@ mod tests {
         store.settle_directory(id, generation, true).unwrap();
         let (_, newer, _, _) = store.claim_directory().unwrap().unwrap();
         assert!(newer > generation);
-        store.queue_directory_deletion(id, r#"{"sourceVersion":{"s:1":4},"deploymentId":"staging"}"#).unwrap();
+        store
+            .queue_directory_deletion(
+                id,
+                r#"{"sourceVersion":{"s:1":4},"deploymentId":"staging"}"#,
+            )
+            .unwrap();
         store.save_directory_state(id, "{}", false).unwrap();
         drop(store);
         let restarted = DocsStore::open(dir.path()).unwrap();
         restarted.queue_directory(id, false).unwrap();
         let (_, _, state, deleted) = restarted.claim_directory().unwrap().unwrap();
         assert!(deleted);
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&state).unwrap()["deploymentId"], "staging");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&state).unwrap()["deploymentId"],
+            "staging"
+        );
     }
 
     #[test]
@@ -510,6 +618,33 @@ mod tests {
         assert!(store.is_trusted_local_command("cmd-local").unwrap());
         store.forget_local_command("cmd-local").unwrap();
         assert!(!store.is_trusted_local_command("cmd-local").unwrap());
+    }
+
+    #[test]
+    fn local_command_retention_preserves_original_admission_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DocsStore::open(dir.path()).unwrap();
+        store.trust_local_command("old").unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE trusted_local_commands SET created_at = 10 WHERE command_id = 'old'",
+                [],
+            )
+            .unwrap();
+        store.mark_processed("old").unwrap();
+        store.trust_local_command("old").unwrap();
+        store.trust_local_command("current").unwrap();
+        store.prune_local_commands(11).unwrap();
+        assert!(
+            !store.is_trusted_local_command("old").unwrap(),
+            "retry must not refresh original admission time"
+        );
+        assert!(store.is_trusted_local_command("current").unwrap());
+        assert!(
+            store.is_processed("old").unwrap(),
+            "retention must not allow re-execution"
+        );
     }
 
     #[test]

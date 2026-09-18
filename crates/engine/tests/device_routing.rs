@@ -295,10 +295,9 @@ async fn target_device_id_routes_over_the_relay() {
         }
     }
 
-    // Durable commands are the exception to device-addressed forwarding. They
-    // enter the caller's shared session document first so an offline target can
-    // receive them through document sync after reconnect. A stale
-    // targetDeviceId must not bypass that durability boundary.
+    // QueueCommand ignores caller-carried targetDeviceId. The workspace
+    // owner is A, so this stays local; only an actual remote owner selects the
+    // separately authenticated peer-command admission path.
     let command = serde_json::to_value(SessionCommandPayload::Run {
         request: RunRequest {
             prompt: "run remotely".into(),

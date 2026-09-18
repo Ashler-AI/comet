@@ -8,6 +8,7 @@ import {
   encodeDeviceFrame,
   enforceDeviceHostGrantAuthority,
   parseTrustedDeviceGrant,
+  peerCommandAdmission,
   rpcAllowedForDirectPeerReply,
   rpcAllowedForPeerSession,
   rpcAllowedForScopedHost,
@@ -33,6 +34,87 @@ const rawGrant = {
   expiresAt: now + 60_000,
   revokedAt: null
 };
+
+describe("ordinary device command admission", () => {
+  const client = {
+    userId: "owner@example.test", projectScope: "project-a",
+    targetDeviceId: "devbox-a", controlSessionId: "chat-a",
+    capabilities: ["session.control", "session.chat"], joinedAt: now - 1
+  };
+  const host = { ...client, hostAuthorization: "local" as const };
+  const request = {
+    id: 1, method: "AdmitPeerCommand",
+    params: { chatId: "chat-a", commandId: "command-a", command: { kind: "interrupt" } }
+  };
+  const encode = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));
+
+  it("binds a one-shot command to verified principal, project, device and session", () => {
+    expect(peerCommandAdmission(client, host, encode(request), now)?.authority).toEqual({
+      subject: client.userId, projectId: client.projectScope, deviceId: "devbox-a",
+      chatId: "chat-a", expiresAt: client.joinedAt + 30_000
+    });
+    for (const changed of [
+      { userId: "attacker" }, { projectScope: "foreign" }, { targetDeviceId: "other" },
+      { controlSessionId: "other-chat" }, { capabilities: ["session.read"] },
+      { controlConsumed: true }, { joinedAt: now - 30_000 }, { grant: rawGrant }
+    ]) {
+      expect(peerCommandAdmission({ ...client, ...changed }, host, encode(request), now)).toBeUndefined();
+    }
+    expect(peerCommandAdmission(client, { ...host, hostAuthorization: "sandbox" }, encode(request), now)).toBeUndefined();
+    expect(peerCommandAdmission(client, host, encode({ ...request, method: "QueueCommand" }), now)).toBeUndefined();
+  });
+
+  it("allows typed Local controls without trusting caller grant ids or Scaffold identities", () => {
+    const command = {
+      kind: "control", source: "local", ownerDeviceId: "devbox-a", sessionId: "agent-a",
+      actorSubject: client.userId, grantId: "", action: { action: "steer", prompt: "continue" }
+    };
+    const typed = { ...request, params: { ...request.params, command } };
+    expect(peerCommandAdmission(client, host, encode(typed), now)).toBeDefined();
+    for (const changed of [{ source: "scaffold" }, { ownerDeviceId: "other" }, { actorSubject: "attacker" }]) {
+      expect(peerCommandAdmission(client, host, encode({ ...typed, params: {
+        ...typed.params, command: { ...command, ...changed }
+      } }), now)).toBeUndefined();
+    }
+    expect(peerCommandAdmission({ ...client, capabilities: ["session.control"] }, host, encode(typed), now)).toBeUndefined();
+  });
+
+  it("consumes authority once even when relay checks overlap", async () => {
+    let attachment = { ...client, role: "client", connId: "desktop", joinedAt: Date.now(), controlConsumed: false };
+    const socket = {
+      deserializeAttachment: () => attachment,
+      serializeAttachment: (value: typeof attachment) => { attachment = value; }
+    } as unknown as WebSocket;
+    const hostSocket = { deserializeAttachment: () => host } as unknown as WebSocket;
+    const deliver = vi.fn();
+    const rejectRequest = vi.fn();
+    const room = {
+      authorizePeerClient: async () => true, authorizeHost: async () => true,
+      liveHost: () => hostSocket, deliver, rejectRequest
+    } as unknown as DeviceRoom;
+    const frame = encodeDeviceFrame({ s: "rpc", k: "rpc" }, encode(request)).buffer as ArrayBuffer;
+    await Promise.all([
+      DeviceRoom.prototype.webSocketMessage.call(room, socket, frame),
+      DeviceRoom.prototype.webSocketMessage.call(room, socket, frame)
+    ]);
+    expect(deliver).toHaveBeenCalledOnce();
+    expect(rejectRequest).toHaveBeenCalledWith(socket, expect.anything(), "peer_command_scope_denied");
+    expect(deliver.mock.calls[0][1].k).toBe("peer-command");
+  });
+
+  it("never relays client-forged authority frames", async () => {
+    const rejectRequest = vi.fn();
+    const deliver = vi.fn();
+    const room = { authorizePeerClient: async () => true, rejectRequest, deliver } as unknown as DeviceRoom;
+    const socket = { deserializeAttachment: () => ({ ...client, role: "client" }) } as unknown as WebSocket;
+    for (const kind of ["grant", "nudge", "peer-command", " relay"]) {
+      await DeviceRoom.prototype.webSocketMessage.call(room, socket,
+        encodeDeviceFrame({ s: "rpc", k: kind }, encode(request)).buffer as ArrayBuffer);
+    }
+    expect(rejectRequest).toHaveBeenCalledTimes(4);
+    expect(deliver).not.toHaveBeenCalled();
+  });
+});
 
 describe("trusted device grants", () => {
   it("emits the exact server-scoped capability envelope", () => {

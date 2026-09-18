@@ -159,6 +159,9 @@ interface SocketState {
   hostAuthorization?: DeviceHostAuthorization;
   peerSessionId?: string;
   peerReply?: boolean;
+  targetDeviceId?: string;
+  controlSessionId?: string;
+  controlConsumed?: boolean;
   /** Accept time — the liveness floor until the socket's first auto-pong. */
   joinedAt?: number;
   /** A newer socket claimed this logical connection id. */
@@ -469,12 +472,23 @@ export class DeviceRoom implements DurableObject {
         if (hostAuthorization === "local" && this.getMeta("targetDeviceId")) {
           return new Response("forbidden", { status: 403 });
         }
+        if (hostAuthorization === "local") {
+          const current = this.liveHost()?.deserializeAttachment() as SocketState | null | undefined;
+          const principal = this.getMeta("localOwnerUserId") ?? current?.userId;
+          if (principal && principal !== userId) return new Response("forbidden", { status: 403 });
+          this.setMeta("localOwnerUserId", userId);
+        }
         if (!owner) this.setMeta("owner", projectScope);
         else if (owner !== projectScope) return new Response("forbidden", { status: 403 });
       } else if (!owner || owner !== projectScope) {
         return new Response("forbidden", { status: 403 });
       }
       const connId = url.searchParams.get("connId") ?? crypto.randomUUID();
+      const controlSessionId = url.searchParams.get("controlSessionId") ?? undefined;
+      if (controlSessionId && (role !== "client" || grant || peerSessionId ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(controlSessionId))) {
+        return new Response("forbidden", { status: 403 });
+      }
       const staleClients =
         role === "client" ? this.ctx.getWebSockets(clientTag(connId)) : [];
       const pair = new WebSocketPair();
@@ -493,7 +507,9 @@ export class DeviceRoom implements DurableObject {
         ...(role === "host" ? { hostAuthorization } : {}),
         ...(grant ? { grant } : {}),
         ...(peerSessionId ? { peerSessionId } : {}),
-        ...(peerReply ? { peerReply } : {})
+        ...(peerReply ? { peerReply } : {}),
+        targetDeviceId: url.searchParams.get("targetDeviceId") ?? undefined,
+        ...(controlSessionId ? { controlSessionId } : {}),
       };
       pair[1].serializeAttachment(state);
       if (role === "client") {
@@ -639,6 +655,11 @@ export class DeviceRoom implements DurableObject {
       return;
     }
     if (state.role === "client") {
+      // Authority and wakeup frames are emitted by this relay, never clients.
+      if (frame.header.k !== "rpc" && frame.header.k !== "term") {
+        this.rejectRequest(ws, frame, "reserved_frame_kind");
+        return;
+      }
       const actorSubject =
         frame.header.k === "rpc" ? controlActorForRpc(frame.payload) : undefined;
       if (actorSubject !== undefined && actorSubject !== state.userId) {
@@ -685,7 +706,30 @@ export class DeviceRoom implements DurableObject {
         this.deliver(ws, { s: frame.header.s, k: RELAY_KIND }, encodeRelayError("host_offline"));
         return;
       }
-      const hostGrant = (host.deserializeAttachment() as SocketState | null)?.grant;
+      const hostState = host.deserializeAttachment() as SocketState | null;
+      const hostGrant = hostState?.grant;
+      let method: string | undefined;
+      try { method = JSON.parse(new TextDecoder().decode(frame.payload)).method; } catch { /* denied below */ }
+      if (method === "AdmitPeerCommand" || state.controlSessionId) {
+        // Re-read after the authority awaits: another message may have consumed it.
+        const current = ws.deserializeAttachment() as SocketState | null;
+        const admission = current && frame.header.k === "rpc"
+          ? peerCommandAdmission(current, hostState, frame.payload, Date.now())
+          : undefined;
+        if (!admission) {
+          this.rejectRequest(ws, frame, "peer_command_scope_denied");
+          return;
+        }
+        // Consume before delivery; replay needs a newly authenticated socket.
+        ws.serializeAttachment({ ...current, controlConsumed: true });
+        this.deliver(host, { s: frame.header.s, k: "peer-command", from: state.connId },
+          new TextEncoder().encode(JSON.stringify(admission)));
+        return;
+      }
+      if (method === "QueueCommand" && !hostGrant) {
+        this.rejectRequest(ws, frame, "peer_command_authority_required");
+        return;
+      }
       if (hostGrant && !rpcAllowedForScopedHost(frame.header, frame.payload, hostGrant)) {
         this.rejectRequest(ws, frame, "session_scope_denied");
         return;
@@ -951,6 +995,42 @@ export const rpcAllowedForPeerSession = (
   }
 };
 
+/** A one-command grant, bound to fresh socket authentication and the host's
+ * verified identity. The host also checks its local workspace session owner. */
+export const peerCommandAdmission = (
+  client: Pick<SocketState, "userId" | "projectScope" | "capabilities" | "grant" | "targetDeviceId" | "controlSessionId" | "controlConsumed" | "joinedAt">,
+  host: Pick<SocketState, "userId" | "projectScope" | "hostAuthorization" | "grant" | "targetDeviceId"> | null,
+  payload: Uint8Array,
+  now: number
+) => {
+  if (!host || host.hostAuthorization !== "local" || host.grant || client.grant ||
+    host.userId !== client.userId || host.projectScope !== client.projectScope ||
+    !host.targetDeviceId || host.targetDeviceId !== client.targetDeviceId ||
+    !client.controlSessionId || client.controlConsumed ||
+    !client.capabilities.includes("session.control") ||
+    !client.joinedAt || client.joinedAt > now || now >= client.joinedAt + 30_000) return undefined;
+  try {
+    const request = JSON.parse(new TextDecoder().decode(payload));
+    if (request.method !== "AdmitPeerCommand" || !Number.isSafeInteger(request.id) || request.id < 0 ||
+      request.cancel || request.params?.chatId !== client.controlSessionId ||
+      typeof request.params.commandId !== "string" || !request.params.commandId.trim()) return undefined;
+    const command = request.params.command;
+    if (command?.kind === "control") {
+      if (command.source !== "local" || command.ownerDeviceId !== host.targetDeviceId ||
+        command.actorSubject !== client.userId || typeof command.sessionId !== "string" ||
+        !command.sessionId.trim()) return undefined;
+    } else if (!["run", "steer", "queue", "interrupt", "respondInput"].includes(command?.kind)) return undefined;
+    if (!client.capabilities.includes(requiredCapabilityForRpc({ s: "rpc", k: "rpc" }, payload))) return undefined;
+    return { request, authority: {
+      subject: client.userId,
+      projectId: client.projectScope,
+      deviceId: host.targetDeviceId,
+      chatId: client.controlSessionId,
+      expiresAt: client.joinedAt + 30_000
+    } };
+  } catch { return undefined; }
+};
+
 export const requiredCapabilityForRpc = (
   header: DeviceFrameHeader,
   payload: Uint8Array
@@ -967,7 +1047,7 @@ export const requiredCapabilityForRpc = (
   }
   if (value.method === "DeliverPeerMessage") return "session.chat";
   if (value.method === "LocalDevice") return SESSION_READ;
-  if (value.method === "QueueCommand") {
+  if (value.method === "QueueCommand" || value.method === "AdmitPeerCommand") {
     const command = value.params?.command;
     if (command?.kind !== "control") return "session.control";
     const action = command.action?.action;

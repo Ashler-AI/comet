@@ -2,6 +2,24 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Crew 0.1.117: ordinary remote device control
+
+Desktop clients can start, steer, answer, and stop sessions on an ordinary
+`comet headless` device signed into the same account and project. These sessions
+are labelled **Local**, including before the first agent publication; only
+explicit Scaffold sessions use the Scaffold label.
+
+Remote commands use fresh, one-shot authenticated device-relay admission scoped
+to the host and chat. The host records immutable command provenance; copied or
+forged commands in the shared document cannot confer execution authority.
+Exact retries retain their receipt through the original command lifetime without
+renewing authority. Offline hosts fail admission explicitly.
+
+Deploy the matching edge before updating clients and hosts, and reconnect
+ordinary hosts after deployment. Scaffold lifecycle and grant checks are unchanged.
+The two-engine collaboration smoke covers ordinary remote legacy and typed Local
+start/response/steer/stop, foreign-principal denial, and existing Scaffold revocation.
+
 ## Unreleased: shared session discovery
 
 `comet session search --query "upload retries"` searches generated and display

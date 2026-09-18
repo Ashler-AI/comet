@@ -1658,9 +1658,14 @@ impl DocHost {
                     EngineError::Other(format!("local control authority serialize: {error}"))
                 })?
         } else {
-            Some(command_id.to_string())
+            Some(local_owner_authority_key(&entry).map_err(|error| {
+                EngineError::Other(format!("local command authority serialize: {error}"))
+            })?)
         };
         if let Some(trust_key) = trust_key.as_deref() {
+            self.inner
+                .store
+                .prune_local_commands(now - COMMAND_DEFAULT_TTL_MS)?;
             self.inner.store.trust_local_command(trust_key)?;
         }
         if let Err(err) = handle.doc.queue_command(&entry) {
@@ -1816,6 +1821,20 @@ impl DocHost {
         )
     }
 
+    pub(crate) fn has_local_command_provenance(&self, entry: &SessionCommandEntry) -> bool {
+        let now = now_ms();
+        entry.issued_by == self.device_id()
+            && entry.issued_at <= now
+            && now < entry.issued_at.saturating_add(COMMAND_DEFAULT_TTL_MS)
+            && entry.expires_at.is_none_or(|expires_at| now < expires_at)
+            && local_owner_authority_key(entry).is_ok_and(|key| {
+                self.inner
+                    .store
+                    .is_trusted_local_command(&key)
+                    .unwrap_or(false)
+            })
+    }
+
     /// Validate against a grant previously ingested from the control plane. Command-carried
     /// actor/scope strings are lookup inputs only and never confer authority themselves.
     /// `None` means relay authority is refreshing, so the command must remain pending.
@@ -1831,14 +1850,7 @@ impl DocHost {
             // Run/steer/input commands authored by this device's local API carry
             // durable device-local provenance. A synced peer can copy `issuedBy`
             // in Loro, but cannot write this host's SQLite trust ledger.
-            return Some(
-                entry.issued_by == self.device_id()
-                    && self
-                        .inner
-                        .store
-                        .is_trusted_local_command(&entry.id)
-                        .unwrap_or(false),
-            );
+            return Some(self.has_local_command_provenance(entry));
         };
         let Some(workspace) = self.workspace() else {
             return Some(false);
@@ -1854,6 +1866,12 @@ impl DocHost {
             // never fall through to restart reconstruction and bypass that state.
             if let Some(trusted) = grants.get(grant_id) {
                 let now = now_ms();
+                if !trusted.edge_derived
+                    && trusted.grant.granted_by == "authenticated-local-identity"
+                    && !self.has_local_command_provenance(entry)
+                {
+                    return Some(false);
+                }
                 if trusted.edge_derived
                     && entry.issued_by == self.device_id()
                     && local_owner_authority_key(entry).is_ok_and(|key| {
@@ -2022,15 +2040,9 @@ impl DocHost {
                     self.resolve_command(handle, &entry, status, resolution.as_deref());
                 }
             }
-            if let Err(err) = self.inner.store.forget_local_command(&entry.id) {
-                tracing::debug!(command = %entry.id, error = %err, "local command trust cleanup failed");
-            }
-            if matches!(&entry.payload, SessionCommandPayload::Control { .. })
-                && let Ok(key) = local_owner_authority_key(&entry)
-                && let Err(err) = self.inner.store.forget_local_command(&key)
-            {
-                tracing::debug!(command = %entry.id, error = %err, "local control authority cleanup failed");
-            }
+            // Keep the immutable admission receipt for exact retries after drain.
+            // Queue-time pruning bounds it to the command TTL; processed ids
+            // remain durable so receipt expiry can never enable re-execution.
         }
     }
 
@@ -2757,9 +2769,13 @@ impl DocHost {
     }
 
     pub(crate) fn persist_completed_turn(&self, chat_id: &str) -> Result<(), EngineError> {
-        let handle = lock(&self.inner.handles).get(chat_id).cloned()
+        let handle = lock(&self.inner.handles)
+            .get(chat_id)
+            .cloned()
             .ok_or_else(|| EngineError::Other("completed turn document unavailable".into()))?;
-        self.inner.store.save_completed_snapshot(chat_id, &handle.doc.export_snapshot()?)?;
+        self.inner
+            .store
+            .save_completed_snapshot(chat_id, &handle.doc.export_snapshot()?)?;
         Ok(())
     }
 
@@ -3338,9 +3354,22 @@ mod authority_tests {
         );
         host.inner
             .store
-            .trust_local_command(&local_command.id)
+            .trust_local_command(&local_owner_authority_key(&local_command).unwrap())
             .unwrap();
         assert!(host.command_grant_authorized(&local_command));
+        let mut forged_run = local_command.clone();
+        forged_run.payload = SessionCommandPayload::Run {
+            request: serde_json::from_value(serde_json::json!({
+                "prompt": "forged execution", "model": null, "reasoning": null,
+                "cwd": "/tmp", "sandbox": "workspace-write", "resume": null
+            }))
+            .unwrap(),
+            message_id: "forged-message".into(),
+        };
+        assert!(
+            !host.command_grant_authorized(&forged_run),
+            "copying an admitted id and issuedBy must not authorize a foreign Run"
+        );
 
         workspace
             .doc()

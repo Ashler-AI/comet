@@ -49,8 +49,8 @@
 //! forward can never loop. Streaming methods are proxied by re-subscribing remotely and
 //! piping items. To make another method device-addressable, nothing per-method is needed
 //! beyond listing it in [`forwardable`] (and [`is_stream_method`] if it streams);
-//! handlers stay transport-agnostic. `QueueCommand` is intentionally local so
-//! the caller durably appends before any remote delivery is attempted.
+//! handlers stay transport-agnostic. `QueueCommand` stays non-forwardable; ordinary
+//! remote hosts use a separate, one-shot authenticated relay admission before append.
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -296,6 +296,21 @@ fn session_viewport_authority(
         .capabilities
         .retain(|capability| grant.capabilities.contains(capability));
     Ok(authority)
+}
+
+fn ordinary_peer_command(command: &SessionCommandPayload) -> bool {
+    matches!(
+        command,
+        SessionCommandPayload::Run { .. }
+            | SessionCommandPayload::Steer { .. }
+            | SessionCommandPayload::Queue { .. }
+            | SessionCommandPayload::Interrupt { .. }
+            | SessionCommandPayload::RespondInput { .. }
+            | SessionCommandPayload::Control {
+                source: comet_proto::AgentSessionSource::Local,
+                ..
+            }
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -1779,6 +1794,67 @@ impl RpcService for AuthRpc {
 
 #[async_trait]
 impl RpcService for EngineRpc {
+    async fn admit_peer_command(
+        &self,
+        authority: comet_rpc::PeerCommandAuthority,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, RpcError> {
+        let mut p: QueueCommandParams = parse_params(params)?;
+        let auth = self.auth()?.state();
+        if self.runtime_profile == RuntimeProfile::ScaffoldHost
+            || auth.user().map(|user| user.id.as_str()) != Some(authority.subject.as_str())
+            || auth.project_scope() != Some(authority.project_id.as_str())
+            || authority.project_id != self.workspace.project_scope()
+            || authority.device_id != self.doc_host.device_id()
+            || authority.chat_id != p.chat_id
+            || authority.expires_at <= crate::now_ms()
+            || !self.doc_host.is_locally_hosted(&p.chat_id)
+            || !ordinary_peer_command(&p.command)
+        {
+            return Err(RpcError::Failed("peer_command_scope_denied".into()));
+        }
+        let command_id = p
+            .command_id
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| RpcError::BadParams("commandId required".into()))?;
+        if let SessionCommandPayload::Control {
+            owner_device_id,
+            actor_device_id,
+            actor_subject,
+            grant_id,
+            ..
+        } = &mut p.command
+        {
+            if owner_device_id != self.doc_host.device_id() || actor_subject != &authority.subject {
+                return Err(RpcError::Failed("peer_command_scope_denied".into()));
+            }
+            // The host admits on behalf of its authenticated owner, rather than
+            // trusting command-carried grant identifiers from the shared doc.
+            *actor_device_id = self.doc_host.device_id().to_string();
+            *grant_id = format!("peer-command:{command_id}");
+        }
+        let entry = match self
+            .doc_host
+            .command_entry(&p.chat_id, &command_id)
+            .map_err(|error| RpcError::Failed(error.to_string()))?
+        {
+            Some(entry) => entry,
+            None => {
+                self.install_local_owner_grant(&p.command)?;
+                self.doc_host
+                    .queue_command_with_id(&p.chat_id, &command_id, p.command.clone())
+                    .map_err(|error| RpcError::Failed(error.to_string()))?
+            }
+        };
+        if entry.payload != p.command || !self.doc_host.has_local_command_provenance(&entry) {
+            return Err(RpcError::Failed("command_id_conflict".into()));
+        }
+        self.workspace
+            .set_chat_archived(&p.chat_id, false)
+            .map_err(|error| RpcError::Failed(error.to_string()))?;
+        Ok(serde_json::json!({ "commandId": entry.id }))
+    }
+
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
         // Device-addressed routing: forward calls that target another device over its
         // relay. The target compares the id to its own, so forwards cannot loop.
@@ -2119,6 +2195,37 @@ impl RpcService for EngineRpc {
             }
             methods::QUEUE_COMMAND => {
                 let p: QueueCommandParams = parse_params(params)?;
+                if ordinary_peer_command(&p.command)
+                    && let Some(chat) = self
+                        .workspace
+                        .doc()
+                        .chat(&p.chat_id)
+                        .map_err(|error| RpcError::Failed(error.to_string()))?
+                    && chat.device_id != self.doc_host.device_id()
+                    && !chat.device_id.starts_with("comet-scaffold-")
+                {
+                    // QueueCommand itself remains non-forwardable. The relay
+                    // authenticates this exact admission on a fresh connection.
+                    let chat_id = canonical_session_id(&p.chat_id)
+                        .ok_or_else(|| RpcError::BadParams("invalid chatId".into()))?;
+                    let command_id = p.command_id.unwrap_or_else(crate::new_id);
+                    let links = self
+                        .links
+                        .as_ref()
+                        .ok_or_else(|| RpcError::Failed("peer relay unavailable".into()))?;
+                    return links
+                        .command_call(
+                            &chat.device_id,
+                            &chat_id,
+                            serde_json::json!({
+                                "chatId": chat_id,
+                                "commandId": command_id,
+                                "command": p.command,
+                            }),
+                        )
+                        .await
+                        .map(RpcReply::Value);
+                }
                 let starts_session = matches!(&p.command, SessionCommandPayload::Run { .. })
                     || matches!(&p.command, SessionCommandPayload::Control { action, .. }
                         if matches!(action.as_ref(), comet_doc::SessionControlAction::Start { .. }));
@@ -3073,6 +3180,107 @@ impl RpcService for EngineRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ordinary_peer_commands_require_exact_relay_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = crate::EngineCore::assemble_with_identity(
+            dir.path(),
+            std::sync::Arc::new(crate::default_registry(RuntimeProfile::Mock)),
+            HarnessId::Mock,
+            None,
+            "project-a",
+            "owner-a",
+            RuntimeProfile::Mock,
+        )
+        .unwrap();
+        let mut auth_config = crate::auth::AuthConfig::new("http://127.0.0.1:1", dir.path());
+        auth_config.project_scope = "project-a".into();
+        auth_config.dev_user_id = "owner-a".into();
+        core.set_auth(Auth::new(auth_config));
+        core.workspace
+            .create_space("space-a", &core.device_id, "/tmp", None, false)
+            .unwrap();
+        core.workspace
+            .create_chat("chat-a", "space-a", None, Some("/tmp".into()))
+            .unwrap();
+        let rpc = core.rpc_service();
+        let params = serde_json::json!({ "chatId": "chat-a", "commandId": "command-a",
+            "command": { "kind": "control", "source": "local", "sessionId": "agent-a",
+                "ownerDeviceId": core.device_id, "actorDeviceId": "desktop-a",
+                "actorSubject": "owner-a", "grantId": "untrusted-caller-grant",
+                "action": { "action": "start", "message_id": "message-a",
+                    "request": { "prompt": "hello", "model": null, "reasoning": null,
+                        "cwd": "/tmp", "sandbox": "workspace-write", "resume": null } }
+            }
+        });
+        let authority = || {
+            serde_json::json!({ "subject": "owner-a", "projectId": "project-a",
+            "deviceId": core.device_id, "chatId": "chat-a", "expiresAt": crate::now_ms() + 30_000 })
+        };
+        for (field, value) in [
+            ("subject", serde_json::json!("attacker")),
+            ("projectId", serde_json::json!("foreign")),
+            ("deviceId", serde_json::json!("other-device")),
+            ("chatId", serde_json::json!("other-chat")),
+            ("expiresAt", serde_json::json!(0)),
+        ] {
+            let mut denied = authority();
+            denied[field] = value;
+            assert!(
+                rpc.admit_peer_command(serde_json::from_value(denied).unwrap(), params.clone())
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            rpc.handle("AdmitPeerCommand", params.clone())
+                .await
+                .is_err(),
+            "ordinary JSON RPC must not expose the trusted relay seam"
+        );
+        assert!(!core.doc_host.chat_has_commands("chat-a").unwrap());
+        let admitted = rpc
+            .admit_peer_command(serde_json::from_value(authority()).unwrap(), params.clone())
+            .await
+            .unwrap();
+        assert_eq!(admitted["commandId"], "command-a");
+        let handle = core.doc_host.open("chat-a").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if handle
+                    .doc()
+                    .collaboration_snapshot()
+                    .unwrap()
+                    .sessions
+                    .iter()
+                    .any(|session| {
+                        session.session_id == "agent-a"
+                            && session.source == comet_proto::AgentSessionSource::Local
+                            && session.owner_device_id == core.device_id
+                    })
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("authenticated remote Start executes as a Local session");
+        assert_eq!(
+            rpc.admit_peer_command(serde_json::from_value(authority()).unwrap(), params.clone())
+                .await
+                .unwrap(),
+            admitted
+        );
+        let mut conflict = params;
+        conflict["command"]["action"]["request"]["prompt"] = serde_json::json!("changed payload");
+        assert!(
+            rpc.admit_peer_command(serde_json::from_value(authority()).unwrap(), conflict)
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn omp_recovery_watch_scopes_initial_snapshot_and_matching_chat_updates() {

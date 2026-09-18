@@ -220,9 +220,9 @@ pub fn local_file_anchor(
     }
 }
 
-/// Resolve a verified host-local grant for one exact agent session. The
-/// collaboration principal is project-scoped for display and capability
-/// discovery; the grant supplies the narrower deployment/session boundary.
+/// Resolve an exact-session grant, or defer ordinary Crew host authority to
+/// authenticated QueueCommand admission with an empty grant ID. Scaffold
+/// sessions always require their existing scoped grant.
 pub fn session_grant_id(
     snapshot: &CollaborationSnapshot,
     session: &comet_proto::AgentSessionRecord,
@@ -256,6 +256,7 @@ pub fn session_grant_id(
         })
         .or_else(|| snapshot.grants.iter().find(permits))
         .map(|grant| grant.id.clone())
+        .or_else(|| (session.source == AgentSessionSource::Local).then(String::new))
 }
 
 /// Durable command identity is encoded in the immutable audit id. Keep this

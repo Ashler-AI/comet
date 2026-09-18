@@ -537,6 +537,39 @@ async fn handle_host_frame(
         return;
     }
     if header.k != RPC_KIND {
+        if header.k == "peer-command" {
+            #[derive(Deserialize)]
+            struct Admission {
+                authority: crate::PeerCommandAuthority,
+                request: crate::ClientFrame,
+            }
+            let Some(from) = header.from else { return };
+            let Ok(admission) = serde_json::from_slice::<Admission>(&payload) else {
+                return;
+            };
+            if admission.request.method.as_deref() != Some("AdmitPeerCommand") {
+                return;
+            }
+            let result = service
+                .admit_peer_command(admission.authority, admission.request.params)
+                .await;
+            let mut response = crate::ServerFrame {
+                id: admission.request.id,
+                ..Default::default()
+            };
+            match result {
+                Ok(value) => response.ok = Some(value),
+                Err(error) => response.err = Some(error.to_string()),
+            }
+            if let Ok(payload) = serde_json::to_vec(&response)
+                && let Ok(frame) = encode_device_frame(
+                    &DeviceFrameHeader::new(RPC_KIND, RPC_KIND).with_to(from),
+                    &payload,
+                )
+            {
+                let _ = out_tx.send(frame).await;
+            }
+        }
         return; // future stream kinds (term, tunnel)
     }
     let Some(from) = header.from else {
@@ -810,6 +843,38 @@ impl LinkCache {
         // curve — the in-call retries must not escalate it by themselves.
         self.note_failure(device_id);
         Err(last_err.unwrap_or(RpcError::Closed))
+    }
+
+    /// Fresh authentication for each ordinary remote command; no cached socket
+    /// may extend a revoked sign-in's control authority.
+    pub async fn command_call(
+        &self,
+        device_id: &str,
+        chat_id: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, RpcError> {
+        let token = self
+            .config
+            .token
+            .token()
+            .await
+            .ok_or_else(|| RpcError::Transport("not signed in".into()))?;
+        let mut url = device_room_ws_url(
+            &self.config.edge_url,
+            device_id,
+            "client",
+            Some(&uuid::Uuid::new_v4().to_string()),
+            &token,
+        );
+        url.push_str("&purpose=control&controlSessionId=");
+        url.push_str(chat_id);
+        let link = DeviceLink::connect(&url).await?;
+        tokio::time::timeout(
+            self.config.probe_timeout,
+            link.client().call("AdmitPeerCommand", params),
+        )
+        .await
+        .map_err(|_| RpcError::Transport("peer command admission timed out".into()))?
     }
 
     /// Drop a cached link after a failed RPC so the next call re-dials.

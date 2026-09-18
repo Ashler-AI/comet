@@ -371,6 +371,13 @@ export default {
       const peerSessionId = canonicalSessionId(url.searchParams.get("peerSessionId") ?? undefined);
       const peerDeploymentId = url.searchParams.get("peerDeploymentId") ?? undefined;
       const peerPurpose = url.searchParams.get("purpose");
+      const controlSessionId = peerPurpose === "control"
+        ? canonicalSessionId(url.searchParams.get("controlSessionId") ?? undefined)
+        : undefined;
+      if (peerPurpose === "control" && (
+        deviceCredential || !controlSessionId || requestedRole !== "client" ||
+        deviceId.startsWith(SANDBOX_DEVICE_PREFIX) || !hasCapability(identity, "session.control")
+      )) return json({ error: "forbidden" }, 403);
       const directPeerReply = peerPurpose === "peer-reply";
       const peerClient =
         parts[2] === "ws" &&
@@ -422,7 +429,7 @@ export default {
         const connId = url.searchParams.get("connId") ?? crypto.randomUUID();
         const peer = peerClient
           ? `&purpose=${encodeURIComponent(peerPurpose!)}&peerSessionId=${encodeURIComponent(peerSessionId!)}&targetDeviceId=${encodeURIComponent(deviceId)}`
-          : `&targetDeviceId=${encodeURIComponent(deviceId)}`;
+          : `&targetDeviceId=${encodeURIComponent(deviceId)}${controlSessionId ? `&controlSessionId=${encodeURIComponent(controlSessionId)}` : ""}`;
         return forward(
           env.DEVICE_ROOMS,
           room,
