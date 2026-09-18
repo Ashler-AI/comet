@@ -36,6 +36,9 @@ use crate::worktree_handoff::{MAX_HANDOFF_ARCHIVE_BYTES, WorktreeHandoffArchive}
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const RUNTIME_START_POLL: Duration = Duration::from_millis(500);
+// At 30 seconds per request, two retries cap a persistent timeout at about
+// 90 seconds plus two lifecycle-validation poll delays.
+const ATTACH_PROBE_TRANSPORT_RETRIES: usize = 2;
 const JOIN_GRANT_TTL_SECONDS: u32 = 15 * 60;
 const DEVICE_ACCESS_TTL_MS: i64 = 12 * 60 * 60 * 1000;
 const SCAFFOLD_HANDOFF_CWD: &str = "/workspace/crew-handoff";
@@ -113,14 +116,72 @@ pub struct ScaffoldApiError {
     pub message: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScaffoldTransportCause {
+    RequestTimeout,
+    ConnectFailure,
+    ConnectionResetOrClosed,
+    SendFailure,
+}
+
+impl fmt::Display for ScaffoldTransportCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::RequestTimeout => "request_timeout",
+            Self::ConnectFailure => "connect_failure",
+            Self::ConnectionResetOrClosed => "connection_reset_or_closed",
+            Self::SendFailure => "send_failure",
+        })
+    }
+}
+
+fn classify_transport_error(error: &reqwest::Error) -> ScaffoldTransportCause {
+    if error.is_timeout() {
+        return ScaffoldTransportCause::RequestTimeout;
+    }
+    let mut source: &(dyn std::error::Error + 'static) = error;
+    loop {
+        if let Some(io_error) = source.downcast_ref::<std::io::Error>()
+            && matches!(
+                io_error.kind(),
+                std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+        {
+            return ScaffoldTransportCause::ConnectionResetOrClosed;
+        }
+        if let Some(hyper_error) = source.downcast_ref::<hyper::Error>()
+            && (hyper_error.is_closed() || hyper_error.is_incomplete_message())
+        {
+            return ScaffoldTransportCause::ConnectionResetOrClosed;
+        }
+        let Some(next) = source.source() else {
+            break;
+        };
+        source = next;
+    }
+    if error.is_connect() {
+        ScaffoldTransportCause::ConnectFailure
+    } else {
+        ScaffoldTransportCause::SendFailure
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ScaffoldError {
     #[error("scaffold_auth_unavailable")]
     AuthUnavailable,
     #[error("scaffold_request_cancelled")]
     Cancelled,
-    #[error("scaffold_request_failed: {0}")]
-    Transport(#[from] reqwest::Error),
+    #[error("scaffold_request_failed: {cause}")]
+    Transport {
+        cause: ScaffoldTransportCause,
+        before_response: bool,
+        #[source]
+        source: reqwest::Error,
+    },
     #[error("scaffold_response_invalid: {0}")]
     InvalidResponse(String),
     #[error("scaffold_scope_invalid: {0}")]
@@ -152,7 +213,45 @@ impl fmt::Display for ScaffoldApiErrorDisplay {
     }
 }
 
+impl From<reqwest::Error> for ScaffoldError {
+    fn from(source: reqwest::Error) -> Self {
+        Self::Transport {
+            cause: classify_transport_error(&source),
+            before_response: false,
+            source: source.without_url(),
+        }
+    }
+}
+
 impl ScaffoldError {
+    fn request_send_failure(source: reqwest::Error) -> Self {
+        Self::Transport {
+            cause: classify_transport_error(&source),
+            before_response: true,
+            source: source.without_url(),
+        }
+    }
+
+    pub(crate) fn transport_cause(&self) -> Option<ScaffoldTransportCause> {
+        match self {
+            Self::Transport { cause, .. } => Some(*cause),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_attach_probe_transport_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Transport {
+                cause:
+                    ScaffoldTransportCause::RequestTimeout
+                    | ScaffoldTransportCause::ConnectionResetOrClosed,
+                before_response: true,
+                ..
+            }
+        )
+    }
+
     fn is_runtime_starting(&self) -> bool {
         self.api_error()
             .is_some_and(|error| error.status == 503 && error.code == "sandbox_runtime_starting")
@@ -475,7 +574,7 @@ impl ScaffoldClient {
         }
         let request = request.body(body);
         tokio::select! {
-            response = request.send() => response.map_err(ScaffoldError::Transport),
+            response = request.send() => response.map_err(ScaffoldError::from),
             () = cancellation.cancelled() => Err(ScaffoldError::Cancelled),
         }
     }
@@ -847,7 +946,17 @@ impl ScaffoldClient {
         let response = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(ScaffoldError::Cancelled),
-            response = &mut send => response?,
+            response = &mut send => match response {
+                Ok(response) => response,
+                Err(error) => {
+                    let error = ScaffoldError::request_send_failure(error);
+                    tracing::warn!(
+                        transport_cause = %error.transport_cause().expect("transport error"),
+                        "Scaffold request send failed"
+                    );
+                    return Err(error);
+                }
+            },
         };
         // The bearer is dropped before any response body is retained or decoded.
         drop(bearer);
@@ -2690,6 +2799,7 @@ impl ScaffoldRuntime {
         argv: &[String],
         cancellation: &CancellationToken,
     ) -> Result<ExecResponse, ScaffoldError> {
+        let mut transport_retries = 0;
         loop {
             let body = ExecBody {
                 argv,
@@ -2703,10 +2813,18 @@ impl ScaffoldRuntime {
             };
             match result {
                 Err(error) if error.is_runtime_starting() => {}
+                Err(error)
+                    if error.is_attach_probe_transport_retryable()
+                        && transport_retries < ATTACH_PROBE_TRANSPORT_RETRIES =>
+                {
+                    // The command is read-only; the background bootstrap exec
+                    // remains outside this bounded retry.
+                    transport_retries += 1;
+                }
                 result => return result,
             }
             // Only authoritative startup for this same lifecycle can extend the
-            // wait. Transport, authorization, and unreadable Inspect errors exit.
+            // wait; transport retries are bounded above and use this same check.
             let pending = async {
                 let current = self
                     .inner
@@ -3242,18 +3360,42 @@ mod tests {
         assert!(envelope.sandbox.into_environment(scope()).is_ok());
     }
 
+    enum MockResponse {
+        Http { status: u16, body: String },
+        Close,
+        HeadersThenClose,
+    }
+
     async fn mock_server(responses: Vec<String>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
-        mock_server_with_status(responses.into_iter().map(|body| (200, body)).collect()).await
+        mock_server_steps(
+            responses
+                .into_iter()
+                .map(|body| MockResponse::Http { status: 200, body })
+                .collect(),
+        )
+        .await
     }
 
     async fn mock_server_with_status(
         responses: Vec<(u16, String)>,
     ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        mock_server_steps(
+            responses
+                .into_iter()
+                .map(|(status, body)| MockResponse::Http { status, body })
+                .collect(),
+        )
+        .await
+    }
+
+    async fn mock_server_steps(
+        responses: Vec<MockResponse>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move {
             let mut requests = Vec::new();
-            for (status, body) in responses {
+            for response in responses {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
                 loop {
@@ -3280,12 +3422,26 @@ mod tests {
                     }
                 }
                 requests.push(String::from_utf8(bytes).unwrap());
-                let response = format!(
-                    "HTTP/1.1 {status} Response\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    body.len(),
-                    body,
-                );
-                stream.write_all(response.as_bytes()).await.unwrap();
+                match response {
+                    MockResponse::Close => continue,
+                    MockResponse::HeadersThenClose => {
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 1\r\nconnection: close\r\n\r\n",
+                            )
+                            .await
+                            .unwrap();
+                        continue;
+                    }
+                    MockResponse::Http { status, body } => {
+                        let response = format!(
+                            "HTTP/1.1 {status} Response\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(),
+                            body,
+                        );
+                        stream.write_all(response.as_bytes()).await.unwrap();
+                    }
+                }
             }
             requests
         });
@@ -3795,6 +3951,134 @@ mod tests {
                 || request.contains("/auth/device-grants")
                 || request.contains("--device-bootstrap-file")
         }));
+    }
+
+    #[tokio::test]
+    async fn attach_retries_closed_authority_probe_without_recreating() {
+        let (origin, captured) = mock_server_steps(vec![
+            MockResponse::Http {
+                status: 200,
+                body: comet_sandbox("starting"),
+            },
+            MockResponse::Close,
+            MockResponse::Http {
+                status: 200,
+                body: comet_sandbox("starting"),
+            },
+            MockResponse::Http {
+                status: 200,
+                body: host_authority("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", now_ms() + 60_000),
+            },
+        ])
+        .await;
+        let runtime = ScaffoldRuntime::new(
+            ScaffoldClient::new(&origin, "project-a", Arc::new(StaticToken("token".into())))
+                .unwrap(),
+            "https://comet-edge.example",
+            Arc::new(UnavailableDeviceJoinGrantProvider),
+        );
+        let result = runtime
+            .control(
+                ScaffoldEnvironmentControl::Attach {
+                    sandbox_id: "sandbox-a".into(),
+                    scope: scope(),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.attached_device_id.as_deref(),
+            Some("comet-scaffold-sandbox-a-e1")
+        );
+        let requests = tokio::time::timeout(Duration::from_secs(2), captured)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.starts_with("POST /api/code-sandboxes HTTP"))
+                .count(),
+            0
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| {
+                    request.starts_with("POST /api/code-sandboxes/sandbox-a/exec ")
+                })
+                .count(),
+            2
+        );
+        assert!(!requests.iter().any(|request| {
+            request.contains("/auth/device-grants") || request.contains("--device-bootstrap-file")
+        }));
+    }
+
+    #[tokio::test]
+    async fn attach_does_not_retry_nontransient_authority_probe_failure() {
+        let (origin, captured) = mock_server_with_status(vec![
+            (200, comet_sandbox("starting")),
+            (403, r#"{"error":"sandbox_profile_mismatch"}"#.into()),
+        ])
+        .await;
+        let runtime = ScaffoldRuntime::new(
+            ScaffoldClient::new(&origin, "project-a", Arc::new(StaticToken("token".into())))
+                .unwrap(),
+            "https://comet-edge.example",
+            Arc::new(UnavailableDeviceJoinGrantProvider),
+        );
+        let error = runtime
+            .control(
+                ScaffoldEnvironmentControl::Attach {
+                    sandbox_id: "sandbox-a".into(),
+                    scope: scope(),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.api_error().unwrap().status, 403);
+        assert_eq!(captured.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn attach_does_not_retry_reset_after_response_headers() {
+        let (origin, captured) = mock_server_steps(vec![
+            MockResponse::Http {
+                status: 200,
+                body: comet_sandbox("starting"),
+            },
+            MockResponse::HeadersThenClose,
+        ])
+        .await;
+        let runtime = ScaffoldRuntime::new(
+            ScaffoldClient::new(&origin, "project-a", Arc::new(StaticToken("token".into())))
+                .unwrap(),
+            "https://comet-edge.example",
+            Arc::new(UnavailableDeviceJoinGrantProvider),
+        );
+        let error = runtime
+            .control(
+                ScaffoldEnvironmentControl::Attach {
+                    sandbox_id: "sandbox-a".into(),
+                    scope: scope(),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ScaffoldError::Transport {
+                cause: ScaffoldTransportCause::ConnectionResetOrClosed,
+                before_response: false,
+                ..
+            }
+        ));
+        assert_eq!(captured.await.unwrap().len(), 2);
     }
 
     #[tokio::test]

@@ -543,6 +543,9 @@ impl Drop for PreparationOutcome {
 fn scaffold_control_error(error: crate::scaffold::ScaffoldError) -> RpcError {
     match error {
         crate::scaffold::ScaffoldError::AuthUnavailable => RpcError::ScaffoldAuthUnavailable,
+        crate::scaffold::ScaffoldError::Transport { cause, .. } => {
+            RpcError::Failed(format!("scaffold_request_failed: {cause}"))
+        }
         error => RpcError::Failed(error.to_string()),
     }
 }
