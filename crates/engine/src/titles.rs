@@ -26,6 +26,7 @@ struct Pending {
 struct Projection {
     source_version: Version,
     completed: Option<String>,
+    completed_is_first: bool,
     input: String,
     links: Vec<String>,
 }
@@ -294,6 +295,11 @@ impl TitleGenerator {
         let Some(completed) = projection.completed else {
             return Ok(None);
         };
+        if !projection.completed_is_first {
+            // ponytail: transcript order is the intentional once gate; persist a marker
+            // only if old one-turn transcripts must remain unnamed.
+            return Ok(None);
+        }
         if pending.generated_for.as_deref() == Some(completed.as_str())
             && pending.generated_title.is_none()
         {
@@ -529,6 +535,8 @@ fn project(bytes: &[u8]) -> Result<Projection, EngineError> {
     let mut recent = String::new();
     let mut turn = String::new();
     let mut completed = None;
+    let mut completed_assistant_turns = 0;
+    let mut turn_completed = false;
     for index in 0..doc.directory_entry_count() {
         let Some(entry) = doc.directory_entry(index)? else {
             continue;
@@ -564,6 +572,11 @@ fn project(bytes: &[u8]) -> Result<Projection, EngineError> {
             append_bounded(&mut initial, &text, 6000);
         }
         if entry.role == MessageRole::User && entry.peer_message.is_none() {
+            // ponytail: The gate keys off the latest cleanly completed assistant turn, so an explicitly queued follow-up persisted before the first assistant entry, like a mid-turn steer that loses the completion race and is re-delivered as a fresh turn while persisted as Steered, can count two completed turns as one and permit one extra generated title; closing this needs persisted turn identity and is deliberately out of scope.
+            if entry.status != Some(MessageStatus::Steered) {
+                completed_assistant_turns += usize::from(turn_completed);
+                turn_completed = false;
+            }
             turn.clear();
             append_bounded(&mut turn, &text, 6000);
         } else if entry.role == MessageRole::Assistant {
@@ -576,23 +589,29 @@ fn project(bytes: &[u8]) -> Result<Projection, EngineError> {
                 turn.drain(..start);
             }
         }
-        if entry.role == MessageRole::Assistant
+        let clean_completion = entry.role == MessageRole::Assistant
             && entry.status == Some(MessageStatus::Complete)
-            && completed_marker
-                .as_deref()
-                .is_none_or(|marker| marker == entry.id)
             && !entry
                 .parts
                 .iter()
-                .any(|part| matches!(part, MessagePart::Error { .. }))
+                .any(|part| matches!(part, MessagePart::Error { .. }));
+        if entry.role == MessageRole::Assistant {
+            turn_completed = clean_completion;
+        }
+        if clean_completion
+            && completed_marker
+                .as_deref()
+                .is_none_or(|marker| marker == entry.id)
         {
             completed = Some(entry.id);
             recent.clone_from(&turn);
         }
     }
+    completed_assistant_turns += usize::from(turn_completed);
     Ok(Projection {
         source_version: version(&doc)?,
         completed,
+        completed_is_first: completed_assistant_turns == 1,
         input: format!(
             "Initial request:\n{initial}\nRecent completed response and tools:\n{recent}"
         ),
@@ -736,8 +755,52 @@ mod tests {
         ]));
     }
 
+    #[test]
+    fn projection_counts_completions_after_the_marked_entry() {
+        let doc = SessionDoc::init("10000000-0000-4000-8000-000000000001").unwrap();
+        let entry = |id: &str| comet_doc::SessionMessageEntry {
+            id: id.into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Text {
+                id: "text".into(),
+                text: "Investigation completed".into(),
+            }],
+            created_at: 1,
+            device_id: "device-a".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+            peer_message: None,
+        };
+        doc.push_message(&entry("assistant-1")).unwrap();
+        doc.doc()
+            .get_map("meta")
+            .insert("directoryCompletedTurn", "assistant-1")
+            .unwrap();
+        let first = project(&doc.export_snapshot().unwrap()).unwrap();
+        assert_eq!(first.completed.as_deref(), Some("assistant-1"));
+        assert!(first.completed_is_first);
+
+        let mut user = entry("user-2");
+        user.role = MessageRole::User;
+        doc.push_message(&user).unwrap();
+        doc.push_message(&entry("assistant-2")).unwrap();
+        let later = project(&doc.export_snapshot().unwrap()).unwrap();
+        assert_eq!(later.completed.as_deref(), Some("assistant-1"));
+        assert!(!later.completed_is_first);
+    }
+
     #[tokio::test]
-    async fn titles_ignore_unrelated_workspace_peers_and_preserve_manual_renames() {
+    async fn titles_generate_once_and_preserve_manual_renames() {
+        check_titles_generate_once(false).await;
+    }
+
+    #[tokio::test]
+    async fn titles_generate_once_after_mid_turn_steer() {
+        check_titles_generate_once(true).await;
+    }
+
+    async fn check_titles_generate_once(steered: bool) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let dir = tempfile::tempdir().unwrap();
         let id = "10000000-0000-4000-8000-000000000001";
@@ -805,7 +868,9 @@ mod tests {
         .unwrap();
         let (initial_tx, initial_rx) = tokio::sync::oneshot::channel();
         let (generated_tx, generated_rx) = tokio::sync::oneshot::channel();
+        let title_requests = Arc::new(AtomicUsize::new(0));
         let target = workspace.clone();
+        let server_title_requests = title_requests.clone();
         let server = tokio::spawn(async move {
             let mut initial_tx = Some(initial_tx);
             let mut generated_tx = Some(generated_tx);
@@ -856,17 +921,19 @@ mod tests {
                         initial_tx.is_none(),
                         "model cannot precede persisted metadata"
                     );
-                    assert!(
-                        body["input"]
-                            .as_str()
-                            .unwrap()
-                            .contains("Investigation completed")
-                    );
-                    let raw = target.doc().doc();
-                    let previous_peer = raw.peer_id();
-                    raw.set_peer_id(131).unwrap();
-                    target.rename_chat(id, "My manual title").unwrap();
-                    raw.set_peer_id(previous_peer).unwrap();
+                    if server_title_requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                        assert!(
+                            body["input"]
+                                .as_str()
+                                .unwrap()
+                                .contains("Investigation completed")
+                        );
+                        let raw = target.doc().doc();
+                        let previous_peer = raw.peer_id();
+                        raw.set_peer_id(131).unwrap();
+                        target.rename_chat(id, "My manual title").unwrap();
+                        raw.set_peer_id(previous_peer).unwrap();
+                    }
                     json!({"title": "Generated incident investigation"})
                 } else {
                     assert!(headers.starts_with("POST /api/crew-directory/upsert "));
@@ -911,6 +978,17 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(workspace.doc().generated_chat_title(id).is_none());
+        if steered {
+            doc.push_message(&entry(
+                "assistant-segment",
+                MessageRole::Assistant,
+                "Starting investigation",
+            ))
+            .unwrap();
+            let mut steer = entry("steer", MessageRole::User, "Focus on the incident");
+            steer.status = Some(MessageStatus::Steered);
+            doc.push_message(&steer).unwrap();
+        }
         doc.push_message(&entry(
             "assistant",
             MessageRole::Assistant,
@@ -922,6 +1000,9 @@ mod tests {
             .insert("directoryCompletedTurn", "assistant")
             .unwrap();
         doc.doc().commit();
+        let first = project(&doc.export_snapshot().unwrap()).unwrap();
+        assert_eq!(first.completed.as_deref(), Some("assistant"));
+        assert!(first.completed_is_first);
         store
             .save_snapshot(id, &doc.export_snapshot().unwrap())
             .unwrap();
@@ -938,6 +1019,51 @@ mod tests {
             workspace.doc().chat(id).unwrap().unwrap().title.as_deref(),
             Some("My manual title")
         );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while store.directory_retry_delay().unwrap().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        store.queue_directory(id, false).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while store.directory_retry_delay().unwrap().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(title_requests.load(Ordering::SeqCst), 1);
+        doc.push_message(&entry(
+            "user-2",
+            MessageRole::User,
+            "Investigate another issue",
+        ))
+        .unwrap();
+        doc.push_message(&entry(
+            "assistant-2",
+            MessageRole::Assistant,
+            "Second investigation completed",
+        ))
+        .unwrap();
+        doc.doc()
+            .get_map("meta")
+            .insert("directoryCompletedTurn", "assistant-2")
+            .unwrap();
+        doc.doc().commit();
+        store
+            .save_snapshot(id, &doc.export_snapshot().unwrap())
+            .unwrap();
+        store.queue_directory(id, false).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while store.directory_retry_delay().unwrap().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(title_requests.load(Ordering::SeqCst), 1);
         server.abort();
     }
 }
