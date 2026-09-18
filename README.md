@@ -2,7 +2,7 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
-## Unreleased: Namespace Devboxes
+## Crew 0.1.119: Namespace Devboxes
 
 Namespace hosts advertise a **Devbox** environment separately from their Linux OS
 and execution authority. Session rows, transcripts, folders, and device settings
@@ -26,7 +26,7 @@ installs agent guidance and separate channel launchers without restarting live e
 Desktop clients can start, steer, answer, and stop sessions on an ordinary
 `comet headless` device signed into the same account and project. These sessions
 were labelled **Local** in 0.1.117, including before the first agent publication;
-the unreleased Namespace metadata above distinguishes Devboxes. Only explicit
+the Namespace metadata in 0.1.119 distinguishes Devboxes. Only explicit
 Scaffold sessions use the Scaffold label.
 
 Remote commands use fresh, one-shot authenticated device-relay admission scoped
