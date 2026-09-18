@@ -11,9 +11,14 @@ Results contain title, owner, matched sources, and a credential-free Crew link,
 never transcript contents or an assertion that the owner is currently working.
 Opening a result preserves its project and deployment scope and requires sign-in.
 
-Completed turns queue fixed-model `gpt-5.6-luna` title generation through Agent
-Auth, independently of the conversation harness. Manual and legacy titles survive
-refresh; generated titles update sidebar metadata, not existing branch names.
+Completed turns queue discovery metadata updates. Automatic title generation uses
+fixed-model `gpt-5.6-luna` through Agent Auth, independently of the conversation
+harness, only when the transcript projection counts one cleanly completed agent
+turn. Later turns normally refresh metadata without regenerating the title; the
+accepted transcript-order and older-session limitations are documented at the
+gate and projection boundary in [titles.rs](crates/engine/src/titles.rs).
+Manual and legacy titles survive refresh; generated titles update sidebar
+metadata, not existing branch names.
 The first prompt still names a new managed branch once. The durable local outbox
 coalesces snapshot metadata to a 30-second maximum scheduling delay; completed
 turns get priority, but model calls are limited to one per session per minute.
