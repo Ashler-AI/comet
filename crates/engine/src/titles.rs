@@ -572,6 +572,7 @@ fn project(bytes: &[u8]) -> Result<Projection, EngineError> {
             append_bounded(&mut initial, &text, 6000);
         }
         if entry.role == MessageRole::User && entry.peer_message.is_none() {
+            // ponytail: A follow-up that loses the turn-completion race can stay persisted as Steered and be re-delivered as a fresh turn, making two genuine turns count as one so a second naming can occur; closing this requires persisted turn identity, deliberately out of scope.
             if entry.status != Some(MessageStatus::Steered) {
                 completed_assistant_turns += usize::from(turn_completed);
                 turn_completed = false;
