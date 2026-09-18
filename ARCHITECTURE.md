@@ -287,6 +287,14 @@ Direct ports of comet behaviors (spec: feature-inventory §3):
   write/append journal descriptors; verified takeover accepts configured OMP ancestry or a
   same-user holder orphaned directly under PID 1, while unrelated live holders
   fail closed.
+  Managed OMP runs pass configuration overlays through repeatable `--config <path>`
+  arguments. Inherited `PI_CONFIG_FILES` entries are split using the host's path-list
+  syntax and forwarded unchanged in their original order, leaving path resolution and
+  missing-file errors to OMP; Crew's private run overlay comes last. Crew removes
+  `PI_CONFIG_FILES` from the child environment so descendants cannot inherit the
+  temporary overlay path. The parent environment is unchanged. The overlay remains
+  run-owned across turns and is removed best-effort when its owner drops; see
+  `OmpRunConfig` in `crates/harness/src/omp/mod.rs` for creation and cleanup.
   Prime Agent and local Devin/Grok/Hermes/Pi reuse the shared ACP transport and
   persistent turn loop. Startup drains replay without duplicating history; model
   selection prefers live config options, with legacy `session/set_model` support.
