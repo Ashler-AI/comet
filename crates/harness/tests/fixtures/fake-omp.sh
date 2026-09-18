@@ -39,10 +39,14 @@ fi
 
 SESSION_ID="omp-session-1"
 NO_SESSION=0
+CONFIG_PATH=""
 prev=""
 for arg in "$@"; do
   if [ "$prev" = "--resume" ]; then
     SESSION_ID="$arg"
+  elif [ "$prev" = "--config" ]; then
+    [ -f "$arg" ] || exit 92
+    CONFIG_PATH="$arg"
   elif [ "$arg" = "--no-session" ]; then
     NO_SESSION=1
   fi
@@ -56,8 +60,7 @@ ACTIVE_GOAL="${OMP_ACTIVE_GOAL:-}"
 
 
 if [ "$NO_SESSION" != "1" ]; then
-  CONFIG_PATH="${PI_CONFIG_FILES##*:}"
-  if [ -z "${PI_CONFIG_FILES:-}" ] || [ ! -f "$CONFIG_PATH" ] ||
+  if [ "${PI_CONFIG_FILES+x}" = x ] || [ ! -f "$CONFIG_PATH" ] ||
     [ "$(sed -n '1p' "$CONFIG_PATH")" != "retry:" ] ||
     [ "$(sed -n '2p' "$CONFIG_PATH")" != "  enabled: true" ] ||
     [ "$(sed -n '3p' "$CONFIG_PATH")" != "  maxRetries: 1" ] ||
@@ -98,7 +101,7 @@ while IFS= read -r line; do
       ;;
     get_state)
       if [ -n "${OMP_SESSION_LOG:-}" ]; then
-        printf 'config:%s\n' "${PI_CONFIG_FILES:-}" >> "$OMP_SESSION_LOG"
+        printf 'config:%s\n' "$CONFIG_PATH" >> "$OMP_SESSION_LOG"
         printf '%s\n' "get_state" >> "$OMP_SESSION_LOG"
       fi
       if [ -n "$ACTIVE_GOAL" ]; then
