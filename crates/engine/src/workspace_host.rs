@@ -340,6 +340,8 @@ impl WorkspaceHost {
                 .filter(|n| !n.is_empty())
                 .unwrap_or_else(|| config.device_name.clone()),
             platform: config.platform.clone(),
+            environment: crate::namespace_devbox()
+                .then_some(comet_proto::DeviceEnvironment::Namespace),
             last_seen_at: Some(now),
             // First registration stamps `createdAt`; restarts keep the original
             // (the Devices page "Added …" fragment).
@@ -1082,7 +1084,13 @@ impl WorkspaceHost {
     /// Hard-delete a space and its chats (doc cascade). The caller (rpc layer)
     /// tears down live runs / doc-host handles for the returned chat ids.
     pub fn delete_space(&self, space_id: &str) -> Result<DeletedSpace, EngineError> {
-        for chat in self.inner.doc.read_chats()?.into_iter().filter(|chat| chat.space_id.as_deref() == Some(space_id)) {
+        for chat in self
+            .inner
+            .doc
+            .read_chats()?
+            .into_iter()
+            .filter(|chat| chat.space_id.as_deref() == Some(space_id))
+        {
             self.queue_directory_deletion(&chat.id)?;
         }
         let deleted = self.inner.doc.delete_space(space_id)?;
@@ -1143,7 +1151,11 @@ impl WorkspaceHost {
         Ok(renamed)
     }
 
-    pub(crate) fn set_generated_title(&self, chat_id: &str, title: &str) -> Result<(), EngineError> {
+    pub(crate) fn set_generated_title(
+        &self,
+        chat_id: &str,
+        title: &str,
+    ) -> Result<(), EngineError> {
         let _update = lock(&self.inner.session_ref_updates);
         self.inner.doc.set_generated_chat_title(chat_id, title)?;
         Ok(())
@@ -1302,18 +1314,45 @@ impl WorkspaceHost {
     // ── persistence / teardown ──────────────────────────────────────────────
 
     pub(crate) fn directory_deployment(&self, chat_id: &str) -> Option<String> {
-        let reference = self.inner.doc.session_ref(&self.inner.config.user_id, chat_id).ok().flatten();
-        reference.as_ref().and_then(|reference| crate::session_activity::projection(reference, self.project_scope()))
+        let reference = self
+            .inner
+            .doc
+            .session_ref(&self.inner.config.user_id, chat_id)
+            .ok()
+            .flatten();
+        reference
+            .as_ref()
+            .and_then(|reference| {
+                crate::session_activity::projection(reference, self.project_scope())
+            })
             .map(|projection| projection.deployment_id)
-            .or_else(|| self.inner.config.edge.as_ref().map(|edge| edge.deployment_id.clone()).filter(|id| !id.is_empty()))
+            .or_else(|| {
+                self.inner
+                    .config
+                    .edge
+                    .as_ref()
+                    .map(|edge| edge.deployment_id.clone())
+                    .filter(|id| !id.is_empty())
+            })
     }
 
     pub(crate) fn directory_eligible(&self, chat_id: &str) -> bool {
         uuid::Uuid::parse_str(chat_id).is_ok()
-            && self.inner.doc.session_ref(&self.inner.config.user_id, chat_id).ok().flatten().is_some()
-            && (self.is_host(chat_id) || has_identity_local_session_evidence(
-                &self.inner.store, chat_id, &self.inner.config.user_id,
-                &self.inner.journal_session_ids).unwrap_or(false))
+            && self
+                .inner
+                .doc
+                .session_ref(&self.inner.config.user_id, chat_id)
+                .ok()
+                .flatten()
+                .is_some()
+            && (self.is_host(chat_id)
+                || has_identity_local_session_evidence(
+                    &self.inner.store,
+                    chat_id,
+                    &self.inner.config.user_id,
+                    &self.inner.journal_session_ids,
+                )
+                .unwrap_or(false))
     }
 
     fn queue_directory_deletion(&self, chat_id: &str) -> Result<(), EngineError> {
@@ -1366,9 +1405,14 @@ impl WorkspaceHostInner {
                 // but wake subscribers only when that entity collection changed.
                 for chat in &state.chats {
                     if uuid::Uuid::parse_str(&chat.id).is_ok()
-                        && self.chats_tx.borrow().iter().find(|old| old.id == chat.id)
+                        && self
+                            .chats_tx
+                            .borrow()
+                            .iter()
+                            .find(|old| old.id == chat.id)
                             .is_none_or(|old| old.title != chat.title)
-                        && let Err(error) = self.store.queue_directory(&chat.id, false) {
+                        && let Err(error) = self.store.queue_directory(&chat.id, false)
+                    {
                         tracing::warn!(%error, "directory title-change enqueue failed");
                     }
                 }

@@ -52,10 +52,14 @@ pub fn remote_participants(
         .collect()
 }
 
-pub const fn source_label(source: AgentSessionSource) -> &'static str {
-    match source {
-        AgentSessionSource::Local => "Local",
-        AgentSessionSource::Scaffold => "Scaffold",
+pub const fn source_label(
+    source: AgentSessionSource,
+    environment: Option<comet_proto::DeviceEnvironment>,
+) -> &'static str {
+    match (source, environment) {
+        (AgentSessionSource::Scaffold, _) => "Scaffold",
+        (AgentSessionSource::Local, Some(comet_proto::DeviceEnvironment::Namespace)) => "Devbox",
+        (AgentSessionSource::Local, None) => "Local",
     }
 }
 
@@ -373,6 +377,22 @@ pub fn activity_items(snapshot: &CollaborationSnapshot) -> Vec<ActivityItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_labels_distinguish_namespace_without_changing_source() {
+        use comet_proto::DeviceEnvironment::Namespace;
+        assert_eq!(
+            source_label(AgentSessionSource::Local, Some(Namespace)),
+            "Devbox"
+        );
+        // Ordinary Mac/Linux, remote personal hosts, and pre-metadata rows.
+        assert_eq!(source_label(AgentSessionSource::Local, None), "Local");
+        assert_eq!(source_label(AgentSessionSource::Scaffold, None), "Scaffold");
+        assert_eq!(
+            source_label(AgentSessionSource::Scaffold, Some(Namespace)),
+            "Scaffold"
+        );
+    }
 
     fn presence(subject: &str) -> ParticipantPresence {
         ParticipantPresence {

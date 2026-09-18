@@ -11,8 +11,13 @@ struct DeviceRow: Identifiable, Hashable {
     var id: String
     var name: String
     var platform: String
+    var environment: String? = nil
     var lastSeenAt: Int64?
     var createdAt: Int64?
+
+    var displayName: String {
+        environment == "namespace" ? "\(name) · Devbox" : name
+    }
 }
 
 /// Sandbox hosts execute commands but cannot control Scaffold's lifecycle.

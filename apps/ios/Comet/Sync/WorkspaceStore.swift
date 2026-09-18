@@ -340,6 +340,7 @@ final class WorkspaceStore {
             return DeviceRow(id: id,
                             name: m["name"]?.stringValue ?? id,
                             platform: m["platform"]?.stringValue ?? "",
+                            environment: m["environment"]?.stringValue,
                             lastSeenAt: m["lastSeenAt"]?.i64Value,
                             createdAt: m["createdAt"]?.i64Value)
         }.sorted { ($0.name, $0.id) < ($1.name, $1.id) }

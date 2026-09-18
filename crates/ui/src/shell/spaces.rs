@@ -113,10 +113,19 @@ fn detached_worktree_label(cwd: &str) -> Option<String> {
     Some(format!("{label} (detached)"))
 }
 
-fn folder_device_name(name: Option<&str>) -> &str {
-    name.map(str::trim)
+fn folder_device_name(
+    name: Option<&str>,
+    environment: Option<comet_proto::DeviceEnvironment>,
+) -> String {
+    let name = name
+        .map(str::trim)
         .filter(|name| !name.is_empty() && !name.eq_ignore_ascii_case("unknown-device"))
-        .unwrap_or("Remote device")
+        .unwrap_or("Remote device");
+    if environment == Some(comet_proto::DeviceEnvironment::Namespace) {
+        format!("{name} · Devbox")
+    } else {
+        name.to_string()
+    }
 }
 
 fn scaffold_sidebar_surfaces(
@@ -511,11 +520,13 @@ impl Shell {
             let device_names: std::collections::HashMap<String, String> = spaces
                 .iter()
                 .map(|space| {
-                    let name = if state.local_device_id.as_deref() == Some(space.device_id.as_str())
+                    let environment = state.device_environment(&space.device_id);
+                    let name = if environment.is_none()
+                        && state.local_device_id.as_deref() == Some(space.device_id.as_str())
                     {
                         "This Mac".to_string()
                     } else {
-                        folder_device_name(state.device_name(&space.device_id)).to_string()
+                        folder_device_name(state.device_name(&space.device_id), environment)
                     };
                     (space.device_id.clone(), name)
                 })
@@ -1031,6 +1042,11 @@ impl Shell {
                         });
                     let meta = super::SidebarSessionMeta {
                         source,
+                        environment: state.device_environment(
+                            agent_session
+                                .map(|session| session.owner_device_id.as_str())
+                                .unwrap_or(&chat.device_id),
+                        ),
                         history_source: imported_chat_history_source(
                             &id,
                             chat.harness_session_id.as_deref(),
@@ -2435,7 +2451,21 @@ mod tests {
 
     #[test]
     fn replaces_synthetic_device_names_in_folder_status() {
-        assert_eq!(folder_device_name(Some("unknown-device")), "Remote device");
-        assert_eq!(folder_device_name(Some("Studio Mac")), "Studio Mac");
+        assert_eq!(
+            folder_device_name(Some("unknown-device"), None),
+            "Remote device"
+        );
+        assert_eq!(folder_device_name(Some("Studio Mac"), None), "Studio Mac");
+        assert_eq!(
+            folder_device_name(Some("namespace-devbox"), None),
+            "namespace-devbox"
+        );
+        assert_eq!(
+            folder_device_name(
+                Some("Owner's workstation"),
+                Some(comet_proto::DeviceEnvironment::Namespace)
+            ),
+            "Owner's workstation · Devbox"
+        );
     }
 }

@@ -567,6 +567,7 @@ fn local_session_age(updated_at: i64, now: chrono::DateTime<Utc>) -> String {
 #[derive(Debug, Clone)]
 struct SidebarSessionMeta {
     source: comet_proto::AgentSessionSource,
+    environment: Option<comet_proto::DeviceEnvironment>,
     history_source: Option<&'static str>,
     runtime_model: SharedString,
     scaffold_web: Option<SharedString>,
@@ -4023,7 +4024,7 @@ impl Shell {
             });
         let source_label = startup_label
             .or(meta.history_source)
-            .unwrap_or_else(|| crate::multiplayer::source_label(meta.source));
+            .unwrap_or_else(|| crate::multiplayer::source_label(meta.source, meta.environment));
         let compact = self.settings.density == Density::Compact;
         let (hover, text) = (theme.glass_hover(), theme.text);
         let selected_wash = crate::theme::glass_selected_bg();

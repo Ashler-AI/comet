@@ -495,7 +495,7 @@ final class AppModel {
     }
 
     func deviceName(_ deviceId: String) -> String {
-        (demo?.lists.devicesById[deviceId] ?? workspace?.device(id: deviceId))?.name ?? deviceId
+        (demo?.lists.devicesById[deviceId] ?? workspace?.device(id: deviceId))?.displayName ?? deviceId
     }
 
     func deviceOnline(_ deviceId: String) -> Bool {

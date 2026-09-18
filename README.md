@@ -2,12 +2,32 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Unreleased: Namespace Devboxes
+
+Namespace hosts advertise a **Devbox** environment separately from their Linux OS
+and execution authority. Session rows, transcripts, folders, and device settings
+show Devbox rather than Local; ordinary personal hosts and Scaffold keep their labels.
+
+Crew protects active turns from Namespace auto-stop with owned files in
+`/.namespace/tasks`. Completion, cancellation, failed starts, and orderly engine
+shutdown remove those markers. Parked idle harnesses do not keep the machine awake.
+Other engines' or independent jobs' markers are never cleared. After SIGKILL or a
+machine crash, restart Crew to clean confirmed stale Crew markers; never delete all
+task markers indiscriminately. Independent background jobs that outlive a turn need
+their own marker and cleanup trap.
+
+Use the [Namespace Devbox setup skill](skills/namespace-devbox/SKILL.md) for an
+owner-named 16-CPU/64-GiB machine, Chromium by default, the Ashler kind/Tilt stack,
+and clickable local-browser login links with callback port forwarding. The setup
+installs agent guidance and separate channel launchers without restarting live engines.
+
 ## Crew 0.1.117: ordinary remote device control
 
 Desktop clients can start, steer, answer, and stop sessions on an ordinary
 `comet headless` device signed into the same account and project. These sessions
-are labelled **Local**, including before the first agent publication; only
-explicit Scaffold sessions use the Scaffold label.
+were labelled **Local** in 0.1.117, including before the first agent publication;
+the unreleased Namespace metadata above distinguishes Devboxes. Only explicit
+Scaffold sessions use the Scaffold label.
 
 Remote commands use fresh, one-shot authenticated device-relay admission scoped
 to the host and chat. The host records immutable command provenance; copied or

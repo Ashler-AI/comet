@@ -42,6 +42,10 @@ use crate::registry::HarnessRegistry;
 use crate::run_journal::RunJournal;
 use crate::{EngineError, new_id, now_ms};
 
+mod namespace_tasks;
+
+use namespace_tasks::NamespaceTasks;
+
 /// [`SessionsEngine::tool_call_detail`]'s reduction of one tool id's journal
 /// events.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -313,6 +317,23 @@ impl RunHandle {
     }
 }
 
+/// Owns cleanup even if dispatch or the streaming task is dropped before it can
+/// emit Done. Run identity prevents an old task from removing its replacement.
+struct RunTaskGuard {
+    inner: Arc<Inner>,
+    chat_id: String,
+    run_id: String,
+    interrupt: CancellationToken,
+}
+
+impl Drop for RunTaskGuard {
+    fn drop(&mut self) {
+        self.interrupt.cancel();
+        self.inner.namespace_tasks.finish_turn(&self.run_id);
+        self.inner.remove_run(&self.chat_id, &self.run_id);
+    }
+}
+
 struct Inner {
     device_id: String,
     journal: Arc<RunJournal>,
@@ -322,6 +343,7 @@ struct Inner {
     doc_host: OnceLock<DocHost>,
     /// chat_id → live run.
     runs: Mutex<HashMap<String, RunHandle>>,
+    namespace_tasks: NamespaceTasks,
     /// One automatic route-lifecycle restart may remain pending until the
     /// replacement run proves inference progress.
     route_restarts: Mutex<HashMap<String, RouteRestartState>>,
@@ -387,6 +409,7 @@ impl SessionsEngine {
                 ipc_port,
                 doc_host: OnceLock::new(),
                 runs: Mutex::new(HashMap::new()),
+                namespace_tasks: NamespaceTasks::detect(),
                 route_restarts: Mutex::new(HashMap::new()),
                 dispatch_locks: Mutex::new(HashMap::new()),
                 preparations: Mutex::new(HashMap::new()),
@@ -420,7 +443,9 @@ impl SessionsEngine {
     }
 
     pub(crate) fn set_title_client(&self, client: crate::scaffold::ScaffoldClient) {
-        if let Some(titles) = self.inner.titles.get() { titles.set_client(client); }
+        if let Some(titles) = self.inner.titles.get() {
+            titles.set_client(client);
+        }
     }
 
     pub(crate) fn set_inference_relay(&self, relay: crate::inference_relay::InferenceRelay) {
@@ -1001,6 +1026,7 @@ impl SessionsEngine {
                         let sender = handle.steer_tx.clone();
                         if let Ok(permit) = sender.try_reserve() {
                             self.save_pending(chat_id, harness_id, &request, &user_id, None)?;
+                            self.inner.start_turn(chat_id, &handle.run_id)?;
                             permit.send(message.clone());
                             handle.turn_active = true;
                             if !was_turn_active {
@@ -1168,6 +1194,13 @@ impl SessionsEngine {
             return Err(error);
         }
 
+        let activity = RunTaskGuard {
+            inner: self.inner.clone(),
+            chat_id: chat_id.to_string(),
+            run_id: run_id.clone(),
+            interrupt: interrupt_token.clone(),
+        };
+
         {
             let mut runs = lock(&self.inner.runs);
             runs.insert(
@@ -1195,23 +1228,32 @@ impl SessionsEngine {
         self.inner
             .note_message(chat_id, user_message_preview(&request.prompt, peer_message));
 
-        if !peer_message && handle.doc().directory_entry_count() == 1
-            && let Some(titles) = self.inner.titles.get() {
+        if !peer_message
+            && handle.doc().directory_entry_count() == 1
+            && let Some(titles) = self.inner.titles.get()
+        {
             titles.name_initial_branch(chat_id, &request.prompt);
         }
         // Starting the harness is part of dispatch, not background run
         // consumption. A spawn/transport error must return to the durable
         // command executor so it can write Rejected + an audit reason instead
         // of first reporting Applied and failing moments later.
-        let stream = match tokio::select! {
-            result = harness.run(harness_run_request(&request, harness_id), controls) => result,
-            _ = self.inner.shutting_down.cancelled() => {
-                if let Some(run) = lock(&self.inner.runs).get(chat_id) {
-                    run.interrupt_token.cancel();
+        let stream = match async {
+            self.inner
+                .start_turn(chat_id, &run_id)
+                .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+            tokio::select! {
+                result = harness.run(harness_run_request(&request, harness_id), controls) => result,
+                _ = self.inner.shutting_down.cancelled() => {
+                    Err(HarnessError::Protocol("Crew is shutting down".into()))
                 }
-                Err(HarnessError::Protocol("Crew is shutting down".into()))
+                _ = activity.interrupt.cancelled() => {
+                    Err(HarnessError::Protocol("Crew turn was interrupted during startup".into()))
+                }
             }
-        } {
+        }
+        .await
+        {
             Ok(stream) => stream,
             Err(err) => {
                 if let HarnessError::SessionBusy { session_id } = &err {
@@ -1302,6 +1344,7 @@ impl SessionsEngine {
                 fork_requested: fork_from.is_some(),
             },
             inference_token,
+            activity,
         )));
         Ok(run_id)
     }
@@ -1334,6 +1377,7 @@ impl SessionsEngine {
                 return Ok(SteerOutcome::NotSteerable);
             };
             self.inner.save_followup(chat_id, &message)?;
+            self.inner.start_turn(chat_id, &handle.run_id)?;
             permit.send(message.clone());
             handle.user_message_id = user_id.clone();
             handle.turn_active = true;
@@ -1380,6 +1424,7 @@ impl SessionsEngine {
                     return Ok(QueueOutcome::NotRunning);
                 };
                 self.inner.save_followup(chat_id, &message)?;
+                self.inner.start_turn(chat_id, &handle.run_id)?;
                 permit.send(message.clone());
                 handle.user_message_id = user_id.clone();
                 handle.turn_active = true;
@@ -1916,6 +1961,20 @@ impl SessionsEngine {
         }
     }
 
+    /// Synchronous fallback for engine Drop, including shutdown futures that
+    /// are cancelled. Close admission before removing only this engine's tasks.
+    pub(crate) fn shutdown_now(&self) {
+        self.inner.shutting_down.cancel();
+        for preparation in lock(&self.inner.preparations).values() {
+            preparation.cancel.cancel();
+        }
+        for run in lock(&self.inner.runs).values() {
+            run.interrupt_token.cancel();
+            let _ = run.cancel.send(true);
+        }
+        self.inner.namespace_tasks.shutdown();
+    }
+
     /// Stop admission before draining dispatches and owned run tasks; callers may
     /// close document stores only after this returns. Pending requests survive Done.
     pub async fn shutdown(&self) {
@@ -1942,6 +2001,7 @@ impl SessionsEngine {
                 }
             }
         }
+        self.inner.namespace_tasks.shutdown();
     }
 
     fn is_live(&self, chat_id: &str, run_id: &str) -> bool {
@@ -1956,6 +2016,15 @@ impl SessionsEngine {
 }
 
 impl Inner {
+    fn start_turn(&self, chat_id: &str, run_id: &str) -> Result<(), EngineError> {
+        self.namespace_tasks.start_turn(chat_id, run_id).map_err(|error| {
+            tracing::error!(chat = %chat_id, %error, "could not create Crew Namespace task marker");
+            EngineError::Other(format!(
+                "Crew could not protect this turn from Namespace Devbox auto-stop: {error}"
+            ))
+        })
+    }
+
     fn save_followup(&self, chat_id: &str, message: &SteerMessage) -> Result<(), EngineError> {
         let Some((identity, device_id, harness, mut request)) =
             self.journal
@@ -2429,6 +2498,7 @@ async fn drive_run(
     mut cancel_rx: watch::Receiver<bool>,
     resume_state: RunResumeState,
     inference_token: Option<String>,
+    _activity: RunTaskGuard,
 ) {
     let device_id = inner.device_id.clone();
     // Retained for resume ownership and the one-shot failed-resume retry.
@@ -2476,7 +2546,7 @@ async fn drive_run(
     let steerable = harness.supports_steering();
 
     let final_status = loop {
-        let event: AgentEvent = tokio::select! {
+        let mut event: AgentEvent = tokio::select! {
             biased;
             changed = cancel_rx.changed(), if !interrupted => {
                 let _ = changed;
@@ -2556,6 +2626,34 @@ async fn drive_run(
         // Any stream activity proves the run is alive — keep the session's
         // freshness inside the UI's 45s staleness window (throttled).
         inner.touch_session(&chat_id);
+        // Empty reasoning deltas are PURE heartbeats: redacted thinking and
+        // tool-input-generation windows stream them with no text. They fold
+        // to nothing, so journaling/publishing them is only noise (hundreds
+        // per long turn observed) — the touch above already did their job.
+        if matches!(&event, AgentEvent::ReasoningDelta { text } if text.is_empty()) {
+            continue;
+        }
+        // A persistent adapter may start its next turn internally (including
+        // a turn-boundary steer), before the caller routes another dispatch.
+        if !matches!(&event, AgentEvent::Done { .. }) {
+            let mut runs = lock(&inner.runs);
+            if let Some(handle) = runs.get_mut(&chat_id).filter(|h| h.run_id == run_id) {
+                match inner.start_turn(&chat_id, &run_id) {
+                    Ok(()) => handle.turn_active = true,
+                    Err(error) => {
+                        handle.interrupt_token.cancel();
+                        interrupted = true;
+                        event = AgentEvent::Done {
+                            status: DoneStatus::Errored,
+                            result: None,
+                            error: Some(error.to_string()),
+                            session_id: None,
+                        };
+                    }
+                }
+            }
+        }
+
         // First event after parking idle = the next turn beginning (a routed
         // dispatch steered in): the session is Working again.
         if idle_since.take().is_some() {
@@ -2564,13 +2662,6 @@ async fn drive_run(
                 .get(&chat_id)
                 .is_some_and(|session| session.status == SessionStatus::Working);
             inner.set_status(&chat_id, SessionStatus::Working, !already_started);
-        }
-        // Empty reasoning deltas are PURE heartbeats: redacted thinking and
-        // tool-input-generation windows stream them with no text. They fold
-        // to nothing, so journaling/publishing them is only noise (hundreds
-        // per long turn observed) — the touch above already did their job.
-        if matches!(&event, AgentEvent::ReasoningDelta { text } if text.is_empty()) {
-            continue;
         }
         if matches!(
             &event,
@@ -2801,7 +2892,11 @@ async fn drive_run(
             }
             if *status == DoneStatus::Completed && !nothing_streamed {
                 if let (Some(titles), Some(host)) = (inner.titles.get(), inner.doc_host.get()) {
-                    if let Err(error) = doc_ref.doc().get_map("meta").insert("directoryCompletedTurn", entry_id.as_str()) {
+                    if let Err(error) = doc_ref
+                        .doc()
+                        .get_map("meta")
+                        .insert("directoryCompletedTurn", entry_id.as_str())
+                    {
                         tracing::warn!(%error, "completed title marker failed");
                     } else {
                         doc_ref.doc().commit();
@@ -2813,7 +2908,7 @@ async fn drive_run(
                 && steerable
                 && !interrupted
                 && !inner.shutting_down.is_cancelled();
-            let mut retirement_failed = false;
+            let mut boundary_failed = false;
             let (queued_delivery, queue_transport_open) = {
                 let mut runs = lock(&inner.runs);
                 match runs.get_mut(&chat_id) {
@@ -2841,7 +2936,7 @@ async fn drive_run(
                             Ok(())
                         })();
                         if let Err(error) = retirement {
-                            retirement_failed = true;
+                            boundary_failed = true;
                             let message = format!(
                                 "Crew could not persist completed request retirement: {error}"
                             );
@@ -2857,13 +2952,34 @@ async fn drive_run(
                                 },
                             );
                         }
+                        inner.namespace_tasks.finish_turn(&run_id);
                         // A visible terminal journal event must not precede
                         // retirement of the request it completed.
-                        if !retirement_failed {
+                        if !boundary_failed {
                             inner.publish(&chat_id, &event);
                         }
                         handle.turn_active = false;
-                        if persistent_boundary && !retirement_failed {
+                        // Already-delivered turn-boundary steers can begin
+                        // immediately after Done, before their Steered ack.
+                        if persistent_boundary
+                            && !boundary_failed
+                            && (!handle.queued_followups.is_empty()
+                                || !handle.pending_turn_boundary_steers.is_empty())
+                        {
+                            match inner.start_turn(&chat_id, &run_id) {
+                                Ok(()) => handle.turn_active = true,
+                                Err(error) => {
+                                    inner.publish(
+                                        &chat_id,
+                                        &AgentEvent::Error {
+                                            message: error.to_string(),
+                                        },
+                                    );
+                                    boundary_failed = true;
+                                }
+                            }
+                        }
+                        if persistent_boundary && !boundary_failed {
                             if let Some(followup) = handle.queued_followups.pop_front() {
                                 let sender = handle.steer_tx.clone();
                                 if let Ok(permit) = sender.try_reserve()
@@ -2883,7 +2999,15 @@ async fn drive_run(
                                     (None, false)
                                 }
                             } else {
-                                inner.set_status(&chat_id, SessionStatus::Idle, false);
+                                inner.set_status(
+                                    &chat_id,
+                                    if handle.turn_active {
+                                        SessionStatus::Working
+                                    } else {
+                                        SessionStatus::Idle
+                                    },
+                                    handle.turn_active,
+                                );
                                 (None, true)
                             }
                         } else {
@@ -2896,7 +3020,7 @@ async fn drive_run(
                     }
                 }
             };
-            if retirement_failed {
+            if boundary_failed {
                 interrupted = true;
                 if let Some(handle) = lock(&inner.runs).get(&chat_id) {
                     handle.interrupt_token.cancel();
@@ -2914,7 +3038,10 @@ async fn drive_run(
                 segment_started = now_ms();
                 // Resume-retry is strictly a first-turn concern.
                 saw_session_started = true;
-                idle_since = Some(tokio::time::Instant::now());
+                idle_since = (!lock(&inner.runs)
+                    .get(&chat_id)
+                    .is_some_and(|h| h.turn_active))
+                .then(tokio::time::Instant::now);
                 if let Some(followup) = queued_delivery {
                     if let Some(message_id) = followup.message_id.as_deref()
                         && let Err(err) =

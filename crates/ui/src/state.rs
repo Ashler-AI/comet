@@ -2212,7 +2212,8 @@ impl AppState {
                 if self.selected_chat.as_deref() == Some(link.session_id.as_str()) {
                     self.select_chat(None, cx);
                 }
-                self.room_projections.insert(link.session_id.clone(), projection);
+                self.room_projections
+                    .insert(link.session_id.clone(), projection);
             }
         }
         // A directory link grants no access. Membership and selection use the
@@ -2440,6 +2441,13 @@ impl AppState {
             .iter()
             .find(|d| d.id == device_id)
             .map(|d| d.name.as_str())
+    }
+
+    pub fn device_environment(&self, device_id: &str) -> Option<comet_proto::DeviceEnvironment> {
+        self.devices
+            .iter()
+            .find(|d| d.id == device_id)
+            .and_then(|d| d.environment)
     }
 
     /// Host-presence check: is this device's 15s presence heartbeat fresh?
@@ -5955,7 +5963,11 @@ mod tests {
             state.drain_directory_link(cx);
             assert!(state.pending_directory_link.is_some());
             state.auth = Some(AuthState::SignedIn {
-                user: UserProfile { id: "u".into(), email: "u@example.com".into(), name: None },
+                user: UserProfile {
+                    id: "u".into(),
+                    email: "u@example.com".into(),
+                    name: None,
+                },
                 project_scope: "my-project".into(),
             });
             state.drain_directory_link(cx);
