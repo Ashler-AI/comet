@@ -371,11 +371,7 @@ impl OmpRunConfig {
 
 fn config_overlay_paths(inherited: Option<&std::ffi::OsStr>, run_config: &Path) -> Vec<PathBuf> {
     let mut paths = inherited
-        .map(|value| {
-            std::env::split_paths(value)
-                .filter(|path| path.is_file())
-                .collect::<Vec<_>>()
-        })
+        .map(|value| std::env::split_paths(value).collect::<Vec<_>>())
         .unwrap_or_default();
     paths.push(run_config.to_path_buf());
     paths
@@ -3884,14 +3880,17 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn run_config_preserves_existing_overlays_and_scrubs_inherited_environment() {
+    async fn run_config_preserves_inherited_overlays_and_scrubs_inherited_environment() {
         let temp = tempfile::tempdir().unwrap();
         let user_a = temp.path().join("user a.yml");
         let user_b = temp.path().join("user-b.yml");
         let stale = temp.path().join("missing.yml");
         std::fs::write(&user_a, "").unwrap();
         std::fs::write(&user_b, "").unwrap();
-        let inherited = std::env::join_paths([&user_a, &stale, &user_b]).unwrap();
+        let relative = Path::new("config/overrides.yml");
+        let home = Path::new("~/overrides.yml");
+        let inherited =
+            std::env::join_paths([user_a.as_path(), &stale, relative, home, &user_b]).unwrap();
         let config = OmpRunConfig::create().unwrap();
         let mut command = Command::new("/bin/sh");
         command
@@ -3908,8 +3907,11 @@ mod tests {
         assert_eq!(
             String::from_utf8(output.stdout).unwrap(),
             format!(
-                "--config\n{}\n--config\n{}\n--config\n{}\n",
+                "--config\n{}\n--config\n{}\n--config\n{}\n--config\n{}\n--config\n{}\n--config\n{}\n",
                 user_a.display(),
+                stale.display(),
+                relative.display(),
+                home.display(),
                 user_b.display(),
                 config.path.display()
             )
