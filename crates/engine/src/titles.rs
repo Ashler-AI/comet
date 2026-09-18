@@ -536,6 +536,7 @@ fn project(bytes: &[u8]) -> Result<Projection, EngineError> {
     let mut turn = String::new();
     let mut completed = None;
     let mut completed_assistant_turns = 0;
+    let mut turn_completed = false;
     for index in 0..doc.directory_entry_count() {
         let Some(entry) = doc.directory_entry(index)? else {
             continue;
@@ -571,6 +572,10 @@ fn project(bytes: &[u8]) -> Result<Projection, EngineError> {
             append_bounded(&mut initial, &text, 6000);
         }
         if entry.role == MessageRole::User && entry.peer_message.is_none() {
+            if entry.status != Some(MessageStatus::Steered) {
+                completed_assistant_turns += usize::from(turn_completed);
+                turn_completed = false;
+            }
             turn.clear();
             append_bounded(&mut turn, &text, 6000);
         } else if entry.role == MessageRole::Assistant {
@@ -589,8 +594,8 @@ fn project(bytes: &[u8]) -> Result<Projection, EngineError> {
                 .parts
                 .iter()
                 .any(|part| matches!(part, MessagePart::Error { .. }));
-        if clean_completion {
-            completed_assistant_turns += 1;
+        if entry.role == MessageRole::Assistant {
+            turn_completed = clean_completion;
         }
         if clean_completion
             && completed_marker
@@ -601,6 +606,7 @@ fn project(bytes: &[u8]) -> Result<Projection, EngineError> {
             recent.clone_from(&turn);
         }
     }
+    completed_assistant_turns += usize::from(turn_completed);
     Ok(Projection {
         source_version: version(&doc)?,
         completed,
@@ -773,6 +779,9 @@ mod tests {
         assert_eq!(first.completed.as_deref(), Some("assistant-1"));
         assert!(first.completed_is_first);
 
+        let mut user = entry("user-2");
+        user.role = MessageRole::User;
+        doc.push_message(&user).unwrap();
         doc.push_message(&entry("assistant-2")).unwrap();
         let later = project(&doc.export_snapshot().unwrap()).unwrap();
         assert_eq!(later.completed.as_deref(), Some("assistant-1"));
@@ -781,6 +790,15 @@ mod tests {
 
     #[tokio::test]
     async fn titles_generate_once_and_preserve_manual_renames() {
+        check_titles_generate_once(false).await;
+    }
+
+    #[tokio::test]
+    async fn titles_generate_once_after_mid_turn_steer() {
+        check_titles_generate_once(true).await;
+    }
+
+    async fn check_titles_generate_once(steered: bool) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let dir = tempfile::tempdir().unwrap();
@@ -959,6 +977,17 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(workspace.doc().generated_chat_title(id).is_none());
+        if steered {
+            doc.push_message(&entry(
+                "assistant-segment",
+                MessageRole::Assistant,
+                "Starting investigation",
+            ))
+            .unwrap();
+            let mut steer = entry("steer", MessageRole::User, "Focus on the incident");
+            steer.status = Some(MessageStatus::Steered);
+            doc.push_message(&steer).unwrap();
+        }
         doc.push_message(&entry(
             "assistant",
             MessageRole::Assistant,
@@ -970,6 +999,9 @@ mod tests {
             .insert("directoryCompletedTurn", "assistant")
             .unwrap();
         doc.doc().commit();
+        let first = project(&doc.export_snapshot().unwrap()).unwrap();
+        assert_eq!(first.completed.as_deref(), Some("assistant"));
+        assert!(first.completed_is_first);
         store
             .save_snapshot(id, &doc.export_snapshot().unwrap())
             .unwrap();
@@ -993,6 +1025,15 @@ mod tests {
         })
         .await
         .unwrap();
+        store.queue_directory(id, false).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while store.directory_retry_delay().unwrap().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(title_requests.load(Ordering::SeqCst), 1);
         doc.push_message(&entry(
             "user-2",
             MessageRole::User,
