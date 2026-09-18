@@ -365,7 +365,7 @@ async fn repeated_transient_faults_end_without_recreation_or_lifecycle_failure()
 async fn preparation_returns_nonretryable_errors_and_cancellation_without_recreation() {
     for failure in [
         "scaffold_auth_unavailable",
-        "scaffold_request_failed: connection closed",
+        "scaffold_request_failed: connection_reset_or_closed",
         "scaffold_response_invalid: unknown lifecycle variant",
         "scaffold_request_cancelled",
     ] {
@@ -1551,6 +1551,42 @@ async fn failure_reports_only_mark_the_matching_existing_unadmitted_preparation(
         untracked
     );
     core.shutdown().await;
+}
+
+#[tokio::test]
+async fn transport_cause_survives_rpc_boundary_without_url_or_token() {
+    use crate::scaffold::ScaffoldClient;
+    use tokio::io::AsyncReadExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let provider = tokio::spawn(async move {
+        let (mut connection, _) = listener.accept().await.unwrap();
+        let mut request = [0; 8192];
+        let _ = connection.read(&mut request).await;
+    });
+    let client = ScaffoldClient::new(
+        &origin,
+        "project-a",
+        std::sync::Arc::new(comet_rpc::StaticToken("bearer-secret".into())),
+    )
+    .unwrap();
+    let error = client
+        .inspect(
+            "sandbox-sensitive-id",
+            &params().scope,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    provider.await.unwrap();
+    let error = scaffold_control_error(error);
+    assert_eq!(
+        error.to_string(),
+        "scaffold_request_failed: connection_reset_or_closed"
+    );
+    assert!(!error.to_string().contains("bearer-secret"));
+    assert!(!error.to_string().contains("sandbox-sensitive-id"));
 }
 
 #[tokio::test]
