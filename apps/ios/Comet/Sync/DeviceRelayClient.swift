@@ -33,6 +33,7 @@ actor DeviceRelayClient {
 
     private let deviceId: String
     private let config: AppConfig
+    private let controlSessionId: String?
 
     private var socket: URLSessionWebSocketTask?
     private var receiveTask: Task<Void, Never>?
@@ -41,9 +42,10 @@ actor DeviceRelayClient {
     private var pending: [UInt64: CheckedContinuation<Result<Data, RelayError>, Never>] = [:]
     private var connected = false
 
-    init(deviceId: String, config: AppConfig) {
+    init(deviceId: String, config: AppConfig, controlSessionId: String? = nil) {
         self.deviceId = deviceId
         self.config = config
+        self.controlSessionId = controlSessionId
     }
 
     // MARK: Lifecycle
@@ -54,14 +56,21 @@ actor DeviceRelayClient {
         var components = URLComponents(url: config.edgeURL.appending(path: "device/\(deviceId)/ws"),
                                        resolvingAgainstBaseURL: false)!
         components.scheme = components.scheme == "http" ? "ws" : "wss"
-        components.queryItems = [
+        var queryItems = [
             URLQueryItem(name: "role", value: "client"),
             // A reconnect is a new relay peer. Reusing a connId can briefly
             // leave two tagged sockets in the hibernating DO and route the
             // host's response to the stale predecessor.
             URLQueryItem(name: "connId", value: UUID().uuidString.lowercased()),
-            URLQueryItem(name: "token", value: token),
         ]
+        if let controlSessionId {
+            queryItems += [
+                URLQueryItem(name: "purpose", value: "control"),
+                URLQueryItem(name: "controlSessionId", value: controlSessionId),
+            ]
+        }
+        queryItems.append(URLQueryItem(name: "token", value: token))
+        components.queryItems = queryItems
         let task = URLSession.shared.webSocketTask(with: components.url!)
         socket = task
         task.resume()
@@ -117,6 +126,10 @@ actor DeviceRelayClient {
     func call<Response: Decodable>(method: String, params: [String: Any],
                                    timeoutNanoseconds: UInt64? = 10_000_000_000,
                                    preserveSuccessfulResponseOnCancellation: Bool = false) async throws -> Response {
+        defer {
+            // Command authority is bound to this fresh socket and consumed once.
+            if controlSessionId != nil { teardown(error: .notConnected) }
+        }
         for attempt in 0..<3 {
             try Task.checkCancellation()
             do {
