@@ -22,7 +22,7 @@ automatically): [loro-swift 1.13.x](https://github.com/loro-dev/loro-swift)
 (cmark-gfm: tables/strikethrough/tasklists — the same feature set as the
 desktop's pulldown-cmark config).
 
-Crew 0.1.90 mobile staging **1.0 (18)** and production **1.0 (12)** are available
+Crew 0.1.119 mobile staging **1.0 (24)** and production **1.0 (18)** are available
 through their existing **Ashler Internal** TestFlight groups. Both are internal-only
 releases, not public App Store submissions. Upload and verification evidence is
 recorded below.
@@ -91,6 +91,31 @@ produce these build candidates.
 `native-verification.yml` is a separate Rust/desktop verification workflow. It
 has no dispatch inputs and runs only on pushes to `verify/native-lifecycle-*`
 or `verify/native-startup-*`; it neither creates nor signs mobile archives.
+
+### Crew 0.1.119 upload evidence
+
+Merged source `c2d56a272d8143c6501ed5f41ea6fe2162ecd696` passed
+[staging CI](https://github.com/Ashler-AI/comet/actions/runs/35412281717) and
+[production CI](https://github.com/Ashler-AI/comet/actions/runs/35412283097), including
+all ten mobile scenarios on Xcode 26.6 / iOS 26.5. This release moves ordinary-host
+commands from the rejected cached `QueueCommand` path to a fresh, one-shot
+`AdmitPeerCommand` authority socket; grant-scoped Scaffold commands remain unchanged.
+
+Downloaded artifact checksums and source provenance matched. Distribution export
+performed no local compilation or typechecks. Both inspection IPAs passed strict
+deep signature verification with their expected bundle/build, matching distribution
+profiles, and `aps-environment = production`. Inspection IPA SHA-256 values:
+
+- Staging 24: `3444f29909895feadd3c40bad1d61fc351f8628d71de32e28291c62baf7c0414`
+- Production 18: `3e15deadbba08a8e64b57cbb8bb5432e9a9d98778e884775bd32a8b363dd852b`
+
+Xcode reported successful uploads, and authenticated App Store Connect readback at
+**2026-09-19 01:41 UTC** showed both uploads `Complete`: staging record
+`71d0129e-c2c2-4388-afe9-ebd40644682e` and production record
+`38f68b73-8783-4f70-92d0-e49284aa10f4`. Both builds are attached to their existing
+**Ashler Internal** groups. App Store Connect also showed the internal tester installed
+staging 24 and production 18 on an iPhone 13 Pro. No group membership changed and no
+public App Store submission occurred.
 
 ### Crew 0.1.101 upload evidence
 
