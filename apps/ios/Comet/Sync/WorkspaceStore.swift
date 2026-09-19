@@ -702,8 +702,10 @@ final class WorkspaceStore {
             command["answers"] = answers.map(encodableDictionary)
         }
         struct Reply: Decodable { var commandId: String }
-        let _: Reply = try await relay(for: hostDeviceId).call(
-            method: "QueueCommand",
+        let commandRelay = DeviceRelayClient(deviceId: hostDeviceId, config: config,
+                                             controlSessionId: chatId)
+        let _: Reply = try await commandRelay.call(
+            method: "AdmitPeerCommand",
             params: [
                 "chatId": chatId,
                 "commandId": payload.messageId ?? UUID().uuidString.lowercased(),
