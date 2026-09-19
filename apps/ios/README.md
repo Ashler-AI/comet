@@ -101,6 +101,12 @@ all ten mobile scenarios on Xcode 26.6 / iOS 26.5. This release moves ordinary-h
 commands from the rejected cached `QueueCommand` path to a fresh, one-shot
 `AdmitPeerCommand` authority socket; grant-scoped Scaffold commands remain unchanged.
 
+The exact staging simulator package was then exercised against a local Wrangler edge
+and an installed Crew Staging 0.1.119 headless host. The app created an ordinary
+session, admitted `e2e ping`, and streamed the two-entry transcript without
+`peer_command_authority_required`; this covered the live one-shot authority path,
+not only the offline simulator scenarios.
+
 Downloaded artifact checksums and source provenance matched. Distribution export
 performed no local compilation or typechecks. Both inspection IPAs passed strict
 deep signature verification with their expected bundle/build, matching distribution
