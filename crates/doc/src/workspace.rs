@@ -4,7 +4,7 @@
 //! Container layout — maps keyed by id, NOT lists: entity rows are LWW upserts, and a
 //! map-of-maps means concurrent writers to *different* rows never conflict while writes
 //! to the *same* row settle field-by-field LWW (exactly right for renames/archives):
-//! - `devices`: LoroMap keyed by deviceId → row map {id, name, platform, lastSeenAt}
+//! - `devices`: LoroMap keyed by deviceId → row map {id, name, platform, environment?, lastSeenAt}
 //! - `spaces`: LoroMap keyed by spaceId → row map {id, deviceId, path, name?,
 //!   gitDetected, gitCheckedAt?, checkoutId?, createdAt}
 //! - `chats`: LoroMap keyed by chatId → row map {id, deviceId, title?, archived, cwd?,
@@ -113,6 +113,13 @@ impl WorkspaceDoc {
         row.insert("id", device.id.as_str())?;
         row.insert("name", device.name.as_str())?;
         row.insert("platform", device.platform.as_str())?;
+        match device.environment {
+            Some(environment) => row.insert(
+                "environment",
+                LoroValue::from(serde_json::to_value(environment)?),
+            )?,
+            None => row.delete("environment")?,
+        }
         set_opt_ms(&row, "lastSeenAt", device.last_seen_at)?;
         set_opt_ms(&row, "createdAt", device.created_at)?;
         set_opt_str(&row, "version", device.version.as_deref())?;
@@ -359,21 +366,30 @@ impl WorkspaceDoc {
     pub fn generated_chat_title(&self, chat_id: &str) -> Option<String> {
         let row = self.existing_row("chats", chat_id)?;
         match row.get("generatedTitle") {
-            Some(loro::ValueOrContainer::Value(LoroValue::String(value))) => Some(value.to_string()),
+            Some(loro::ValueOrContainer::Value(LoroValue::String(value))) => {
+                Some(value.to_string())
+            }
             _ => None,
         }
     }
 
     pub fn set_generated_chat_title(&self, chat_id: &str, title: &str) -> Result<bool, DocError> {
-        let Some(row) = self.existing_row("chats", chat_id) else { return Ok(false) };
+        let Some(row) = self.existing_row("chats", chat_id) else {
+            return Ok(false);
+        };
         let current = self.chat(chat_id)?.and_then(|chat| chat.title);
         let source = match row.get("titleSource") {
-            Some(loro::ValueOrContainer::Value(LoroValue::String(value))) => Some(value.to_string()),
+            Some(loro::ValueOrContainer::Value(LoroValue::String(value))) => {
+                Some(value.to_string())
+            }
             _ => None,
         };
         let replace = source.as_deref() != Some("manual")
-            && (current.as_deref().is_none_or(|title| title.trim().is_empty())
-                || (source.as_deref() == Some("generated") && current == self.generated_chat_title(chat_id)));
+            && (current
+                .as_deref()
+                .is_none_or(|title| title.trim().is_empty())
+                || (source.as_deref() == Some("generated")
+                    && current == self.generated_chat_title(chat_id)));
         row.insert("generatedTitle", title)?;
         if replace {
             row.insert("title", title)?;
@@ -804,6 +820,8 @@ struct RawDevice {
     name: String,
     platform: String,
     #[serde(default)]
+    environment: Option<comet_proto::DeviceEnvironment>,
+    #[serde(default)]
     last_seen_at: Option<i64>,
     #[serde(default)]
     created_at: Option<i64>,
@@ -817,6 +835,7 @@ impl From<RawDevice> for Device {
             id: raw.id,
             name: raw.name,
             platform: raw.platform,
+            environment: raw.environment,
             last_seen_at: raw.last_seen_at.map(dt),
             created_at: raw.created_at.map(dt),
             version: raw.version,
@@ -998,6 +1017,7 @@ mod tests {
             id: id.into(),
             name: name.into(),
             platform: "linux".into(),
+            environment: None,
             last_seen_at: Some(ts(1_000)),
             created_at: Some(ts(500)),
             version: Some("0.1.0".into()),
@@ -1078,6 +1098,63 @@ mod tests {
     }
 
     #[test]
+    fn namespace_device_metadata_survives_sync_and_old_rows() {
+        let a = WorkspaceDoc::new();
+        let b = WorkspaceDoc::new();
+        let mut namespace = device("devbox", "Owner's workstation");
+        namespace.environment = Some(comet_proto::DeviceEnvironment::Namespace);
+        a.upsert_device(&namespace).unwrap();
+        cross_sync(&a, &b);
+        assert_eq!(b.read_devices().unwrap(), vec![namespace.clone()]);
+        let restored = LoroDoc::new();
+        restored.import(&b.export_snapshot().unwrap()).unwrap();
+        assert_eq!(
+            WorkspaceDoc::from_doc(restored).read_devices().unwrap(),
+            vec![namespace.clone()]
+        );
+
+        // Older writers have no environment field; neither the name nor Linux
+        // alone identifies a Namespace host.
+        let legacy = a.row("devices", "legacy").unwrap();
+        legacy.insert("id", "legacy").unwrap();
+        legacy.insert("name", "namespace-devbox").unwrap();
+        legacy.insert("platform", "linux").unwrap();
+        a.doc().commit();
+        cross_sync(&a, &b);
+        let legacy = b
+            .read_devices()
+            .unwrap()
+            .into_iter()
+            .find(|d| d.id == "legacy")
+            .unwrap();
+        assert_eq!(legacy.environment, None);
+        assert_eq!(legacy.platform, "linux");
+        let wire = serde_json::to_value(&namespace).unwrap();
+        assert_eq!(wire["environment"], "namespace");
+        assert_eq!(serde_json::from_value::<Device>(wire).unwrap(), namespace);
+        let mut legacy_wire = serde_json::to_value(&legacy).unwrap();
+        legacy_wire.as_object_mut().unwrap().remove("environment");
+        assert_eq!(
+            serde_json::from_value::<Device>(legacy_wire)
+                .unwrap()
+                .environment,
+            None
+        );
+
+        namespace.environment = None;
+        a.upsert_device(&namespace).unwrap();
+        cross_sync(&a, &b);
+        assert_eq!(
+            b.read_devices()
+                .unwrap()
+                .into_iter()
+                .find(|d| d.id == namespace.id)
+                .unwrap(),
+            namespace
+        );
+    }
+
+    #[test]
     fn generated_titles_preserve_manual_and_legacy_names_after_restart() {
         let ws = WorkspaceDoc::new();
         let mut row = chat("chat-title", "dev-a");
@@ -1088,12 +1165,23 @@ mod tests {
         let restored = LoroDoc::new();
         restored.import(&ws.export_snapshot().unwrap()).unwrap();
         let restored = WorkspaceDoc::from_doc(restored);
-        assert!(!restored.set_generated_chat_title(&row.id, "Refresh").unwrap());
-        assert_eq!(restored.chat(&row.id).unwrap().unwrap().title.as_deref(), Some("Chosen by user"));
+        assert!(
+            !restored
+                .set_generated_chat_title(&row.id, "Refresh")
+                .unwrap()
+        );
+        assert_eq!(
+            restored.chat(&row.id).unwrap().unwrap().title.as_deref(),
+            Some("Chosen by user")
+        );
         row.id = "legacy-title".into();
         row.title = Some("Existing name with unknown provenance".into());
         restored.upsert_chat(&row).unwrap();
-        assert!(!restored.set_generated_chat_title(&row.id, "Replacement").unwrap());
+        assert!(
+            !restored
+                .set_generated_chat_title(&row.id, "Replacement")
+                .unwrap()
+        );
         assert_eq!(restored.chat(&row.id).unwrap().unwrap().title, row.title);
     }
 

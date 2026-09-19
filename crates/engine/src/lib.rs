@@ -517,6 +517,12 @@ impl EngineRuntime {
     }
 }
 
+impl Drop for EngineRuntime {
+    fn drop(&mut self) {
+        self.core.sessions.shutdown_now();
+    }
+}
+
 impl Engine {
     pub fn new(config: EngineConfig) -> Self {
         Self {
@@ -617,10 +623,15 @@ impl Engine {
             },
         )?;
         core.set_auth(auth.clone());
-        if let Some(scaffold_url) = config.scaffold_url.as_deref() && auth.device_mode() {
+        if let Some(scaffold_url) = config.scaffold_url.as_deref()
+            && auth.device_mode()
+        {
             // Exact-session directory production is not general Scaffold control.
             core.sessions.set_title_client(ScaffoldClient::new(
-                scaffold_url, project_scope.clone(), Arc::new(auth.clone()))?);
+                scaffold_url,
+                project_scope.clone(),
+                Arc::new(auth.clone()),
+            )?);
         }
         if let Some(scaffold_url) = config.scaffold_url.as_deref()
             && !auth.device_mode()
@@ -886,6 +897,11 @@ async fn read_stdin_line() -> Option<String> {
     .await
     .ok()
     .flatten()
+}
+
+/// Namespace exposes task markers only inside its Linux devboxes.
+pub(crate) fn namespace_devbox() -> bool {
+    cfg!(target_os = "linux") && std::path::Path::new("/.namespace/tasks").is_dir()
 }
 
 /// Best-effort human name for this device's registry row (hostname).

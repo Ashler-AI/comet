@@ -113,7 +113,7 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
    device+folder pair, the app's unit of organization; the owning device's SpacesSync stamps git
    presence so branch pickers / the diff sidebar gate on a synced bool, no RPC), chats index
    (id, deviceId, title, archived, cwd, branch, checkoutId, spaceId, lastSeenAt,
-   lastMessagePreview/At, config), devices registry (id, name, platform, lastSeenAt), session
+   lastMessagePreview/At, config), devices registry (id, name, platform, environment?, lastSeenAt), session
    status rows (Working indicator; staleness-checked client-side so a crashed backend never shows
    eternal "Working"), checkout-diff summary pointers. `lastSeenAt` is the synced LWW seen marker
    behind the "completed (unseen)" indicator. Lives in its own DO room (same SessionRoom DO
@@ -122,6 +122,9 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
    writes only its own device/session/chat rows and the git stamps of spaces it owns;
    creates/renames/archives/seen-marks are LWW map sets from any device. `deleteSpace` cascades:
    the space row and every chat/session row in it tombstone in one commit.
+   Optional device `environment: "namespace"` identifies a Namespace Devbox for presentation;
+   the host detects Linux `/.namespace/tasks`. Missing metadata remains Local, OS `platform`
+   stays unchanged, and this field never grants execution authority.
    Per-principal `sessionRefs` rows determine session discovery across that user's Crew clients.
    Owned-session creation and explicit imports publish memberships; imports never assign host
    placement. Legacy membership recovery runs for newly arriving rows, including after initial

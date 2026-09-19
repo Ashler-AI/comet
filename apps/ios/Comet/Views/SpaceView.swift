@@ -259,7 +259,7 @@ struct NewSpaceSheet: View {
                                 .fill(model.deviceOnline(device.id)
                                     ? Theme.statusCompleted.opacity(0.9) : whiteAlpha(0.18))
                                 .frame(width: 6, height: 6)
-                            Text(device.name)
+                            Text(device.displayName)
                                 .font(Theme.sans(13, weight: .medium))
                                 .foregroundStyle(selected ? Theme.text : Theme.textMuted)
                         }

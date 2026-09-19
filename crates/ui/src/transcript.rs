@@ -2457,7 +2457,12 @@ impl Transcript {
                             .find(|session| session.session_id == provenance.session_id)
                     });
                     let source = session
-                        .map(|session| crate::multiplayer::source_label(session.source))
+                        .map(|session| {
+                            crate::multiplayer::source_label(
+                                session.source,
+                                state.device_environment(&session.owner_device_id),
+                            )
+                        })
                         .unwrap_or("Teammate");
                     let runtime = session
                         .and_then(|session| session.harness)
