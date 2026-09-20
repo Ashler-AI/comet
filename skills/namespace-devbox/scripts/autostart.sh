@@ -10,8 +10,10 @@ esac
 wrapper="$HOME/.local/bin/crew-devbox-$channel"
 [[ -x "$wrapper" ]] || { echo "Configure Crew $channel on this Devbox first." >&2; exit 1; }
 command -v tmux >/dev/null || { echo 'tmux is required for Crew Devbox startup.' >&2; exit 1; }
+# Ignore an inherited TMUX socket from Namespace's declared dev-shell. CLI wake
+# and boot must address the same server rather than create competing supervisors.
 session="crew-engine-$channel"
-if ! tmux has-session -t "=$session" 2>/dev/null; then
+if ! tmux -L crew-devbox has-session -t "=$session" 2>/dev/null; then
   # A manually started engine must not acquire a competing supervisor.
   if python3 - "$port" <<'PY'
 import socket, sys
@@ -23,10 +25,10 @@ PY
     exit 0
   fi
   printf -v command 'sleep 5; export ASHLER_INCREMENTAL_TSC_CHECKS=false; exec %q headless' "$wrapper"
-  tmux new-session -d -s "$session" -c "$HOME" "$command" || tmux has-session -t "=$session"
+  tmux -L crew-devbox new-session -d -s "$session" -c "$HOME" "$command" || tmux -L crew-devbox has-session -t "=$session"
 fi
-tmux set-option -w -t "$session:0" remain-on-exit on
-tmux set-hook -w -t "$session:0" pane-died "respawn-pane -t $session:0.0"
-if [[ "$(tmux display-message -p -t "$session:0.0" '#{pane_dead}')" == 1 ]]; then
-  tmux respawn-pane -t "$session:0.0"
+tmux -L crew-devbox set-option -w -t "$session:0" remain-on-exit on
+tmux -L crew-devbox set-hook -w -t "$session:0" pane-died "respawn-pane -t $session:0.0"
+if [[ "$(tmux -L crew-devbox display-message -p -t "$session:0.0" '#{pane_dead}')" == 1 ]]; then
+  tmux -L crew-devbox respawn-pane -t "$session:0.0"
 fi
