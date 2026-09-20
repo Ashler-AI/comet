@@ -20,6 +20,8 @@
 //! - `Mutate {op, …}` → `{ok}` — workspace entity mutations (createChat, renameChat,
 //!   setChatArchived, deleteChat, renameDevice, markChatSeen, markChatUnread)
 //! - `LocalDevice` → `{deviceId}` — this engine's identity (never forwarded)
+//! - `WakeDevice {deviceId}` → `{deviceId, ready: true}` — local authenticated
+//!   controller only; explicitly boots the bound Namespace host and probes its peer
 //! - AuthRpc: `AuthStatus` (stream), `SignIn`/`SignInHeadless` → `{url}`,
 //!   `CompleteSignIn {code}`, and `SignOut`
 //! - Repos (§3.5): `ListRepos`, `AddRepo {path}`, `CloneRepo {url}`,
@@ -641,6 +643,7 @@ pub struct EngineRpc {
     agent_accounts: AgentAccounts,
     auth: Option<Auth>,
     links: Option<std::sync::Arc<LinkCache>>,
+    device_wake: Option<std::sync::Arc<crate::device_wake::DeviceWake>>,
     updater: Option<comet_update::Updater>,
     scaffold: Option<ScaffoldRuntime>,
     runtime_profile: RuntimeProfile,
@@ -719,6 +722,7 @@ impl EngineRpc {
             agent_accounts,
             auth: None,
             links: None,
+            device_wake: None,
             updater: None,
             scaffold: None,
             runtime_profile,
@@ -734,6 +738,14 @@ impl EngineRpc {
     /// Attach the peer link cache — enables `targetDeviceId` relay forwarding.
     pub fn with_links(mut self, links: std::sync::Arc<LinkCache>) -> Self {
         self.links = Some(links);
+        self
+    }
+
+    pub(crate) fn with_device_wake(
+        mut self,
+        wake: std::sync::Arc<crate::device_wake::DeviceWake>,
+    ) -> Self {
+        self.device_wake = Some(wake);
         self
     }
 
@@ -1871,6 +1883,58 @@ impl RpcService for EngineRpc {
                 .await;
         }
         match method {
+            methods::WAKE_DEVICE => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct Params {
+                    device_id: String,
+                }
+                let p: Params = parse_params(params)?;
+                let wake = self
+                    .device_wake
+                    .as_ref()
+                    .filter(|_| self.runtime_profile == RuntimeProfile::LocalController)
+                    .ok_or_else(|| {
+                        RpcError::Failed(
+                            "Wake Device is available only on the local controller".into(),
+                        )
+                    })?;
+                let state = self.auth()?.state();
+                if !state.is_signed_in()
+                    || state.project_scope() != Some(self.workspace.project_scope())
+                {
+                    return Err(RpcError::Failed(
+                        "Sign in to Crew before waking a Devbox".into(),
+                    ));
+                }
+                let devices = self
+                    .workspace
+                    .doc()
+                    .read_devices()
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let device = devices
+                    .iter()
+                    .find(|device| device.id == p.device_id)
+                    .ok_or_else(|| {
+                        RpcError::BadParams("Device is not registered in this workspace".into())
+                    })?;
+                let provider_id =
+                    crate::device_wake::bound_devbox_id(device, self.doc_host.device_id())
+                        .map_err(RpcError::BadParams)?
+                        .to_string();
+                let links = self.links.clone().ok_or_else(|| RpcError::Failed(
+                    "Crew relay is unavailable; reconnect the controller before waking the Devbox".into()
+                ))?;
+                wake.wake(
+                    &p.device_id,
+                    provider_id,
+                    self.workspace.project_scope(),
+                    links,
+                )
+                .await
+                .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "deviceId": p.device_id, "ready": true }))
+            }
             methods::LIST_HARNESSES if !generic_catalog_allowed(self.runtime_profile, method) => {
                 Err(RpcError::Failed(
                     "generic_harness_discovery_disabled_by_runtime_profile".into(),

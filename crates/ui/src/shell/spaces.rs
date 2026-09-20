@@ -122,7 +122,7 @@ fn folder_device_name(
         .filter(|name| !name.is_empty() && !name.eq_ignore_ascii_case("unknown-device"))
         .unwrap_or("Remote device");
     if environment == Some(comet_proto::DeviceEnvironment::Namespace) {
-        format!("{name} · Devbox")
+        "Devbox".to_string()
     } else {
         name.to_string()
     }
@@ -816,7 +816,7 @@ impl Shell {
         cx.notify();
     }
 
-    /// One space row: folder icon + folder name, device name subline.
+    /// One space row: folder name with a compact, bounded device label.
     /// `host_offline` marks a remote host whose presence heartbeat lapsed.
     #[allow(clippy::too_many_arguments)]
     fn render_space_row(
@@ -833,6 +833,16 @@ impl Shell {
     ) -> gpui::Stateful<gpui::Div> {
         let id = space.id.clone();
         let name: SharedString = space.display_name().to_string().into();
+        let full_device_name = self
+            .state
+            .read(cx)
+            .device_name(&space.device_id)
+            .unwrap_or(&device_name)
+            .to_string();
+        let tooltip = format!(
+            "{name} · {full_device_name}{}",
+            if host_offline { " · Offline" } else { "" }
+        );
         let fade_key = format!("space-row-{id}");
         let rest_bg = if selected {
             crate::theme::glass_selected_bg()
@@ -846,11 +856,12 @@ impl Shell {
         };
         let select_id = id.clone();
         let menu_id = id.clone();
-        // One line: "name @ device" — the folder name carries the weight, the
-        // device tag rides along slightly muted. Long names truncate; the
-        // device tag stays visible.
+        // Both labels ellipsize; the device must not squeeze out the folder name.
         div()
             .id(SharedString::from(format!("space-{id}")))
+            .w_full()
+            .min_w_0()
+            .tooltip(popover::text_tooltip(tooltip))
             .flex()
             .flex_row()
             .items_center()
@@ -913,6 +924,7 @@ impl Shell {
             )
             .child(
                 div()
+                    .flex_1()
                     .min_w_0()
                     .truncate()
                     .text_size(px(13.0))
@@ -920,10 +932,10 @@ impl Shell {
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .child(name),
             )
-            .child(div().flex_1())
             .child(
                 div()
                     .flex_none()
+                    .max_w(gpui::relative(0.4))
                     .min_w_0()
                     .truncate()
                     .text_size(px(12.0))
@@ -2465,7 +2477,7 @@ mod tests {
                 Some("Owner's workstation"),
                 Some(comet_proto::DeviceEnvironment::Namespace)
             ),
-            "Owner's workstation · Devbox"
+            "Devbox"
         );
     }
 }

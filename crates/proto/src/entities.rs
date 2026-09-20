@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{HarnessId, ReasoningLevel, SandboxLevel, SessionEnvironment};
 
-/// Host environment metadata for presentation, independent of OS and routing.
+/// Host environment metadata, independent of OS and peer routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DeviceEnvironment {
@@ -24,6 +24,9 @@ pub struct Device {
     /// Absent on ordinary hosts and older registry rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<DeviceEnvironment>,
+    /// Immutable Namespace Devbox ID, never the machine's display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace_devbox_id: Option<String>,
     pub last_seen_at: Option<DateTime<Utc>>,
     /// First registration time (comet devices.created_at — the Devices page
     /// "Added …" fragment). Optional so pre-existing docs stay readable.
