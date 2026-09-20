@@ -14,6 +14,7 @@ use comet_sync::DocsStore;
 
 pub mod agent_accounts;
 pub mod auth;
+mod device_wake;
 pub mod diff_sync;
 pub mod doc_host;
 mod inference_relay;
@@ -163,6 +164,7 @@ pub struct EngineCore {
     auth: std::sync::Mutex<Option<Auth>>,
     /// Peer link cache for `targetDeviceId` routing (attached when edge+auth are ready).
     links: std::sync::Mutex<Option<Arc<comet_rpc::LinkCache>>>,
+    device_wake: Arc<device_wake::DeviceWake>,
     /// Release checker (attached by [`Engine::assemble_runtime`]) — the
     /// UpdateStatus stream + ApplyUpdate.
     updater: std::sync::Mutex<Option<comet_update::Updater>>,
@@ -318,6 +320,7 @@ impl EngineCore {
             runtime_profile: context.runtime_profile,
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
+            device_wake: Arc::new(device_wake::DeviceWake::default()),
             updater: std::sync::Mutex::new(None),
             scaffold: std::sync::Mutex::new(None),
             session_activity,
@@ -446,7 +449,7 @@ impl EngineCore {
         });
         comet_rpc::HostRelay::spawn_with_authority(
             config,
-            self.rpc_service(),
+            Arc::new(self.build_rpc_service()),
             on_nudge,
             on_grant_reset,
             on_grant,
@@ -454,6 +457,14 @@ impl EngineCore {
     }
 
     pub fn rpc_service(&self) -> Arc<EngineRpc> {
+        Arc::new(
+            self.build_rpc_service()
+                .with_device_wake(self.device_wake.clone()),
+        )
+    }
+
+    // Relay clients never receive the local controller's provider wake capability.
+    fn build_rpc_service(&self) -> EngineRpc {
         let mut rpc = EngineRpc::new(
             self.sessions.clone(),
             self.doc_host.clone(),
@@ -476,7 +487,7 @@ impl EngineCore {
         if let Some(scaffold) = self.scaffold_runtime() {
             rpc = rpc.with_scaffold(scaffold);
         }
-        Arc::new(rpc)
+        rpc
     }
 
     /// Graceful teardown: settle live runs (streaming entries stamped `aborted`),

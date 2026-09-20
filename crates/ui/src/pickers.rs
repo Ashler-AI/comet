@@ -495,6 +495,7 @@ pub struct Pickers {
     /// Synchronous cold-start metadata: `/goal` stays discoverable while the
     /// repository/device-specific OMP catalog is still loading.
     omp_command_fallback: HarnessCommand,
+    catalog_generation: u64,
     refs: Loadable<Vec<RepoRef>>,
     /// Space id the `refs` slot belongs to (invalidated on space change).
     refs_space: Option<String>,
@@ -562,6 +563,14 @@ impl Pickers {
             let pending_scaffold =
                 is_pending_scaffold_selection(selected.as_deref(), pending_scaffold_chat);
             if selected != this.draft_owner {
+                this.catalog_generation = this.catalog_generation.wrapping_add(1);
+                this.load_task = None;
+                this.refs_task = None;
+                this.harnesses = Loadable::Idle;
+                this.models.clear();
+                this.commands.clear();
+                this.refs = Loadable::Idle;
+                this.refs_space = None;
                 this.draft_owner = selected.clone();
                 if !pending_scaffold {
                     this.config.harness = None;
@@ -587,6 +596,9 @@ impl Pickers {
             // (and possibly the device) changed under them.
             let space = state.selected_space.clone();
             if space != this.space_owner {
+                this.catalog_generation = this.catalog_generation.wrapping_add(1);
+                this.load_task = None;
+                this.refs_task = None;
                 this.space_owner = space;
                 this.config.branch = None;
                 this.config.checkout = CheckoutKind::remembered(this.defaults.new_worktree);
@@ -637,6 +649,7 @@ impl Pickers {
             omp_command_fallback: comet_proto::omp_goal_command(),
             refs: Loadable::Idle,
             refs_space: None,
+            catalog_generation: 0,
             active: 0,
             model_scroll: gpui::ScrollHandle::new(),
             search,
@@ -716,7 +729,16 @@ impl Pickers {
     /// anywhere" from a Mac without codex).
     fn space_target(&self, cx: &App) -> Option<String> {
         let state = self.state.read(cx);
-        let device = state.selected_space_row()?.device_id.clone();
+        let device = state
+            .selected_chat
+            .as_deref()
+            .and_then(|id| state.chat_host_device_id(id))
+            .or_else(|| {
+                state
+                    .selected_space_row()
+                    .map(|space| space.device_id.as_str())
+            })?
+            .to_owned();
         (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device)
     }
 
@@ -972,6 +994,70 @@ impl Pickers {
 
     // ---- loads ----
 
+    /// Explicit wake completion invalidates failed/in-flight loads, not draft picks.
+    pub(crate) fn reload_after_wake(&mut self, cx: &mut Context<Self>) {
+        self.catalog_generation = self.catalog_generation.wrapping_add(1);
+        self.load_task = None;
+        self.refs_task = None;
+        self.harnesses = Loadable::Idle;
+        self.models.clear();
+        self.commands.clear();
+        self.refs = Loadable::Idle;
+        self.refs_space = None;
+        self.ensure_harnesses(cx);
+        self.ensure_refs(false, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn wake_readiness(
+        &mut self,
+        sending: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, String> {
+        match &self.harnesses {
+            Loadable::Error(error) => return Err(format!("Could not load agents: {error}")),
+            Loadable::Ready(_) => {}
+            _ => return Ok(false),
+        }
+        let harness = self
+            .effective_harness(cx)
+            .ok_or_else(|| "No agent is configured on this Devbox".to_string())?;
+        self.ensure_models(harness, cx);
+        match self.models.get(&harness) {
+            Some(Loadable::Error(error)) => return Err(format!("Could not load models: {error}")),
+            Some(Loadable::Ready(_)) => {}
+            _ => return Ok(false),
+        }
+        if let Some(id) = self.effective_model_id(cx)
+            && !self
+                .models
+                .get(&harness)
+                .and_then(Loadable::ready)
+                .is_some_and(|models| models.iter().any(|model| model.id == id))
+        {
+            return Err("The selected model is unavailable. Select a model and retry.".into());
+        }
+        if self.selected_model(cx).is_none() {
+            return Err("No model is available on this Devbox".into());
+        }
+        if self.state.read(cx).selected_chat.is_none() && self.state.read(cx).selected_space_git() {
+            match &self.refs {
+                Loadable::Error(error) => return Err(format!("Could not load Git refs: {error}")),
+                Loadable::Ready(_) => {}
+                _ => return Ok(false),
+            }
+            if sending {
+                if self.config.branch.is_some() && self.selected_ref().is_none() {
+                    return Err(
+                        "The selected Git ref is unavailable. Select a ref and retry.".into(),
+                    );
+                }
+                self.checkout_plan(cx).map_err(str::to_owned)?;
+            }
+        }
+        Ok(true)
+    }
+
     fn ensure_harnesses(&mut self, cx: &mut Context<Self>) {
         // Only load from Idle: `render` re-runs this every frame, so an Error
         // that could re-trigger a load would flip back to Loading before the
@@ -983,6 +1069,7 @@ impl Pickers {
             return;
         };
         let target = self.space_target(cx);
+        let generation = self.catalog_generation;
         self.harnesses = Loadable::Loading;
         self.load_task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::Map::new();
@@ -997,6 +1084,9 @@ impl Pickers {
                 .call(methods::LIST_HARNESSES, serde_json::Value::Object(params))
                 .await;
             this.update(cx, |pickers, cx| {
+                if generation != pickers.catalog_generation || target != pickers.space_target(cx) {
+                    return;
+                }
                 pickers.harnesses = match result {
                     Ok(value) => match serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
                         Ok(list) => Loadable::Ready(list),
@@ -1028,6 +1118,7 @@ impl Pickers {
             return;
         };
         let target = self.space_target(cx);
+        let generation = self.catalog_generation;
         self.models.insert(harness, Loadable::Loading);
         cx.spawn(async move |this, cx| {
             let mut params = serde_json::json!({ "harness": harness });
@@ -1039,6 +1130,9 @@ impl Pickers {
             }
             let result = engine.client().call(methods::LIST_MODELS, params).await;
             this.update(cx, |pickers, cx| {
+                if generation != pickers.catalog_generation || target != pickers.space_target(cx) {
+                    return;
+                }
                 let loaded = match result {
                     Ok(value) => match serde_json::from_value::<Vec<Model>>(value) {
                         Ok(models) => Loadable::Ready(models),
@@ -1181,6 +1275,7 @@ impl Pickers {
             self.refs = Loadable::Loading;
         }
         self.refs_space = Some(space.id.clone());
+        let generation = self.catalog_generation;
         self.refs_task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::Map::new();
             params.insert(
@@ -1198,6 +1293,11 @@ impl Pickers {
                 .call(methods::LIST_REFS, serde_json::Value::Object(params))
                 .await;
             this.update(cx, |pickers, cx| {
+                if generation != pickers.catalog_generation
+                    || pickers.state.read(cx).selected_space.as_deref() != Some(space.id.as_str())
+                {
+                    return;
+                }
                 pickers.refs = match result {
                     Ok(value) => match serde_json::from_value::<Vec<RepoRef>>(value) {
                         Ok(refs) => Loadable::Ready(refs),
@@ -3223,6 +3323,50 @@ impl Render for Pickers {
 mod tests {
     use super::*;
     use comet_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+
+    #[gpui::test]
+    fn explicit_connect_does_not_require_a_worktree_base(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, _| {
+            state.spaces = vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": "folder", "deviceId": "devbox", "path": "/repo",
+                    "gitDetected": true, "createdAt": chrono::Utc::now()
+                }))
+                .unwrap(),
+            ];
+            state.selected_space = Some("folder".into());
+        });
+        let pickers = cx.new(|cx| Pickers::new(state, cx));
+        pickers.update(cx, |pickers, cx| {
+            pickers.config.harness = Some(HarnessId::Omp);
+            pickers.config.model = Some("test-model".into());
+            pickers.config.checkout = CheckoutKind::NewWorktree;
+            pickers.harnesses = Loadable::Ready(vec![HarnessDescriptor {
+                id: HarnessId::Omp,
+                name: "OMP".into(),
+                supports_steering: true,
+                steering_mode: SteeringMode::StepBoundary,
+                reasoning_levels: vec![],
+            }]);
+            pickers.models.insert(
+                HarnessId::Omp,
+                Loadable::Ready(vec![Model {
+                    id: "test-model".into(),
+                    label: "Test".into(),
+                    description: None,
+                    reasoning_levels: vec![],
+                    options: vec![],
+                }]),
+            );
+            pickers.refs = Loadable::Ready(vec![]);
+            assert_eq!(pickers.wake_readiness(false, cx), Ok(true));
+            assert_eq!(
+                pickers.wake_readiness(true, cx),
+                Err(NEW_WORKTREE_REF_REQUIRED.into())
+            );
+        });
+    }
 
     #[test]
     fn new_worktrees_default_to_repository_default_ref() {

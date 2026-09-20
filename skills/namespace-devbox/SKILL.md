@@ -37,11 +37,12 @@ The macOS controller and remote host both need a release containing Devbox suppo
 
 ## Configure Chromium, identity, and agent guidance
 
-Upload this skill's `scripts/configure-host.sh`, then run it **inside the Devbox** with:
+Resolve the selected machine's immutable `id` from `devbox list --output json`; do not use its display name as the wake binding. Upload both `scripts/configure-host.sh` and `scripts/autostart.sh` into the same directory on the Devbox, then run:
 
 ```bash
 CREW_OWNER_NAME="$OWNER_NAME" \
 NAMESPACE_DEVBOX_NAME="$DEVBOX_NAME" \
+NAMESPACE_DEVBOX_ID="$DEVBOX_ID" \
 CREW_BINARY="$HOME/.local/lib/crew/$VERSION/comet" \
 CREW_CHANNEL=staging \
   bash /tmp/configure-host.sh
@@ -52,6 +53,8 @@ Resolve the host `$HOME`, not the Mac's home, when constructing the remote comma
 - Installs pinned Playwright Chromium and Linux dependencies by default, without Ubuntu's snap-based Chromium package. Node/npm/Python and sudo access for browser system dependencies are prerequisites.
 - Exposes `~/.local/bin/crew-chromium`; stores the browser outside repository checkouts.
 - Creates `~/.local/bin/crew-devbox-staging` (or `crew-devbox-production`) with the explicit matching edge, Scaffold URL, project, data directory, IPC port, and owner-qualified name. It does not restart existing engines.
+- Stores the immutable Namespace ID in the channel configuration so the host publishes `namespaceDevboxId` in its Crew device row. Both controller and host must run a release with this field for the wake control to appear.
+- Installs `~/.local/bin/crew-devbox-autostart` and an idempotent, channel-specific `.bashrc` hook. Namespace's declared interactive `dev-shell` runs the hook at boot; it starts a self-respawning user tmux session without an idle activity marker. It does not restart an already-running engine.
 - Adds a bounded managed guidance block to OMP, Claude Code, and Codex personal instructions without replacing existing guidance. It includes clickable login links, callback forwarding, secret handling, and independent task-marker cleanup.
 
 If the Devbox cannot resolve the browser CDN, do not change its network/security policy. Download the exact archive URL emitted by the pinned Playwright installer on an authorized local machine, compare SHA-256 before and after `devbox upload`, and extract into the exact versioned cache directory reported by `chromium.executablePath()`. Then rerun configuration; it reuses an existing executable. Install required Linux dependencies before the smoke check. Never substitute an unchecked mirror or claim the browser is installed after a failed download.
@@ -70,15 +73,24 @@ Keep that forwarding process running until the CLI confirms successful login. If
 
 For gcloud/Infisical/GitHub use their supported interactive remote login. Print the actual provider authorization link and use the callback port they report; do not assume every provider uses Crew's port. `gcloud auth login --no-launch-browser` and the current `--no-browser` remote-bootstrap flow are alternatives; follow the installed CLI's output. Do not sync entire credential directories or distribute production credentials. Render only Infisical `platform/localdev` products for local development.
 
-Start headless Crew in a persistent Namespace terminal session:
+Start the configured engine with its installed supervisor:
 
 ```bash
-devbox session connect "$DEVBOX_NAME" --session crew-staging
-# Inside that terminal:
-~/.local/bin/crew-devbox-staging headless
+~/.local/bin/crew-devbox-autostart staging
+~/.local/bin/crew-devbox-staging status
 ```
 
-A detached terminal keeps the process alive across disconnects but does **not** replace activity markers. Use `crew-devbox-staging status` to verify the signed-in account, edge/project, engine PID, and IPC listener. If using a service manager instead, preserve the generated channel environment and ensure its stop signal reaches Crew; do not run two engines on the same data directory.
+The helper uses a channel-specific tmux session and restarts the engine after exit with a five-second delay. It requires `tmux` and Python. Namespace's built-in image does not provide systemd; do not assume `comet daemon install` works there. Keep a declared interactive `dev-shell` session so `.bashrc` runs after a machine restart. A separate systemd-capable image may use Crew's native daemon installer instead, preserving the channel configuration and `NAMESPACE_DEVBOX_ID`; never run competing supervisors on one data directory.
+
+On the controller, **Wake and connect** is available for an offline Namespace device with a stored immutable ID. Sending a draft to that device also starts the explicit wake flow. Crew uses the controller's installed `devbox` CLI and existing Namespace login, boots the selected machine, starts the matching channel helper, and verifies the exact Crew device identity through the relay before reloading refs and models. A failed wake preserves the draft and offers Retry. Browsing folders or receiving presence updates never wakes the machine.
+
+The manual equivalent, including after auto-stop, is:
+
+```bash
+devbox exec "$DEVBOX_ID" -- sh -c 'exec "$HOME/.local/bin/crew-devbox-autostart" staging'
+```
+
+OAuth callback and application forwards have separate lifetimes. Wake does not restore expired login flows or automatically expose ports. Use fresh provider URLs and supervise callback forwards independently of a transient agent harness.
 
 ## Automatic sleep protection
 
@@ -114,5 +126,6 @@ Do not stop at installation. Record:
 4. Marker present while that turn is active and absent after completion/cancellation; shutdown clears only that engine's markers. Do not restart a user's active engine without coordinating their running turns.
 5. Headless Chromium successfully renders a page (not merely `--version`) and the forwarded app/Tilt endpoints respond.
 6. Login success without tokens in logs. Explain how to reconnect, log in through forwarded callbacks, and clean up truly stale markers.
+7. Explicitly stop an idle Devbox, then use Wake and connect or a pending send. Verify the same device ID returns, refs load, and the draft submits once; also verify passive sidebar viewing leaves a stopped machine stopped.
 
 State any blocked authentication, missing release, or unverified UI explicitly. Do not claim an installed or locally tested implementation is already released.

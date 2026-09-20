@@ -3,18 +3,20 @@
 set -euo pipefail
 : "${CREW_OWNER_NAME:?Set the real owner display name}"
 : "${NAMESPACE_DEVBOX_NAME:?Set the Namespace Devbox name}"
+: "${NAMESPACE_DEVBOX_ID:?Set the immutable ID from devbox list --output json}"
 : "${CREW_BINARY:?Set the absolute path to the verified Crew executable}"
 CREW_CHANNEL="${CREW_CHANNEL:-staging}"
 [[ "$(uname -s)" == Linux && -d /.namespace/tasks ]] || { echo 'Run inside a Namespace Linux Devbox.' >&2; exit 1; }
 [[ "$CREW_BINARY" == /* && -x "$CREW_BINARY" ]] || { echo 'CREW_BINARY must be an absolute executable path.' >&2; exit 1; }
 [[ "$NAMESPACE_DEVBOX_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || { echo 'Invalid Devbox name.' >&2; exit 1; }
+[[ "$NAMESPACE_DEVBOX_ID" =~ ^[a-z0-9]{13}$ ]] || { echo 'Invalid Namespace Devbox ID.' >&2; exit 1; }
 [[ "$CREW_OWNER_NAME" != *$'\n'* && -n "${CREW_OWNER_NAME// /}" ]] || { echo 'Invalid owner name.' >&2; exit 1; }
 case "$CREW_CHANNEL" in
   staging) edge=https://comet-staging.internal.ashler.com; scaffold=https://scaffold-staging.internal.ashler.com; scope=ashler-staging; data="$HOME/.comet-native-staging"; port=27655 ;;
   production) edge=https://comet.internal.ashler.com; scaffold=https://scaffold.internal.ashler.com; scope=ashler-production; data="$HOME/.comet-native"; port=27653 ;;
   *) echo 'CREW_CHANNEL must be staging or production.' >&2; exit 1 ;;
 esac
-for tool in node npm python3; do command -v "$tool" >/dev/null || { echo "$tool is required" >&2; exit 1; }; done
+for tool in node npm python3 tmux; do command -v "$tool" >/dev/null || { echo "$tool is required" >&2; exit 1; }; done
 
 # Crew setup work also needs protection before the turn-aware engine starts.
 marker="$(mktemp /.namespace/tasks/crew-setup.XXXXXXXX)"
@@ -46,13 +48,15 @@ config="$HOME/.config/crew-devbox/$CREW_CHANNEL.env"
   printf 'export PUPPETEER_EXECUTABLE_PATH=%q\n' "$browser"
   printf 'export PLAYWRIGHT_BROWSERS_PATH=%q\n' "$PLAYWRIGHT_BROWSERS_PATH"
   printf 'export NAMESPACE_DEVBOX_NAME=%q\n' "$NAMESPACE_DEVBOX_NAME"
+  printf 'export NAMESPACE_DEVBOX_ID=%q\n' "$NAMESPACE_DEVBOX_ID"
 ) > "$config"
 chmod 600 "$config"
 printf '#!/usr/bin/env bash\nset -euo pipefail\nsource %q\nexec %q "$@"\n' "$config" "$CREW_BINARY" > "$HOME/.local/bin/crew-devbox-$CREW_CHANNEL"
 chmod 755 "$HOME/.local/bin/crew-devbox-$CREW_CHANNEL"
+install -m 755 "$(dirname "${BASH_SOURCE[0]}")/autostart.sh" "$HOME/.local/bin/crew-devbox-autostart"
 
 # Preserve existing personal instructions; replace only this setup's named block.
-python3 - "$NAMESPACE_DEVBOX_NAME" <<'PY'
+python3 - "$NAMESPACE_DEVBOX_NAME" "$CREW_CHANNEL" <<'PY'
 from pathlib import Path
 import sys
 name = sys.argv[1]
@@ -81,7 +85,24 @@ for relative in ('.omp/agent/AGENTS.md', '.claude/CLAUDE.md', '.codex/AGENTS.md'
         new = old.rstrip() + '\n\n' + block + '\n'
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(new)
+
+# Namespace recreates its declared interactive dev-shell on boot. Preserve the
+# owner's shell setup and install only this channel's idempotent startup hook.
+channel = sys.argv[2]
+path = Path.home() / '.bashrc'
+old = path.read_text() if path.exists() else ''
+start = f'# >>> Crew Devbox {channel} autostart >>>'
+end = f'# <<< Crew Devbox {channel} autostart <<<'
+for first, last in [(start, end)] + ([('# >>> Crew Devbox autostart >>>', '# <<< Crew Devbox autostart <<<')] if channel == 'staging' else []):
+    if first in old or last in old:
+        if old.count(first) != 1 or old.count(last) != 1 or old.index(first) > old.index(last):
+            raise SystemExit(f'Malformed Crew startup block in {path}')
+        before, rest = old.split(first, 1)
+        _, after = rest.split(last, 1)
+        old = before + after
+block = f'{start}\n"$HOME/.local/bin/crew-devbox-autostart" {channel}\n{end}\n'
+path.write_text(old.rstrip() + '\n\n' + block)
 PY
 "$HOME/.local/bin/crew-chromium" --version
 printf 'Configured %s for %s. Existing engines were NOT restarted.\n' "$CREW_CHANNEL" "$CREW_OWNER_NAME"
-printf 'Sign in: %s login\nStart: %s headless\n' "$HOME/.local/bin/crew-devbox-$CREW_CHANNEL" "$HOME/.local/bin/crew-devbox-$CREW_CHANNEL"
+printf 'Sign in: %s login\nStart: %s %s\n' "$HOME/.local/bin/crew-devbox-$CREW_CHANNEL" "$HOME/.local/bin/crew-devbox-autostart" "$CREW_CHANNEL"

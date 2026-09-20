@@ -3680,6 +3680,35 @@ fn mention_error_message(err: &RpcError) -> SharedString {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WakeTarget {
+    device_id: String,
+    chat_id: Option<String>,
+    space_id: Option<String>,
+    agent_id: Option<String>,
+    start_agent: bool,
+}
+
+#[derive(Clone)]
+struct WakeSend {
+    text: String,
+    delivery: SubmitDelivery,
+    attachments: Vec<String>,
+    config: crate::pickers::DraftConfig,
+}
+
+enum WakePhase {
+    Starting,
+    Connecting,
+    Failed(String),
+}
+
+struct WakeInteraction {
+    target: WakeTarget,
+    send: Option<WakeSend>,
+    phase: WakePhase,
+}
+
 pub struct Composer {
     state: Entity<AppState>,
     input: Entity<ComposerInput>,
@@ -3707,6 +3736,8 @@ pub struct Composer {
     sending_chats: HashMap<String, usize>,
     scaffold_preparations: HashMap<String, futures::channel::oneshot::Sender<()>>,
     failure: Option<SharedString>,
+    wake: Option<WakeInteraction>,
+    wake_task: Option<Task<()>>,
     wizard: Option<Wizard>,
     wizard_focus: FocusHandle,
     /// Requests already answered locally (suppresses the panel until the doc
@@ -3807,6 +3838,8 @@ impl Composer {
             sending_chats: HashMap::new(),
             scaffold_preparations: HashMap::new(),
             failure: None,
+            wake: None,
+            wake_task: None,
             wizard: None,
             wizard_focus: cx.focus_handle(),
             answered_requests: HashSet::new(),
@@ -4813,6 +4846,14 @@ impl Composer {
                 }
             }
         }
+        if self
+            .wake
+            .as_ref()
+            .is_some_and(|wake| Some(&wake.target) != self.wake_target(cx).as_ref())
+        {
+            self.wake = None;
+            self.wake_task = None;
+        }
         cx.notify();
     }
 
@@ -4837,6 +4878,13 @@ impl Composer {
     }
 
     fn button_mode(&self, cx: &App) -> SendButtonMode {
+        if self
+            .wake
+            .as_ref()
+            .is_some_and(|wake| !matches!(wake.phase, WakePhase::Failed(_)))
+        {
+            return SendButtonMode::Starting;
+        }
         if self
             .state
             .read(cx)
@@ -4894,6 +4942,178 @@ impl Composer {
     }
 
     fn send(&mut self, text: String, delivery: SubmitDelivery, cx: &mut Context<Self>) {
+        if self
+            .wake
+            .as_ref()
+            .is_some_and(|wake| !matches!(wake.phase, WakePhase::Failed(_)))
+        {
+            return;
+        }
+        if let Some(target) = self.wake_target(cx)
+            && (self.offline_wake_target(cx).is_some() || self.wake.is_some())
+        {
+            let pending = WakeSend {
+                text,
+                delivery,
+                attachments: self
+                    .staged()
+                    .iter()
+                    .map(|attachment| attachment.id.clone())
+                    .collect(),
+                config: self.pickers.read(cx).draft().clone(),
+            };
+            self.begin_wake(target, Some(pending), cx);
+            return;
+        }
+        self.send_ready(text, delivery, cx);
+    }
+
+    fn wake_target(&self, cx: &App) -> Option<WakeTarget> {
+        let state = self.state.read(cx);
+        if state.scaffold_session_draft().is_some() {
+            return None;
+        }
+        let route = self
+            .control_route(comet_proto::CAPABILITY_SESSION_CHAT, cx)
+            .ok()?;
+        let device_id = route
+            .map(|route| route.owner_device_id)
+            .or_else(|| {
+                state
+                    .selected_chat
+                    .as_deref()
+                    .and_then(|id| state.chat_host_device_id(id))
+                    .map(str::to_owned)
+            })
+            .or_else(|| {
+                state
+                    .selected_space_row()
+                    .map(|space| space.device_id.clone())
+            })?;
+        let device = state.devices.iter().find(|device| device.id == device_id)?;
+        if state.local_device_id.as_deref() == Some(device_id.as_str())
+            || device.environment != Some(comet_proto::DeviceEnvironment::Namespace)
+            || !device
+                .namespace_devbox_id
+                .as_deref()
+                .is_some_and(|id| !id.trim().is_empty())
+        {
+            return None;
+        }
+        Some(WakeTarget {
+            device_id,
+            chat_id: state.selected_chat.clone(),
+            space_id: state.selected_space.clone(),
+            agent_id: self.agent_target.clone(),
+            start_agent: self.start_agent,
+        })
+    }
+
+    fn offline_wake_target(&self, cx: &App) -> Option<WakeTarget> {
+        self.wake_target(cx).filter(|target| {
+            !self
+                .state
+                .read(cx)
+                .device_online(&target.device_id, chrono::Utc::now())
+        })
+    }
+
+    fn begin_wake(&mut self, target: WakeTarget, send: Option<WakeSend>, cx: &mut Context<Self>) {
+        if self
+            .wake
+            .as_ref()
+            .is_some_and(|wake| !matches!(wake.phase, WakePhase::Failed(_)))
+        {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.failure = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        if self.wake_target(cx).as_ref() != Some(&target) {
+            return;
+        }
+        self.failure = None;
+        self.wake = Some(WakeInteraction {
+            target: target.clone(),
+            send,
+            phase: WakePhase::Starting,
+        });
+        self.wake_task = Some(cx.spawn(async move |this, cx| {
+            let executor = cx.background_executor().clone();
+            let result = attachments::call_with_timeout(
+                &engine, &executor, methods::WAKE_DEVICE,
+                serde_json::json!({ "deviceId": target.device_id }),
+                Duration::from_secs(180),
+            ).await.and_then(|reply| {
+                if reply.get("ready").and_then(serde_json::Value::as_bool) == Some(true)
+                    && reply.get("deviceId").and_then(serde_json::Value::as_str) == Some(target.device_id.as_str()) {
+                    Ok(())
+                } else {
+                    Err("Devbox did not confirm its connection. Retry Wake and connect.".into())
+                }
+            });
+            let proceed = this.update(cx, |composer, cx| {
+                if composer.wake_target(cx).as_ref() != Some(&target) {
+                    return false;
+                }
+                let Some(wake) = composer.wake.as_mut() else { return false; };
+                match result {
+                    Ok(()) => {
+                        wake.phase = WakePhase::Connecting;
+                        composer.pickers.update(cx, |pickers, cx| pickers.reload_after_wake(cx));
+                        cx.notify();
+                        true
+                    }
+                    Err(error) => {
+                        wake.phase = WakePhase::Failed(format!("Could not start Devbox: {error}"));
+                        cx.notify();
+                        false
+                    }
+                }
+            }).unwrap_or(false);
+            if !proceed { return; }
+            let deadline = Instant::now() + Duration::from_secs(45);
+            loop {
+                let done = this.update(cx, |composer, cx| {
+                    if composer.wake_target(cx).as_ref() != Some(&target) || composer.wake.is_none() {
+                        return true;
+                    }
+                    let sending = composer.wake.as_ref().is_some_and(|wake| wake.send.is_some());
+                    let readiness = composer.pickers.update(cx, |pickers, cx| pickers.wake_readiness(sending, cx));
+                    let error = match readiness {
+                        Ok(true) => {
+                            // Take before dispatch: every completion can continue at most once.
+                            let wake = composer.wake.take().unwrap();
+                            if let Some(send) = wake.send {
+                                if send.text == composer.input.read(cx).text().trim()
+                                    && send.config == *composer.pickers.read(cx).draft()
+                                    && send.attachments.iter().map(String::as_str).eq(composer.staged().iter().map(|attachment| attachment.id.as_str())) {
+                                    composer.send_ready(send.text, send.delivery, cx);
+                                } else {
+                                    composer.failure = Some("Devbox connected. Your draft changed; send when ready.".into());
+                                }
+                            }
+                            cx.notify();
+                            return true;
+                        }
+                        Err(error) => error,
+                        Ok(false) if Instant::now() >= deadline => "Connecting timed out. Check the Devbox agent and retry.".into(),
+                        Ok(false) => return false,
+                    };
+                    composer.wake.as_mut().unwrap().phase = WakePhase::Failed(error);
+                    cx.notify();
+                    true
+                }).unwrap_or(true);
+                if done { break; }
+                executor.timer(Duration::from_millis(100)).await;
+            }
+        }));
+        cx.notify();
+    }
+
+    fn send_ready(&mut self, text: String, delivery: SubmitDelivery, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.failure = Some("Engine not connected".into());
             cx.notify();
@@ -6500,6 +6720,58 @@ impl Render for Composer {
 
         let failure = self.failure.clone();
         let active_goal = self.render_active_goal_indicator(&theme, cx);
+        let wake_target = self
+            .wake
+            .as_ref()
+            .map(|wake| wake.target.clone())
+            .or_else(|| self.offline_wake_target(cx));
+        let wake_notice = wake_target.map(|target| {
+            let (message, action, busy) = match self.wake.as_ref().map(|wake| &wake.phase) {
+                Some(WakePhase::Starting) => ("Starting Devbox…".to_string(), None, true),
+                Some(WakePhase::Connecting) => ("Connecting…".to_string(), None, true),
+                Some(WakePhase::Failed(error)) => (error.clone(), Some("Retry"), false),
+                None => (
+                    "Devbox is offline".to_string(),
+                    Some("Wake and connect"),
+                    false,
+                ),
+            };
+            let opacity = if busy && !motion::reduced_motion(cx) {
+                let phase = motion::pulse_delta(&motion::COMET_PULSE, cx.entity_id(), cx);
+                0.65 + 0.35 * motion::pulse_wave(phase)
+            } else {
+                1.0
+            };
+            div()
+                .id("devbox-wake-notice")
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .px(px(12.0))
+                .py(px(8.0))
+                .text_size(px(12.0))
+                .text_color(theme.text_muted)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .opacity(opacity)
+                        .child(SharedString::from(message)),
+                )
+                .when_some(action, |row, label| {
+                    row.child(
+                        div()
+                            .id("devbox-wake-connect")
+                            .cursor_pointer()
+                            .text_color(theme.text)
+                            .child(label)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let send = this.wake.as_ref().and_then(|wake| wake.send.clone());
+                                this.begin_wake(target.clone(), send, cx);
+                            })),
+                    )
+                })
+        });
         // The shell derives this from the same available lane as the transcript.
         let container = div()
             .w_full()
@@ -6568,6 +6840,7 @@ impl Render for Composer {
                         .child(div().min_w_0().child(message)),
                 )
             })
+            .children(wake_notice)
             .children(active_goal);
 
         if wizard_active {
@@ -6800,6 +7073,181 @@ impl Render for Composer {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    struct WakeRpc {
+        wake: tokio::sync::Semaphore,
+        models: tokio::sync::Semaphore,
+        fail: std::sync::atomic::AtomicBool,
+        wakes: std::sync::atomic::AtomicUsize,
+        sends: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl comet_rpc::RpcService for WakeRpc {
+        async fn handle(
+            &self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<comet_rpc::RpcReply, RpcError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            match method {
+                methods::WAKE_DEVICE => {
+                    self.wakes.fetch_add(1, SeqCst);
+                    self.wake.acquire().await.unwrap().forget();
+                    if self.fail.load(SeqCst) {
+                        return Err(RpcError::Failed("Namespace login required".into()));
+                    }
+                    comet_rpc::RpcReply::value(
+                        &serde_json::json!({"deviceId":"devbox", "ready":true}),
+                    )
+                }
+                methods::LIST_HARNESSES => {
+                    comet_rpc::RpcReply::value(&vec![comet_engine::registry::HarnessDescriptor {
+                        id: HarnessId::Omp,
+                        name: "OMP".into(),
+                        supports_steering: true,
+                        steering_mode: SteeringMode::StepBoundary,
+                        reasoning_levels: vec![],
+                    }])
+                }
+                methods::LIST_MODELS => {
+                    // Opening catalog readiness releases both the eager pre-wake
+                    // request and the refreshed request; generations discard the former.
+                    let _ready = self.models.acquire().await.unwrap();
+                    comet_rpc::RpcReply::value(&vec![comet_proto::Model {
+                        id: "test-model".into(),
+                        label: "Test".into(),
+                        description: None,
+                        reasoning_levels: vec![],
+                        options: vec![],
+                    }])
+                }
+                methods::LIST_HARNESS_COMMANDS => {
+                    comet_rpc::RpcReply::value(&Vec::<serde_json::Value>::new())
+                }
+                methods::QUEUE_COMMAND => {
+                    self.sends.fetch_add(1, SeqCst);
+                    comet_rpc::RpcReply::value(&serde_json::json!({"accepted":true}))
+                }
+                _ => Err(RpcError::UnknownMethod(method.into())),
+            }
+        }
+    }
+
+    fn wake_composer(
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<Composer>, Entity<AppState>, Arc<WakeRpc>) {
+        let rpc = Arc::new(WakeRpc {
+            wake: tokio::sync::Semaphore::new(0),
+            models: tokio::sync::Semaphore::new(0),
+            fail: false.into(),
+            wakes: 0.into(),
+            sends: 0.into(),
+        });
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            state.local_device_id = Some("local".into());
+            state.devices = vec![comet_proto::Device {
+                id: "devbox".into(), name: "Devbox".into(), platform: "linux".into(),
+                environment: Some(comet_proto::DeviceEnvironment::Namespace),
+                namespace_devbox_id: Some("immutable-id".into()), last_seen_at: None,
+                created_at: None, version: None,
+            }];
+            state.apply_chats(vec![serde_json::from_value(serde_json::json!({
+                "id":"wake-chat", "deviceId":"devbox", "archived":false,
+                "cwd":"/repo", "createdAt":chrono::Utc::now(),
+                "config": {"harness":HarnessId::Omp,"model":"test-model","sandbox":SandboxLevel::WorkspaceWrite}
+            })).unwrap()]);
+            state.select_chat(Some("wake-chat".into()), cx);
+            state.set_engine_for_test(EngineHandle::for_test(rpc.clone()));
+        });
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        (composer, state, rpc)
+    }
+
+    #[gpui::test]
+    async fn devbox_send_waits_for_wake_and_models_then_submits_once(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::sync::atomic::Ordering::SeqCst;
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let (composer, state, rpc) = wake_composer(cx);
+        cx.run_until_parked();
+        assert_eq!(rpc.wakes.load(SeqCst), 0, "passive setup must not wake");
+        composer.update(cx, |composer, cx| {
+            composer.submit_command("keep my prompt", cx);
+            composer.on_submit(cx);
+            assert_eq!(composer.input.read(cx).text(), "keep my prompt");
+        });
+        assert!(state.read_with(cx, |state, _| state.transcript.is_empty()));
+        assert_eq!(rpc.sends.load(SeqCst), 0);
+        rpc.wake.add_permits(1);
+        cx.condition(&composer, |composer, _| {
+            matches!(
+                composer.wake.as_ref().map(|wake| &wake.phase),
+                Some(WakePhase::Connecting)
+            )
+        })
+        .await;
+        assert_eq!(rpc.sends.load(SeqCst), 0, "model readiness gates admission");
+        rpc.models.add_permits(1);
+        cx.condition(&composer, |composer, _| {
+            composer.wake.is_none() && !composer.is_sending("wake-chat")
+        })
+        .await;
+        assert_eq!(rpc.wakes.load(SeqCst), 1);
+        assert_eq!(rpc.sends.load(SeqCst), 1);
+    }
+
+    #[gpui::test]
+    async fn devbox_failure_keeps_draft_and_retry_cannot_follow_navigation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::sync::atomic::Ordering::SeqCst;
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let (composer, state, rpc) = wake_composer(cx);
+        rpc.fail.store(true, SeqCst);
+        composer.update(cx, |composer, cx| {
+            composer.add_staged(
+                vec![attachments::stage_pasted_text("keep attachment".into())],
+                cx,
+            );
+            composer.submit_command("keep draft", cx);
+        });
+        rpc.wake.add_permits(1);
+        cx.condition(&composer, |composer, _| {
+            matches!(
+                composer.wake.as_ref().map(|wake| &wake.phase),
+                Some(WakePhase::Failed(_))
+            )
+        })
+        .await;
+        composer.update(cx, |composer, cx| {
+            assert_eq!(composer.input.read(cx).text(), "keep draft");
+            assert_eq!(composer.staged().len(), 1);
+            let wake = composer.wake.as_ref().unwrap();
+            composer.begin_wake(wake.target.clone(), wake.send.clone(), cx);
+        });
+        state.update(cx, |state, cx| state.select_chat(None, cx));
+        cx.run_until_parked();
+        rpc.fail.store(false, SeqCst);
+        rpc.wake.add_permits(1);
+        rpc.models.add_permits(1);
+        cx.run_until_parked();
+        assert_eq!(rpc.sends.load(SeqCst), 0);
+        composer.read_with(cx, |composer, _| {
+            assert!(composer.wake.is_none());
+            assert_eq!(
+                composer.drafts.get("wake-chat").map(String::as_str),
+                Some("keep draft")
+            );
+            assert_eq!(composer.attachments["wake-chat"].len(), 1);
+        });
+    }
 
     struct RejectedScaffoldCreateRpc;
 

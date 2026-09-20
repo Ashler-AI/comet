@@ -342,6 +342,10 @@ impl WorkspaceHost {
             platform: config.platform.clone(),
             environment: crate::namespace_devbox()
                 .then_some(comet_proto::DeviceEnvironment::Namespace),
+            namespace_devbox_id: crate::namespace_devbox()
+                .then(|| std::env::var("NAMESPACE_DEVBOX_ID").ok())
+                .flatten()
+                .filter(|id| crate::device_wake::valid_devbox_id(id)),
             last_seen_at: Some(now),
             // First registration stamps `createdAt`; restarts keep the original
             // (the Devices page "Added …" fragment).

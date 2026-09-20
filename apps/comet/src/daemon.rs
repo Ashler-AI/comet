@@ -40,6 +40,7 @@ const CAPTURED_ENV: &[&str] = &[
     "COMET_CALLBACK_PORT",
     "COMET_HARNESS",
     "COMET_DEVICE_NAME",
+    "NAMESPACE_DEVBOX_ID",
     "RUST_LOG",
 ];
 

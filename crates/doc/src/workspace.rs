@@ -4,7 +4,8 @@
 //! Container layout — maps keyed by id, NOT lists: entity rows are LWW upserts, and a
 //! map-of-maps means concurrent writers to *different* rows never conflict while writes
 //! to the *same* row settle field-by-field LWW (exactly right for renames/archives):
-//! - `devices`: LoroMap keyed by deviceId → row map {id, name, platform, environment?, lastSeenAt}
+//! - `devices`: LoroMap keyed by deviceId → row map {id, name, platform, environment?,
+//!   namespaceDevboxId?, lastSeenAt}
 //! - `spaces`: LoroMap keyed by spaceId → row map {id, deviceId, path, name?,
 //!   gitDetected, gitCheckedAt?, checkoutId?, createdAt}
 //! - `chats`: LoroMap keyed by chatId → row map {id, deviceId, title?, archived, cwd?,
@@ -120,6 +121,11 @@ impl WorkspaceDoc {
             )?,
             None => row.delete("environment")?,
         }
+        set_opt_str(
+            &row,
+            "namespaceDevboxId",
+            device.namespace_devbox_id.as_deref(),
+        )?;
         set_opt_ms(&row, "lastSeenAt", device.last_seen_at)?;
         set_opt_ms(&row, "createdAt", device.created_at)?;
         set_opt_str(&row, "version", device.version.as_deref())?;
@@ -822,6 +828,8 @@ struct RawDevice {
     #[serde(default)]
     environment: Option<comet_proto::DeviceEnvironment>,
     #[serde(default)]
+    namespace_devbox_id: Option<String>,
+    #[serde(default)]
     last_seen_at: Option<i64>,
     #[serde(default)]
     created_at: Option<i64>,
@@ -836,6 +844,7 @@ impl From<RawDevice> for Device {
             name: raw.name,
             platform: raw.platform,
             environment: raw.environment,
+            namespace_devbox_id: raw.namespace_devbox_id,
             last_seen_at: raw.last_seen_at.map(dt),
             created_at: raw.created_at.map(dt),
             version: raw.version,
@@ -1018,6 +1027,7 @@ mod tests {
             name: name.into(),
             platform: "linux".into(),
             environment: None,
+            namespace_devbox_id: None,
             last_seen_at: Some(ts(1_000)),
             created_at: Some(ts(500)),
             version: Some("0.1.0".into()),
@@ -1103,6 +1113,7 @@ mod tests {
         let b = WorkspaceDoc::new();
         let mut namespace = device("devbox", "Owner's workstation");
         namespace.environment = Some(comet_proto::DeviceEnvironment::Namespace);
+        namespace.namespace_devbox_id = Some("ofpf7g22n4412".into());
         a.upsert_device(&namespace).unwrap();
         cross_sync(&a, &b);
         assert_eq!(b.read_devices().unwrap(), vec![namespace.clone()]);
@@ -1128,12 +1139,24 @@ mod tests {
             .find(|d| d.id == "legacy")
             .unwrap();
         assert_eq!(legacy.environment, None);
+        assert_eq!(legacy.namespace_devbox_id, None);
         assert_eq!(legacy.platform, "linux");
         let wire = serde_json::to_value(&namespace).unwrap();
         assert_eq!(wire["environment"], "namespace");
+        assert_eq!(wire["namespaceDevboxId"], "ofpf7g22n4412");
         assert_eq!(serde_json::from_value::<Device>(wire).unwrap(), namespace);
         let mut legacy_wire = serde_json::to_value(&legacy).unwrap();
         legacy_wire.as_object_mut().unwrap().remove("environment");
+        legacy_wire
+            .as_object_mut()
+            .unwrap()
+            .remove("namespaceDevboxId");
+        assert_eq!(
+            serde_json::from_value::<Device>(legacy_wire.clone())
+                .unwrap()
+                .namespace_devbox_id,
+            None
+        );
         assert_eq!(
             serde_json::from_value::<Device>(legacy_wire)
                 .unwrap()
@@ -1142,6 +1165,7 @@ mod tests {
         );
 
         namespace.environment = None;
+        namespace.namespace_devbox_id = None;
         a.upsert_device(&namespace).unwrap();
         cross_sync(&a, &b);
         assert_eq!(
