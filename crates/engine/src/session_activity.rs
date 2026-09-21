@@ -49,6 +49,7 @@ impl SessionActivity {
                                 let mut messages = handle.watch_messages();
                                 let mut previous = None;
                                 let mut streamed_at = None;
+                                let mut previous_status = None;
                                 loop {
                                     let result = {
                                         let tail = messages.borrow_and_update();
@@ -77,8 +78,14 @@ impl SessionActivity {
                                             if previous.as_ref() != latest {
                                                 previous = latest.cloned();
                                             }
+                                            let source_status = agent.status.unwrap_or(SessionStatus::Idle);
+                                            let completed = previous_status.is_some_and(|status| {
+                                                matches!(status, SessionStatus::Working | SessionStatus::AwaitingInput)
+                                                    && matches!(source_status, SessionStatus::Idle | SessionStatus::Errored)
+                                            });
+                                            previous_status = Some(source_status);
                                             let source_at = agent.updated_at.unwrap_or(agent.created_at);
-                                            let mut status = agent.status.unwrap_or(SessionStatus::Idle);
+                                            let mut status = source_status;
                                             let mut updated_at = source_at;
                                             if let Some(entry) = latest
                                                 && (status == SessionStatus::Working || entry.created_at > source_at)
@@ -92,8 +99,7 @@ impl SessionActivity {
                                             }
                                             let Some(updated_at) = DateTime::<Utc>::from_timestamp_millis(updated_at) else { return Ok(()); };
                                             let last_message_at = tail.entries.iter().map(|entry| entry.created_at)
-                                                .chain(matches!(agent.status, Some(SessionStatus::Idle | SessionStatus::Errored))
-                                                    .then_some(source_at)).max();
+                                                .chain(completed.then_some(source_at)).max();
                                             target.record_scaffold_activity(&room, &Session {
                                                 chat_id: room.session_id.clone(),
                                                 device_id: agent.owner_device_id.clone(),
@@ -394,6 +400,21 @@ mod tests {
         assert_eq!(
             comet_proto::view::display_status(&list[0], sessions.borrow().first(), now),
             ChatIndicator::Idle
+        );
+        publish("chat", SessionStatus::Idle, 7_000);
+        receive(&mut sessions, |rows| {
+            rows[0].updated_at.timestamp_millis() == 7_000
+        })
+        .await;
+        assert_eq!(
+            workspace
+                .doc()
+                .chat("chat")
+                .unwrap()
+                .unwrap()
+                .last_message_at,
+            Some(now),
+            "a redundant idle publication is status, not message activity"
         );
 
         workspace.remove_session_ref("chat").unwrap();
