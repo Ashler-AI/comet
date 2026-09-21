@@ -56,6 +56,7 @@ Resolve the host `$HOME`, not the Mac's home, when constructing the remote comma
 - Stores the immutable Namespace ID in the channel configuration so the host publishes `namespaceDevboxId` in its Crew device row. Both controller and host must run a release with this field for the wake control to appear.
 - Installs `~/.local/bin/crew-devbox-autostart` and an idempotent, channel-specific `.bashrc` hook. Namespace's declared interactive `dev-shell` runs the hook at boot; it starts a self-respawning session on the dedicated `tmux -L crew-devbox` server without an idle activity marker. Boot and CLI wake use that same server regardless of inherited `TMUX`. It does not restart an already-running engine.
 - Adds a bounded managed guidance block to OMP, Claude Code, and Codex personal instructions without replacing existing guidance. It includes clickable login links, callback forwarding, secret handling, and independent task-marker cleanup.
+- Configuration changes apply on the next engine start. On a reused machine, inspect active turns before restarting; do not claim the new device identity, immutable Namespace binding, or callback port is live until the restarted engine republishes them.
 
 If the Devbox cannot resolve the browser CDN, do not change its network/security policy. Download the exact archive URL emitted by the pinned Playwright installer on an authorized local machine, compare SHA-256 before and after `devbox upload`, and extract into the exact versioned cache directory reported by `chromium.executablePath()`. Then rerun configuration; it reuses an existing executable. Install required Linux dependencies before the smoke check. Never substitute an unchecked mirror or claim the browser is installed after a failed download.
 
@@ -74,6 +75,7 @@ devbox port-forward "$DEVBOX_ID" \
 ```
 
 Port `8085` is gcloud's loopback callback. Ports `3000` and `10350` expose the app and Tilt. If either application port is occupied, remap only its local side and update the owner links. Credential callback ports cannot be remapped because providers bind them into signed OAuth requests; fail closed rather than kill another listener. Keep this single forward alive through authentication and runtime verification. The tunnel transports loopback HTTP only; provider credentials are created and stored on the Devbox.
+This forward is setup-scoped. Stop it after authentication and endpoint verification so an idle connection cannot defeat Namespace auto-stop. Crew's relay—not this tunnel—carries coding-session control, transcripts, and streaming output.
 
 Run `~/.local/bin/crew-devbox-staging login` on the host and open its printed authorization URL for the owner. The forwarded fixed callback completes sign-in automatically; never ask the owner to paste its callback URL or code unless the provider rejects loopback callbacks.
 
@@ -90,7 +92,9 @@ Start the configured engine with its installed supervisor:
 
 The helper uses a channel-specific tmux session and restarts the engine after exit with a five-second delay. It requires `tmux` and Python. Namespace's built-in image does not provide systemd; do not assume `comet daemon install` works there. Keep a declared interactive `dev-shell` session so `.bashrc` runs after a machine restart. A separate systemd-capable image may use Crew's native daemon installer instead, preserving the channel configuration and `NAMESPACE_DEVBOX_ID`; never run competing supervisors on one data directory.
 
-After one-time setup, ordinary coding sessions need no port forward and no local coordinating LLM: the desktop client uses Crew's authenticated device relay. On the controller, **Wake and connect** is available for an offline Namespace device with a stored immutable ID. Sending a draft to that device also starts the explicit wake flow. Crew uses the controller's installed `devbox` CLI and existing Namespace login, boots the selected machine, starts the matching channel helper, and verifies the exact Crew device identity through the relay before reloading refs and models. A failed wake preserves the draft and offers Retry. Browsing folders or receiving presence updates never wakes the machine.
+On a fresh machine, start the helper normally. On a reused machine whose engine predates this configuration, first verify there are no active turns, then stop only that channel's existing engine and start the helper once. Confirm the republished device row is labeled **Devbox** and carries the expected immutable Namespace ID before testing wake.
+
+After one-time setup, ordinary coding sessions need no port forward and no local coordinating LLM: the desktop client uses Crew's authenticated device relay. Crew owns device wake, exact-device verification, model/ref reload, command submission, steering, cancellation, transcripts, and streamed output. It does not own arbitrary localhost application or third-party OAuth tunnels. On the controller, **Wake and connect** is available for an offline Namespace device with a stored immutable ID. Sending a draft to that device also starts the explicit wake flow. Crew uses the controller's installed `devbox` CLI and existing Namespace login, boots the selected machine, starts the matching channel helper, and verifies the exact Crew device identity through the relay before reloading refs and models. A failed wake preserves the draft and offers Retry. Browsing folders or receiving presence updates never wakes the machine.
 
 The manual wake equivalent is diagnostic only:
 
@@ -110,19 +114,13 @@ Markers survive a crash. No application can run cleanup after SIGKILL or power l
 
 For independent work that outlives a Crew turn, use a separate uniquely named marker with a shell EXIT/INT/TERM trap. A background process alone does not extend Crew's turn marker. Removing the last marker restarts Namespace's normal idle countdown; active connections may still keep the machine awake.
 
-## Ashler local stack and forwarding
+## Ashler local stack and setup-scoped forwarding
 
 In the checked-out Ashler Platform repository read `docs/agents/localdev.md` and `infra/localdev/README.md`. Install/verify Docker, Node/npm, kubectl, kind, ctlptl, Tilt, just, gcloud and Infisical using their maintained Linux installation paths. Follow that repository's setup tooling; do not create a competing stack implementation here.
 
 Keep `ASHLER_INCREMENTAL_TSC_CHECKS=false` and do not run local typechecks. Once Infisical localdev authentication is ready, use the repository's `just bootstrap`, `just env`, and `just dev`. Seed only the confirmed sandbox-local database when needed; never reset a shared database to make setup pass. Run Tilt in another persistent Namespace terminal.
 
-Forward only required services, checking local port conflicts first:
-
-```bash
-devbox port-forward "$DEVBOX_NAME" --ports 3000:3000,10350:10350
-```
-
-The CLI accepts a comma-separated `--ports` list. Give the owner clickable links: http://localhost:3000 and http://localhost:10350. Use alternate local ports if occupied, and update the links. Keep credential callbacks and browser CDP loopback-only; never publish unauthenticated debugging endpoints via `devbox url`.
+The unified setup forward already exposes the app and Tilt on ports `3000` and `10350`. Give the owner clickable links only after both endpoints respond: http://localhost:3000 and http://localhost:10350. If either local port was remapped, use the actual local port in the link. Stop the unified forward when verification ends. Later coding sessions remain fully functional through Crew without it; rerun only this skill's forwarding phase when the owner explicitly needs localhost application access again. Keep credential callbacks and browser CDP loopback-only; never publish unauthenticated debugging endpoints via `devbox url`.
 
 ## Completion evidence
 
