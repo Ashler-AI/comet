@@ -1814,6 +1814,11 @@ impl Pickers {
             .branch
             .clone()
             .or_else(|| self.selected_ref().map(|r| r.name.clone()))
+            .or_else(|| {
+                // A sleeping host cannot list refs before the first send wakes it.
+                (self.config.checkout == CheckoutKind::NewWorktree && self.refs.ready().is_none())
+                    .then(|| "master".into())
+            })
     }
 
     /// The existing worktree the picked ref is materialized in, if any.
@@ -3323,6 +3328,42 @@ impl Render for Pickers {
 mod tests {
     use super::*;
     use comet_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+
+    #[gpui::test]
+    fn offline_worktree_draft_defaults_to_master(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        let pickers = cx.new(|cx| Pickers::new(state, cx));
+        pickers.update(cx, |pickers, _| {
+            pickers.config.checkout = CheckoutKind::NewWorktree;
+            for refs in [
+                Loadable::Idle,
+                Loadable::Loading,
+                Loadable::Error("offline".into()),
+            ] {
+                pickers.refs = refs;
+                assert_eq!(pickers.ref_label().as_ref(), "From master");
+                assert_eq!(
+                    resolve_checkout_plan(
+                        true,
+                        pickers.config.checkout,
+                        pickers.effective_ref_name(),
+                        None
+                    ),
+                    Ok(CheckoutPlan::NewWorktree {
+                        base: "master".into()
+                    })
+                );
+            }
+            pickers.config.branch = Some("feature/selected".into());
+            assert_eq!(
+                pickers.effective_ref_name().as_deref(),
+                Some("feature/selected")
+            );
+            pickers.config.branch = None;
+            pickers.config.checkout = CheckoutKind::Local;
+            assert_eq!(pickers.effective_ref_name(), None);
+        });
+    }
 
     #[gpui::test]
     fn explicit_connect_does_not_require_a_worktree_base(cx: &mut gpui::TestAppContext) {
