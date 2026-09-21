@@ -12,8 +12,8 @@ CREW_CHANNEL="${CREW_CHANNEL:-staging}"
 [[ "$NAMESPACE_DEVBOX_ID" =~ ^[a-z0-9]{13}$ ]] || { echo 'Invalid Namespace Devbox ID.' >&2; exit 1; }
 [[ "$CREW_OWNER_NAME" != *$'\n'* && -n "${CREW_OWNER_NAME// /}" ]] || { echo 'Invalid owner name.' >&2; exit 1; }
 case "$CREW_CHANNEL" in
-  staging) edge=https://comet-staging.internal.ashler.com; scaffold=https://scaffold-staging.internal.ashler.com; scope=ashler-staging; data="$HOME/.comet-native-staging"; port=27655 ;;
-  production) edge=https://comet.internal.ashler.com; scaffold=https://scaffold.internal.ashler.com; scope=ashler-production; data="$HOME/.comet-native"; port=27653 ;;
+  staging) edge=https://comet-staging.internal.ashler.com; scaffold=https://scaffold-staging.internal.ashler.com; scope=ashler-staging; data="$HOME/.comet-native-staging"; port=27655; callback_port=27656 ;;
+  production) edge=https://comet.internal.ashler.com; scaffold=https://scaffold.internal.ashler.com; scope=ashler-production; data="$HOME/.comet-native"; port=27653; callback_port=27654 ;;
   *) echo 'CREW_CHANNEL must be staging or production.' >&2; exit 1 ;;
 esac
 for tool in node npm python3 tmux; do command -v "$tool" >/dev/null || { echo "$tool is required" >&2; exit 1; }; done
@@ -43,6 +43,7 @@ config="$HOME/.config/crew-devbox/$CREW_CHANNEL.env"
   printf 'export COMET_SCAFFOLD_URL=%q\n' "$scaffold"
   printf 'export COMET_PROJECT_SCOPE=%q\n' "$scope"
   printf 'export COMET_IPC_PORT=%q\n' "$port"
+  printf 'export COMET_CALLBACK_PORT=%q\n' "$callback_port"
   printf 'export ASHLER_INCREMENTAL_TSC_CHECKS=false\n'
   printf 'export CHROME_PATH=%q\n' "$browser"
   printf 'export PUPPETEER_EXECUTABLE_PATH=%q\n' "$browser"
@@ -54,6 +55,18 @@ chmod 600 "$config"
 printf '#!/usr/bin/env bash\nset -euo pipefail\nsource %q\nexec %q "$@"\n' "$config" "$CREW_BINARY" > "$HOME/.local/bin/crew-devbox-$CREW_CHANNEL"
 chmod 755 "$HOME/.local/bin/crew-devbox-$CREW_CHANNEL"
 install -m 755 "$(dirname "${BASH_SOURCE[0]}")/autostart.sh" "$HOME/.local/bin/crew-devbox-autostart"
+cat > "$HOME/.local/bin/crew-devbox-gcloud-login" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+command -v docker >/dev/null || { echo 'docker is required for gcloud login.' >&2; exit 1; }
+# Force gcloud's loopback flow without launching a browser inside the Devbox.
+# The setup controller forwards localhost:8085 and opens the printed URL locally.
+exec docker run --rm -i --network host \
+  -e DISPLAY=:99 -e BROWSER=/bin/echo \
+  -v "$HOME/.config/gcloud:/root/.config/gcloud" \
+  google/cloud-sdk:slim gcloud auth login --force "$@"
+SH
+chmod 755 "$HOME/.local/bin/crew-devbox-gcloud-login"
 
 # Preserve existing personal instructions; replace only this setup's named block.
 python3 - "$NAMESPACE_DEVBOX_NAME" "$CREW_CHANNEL" <<'PY'
@@ -64,9 +77,9 @@ start, end = '<!-- crew-namespace-devbox:start -->', '<!-- crew-namespace-devbox
 block = f'''{start}
 ## Namespace Devbox execution
 You are running on Namespace Devbox `{name}`, not the user's Mac.
-- For browser authentication, print the provider's actual clickable authorization URL and tell the user to open it on their local machine. Do not silently open a remote browser for human login.
-- For localhost OAuth callbacks, establish `devbox port-forward {name} --ports PORT:PORT` on the user's machine before opening the URL. Use the port actually reported by the provider; keep the forward alive until login completes. A remote localhost URL alone is not reachable from the user's browser.
-- Prefer provider-supported remote/device-code flows when callback forwarding is unavailable (for example `gcloud auth login --no-launch-browser` or the current gcloud remote-bootstrap flow). Follow CLI output; never guess a callback port or manufacture an auth URL. User approval and MFA must remain interactive.
+- Human browser approval remains interactive, but credentials must be created and stored on this Devbox; never copy a local credential directory or use gcloud remote bootstrap.
+- One-time setup owns the short-lived controller callback tunnel. For gcloud reauthentication, use `~/.local/bin/crew-devbox-gcloud-login`; if localhost:8085 is not already forwarded, rerun the Namespace Devbox skill's authentication phase rather than asking for a separate local coordinating agent.
+- Use provider-supported device flows when available. Follow the CLI's actual URL and preserve user approval/MFA; never guess callback ports or manufacture authorization URLs.
 - Never print access/refresh tokens, service-account keys, browser cookies, callback codes, or secret environment files. Do not copy broad local credentials to this machine. Use normal Crew sign-in and Infisical localdev secret rendering, not production credentials.
 - Chromium is installed at `~/.local/bin/crew-chromium`. Use it headlessly for automation. Keep CDP and application listeners loopback-only and forward only required ports; never publish an unauthenticated browser debugging port.
 - Crew builds with Namespace turn protection manage owned `/.namespace/tasks` markers automatically. On older engines, or for independent commands that outlive a turn, create a uniquely named marker for long-running work and remove only that marker with an EXIT/INT/TERM trap. Do not assume an idle connection protects a task. Never delete other sessions' markers. Markers survive a crash; inspect ownership before removing stale ones.

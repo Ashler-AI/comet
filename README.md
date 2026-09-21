@@ -18,8 +18,9 @@ their own marker and cleanup trap.
 
 Use the [Namespace Devbox setup skill](skills/namespace-devbox/SKILL.md) for an
 owner-named 16-CPU/64-GiB machine, Chromium by default, the Ashler kind/Tilt stack,
-and clickable local-browser login links with callback port forwarding. The setup
-installs agent guidance and separate channel launchers without restarting live engines.
+and one supervised callback forward for all initial browser logins. After setup,
+Crew wakes the machine and runs coding sessions through its device relay; no local
+coordinating agent or credential copying is required.
 
 ## Crew 0.1.117: ordinary remote device control
 

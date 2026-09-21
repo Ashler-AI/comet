@@ -61,17 +61,25 @@ If the Devbox cannot resolve the browser CDN, do not change its network/security
 
 Use separate staging and production data directories. Do not copy `session.json`, device identity, or provider OAuth tokens across environments.
 
-## Authenticate and run persistently
+## Authenticate once, then run transparently
 
-Run `~/.local/bin/crew-devbox-staging login` on the host. Present its actual authorization URL as a clickable link to the owner. Before they open it, establish a local tunnel for the **actual callback port reported by Crew**:
+The setup skill owns every controller-side forward. Never ask the owner to start a second local agent session, copy a credential directory, or manually run `devbox port-forward`.
+
+Use fixed channel callback ports installed by `configure-host.sh`: staging `27656`, production `27654`. Before presenting any authorization URL, check that the required local ports are free, then start one supervised Namespace forward for the whole setup:
 
 ```bash
-devbox port-forward "$DEVBOX_NAME" --ports "$CALLBACK_PORT:$CALLBACK_PORT"
+# staging; production uses 27654 instead of 27656
+devbox port-forward "$DEVBOX_ID" \
+  --ports 27656:27656,8085:8085,3000:3000,10350:10350
 ```
 
-Keep that forwarding process running until the CLI confirms successful login. If the port is occupied locally, do not kill another listener: use the provider's supported remote/device-code flow or the CLI's supported final-callback paste mechanism, treating the callback URL as a credential (never log it).
+Port `8085` is gcloud's loopback callback. Ports `3000` and `10350` expose the app and Tilt. If either application port is occupied, remap only its local side and update the owner links. Credential callback ports cannot be remapped because providers bind them into signed OAuth requests; fail closed rather than kill another listener. Keep this single forward alive through authentication and runtime verification. The tunnel transports loopback HTTP only; provider credentials are created and stored on the Devbox.
 
-For gcloud/Infisical/GitHub use their supported interactive remote login. Print the actual provider authorization link and use the callback port they report; do not assume every provider uses Crew's port. `gcloud auth login --no-launch-browser` and the current `--no-browser` remote-bootstrap flow are alternatives; follow the installed CLI's output. Do not sync entire credential directories or distribute production credentials. Render only Infisical `platform/localdev` products for local development.
+Run `~/.local/bin/crew-devbox-staging login` on the host and open its printed authorization URL for the owner. The forwarded fixed callback completes sign-in automatically; never ask the owner to paste its callback URL or code unless the provider rejects loopback callbacks.
+
+For gcloud, run `~/.local/bin/crew-devbox-gcloud-login` on the host. It forces gcloud's normal `localhost:8085` browser flow without launching a remote browser; open the printed URL locally and let the existing forward return the callback directly to gcloud on the Devbox. Do not use `--no-browser`, `--no-launch-browser`, remote bootstrap, local credential export, or credential-directory copying for normal setup.
+
+GitHub uses its supported device flow and Infisical uses its supported interactive remote login; neither requires local credential copying. Preserve user approval and MFA. Do not distribute production credentials. Render only Infisical `platform/localdev` products for local development.
 
 Start the configured engine with its installed supervisor:
 
@@ -82,15 +90,15 @@ Start the configured engine with its installed supervisor:
 
 The helper uses a channel-specific tmux session and restarts the engine after exit with a five-second delay. It requires `tmux` and Python. Namespace's built-in image does not provide systemd; do not assume `comet daemon install` works there. Keep a declared interactive `dev-shell` session so `.bashrc` runs after a machine restart. A separate systemd-capable image may use Crew's native daemon installer instead, preserving the channel configuration and `NAMESPACE_DEVBOX_ID`; never run competing supervisors on one data directory.
 
-On the controller, **Wake and connect** is available for an offline Namespace device with a stored immutable ID. Sending a draft to that device also starts the explicit wake flow. Crew uses the controller's installed `devbox` CLI and existing Namespace login, boots the selected machine, starts the matching channel helper, and verifies the exact Crew device identity through the relay before reloading refs and models. A failed wake preserves the draft and offers Retry. Browsing folders or receiving presence updates never wakes the machine.
+After one-time setup, ordinary coding sessions need no port forward and no local coordinating LLM: the desktop client uses Crew's authenticated device relay. On the controller, **Wake and connect** is available for an offline Namespace device with a stored immutable ID. Sending a draft to that device also starts the explicit wake flow. Crew uses the controller's installed `devbox` CLI and existing Namespace login, boots the selected machine, starts the matching channel helper, and verifies the exact Crew device identity through the relay before reloading refs and models. A failed wake preserves the draft and offers Retry. Browsing folders or receiving presence updates never wakes the machine.
 
-The manual equivalent, including after auto-stop, is:
+The manual wake equivalent is diagnostic only:
 
 ```bash
 devbox exec "$DEVBOX_ID" -- sh -c 'exec "$HOME/.local/bin/crew-devbox-autostart" staging'
 ```
 
-OAuth callback and application forwards have separate lifetimes. Wake does not restore expired login flows or automatically expose ports. Use fresh provider URLs and supervise callback forwards independently of a transient agent harness.
+Do not teach the owner to use that command for normal operation. Provider reauthentication is exceptional and remains an interactive security boundary; rerun this skill's authentication phase so it owns the short-lived callback forward.
 
 ## Automatic sleep protection
 
