@@ -24,8 +24,10 @@ pub enum HarnessError {
     NotInstalled(String),
     #[error("harness protocol error: {0}")]
     Protocol(String),
-    #[error("This OMP session is already running. Stop it before resuming in Comet.")]
+    #[error("This OMP session is already running. Take over to resume it in Crew.")]
     SessionBusy { session_id: String },
+    #[error("The write-capable holder has no verified OMP owner")]
+    SessionOwnerUnverified,
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }

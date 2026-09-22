@@ -1115,11 +1115,7 @@ fn stop_plan(files: &[PathBuf], omp_executable: &Path) -> Result<Vec<StopTarget>
                     roots.push(root);
                 }
             }
-            None => {
-                return Err(HarnessError::Protocol(
-                    "The write-capable holder has no verified OMP owner".into(),
-                ));
-            }
+            None => return Err(HarnessError::SessionOwnerUnverified),
         }
     }
 
@@ -1195,6 +1191,18 @@ fn session_has_writer(files: &[PathBuf]) -> Result<bool, HarnessError> {
 fn stop_session_writer(files: Vec<PathBuf>, omp_executable: PathBuf) -> Result<(), HarnessError> {
     let graceful = match stop_plan(&files, &omp_executable) {
         Ok(plan) => plan,
+        Err(HarnessError::SessionOwnerUnverified) => {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if !session_has_writer(&files)? {
+                    return Ok(());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(HarnessError::SessionOwnerUnverified);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
         Err(_) if !session_has_writer(&files)? => return Ok(()),
         Err(error) => return Err(error),
     };
