@@ -35,6 +35,8 @@ Install under `~/.local/lib/crew/<version>/`; extract with `--strip-components=1
 
 The macOS controller and remote host both need a release containing Devbox support. A current Mac binary paired with an old running engine may still show Local or fail to control remote turns.
 
+Install the OMP version pinned by that Crew release before configuring the host. Read `source.repository` and `source.commit` from the verified manifest, fetch that exact commit's root `install.sh` through the authenticated GitHub API, upload it, and run `install.sh --install-omp` on the Devbox. The installer selects the Linux architecture, verifies the official upstream SHA-256, and installs `~/.local/bin/omp`. Never use a moving OMP release or copy local provider credentials. Confirm `omp --version`; `configure-host.sh` fails closed when the harness is absent.
+
 ## Configure Chromium, identity, and agent guidance
 
 Resolve the selected machine's immutable `id` from `devbox list --output json`; do not use its display name as the wake binding. Upload both `scripts/configure-host.sh` and `scripts/autostart.sh` into the same directory on the Devbox, then run:
@@ -69,12 +71,16 @@ The setup skill owns every controller-side forward. Never ask the owner to start
 Use fixed channel callback ports installed by `configure-host.sh`: staging `27656`, production `27654`. Before presenting any authorization URL, check that the required local ports are free, then start one supervised Namespace forward for the whole setup:
 
 ```bash
+# Keep remote ports fixed; override only an occupied local app port.
+WEB_LOCAL_PORT="${WEB_LOCAL_PORT:-3000}"
+TILT_LOCAL_PORT="${TILT_LOCAL_PORT:-10350}"
+# Example: WEB_LOCAL_PORT=13000 TILT_LOCAL_PORT=20350
 # staging; production uses 27654 instead of 27656
 devbox port-forward "$DEVBOX_ID" \
-  --ports 27656:27656,8085:8085,3000:3000,10350:10350
+  --ports "27656:27656,8085:8085,$WEB_LOCAL_PORT:3000,$TILT_LOCAL_PORT:10350"
 ```
 
-Port `8085` is gcloud's loopback callback. Ports `3000` and `10350` expose the app and Tilt. If either application port is occupied, remap only its local side and update the owner links. Credential callback ports cannot be remapped because providers bind them into signed OAuth requests; fail closed rather than kill another listener. Keep this single forward alive through authentication and runtime verification. The tunnel transports loopback HTTP only; provider credentials are created and stored on the Devbox.
+Port `8085` is gcloud's loopback callback. Ports `3000` and `10350` are remote app and Tilt ports; their local sides are `$WEB_LOCAL_PORT` and `$TILT_LOCAL_PORT`. Check the chosen local ports immediately before starting the forward. If either application port is occupied, set that variable to an unused local port and use it in every link and health check. Never stop the existing listener. Credential callback ports cannot be remapped because providers bind them into signed OAuth requests; fail closed rather than kill another listener. Keep this single forward alive through authentication and runtime verification. The tunnel transports loopback HTTP only; provider credentials are created and stored on the Devbox.
 This forward is setup-scoped. Stop it after authentication and endpoint verification so an idle connection cannot defeat Namespace auto-stop. Crew's relay—not this tunnel—carries coding-session control, transcripts, and streaming output.
 
 Run `~/.local/bin/crew-devbox-staging login` on the host and open its printed authorization URL for the owner. The forwarded fixed callback completes sign-in automatically; never ask the owner to paste its callback URL or code unless the provider rejects loopback callbacks.
@@ -82,6 +88,8 @@ Run `~/.local/bin/crew-devbox-staging login` on the host and open its printed au
 For gcloud, run `~/.local/bin/crew-devbox-gcloud-login` on the host. It forces gcloud's normal `localhost:8085` browser flow without launching a remote browser; open the printed URL locally and let the existing forward return the callback directly to gcloud on the Devbox. Do not use `--no-browser`, `--no-launch-browser`, remote bootstrap, local credential export, or credential-directory copying for normal setup.
 
 GitHub uses its supported device flow and Infisical uses its supported interactive remote login; neither requires local credential copying. Preserve user approval and MFA. Do not distribute production credentials. Render only Infisical `platform/localdev` products for local development.
+
+OMP runs launched by Crew use Crew Agent Auth through a per-run inference route. Do not run OMP `/login`, copy provider credentials, or configure a separate OMP auth broker. A bare interactive `omp` process is not an Agent Auth test; verify models by starting a Crew-owned remote turn with an explicit selected model.
 
 Start the configured engine with its installed supervisor:
 
@@ -120,14 +128,14 @@ In the checked-out Ashler Platform repository read `docs/agents/localdev.md` and
 
 Keep `ASHLER_INCREMENTAL_TSC_CHECKS=false` and do not run local typechecks. Once Infisical localdev authentication is ready, use the repository's `just bootstrap`, `just env`, and `just dev`. Seed only the confirmed sandbox-local database when needed; never reset a shared database to make setup pass. Run Tilt in another persistent Namespace terminal.
 
-The unified setup forward already exposes the app and Tilt on ports `3000` and `10350`. Give the owner clickable links only after both endpoints respond: http://localhost:3000 and http://localhost:10350. If either local port was remapped, use the actual local port in the link. Stop the unified forward when verification ends. Later coding sessions remain fully functional through Crew without it; rerun only this skill's forwarding phase when the owner explicitly needs localhost application access again. Keep credential callbacks and browser CDP loopback-only; never publish unauthenticated debugging endpoints via `devbox url`.
+The unified setup forward exposes the app at `http://localhost:$WEB_LOCAL_PORT` and Tilt at `http://localhost:$TILT_LOCAL_PORT`. Give the owner clickable links using the actual selected values only after both endpoints respond. Stop the unified forward when verification ends. Later coding sessions remain fully functional through Crew without it; rerun only this skill's forwarding phase when the owner explicitly needs localhost application access again. Keep credential callbacks and browser CDP loopback-only; never publish unauthenticated debugging endpoints via `devbox url`.
 
 ## Completion evidence
 
 Do not stop at installation. Record:
 
 1. Namespace machine name, verified owner, 16 CPU / 64 GiB capacity, and running Crew version/environment.
-2. Both Mac and Devbox sessions visible in Crew, with this host labeled **Devbox** and the owner-qualified device name.
+2. Both Mac and Devbox sessions visible in Crew, with this host labeled **Devbox** and the owner-qualified device name. Stop the Devbox and confirm the same offline row remains reachable in **Settings → Devices** and the add-folder picker.
 3. A Mac-initiated turn that runs `hostname`/`pwd` on the Devbox and streams its real result back.
 4. Marker present while that turn is active and absent after completion/cancellation; shutdown clears only that engine's markers. Do not restart a user's active engine without coordinating their running turns.
 5. Headless Chromium successfully renders a page (not merely `--version`) and the forwarded app/Tilt endpoints respond.
