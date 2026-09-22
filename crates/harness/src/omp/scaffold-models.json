@@ -2,7 +2,9 @@
   "source": {
     "repository": "Ashler-AI/ashler-platform",
     "revision": "a9d27fc871877242952bded20136bf44f8679139",
-    "path": "internal/scaffold/control-plane/worker/src/omp-auth-broker.ts"
+    "path": "internal/scaffold/control-plane/worker/src/omp-auth-broker.ts",
+    "localProvisionalAdditions": ["anthropic/claude-opus-5-5"],
+    "note": "The revision identifies the base snapshot, not local provisional additions. Resync from a published Platform commit once the model ID and capabilities are confirmed."
   },
   "models": [
     {
@@ -140,6 +142,12 @@
         "medium",
         "high"
       ]
+    },
+    {
+      "id": "anthropic/claude-opus-5-5",
+      "label": "Opus 5.5 (provisional)",
+      "description": "Provisional model ID; availability and capabilities are unconfirmed; account access checked when starting a run",
+      "reasoningLevels": []
     }
   ]
 }

@@ -173,8 +173,13 @@ catalog, and every run still passes the existing Agent Auth checks.
 The bundled `crates/harness/src/omp/scaffold-models.json` is generated from the
 canonical Platform `ompInferenceModelCatalog`, with its source commit recorded
 in the file. It is a release snapshot, not a live availability promise. Refresh
-it with `node scripts/sync-omp-model-catalog.mjs <platform commit SHA>`; do not
-hand-edit the model list. Unknown source formats fail regeneration.
+it with `node scripts/sync-omp-model-catalog.mjs <platform commit SHA>`; unknown
+source formats fail regeneration. The Opus 5.5 draft adds a local provisional
+`anthropic/claude-opus-5-5` entry, explicitly recorded in
+`source.localProvisionalAdditions`; the source revision still identifies only
+the base snapshot. Resync from a published Platform commit once the exact ID
+and capabilities are confirmed. The provisional static entries advertise no
+reasoning levels or capability options and do not change existing defaults.
 
 Catalog regressions cover credential-free defaults, local overrides/custom
 providers, deduplication, and preservation of the Scaffold-scoped catalog.

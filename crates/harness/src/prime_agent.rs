@@ -596,6 +596,10 @@ prime-inference openai/gpt-5.6-sol-pro 1.0M 128K yes yes\n\
 openai-codex gpt-5.5 1.0M 262.1K yes yes\n\
 openai-codex gpt-5.60-future 1.0M 262.1K yes yes\n\
 anthropic claude-opus-5 200K 64K yes yes\n\
+anthropic claude-opus-5-5 unknown unknown no no\n\
+prime-inference anthropic/claude-opus-5-5 unknown unknown no no\n\
+anthropic claude-opus-5-50 unknown unknown no no\n\
+prime-inference anthropic/claude-opus-5-5-future unknown unknown no no\n\
 prime-inference anthropic/claude-fable-5 1.0M 128K yes yes\n\
 prime-inference moonshotai/kimi-k3 262.1K 262.1K yes no\n\
 prime-inference x-ai/grok-4.20 2.0M 65.5K yes no\n\
@@ -611,6 +615,8 @@ prime-inference z-ai/glm-5.2 1.0M 262.1K yes no\n",
                 "openai-codex/gpt-5.6-sol",
                 "prime-inference/openai/gpt-5.6-sol-pro",
                 "anthropic/claude-opus-5",
+                "anthropic/claude-opus-5-5",
+                "prime-inference/anthropic/claude-opus-5-5",
                 "prime-inference/anthropic/claude-fable-5",
                 "prime-inference/moonshotai/kimi-k3",
                 "prime-inference/x-ai/grok-4.20",

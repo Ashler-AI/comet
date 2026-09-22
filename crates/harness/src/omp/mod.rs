@@ -4588,11 +4588,13 @@ mod tests {
     #[test]
     fn desktop_catalog_has_scaffold_defaults_without_local_credentials() {
         let models = desktop_models(models_from_catalog(br#"{"models":[]}"#).unwrap());
-        assert!(
-            models
-                .iter()
-                .any(|model| model.id == "openai-codex/gpt-6-astra")
-        );
+        assert_eq!(models[0].id, "openai-codex/gpt-6-astra");
+        let provisional = models
+            .iter()
+            .find(|model| model.id == "anthropic/claude-opus-5-5")
+            .expect("provisional Opus 5.5 is available without local credentials");
+        assert!(provisional.reasoning_levels.is_empty());
+        assert!(provisional.options.is_empty());
         assert!(
             models
                 .iter()

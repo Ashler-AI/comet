@@ -63,6 +63,8 @@ enum HarnessCatalog {
                           description: "Balanced speed and intelligence", reasoningLevels: claudeXhighLadder),
                 ModelInfo(id: "claude-haiku-4-5", label: "Haiku 4.5",
                           description: "Fastest model for everyday tasks", reasoningLevels: []),
+                ModelInfo(id: "claude-opus-5-5", label: "Opus 5.5 (provisional)",
+                          description: "Provisional model ID; availability and capabilities are unconfirmed", reasoningLevels: []),
             ]
         default:
             return []

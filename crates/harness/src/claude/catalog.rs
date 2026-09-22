@@ -197,6 +197,13 @@ pub(crate) fn static_models() -> Vec<Model> {
             &[],
             vec![toggle("thinking", "Thinking")],
         ),
+        model(
+            "claude-opus-5-5",
+            "Opus 5.5 (provisional)",
+            "Provisional model ID; availability and capabilities are unconfirmed",
+            &[],
+            vec![],
+        ),
     ]
 }
 
@@ -230,9 +237,16 @@ mod tests {
     }
 
     #[test]
-    fn catalog_includes_fable_5_1() {
-        assert_eq!(static_models()[0].id, "claude-fable-5-1");
-        assert_eq!(static_models()[0].label, "Fable 5.1");
+    fn catalog_includes_provisional_opus_5_5_without_changing_default() {
+        let models = static_models();
+        assert_eq!(models[0].id, "claude-fable-5-1");
+        let provisional = models
+            .iter()
+            .find(|model| model.id == "claude-opus-5-5")
+            .expect("provisional Opus 5.5 is discoverable");
+        assert!(provisional.reasoning_levels.is_empty());
+        assert!(provisional.options.is_empty());
+        assert!(!models.iter().any(|model| model.id == "claude-opus-5-50"));
     }
 
     #[test]

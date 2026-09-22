@@ -142,9 +142,11 @@ pub(crate) fn is_curated_comet_model(model_id: &str) -> bool {
         || matches!(
             model_id,
             "anthropic/claude-opus-5"
+                | "anthropic/claude-opus-5-5"
                 | "anthropic/claude-sonnet-5"
                 | "anthropic/claude-fable-5"
                 | "prime-inference/anthropic/claude-opus-5"
+                | "prime-inference/anthropic/claude-opus-5-5"
                 | "prime-inference/anthropic/claude-sonnet-5"
                 | "prime-inference/anthropic/claude-fable-5"
                 | "prime-inference/moonshotai/kimi-k3"

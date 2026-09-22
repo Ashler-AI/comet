@@ -136,6 +136,12 @@ async fn model_and_command_catalogs_come_from_omp() {
             .iter()
             .any(|model| model.id == "anthropic/claude-fable-5-1")
     );
+    let provisional = models
+        .iter()
+        .find(|model| model.id == "anthropic/claude-opus-5-5")
+        .expect("provisional Opus 5.5 is discoverable");
+    assert!(provisional.reasoning_levels.is_empty());
+    assert!(provisional.options.is_empty());
     assert_eq!(
         models
             .iter()
