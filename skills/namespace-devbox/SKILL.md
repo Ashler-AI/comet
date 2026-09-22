@@ -25,6 +25,8 @@ devbox create --name "$DEVBOX_NAME" --purpose "$OWNER_NAME's Ashler development 
 devbox configure-ssh "$DEVBOX_NAME"
 ```
 
+Namespace keeps the persistent checkout at `/workspaces/ashler-platform`. Verify that path after creation; do not relocate it into the Devbox home filesystem. Host configuration defaults Crew's folder browser to `/workspaces`, so the checkout is visible immediately instead of opening at `$HOME`. If an approved Blueprint uses a different persistent checkout parent, pass that absolute directory as `CREW_FOLDER_ROOT` when running `configure-host.sh`.
+
 Only use `--setup_github`/`devbox setup-github` after the user explicitly authorizes transferring their local GitHub authentication. Otherwise sign in on the host with GitHub's interactive browser/device flow. Linux uses Docker, not OrbStack; use the same kind/Tilt topology as the Mac without trying to install OrbStack remotely.
 
 ## Install the verified Crew release
@@ -47,6 +49,7 @@ NAMESPACE_DEVBOX_NAME="$DEVBOX_NAME" \
 NAMESPACE_DEVBOX_ID="$DEVBOX_ID" \
 CREW_BINARY="$HOME/.local/lib/crew/$VERSION/comet" \
 CREW_CHANNEL=staging \
+CREW_FOLDER_ROOT=/workspaces \
   bash /tmp/configure-host.sh
 ```
 
@@ -55,6 +58,7 @@ Resolve the host `$HOME`, not the Mac's home, when constructing the remote comma
 - Installs pinned Playwright Chromium and Linux dependencies by default, without Ubuntu's snap-based Chromium package. Node/npm/Python and sudo access for browser system dependencies are prerequisites.
 - Exposes `~/.local/bin/crew-chromium`; stores the browser outside repository checkouts.
 - Creates `~/.local/bin/crew-devbox-staging` (or `crew-devbox-production`) with the explicit matching edge, Scaffold URL, project, data directory, IPC port, and owner-qualified name. It does not restart existing engines.
+- Opens Crew's folder browser at the persistent Namespace checkout parent (`/workspaces` by default), making `ashler-platform` directly selectable without moving it into the Devbox home filesystem.
 - Stores the immutable Namespace ID in the channel configuration so the host publishes `namespaceDevboxId` in its Crew device row. Both controller and host must run a release with this field for the wake control to appear.
 - Installs `~/.local/bin/crew-devbox-autostart` and an idempotent, channel-specific `.bashrc` hook. Namespace's declared interactive `dev-shell` runs the hook at boot; it starts a self-respawning session on the dedicated `tmux -L crew-devbox` server without an idle activity marker. Boot and CLI wake use that same server regardless of inherited `TMUX`. It does not restart an already-running engine.
 - Adds a bounded managed guidance block to OMP, Claude Code, and Codex personal instructions without replacing existing guidance. It includes clickable login links, callback forwarding, secret handling, and independent task-marker cleanup.
