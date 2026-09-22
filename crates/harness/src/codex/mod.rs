@@ -231,6 +231,15 @@ impl Harness for CodexHarness {
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
+        if request.model.as_deref().is_none_or(|model| {
+            let model = model.trim();
+            model.is_empty() || model == "default"
+        }) {
+            request.model = Some("gpt-6-sol".into());
+        }
+        if request.model.as_deref() == Some("gpt-6-sol") && request.reasoning.is_none() {
+            request.reasoning = Some(ReasoningLevel::High);
+        }
         // Codex ≤0.144.x: the workspace-write sandbox derives a MALFORMED
         // worktree mount when the checked-out branch name contains '/'
         // (verified against the real CLI: `wing/x` in a linked worktree kills

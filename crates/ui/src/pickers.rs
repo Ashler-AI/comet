@@ -169,11 +169,20 @@ impl ResolvedRunConfig {
 // Pure: default resolution (no "Default" placeholders — a concrete pick always)
 // ---------------------------------------------------------------------------
 
-/// The harness's default model: the first catalog row (both curated catalogs
-/// lead with the flagship — comet's `pickDefaultModel` Opus preference maps to
-/// the same row here).
+/// Keep the host's preferred model, upgrading only an implicit legacy Sol default.
 pub fn default_model(models: &[Model]) -> Option<&Model> {
-    models.first()
+    let first = models.first()?;
+    if first.id.rsplit('/').next() == Some("gpt-5.6-sol")
+        && let Some(prefix) = first.id.strip_suffix("gpt-5.6-sol")
+    {
+        if let Some(released) = models
+            .iter()
+            .find(|model| model.id.strip_prefix(prefix) == Some("gpt-6-sol"))
+        {
+            return Some(released);
+        }
+    }
+    Some(first)
 }
 
 /// Default reasoning for models without a model-specific recommendation.
@@ -829,8 +838,8 @@ impl Pickers {
     }
 
     /// The selected model — concrete from the moment the list loads: the
-    /// effective id when the list still offers it, else the harness default
-    /// (first row). Never `None` with a non-empty catalog.
+    /// effective id when the list still offers it, else the harness default.
+    /// Never `None` with a non-empty catalog.
     fn selected_model<'a>(&'a self, cx: &'a App) -> Option<&'a Model> {
         let harness = self.effective_harness(cx)?;
         let models = self.models.get(&harness)?.ready()?;
@@ -3675,24 +3684,36 @@ mod tests {
     }
 
     #[test]
-    fn default_model_is_first_catalog_row() {
-        let models = vec![
+    fn default_model_upgrades_legacy_sol_without_changing_other_defaults() {
+        let mut models = vec![
             Model {
-                id: "flagship".into(),
-                label: "Flagship".into(),
+                id: "openai-codex/gpt-5.6-sol".into(),
+                label: "Legacy Sol".into(),
                 description: None,
                 reasoning_levels: vec![],
                 options: vec![],
             },
             Model {
-                id: "fast".into(),
-                label: "Fast".into(),
+                id: "openai-codex/gpt-6-sol".into(),
+                label: "Sol".into(),
                 description: None,
                 reasoning_levels: vec![],
                 options: vec![],
             },
         ];
-        assert_eq!(default_model(&models).map(|m| &*m.id), Some("flagship"));
+        assert_eq!(
+            default_model(&models).map(|m| &*m.id),
+            Some("openai-codex/gpt-6-sol")
+        );
+        assert_eq!(
+            default_model(&models[..1]).map(|m| &*m.id),
+            Some("openai-codex/gpt-5.6-sol")
+        );
+        models[0].id = "openai-codex/gpt-6-astra".into();
+        assert_eq!(
+            default_model(&models).map(|m| &*m.id),
+            Some("openai-codex/gpt-6-astra")
+        );
         assert!(default_model(&[]).is_none());
     }
 

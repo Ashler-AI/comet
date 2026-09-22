@@ -2184,7 +2184,8 @@ fn models_from_catalog(bytes: &[u8]) -> Result<Vec<Model>, HarnessError> {
         .models
         .into_iter()
         .map(|model| {
-            let opus_5_5 = model.selector.rsplit('/').next() == Some("claude-opus-5-5");
+            let max_ladder = matches!(model.selector.rsplit('/').next(),
+                Some("claude-opus-5-5" | "gpt-6-sol" | "gpt-6-luna"));
             let size_description = match (model.context_window, model.max_tokens) {
                 (Some(context_window), Some(max_tokens)) => {
                     format!("{context_window} context · {max_tokens} max output · ")
@@ -2204,7 +2205,7 @@ fn models_from_catalog(bytes: &[u8]) -> Result<Vec<Model>, HarnessError> {
                     .unwrap_or_default()
                     .into_iter()
                     .filter_map(|level| serde_json::from_value(Value::String(level)).ok())
-                    .filter(|level| !opus_5_5 || matches!(level,
+                    .filter(|level| !max_ladder || matches!(level,
                         ReasoningLevel::Low | ReasoningLevel::Medium | ReasoningLevel::High
                         | ReasoningLevel::XHigh | ReasoningLevel::Max))
                     .collect(),
@@ -4642,6 +4643,14 @@ mod tests {
                 ReasoningLevel::Max,
             ]
         );
+        for id in ["openai-codex/gpt-6-sol", "openai-codex/gpt-6-luna"] {
+            let released = models
+                .iter()
+                .find(|model| model.id == id)
+                .expect("released model");
+            assert_eq!(released.reasoning_levels, opus.reasoning_levels);
+            assert!(released.options.is_empty());
+        }
         assert!(opus.options.is_empty());
         assert!(
             models

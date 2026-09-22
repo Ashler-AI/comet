@@ -177,7 +177,19 @@ it with `node scripts/sync-omp-model-catalog.mjs <platform commit SHA>`; unknown
 source formats fail regeneration. Released `claude-opus-5-5` uses the confirmed
 `low`, `medium`, `high`, `xhigh`, `max` effort ladder. New selections without a
 saved effort start at `medium`; valid saved or explicit choices are preserved.
-Claude Code's existing Fable 5.1 default and all other model defaults are unchanged.
+Claude Code's existing Fable 5.1 default is unchanged.
+
+Released `gpt-6-sol` and `gpt-6-luna` are available in the Codex, OMP/Scaffold,
+Prime Agent, and mobile catalogs. Codex defaults and implicit legacy Sol defaults
+now select `gpt-6-sol` at `high` effort; explicit saved models and efforts remain
+unchanged. Astra and Anthropic defaults are unchanged. Both new models support
+1,050,000 context tokens, 922,000 maximum input tokens, and 128,000 output tokens.
+Crew exposes `low`, `medium`, `high`, `xhigh`, and `max`; provider `none` is not
+represented in Crew's shared effort enum. Tool-bearing reasoning uses the existing
+Responses API routes, not Chat Completions. The OMP/Prime gateway records the base
+per-million input/cache-read/output rates ($2/$0.20/$10 for Sol,
+$0.10/$0.01/$0.50 for Luna); requests above 272K input tokens incur the provider's
+2x input/cache and 1.5x output multipliers.
 
 The Crew OMP/Prime gateway registers Opus 5.5 with 1,000,000 context tokens,
 128,000 output tokens, and per-million-token costs of $4 input, $20 output,

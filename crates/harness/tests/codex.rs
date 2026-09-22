@@ -89,6 +89,25 @@ async fn run_to_end(
 }
 
 #[tokio::test]
+async fn omitted_model_and_effort_use_released_sol_high() {
+    let (controls, _steer, _token) = controls("Yes");
+    let mut req = request("scenario:sol-default");
+    req.model = None;
+    req.reasoning = None;
+    let events = run_to_end(&harness(), req, controls).await;
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
 async fn happy_path_maps_deltas_items_usage_and_done() {
     let (controls, _steer, _token) = controls("Yes");
     let mut req = request("scenario:happy");
@@ -584,14 +603,29 @@ async fn missing_binary_is_not_installed() {
 #[tokio::test]
 async fn models_returns_curated_catalog() {
     let models = harness().models().await.expect("models");
-    assert_eq!(models.len(), 7);
-    assert_eq!(models[0].id, "gpt-5.6-sol");
-    assert!(models[0].reasoning_levels.contains(&ReasoningLevel::Ultra));
-    assert!(
-        models
+    assert_eq!(models[0].id, "gpt-6-sol");
+    for id in ["gpt-6-sol", "gpt-6-luna"] {
+        let released = models
             .iter()
-            .all(|m| m.options.iter().any(|o| o.id == "serviceTier"))
-    );
+            .find(|model| model.id == id)
+            .expect("released model");
+        assert_eq!(
+            released.reasoning_levels,
+            vec![
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max,
+            ]
+        );
+        assert!(
+            released
+                .options
+                .iter()
+                .any(|option| option.id == "serviceTier")
+        );
+    }
 
     let missing = CodexHarness::new().with_executable("/nonexistent/codex-nowhere");
     // models() requires a resolvable binary… but with_executable trusts the

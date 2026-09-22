@@ -64,7 +64,7 @@ struct NewSessionView: View {
     }
 
     private var selectedModel: ModelInfo? {
-        models.first { $0.id == storedModel } ?? models.first
+        models.first { $0.id == storedModel } ?? HarnessCatalog.defaultModel(in: models)
     }
 
     private var reasoning: String? {
@@ -732,7 +732,7 @@ struct ModelPickerSheet: View {
             guard harness != h.id else { return }
             UISelectionFeedbackGenerator().selectionChanged()
             harness = h.id
-            let first = models(for: h.id).first
+            let first = HarnessCatalog.defaultModel(in: models(for: h.id))
             modelId = first?.id ?? ""
             reasoning = first.flatMap { HarnessCatalog.defaultReasoning(for: $0) }
         } label: {
