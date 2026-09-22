@@ -1822,7 +1822,9 @@ impl Shell {
         //    presence dot per row, an info line naming the browsed device.
         //    Rows are the tab recipe (h-28 rounded-8 washes), vertical.
         let rail = div()
+            .id("add-space-device-rail")
             .w(px(196.0))
+            .h_full()
             .flex_none()
             .border_l_1()
             .border_color(hairline)
@@ -1830,6 +1832,8 @@ impl Shell {
             .py(px(8.0))
             .flex()
             .flex_col()
+            .min_h_0()
+            .overflow_y_scroll()
             .gap(px(2.0))
             .child(
                 div()

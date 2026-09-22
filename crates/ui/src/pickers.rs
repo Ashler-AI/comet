@@ -3240,25 +3240,23 @@ impl Render for Pickers {
                     None => remembered.map(|m| m.label.clone()),
                 }
             });
-            label.map(SharedString::from).unwrap_or_default()
+            label
+                .map(SharedString::from)
+                .unwrap_or_else(|| SharedString::from("Select model"))
         };
-        let harness_icon: (&'static str, Option<gpui::Hsla>) = self
-            .effective_harness(cx)
-            .map(harness_brand_icon)
-            .unwrap_or((
-                crate::icons::CLAUDE_MARK,
-                Some(crate::icons::claude_brand()),
-            ));
+        let harness_icon = self.effective_harness(cx).map(harness_brand_icon);
         let explicit_options = self.explicit_options(cx);
         let traits_set = traits_summary(
             self.selected_model(cx),
             self.effective_reasoning(cx),
             &explicit_options,
         );
-        let traits_label: SharedString = traits_set
-            .clone()
-            .map(SharedString::from)
-            .unwrap_or_else(|| SharedString::from("Traits"));
+        let traits_label = self.selected_model(cx).map(|_| {
+            traits_set
+                .clone()
+                .map(SharedString::from)
+                .unwrap_or_else(|| SharedString::from("Traits"))
+        });
 
         // Render the open popover's body first (mutable borrow), then the
         // chips. Branch/Checkout render in the composer FOOTER row (see
@@ -3289,13 +3287,8 @@ impl Render for Pickers {
         // ONE combined model+effort chip (user request): brand icon + model
         // name, then the effort level muted with no icon — a single button
         // opening the single merged menu.
-        let combined_chip = self.model_trigger_chip(
-            model_label,
-            Some(harness_icon),
-            Some(traits_label),
-            &theme,
-            cx,
-        );
+        let combined_chip =
+            self.model_trigger_chip(model_label, harness_icon, traits_label, &theme, cx);
         let _ = traits_set;
         let right = div()
             .flex()

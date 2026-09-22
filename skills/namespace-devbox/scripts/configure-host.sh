@@ -16,7 +16,7 @@ case "$CREW_CHANNEL" in
   production) edge=https://comet.internal.ashler.com; scaffold=https://scaffold.internal.ashler.com; scope=ashler-production; data="$HOME/.comet-native"; port=27653; callback_port=27654 ;;
   *) echo 'CREW_CHANNEL must be staging or production.' >&2; exit 1 ;;
 esac
-for tool in node npm python3 tmux; do command -v "$tool" >/dev/null || { echo "$tool is required" >&2; exit 1; }; done
+for tool in node npm python3 tmux omp; do command -v "$tool" >/dev/null || { echo "$tool is required" >&2; exit 1; }; done
 
 # Crew setup work also needs protection before the turn-aware engine starts.
 marker="$(mktemp /.namespace/tasks/crew-setup.XXXXXXXX)"
