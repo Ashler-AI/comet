@@ -80,7 +80,7 @@ fn orphaned_omp_writer_process_helper() {
     let ready = std::env::var_os("COMET_TEST_OMP_WRITER_READY").unwrap();
     std::process::Command::new("/bin/sh")
         .arg("-c")
-        .arg("exec 3>>\"$COMET_TEST_OMP_WRITER_PATH\"; echo $$ >\"$COMET_TEST_OMP_WRITER_READY\"; exec /bin/sleep 600")
+        .arg("exec 3>>\"$COMET_TEST_OMP_WRITER_PATH\"; echo $$ >\"$COMET_TEST_OMP_WRITER_READY\"; exec /bin/sleep \"${COMET_TEST_OMP_WRITER_LIFETIME:-600}\"")
         .env("COMET_TEST_OMP_WRITER_PATH", path)
         .env("COMET_TEST_OMP_WRITER_READY", ready)
         .stdin(std::process::Stdio::null())
@@ -92,6 +92,32 @@ fn orphaned_omp_writer_process_helper() {
     // now so the write-capable tool is reparented to PID 1, matching the real
     // agent-browser zombie left after OMP died.
     std::process::exit(0);
+}
+
+#[cfg(unix)]
+fn spawn_orphaned_writer(
+    journal: &std::path::Path,
+    ready: &std::path::Path,
+    lifetime_secs: u64,
+) -> std::process::Child {
+    use std::os::unix::process::CommandExt as _;
+
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "orphaned_omp_writer_process_helper",
+            "--nocapture",
+        ])
+        .env("COMET_TEST_OMP_WRITER_PATH", journal)
+        .env("COMET_TEST_OMP_WRITER_READY", ready)
+        .env("COMET_TEST_OMP_WRITER_LIFETIME", lifetime_secs.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap()
 }
 fn controls() -> RunControls {
     let (_steer_tx, steer_rx) = mpsc::channel(4);
@@ -1113,28 +1139,11 @@ async fn verified_takeover_stops_exact_writer_and_releases_journal() {
 #[cfg(unix)]
 #[tokio::test]
 async fn takeover_rejects_unproven_orphan_writer() {
-    use std::os::unix::process::CommandExt as _;
-
     let temp = tempfile::tempdir().unwrap();
     let session_dir = temp.path().join("sessions");
     let journal = write_omp_session(&session_dir, "orphaned-takeover-session");
     let ready = temp.path().join("orphaned-writer-ready");
-    let executable = std::env::current_exe().unwrap();
-    let mut launcher = std::process::Command::new(&executable)
-        .args([
-            "--ignored",
-            "--exact",
-            "orphaned_omp_writer_process_helper",
-            "--nocapture",
-        ])
-        .env("COMET_TEST_OMP_WRITER_PATH", &journal)
-        .env("COMET_TEST_OMP_WRITER_READY", &ready)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .process_group(0)
-        .spawn()
-        .unwrap();
+    let mut launcher = spawn_orphaned_writer(&journal, &ready, 600);
     assert!(launcher.wait().unwrap().success());
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -1167,6 +1176,40 @@ async fn takeover_rejects_unproven_orphan_writer() {
         libc::kill(pid, libc::SIGKILL);
     }
 }
+#[cfg(unix)]
+#[tokio::test]
+async fn takeover_waits_for_transient_orphan_writer_to_exit() {
+    let temp = tempfile::tempdir().unwrap();
+    let session_dir = temp.path().join("sessions");
+    let journal = write_omp_session(&session_dir, "transient-orphan-session");
+    let ready = temp.path().join("transient-orphan-ready");
+    let mut launcher = spawn_orphaned_writer(&journal, &ready, 1);
+    assert!(launcher.wait().unwrap().success());
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let pid = std::fs::read_to_string(&ready)
+        .expect("transient orphan writer started")
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    assert!(process_exists(pid));
+
+    OmpHarness::new()
+        .with_executable(fixture_path())
+        .with_session_dir(&session_dir)
+        .stop_session("transient-orphan-session")
+        .await
+        .expect("takeover should continue after a transient inherited descriptor closes");
+    assert_eq!(
+        comet_harness::omp::session_writer_state(&journal),
+        comet_harness::omp::SessionWriterState::Inactive
+    );
+    assert!(!process_exists(pid));
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn supervised_omp_run_is_its_process_group_leader() {
