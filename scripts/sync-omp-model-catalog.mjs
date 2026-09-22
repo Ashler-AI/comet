@@ -19,7 +19,8 @@ const models = Object.entries(roster).flatMap(([provider, ids]) => {
     if (typeof id !== "string" || !/^[a-z0-9.-]+$/.test(id)) throw new Error("Invalid model ID");
     return { id: `${provider === "openai" ? "openai-codex" : provider}/${id}`, label: id,
       description: "Scaffold model · account access checked when starting a run",
-      reasoningLevels: id.startsWith("claude-3-") ? [] : ["low", "medium", "high"] };
+      reasoningLevels: id === "claude-opus-5-5" ? ["low", "medium", "high", "xhigh", "max"]
+        : id.startsWith("claude-3-") ? [] : ["low", "medium", "high"] };
   });
 });
 if (new Set(models.map(model => model.id)).size !== models.length) throw new Error("Duplicate model ID");

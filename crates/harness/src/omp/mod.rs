@@ -1984,7 +1984,14 @@ impl OmpHarness {
         {
             command.args(["--model", model]);
         }
-        if let Some(reasoning) = request.reasoning {
+        let reasoning = request.reasoning.or_else(|| {
+            request
+                .model
+                .as_deref()
+                .is_some_and(|model| model.rsplit('/').next() == Some("claude-opus-5-5"))
+                .then_some(ReasoningLevel::Medium)
+        });
+        if let Some(reasoning) = reasoning {
             command.args(["--thinking", thinking_flag(reasoning)]);
         }
         if let Some(resume) = request.resume.as_deref() {
@@ -2169,6 +2176,7 @@ fn models_from_catalog(bytes: &[u8]) -> Result<Vec<Model>, HarnessError> {
         .models
         .into_iter()
         .map(|model| {
+            let opus_5_5 = model.selector.rsplit('/').next() == Some("claude-opus-5-5");
             let size_description = match (model.context_window, model.max_tokens) {
                 (Some(context_window), Some(max_tokens)) => {
                     format!("{context_window} context · {max_tokens} max output · ")
@@ -2188,6 +2196,9 @@ fn models_from_catalog(bytes: &[u8]) -> Result<Vec<Model>, HarnessError> {
                     .unwrap_or_default()
                     .into_iter()
                     .filter_map(|level| serde_json::from_value(Value::String(level)).ok())
+                    .filter(|level| !opus_5_5 || matches!(level,
+                        ReasoningLevel::Low | ReasoningLevel::Medium | ReasoningLevel::High
+                        | ReasoningLevel::XHigh | ReasoningLevel::Max))
                     .collect(),
                 options: Vec::new(),
             }
@@ -4586,15 +4597,44 @@ mod tests {
     }
 
     #[test]
+    fn catalog_rejects_unsupported_opus_5_5_efforts() {
+        let models = models_from_catalog(br#"{"models":[
+            {"selector":"anthropic/claude-opus-5-5","name":"Opus 5.5","thinking":["off","minimal","low","xhigh","max","ultracode"]},
+            {"selector":"custom/other","name":"Other","thinking":["minimal","high"]}
+        ]}"#).unwrap();
+        assert_eq!(
+            models[0].reasoning_levels,
+            vec![
+                ReasoningLevel::Low,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max
+            ]
+        );
+        assert_eq!(
+            models[1].reasoning_levels,
+            vec![ReasoningLevel::Minimal, ReasoningLevel::High]
+        );
+    }
+
+    #[test]
     fn desktop_catalog_has_scaffold_defaults_without_local_credentials() {
         let models = desktop_models(models_from_catalog(br#"{"models":[]}"#).unwrap());
         assert_eq!(models[0].id, "openai-codex/gpt-6-astra");
-        let provisional = models
+        let opus = models
             .iter()
             .find(|model| model.id == "anthropic/claude-opus-5-5")
-            .expect("provisional Opus 5.5 is available without local credentials");
-        assert!(provisional.reasoning_levels.is_empty());
-        assert!(provisional.options.is_empty());
+            .expect("released Opus 5.5 is available without local credentials");
+        assert_eq!(
+            opus.reasoning_levels,
+            vec![
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max,
+            ]
+        );
+        assert!(opus.options.is_empty());
         assert!(
             models
                 .iter()

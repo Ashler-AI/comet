@@ -174,12 +174,32 @@ The bundled `crates/harness/src/omp/scaffold-models.json` is generated from the
 canonical Platform `ompInferenceModelCatalog`, with its source commit recorded
 in the file. It is a release snapshot, not a live availability promise. Refresh
 it with `node scripts/sync-omp-model-catalog.mjs <platform commit SHA>`; unknown
-source formats fail regeneration. The Opus 5.5 draft adds a local provisional
-`anthropic/claude-opus-5-5` entry, explicitly recorded in
-`source.localProvisionalAdditions`; the source revision still identifies only
-the base snapshot. Resync from a published Platform commit once the exact ID
-and capabilities are confirmed. The provisional static entries advertise no
-reasoning levels or capability options and do not change existing defaults.
+source formats fail regeneration. Released `claude-opus-5-5` uses the confirmed
+`low`, `medium`, `high`, `xhigh`, `max` effort ladder. New selections without a
+saved effort start at `medium`; valid saved or explicit choices are preserved.
+Claude Code's existing Fable 5.1 default and all other model defaults are unchanged.
+
+The Crew OMP/Prime gateway registers Opus 5.5 with 1,000,000 context tokens,
+128,000 output tokens, and per-million-token costs of $4 input, $20 output,
+$0.20 cache read, and $5 for 5-minute cache writes. The provider uses adaptive
+thinking with `display: "summarized"`, so progress arrives in the existing
+reasoning stream. Signed thinking and conversation history are not rewritten.
+Forced `tool_choice` is preserved for an upstream error, never changed to `auto`.
+Keep conversations append-only; editing old turns or changing the system prompt
+or tools can invalidate signed thinking. Direct user-owned OMP provider overrides
+remain authoritative and require their own compatible model configuration.
+
+Native Claude Code owns its Messages transport and signed history; Crew passes
+the exact model ID and supported `--effort` flag, rather than inventing transport
+flags. Opus 5.5 has native 1M context and always-on adaptive thinking, so Crew
+does not offer its old context/thinking toggles or unverified CLI options.
+Use a current Claude Code supporting this release. See the
+[official model overview](https://platform.claude.com/docs/en/models/opus-5-5/overview)
+and [migration guide](https://platform.claude.com/docs/en/models/opus-5-5/migration-guide).
+
+The focused transport smoke runs the installed OMP against a credential-free
+loopback server, exercises a real read tool, and verifies signed thinking replay:
+`node scripts/omp-gateway-revival-smoke.mjs /path/to/omp --opus-only`.
 
 Catalog regressions cover credential-free defaults, local overrides/custom
 providers, deduplication, and preservation of the Scaffold-scoped catalog.

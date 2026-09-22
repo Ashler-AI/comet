@@ -49,7 +49,9 @@ pub(crate) fn to_effort(
     reasoning: Option<ReasoningLevel>,
     model: Option<&str>,
 ) -> Option<&'static str> {
-    let base = match reasoning? {
+    let reasoning = reasoning
+        .or_else(|| (model == Some("claude-opus-5-5")).then_some(ReasoningLevel::Medium))?;
+    let base = match reasoning {
         ReasoningLevel::Ultrathink => return None,
         ReasoningLevel::Minimal | ReasoningLevel::Low => "low",
         ReasoningLevel::Medium => "medium",
@@ -199,9 +201,15 @@ pub(crate) fn static_models() -> Vec<Model> {
         ),
         model(
             "claude-opus-5-5",
-            "Opus 5.5 (provisional)",
-            "Provisional model ID; availability and capabilities are unconfirmed",
-            &[],
+            "Opus 5.5",
+            "Long-running coding and knowledge work · 1M context",
+            &[
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max,
+            ],
             vec![],
         ),
     ]
@@ -237,15 +245,29 @@ mod tests {
     }
 
     #[test]
-    fn catalog_includes_provisional_opus_5_5_without_changing_default() {
+    fn catalog_includes_released_opus_5_5_without_changing_default() {
         let models = static_models();
         assert_eq!(models[0].id, "claude-fable-5-1");
-        let provisional = models
+        let opus = models
             .iter()
             .find(|model| model.id == "claude-opus-5-5")
-            .expect("provisional Opus 5.5 is discoverable");
-        assert!(provisional.reasoning_levels.is_empty());
-        assert!(provisional.options.is_empty());
+            .expect("released Opus 5.5 is discoverable");
+        assert_eq!(
+            opus.reasoning_levels,
+            vec![
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max,
+            ]
+        );
+        assert!(opus.options.is_empty());
+        assert_eq!(to_effort(None, Some(&opus.id)), Some("medium"));
+        assert_eq!(
+            to_effort(Some(ReasoningLevel::XHigh), Some(&opus.id)),
+            Some("xhigh")
+        );
         assert!(!models.iter().any(|model| model.id == "claude-opus-5-50"));
     }
 
