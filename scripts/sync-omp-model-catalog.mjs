@@ -18,8 +18,10 @@ const models = Object.entries(roster).flatMap(([provider, ids]) => {
   return ids.map(id => {
     if (typeof id !== "string" || !/^[a-z0-9.-]+$/.test(id)) throw new Error("Invalid model ID");
     return { id: `${provider === "openai" ? "openai-codex" : provider}/${id}`, label: id,
-      description: "Scaffold model · account access checked when starting a run",
-      reasoningLevels: id === "claude-opus-5-5" ? ["low", "medium", "high", "xhigh", "max"]
+      description: id === "gpt-6-sol" || id === "gpt-6-luna"
+        ? "1,050,000 context · 922,000 max input · 128,000 max output · Scaffold model · account access checked when starting a run"
+        : "Scaffold model · account access checked when starting a run",
+      reasoningLevels: ["claude-opus-5-5", "gpt-6-sol", "gpt-6-luna"].includes(id) ? ["low", "medium", "high", "xhigh", "max"]
         : id.startsWith("claude-3-") ? [] : ["low", "medium", "high"] };
   });
 });

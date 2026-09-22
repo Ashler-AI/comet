@@ -142,7 +142,6 @@ pub(crate) fn is_curated_comet_model(model_id: &str) -> bool {
         || matches!(
             model_id,
             "anthropic/claude-opus-5"
-                // Provisional exact IDs; no wildcard admission of future models.
                 | "openai-codex/gpt-6-sol"
                 | "openai-codex/gpt-6-luna"
                 | "prime-inference/openai/gpt-6-sol"

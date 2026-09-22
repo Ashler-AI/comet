@@ -1,7 +1,7 @@
 {
   "source": {
     "repository": "Ashler-AI/ashler-platform",
-    "revision": "7d6a61f5382cec81275bf1fbdd9b85aa9ecde081",
+    "revision": "a149af01df2a7b04fd0d569b1135212c3ef2804a",
     "path": "internal/scaffold/control-plane/worker/src/omp-auth-broker.ts"
   },
   "models": [
@@ -14,18 +14,6 @@
         "medium",
         "high"
       ]
-    },
-    {
-      "id": "openai-codex/gpt-6-sol",
-      "label": "GPT-6 Sol (provisional)",
-      "description": "Release name and capabilities unconfirmed",
-      "reasoningLevels": []
-    },
-    {
-      "id": "openai-codex/gpt-6-luna",
-      "label": "GPT-6 Luna (provisional)",
-      "description": "Release name and capabilities unconfirmed",
-      "reasoningLevels": []
     },
     {
       "id": "openai-codex/gpt-5.6-terra",
@@ -65,6 +53,30 @@
         "low",
         "medium",
         "high"
+      ]
+    },
+    {
+      "id": "openai-codex/gpt-6-sol",
+      "label": "gpt-6-sol",
+      "description": "1,050,000 context · 922,000 max input · 128,000 max output · Scaffold model · account access checked when starting a run",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    {
+      "id": "openai-codex/gpt-6-luna",
+      "label": "gpt-6-luna",
+      "description": "1,050,000 context · 922,000 max input · 128,000 max output · Scaffold model · account access checked when starting a run",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
       ]
     },
     {

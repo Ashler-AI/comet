@@ -912,7 +912,7 @@ mod tests {
         );
         assert_eq!(
             inference_binding(HarnessId::Codex, None),
-            Some(("openai", "gpt-5.6-sol".into()))
+            Some(("openai", "gpt-6-sol".into()))
         );
         assert_eq!(inference_binding(HarnessId::Omp, None), None);
         assert_eq!(

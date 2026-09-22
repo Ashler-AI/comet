@@ -180,7 +180,7 @@ fn models_from_output(stdout: &[u8]) -> Vec<Model> {
                     "{} context · {} max output · Listed in Prime Agent's catalog; run availability is not verified; authorization is not verified",
                     columns[2], columns[3]
                 )),
-                reasoning_levels: if model == "claude-opus-5-5" || model == "anthropic/claude-opus-5-5" {
+                reasoning_levels: if matches!(model.rsplit('/').next(), Some("claude-opus-5-5" | "gpt-6-sol" | "gpt-6-luna")) {
                     REASONING_LEVELS[1..].to_vec()
                 } else {
                     REASONING_LEVELS.to_vec()
@@ -597,10 +597,10 @@ mod tests {
             b"provider model context max-out thinking images\n\
 openai-codex gpt-5.6-sol 1.0M 262.1K yes yes\n\
 prime-inference openai/gpt-5.6-sol-pro 1.0M 128K yes yes\n\
-openai-codex gpt-6-sol 1000 100 yes yes\n\
-openai-codex gpt-6-luna 1000 100 yes yes\n\
-prime-inference openai/gpt-6-sol 1000 100 yes yes\n\
-prime-inference openai/gpt-6-luna 1000 100 yes yes\n\
+openai-codex gpt-6-sol 1050000 128000 yes yes\n\
+openai-codex gpt-6-luna 1050000 128000 yes yes\n\
+prime-inference openai/gpt-6-sol 1050000 128000 yes yes\n\
+prime-inference openai/gpt-6-luna 1050000 128000 yes yes\n\
 openai-codex gpt-6-unlisted 1000 100 yes yes\n\
 openai-codex gpt-5.5 1.0M 262.1K yes yes\n\
 openai-codex gpt-5.60-future 1.0M 262.1K yes yes\n\
@@ -637,8 +637,9 @@ prime-inference z-ai/glm-5.2 1.0M 262.1K yes no\n",
             ]
         );
         assert_eq!(models[0].reasoning_levels, REASONING_LEVELS);
-        for opus in &models[3..5] {
-            assert_eq!(opus.reasoning_levels, &REASONING_LEVELS[1..]);
+        for model in models.iter().filter(|model| matches!(model.id.rsplit('/').next(),
+            Some("claude-opus-5-5" | "gpt-6-sol" | "gpt-6-luna"))) {
+            assert_eq!(model.reasoning_levels, &REASONING_LEVELS[1..]);
         }
         assert!(
             models[0]

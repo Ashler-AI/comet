@@ -123,11 +123,22 @@ fn model(id: &str, label: &str, description: &str, ladder: &[ReasoningLevel]) ->
     }
 }
 
-/// The curated catalog: a snapshot of codex-cli 0.144's `model/list`, newest
-/// family first — efforts as the server reports them (gpt-5.6 goes up to
-/// `ultra`). Mirrors codex.ts's `CODEX_MODELS` fallback.
+/// Curated fallback: released GPT-6 models followed by the codex-cli 0.144
+/// snapshot. GPT-6 supports up to max; legacy GPT-5.6 retains ultra.
 pub(crate) fn static_models() -> Vec<Model> {
     vec![
+        model(
+            "gpt-6-sol",
+            "GPT-6 Sol",
+            "1,050,000 context · 922,000 max input · 128,000 max output",
+            MAX_LADDER,
+        ),
+        model(
+            "gpt-6-luna",
+            "GPT-6 Luna",
+            "1,050,000 context · 922,000 max input · 128,000 max output",
+            MAX_LADDER,
+        ),
         model(
             "gpt-5.6-sol",
             "GPT-5.6-Sol",
@@ -170,21 +181,6 @@ pub(crate) fn static_models() -> Vec<Model> {
             "Ultra-fast lightweight coding",
             XHIGH_LADDER,
         ),
-        // Provisional IDs only; capabilities must be confirmed before release.
-        Model {
-            id: "gpt-6-sol".into(),
-            label: "GPT-6 Sol (provisional)".into(),
-            description: Some("Release name and capabilities unconfirmed".into()),
-            reasoning_levels: vec![],
-            options: vec![],
-        },
-        Model {
-            id: "gpt-6-luna".into(),
-            label: "GPT-6 Luna (provisional)".into(),
-            description: Some("Release name and capabilities unconfirmed".into()),
-            reasoning_levels: vec![],
-            options: vec![],
-        },
     ]
 }
 
@@ -219,13 +215,14 @@ mod tests {
     #[test]
     fn catalog_is_newest_first_with_service_tiers() {
         let models = static_models();
-        assert_eq!(models[0].id, "gpt-5.6-sol");
-        assert!(models[0].reasoning_levels.contains(&ReasoningLevel::Ultra));
-        assert!(!models[3].reasoning_levels.contains(&ReasoningLevel::Max));
-        for m in models
-            .iter()
-            .filter(|model| !model.id.starts_with("gpt-6-"))
-        {
+        assert_eq!(models[0].id, "gpt-6-sol");
+        for id in ["gpt-6-sol", "gpt-6-luna"] {
+            let model = models.iter().find(|model| model.id == id).unwrap();
+            assert_eq!(model.reasoning_levels, MAX_LADDER);
+        }
+        let legacy = models.iter().find(|model| model.id == "gpt-5.6-sol").unwrap();
+        assert!(legacy.reasoning_levels.contains(&ReasoningLevel::Ultra));
+        for m in &models {
             let tier = m.options.iter().find(|o| o.id == "serviceTier");
             assert!(tier.is_some(), "{} missing serviceTier", m.id);
         }
