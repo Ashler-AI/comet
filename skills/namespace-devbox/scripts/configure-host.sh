@@ -6,11 +6,13 @@ set -euo pipefail
 : "${NAMESPACE_DEVBOX_ID:?Set the immutable ID from devbox list --output json}"
 : "${CREW_BINARY:?Set the absolute path to the verified Crew executable}"
 CREW_CHANNEL="${CREW_CHANNEL:-staging}"
+CREW_FOLDER_ROOT="${CREW_FOLDER_ROOT:-/workspaces}"
 [[ "$(uname -s)" == Linux && -d /.namespace/tasks ]] || { echo 'Run inside a Namespace Linux Devbox.' >&2; exit 1; }
 [[ "$CREW_BINARY" == /* && -x "$CREW_BINARY" ]] || { echo 'CREW_BINARY must be an absolute executable path.' >&2; exit 1; }
 [[ "$NAMESPACE_DEVBOX_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || { echo 'Invalid Devbox name.' >&2; exit 1; }
 [[ "$NAMESPACE_DEVBOX_ID" =~ ^[a-z0-9]{13}$ ]] || { echo 'Invalid Namespace Devbox ID.' >&2; exit 1; }
 [[ "$CREW_OWNER_NAME" != *$'\n'* && -n "${CREW_OWNER_NAME// /}" ]] || { echo 'Invalid owner name.' >&2; exit 1; }
+[[ "$CREW_FOLDER_ROOT" == /* && -d "$CREW_FOLDER_ROOT" ]] || { echo 'CREW_FOLDER_ROOT must be an accessible absolute directory.' >&2; exit 1; }
 case "$CREW_CHANNEL" in
   staging) edge=https://comet-staging.internal.ashler.com; scaffold=https://scaffold-staging.internal.ashler.com; scope=ashler-staging; data="$HOME/.comet-native-staging"; port=27655; callback_port=27656 ;;
   production) edge=https://comet.internal.ashler.com; scaffold=https://scaffold.internal.ashler.com; scope=ashler-production; data="$HOME/.comet-native"; port=27653; callback_port=27654 ;;
@@ -44,6 +46,7 @@ config="$HOME/.config/crew-devbox/$CREW_CHANNEL.env"
   printf 'export COMET_PROJECT_SCOPE=%q\n' "$scope"
   printf 'export COMET_IPC_PORT=%q\n' "$port"
   printf 'export COMET_CALLBACK_PORT=%q\n' "$callback_port"
+  printf 'export COMET_DEFAULT_FOLDER=%q\n' "$CREW_FOLDER_ROOT"
   printf 'export ASHLER_INCREMENTAL_TSC_CHECKS=false\n'
   printf 'export CHROME_PATH=%q\n' "$browser"
   printf 'export PUPPETEER_EXECUTABLE_PATH=%q\n' "$browser"
