@@ -593,6 +593,11 @@ mod tests {
             b"provider model context max-out thinking images\n\
 openai-codex gpt-5.6-sol 1.0M 262.1K yes yes\n\
 prime-inference openai/gpt-5.6-sol-pro 1.0M 128K yes yes\n\
+openai-codex gpt-6-sol 1000 100 yes yes\n\
+openai-codex gpt-6-luna 1000 100 yes yes\n\
+prime-inference openai/gpt-6-sol 1000 100 yes yes\n\
+prime-inference openai/gpt-6-luna 1000 100 yes yes\n\
+openai-codex gpt-6-unlisted 1000 100 yes yes\n\
 openai-codex gpt-5.5 1.0M 262.1K yes yes\n\
 openai-codex gpt-5.60-future 1.0M 262.1K yes yes\n\
 anthropic claude-opus-5 200K 64K yes yes\n\
@@ -610,6 +615,10 @@ prime-inference z-ai/glm-5.2 1.0M 262.1K yes no\n",
             vec![
                 "openai-codex/gpt-5.6-sol",
                 "prime-inference/openai/gpt-5.6-sol-pro",
+                "openai-codex/gpt-6-sol",
+                "openai-codex/gpt-6-luna",
+                "prime-inference/openai/gpt-6-sol",
+                "prime-inference/openai/gpt-6-luna",
                 "anthropic/claude-opus-5",
                 "prime-inference/anthropic/claude-fable-5",
                 "prime-inference/moonshotai/kimi-k3",

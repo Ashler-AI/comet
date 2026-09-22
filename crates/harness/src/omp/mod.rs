@@ -4593,6 +4593,14 @@ mod tests {
                 .iter()
                 .any(|model| model.id == "openai-codex/gpt-6-astra")
         );
+        for id in ["openai-codex/gpt-6-sol", "openai-codex/gpt-6-luna"] {
+            let provisional = models
+                .iter()
+                .find(|model| model.id == id)
+                .expect("provisional model");
+            assert!(provisional.reasoning_levels.is_empty());
+            assert!(provisional.options.is_empty());
+        }
         assert!(
             models
                 .iter()

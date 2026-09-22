@@ -46,6 +46,11 @@ enum HarnessCatalog {
                           description: "Small, fast and capable", reasoningLevels: codexXhighLadder),
                 ModelInfo(id: "gpt-5.3-codex-spark", label: "GPT-5.3-Codex-Spark",
                           description: "Ultra-fast lightweight coding", reasoningLevels: codexXhighLadder),
+                // Provisional IDs only; capabilities must be confirmed before release.
+                ModelInfo(id: "gpt-6-sol", label: "GPT-6 Sol (provisional)",
+                          description: "Release name and capabilities unconfirmed", reasoningLevels: []),
+                ModelInfo(id: "gpt-6-luna", label: "GPT-6 Luna (provisional)",
+                          description: "Release name and capabilities unconfirmed", reasoningLevels: []),
             ]
         case "claude-code", "mock":
             return [

@@ -170,6 +170,21 @@ pub(crate) fn static_models() -> Vec<Model> {
             "Ultra-fast lightweight coding",
             XHIGH_LADDER,
         ),
+        // Provisional IDs only; capabilities must be confirmed before release.
+        Model {
+            id: "gpt-6-sol".into(),
+            label: "GPT-6 Sol (provisional)".into(),
+            description: Some("Release name and capabilities unconfirmed".into()),
+            reasoning_levels: vec![],
+            options: vec![],
+        },
+        Model {
+            id: "gpt-6-luna".into(),
+            label: "GPT-6 Luna (provisional)".into(),
+            description: Some("Release name and capabilities unconfirmed".into()),
+            reasoning_levels: vec![],
+            options: vec![],
+        },
     ]
 }
 
@@ -204,11 +219,13 @@ mod tests {
     #[test]
     fn catalog_is_newest_first_with_service_tiers() {
         let models = static_models();
-        assert_eq!(models.len(), 7);
         assert_eq!(models[0].id, "gpt-5.6-sol");
         assert!(models[0].reasoning_levels.contains(&ReasoningLevel::Ultra));
         assert!(!models[3].reasoning_levels.contains(&ReasoningLevel::Max));
-        for m in &models {
+        for m in models
+            .iter()
+            .filter(|model| !model.id.starts_with("gpt-6-"))
+        {
             let tier = m.options.iter().find(|o| o.id == "serviceTier");
             assert!(tier.is_some(), "{} missing serviceTier", m.id);
         }

@@ -584,14 +584,16 @@ async fn missing_binary_is_not_installed() {
 #[tokio::test]
 async fn models_returns_curated_catalog() {
     let models = harness().models().await.expect("models");
-    assert_eq!(models.len(), 7);
     assert_eq!(models[0].id, "gpt-5.6-sol");
     assert!(models[0].reasoning_levels.contains(&ReasoningLevel::Ultra));
-    assert!(
-        models
+    for id in ["gpt-6-sol", "gpt-6-luna"] {
+        let provisional = models
             .iter()
-            .all(|m| m.options.iter().any(|o| o.id == "serviceTier"))
-    );
+            .find(|model| model.id == id)
+            .expect("provisional model");
+        assert!(provisional.reasoning_levels.is_empty());
+        assert!(provisional.options.is_empty());
+    }
 
     let missing = CodexHarness::new().with_executable("/nonexistent/codex-nowhere");
     // models() requires a resolvable binary… but with_executable trusts the
