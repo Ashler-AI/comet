@@ -89,6 +89,29 @@ async fn run_to_end(
 }
 
 #[tokio::test]
+async fn opus_5_5_rejects_unsupported_configuration_before_launch() {
+    let harness = ClaudeHarness::new().with_executable("/missing/claude");
+    for (reasoning, options) in [
+        (
+            Some(comet_proto::ReasoningLevel::Minimal),
+            serde_json::json!({}),
+        ),
+        (None, serde_json::json!({"thinking": "off"})),
+        (None, serde_json::json!({"contextWindow": "200k"})),
+    ] {
+        let mut req = request("hello");
+        req.model = Some("claude-opus-5-5".into());
+        req.reasoning = reasoning;
+        req.model_options = options.as_object().unwrap().clone();
+        let (controls, _steer, _token) = controls("A");
+        assert!(matches!(
+            harness.run(req, controls).await,
+            Err(HarnessError::Protocol(_))
+        ));
+    }
+}
+
+#[tokio::test]
 async fn happy_path_normalizes_events_and_filters_subagents() {
     let (controls, _steer, _token) = controls("A");
     let events = run_to_end(&harness(), request("scenario:happy"), controls).await;

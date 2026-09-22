@@ -256,6 +256,21 @@ impl Harness for ClaudeHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        if request.model.as_deref() == Some("claude-opus-5-5") {
+            if request
+                .reasoning
+                .is_some_and(|level| !self.reasoning_levels().contains(&level))
+            {
+                return Err(HarnessError::Protocol(
+                    "Opus 5.5 supports low, medium, high, xhigh, or max effort".into(),
+                ));
+            }
+            if !request.model_options.is_empty() {
+                return Err(HarnessError::Protocol(
+                    "Opus 5.5 uses always-on adaptive thinking and native 1M context; additional Claude Code options are not supported by Crew".into(),
+                ));
+            }
+        }
         let exe = self.resolve_executable()?;
         let mut cmd = self.build_command(&exe, &request);
         if let Some(fork_from) = controls

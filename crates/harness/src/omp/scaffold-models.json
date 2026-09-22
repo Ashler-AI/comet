@@ -1,8 +1,7 @@
 {
   "source": {
     "repository": "Ashler-AI/ashler-platform",
-    "revision": "a9d27fc871877242952bded20136bf44f8679139",
-    "localPreparation": "Provisional gpt-6-sol/luna additions; confirm release metadata and regenerate from the published platform revision before release.",
+    "revision": "7d6a61f5382cec81275bf1fbdd9b85aa9ecde081",
     "path": "internal/scaffold/control-plane/worker/src/omp-auth-broker.ts"
   },
   "models": [
@@ -152,6 +151,18 @@
         "low",
         "medium",
         "high"
+      ]
+    },
+    {
+      "id": "anthropic/claude-opus-5-5",
+      "label": "claude-opus-5-5",
+      "description": "Scaffold model · account access checked when starting a run",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
       ]
     }
   ]
