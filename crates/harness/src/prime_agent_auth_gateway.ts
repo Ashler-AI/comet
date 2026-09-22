@@ -43,6 +43,32 @@ function stripProviderPrefix(model: GatewayModel): string {
 
 function modelConfig(model: GatewayModel) {
   const id = stripProviderPrefix(model);
+  if (model.owned_by === "anthropic" && id === "claude-opus-5-5") {
+    return {
+      id,
+      name: "Opus 5.5",
+      reasoning: true,
+      thinking: {
+        mode: "anthropic-adaptive" as const,
+        efforts: ["low", "medium", "high", "xhigh", "max"] as const,
+        defaultLevel: "medium" as const,
+        supportsDisplay: true,
+        prefixBinding: true,
+      },
+      input: ["text", "image"] as Array<"text" | "image">,
+      cost: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 },
+      contextWindow: 1_000_000,
+      maxTokens: 128_000,
+      compat: {
+        requiresThinkingEnabled: true,
+        signingEndpoint: true,
+        replayUnsignedThinking: false,
+        // OMP otherwise silently rewrites any/tool to auto. Preserve the
+        // caller's choice so the upstream rejects unsupported forced use.
+        supportsForcedToolChoice: true,
+      },
+    };
+  }
   return {
     id,
     name: id,

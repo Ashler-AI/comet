@@ -63,6 +63,9 @@ enum HarnessCatalog {
                           description: "Balanced speed and intelligence", reasoningLevels: claudeXhighLadder),
                 ModelInfo(id: "claude-haiku-4-5", label: "Haiku 4.5",
                           description: "Fastest model for everyday tasks", reasoningLevels: []),
+                ModelInfo(id: "claude-opus-5-5", label: "Opus 5.5",
+                          description: "Long-running coding and knowledge work · 1M context",
+                          reasoningLevels: ["low", "medium", "high", "xhigh", "max"]),
             ]
         default:
             return []
@@ -73,9 +76,11 @@ enum HarnessCatalog {
         models(for: harness).first
     }
 
-    /// pickers.rs:126 — X-High when the ladder has it, else High.
+    /// Preserve existing defaults; Opus 5.5 starts at its native Medium effort.
     static func defaultReasoning(for model: ModelInfo) -> String? {
         if model.reasoningLevels.isEmpty { return nil }
+        if model.id.split(separator: "/").last == "claude-opus-5-5",
+           model.reasoningLevels.contains("medium") { return "medium" }
         return ["xhigh", "high"].first(where: model.reasoningLevels.contains)
             ?? model.reasoningLevels.first
     }

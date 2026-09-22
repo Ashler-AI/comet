@@ -176,8 +176,7 @@ pub fn default_model(models: &[Model]) -> Option<&Model> {
     models.first()
 }
 
-/// A model's default reasoning: X-High when the ladder offers it (comet
-/// `DEFAULT_REASONING = "xhigh"`), else High, else the ladder's first entry.
+/// Default reasoning for models without a model-specific recommendation.
 /// `None` only for ladder-less models (e.g. Haiku's thinking toggle instead).
 pub fn default_reasoning(ladder: &[ReasoningLevel]) -> Option<ReasoningLevel> {
     // The recommended default is High (user-corrected — not X-High globally);
@@ -197,9 +196,15 @@ pub fn default_reasoning(ladder: &[ReasoningLevel]) -> Option<ReasoningLevel> {
 pub fn clamp_reasoning(
     level: Option<ReasoningLevel>,
     ladder: &[ReasoningLevel],
+    model_id: &str,
 ) -> Option<ReasoningLevel> {
     match level {
         Some(level) if ladder.contains(&level) => Some(level),
+        _ if model_id.rsplit('/').next() == Some("claude-opus-5-5")
+            && ladder.contains(&ReasoningLevel::Medium) =>
+        {
+            Some(ReasoningLevel::Medium)
+        }
         _ => default_reasoning(ladder),
     }
 }
@@ -815,12 +820,12 @@ impl Pickers {
         } else {
             None
         };
-        if self.selected_model(cx).is_none() {
+        let Some(model) = self.selected_model(cx) else {
             // Catalog not loaded yet: show the explicit value as-is (nothing
             // to clamp against); it resolves to a concrete level on load.
             return explicit;
-        }
-        clamp_reasoning(explicit, &self.trait_ladder(cx))
+        };
+        clamp_reasoning(explicit, &self.trait_ladder(cx), &model.id)
     }
 
     /// The selected model — concrete from the moment the list loads: the
@@ -3709,12 +3714,20 @@ mod tests {
         use ReasoningLevel::*;
         let ladder = [Low, Medium, High, Max];
         // A pick the ladder offers survives.
-        assert_eq!(clamp_reasoning(Some(Max), &ladder), Some(Max));
+        assert_eq!(clamp_reasoning(Some(Max), &ladder, "other"), Some(Max));
         // A remembered level the new model doesn't offer heals to its default.
-        assert_eq!(clamp_reasoning(Some(XHigh), &ladder), Some(High));
+        assert_eq!(clamp_reasoning(Some(XHigh), &ladder, "other"), Some(High));
         // No pick at all resolves to the concrete default too.
-        assert_eq!(clamp_reasoning(None, &ladder), Some(High));
-        assert_eq!(clamp_reasoning(Some(High), &[]), None);
+        assert_eq!(clamp_reasoning(None, &ladder, "other"), Some(High));
+        assert_eq!(clamp_reasoning(Some(High), &[], "other"), None);
+        let opus = "anthropic/claude-opus-5-5";
+        assert_eq!(clamp_reasoning(None, &ladder, opus), Some(Medium));
+        assert_eq!(clamp_reasoning(Some(Minimal), &ladder, opus), Some(Medium));
+        assert_eq!(clamp_reasoning(Some(Max), &ladder, opus), Some(Max));
+        assert_eq!(
+            clamp_reasoning(None, &ladder, "anthropic/claude-opus-5-50"),
+            Some(High)
+        );
     }
 
     #[test]

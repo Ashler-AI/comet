@@ -136,6 +136,21 @@ async fn model_and_command_catalogs_come_from_omp() {
             .iter()
             .any(|model| model.id == "anthropic/claude-fable-5-1")
     );
+    let opus = models
+        .iter()
+        .find(|model| model.id == "anthropic/claude-opus-5-5")
+        .expect("released Opus 5.5 is discoverable");
+    assert_eq!(
+        opus.reasoning_levels,
+        vec![
+            ReasoningLevel::Low,
+            ReasoningLevel::Medium,
+            ReasoningLevel::High,
+            ReasoningLevel::XHigh,
+            ReasoningLevel::Max,
+        ]
+    );
+    assert!(opus.options.is_empty());
     assert_eq!(
         models
             .iter()
