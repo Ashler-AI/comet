@@ -1688,7 +1688,11 @@ impl Pickers {
                 ladder = descriptor.reasoning_levels.clone();
             }
             if !ladder.is_empty() {
-                config.reasoning = clamp_reasoning(config.reasoning, &ladder);
+                config.reasoning = clamp_reasoning(
+                    config.reasoning,
+                    &ladder,
+                    config.model.as_deref().unwrap_or_default(),
+                );
             }
         }
         // Account choice is intentionally delegated to automatic routing.
