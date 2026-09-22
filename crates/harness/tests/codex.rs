@@ -95,9 +95,16 @@ async fn omitted_model_and_effort_use_released_sol_high() {
     req.model = None;
     req.reasoning = None;
     let events = run_to_end(&harness(), req, controls).await;
-    assert!(events.iter().any(|event| matches!(event,
-        AgentEvent::Done { status: DoneStatus::Completed, .. }
-    )), "{events:?}");
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
 }
 
 #[tokio::test]
@@ -602,11 +609,22 @@ async fn models_returns_curated_catalog() {
             .iter()
             .find(|model| model.id == id)
             .expect("released model");
-        assert_eq!(released.reasoning_levels, vec![
-            ReasoningLevel::Low, ReasoningLevel::Medium, ReasoningLevel::High,
-            ReasoningLevel::XHigh, ReasoningLevel::Max,
-        ]);
-        assert!(released.options.iter().any(|option| option.id == "serviceTier"));
+        assert_eq!(
+            released.reasoning_levels,
+            vec![
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max,
+            ]
+        );
+        assert!(
+            released
+                .options
+                .iter()
+                .any(|option| option.id == "serviceTier")
+        );
     }
 
     let missing = CodexHarness::new().with_executable("/nonexistent/codex-nowhere");

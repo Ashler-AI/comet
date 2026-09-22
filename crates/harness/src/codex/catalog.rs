@@ -220,7 +220,10 @@ mod tests {
             let model = models.iter().find(|model| model.id == id).unwrap();
             assert_eq!(model.reasoning_levels, MAX_LADDER);
         }
-        let legacy = models.iter().find(|model| model.id == "gpt-5.6-sol").unwrap();
+        let legacy = models
+            .iter()
+            .find(|model| model.id == "gpt-5.6-sol")
+            .unwrap();
         assert!(legacy.reasoning_levels.contains(&ReasoningLevel::Ultra));
         for m in &models {
             let tier = m.options.iter().find(|o| o.id == "serviceTier");

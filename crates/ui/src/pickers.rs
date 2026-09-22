@@ -175,9 +175,10 @@ pub fn default_model(models: &[Model]) -> Option<&Model> {
     if first.id.rsplit('/').next() == Some("gpt-5.6-sol")
         && let Some(prefix) = first.id.strip_suffix("gpt-5.6-sol")
     {
-        if let Some(released) = models.iter().find(|model| {
-            model.id.strip_prefix(prefix) == Some("gpt-6-sol")
-        }) {
+        if let Some(released) = models
+            .iter()
+            .find(|model| model.id.strip_prefix(prefix) == Some("gpt-6-sol"))
+        {
             return Some(released);
         }
     }
@@ -3700,10 +3701,19 @@ mod tests {
                 options: vec![],
             },
         ];
-        assert_eq!(default_model(&models).map(|m| &*m.id), Some("openai-codex/gpt-6-sol"));
-        assert_eq!(default_model(&models[..1]).map(|m| &*m.id), Some("openai-codex/gpt-5.6-sol"));
+        assert_eq!(
+            default_model(&models).map(|m| &*m.id),
+            Some("openai-codex/gpt-6-sol")
+        );
+        assert_eq!(
+            default_model(&models[..1]).map(|m| &*m.id),
+            Some("openai-codex/gpt-5.6-sol")
+        );
         models[0].id = "openai-codex/gpt-6-astra".into();
-        assert_eq!(default_model(&models).map(|m| &*m.id), Some("openai-codex/gpt-6-astra"));
+        assert_eq!(
+            default_model(&models).map(|m| &*m.id),
+            Some("openai-codex/gpt-6-astra")
+        );
         assert!(default_model(&[]).is_none());
     }
 

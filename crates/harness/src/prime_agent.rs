@@ -637,8 +637,12 @@ prime-inference z-ai/glm-5.2 1.0M 262.1K yes no\n",
             ]
         );
         assert_eq!(models[0].reasoning_levels, REASONING_LEVELS);
-        for model in models.iter().filter(|model| matches!(model.id.rsplit('/').next(),
-            Some("claude-opus-5-5" | "gpt-6-sol" | "gpt-6-luna"))) {
+        for model in models.iter().filter(|model| {
+            matches!(
+                model.id.rsplit('/').next(),
+                Some("claude-opus-5-5" | "gpt-6-sol" | "gpt-6-luna")
+            )
+        }) {
             assert_eq!(model.reasoning_levels, &REASONING_LEVELS[1..]);
         }
         assert!(
