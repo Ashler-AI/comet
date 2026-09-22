@@ -655,6 +655,40 @@ fn scaffold_session_attachment(
     })
 }
 
+#[derive(Debug)]
+pub(crate) enum ScaffoldReconnectError {
+    Terminal(ScaffoldLifecycle),
+    InvalidAttachment(RpcError),
+    ProviderUnavailable(RpcError),
+}
+
+impl std::fmt::Display for ScaffoldReconnectError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Terminal(lifecycle) => {
+                write!(formatter, "Scaffold sandbox is terminal ({lifecycle:?})")
+            }
+            Self::InvalidAttachment(error) | Self::ProviderUnavailable(error) => {
+                error.fmt(formatter)
+            }
+        }
+    }
+}
+
+fn scaffold_reconnect_control_error(error: RpcError) -> ScaffoldReconnectError {
+    // ponytail: RpcError has no stable provider/validation code. Crew's own
+    // "returned" checks are invariants; add wire error codes if more cases appear.
+    if matches!(
+        &error,
+        RpcError::Failed(message)
+            if message.starts_with("Scaffold ") && message.contains(" returned ")
+    ) {
+        ScaffoldReconnectError::InvalidAttachment(error)
+    } else {
+        ScaffoldReconnectError::ProviderUnavailable(error)
+    }
+}
+
 // Existing-session reconnects retry transient control failures for up to ten minutes.
 const SCAFFOLD_CONTROL_MAX_ATTEMPTS: usize = 1_200;
 #[cfg(not(test))]
@@ -695,8 +729,11 @@ async fn ensure_scaffold_session_attached_once(
     handle: &EngineHandle,
     sandbox_id: &str,
     scope: &CollaborationScope,
-) -> Result<ScaffoldSessionAttachment, RpcError> {
-    match inspect_scaffold_session(handle, sandbox_id, scope).await? {
+) -> Result<ScaffoldSessionAttachment, ScaffoldReconnectError> {
+    match inspect_scaffold_session(handle, sandbox_id, scope)
+        .await
+        .map_err(scaffold_reconnect_control_error)?
+    {
         ScaffoldLifecycle::Paused => {
             let value = handle
                 .client()
@@ -708,13 +745,16 @@ async fn ensure_scaffold_session_attached_once(
                     })
                     .unwrap_or_default(),
                 )
-                .await?;
+                .await
+                .map_err(scaffold_reconnect_control_error)?;
             let resumed: ScaffoldEnvironmentControlResult =
-                serde_json::from_value(value).map_err(|err| RpcError::Failed(err.to_string()))?;
+                serde_json::from_value(value).map_err(|err| {
+                    scaffold_reconnect_control_error(RpcError::Failed(err.to_string()))
+                })?;
             if resumed.environment.scope != *scope {
-                return Err(RpcError::Failed(
+                return Err(scaffold_reconnect_control_error(RpcError::Failed(
                     "Scaffold resume returned a different sandbox scope".into(),
-                ));
+                )));
             }
             let SessionEnvironmentSource::Scaffold {
                 sandbox_id: resumed_id,
@@ -722,28 +762,24 @@ async fn ensure_scaffold_session_attached_once(
                 ..
             } = resumed.environment.source
             else {
-                return Err(RpcError::Failed(
+                return Err(scaffold_reconnect_control_error(RpcError::Failed(
                     "Scaffold resume returned a local environment".into(),
-                ));
+                )));
             };
             if resumed_id != sandbox_id {
-                return Err(RpcError::Failed(
+                return Err(scaffold_reconnect_control_error(RpcError::Failed(
                     "Scaffold resume returned a different sandbox scope".into(),
-                ));
+                )));
             }
             if matches!(
                 lifecycle,
                 ScaffoldLifecycle::Stopped | ScaffoldLifecycle::Failed
             ) {
-                return Err(RpcError::Failed(format!(
-                    "Scaffold resume returned terminal lifecycle {lifecycle:?}"
-                )));
+                return Err(ScaffoldReconnectError::Terminal(lifecycle));
             }
         }
-        ScaffoldLifecycle::Stopped | ScaffoldLifecycle::Failed => {
-            return Err(RpcError::Failed(
-                "Scaffold session is no longer resumable".into(),
-            ));
+        lifecycle @ (ScaffoldLifecycle::Stopped | ScaffoldLifecycle::Failed) => {
+            return Err(ScaffoldReconnectError::Terminal(lifecycle));
         }
         ScaffoldLifecycle::Creating
         | ScaffoldLifecycle::RestoringSnapshot
@@ -752,7 +788,9 @@ async fn ensure_scaffold_session_attached_once(
         | ScaffoldLifecycle::AgentRunning
         | ScaffoldLifecycle::Resuming => {}
     }
-    attach_scaffold_session(handle, sandbox_id, scope.clone()).await
+    attach_scaffold_session(handle, sandbox_id, scope.clone())
+        .await
+        .map_err(scaffold_reconnect_control_error)
 }
 
 /// Reconnect an existing Scaffold room with bounded automatic recovery for
@@ -762,16 +800,25 @@ pub(crate) async fn ensure_scaffold_session_attached<Wait, WaitFuture>(
     sandbox_id: &str,
     scope: &CollaborationScope,
     wait: &Wait,
-) -> Result<ScaffoldSessionAttachment, RpcError>
+) -> Result<ScaffoldSessionAttachment, ScaffoldReconnectError>
 where
     Wait: Fn(std::time::Duration) -> WaitFuture,
     WaitFuture: Future<Output = ()>,
 {
-    retry_scaffold_control_operation(
-        || ensure_scaffold_session_attached_once(handle, sandbox_id, scope),
-        wait,
-    )
-    .await
+    let mut attempt = 1;
+    loop {
+        match ensure_scaffold_session_attached_once(handle, sandbox_id, scope).await {
+            Ok(attachment) => return Ok(attachment),
+            Err(ScaffoldReconnectError::ProviderUnavailable(error))
+                if attempt < SCAFFOLD_CONTROL_MAX_ATTEMPTS
+                    && comet_engine::scaffold::is_retryable_scaffold_control_error(&error) =>
+            {
+                attempt += 1;
+                wait(SCAFFOLD_CONTROL_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 async fn update_scaffold_session_agent_route_once(
     handle: &EngineHandle,
@@ -4432,6 +4479,46 @@ mod tests {
                 ]
             );
         });
+    }
+
+    #[tokio::test]
+    async fn scaffold_reconnect_preserves_terminal_lifecycle() {
+        let operations = Arc::new(StdMutex::new(Vec::new()));
+        let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
+            operations: Arc::clone(&operations),
+            attach_failures_remaining: AtomicU16::new(0),
+            inspect_lifecycle: "stopped",
+            archive_fails: false,
+            update_route_failures_remaining: AtomicU16::new(0),
+        });
+        let handle = EngineHandle {
+            inner: Arc::new(RemoteEngine {
+                client: memory_client(service),
+                url: "memory://terminal-scaffold".into(),
+            }),
+        };
+        let scope = CollaborationScope {
+            project_id: "ashler-staging".into(),
+            deployment_id: Some("ashler-staging".into()),
+            session_id: Some("session-terminal".into()),
+            unknown: Default::default(),
+        };
+        let no_wait = |_| futures::future::ready(());
+
+        let error = ensure_scaffold_session_attached(&handle, "sandbox-ready", &scope, &no_wait)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ScaffoldReconnectError::Terminal(ScaffoldLifecycle::Stopped)
+        ));
+        assert_eq!(
+            operations
+                .lock()
+                .expect("Scaffold operation log")
+                .as_slice(),
+            ["inspect"]
+        );
     }
 
     #[tokio::test]

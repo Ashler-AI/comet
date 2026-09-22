@@ -42,7 +42,7 @@ use crate::motion;
 use crate::pickers::{CheckoutPlan, Pickers};
 use crate::state::{
     AppState, ChatStartupPhase, EngineHandle, Indicator, ScaffoldControlTarget,
-    latest_active_omp_goal,
+    ScaffoldReconnectError, latest_active_omp_goal,
 };
 use crate::theme::Theme;
 
@@ -3418,6 +3418,101 @@ struct ControlRoute {
     scaffold: Option<ScaffoldControlTarget>,
 }
 
+#[derive(Debug)]
+enum ReconnectFailureKind {
+    MissingMetadata,
+    AccessChanged,
+    ProviderUnavailable,
+    SandboxTerminal(comet_proto::ScaffoldLifecycle),
+    RouteRepublish,
+    Invariant,
+}
+
+#[derive(Debug)]
+struct ReconnectFailure {
+    kind: ReconnectFailureKind,
+    session_id: String,
+    sandbox_id: Option<String>,
+    detail: Option<String>,
+}
+
+impl ReconnectFailure {
+    fn new(
+        kind: ReconnectFailureKind,
+        session_id: impl Into<String>,
+        sandbox_id: Option<String>,
+    ) -> Self {
+        Self {
+            kind,
+            session_id: session_id.into(),
+            sandbox_id,
+            detail: None,
+        }
+    }
+
+    fn with_detail(mut self, detail: impl ToString) -> Self {
+        self.detail = Some(detail.to_string());
+        self
+    }
+
+    fn report(self) -> SharedString {
+        tracing::warn!(
+            session_id = %self.session_id,
+            sandbox_id = self.sandbox_id.as_deref().unwrap_or("unknown"),
+            reason = ?self.kind,
+            detail = self.detail.as_deref().unwrap_or("none"),
+            "Scaffold session reconnect failed"
+        );
+        match self.kind {
+            ReconnectFailureKind::MissingMetadata => {
+                "Reconnect information is missing. Start a new session.".into()
+            }
+            ReconnectFailureKind::AccessChanged => {
+                "Access to this Scaffold session changed. Ask the owner to share it again.".into()
+            }
+            ReconnectFailureKind::ProviderUnavailable => {
+                "Crew couldn’t reach this Scaffold sandbox. Try again.".into()
+            }
+            ReconnectFailureKind::SandboxTerminal(comet_proto::ScaffoldLifecycle::Stopped) => {
+                "This Scaffold sandbox has stopped and cannot reconnect. Start a new session."
+                    .into()
+            }
+            ReconnectFailureKind::SandboxTerminal(comet_proto::ScaffoldLifecycle::Failed) => {
+                "This Scaffold sandbox failed and cannot reconnect. Start a new session.".into()
+            }
+            ReconnectFailureKind::SandboxTerminal(_) | ReconnectFailureKind::Invariant => {
+                "Crew received invalid reconnect information. Start a new session.".into()
+            }
+            ReconnectFailureKind::RouteRepublish => {
+                "Crew reconnected, but could not restore the agent route. Try again.".into()
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ControlRouteFailure {
+    Message(SharedString),
+    Reconnect(ReconnectFailure),
+}
+
+impl ControlRouteFailure {
+    fn report(self) -> SharedString {
+        match self {
+            Self::Message(message) => message,
+            Self::Reconnect(failure) => failure.report(),
+        }
+    }
+}
+
+fn terminal_reconnect_message(message: &str) -> bool {
+    matches!(
+        message,
+        "This Scaffold sandbox has stopped and cannot reconnect. Start a new session."
+            | "This Scaffold sandbox failed and cannot reconnect. Start a new session."
+    )
+}
+
 fn control_route_grant_id(
     snapshot: &comet_proto::CollaborationSnapshot,
     session: &comet_proto::AgentSessionRecord,
@@ -4589,7 +4684,7 @@ impl Composer {
         &self,
         required_capability: &str,
         cx: &App,
-    ) -> Result<Option<ControlRoute>, SharedString> {
+    ) -> Result<Option<ControlRoute>, ControlRouteFailure> {
         if !self.start_agent && self.agent_target.is_none() {
             return Ok(None);
         }
@@ -4597,15 +4692,15 @@ impl Composer {
         let snapshot = state
             .collaboration
             .as_ref()
-            .ok_or_else(|| SharedString::from("Collaboration unavailable"))?;
+            .ok_or_else(|| ControlRouteFailure::Message("Collaboration unavailable".into()))?;
         let principal = snapshot
             .principal
             .as_ref()
-            .ok_or_else(|| SharedString::from("Identity unavailable"))?;
+            .ok_or_else(|| ControlRouteFailure::Message("Identity unavailable".into()))?;
         let actor_device_id = state
             .local_device_id
             .clone()
-            .ok_or_else(|| SharedString::from("Device unavailable"))?;
+            .ok_or_else(|| ControlRouteFailure::Message("Device unavailable".into()))?;
         let principal_can_control = principal.has_capability(required_capability);
         let now = chrono::Utc::now().timestamp_millis();
         let selected_chat = state.selected_chat.as_deref();
@@ -4663,10 +4758,18 @@ impl Composer {
                             grant_id,
                         )
                     })
-                    .ok_or_else(|| SharedString::from("Could not reconnect to this session"))?
+                    .ok_or_else(|| {
+                        ControlRouteFailure::Reconnect(ReconnectFailure::new(
+                            ReconnectFailureKind::MissingMetadata,
+                            selected_chat.unwrap_or("unknown"),
+                            None,
+                        ))
+                    })?
             } else {
                 if !principal_can_control {
-                    return Err(SharedString::from("Agent control not allowed"));
+                    return Err(ControlRouteFailure::Message(
+                        "Agent control not allowed".into(),
+                    ));
                 }
                 (
                     uuid::Uuid::new_v4().to_string(),
@@ -4685,12 +4788,14 @@ impl Composer {
                         .iter()
                         .find(|session| session.session_id == id)
                 })
-                .ok_or_else(|| SharedString::from("Agent session unavailable"))?;
+                .ok_or_else(|| ControlRouteFailure::Message("Agent session unavailable".into()))?;
             let grant_id = if target.source == AgentSessionSource::Local
                 && target.owner_device_id == actor_device_id
             {
                 if !principal_can_control {
-                    return Err(SharedString::from("Agent control not allowed"));
+                    return Err(ControlRouteFailure::Message(
+                        "Agent control not allowed".into(),
+                    ));
                 }
                 // The local engine derives and installs this single-action grant
                 // from its authenticated identity before queueing the command.
@@ -4714,7 +4819,9 @@ impl Composer {
                 // before it can queue any agent command.
                 String::new()
             } else {
-                return Err(SharedString::from("Agent control not allowed"));
+                return Err(ControlRouteFailure::Message(
+                    "Agent control not allowed".into(),
+                ));
             };
             (
                 target.session_id.clone(),
@@ -4724,8 +4831,16 @@ impl Composer {
             )
         };
         let scaffold = if source == AgentSessionSource::Scaffold {
-            state
-                .scaffold_control_target(&session_id)
+            let current_target = state.scaffold_control_target(&session_id);
+            let has_reconnect_metadata = current_target.is_some()
+                || state.session_refs.iter().any(|session_ref| {
+                    session_ref.chat_id == session_id && session_ref.environment.is_some()
+                })
+                || snapshot.grants.iter().any(|grant| {
+                    grant.scope.session_id.as_deref() == Some(session_id.as_str())
+                        || grant.device_id.as_deref() == Some(owner_device_id.as_str())
+                });
+            current_target
                 .filter(|target| principal_can_control && principal.authorizes_scope(&target.scope))
                 .cloned()
                 .or_else(|| {
@@ -4748,7 +4863,19 @@ impl Composer {
                     )
                 })
                 .map(Some)
-                .ok_or_else(|| SharedString::from("Could not reconnect to this session"))?
+                .ok_or_else(|| {
+                    let sandbox_id = comet_proto::parse_scaffold_device_id(&owner_device_id)
+                        .map(|(sandbox_id, _)| sandbox_id.to_string());
+                    ControlRouteFailure::Reconnect(ReconnectFailure::new(
+                        if !principal_can_control || has_reconnect_metadata {
+                            ReconnectFailureKind::AccessChanged
+                        } else {
+                            ReconnectFailureKind::MissingMetadata
+                        },
+                        &session_id,
+                        sandbox_id,
+                    ))
+                })?
         } else {
             None
         };
@@ -5125,8 +5252,8 @@ impl Composer {
         } else {
             match self.control_route(comet_proto::CAPABILITY_SESSION_CHAT, cx) {
                 Ok(route) => route,
-                Err(message) => {
-                    self.failure = Some(message);
+                Err(failure) => {
+                    self.failure = Some(failure.report());
                     cx.notify();
                     return;
                 }
@@ -5526,12 +5653,25 @@ impl Composer {
                     )
                     .await
                     .map_err(|error| {
-                        tracing::warn!(
-                            sandbox_id = %target.sandbox_id,
-                            error = %error,
-                            "Scaffold session reconnect failed"
+                        let (kind, detail) = match error {
+                            ScaffoldReconnectError::Terminal(lifecycle) => {
+                                (ReconnectFailureKind::SandboxTerminal(lifecycle), None)
+                            }
+                            ScaffoldReconnectError::InvalidAttachment(error) => {
+                                (ReconnectFailureKind::Invariant, Some(error.to_string()))
+                            }
+                            ScaffoldReconnectError::ProviderUnavailable(error) => (
+                                ReconnectFailureKind::ProviderUnavailable,
+                                Some(error.to_string()),
+                            ),
+                        };
+                        let mut failure = ReconnectFailure::new(
+                            kind,
+                            &err_chat_id,
+                            Some(target.sandbox_id.clone()),
                         );
-                        "Could not reconnect to this session".to_string()
+                        failure.detail = detail;
+                        failure.report().to_string()
                     })?;
                     crate::state::update_scaffold_session_agent_route(
                         &engine,
@@ -5545,12 +5685,14 @@ impl Composer {
                     )
                     .await
                     .map_err(|error| {
-                        tracing::warn!(
-                            sandbox_id = %target.sandbox_id,
-                            error = %error,
-                            "Scaffold session agent route update failed"
-                        );
-                        "Could not reconnect to this session".to_string()
+                        ReconnectFailure::new(
+                            ReconnectFailureKind::RouteRepublish,
+                            &err_chat_id,
+                            Some(target.sandbox_id.clone()),
+                        )
+                        .with_detail(error)
+                        .report()
+                        .to_string()
                     })?;
                     start_agent_mode = scaffold_turn_requires_start(
                         start_agent_mode,
@@ -5860,7 +6002,17 @@ impl Composer {
                 };
                 let command = if let Some(route) = control_route {
                     if route.source == AgentSessionSource::Scaffold && route.grant_id.is_empty() {
-                        return Err("Could not reconnect to this session".into());
+                        return Err(ReconnectFailure::new(
+                            ReconnectFailureKind::Invariant,
+                            &route.session_id,
+                            route
+                                .scaffold
+                                .as_ref()
+                                .map(|target| target.sandbox_id.clone()),
+                        )
+                        .with_detail("control grant missing after reconnect")
+                        .report()
+                        .to_string());
                     }
                     let action =
                         if scaffold_control_uses_start(start_agent_mode, steer_cmd, queue_cmd) {
@@ -6075,8 +6227,8 @@ impl Composer {
                 "chatId": chat_id,
                 "command": { "kind": "interrupt" },
             }),
-            Err(message) => {
-                self.failure = Some(message);
+            Err(failure) => {
+                self.failure = Some(failure.report());
                 cx.notify();
                 return;
             }
@@ -6193,8 +6345,8 @@ impl Composer {
                     answers,
                 },
             }),
-            Err(message) => {
-                self.failure = Some(message);
+            Err(failure) => {
+                self.failure = Some(failure.report());
                 self.answered_requests.remove(&request_id);
                 cx.notify();
                 return;
@@ -6792,6 +6944,7 @@ impl Render for Composer {
                 // stroke. Amber for the offline-ish case (engine not
                 // connected), red for send/run failures. Click dismisses.
                 let offline = message.as_ref() == "Engine not connected";
+                let terminal_reconnect = terminal_reconnect_message(message.as_ref());
                 let (border_c, wash, text_c) = if offline {
                     let amber = theme.warning; // amber-400
                     let amber_200 = theme.warning_muted;
@@ -6837,7 +6990,37 @@ impl Render for Composer {
                                 .mt(px(2.0))
                                 .text_color(text_c),
                         )
-                        .child(div().min_w_0().child(message)),
+                        .child(div().flex_1().min_w_0().child(message))
+                        .when(terminal_reconnect, |notice| {
+                            notice.child(
+                                div()
+                                    .id("start-new-session-after-reconnect")
+                                    .flex_none()
+                                    .text_color(theme.text)
+                                    .child("Start new Scaffold session")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.failure = None;
+                                        let started = this.state.update(cx, |state, cx| {
+                                            if state.can_start_scaffold_session() {
+                                                state.start_scaffold_session(
+                                                    comet_proto::ScaffoldDatabaseEnvironment::Local,
+                                                    cx,
+                                                );
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        });
+                                        if !started {
+                                            window.dispatch_action(
+                                                Box::new(crate::shell::NewSession),
+                                                cx,
+                                            );
+                                        }
+                                    })),
+                            )
+                        }),
                 )
             })
             .children(wake_notice)
@@ -8487,6 +8670,29 @@ mod tests {
             ]
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn reconnect_failure_keeps_terminal_lifecycle_actionable() {
+        for (lifecycle, expected) in [
+            (
+                comet_proto::ScaffoldLifecycle::Stopped,
+                "This Scaffold sandbox has stopped and cannot reconnect. Start a new session.",
+            ),
+            (
+                comet_proto::ScaffoldLifecycle::Failed,
+                "This Scaffold sandbox failed and cannot reconnect. Start a new session.",
+            ),
+        ] {
+            let message = ReconnectFailure::new(
+                ReconnectFailureKind::SandboxTerminal(lifecycle),
+                "session-a",
+                Some("sandbox-a".into()),
+            )
+            .report();
+            assert_eq!(message.as_ref(), expected);
+            assert!(terminal_reconnect_message(message.as_ref()));
+        }
     }
 
     #[test]
