@@ -67,7 +67,7 @@ use comet_proto::{
     AgentSessionRecord, Chat, ChatConfig, CollaborationPrincipal, CollaborationScope,
     CollaborationSnapshot, HarnessId, OmpAdvisorSyncBacklog, ParticipantPresence, ParticipantState,
     RuntimeProfile, ScaffoldEnvironmentControl, ScaffoldEnvironmentControlResult,
-    SessionEnvironmentSource, SessionRoomProjection, SessionStatus, ToolCall, Worktree,
+    SessionEnvironmentSource, SessionRoomProjection, SessionStatus, Space, ToolCall, Worktree,
     WorktreeDeletionStage,
 };
 use comet_rpc::{
@@ -324,6 +324,15 @@ struct QueueCommandParams {
     command_id: Option<String>,
     #[serde(default)]
     preparation_generation: Option<String>,
+    #[serde(default)]
+    bootstrap: Option<PeerCommandBootstrap>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PeerCommandBootstrap {
+    chat: Chat,
+    space: Space,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1820,9 +1829,62 @@ impl RpcService for EngineRpc {
             || authority.device_id != self.doc_host.device_id()
             || authority.chat_id != p.chat_id
             || authority.expires_at <= crate::now_ms()
-            || !self.doc_host.is_locally_hosted(&p.chat_id)
             || !ordinary_peer_command(&p.command)
         {
+            return Err(RpcError::Failed("peer_command_scope_denied".into()));
+        }
+        if !self.doc_host.is_locally_hosted(&p.chat_id) {
+            let Some(bootstrap) = p.bootstrap.take() else {
+                return Err(RpcError::Failed("peer_command_scope_denied".into()));
+            };
+            let valid = bootstrap.chat.id == authority.chat_id
+                && bootstrap.chat.device_id == authority.device_id
+                && bootstrap.chat.space_id.as_deref() == Some(bootstrap.space.id.as_str())
+                && bootstrap.space.device_id == authority.device_id
+                && bootstrap
+                    .chat
+                    .cwd
+                    .as_deref()
+                    .is_some_and(|path| std::path::Path::new(path).is_absolute())
+                && std::path::Path::new(&bootstrap.space.path).is_absolute();
+            if !valid {
+                return Err(RpcError::Failed("peer_command_scope_denied".into()));
+            }
+            if let Some(existing) = self
+                .workspace
+                .doc()
+                .chat(&bootstrap.chat.id)
+                .map_err(|error| RpcError::Failed(error.to_string()))?
+                && existing.device_id != authority.device_id
+            {
+                return Err(RpcError::Failed("peer_command_scope_denied".into()));
+            }
+            let existing_space = self
+                .workspace
+                .doc()
+                .space(&bootstrap.space.id)
+                .map_err(|error| RpcError::Failed(error.to_string()))?;
+            if existing_space.as_ref().is_some_and(|existing| {
+                existing.device_id != bootstrap.space.device_id
+                    || existing.path != bootstrap.space.path
+            }) {
+                return Err(RpcError::Failed("peer_command_scope_denied".into()));
+            }
+            if existing_space.is_none() {
+                self.workspace
+                    .doc()
+                    .upsert_space(&bootstrap.space)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+            }
+            self.workspace
+                .doc()
+                .upsert_chat(&bootstrap.chat)
+                .map_err(|error| RpcError::Failed(error.to_string()))?;
+            self.workspace
+                .upsert_session_ref(&p.chat_id, None)
+                .map_err(|error| RpcError::Failed(error.to_string()))?;
+        }
+        if !self.doc_host.is_locally_hosted(&p.chat_id) {
             return Err(RpcError::Failed("peer_command_scope_denied".into()));
         }
         let command_id = p
@@ -2277,6 +2339,11 @@ impl RpcService for EngineRpc {
                         .links
                         .as_ref()
                         .ok_or_else(|| RpcError::Failed("peer relay unavailable".into()))?;
+                    let bootstrap = chat
+                        .space_id
+                        .as_deref()
+                        .and_then(|space_id| self.workspace.doc().space(space_id).ok().flatten())
+                        .map(|space| serde_json::json!({ "chat": chat.clone(), "space": space }));
                     return links
                         .command_call(
                             &chat.device_id,
@@ -2285,6 +2352,7 @@ impl RpcService for EngineRpc {
                                 "chatId": chat_id,
                                 "commandId": command_id,
                                 "command": p.command,
+                                "bootstrap": bootstrap,
                             }),
                         )
                         .await
@@ -3262,14 +3330,38 @@ mod tests {
         auth_config.project_scope = "project-a".into();
         auth_config.dev_user_id = "owner-a".into();
         core.set_auth(Auth::new(auth_config));
-        core.workspace
-            .create_space("space-a", &core.device_id, "/tmp", None, false)
-            .unwrap();
-        core.workspace
-            .create_chat("chat-a", "space-a", None, Some("/tmp".into()))
-            .unwrap();
+        let created_at = chrono::Utc::now();
+        let space = Space {
+            id: "space-a".into(),
+            device_id: core.device_id.clone(),
+            path: "/tmp".into(),
+            name: None,
+            git_detected: false,
+            git_checked_at: None,
+            checkout_id: None,
+            created_at,
+        };
+        let chat = Chat {
+            id: "chat-a".into(),
+            device_id: core.device_id.clone(),
+            title: None,
+            archived: false,
+            cwd: Some("/tmp".into()),
+            branch: None,
+            checkout_id: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at,
+            harness_session_id: None,
+            harness_session_cwd: None,
+            fork_from: None,
+            space_id: Some(space.id.clone()),
+            last_seen_at: None,
+        };
         let rpc = core.rpc_service();
         let params = serde_json::json!({ "chatId": "chat-a", "commandId": "command-a",
+            "bootstrap": { "chat": chat, "space": space },
             "command": { "kind": "control", "source": "local", "sessionId": "agent-a",
                 "ownerDeviceId": core.device_id, "actorDeviceId": "desktop-a",
                 "actorSubject": "owner-a", "grantId": "untrusted-caller-grant",
@@ -3297,6 +3389,28 @@ mod tests {
                     .is_err()
             );
         }
+        assert!(core.workspace.doc().chat("chat-a").unwrap().is_none());
+        let mut missing_bootstrap = params.clone();
+        missing_bootstrap
+            .as_object_mut()
+            .unwrap()
+            .remove("bootstrap");
+        assert!(
+            rpc.admit_peer_command(
+                serde_json::from_value(authority()).unwrap(),
+                missing_bootstrap,
+            )
+            .await
+            .is_err()
+        );
+        let mut bad_bootstrap = params.clone();
+        bad_bootstrap["bootstrap"]["chat"]["deviceId"] = serde_json::json!("other-device");
+        assert!(
+            rpc.admit_peer_command(serde_json::from_value(authority()).unwrap(), bad_bootstrap,)
+                .await
+                .is_err()
+        );
+        assert!(core.workspace.doc().chat("chat-a").unwrap().is_none());
         assert!(
             rpc.handle("AdmitPeerCommand", params.clone())
                 .await
