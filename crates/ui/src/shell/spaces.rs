@@ -378,6 +378,25 @@ impl Render for SpaceGhost {
     }
 }
 
+fn wakeable_add_space_device(device: Option<&Device>, local_device_id: Option<&str>) -> bool {
+    let Some(device) = device else {
+        return false;
+    };
+    local_device_id != Some(device.id.as_str())
+        && device.environment == Some(comet_proto::DeviceEnvironment::Namespace)
+        && device
+            .namespace_devbox_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty())
+}
+
+fn visible_add_space_device(device: &Device, local_device_id: Option<&str>, online: bool) -> bool {
+    local_device_id == Some(device.id.as_str())
+        || device.environment != Some(comet_proto::DeviceEnvironment::Namespace)
+        || online
+        || wakeable_add_space_device(Some(device), local_device_id)
+}
+
 /// The add-space palette (a command-K surface, summoned by ⌘K): search bar
 /// across the top, folder browser on the left, a Devices rail on the right,
 /// kbd-hint footer. One surface — picking a device in the rail rebrowses in
@@ -1107,8 +1126,21 @@ impl Shell {
     // ---- add-space flow (the ⌘K palette) ----
 
     pub(super) fn open_add_space(&mut self, cx: &mut Context<Self>) {
-        let devices: Vec<Device> = self.state.read(cx).devices.clone();
-        let local = self.state.read(cx).local_device_id.clone();
+        let state = self.state.read(cx);
+        let local = state.local_device_id.clone();
+        let now = Utc::now();
+        let devices: Vec<Device> = state
+            .devices
+            .iter()
+            .filter(|device| {
+                visible_add_space_device(
+                    device,
+                    local.as_deref(),
+                    state.device_online(&device.id, now),
+                )
+            })
+            .cloned()
+            .collect();
         // Land on this device's tab (else the first registered device).
         let device = devices
             .iter()
@@ -1276,6 +1308,69 @@ impl Shell {
                     };
                 }
                 cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn wake_add_space_device(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let local = self.state.read(cx).local_device_id.clone();
+        let Some(flow) = self.add_space.as_mut() else {
+            return;
+        };
+        let Some(device) = flow
+            .device
+            .as_ref()
+            .filter(|device| wakeable_add_space_device(Some(device), local.as_deref()))
+            .cloned()
+        else {
+            return;
+        };
+        let path = flow.browser_path.clone();
+        flow.browser = Loadable::Loading;
+        flow.error = None;
+        flow.load_task = Some(cx.spawn(async move |this, cx| {
+            let executor = cx.background_executor().clone();
+            let result = crate::attachments::call_with_timeout(
+                &engine,
+                &executor,
+                methods::WAKE_DEVICE,
+                serde_json::json!({ "deviceId": device.id }),
+                Duration::from_secs(180),
+            )
+            .await
+            .and_then(|reply| {
+                if reply.get("ready").and_then(serde_json::Value::as_bool) == Some(true)
+                    && reply.get("deviceId").and_then(serde_json::Value::as_str)
+                        == Some(device.id.as_str())
+                {
+                    Ok(())
+                } else {
+                    Err("Devbox did not confirm its connection".into())
+                }
+            });
+            this.update(cx, |shell, cx| {
+                if shell
+                    .add_space
+                    .as_ref()
+                    .and_then(|flow| flow.device.as_ref())
+                    .is_none_or(|selected| selected.id != device.id)
+                {
+                    return;
+                }
+                match result {
+                    Ok(()) => shell.load_space_folders(path, cx),
+                    Err(error) => {
+                        if let Some(flow) = shell.add_space.as_mut() {
+                            flow.browser = Loadable::Error("Devbox is offline".into());
+                            flow.error = Some(format!("Could not start Devbox: {error}").into());
+                        }
+                        cx.notify();
+                    }
+                }
             })
             .ok();
         }));
@@ -1497,25 +1592,33 @@ impl Shell {
                 flow.home.clone(),
             )
         };
-        let devices = self.state.read(cx).devices.clone();
+        let now = Utc::now();
+        // Hide only stale Namespace rows that cannot be woken. Online legacy
+        // hosts remain browsable; bound offline Devboxes expose explicit wake.
+        let (devices, device_presence): (Vec<Device>, Vec<bool>) = {
+            let state = self.state.read(cx);
+            state
+                .devices
+                .iter()
+                .filter_map(|device| {
+                    let online = state.device_online(&device.id, now);
+                    visible_add_space_device(device, state.local_device_id.as_deref(), online)
+                        .then(|| (device.clone(), online))
+                })
+                .unzip()
+        };
         let rows = self.add_space_filtered(cx);
         let query_empty = search.read(cx).is_empty();
         let hairline = crate::theme::hairline(0.06);
-        let now = Utc::now();
-        // (browsed device name, online) per rail row — presence is the same
-        // signal the sidebar space rows use.
-        let device_presence: Vec<bool> = {
-            let state = self.state.read(cx);
-            devices
-                .iter()
-                .map(|d| state.device_online(&d.id, now))
-                .collect()
-        };
         let device_name: SharedString = device
             .as_ref()
             .map(|d| d.name.clone())
             .unwrap_or_else(|| "This device".to_string())
             .into();
+        let wakeable = wakeable_add_space_device(
+            device.as_ref(),
+            self.state.read(cx).local_device_id.as_deref(),
+        );
 
         // A quiet mono key-cap chip ("⌘K" / "esc") for the search bar ends.
         let key_chip = |theme: &Theme| {
@@ -1738,11 +1841,22 @@ impl Shell {
                         .text_color(theme.text)
                         .cursor_pointer()
                         .hover(|s| s.bg(theme.element_hover))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            let path = this.add_space.as_ref().and_then(|f| f.browser_path.clone());
-                            this.load_space_folders(path, cx);
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if wakeable {
+                                this.wake_add_space_device(cx);
+                            } else {
+                                let path = this
+                                    .add_space
+                                    .as_ref()
+                                    .and_then(|flow| flow.browser_path.clone());
+                                this.load_space_folders(path, cx);
+                            }
                         }))
-                        .child(SharedString::from("Retry")),
+                        .child(SharedString::from(if wakeable {
+                            "Wake and connect"
+                        } else {
+                            "Retry"
+                        })),
                 )
                 .into_any_element()
         } else if rows.is_empty() {
@@ -2224,10 +2338,12 @@ mod tests {
     use super::{
         collapse_sidebar_sources, detached_worktree_label, folder_device_name,
         scaffold_sidebar_surfaces, sidebar_session_source, source_picker_spaces,
-        spaces_with_visible_sessions,
+        spaces_with_visible_sessions, visible_add_space_device, wakeable_add_space_device,
     };
     use chrono::{DateTime, Utc};
-    use comet_proto::{AgentSessionSource, ScaffoldEnvironmentLinks, Space};
+    use comet_proto::{
+        AgentSessionSource, Device, DeviceEnvironment, ScaffoldEnvironmentLinks, Space,
+    };
     use std::path::PathBuf;
 
     fn space(id: &str, device_id: &str, path: &str, created_at: i64) -> Space {
@@ -2241,6 +2357,58 @@ mod tests {
             checkout_id: None,
             created_at: DateTime::<Utc>::from_timestamp(created_at, 0).unwrap(),
         }
+    }
+
+    fn device(
+        id: &str,
+        environment: Option<DeviceEnvironment>,
+        provider_id: Option<&str>,
+    ) -> Device {
+        Device {
+            id: id.into(),
+            name: id.into(),
+            platform: "linux".into(),
+            environment,
+            namespace_devbox_id: provider_id.map(str::to_owned),
+            last_seen_at: None,
+            created_at: None,
+            version: None,
+        }
+    }
+
+    #[test]
+    fn only_bound_remote_devboxes_offer_wake() {
+        let devbox = device(
+            "remote",
+            Some(DeviceEnvironment::Namespace),
+            Some("jfoemktp03vp0"),
+        );
+        assert!(wakeable_add_space_device(Some(&devbox), Some("local")));
+        assert!(!wakeable_add_space_device(Some(&devbox), Some("remote")));
+        assert!(!wakeable_add_space_device(
+            Some(&device("remote", Some(DeviceEnvironment::Namespace), None)),
+            Some("local")
+        ));
+        assert!(!wakeable_add_space_device(
+            Some(&device("remote", None, Some("jfoemktp03vp0"))),
+            Some("local")
+        ));
+    }
+
+    #[test]
+    fn offline_unbound_devboxes_stay_out_of_folder_picker() {
+        let stale = device("stale", Some(DeviceEnvironment::Namespace), None);
+        assert!(!visible_add_space_device(&stale, Some("local"), false));
+        assert!(visible_add_space_device(&stale, Some("local"), true));
+        assert!(visible_add_space_device(
+            &device(
+                "bound",
+                Some(DeviceEnvironment::Namespace),
+                Some("jfoemktp03vp0")
+            ),
+            Some("local"),
+            false
+        ));
     }
     #[test]
     fn sidebar_shows_only_spaces_with_visible_sessions() {
