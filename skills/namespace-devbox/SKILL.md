@@ -70,22 +70,22 @@ Use separate staging and production data directories. Do not copy `session.json`
 
 ## Authenticate once, then run transparently
 
-The setup skill owns every controller-side forward. Never ask the owner to start a second local agent session, copy a credential directory, or manually run `devbox port-forward`.
+The setup skill owns the unified controller-side forward during initial setup. On the first turn to an online Namespace Devbox, Crew's local controller starts separate bounded forwards for gcloud and available Ashler services without delaying the turn; offline devices are woken first. Never ask the owner to start a second local agent session, copy a credential directory, or manually run `devbox port-forward` for normal Crew use.
 
 Use fixed channel callback ports installed by `configure-host.sh`: staging `27656`, production `27654`. Before presenting any authorization URL, check that the required local ports are free, then start one supervised Namespace forward for the whole setup:
 
 ```bash
-# Keep remote ports fixed; override only an occupied local app port.
-WEB_LOCAL_PORT="${WEB_LOCAL_PORT:-3000}"
-TILT_LOCAL_PORT="${TILT_LOCAL_PORT:-10350}"
-# Example: WEB_LOCAL_PORT=13000 TILT_LOCAL_PORT=20350
+# Avoid the owner's usual local app and Tilt ports by default.
+WEB_LOCAL_PORT="${WEB_LOCAL_PORT:-13000}"
+TILT_LOCAL_PORT="${TILT_LOCAL_PORT:-20350}"
+# Override either local port when it is already occupied.
 # staging; production uses 27654 instead of 27656
 devbox port-forward "$DEVBOX_ID" \
   --ports "27656:27656,8085:8085,$WEB_LOCAL_PORT:3000,$TILT_LOCAL_PORT:10350"
 ```
 
 Port `8085` is gcloud's loopback callback. Ports `3000` and `10350` are remote app and Tilt ports; their local sides are `$WEB_LOCAL_PORT` and `$TILT_LOCAL_PORT`. Check the chosen local ports immediately before starting the forward. If either application port is occupied, set that variable to an unused local port and use it in every link and health check. Never stop the existing listener. Credential callback ports cannot be remapped because providers bind them into signed OAuth requests; fail closed rather than kill another listener. Keep this single forward alive through authentication and runtime verification. The tunnel transports loopback HTTP only; provider credentials are created and stored on the Devbox.
-This forward is setup-scoped. Stop it after authentication and endpoint verification so an idle connection cannot defeat Namespace auto-stop. Crew's relay—not this tunnel—carries coding-session control, transcripts, and streaming output.
+This unified forward is setup-scoped. Stop it after authentication and endpoint verification—and before testing an ordinary Crew turn—so it does not collide with Crew's automatic `8085` forward or defeat Namespace auto-stop. Crew's relay, not this tunnel, carries coding-session control, transcripts, and streaming output.
 
 Run `~/.local/bin/crew-devbox-staging login` on the host and open its printed authorization URL for the owner. The forwarded fixed callback completes sign-in automatically; never ask the owner to paste its callback URL or code unless the provider rejects loopback callbacks.
 
@@ -106,7 +106,7 @@ The helper uses a channel-specific tmux session and restarts the engine after ex
 
 On a fresh machine, start the helper normally. On a reused machine whose engine predates this configuration, first verify there are no active turns, then stop only that channel's existing engine and start the helper once. Confirm the republished device row is labeled **Devbox** and carries the expected immutable Namespace ID before testing wake.
 
-After one-time setup, ordinary coding sessions need no port forward and no local coordinating LLM: the desktop client uses Crew's authenticated device relay. Crew owns device wake, exact-device verification, model/ref reload, command submission, steering, cancellation, transcripts, and streamed output. It does not own arbitrary localhost application or third-party OAuth tunnels. On the controller, **Wake and connect** is available for an offline Namespace device with a stored immutable ID. Sending a draft to that device also starts the explicit wake flow. Crew uses the controller's installed `devbox` CLI and existing Namespace login, boots the selected machine, starts the matching channel helper, and verifies the exact Crew device identity through the relay before reloading refs and models. A failed wake preserves the draft and offers Retry. Browsing folders or receiving presence updates never wakes the machine.
+After one-time setup, ordinary coding sessions need no manual port forward or local coordinating LLM. Crew starts one 30-minute forward for gcloud `8085` and a separate 30-minute service forward for each available local mapping: `http://devbox.localhost:13000` reaches the Ashler app on Devbox port `3000`, and `http://tilt.devbox.localhost:20350` reaches Tilt on port `10350`. An occupied service port is skipped without affecting gcloud or the other service; failures are logged locally and never wake or relink an already-online device. Sending a draft to an offline Namespace device starts the explicit wake flow: the controller uses its installed `devbox` CLI and Namespace login, boots the selected machine, starts the matching channel helper, verifies the exact Crew device through the relay, then reloads refs and models.
 
 The manual wake equivalent is diagnostic only:
 
@@ -132,7 +132,7 @@ In the checked-out Ashler Platform repository read `docs/agents/localdev.md` and
 
 Keep `ASHLER_INCREMENTAL_TSC_CHECKS=false` and do not run local typechecks. Once Infisical localdev authentication is ready, use the repository's `just bootstrap`, `just env`, and `just dev`. Seed only the confirmed sandbox-local database when needed; never reset a shared database to make setup pass. Run Tilt in another persistent Namespace terminal.
 
-The unified setup forward exposes the app at `http://localhost:$WEB_LOCAL_PORT` and Tilt at `http://localhost:$TILT_LOCAL_PORT`. Give the owner clickable links using the actual selected values only after both endpoints respond. Stop the unified forward when verification ends. Later coding sessions remain fully functional through Crew without it; rerun only this skill's forwarding phase when the owner explicitly needs localhost application access again. Keep credential callbacks and browser CDP loopback-only; never publish unauthenticated debugging endpoints via `devbox url`.
+The unified setup forward exposes the app at `http://devbox.localhost:$WEB_LOCAL_PORT` and Tilt at `http://tilt.devbox.localhost:$TILT_LOCAL_PORT`; these `*.localhost` names remain local to the owner's machine. Give the owner clickable links using the actual selected values only after both endpoints respond, then stop the setup forward before testing Crew's automatic forwards. Do not expose Tilt or browser CDP through `devbox url`. A Namespace `devbox.so` URL is optional, supports only `private` or `workspace` access, and must be created only after the owner authorizes that broader access.
 
 ## Completion evidence
 

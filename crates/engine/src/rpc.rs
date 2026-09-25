@@ -22,6 +22,8 @@
 //! - `LocalDevice` → `{deviceId}` — this engine's identity (never forwarded)
 //! - `WakeDevice {deviceId}` → `{deviceId, ready: true}` — local authenticated
 //!   controller only; explicitly boots the bound Namespace host and probes its peer
+//! - `EnsureDevboxCallbackForward {deviceId}` → `{deviceId, ready: true}` — local
+//!   controller only; starts the bounded auth callback tunnel without waking or relinking
 //! - AuthRpc: `AuthStatus` (stream), `SignIn`/`SignInHeadless` → `{url}`,
 //!   `CompleteSignIn {code}`, and `SignOut`
 //! - Repos (§3.5): `ListRepos`, `AddRepo {path}`, `CloneRepo {url}`,
@@ -659,6 +661,29 @@ pub struct EngineRpc {
 }
 
 impl EngineRpc {
+    fn devbox_provider_id(&self, device_id: &str) -> Result<String, RpcError> {
+        let state = self.auth()?.state();
+        if !state.is_signed_in() || state.project_scope() != Some(self.workspace.project_scope()) {
+            return Err(RpcError::Failed(
+                "Sign in to Crew before connecting to a Devbox".into(),
+            ));
+        }
+        let devices = self
+            .workspace
+            .doc()
+            .read_devices()
+            .map_err(|error| RpcError::Failed(error.to_string()))?;
+        let device = devices
+            .iter()
+            .find(|device| device.id == device_id)
+            .ok_or_else(|| {
+                RpcError::BadParams("Device is not registered in this workspace".into())
+            })?;
+        crate::device_wake::bound_devbox_id(device, self.doc_host.device_id())
+            .map(str::to_owned)
+            .map_err(RpcError::BadParams)
+    }
+
     async fn fresh_session_context(
         &self,
         chat_id: &str,
@@ -1961,41 +1986,49 @@ impl RpcService for EngineRpc {
                             "Wake Device is available only on the local controller".into(),
                         )
                     })?;
-                let state = self.auth()?.state();
-                if !state.is_signed_in()
-                    || state.project_scope() != Some(self.workspace.project_scope())
-                {
-                    return Err(RpcError::Failed(
-                        "Sign in to Crew before waking a Devbox".into(),
-                    ));
-                }
-                let devices = self
-                    .workspace
-                    .doc()
-                    .read_devices()
-                    .map_err(|error| RpcError::Failed(error.to_string()))?;
-                let device = devices
-                    .iter()
-                    .find(|device| device.id == p.device_id)
-                    .ok_or_else(|| {
-                        RpcError::BadParams("Device is not registered in this workspace".into())
-                    })?;
-                let provider_id =
-                    crate::device_wake::bound_devbox_id(device, self.doc_host.device_id())
-                        .map_err(RpcError::BadParams)?
-                        .to_string();
+                let provider_id = self.devbox_provider_id(&p.device_id)?;
                 let links = self.links.clone().ok_or_else(|| RpcError::Failed(
                     "Crew relay is unavailable; reconnect the controller before waking the Devbox".into()
                 ))?;
                 wake.wake(
                     &p.device_id,
-                    provider_id,
+                    provider_id.clone(),
                     self.workspace.project_scope(),
                     links,
                 )
                 .await
                 .map_err(RpcError::Failed)?;
-                RpcReply::value(&serde_json::json!({ "deviceId": p.device_id, "ready": true }))
+                RpcReply::value(&serde_json::json!({
+                    "deviceId": p.device_id,
+                    "ready": true,
+                    "callbackForwardReady": wake.auth_forward_active(&provider_id)
+                }))
+            }
+            methods::ENSURE_DEVBOX_CALLBACK_FORWARD => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct Params {
+                    device_id: String,
+                }
+                let p: Params = parse_params(params)?;
+                let wake = self
+                    .device_wake
+                    .as_ref()
+                    .filter(|_| self.runtime_profile == RuntimeProfile::LocalController)
+                    .ok_or_else(|| {
+                        RpcError::Failed(
+                            "Devbox callback forwarding is available only on the local controller"
+                                .into(),
+                        )
+                    })?;
+                let provider_id = self.devbox_provider_id(&p.device_id)?;
+                wake.ensure_callback_forward(provider_id)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({
+                    "deviceId": p.device_id,
+                    "ready": true
+                }))
             }
             methods::LIST_HARNESSES if !generic_catalog_allowed(self.runtime_profile, method) => {
                 Err(RpcError::Failed(
@@ -3706,6 +3739,8 @@ mod tests {
     fn durable_commands_are_queued_locally_before_remote_delivery() {
         assert!(!forwardable(methods::LOCAL_DEVICE));
         assert!(!forwardable(methods::QUEUE_COMMAND));
+        assert!(!forwardable(methods::WAKE_DEVICE));
+        assert!(!forwardable(methods::ENSURE_DEVBOX_CALLBACK_FORWARD));
         assert!(forwardable(methods::SEARCH_FILES));
         assert!(forwardable(methods::READ_CHECKOUT_DIFF));
         assert!(forwardable(methods::UPDATE_HARNESS));

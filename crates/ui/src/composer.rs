@@ -3833,6 +3833,8 @@ pub struct Composer {
     failure: Option<SharedString>,
     wake: Option<WakeInteraction>,
     wake_task: Option<Task<()>>,
+    callback_forward: Option<(String, Instant)>,
+    callback_forward_task: Option<Task<()>>,
     wizard: Option<Wizard>,
     wizard_focus: FocusHandle,
     /// Requests already answered locally (suppresses the panel until the doc
@@ -3935,6 +3937,8 @@ impl Composer {
             failure: None,
             wake: None,
             wake_task: None,
+            callback_forward: None,
+            callback_forward_task: None,
             wizard: None,
             wizard_focus: cx.focus_handle(),
             answered_requests: HashSet::new(),
@@ -5076,23 +5080,70 @@ impl Composer {
         {
             return;
         }
-        if let Some(target) = self.wake_target(cx)
-            && (self.offline_wake_target(cx).is_some() || self.wake.is_some())
-        {
-            let pending = WakeSend {
-                text,
-                delivery,
-                attachments: self
-                    .staged()
-                    .iter()
-                    .map(|attachment| attachment.id.clone())
-                    .collect(),
-                config: self.pickers.read(cx).draft().clone(),
-            };
-            self.begin_wake(target, Some(pending), cx);
-            return;
+        if let Some(target) = self.wake_target(cx) {
+            if self.offline_wake_target(cx).is_some() {
+                let pending = WakeSend {
+                    text,
+                    delivery,
+                    attachments: self
+                        .staged()
+                        .iter()
+                        .map(|attachment| attachment.id.clone())
+                        .collect(),
+                    config: self.pickers.read(cx).draft().clone(),
+                };
+                self.begin_wake(target, Some(pending), cx);
+                return;
+            }
+            self.wake = None;
+            self.prepare_callback_forward(&target, cx);
         }
         self.send_ready(text, delivery, cx);
+    }
+
+    fn prepare_callback_forward(&mut self, target: &WakeTarget, cx: &mut Context<Self>) {
+        if self
+            .callback_forward
+            .as_ref()
+            .is_some_and(|(device_id, until)| {
+                device_id == &target.device_id && *until > Instant::now()
+            })
+            || self.callback_forward_task.is_some()
+        {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let device_id = target.device_id.clone();
+        self.callback_forward = Some((device_id.clone(), Instant::now() + Duration::from_secs(60)));
+        self.callback_forward_task = Some(cx.spawn(async move |this, cx| {
+            let executor = cx.background_executor().clone();
+            let result = attachments::call_with_timeout(
+                &engine,
+                &executor,
+                methods::ENSURE_DEVBOX_CALLBACK_FORWARD,
+                serde_json::json!({ "deviceId": device_id }),
+                Duration::from_secs(30),
+            )
+            .await;
+            let _ = this.update(cx, |composer, _| {
+                composer.callback_forward_task = None;
+                match result {
+                    Ok(reply)
+                        if reply.get("ready").and_then(serde_json::Value::as_bool)
+                            == Some(true) =>
+                    {
+                        composer.callback_forward =
+                            Some((device_id, Instant::now() + Duration::from_secs(60)));
+                    }
+                    Ok(_) => tracing::warn!("Devbox callback tunnel returned an invalid response"),
+                    Err(error) => {
+                        tracing::warn!(%error, "Devbox callback tunnel preparation failed")
+                    }
+                }
+            });
+        }));
     }
 
     fn wake_target(&self, cx: &App) -> Option<WakeTarget> {
@@ -5176,7 +5227,7 @@ impl Composer {
             ).await.and_then(|reply| {
                 if reply.get("ready").and_then(serde_json::Value::as_bool) == Some(true)
                     && reply.get("deviceId").and_then(serde_json::Value::as_str) == Some(target.device_id.as_str()) {
-                    Ok(())
+                    Ok(reply.get("callbackForwardReady").and_then(serde_json::Value::as_bool) == Some(true))
                 } else {
                     Err("Devbox did not confirm its connection. Retry Wake and connect.".into())
                 }
@@ -5187,7 +5238,13 @@ impl Composer {
                 }
                 let Some(wake) = composer.wake.as_mut() else { return false; };
                 match result {
-                    Ok(()) => {
+                    Ok(callback_forward_ready) => {
+                        if callback_forward_ready {
+                            composer.callback_forward = Some((
+                                target.device_id.clone(),
+                                Instant::now() + Duration::from_secs(60),
+                            ));
+                        }
                         wake.phase = WakePhase::Connecting;
                         composer.pickers.update(cx, |pickers, cx| pickers.reload_after_wake(cx));
                         cx.notify();
@@ -7259,9 +7316,13 @@ mod tests {
 
     struct WakeRpc {
         wake: tokio::sync::Semaphore,
+        forward: tokio::sync::Semaphore,
         models: tokio::sync::Semaphore,
         fail: std::sync::atomic::AtomicBool,
+        callback_ready: std::sync::atomic::AtomicBool,
         wakes: std::sync::atomic::AtomicUsize,
+        forwards: std::sync::atomic::AtomicUsize,
+        forward_fail: std::sync::atomic::AtomicBool,
         sends: std::sync::atomic::AtomicUsize,
     }
 
@@ -7279,6 +7340,18 @@ mod tests {
                     self.wake.acquire().await.unwrap().forget();
                     if self.fail.load(SeqCst) {
                         return Err(RpcError::Failed("Namespace login required".into()));
+                    }
+                    comet_rpc::RpcReply::value(&serde_json::json!({
+                        "deviceId":"devbox",
+                        "ready":true,
+                        "callbackForwardReady":self.callback_ready.load(SeqCst)
+                    }))
+                }
+                methods::ENSURE_DEVBOX_CALLBACK_FORWARD => {
+                    self.forwards.fetch_add(1, SeqCst);
+                    self.forward.acquire().await.unwrap().forget();
+                    if self.forward_fail.load(SeqCst) {
+                        return Err(RpcError::Failed("port occupied".into()));
                     }
                     comet_rpc::RpcReply::value(
                         &serde_json::json!({"deviceId":"devbox", "ready":true}),
@@ -7322,9 +7395,13 @@ mod tests {
     ) -> (Entity<Composer>, Entity<AppState>, Arc<WakeRpc>) {
         let rpc = Arc::new(WakeRpc {
             wake: tokio::sync::Semaphore::new(0),
+            forward: tokio::sync::Semaphore::new(1),
             models: tokio::sync::Semaphore::new(0),
             fail: false.into(),
+            callback_ready: true.into(),
             wakes: 0.into(),
+            forwards: 0.into(),
+            forward_fail: false.into(),
             sends: 0.into(),
         });
         let state = cx.new(|_| AppState::new());
@@ -7384,6 +7461,121 @@ mod tests {
         assert_eq!(rpc.sends.load(SeqCst), 1);
     }
 
+    #[gpui::test]
+    async fn online_devbox_prepares_callbacks_in_background_without_waking(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::sync::atomic::Ordering::SeqCst;
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let (composer, state, rpc) = wake_composer(cx);
+        state.update(cx, |state, _| {
+            state.devices[0].last_seen_at = Some(chrono::Utc::now());
+        });
+        composer.update(cx, |composer, cx| {
+            composer.submit_command("first", cx);
+            composer.on_submit(cx);
+        });
+        rpc.models.add_permits(1);
+        cx.condition(&composer, |_, _| rpc.sends.load(SeqCst) == 1)
+            .await;
+        assert_eq!(rpc.wakes.load(SeqCst), 0);
+        assert_eq!(rpc.forwards.load(SeqCst), 1);
+        assert_eq!(rpc.sends.load(SeqCst), 1);
+
+        composer.update(cx, |composer, cx| {
+            composer.submit_command("second", cx);
+            composer.on_submit(cx);
+        });
+        cx.condition(&composer, |_, _| rpc.sends.load(SeqCst) == 2)
+            .await;
+        assert_eq!(rpc.wakes.load(SeqCst), 0);
+        assert_eq!(rpc.forwards.load(SeqCst), 1);
+        assert_eq!(rpc.sends.load(SeqCst), 2);
+    }
+
+    #[gpui::test]
+    async fn online_devbox_tunnel_failure_is_backed_off_without_blocking_sends(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::sync::atomic::Ordering::SeqCst;
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let (composer, state, rpc) = wake_composer(cx);
+        rpc.forward_fail.store(true, SeqCst);
+        state.update(cx, |state, _| {
+            state.devices[0].last_seen_at = Some(chrono::Utc::now());
+        });
+        rpc.models.add_permits(1);
+        for (text, sends) in [("first", 1), ("second", 2)] {
+            composer.update(cx, |composer, cx| {
+                composer.submit_command(text, cx);
+                composer.on_submit(cx);
+            });
+            cx.condition(&composer, |_, _| rpc.sends.load(SeqCst) == sends)
+                .await;
+        }
+        assert_eq!(rpc.wakes.load(SeqCst), 0);
+        assert_eq!(rpc.forwards.load(SeqCst), 1);
+    }
+
+    #[gpui::test]
+    async fn online_devbox_hung_tunnel_is_backed_off_without_blocking_sends(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::sync::atomic::Ordering::SeqCst;
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let (composer, state, rpc) = wake_composer(cx);
+        rpc.forward.acquire().await.unwrap().forget();
+        state.update(cx, |state, _| {
+            state.devices[0].last_seen_at = Some(chrono::Utc::now());
+        });
+        rpc.models.add_permits(1);
+        for (text, sends) in [("first", 1), ("second", 2)] {
+            composer.update(cx, |composer, cx| {
+                composer.submit_command(text, cx);
+                composer.on_submit(cx);
+            });
+            cx.condition(&composer, |_, _| rpc.sends.load(SeqCst) == sends)
+                .await;
+        }
+        assert_eq!(rpc.wakes.load(SeqCst), 0);
+        assert_eq!(rpc.forwards.load(SeqCst), 1);
+        rpc.forward.add_permits(1);
+    }
+
+    #[gpui::test]
+    async fn failed_wake_time_forward_does_not_wake_again(cx: &mut gpui::TestAppContext) {
+        use std::sync::atomic::Ordering::SeqCst;
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let (composer, state, rpc) = wake_composer(cx);
+        rpc.callback_ready.store(false, SeqCst);
+        rpc.wake.add_permits(1);
+        rpc.models.add_permits(1);
+        composer.update(cx, |composer, cx| {
+            composer.submit_command("first", cx);
+            composer.on_submit(cx);
+        });
+        cx.condition(&composer, |_, _| rpc.sends.load(SeqCst) == 1)
+            .await;
+        state.update(cx, |state, _| {
+            state.devices[0].last_seen_at = Some(chrono::Utc::now());
+        });
+        composer.update(cx, |composer, cx| {
+            composer.submit_command("second", cx);
+            composer.on_submit(cx);
+        });
+        cx.condition(&composer, |_, _| rpc.sends.load(SeqCst) == 2)
+            .await;
+        assert_eq!(rpc.wakes.load(SeqCst), 1);
+        assert_eq!(rpc.forwards.load(SeqCst), 1);
+    }
     #[gpui::test]
     async fn devbox_failure_keeps_draft_and_retry_cannot_follow_navigation(
         cx: &mut gpui::TestAppContext,
