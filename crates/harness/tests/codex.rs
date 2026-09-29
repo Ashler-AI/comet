@@ -604,7 +604,7 @@ async fn missing_binary_is_not_installed() {
 async fn models_returns_curated_catalog() {
     let models = harness().models().await.expect("models");
     assert_eq!(models[0].id, "gpt-6-sol");
-    for id in ["gpt-6-sol", "gpt-6-luna"] {
+    for id in ["gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"] {
         let released = models
             .iter()
             .find(|model| model.id == id)

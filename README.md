@@ -191,6 +191,11 @@ per-million input/cache-read/output rates ($2/$0.20/$10 for Sol,
 $0.10/$0.01/$0.50 for Luna); requests above 272K input tokens incur the provider's
 2x input/cache and 1.5x output multipliers.
 
+`gpt-6.1-sol` is also selectable in Codex, OMP/Scaffold, Prime Agent, and mobile
+catalogs with the same context/output limits and `low`–`max` efforts; Crew's
+existing defaults remain unchanged. Its base input/cached-input/output rates
+are $2/$0.10/$10 per million tokens.
+
 The Crew OMP/Prime gateway registers Opus 5.5 with 1,000,000 context tokens,
 128,000 output tokens, and per-million-token costs of $4 input, $20 output,
 $0.20 cache read, and $5 for 5-minute cache writes. The provider uses adaptive

@@ -34,6 +34,8 @@ enum HarnessCatalog {
             return [
                 ModelInfo(id: "gpt-6-sol", label: "GPT-6 Sol",
                           description: "1,050,000 context · 922,000 max input · 128,000 max output", reasoningLevels: codexMaxLadder),
+                ModelInfo(id: "gpt-6.1-sol", label: "GPT-6.1 Sol",
+                          description: "1,050,000 context · 922,000 max input · 128,000 max output", reasoningLevels: codexMaxLadder),
                 ModelInfo(id: "gpt-6-luna", label: "GPT-6 Luna",
                           description: "1,050,000 context · 922,000 max input · 128,000 max output", reasoningLevels: codexMaxLadder),
                 ModelInfo(id: "gpt-5.6-sol", label: "GPT-5.6-Sol",

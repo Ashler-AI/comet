@@ -4,10 +4,16 @@ import { writeFileSync } from "node:fs";
 // Import the sandbox roster, never maintain a second list of model IDs here.
 const revision = process.argv[2];
 if (!/^[a-f0-9]{40}$/.test(revision ?? "")) {
-  throw new Error("Usage: node scripts/sync-omp-model-catalog.mjs <platform commit SHA>");
+  throw new Error("Usage: node scripts/sync-omp-model-catalog.mjs <platform commit SHA> [platform worktree]");
 }
 const path = "internal/scaffold/control-plane/worker/src/omp-auth-broker.ts";
-const source = execFileSync("gh", ["api", `repos/Ashler-AI/ashler-platform/contents/${path}?ref=${revision}`, "-H", "Accept: application/vnd.github.raw+json"], { encoding: "utf8", maxBuffer: 1024 * 1024 });
+const platformWorktree = process.argv[3];
+if (platformWorktree && execFileSync("git", ["-C", platformWorktree, "rev-parse", "HEAD"], { encoding: "utf8" }).trim() !== revision) {
+  throw new Error("Platform worktree HEAD does not match the supplied commit SHA");
+}
+const source = platformWorktree
+  ? execFileSync("git", ["-C", platformWorktree, "show", `${revision}:${path}`], { encoding: "utf8", maxBuffer: 1024 * 1024 })
+  : execFileSync("gh", ["api", `repos/Ashler-AI/ashler-platform/contents/${path}?ref=${revision}`, "-H", "Accept: application/vnd.github.raw+json"], { encoding: "utf8", maxBuffer: 1024 * 1024 });
 const literal = source.match(/export const ompInferenceModelCatalog = (\{[\s\S]*?\}) as const;/)?.[1];
 if (!literal) throw new Error("Sandbox model catalog declaration not found");
 // The canonical declaration is a plain object of string arrays. Reject code.
@@ -18,10 +24,10 @@ const models = Object.entries(roster).flatMap(([provider, ids]) => {
   return ids.map(id => {
     if (typeof id !== "string" || !/^[a-z0-9.-]+$/.test(id)) throw new Error("Invalid model ID");
     return { id: `${provider === "openai" ? "openai-codex" : provider}/${id}`, label: id,
-      description: id === "gpt-6-sol" || id === "gpt-6-luna"
+      description: ["gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"].includes(id)
         ? "1,050,000 context · 922,000 max input · 128,000 max output · Scaffold model · account access checked when starting a run"
         : "Scaffold model · account access checked when starting a run",
-      reasoningLevels: ["claude-opus-5-5", "gpt-6-sol", "gpt-6-luna"].includes(id) ? ["low", "medium", "high", "xhigh", "max"]
+      reasoningLevels: ["claude-opus-5-5", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"].includes(id) ? ["low", "medium", "high", "xhigh", "max"]
         : id.startsWith("claude-3-") ? [] : ["low", "medium", "high"] };
   });
 });
