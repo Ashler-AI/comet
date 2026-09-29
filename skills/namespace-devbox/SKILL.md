@@ -5,7 +5,7 @@ description: Set up an owner-named Namespace Devbox with Crew, Chromium, forward
 
 # Personal Namespace Devbox
 
-Use when someone asks for their own remote Crew development machine. Reuse an existing owner-matched machine unless a new one was requested. Default: persistent Linux amd64, 16 CPUs, 64 GiB memory, private access, a one-hour idle timeout, Crew staging. This creates billable infrastructure: the user's setup request must authorize the machine. Do not create extra machines to retry an uncertain response; inspect `devbox list` first.
+Use when someone asks for their own remote Crew development machine. Reuse an existing owner-matched machine unless a new one was requested. Default: persistent Linux amd64, the smallest current shape with at least 16 CPUs and 64 GiB memory, private access, a one-hour idle timeout, Crew production. This creates billable infrastructure: the user's setup request must authorize the machine. Do not create extra machines to retry an uncertain response; inspect `devbox list` first.
 
 ## Identity and prerequisites
 
@@ -13,7 +13,7 @@ Use when someone asks for their own remote Crew development machine. Reuse an ex
 - Name the machine `<owner-login>-ashler-dev`. Include `<Owner Name> · Devbox · <machine-name>` in its Crew display name and put owner/purpose in Namespace's `--purpose` field. Existing Crew device names survive restarts: rename an existing device through Crew's device controls rather than assuming an environment change renames its synced row.
 - Read the target checkout's own guidance. Avoid checking out or resetting a worktree with someone else's changes.
 - Install the official Namespace `devbox` CLI and authenticate interactively: https://namespace.so/docs/reference/devbox-cli. Preserve user approval/MFA. Do not copy provider keys or change account permissions to bypass login.
-- Inspect `devbox create --help`, `devbox image list --help`, and https://namespace.so/docs/devbox/creating. Size labels can change; verify the selected size is **16 CPU / 64 GiB** rather than assuming `l` always means that. After creation, confirm with `nproc` and `/proc/meminfo`.
+- Inspect `devbox create --help`, `devbox image list --help`, and https://namespace.so/docs/devbox/creating. Size labels can change; select the smallest shape that provides **at least 16 CPUs and 64 GiB**, rather than assuming `l` maps to those resources. After creation, confirm and report the actual shape with `nproc` and `/proc/meminfo`; a current 64 GiB shape may provide 32 CPUs.
 
 Create using the verified size and existing approved image/Blueprint (the official `builtin:agents` image is a starting point):
 
@@ -31,11 +31,11 @@ Only use `--setup_github`/`devbox setup-github` after the user explicitly author
 
 ## Install the verified Crew release
 
-Pick one explicit released version from the requested channel. Read its private immutable `releases/<version>/scaffold-manifest.json` using the owner's authorized GCS access. Validate `releaseSurface=scaffold`, the version, `scaffoldRuntimeVersion` compatibility, and the Linux architecture/digest. Download the exact archive from that same version directory, verify SHA-256 locally, upload it with `devbox upload`, and verify the same SHA-256 on the host before extraction. Do not install a moving `latest` archive against an earlier manifest or trust an unchecked downloaded executable.
+Pick one explicit released version from the production channel. Read its private immutable `releases/<version>/scaffold-manifest.json` using the owner's authorized GCS access. Validate `releaseSurface=scaffold`, the version, `scaffoldRuntimeVersion` compatibility, and the Linux architecture/digest. Download the exact archive from that same version directory, verify SHA-256 locally, upload it with `devbox upload`, and verify the same SHA-256 on the host before extraction. Do not install a moving `latest` archive against an earlier manifest or trust an unchecked downloaded executable.
 
 Install under `~/.local/lib/crew/<version>/`; extract with `--strip-components=1` only after checking the archive layout. Keep previous versions for rollback. Do not replace/restart the Mac client hosting your current agent turn. A source build is not a released version, and installing a binary does not update a running engine.
 
-The macOS controller and remote host both need a release containing Devbox support. A current Mac binary paired with an old running engine may still show Local or fail to control remote turns.
+The macOS controller and active remote host both need a release containing Devbox support. A current Mac binary paired with an old running engine may still show Local or fail to control remote turns.
 
 Install the OMP version pinned by that Crew release before configuring the host. Read `source.repository` and `source.commit` from the verified manifest, fetch that exact commit's root `install.sh` through the authenticated GitHub API, upload it, and run `install.sh --install-omp` on the Devbox. The installer selects the Linux architecture, verifies the official upstream SHA-256, and installs `~/.local/bin/omp`. Never use a moving OMP release or copy local provider credentials. Confirm `omp --version`; `configure-host.sh` fails closed when the harness is absent.
 
@@ -48,7 +48,7 @@ CREW_OWNER_NAME="$OWNER_NAME" \
 NAMESPACE_DEVBOX_NAME="$DEVBOX_NAME" \
 NAMESPACE_DEVBOX_ID="$DEVBOX_ID" \
 CREW_BINARY="$HOME/.local/lib/crew/$VERSION/comet" \
-CREW_CHANNEL=staging \
+CREW_CHANNEL=production \
 CREW_FOLDER_ROOT=/workspaces \
   bash /tmp/configure-host.sh
 ```
@@ -72,46 +72,50 @@ Use separate staging and production data directories. Do not copy `session.json`
 
 The setup skill owns the unified controller-side forward during initial setup. On the first turn to an online Namespace Devbox, Crew's local controller starts separate bounded forwards for gcloud and available Ashler services without delaying the turn; offline devices are woken first. Never ask the owner to start a second local agent session, copy a credential directory, or manually run `devbox port-forward` for normal Crew use.
 
-Use fixed channel callback ports installed by `configure-host.sh`: staging `27656`, production `27654`. Before presenting any authorization URL, check that the required local ports are free, then start one supervised Namespace forward for the whole setup:
+Use the production callback port `27654` installed by `configure-host.sh` (`27656` is reserved for staging). Before presenting any authorization URL, check that the required local ports are free, then start one supervised Namespace forward for the whole setup:
 
 ```bash
 # Avoid the owner's usual local app and Tilt ports by default.
 WEB_LOCAL_PORT="${WEB_LOCAL_PORT:-13000}"
 TILT_LOCAL_PORT="${TILT_LOCAL_PORT:-20350}"
 # Override either local port when it is already occupied.
-# staging; production uses 27654 instead of 27656
+# Production; staging uses 27656 instead of 27654.
 devbox port-forward "$DEVBOX_ID" \
-  --ports "27656:27656,8085:8085,$WEB_LOCAL_PORT:3000,$TILT_LOCAL_PORT:10350"
+  --ports "27654:27654,8085:8085,$WEB_LOCAL_PORT:3000,$TILT_LOCAL_PORT:10350"
 ```
 
 Port `8085` is gcloud's loopback callback. Ports `3000` and `10350` are remote app and Tilt ports; their local sides are `$WEB_LOCAL_PORT` and `$TILT_LOCAL_PORT`. Check the chosen local ports immediately before starting the forward. If either application port is occupied, set that variable to an unused local port and use it in every link and health check. Never stop the existing listener. Credential callback ports cannot be remapped because providers bind them into signed OAuth requests; fail closed rather than kill another listener. Keep this single forward alive through authentication and runtime verification. The tunnel transports loopback HTTP only; provider credentials are created and stored on the Devbox.
 This unified forward is setup-scoped. Stop it after authentication and endpoint verification—and before testing an ordinary Crew turn—so it does not collide with Crew's automatic `8085` forward or defeat Namespace auto-stop. Crew's relay, not this tunnel, carries coding-session control, transcripts, and streaming output.
 
-Run `~/.local/bin/crew-devbox-staging login` on the host and open its printed authorization URL for the owner. The forwarded fixed callback completes sign-in automatically; never ask the owner to paste its callback URL or code unless the provider rejects loopback callbacks.
+Run `~/.local/bin/crew-devbox-production login` on the host and open its printed authorization URL for the owner. The forwarded fixed callback completes sign-in automatically; never ask the owner to paste its callback URL or code unless the provider rejects loopback callbacks.
 
 For gcloud, run `~/.local/bin/crew-devbox-gcloud-login` on the host. It forces gcloud's normal `localhost:8085` browser flow without launching a remote browser; open the printed URL locally and let the existing forward return the callback directly to gcloud on the Devbox. Do not use `--no-browser`, `--no-launch-browser`, remote bootstrap, local credential export, or credential-directory copying for normal setup.
+
+The gcloud helper owns one interactive login at a time. Do not wrap it in a short command timeout: browser approval and MFA can legitimately take several minutes. If the controller disconnects or a login appears stale, inspect the existing Devbox listener/container before retrying. A still-running flow on `8085` remains authoritative; starting another flow makes gcloud choose `8086`, which the fixed callback tunnel intentionally does not forward. Stop only a duplicate flow created by this setup.
 
 GitHub uses its supported device flow and Infisical uses its supported interactive remote login; neither requires local credential copying. Preserve user approval and MFA. Do not distribute production credentials. Render only Infisical `platform/localdev` products for local development.
 
 OMP runs launched by Crew use Crew Agent Auth through a per-run inference route. Do not run OMP `/login`, copy provider credentials, or configure a separate OMP auth broker. A bare interactive `omp` process is not an Agent Auth test; verify models by starting a Crew-owned remote turn with an explicit selected model.
 
+Use the canonical model selector returned by Crew's model catalog, not the display label. For example, `openai-codex/gpt-5.6-luna` is a selector while `gpt-5.6-luna` is only its label; a label-only request can create a user message without a runnable agent turn or task marker.
+
 Start the configured engine with its installed supervisor:
 
 ```bash
-~/.local/bin/crew-devbox-autostart staging
-~/.local/bin/crew-devbox-staging status
+~/.local/bin/crew-devbox-autostart production
+~/.local/bin/crew-devbox-production status
 ```
 
 The helper uses a channel-specific tmux session and restarts the engine after exit with a five-second delay. It requires `tmux` and Python. Namespace's built-in image does not provide systemd; do not assume `comet daemon install` works there. Keep a declared interactive `dev-shell` session so `.bashrc` runs after a machine restart. A separate systemd-capable image may use Crew's native daemon installer instead, preserving the channel configuration and `NAMESPACE_DEVBOX_ID`; never run competing supervisors on one data directory.
 
-On a fresh machine, start the helper normally. On a reused machine whose engine predates this configuration, first verify there are no active turns, then stop only that channel's existing engine and start the helper once. Confirm the republished device row is labeled **Devbox** and carries the expected immutable Namespace ID before testing wake.
+On a fresh machine, start the helper normally. On a reused machine running staging, first verify there are no active turns, then stop only the staging engine before starting production once; never run both channels concurrently. Confirm the production device row is labeled **Devbox** and carries the expected immutable Namespace ID before testing wake.
 
 After one-time setup, ordinary coding sessions need no manual port forward or local coordinating LLM. Crew starts one 30-minute forward for gcloud `8085` and a separate 30-minute service forward for each available local mapping: `http://devbox.localhost:13000` reaches the Ashler app on Devbox port `3000`, and `http://tilt.devbox.localhost:20350` reaches Tilt on port `10350`. An occupied service port is skipped without affecting gcloud or the other service; failures are logged locally and never wake or relink an already-online device. Sending a draft to an offline Namespace device starts the explicit wake flow: the controller uses its installed `devbox` CLI and Namespace login, boots the selected machine, starts the matching channel helper, verifies the exact Crew device through the relay, then reloads refs and models.
 
 The manual wake equivalent is diagnostic only:
 
 ```bash
-devbox exec "$DEVBOX_ID" -- sh -c 'exec "$HOME/.local/bin/crew-devbox-autostart" staging'
+devbox exec "$DEVBOX_ID" -- sh -c 'exec "$HOME/.local/bin/crew-devbox-autostart" production'
 ```
 
 Do not teach the owner to use that command for normal operation. Provider reauthentication is exceptional and remains an interactive security boundary; rerun this skill's authentication phase so it owns the short-lived callback forward.
@@ -134,16 +138,18 @@ Keep `ASHLER_INCREMENTAL_TSC_CHECKS=false` and do not run local typechecks. Once
 
 The unified setup forward exposes the app at `http://devbox.localhost:$WEB_LOCAL_PORT` and Tilt at `http://tilt.devbox.localhost:$TILT_LOCAL_PORT`; these `*.localhost` names remain local to the owner's machine. Give the owner clickable links using the actual selected values only after both endpoints respond, then stop the setup forward before testing Crew's automatic forwards. Do not expose Tilt or browser CDP through `devbox url`. A Namespace `devbox.so` URL is optional, supports only `private` or `workspace` access, and must be created only after the owner authorizes that broader access.
 
+Crew wake proves the engine and relay are back; it does not prove the host-local kind/Tilt stack survived the machine stop. After every explicit stop/wake verification, recheck the app and Tilt endpoints. If Kubernetes reports a refused stale API-server port, use the maintained `just env` path to reconcile ctlptl/kind and regenerate kubeconfig, then restart the dedicated Tilt tmux session and wait for `critical-path-ready` on port `10350`. Reconciliation may recreate the ephemeral local cluster and database, so let the normal seed resource run again; never apply this recovery to a shared or snapshot database.
+
 ## Completion evidence
 
 Do not stop at installation. Record:
 
-1. Namespace machine name, verified owner, 16 CPU / 64 GiB capacity, and running Crew version/environment.
+1. Namespace machine name, verified owner, actual CPU/memory capacity, and active production Crew version/environment.
 2. Both Mac and Devbox sessions visible in Crew, with this host labeled **Devbox** and the owner-qualified device name. Stop the Devbox and confirm the same offline row remains reachable in **Settings → Devices** and the add-folder picker.
 3. A Mac-initiated turn that runs `hostname`/`pwd` on the Devbox and streams its real result back.
 4. Marker present while that turn is active and absent after completion/cancellation; shutdown clears only that engine's markers. Do not restart a user's active engine without coordinating their running turns.
 5. Headless Chromium successfully renders a page (not merely `--version`) and the forwarded app/Tilt endpoints respond.
 6. Login success without tokens in logs. Explain how to reconnect, log in through forwarded callbacks, and clean up truly stale markers.
-7. Explicitly stop an idle Devbox, then use Wake and connect or a pending send. Verify the same device ID returns, refs load, and the draft submits once; also verify passive sidebar viewing leaves a stopped machine stopped.
+7. Explicitly stop an idle Devbox, then use Wake and connect or a pending send. Verify the same device ID returns, refs load, the draft submits once, and the app/Tilt endpoints recover; also verify passive sidebar viewing leaves a stopped machine stopped.
 
 State any blocked authentication, missing release, or unverified UI explicitly. Do not claim an installed or locally tested implementation is already released.
