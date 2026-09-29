@@ -1160,6 +1160,10 @@ mod tests {
                 "routingMode": "automatic",
             })
         );
+        let sol = AgentRoute::from_omp_model("openai-codex/gpt-6.1-sol").unwrap();
+        assert_eq!(sol.provider, AgentProvider::OpenAi);
+        assert_eq!(sol.model, "gpt-6.1-sol");
+        assert_eq!(sol.omp_model(), "openai-codex/gpt-6.1-sol");
 
         let pinned = AgentRoute::pinned(
             AgentProvider::Anthropic,

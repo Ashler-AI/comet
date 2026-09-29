@@ -1,7 +1,7 @@
 {
   "source": {
     "repository": "Ashler-AI/ashler-platform",
-    "revision": "a149af01df2a7b04fd0d569b1135212c3ef2804a",
+    "revision": "11c6555ae3d07fc9057ee6fa4dfee35e2b013532",
     "path": "internal/scaffold/control-plane/worker/src/omp-auth-broker.ts"
   },
   "models": [
@@ -70,6 +70,18 @@
     {
       "id": "openai-codex/gpt-6-luna",
       "label": "gpt-6-luna",
+      "description": "1,050,000 context · 922,000 max input · 128,000 max output · Scaffold model · account access checked when starting a run",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    {
+      "id": "openai-codex/gpt-6.1-sol",
+      "label": "gpt-6.1-sol",
       "description": "1,050,000 context · 922,000 max input · 128,000 max output · Scaffold model · account access checked when starting a run",
       "reasoningLevels": [
         "low",

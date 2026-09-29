@@ -134,6 +134,12 @@ pub(crate) fn static_models() -> Vec<Model> {
             MAX_LADDER,
         ),
         model(
+            "gpt-6.1-sol",
+            "GPT-6.1 Sol",
+            "1,050,000 context · 922,000 max input · 128,000 max output",
+            MAX_LADDER,
+        ),
+        model(
             "gpt-6-luna",
             "GPT-6 Luna",
             "1,050,000 context · 922,000 max input · 128,000 max output",

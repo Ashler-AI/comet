@@ -2184,8 +2184,10 @@ fn models_from_catalog(bytes: &[u8]) -> Result<Vec<Model>, HarnessError> {
         .models
         .into_iter()
         .map(|model| {
-            let max_ladder = matches!(model.selector.rsplit('/').next(),
-                Some("claude-opus-5-5" | "gpt-6-sol" | "gpt-6-luna"));
+            let max_ladder = matches!(
+                model.selector.rsplit('/').next(),
+                Some("claude-opus-5-5" | "gpt-6-sol" | "gpt-6.1-sol" | "gpt-6-luna")
+            );
             let size_description = match (model.context_window, model.max_tokens) {
                 (Some(context_window), Some(max_tokens)) => {
                     format!("{context_window} context · {max_tokens} max output · ")
@@ -4609,7 +4611,8 @@ mod tests {
     fn catalog_rejects_unsupported_opus_5_5_efforts() {
         let models = models_from_catalog(br#"{"models":[
             {"selector":"anthropic/claude-opus-5-5","name":"Opus 5.5","thinking":["off","minimal","low","xhigh","max","ultracode"]},
-            {"selector":"custom/other","name":"Other","thinking":["minimal","high"]}
+            {"selector":"custom/other","name":"Other","thinking":["minimal","high"]},
+            {"selector":"openai-codex/gpt-6.1-sol","name":"GPT-6.1 Sol","thinking":["minimal","low","medium","high","xhigh","max","ultra"]}
         ]}"#).unwrap();
         assert_eq!(
             models[0].reasoning_levels,
@@ -4622,6 +4625,16 @@ mod tests {
         assert_eq!(
             models[1].reasoning_levels,
             vec![ReasoningLevel::Minimal, ReasoningLevel::High]
+        );
+        assert_eq!(
+            models[2].reasoning_levels,
+            vec![
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max
+            ]
         );
     }
 
@@ -4643,7 +4656,11 @@ mod tests {
                 ReasoningLevel::Max,
             ]
         );
-        for id in ["openai-codex/gpt-6-sol", "openai-codex/gpt-6-luna"] {
+        for id in [
+            "openai-codex/gpt-6-sol",
+            "openai-codex/gpt-6.1-sol",
+            "openai-codex/gpt-6-luna",
+        ] {
             let released = models
                 .iter()
                 .find(|model| model.id == id)
