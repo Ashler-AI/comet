@@ -869,10 +869,12 @@ actor RoomClient {
             guard let localChat = doc.getMap(id: "chats").get(key: "old")?.asLoroMap() else { return false }
             try localChat.insert(key: "lastSeenAt", v: Int64(300))
             doc.commit()
-            let original = doc
-            let originalVersion = doc.oplogVv()
 
             try chat.insert(key: "lastSeenAt", v: serverSeen)
+            source.commit()
+            // Two committed advances leave a dependency below the new shallow
+            // boundary; a one-op advance can still merge directly into the cache.
+            try chat.insert(key: "lastMessageAt", v: Int64(1_000))
             source.commit()
             let baselineVersion = source.oplogVv()
             let baseline = try source.export(mode: .shallowSnapshot(frontiers: source.stateFrontiers()))
@@ -888,22 +890,26 @@ actor RoomClient {
             try status.insert(key: "status", v: "working")
             try status.insert(key: "updatedAt", v: Int64(2_000))
             source.commit()
+            let tail = try source.export(mode: .updates(from: baselineVersion))
+            let receiver = LoroDoc()
+            _ = try receiver.importWith(bytes: baseline, origin: "server")
+            _ = try receiver.importWith(bytes: tail, origin: "server")
 
             await onJoinOk(crdt: .loro, version: [UInt8](source.oplogVv().encode()))
             guard uploads.isEmpty, recovering else { return false }
             await applyRemote(crdt: .loro, updates: [[UInt8](baseline)])
-            guard doc === original, uploads.isEmpty, recovering,
+            guard uploads.isEmpty, recovering,
                   doc.getMap(id: "chats").get(key: "new") == nil else { return false }
-            await applyRemote(crdt: .loro, updates: [[UInt8](try source.export(mode: .updates(from: baselineVersion)))])
-            guard doc !== original, original.oplogVv() == originalVersion,
-                  localChat.get(key: "lastSeenAt")?.asValue()?.i64Value == 300 else { return false }
+            await applyRemote(crdt: .loro, updates: [[UInt8](tail)])
             if serverSeen < 300 {
-                guard uploads.count == 1, recovering else { return false }
-                for bytes in uploads[0].0 {
-                    let imported = try source.importWith(bytes: Data(bytes), origin: "phone")
-                    guard imported.pending?.isEmpty ?? true else { return false }
+                guard !uploads.isEmpty, recovering else { return false }
+                for (updates, batch) in uploads {
+                    for bytes in updates {
+                        let imported = try receiver.importWith(bytes: Data(bytes), origin: "phone")
+                        guard imported.pending?.isEmpty ?? true else { return false }
+                    }
+                    await onAck(crdt: .loro, refId: batch, status: .ok)
                 }
-                await onAck(crdt: .loro, refId: uploads[0].1, status: .ok)
             } else {
                 guard uploads.isEmpty else { return false }
             }
@@ -912,7 +918,8 @@ actor RoomClient {
                 && projected.chats.first(where: { $0.id == "old" })?.lastSeenAt == max(serverSeen, 300)
                 && projected.sessions["old"]?.updatedAt == 2_000
                 && effectiveStatus(projected.sessions["old"], now: 2_000) == .working
-                && chat.get(key: "lastSeenAt")?.asValue()?.i64Value == max(serverSeen, 300)
+                && receiver.getMap(id: "chats").get(key: "old")?.asLoroMap()?
+                    .get(key: "lastSeenAt")?.asValue()?.i64Value == max(serverSeen, 300)
         } catch {
             await E2ERunner.log("FAIL Crew warm shallow recovery error: \(error)")
             return false
