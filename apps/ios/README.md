@@ -92,6 +92,30 @@ produce these build candidates.
 has no dispatch inputs and runs only on pushes to `verify/native-lifecycle-*`
 or `verify/native-startup-*`; it neither creates nor signs mobile archives.
 
+### Crew 0.1.132 mobile release evidence
+
+Merged source `e5029a5b8495dc44f2d63869d63dc7fa0ab14749` passed all ten native
+scenarios in [staging CI](https://github.com/Ashler-AI/comet/actions/runs/36760070670)
+and [production CI](https://github.com/Ashler-AI/comet/actions/runs/36760074813).
+Downloaded checksums and source provenance matched both candidates.
+
+Crew Staging **1.0 (28)** uploaded at **19:25 UTC** on September 30. Authenticated
+App Store Connect readback confirmed Complete, VALID, INTERNAL_ONLY, and
+IN_BETA_TESTING; the build list shows the existing **Ashler Internal** group.
+Its exact uploaded IPA passed strict deep signature verification, has bundle
+`ai.ashler.crew.staging`, build 28, and `aps-environment = production`.
+Uploaded IPA SHA-256: `e0d0f27ed7b8033995611a4cfbaf52b0a957b7320c813bb73bd5e0304a962674`.
+Apple build/upload record: `9cc32fb7-96dc-44d6-a56d-937995f70472`.
+
+Crew **1.0 (21)** is prepared but **not uploaded** pending captain verification
+of the restarted staging desktop. Its distribution-signed inspection IPA passed
+strict deep signature verification with bundle `ai.ashler.crew`, build 21, and
+production APNs. Inspection SHA-256:
+`d3f9d80d1d4085f911974152668d96ca4ca071a8431093ad1f78b90563f12b33`.
+Export/upload performed no local compilation or typechecks. No tester memberships,
+account permissions, or public App Store submissions changed. Physical-phone
+installation and notification receipt were not verified.
+
 ### September 30 warm-cache release evidence
 
 The permanent warm-cache repair is merged in [PR #56](https://github.com/Ashler-AI/comet/pull/56).
