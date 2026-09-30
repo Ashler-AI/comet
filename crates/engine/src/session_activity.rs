@@ -1,34 +1,50 @@
 //! Local-controller projection of exact Scaffold rooms into sidebar activity.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use comet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
 use comet_proto::{
-    Session, SessionEnvironmentSource, SessionRef, SessionRoomProjection, SessionStatus,
+    Chat, Session, SessionEnvironmentSource, SessionRef, SessionRoomProjection, SessionStatus,
 };
 use tokio::task::{AbortHandle, JoinSet};
 
 use crate::{DocHost, WorkspaceHost};
+
+fn projected_rooms(
+    refs: &[SessionRef],
+    chats: &[Chat],
+    project: &str,
+) -> HashMap<String, SessionRoomProjection> {
+    let archived: HashSet<_> = chats
+        .iter()
+        .filter(|chat| chat.archived)
+        .map(|chat| chat.id.as_str())
+        .collect();
+    refs.iter()
+        .filter(|reference| !archived.contains(reference.chat_id.as_str()))
+        .filter_map(|reference| {
+            projection(reference, project).map(|scope| (reference.chat_id.clone(), scope))
+        })
+        .collect()
+}
 
 pub(crate) struct SessionActivity(AbortHandle);
 
 impl SessionActivity {
     pub(crate) fn start(host: DocHost, workspace: WorkspaceHost) -> Self {
         let mut refs = workspace.watch_session_refs();
+        let mut chats = workspace.watch_chats();
         let task = tokio::spawn(async move {
             // Dropping the set aborts every room observer, including at shutdown.
             let mut tasks = JoinSet::new();
             let mut rooms: HashMap<String, (SessionRoomProjection, AbortHandle)> = HashMap::new();
             loop {
-                let wanted: HashMap<_, _> = refs
-                    .borrow_and_update()
-                    .iter()
-                    .filter_map(|reference| {
-                        projection(reference, workspace.project_scope())
-                            .map(|scope| (reference.chat_id.clone(), scope))
-                    })
-                    .collect();
+                let wanted = {
+                    let chat_rows = chats.borrow_and_update();
+                    let ref_rows = refs.borrow_and_update();
+                    projected_rooms(&ref_rows, &chat_rows, workspace.project_scope())
+                };
                 rooms.retain(|id, (scope, task)| {
                     if wanted.get(id) == Some(scope) && !task.is_finished() {
                         true
@@ -128,6 +144,7 @@ impl SessionActivity {
                 }
                 tokio::select! {
                     changed = refs.changed() => if changed.is_err() { break; },
+                    changed = chats.changed() => if changed.is_err() { break; },
                     Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
                 }
             }
@@ -318,6 +335,28 @@ mod tests {
             })
         })
         .await;
+        workspace.set_chat_archived("chat", true).unwrap();
+        let archived = receive(&mut chats, |chats| chats[0].archived).await;
+        assert!(
+            projected_rooms(std::slice::from_ref(&reference), &archived, "project").is_empty(),
+            "archived sessions must not keep room observers alive"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while std::sync::Arc::strong_count(&handle) > 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("archived room observer stayed alive");
+        workspace.set_chat_archived("chat", false).unwrap();
+        receive(&mut chats, |chats| !chats[0].archived).await;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while std::sync::Arc::strong_count(&handle) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unarchived room observer did not restart");
         let now = DateTime::from_timestamp_millis(5_000).unwrap();
         assert_eq!(
             comet_proto::view::display_status(&list[0], rows.first(), now),
