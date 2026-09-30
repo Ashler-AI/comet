@@ -26,6 +26,19 @@ Release verification dropped a redundant callback-RPC-count test that assumed a
 background tunnel request ran before message admission. The failed-tunnel and
 hung-tunnel regressions still verify that forwarding does not block sends.
 
+Crew **0.1.132** staging published from `4346d8a3612de0e988998a66e7eec25bff83c2c6`
+in [release run 36765542374](https://github.com/Ashler-AI/comet/actions/runs/36765542374).
+The run verified the signed macOS candidate and read back the desktop,
+desktop-staging, and Scaffold staging channels. Production must reuse this exact
+`candidate_run_id` after captain approval; no production publication or Scaffold
+image-pin changes have been performed. Crew Staging mobile **1.0 (28)** is available
+in the existing Ashler Internal TestFlight group; production mobile **1.0 (21)**
+is verified and prepared but not uploaded. See
+[mobile publication evidence](apps/ios/README.md#crew-01132-mobile-release-evidence).
+Downloaded macOS distributions also passed checksums, strict same-team signatures,
+stapler and Gatekeeper checks, with matching DMG/updater bundles. Candidate SHA-256:
+`952d02d9ac401398dd439d56ad12340fa038d3af5a8a2bc1ee972133e0bbdcfc`.
+
 ## Crew 0.1.119: Namespace Devboxes
 
 Namespace hosts advertise a **Devbox** environment separately from their Linux OS
