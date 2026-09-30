@@ -217,6 +217,21 @@ impl Drop for AuthForwardLease {
     }
 }
 
+struct ForwardProcessGroup(Option<u32>);
+
+impl Drop for ForwardProcessGroup {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(group) = self.0 {
+            // SAFETY: this process created `group` for the forward below and
+            // retains the guard only while that exact process tree may live.
+            unsafe {
+                libc::killpg(group as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+}
+
 async fn ensure_auth_forward(
     executable: PathBuf,
     provider_id: String,
@@ -244,14 +259,22 @@ async fn ensure_auth_forward(
         provider_id: provider_id.clone(),
     };
     let port_spec = forward_port_spec(&ports);
-    let mut child = Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .args(["port-forward", &provider_id, "--ports", &port_spec])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.as_std_mut().process_group(0);
+    }
+    let mut child = command
         .spawn()
         .map_err(|error| format!("Could not start Namespace port forward: {error}"))?;
+    let process_group = ForwardProcessGroup(child.id());
     let ready = tokio::time::timeout(ready_timeout, async {
         loop {
             if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
@@ -275,6 +298,7 @@ async fn ensure_auth_forward(
         return Err(error);
     }
     tokio::spawn(async move {
+        let _process_group = process_group;
         tokio::select! {
             _ = tokio::time::sleep(lease_duration) => {
                 let _ = child.kill().await;
@@ -685,7 +709,13 @@ mod tests {
             raw.parse::<u16>().unwrap(),
         ))
         .unwrap();
-        std::thread::sleep(Duration::from_secs(60));
+        std::thread::sleep(
+            std::env::var("COMET_TEST_AUTH_FORWARD_SLEEP_MS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .map(Duration::from_millis)
+                .unwrap_or(Duration::from_secs(60)),
+        );
     }
 
     #[cfg(unix)]
@@ -739,6 +769,47 @@ mod tests {
             tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, callback_port))
                 .await
                 .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn callback_tunnel_lease_kills_spawned_process_group() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let callback_port = unused_port();
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("devbox");
+        let test_binary = std::env::current_exe().unwrap();
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nCOMET_TEST_AUTH_FORWARD_PORT='{callback_port}' COMET_TEST_AUTH_FORWARD_SLEEP_MS=2000 '{}' --exact device_wake::tests::auth_forward_child --nocapture &\nwait\n",
+                test_binary.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let wake = DeviceWake::default();
+        ensure_auth_forward(
+            executable,
+            "ofpf7g22n4412".into(),
+            vec![(callback_port, 8085)],
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+            wake.auth_forward.clone(),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, callback_port))
+                .await
+                .is_err(),
+            "forward grandchild survived its lease"
         );
     }
 

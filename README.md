@@ -2,6 +2,13 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Unreleased: Devbox streaming and forwards
+
+Archived remote sessions no longer retain background room observers, so active
+Devbox transcripts and status updates are not starved by old session history.
+Crew-owned Namespace forwards run in an isolated process group; their 30-minute
+lease now stops helper subprocesses as well as the top-level `devbox` command.
+
 ## Crew 0.1.119: Namespace Devboxes
 
 Namespace hosts advertise a **Devbox** environment separately from their Linux OS
