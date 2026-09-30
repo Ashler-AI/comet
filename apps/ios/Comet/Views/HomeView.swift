@@ -32,7 +32,6 @@ struct HomeView: View {
             .scrollContentBackground(.hidden)
             .scrollEdgeEffectStyle(.soft, for: .top)
             .background(Theme.surface.ignoresSafeArea())
-            .refreshable { await model.refreshSync() }
             .navigationTitle("Crew")  // feeds the back menu; not displayed
             .navigationBarTitleDisplayMode(.inline)
             .toolbar(removing: .title)

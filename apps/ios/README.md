@@ -94,7 +94,7 @@ or `verify/native-startup-*`; it neither creates nor signs mobile archives.
 
 ### Recent-session room recovery
 
-Foregrounding Crew or pulling down the Sessions list probes quiet workspace and
+Foregrounding Crew probes quiet workspace and
 open session rooms, matching desktop's 30-second quiet-room gate. An outstanding
 join coalesces repeated refreshes; a missed answer uses the existing bounded
 reconnect path. Write acknowledgements and transport pongs do not reset the
