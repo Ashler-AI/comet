@@ -108,6 +108,17 @@ the complete advertised server frontier arrives. Only then are local edits repla
 and any surviving writes uploaded, with readiness still gated on their ACKs. Cached
 bindings remain intact if recovery fails. No shared-room reset or sign-out is needed.
 
+Candidate source `e84fd0e8f803cb3cb7699836937c3f6930ee67b7` passed all ten native
+scenarios and device archiving in [staging CI](https://github.com/Ashler-AI/comet/actions/runs/36676358982)
+and [production CI](https://github.com/Ashler-AI/comet/actions/runs/36676361725).
+The actual affected cache was then copied into an isolated simulator against a real
+local edge holding the captured server state. Build 26 reproduced the native
+`fork_at on shallow docs` errors and repeated rejected uploads. The exact build 27
+candidate adopted the complete snapshot, cleared the connecting indicator, and
+persisted all 1,434 server memberships plus one isolated test marker. Live updates
+rendered Running → Failed → Running. Old receipt-operation IDs were not falsely
+advertised as imported. No real phone or shared cloud data was changed by this check.
+
 Builds 26/19 supplied foreground probes, not this warm-cache repair. Both were built
 from merged source `1b0f7bb7a9a96d356cfd236adf8ae350a64b6c84` and passed all ten
 scenarios in [staging CI](https://github.com/Ashler-AI/comet/actions/runs/36669878791)

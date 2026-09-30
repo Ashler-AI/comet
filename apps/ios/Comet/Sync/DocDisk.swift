@@ -131,17 +131,16 @@ enum DocDisk {
 
         // diff/checkout can change attachment/state in SDK versions. Work only
         // on forks, keeping the old binding usable if any step fails.
-        let local = previous.fork()
-        let baseFrontiers = local.vvToFrontiers(vv: common)
-        guard let reconstructed = local.frontiersToVv(frontiers: baseFrontiers),
+        let base = previous.fork()
+        let baseFrontiers = base.vvToFrontiers(vv: common)
+        guard let reconstructed = base.frontiersToVv(frontiers: baseFrontiers),
               reconstructed == common
         else { return false }
-        // forkAt is unsupported for shallow docs. Checkout a separate read-only
-        // fork instead; its oplog deliberately retains the local edits.
-        let base = local.fork()
+        let delta = try base.diff(a: baseFrontiers, b: base.oplogFrontiers())
+        // forkAt is unsupported for shallow docs. Reuse this isolated fork as
+        // the read-only base; its oplog deliberately retains the local edits.
         try base.checkout(frontiers: baseFrontiers)
         guard base.stateVv() == common else { return false }
-        let delta = try local.diff(a: baseFrontiers, b: local.oplogFrontiers())
         let candidate = replacement.fork()
 
         // applyDiff is a state replay, NOT a concurrent CRDT merge. Map value
