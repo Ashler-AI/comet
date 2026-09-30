@@ -22,6 +22,10 @@ remain gated on captain verification of the restarted staging desktop app. Infer
 review could not start because this repository lacks the checked-in opposite-provider
 launcher; local typechecks were intentionally skipped.
 
+Release verification dropped a redundant callback-RPC-count test that assumed a
+background tunnel request ran before message admission. The failed-tunnel and
+hung-tunnel regressions still verify that forwarding does not block sends.
+
 ## Crew 0.1.119: Namespace Devboxes
 
 Namespace hosts advertise a **Devbox** environment separately from their Linux OS
