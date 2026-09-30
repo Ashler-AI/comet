@@ -295,7 +295,7 @@ actor RoomClient {
     /// hibernation is NOT death, which is why probes run in minutes while
     /// the transport lease runs in seconds.
     private func livenessTick(gen: Int, at instant: DispatchTime = .now()) async {
-        guard gen == generation, socket != nil, !closed else { return }
+        guard gen == generation, !closed else { return }
         let now = instant.uptimeNanoseconds
         if let sent = joinSentAt {
             let base = max(sent.uptimeNanoseconds, lastLorRx.uptimeNanoseconds)
@@ -817,8 +817,6 @@ actor RoomClient {
         regressionSend = { message in
             if case .joinRequest(.loro, _, _, _) = message { joins += 1 }
         }
-        // Never resume this socket; all sends use the in-process transport.
-        socket = URLSession.shared.webSocketTask(with: URL(string: "http://127.0.0.1:1")!)
         defer { regressionSend = nil; stop() }
         do {
             await onJoinOk(crdt: .loro, version: [])
