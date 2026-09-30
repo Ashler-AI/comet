@@ -724,6 +724,46 @@ describe("SessionRoom chat authorization", () => {
     }
   });
 
+  it("atomically reseeds a workspace reset from one bounded complete snapshot", async () => {
+    const previous = new LoroDoc();
+    const replacement = new LoroDoc();
+    const restored = new LoroDoc();
+    try {
+      previous.getMap("metadata").set("previous", true);
+      replacement.getMap("metadata").set("canonical", true);
+      const sql = new MemorySql();
+      sql.putBlob("snapshot", previous.export({ mode: "snapshot" }));
+      sql.meta.set("roomKind", "workspace");
+      sql.meta.set("owner", PROJECT_SCOPE);
+      sql.meta.set("chatId", "ws4/project-a");
+      const { room } = makeRoom(sql);
+
+      const oversized = await room.fetch(authedRequest("/reset-log", "user-a", {
+        method: "POST", headers: { [ROOM_KIND_HEADER]: "workspace" },
+        body: new Uint8Array(8 * 1024 * 1024 + 1)
+      }));
+      expect(oversized.status).toBe(413);
+      expect(sql.hasBlob("snapshot")).toBe(true);
+
+      const seed = replacement.export({
+        mode: "shallow-snapshot", frontiers: replacement.frontiers()
+      });
+      const response = await room.fetch(authedRequest("/reset-log", "user-a", {
+        method: "POST", headers: { [ROOM_KIND_HEADER]: "workspace" }, body: seed
+      }));
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({ ok: true, seedBytes: seed.byteLength });
+
+      const cold = await makeRoom(sql).room.fetch(authedRequest("/snapshot", "user-a"));
+      restored.import(new Uint8Array(await cold.arrayBuffer()));
+      expect(restored.toJSON()).toEqual({ metadata: { canonical: true } });
+      expect(sql.updateCount()).toBe(0);
+      expect(sql.meta.get("postReset")).toBe("0");
+    } finally {
+      restored.free(); replacement.free(); previous.free();
+    }
+  });
+
   it("bootstraps out-of-order pending deltas without losing them across cold replay", async () => {
     const source = new LoroDoc();
     const map = source.getMap("metadata");

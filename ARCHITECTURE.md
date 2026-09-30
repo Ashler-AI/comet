@@ -149,6 +149,11 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
    forcing every active reader to materialize unbounded superseded operations. Session
    transcripts remain independently durable in their per-session documents.
 
+   Authorized workspace recovery may atomically replace a wedged room with one bounded complete
+   snapshot. The edge validates the snapshot envelope and enforces an 8 MiB observed-byte limit
+   before clearing old state, so independently compacted clients cannot race to seed incompatible
+   causal boundaries. An empty reset body retains the legacy clear-and-reupload operation.
+
    A join response is not proof of convergence. Native clients retain advertised remote version
    requirements across reconnects, wait for materialized backfill and catch-up upload ACKs, and
    stay disconnected on rejection or unresolved dependencies. Pending initial joins are owned
