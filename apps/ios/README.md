@@ -22,7 +22,7 @@ automatically): [loro-swift 1.13.x](https://github.com/loro-dev/loro-swift)
 (cmark-gfm: tables/strikethrough/tasklists — the same feature set as the
 desktop's pulldown-cmark config).
 
-Mobile staging **1.0 (26)** and production **1.0 (19)** are available
+Mobile staging **1.0 (27)** and production **1.0 (20)** are available
 through their existing **Ashler Internal** TestFlight groups. Both are internal-only
 releases, not public App Store submissions. Upload and verification evidence is
 recorded below.
@@ -91,6 +91,35 @@ produce these build candidates.
 `native-verification.yml` is a separate Rust/desktop verification workflow. It
 has no dispatch inputs and runs only on pushes to `verify/native-lifecycle-*`
 or `verify/native-startup-*`; it neither creates nor signs mobile archives.
+
+### September 30 warm-cache release evidence
+
+The permanent warm-cache repair is merged in [PR #56](https://github.com/Ashler-AI/comet/pull/56).
+Release source `576b7753c838083ad1cb683c4201f6e9431ae2ed` passed all ten native
+scenarios, including both receipt precedence directions and shallow-server admission,
+in [staging CI](https://github.com/Ashler-AI/comet/actions/runs/36680346402) and
+[production CI](https://github.com/Ashler-AI/comet/actions/runs/36680349038).
+Downloaded checksums and provenance matched that merged source.
+
+Distribution export and upload performed no local compilation. Both inspection IPAs
+passed strict deep signatures, expected bundle/build identities, and matching
+production APNs profile/signature checks. Inspection IPA SHA-256 values:
+
+- Staging 27: `040ae2a223bce5922c89a551e3db8c2f7d9564e9cfe6b82faa04372f528ed239`
+- Production 20: `9b4a2d39076880f1361ffa843a22c75ad81dbbc6a0e16e43abef10526b8bf3d5`
+
+Apple accepted production at **07:07 UTC** and staging at **07:13 UTC** on September
+30. Authenticated App Store Connect readback confirmed both uploads Complete and
+both builds Testing in their existing **Ashler Internal** groups. Production's API
+also reported VALID, INTERNAL_ONLY, IN_BETA_TESTING, and the existing internal-group
+relationship. No tester membership or account permissions changed and no public App
+Store submission occurred. Physical-phone acceptance of builds 27/20 is still a
+separate check; the affected-cache simulator proof is recorded below.
+
+The opposite-provider review attempt could not start because this repository lacks
+the checked-in launcher (`MODULE_NOT_FOUND`); no review passed. Local typechecks were
+intentionally skipped to preserve workstation resources. No shared room history,
+phone cache, login, or active desktop engine was reset by this release.
 
 ### Warm shallow-cache recovery
 
