@@ -2,12 +2,25 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
-## Unreleased: Devbox streaming and forwards
+## Crew 0.1.132 release candidate
 
 Archived remote sessions no longer retain background room observers, so active
 Devbox transcripts and status updates are not starved by old session history.
 Crew-owned Namespace forwards run in an isolated process group; their 30-minute
 lease now stops helper subprocesses as well as the top-level `devbox` command.
+
+This candidate includes the mobile shallow-cache recovery in
+[PR #56](https://github.com/Ashler-AI/comet/pull/56) and the Devbox streaming/forward
+fixes in [PR #58](https://github.com/Ashler-AI/comet/pull/58). Mobile candidates are
+Crew Staging **1.0 (28)** and Crew **1.0 (21)**. The Scaffold runtime contract stays
+`scaffold.comet-runtime.v1`; both Scaffold image lanes must pin the verified release's
+version, private bucket, and Linux x86_64 digest together.
+
+The local headed demo built 0.1.132, admitted a mock release-smoke prompt, and rendered
+its streamed response. Desktop production promotion and both Scaffold pin changes
+remain gated on captain verification of the restarted staging desktop app. Inference
+review could not start because this repository lacks the checked-in opposite-provider
+launcher; local typechecks were intentionally skipped.
 
 ## Crew 0.1.119: Namespace Devboxes
 
