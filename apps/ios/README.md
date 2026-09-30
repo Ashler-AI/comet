@@ -103,6 +103,17 @@ hide missing session updates. Background probes retain their existing idle backo
 Recovery preserves cached documents and local operations; it does not reset shared
 room history, sign the user out, or widen principal/project membership.
 
+Corrected source `cbd7dc52c9d8dfc7edf41304aba139838110c4d6` passed all ten mobile
+scenarios and device archiving in [production CI](https://github.com/Ashler-AI/comet/actions/runs/36668250877).
+Its checksum-verified simulator binary was exercised against a real local Wrangler
+edge with one workspace broadcast deliberately withheld. Foregrounding, without
+restarting, issued one rejoin, received the missing backfill, and displayed the newest
+session first. The preceding staging build 25 stayed stale under the same fault.
+This is simulator proof, not a physical-phone acceptance claim. No shared room was
+reset and no active desktop engine was restarted. Local typechecks were intentionally
+skipped. The required opposite-provider review attempt failed with `MODULE_NOT_FOUND`
+because this repository lacks the checked-in review launcher; no review passed.
+
 ### Crew 0.1.119 upload evidence
 
 Merged source `c2d56a272d8143c6501ed5f41ea6fe2162ecd696` passed
