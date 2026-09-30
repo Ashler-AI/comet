@@ -2,6 +2,23 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Crew 0.1.133 release candidate
+
+Workspace CRDT history is now bounded without removing sessions: native clients
+persist state-only snapshots before joining, and the edge shallow-compacts
+workspace history under the same retention policy as session documents. Current
+chat, archive, session, device, space, and worktree state remains intact; stale
+peers resynchronize current metadata while transcripts remain independently
+durable in their session documents.
+
+The retained staging workspace shrinks from 15,359,379 bytes to 2,272,109 bytes
+while preserving all 1,577 chat rows and 1,465 session rows. The Scaffold runtime
+contract stays `scaffold.comet-runtime.v1`.
+The local headed demo built 0.1.133, admitted a mock workspace-compaction
+smoke prompt, and rendered the streamed response.
+Opposite-provider review could not start because this repository has no checked-in
+review launcher. Local typechecks were intentionally skipped.
+
 ## Crew 0.1.132 release candidate
 
 Archived remote sessions no longer retain background room observers, so active

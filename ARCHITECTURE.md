@@ -143,11 +143,11 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
 
    *Why a workspace doc and not N tiny docs:* the sidebar needs one subscription for the whole
    list (grouping, resort animations, unseen markers); one doc = one room connection + one mirror.
-   Workspace history uses **lossless snapshot folding**, not age- or size-based shallow trimming:
-   disconnected writers may still depend on any retained operation. This trades increasing
-   retained history for correct offline merges; transcript-room retention is separate. Fresh
-   readers receive the persisted baseline followed by ordered accepted deltas, avoiding a
-   whole-history export for every sign-in.
+   Workspace snapshots use bounded shallow history: the edge retains current state plus a
+   three-day causal boundary, and native clients persist state-only snapshots before joining.
+   A peer older than the retained boundary re-syncs current workspace metadata instead of
+   forcing every active reader to materialize unbounded superseded operations. Session
+   transcripts remain independently durable in their per-session documents.
 
    A join response is not proof of convergence. Native clients retain advertised remote version
    requirements across reconnects, wait for materialized backfill and catch-up upload ACKs, and
