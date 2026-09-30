@@ -682,72 +682,45 @@ describe("SessionRoom chat authorization", () => {
     }
   });
 
-  it("keeps offline workspace writes mergeable through retention pressure and backfills a fresh reader", async () => {
+  it("bounds workspace history while preserving current state and future writes", async () => {
     const source = new LoroDoc();
-    const offline = new LoroDoc();
+    const writer = new LoroDoc();
     const reader = new LoroDoc();
-    let offlineBase: VersionVector | undefined;
-    let bufferedBase: VersionVector | undefined;
+    let writerBase: VersionVector | undefined;
     try {
       source.getMap("metadata").set("base", true);
+      source.getMap("metadata").set("payload", oversizedPayload());
       source.commit();
+      source.getMap("metadata").set("payload", "current");
+      source.commit();
+      const fullSnapshot = source.export({ mode: "snapshot" });
+      expect(fullSnapshot.byteLength).toBeGreaterThan(512 * 1024);
       const sql = new MemorySql();
-      sql.putBlob("snapshot", source.export({ mode: "snapshot" }));
-      offline.import(source.export({ mode: "snapshot" }));
-      offlineBase = offline.oplogVersion();
-      offline.getMap("metadata").set("offline", "preserved");
-      offline.commit();
+      sql.putBlob("snapshot", fullSnapshot);
       sql.meta.set("roomKind", "workspace");
       sql.meta.set("owner", PROJECT_SCOPE);
       sql.meta.set("chatId", "ws4/project-a");
       const { room } = makeRoom(sql);
       const internals = room as unknown as SessionRoomInternals;
-      // Large obsolete history triggers folding; an aged cutoff would also
-      // trim past the offline writer if workspaces shared transcript policy.
-      source.getMap("metadata").set("payload", oversizedPayload());
-      source.commit();
-      source.getMap("metadata").set("payload", "current");
-      source.commit();
-      expect((await room.fetch(authedRequest("/append", "user-a", {
-        method: "POST", body: source.export({ mode: "update" })
-      }))).status).toBe(200);
-      sql.meta.set("checkpoints", JSON.stringify([{ at: Date.now() - 365 * 24 * 60 * 60 * 1000, frontiers: source.frontiers() }]));
-      await room.fetch(authedRequest("/stats", "user-a"));
-      expect(await internals.trimHistoryIfDue(await internals.ensureDoc(), Date.now())).toBe(false);
-      const offlineDelta = offline.export({ mode: "update", from: offlineBase });
-      expect((await room.fetch(authedRequest("/append", "user-a", { method: "POST", body: offlineDelta }))).status).toBe(200);
-      source.import(offlineDelta);
-      await room.fetch(authedRequest("/stats", "user-a"));
-      bufferedBase = source.oplogVersion();
-      source.getMap("metadata").set("buffered", "latest");
-      source.commit();
-      expect((await room.fetch(authedRequest("/append", "user-a", {
-        method: "POST", body: source.export({ mode: "update", from: bufferedBase })
-      }))).status).toBe(200);
-      const emptyVersion = reader.oplogVersion();
-      let socket: CapturingSocket;
-      try { socket = await join(room, "user-a", "ws4/project-a", emptyVersion.encode()); }
-      finally { emptyVersion.free(); }
-      let fragments: Uint8Array | undefined;
-      let offset = 0;
-      for (const bytes of socket.sent) {
-        const message = decode(bytes);
-        if (message.type === MessageType.DocUpdateFragmentHeader) {
-          fragments = new Uint8Array(message.totalSizeBytes);
-          offset = 0;
-        } else if (message.type === MessageType.DocUpdateFragment) {
-          fragments!.set(message.fragment, offset);
-          offset += message.fragment.length;
-          if (offset === fragments!.length) expect(reader.import(fragments!).pending?.size ?? 0).toBe(0);
-        } else if (message.type === MessageType.DocUpdate) {
-          for (const update of message.updates) expect(reader.import(update).pending?.size ?? 0).toBe(0);
-        }
-      }
+      expect(sql.meta.get("lastTrimAt")).toBeUndefined();
+      await internals.ensureDoc();
+      expect(sql.meta.get("lastTrimAt")).toBeDefined();
+      const compacted = await room.fetch(authedRequest("/snapshot", "user-a"));
+      const compactedBytes = new Uint8Array(await compacted.arrayBuffer());
+      expect(compactedBytes.byteLength).toBeLessThan(fullSnapshot.byteLength / 2);
+      reader.import(compactedBytes);
       expect(reader.toJSON()).toEqual(source.toJSON());
-      offline.import(reader.export({ mode: "update", from: offlineBase }));
-      expect(offline.toJSON()).toEqual(source.toJSON());
+
+      writer.import(compactedBytes);
+      writerBase = writer.oplogVersion();
+      writer.getMap("metadata").set("future", "preserved");
+      writer.commit();
+      expect((await room.fetch(authedRequest("/append", "user-a", {
+        method: "POST", body: writer.export({ mode: "update", from: writerBase })
+      }))).status).toBe(200);
+      expect((await internals.ensureDoc()).toJSON()).toEqual(writer.toJSON());
     } finally {
-      bufferedBase?.free(); offlineBase?.free(); reader.free(); offline.free(); source.free();
+      writerBase?.free(); reader.free(); writer.free(); source.free();
     }
   });
 

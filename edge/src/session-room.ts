@@ -10,10 +10,10 @@
  *   ops is healed by normal CRDT resync from the host on reconnect).
  * - `snapshot` blob — the doc's current snapshot. Two-level compaction:
  *   LOG FOLD (whenever the update log passes COMPACT_LOG_BYTES): re-export a
- *   full snapshot and clear the log — loses nothing. Workspace documents use
- *   lossless folds only so offline writers remain mergeable. Session HISTORY
- *   TRIM retains its existing age/size policy: export a shallow snapshot at a
- *   retained frontier, permanently discarding older history (§3.1).
+ *   full snapshot and clear the log — loses nothing. HISTORY TRIM retains the
+ *   current state and a shallow causal boundary while discarding superseded
+ *   operations. Peers older than that boundary take the stale-peer full-resync
+ *   path; session transcripts remain independently durable.
  * - `tail` blob — materialized last-N-messages JSON, recomputed lazily on
  *   GET /tail when dirty (§5 L2).
  * - `diff` blob — latest-only working-tree diff sidecar, overwritten on each
@@ -1673,24 +1673,21 @@ export class SessionRoom implements DurableObject {
    * `this.doc`). Best-effort: any export failure leaves the room to the
    * caller's lossless fold. */
   private async trimHistoryIfDue(doc: LoroDoc, now: number): Promise<boolean> {
-    // Workspace writers can remain offline indefinitely. Neither an age nor a
-    // size threshold proves their operations are above a safe causal boundary.
-    // Unknown legacy rooms stay lossless until a trusted request classifies them.
-    if (this.retainsWorkspaceHistory() || this.docPendingEnds?.size) return false;
+    // Pending dependencies mean the materialized state is incomplete. Unknown
+    // legacy rooms stay lossless until a trusted request classifies them.
+    const kind = this.getMeta("roomKind");
+    if ((kind !== "session" && kind !== "workspace") || this.docPendingEnds?.size) return false;
     const checkpoints = JSON.parse(this.getMeta("checkpoints") ?? "[]") as FrontierCheckpoint[];
     const cutoff = checkpoints.filter((c) => now - c.at >= RETAIN_MS).pop();
     let frontiers: { peer: `${number}`; counter: number }[];
     // The durable lastTrimAt marker identifies the cutoff already applied.
     // A cold start or regular snapshot re-export must not re-trim that cutoff,
     // regardless of the materialized document's shallow status.
+    const retainedBytes = (this.blobs.byteLength("snapshot") ?? 0) +
+      Number(this.getMeta("updateBytes") ?? "0") + this.pendingBytes;
     if (cutoff && this.getMeta("lastTrimAt") !== String(cutoff.at)) {
       frontiers = cutoff.frontiers.map((f) => ({ peer: f.peer as `${number}`, counter: f.counter }));
-    } else if (
-      (this.blobs.byteLength("snapshot") ?? 0) +
-        Number(this.getMeta("updateBytes") ?? "0") +
-        this.pendingBytes >
-      TRIM_FORCE_BYTES
-    ) {
+    } else if (retainedBytes > TRIM_FORCE_BYTES) {
       // Include buffered backfills: oversized updates fold without first
       // becoming log rows. Otherwise their history misses the force-trim
       // budget until a later flush or cold start.
@@ -1716,7 +1713,8 @@ export class SessionRoom implements DurableObject {
       // leaks it into the shared wasm heap exactly when trimming was
       // supposed to relieve it (see handleJoin).
       if (doc !== fresh) doc.free();
-    } catch {
+    } catch (error) {
+      console.error("history trim failed", `room=${this.getMeta("chatId") ?? "?"}`, String(error));
       return false;
     }
     // The live document is already replaced before yielding, so accepted writes
