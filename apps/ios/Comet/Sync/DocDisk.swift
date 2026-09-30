@@ -136,8 +136,11 @@ enum DocDisk {
         guard let reconstructed = local.frontiersToVv(frontiers: baseFrontiers),
               reconstructed == common
         else { return false }
-        let base = try local.forkAt(frontiers: baseFrontiers)
-        guard base.stateVv() == common, base.oplogVv() == common else { return false }
+        // forkAt is unsupported for shallow docs. Checkout a separate read-only
+        // fork instead; its oplog deliberately retains the local edits.
+        let base = local.fork()
+        try base.checkout(frontiers: baseFrontiers)
+        guard base.stateVv() == common else { return false }
         let delta = try local.diff(a: baseFrontiers, b: local.oplogFrontiers())
         let candidate = replacement.fork()
 
@@ -168,9 +171,16 @@ enum DocDisk {
                 // The host may already have materialized the same intent under
                 // other operation IDs. Do not rewrite it or change precedence.
                 if serverValues[key] == desired { continue }
-                guard baseValues[key] == serverValues[key],
-                      isRecoveryValue(baseValues[key])
-                else { return false }
+                if key == "lastSeenAt", let chatId = serverValues["id"]?.stringValue,
+                   replacement.getMap(id: "chats").get(key: chatId)?.asLoroMap()?.id() == entry.cid,
+                   let desiredAt = desired?.i64Value, let serverAt = serverValues[key]?.i64Value {
+                    // Seen markers are monotonic across devices. A newer server
+                    // receipt already covers this intent; never move it backward.
+                    if serverAt >= desiredAt { continue }
+                } else {
+                    guard baseValues[key] == serverValues[key],
+                          isRecoveryValue(baseValues[key]) else { return false }
+                }
                 // updateValue retains a nil payload as a deletion entry.
                 pending.updateValue(updated, forKey: key)
             }
