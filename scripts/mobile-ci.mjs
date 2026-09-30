@@ -119,7 +119,7 @@ async function verifySimulator(app) {
   // A newly created simulator has no prior auth, preferences, or stale markers.
   // This hook enters demo mode; its APNs probe injects URLProtocol and never
   // requests notification authorization, registers with APNs, or uses live auth.
-  run("xcrun", ["simctl", "launch", "--terminate-running-process", simulator, bundleId, "-visibility-e2e"], { log: "simulator.log" });
+  run("xcrun", ["simctl", "launch", "--terminate-running-process", simulator, bundleId, "-visibility-e2e"], { timeout: 300_000, log: "simulator.log" });
   const deadline = Date.now() + 180_000;
   while (Date.now() < deadline) {
     const text = snapshotE2ELog();
