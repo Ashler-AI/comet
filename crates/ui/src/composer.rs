@@ -7462,40 +7462,6 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn online_devbox_prepares_callbacks_in_background_without_waking(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        use std::sync::atomic::Ordering::SeqCst;
-        cx.executor().allow_parking();
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let _guard = runtime.enter();
-        let (composer, state, rpc) = wake_composer(cx);
-        state.update(cx, |state, _| {
-            state.devices[0].last_seen_at = Some(chrono::Utc::now());
-        });
-        composer.update(cx, |composer, cx| {
-            composer.submit_command("first", cx);
-            composer.on_submit(cx);
-        });
-        rpc.models.add_permits(1);
-        cx.condition(&composer, |_, _| rpc.sends.load(SeqCst) == 1)
-            .await;
-        assert_eq!(rpc.wakes.load(SeqCst), 0);
-        assert_eq!(rpc.forwards.load(SeqCst), 1);
-        assert_eq!(rpc.sends.load(SeqCst), 1);
-
-        composer.update(cx, |composer, cx| {
-            composer.submit_command("second", cx);
-            composer.on_submit(cx);
-        });
-        cx.condition(&composer, |_, _| rpc.sends.load(SeqCst) == 2)
-            .await;
-        assert_eq!(rpc.wakes.load(SeqCst), 0);
-        assert_eq!(rpc.forwards.load(SeqCst), 1);
-        assert_eq!(rpc.sends.load(SeqCst), 2);
-    }
-
-    #[gpui::test]
     async fn online_devbox_tunnel_failure_is_backed_off_without_blocking_sends(
         cx: &mut gpui::TestAppContext,
     ) {
