@@ -22,7 +22,7 @@ automatically): [loro-swift 1.13.x](https://github.com/loro-dev/loro-swift)
 (cmark-gfm: tables/strikethrough/tasklists — the same feature set as the
 desktop's pulldown-cmark config).
 
-Crew 0.1.119 mobile staging **1.0 (24)** and production **1.0 (18)** are available
+Mobile staging **1.0 (26)** and production **1.0 (19)** are available
 through their existing **Ashler Internal** TestFlight groups. Both are internal-only
 releases, not public App Store submissions. Upload and verification evidence is
 recorded below.
@@ -31,11 +31,11 @@ Production and staging use the same Swift target with separate checked-in scheme
 bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
 
 ```sh
-# Production candidate: Crew, ai.ashler.crew, version 1.0 build 19
+# Production candidate: Crew, ai.ashler.crew, version 1.0 build 20
 xcodebuild -project Comet.xcodeproj -scheme Comet \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 
-# Staging candidate: Crew Staging, ai.ashler.crew.staging, version 1.0 build 26
+# Staging candidate: Crew Staging, ai.ashler.crew.staging, version 1.0 build 27
 xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 ```
@@ -65,8 +65,8 @@ The artifact `crew-mobile-<environment>-<source SHA>` contains:
 
 | Environment | Device archive | Simulator app package |
 | --- | --- | --- |
-| staging | `Crew-Staging-1.0-26-unsigned.xcarchive.tar.gz` | `Crew-Staging-1.0-26-simulator-arm64.tar.gz` |
-| production | `Crew-1.0-19-unsigned.xcarchive.tar.gz` | `Crew-1.0-19-simulator-arm64.tar.gz` |
+| staging | `Crew-Staging-1.0-27-unsigned.xcarchive.tar.gz` | `Crew-Staging-1.0-27-simulator-arm64.tar.gz` |
+| production | `Crew-1.0-20-unsigned.xcarchive.tar.gz` | `Crew-1.0-20-simulator-arm64.tar.gz` |
 
 Both also include `SHA256SUMS`, `source-sha.txt`, `provenance.json`, `e2e.log`,
 and `archive-signed.entitlements`. Artifacts originate in
@@ -91,6 +91,44 @@ produce these build candidates.
 `native-verification.yml` is a separate Rust/desktop verification workflow. It
 has no dispatch inputs and runs only on pushes to `verify/native-lifecycle-*`
 or `verify/native-startup-*`; it neither creates nor signs mobile archives.
+
+### Warm shallow-cache recovery
+
+The paired iPhone still showed stale sessions and statuses after installing staging
+build 26. Its cached shallow workspace contained 1,381 memberships versus 1,434
+on the server, plus six unsynced `lastSeenAt` writes. Those writes were older than
+the server's read receipts but had operation IDs absent from the compacted server
+history. Importing the current snapshot left dependencies pending; recovery then
+called `forkAt`, which Loro does not support on shallow documents.
+
+Recovery now reconstructs the common base with checkout on an isolated fork.
+Workspace-chat read receipts keep the greater timestamp; other conflicting edits
+still fail closed. A shallow baseline and its following deltas stay isolated until
+the complete advertised server frontier arrives. Only then are local edits replayed
+and any surviving writes uploaded, with readiness still gated on their ACKs. Cached
+bindings remain intact if recovery fails. No shared-room reset or sign-out is needed.
+
+Candidate source `e84fd0e8f803cb3cb7699836937c3f6930ee67b7` passed all ten native
+scenarios and device archiving in [staging CI](https://github.com/Ashler-AI/comet/actions/runs/36676358982)
+and [production CI](https://github.com/Ashler-AI/comet/actions/runs/36676361725).
+The actual affected cache was then copied into an isolated simulator against a real
+local edge holding the captured server state. Build 26 reproduced the native
+`fork_at on shallow docs` errors and repeated rejected uploads. The exact build 27
+candidate adopted the complete snapshot, cleared the connecting indicator, and
+persisted all 1,434 server memberships plus one isolated test marker. Live updates
+rendered Running → Failed → Running. Old receipt-operation IDs were not falsely
+advertised as imported. No real phone or shared cloud data was changed by this check.
+
+Builds 26/19 supplied foreground probes, not this warm-cache repair. Both were built
+from merged source `1b0f7bb7a9a96d356cfd236adf8ae350a64b6c84` and passed all ten
+scenarios in [staging CI](https://github.com/Ashler-AI/comet/actions/runs/36669878791)
+and [production CI](https://github.com/Ashler-AI/comet/actions/runs/36669881146).
+Apple upload succeeded on September 30 at 04:57/04:58 UTC. Authenticated readback
+confirmed both uploads Complete and both internal-only builds Testing in their
+existing Ashler Internal groups. Distribution inspections passed strict signatures,
+matching bundle/build identities, and production APNs profile/signature checks.
+No tester memberships or public App Store submissions changed. Build 26 was read
+directly from the paired phone; production on that phone was still build 18.
 
 ### Recent-session room recovery
 

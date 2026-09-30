@@ -65,7 +65,7 @@ actor RoomClient {
     private var fragments: [BatchId: FragmentBuffer] = [:]
     private var joinedLor = false
     private var fullResyncs = 0
-    private var snapshotRecoveryAttempted = false
+    private var snapshotRecovery: LoroDoc?
     private var serverVersion: VersionVector?
     // Join advertisements and pending imports may not advance either local VV.
     // Keep their target across redials so a stale server reply cannot heal it.
@@ -151,7 +151,7 @@ actor RoomClient {
         let gen = generation
         joinedLor = false
         fullResyncs = 0
-        snapshotRecoveryAttempted = false
+        snapshotRecovery = nil
         serverVersion = nil
         historyRepairAttempted = false
         historyRepairBatch = nil
@@ -445,13 +445,14 @@ actor RoomClient {
             // The edge answers the join BEFORE sending its snapshot/deltas.
             // An accepted socket is not a usable replica until that advertised
             // version has reached materialized state, including on first login.
-            if !hasMaterializedRemoteVersion()
+            if !hasMaterializedRemoteVersion(doc)
                 || serverVersion.map({ !$0.includesVv(other: doc.oplogVv()) }) == true {
                 if !recovering { events(.disconnected) }
                 recovering = true
                 backfillStartedAt = .now()
             }
             if !wasProbe { recovering = true }
+            if await adoptRecoveredSnapshotIfCaughtUp() { events(.remoteUpdate) }
             await resubmitMissingUpdates()
             guard gen == generation, !closed, joinedLor else { return }
             if wasProbe {
@@ -484,33 +485,34 @@ actor RoomClient {
             var imported = false
             for update in updates where !update.isEmpty {
                 let bytes = Data(update)
-                let status = try? doc.importWith(bytes: bytes, origin: "remote")
-                let complete = status.map { ($0.pending?.isEmpty ?? true) } ?? false
-                if complete, !doc.isDetached(), doc.stateVv() == doc.oplogVv() {
-                    imported = imported || !(status?.success.isEmpty ?? true)
-                    finishRecoveryIfCaughtUp()
-                    continue
-                }
                 if let metadata = try? decodeImportBlobMeta(bytes: bytes, checkChecksum: true) {
                     requiredRemoteVersion.merge(other: metadata.partialEndVv)
+                    serverVersion?.merge(other: metadata.partialEndVv)
                 }
-                // Pending is NOT success: a warm replica can have equal state
-                // and oplog VVs while the entire server backfill stays pending.
-                if !snapshotRecoveryAttempted,
-                   let replacement = DocDisk.replacementSnapshot(bytes: bytes) {
-                    snapshotRecoveryAttempted = true
-                    let previous = doc
-                    if await adoptSnapshot(previous, replacement) {
-                        doc = replacement
-                        imported = true
-                        finishRecoveryIfCaughtUp()
-                        roomLog.info("room \(self.roomId, privacy: .public): adopted complete snapshot and retained local operations")
-                        await resubmitMissingUpdates()
+                if let candidate = snapshotRecovery {
+                    guard (try? candidate.importWith(bytes: bytes, origin: "remote")) != nil else {
+                        snapshotRecovery = nil
+                        await requestFullSnapshot()
                         continue
                     }
-                    roomLog.error("room \(self.roomId, privacy: .public): snapshot handoff rejected; retaining current replica")
+                } else {
+                    let status = try? doc.importWith(bytes: bytes, origin: "remote")
+                    let complete = status.map { ($0.pending?.isEmpty ?? true) } ?? false
+                    if complete, !doc.isDetached(), doc.stateVv() == doc.oplogVv() {
+                        imported = imported || !(status?.success.isEmpty ?? true)
+                        await resubmitMissingUpdates()
+                        finishRecoveryIfCaughtUp()
+                        continue
+                    }
+                    // A persisted shallow baseline can precede many server deltas.
+                    // Keep it isolated until the entire advertised frontier arrives.
+                    guard let candidate = DocDisk.replacementSnapshot(bytes: bytes) else {
+                        await requestFullSnapshot()
+                        continue
+                    }
+                    snapshotRecovery = candidate
                 }
-                await requestFullSnapshot()
+                if await adoptRecoveredSnapshotIfCaughtUp() { imported = true }
             }
             if imported { events(.remoteUpdate) }
         case .loroEphemeral:
@@ -520,6 +522,23 @@ actor RoomClient {
             }
             if applied { events(.ephemeralUpdate) }
         }
+    }
+
+    private func adoptRecoveredSnapshotIfCaughtUp() async -> Bool {
+        guard let candidate = snapshotRecovery, hasMaterializedRemoteVersion(candidate) else { return false }
+        let previous = doc
+        guard await adoptSnapshot(previous, candidate) else {
+            snapshotRecovery = nil
+            roomLog.error("room \(self.roomId, privacy: .public): snapshot handoff rejected; retaining current replica")
+            await requestFullSnapshot()
+            return false
+        }
+        doc = candidate
+        snapshotRecovery = nil
+        await resubmitMissingUpdates()
+        finishRecoveryIfCaughtUp()
+        roomLog.info("room \(self.roomId, privacy: .public): adopted complete snapshot and retained local operations")
+        return true
     }
 
     private func requestFullSnapshot() async {
@@ -541,13 +560,13 @@ actor RoomClient {
         }
         fullResyncs += 1
         serverVersion = nil
-        snapshotRecoveryAttempted = false
+        snapshotRecovery = nil
         roomLog.warning("room \(self.roomId, privacy: .public): incomplete import; requesting full snapshot")
         await sendJoinLoro(version: [])
     }
     private func finishRecoveryIfCaughtUp() {
         guard recovering, joinedLor, catchupBatches.isEmpty,
-              hasMaterializedRemoteVersion() else { return }
+              hasMaterializedRemoteVersion(doc) else { return }
         recovering = false
         deferredFullResync = false
         backfillStartedAt = nil
@@ -556,18 +575,17 @@ actor RoomClient {
         if joinedLor { events(.connected) }
     }
 
-    private func hasMaterializedRemoteVersion() -> Bool {
-        guard let serverVersion, !doc.isDetached() else { return false }
-        let state = doc.stateVv()
-        return state == doc.oplogVv() && state.includesVv(other: serverVersion)
+    private func hasMaterializedRemoteVersion(_ replica: LoroDoc) -> Bool {
+        guard let serverVersion, !replica.isDetached() else { return false }
+        let state = replica.stateVv()
+        return state == replica.oplogVv() && state.includesVv(other: serverVersion)
             && state.includesVv(other: requiredRemoteVersion)
     }
 
     private func resubmitMissingUpdates() async {
-        guard joinedLor, let serverVersion, !serverVersion.includesVv(other: doc.oplogVv())
-        else { return }
-        if !recovering { events(.disconnected) }
-        recovering = true
+        guard recovering, joinedLor, catchupBatches.isEmpty,
+              hasMaterializedRemoteVersion(doc), let serverVersion,
+              !serverVersion.includesVv(other: doc.oplogVv()) else { return }
         backfillStartedAt = .now()
         // A shallow replica cannot export dependencies older than its retained
         // history. A snapshot carries that state without dropping local edits.
@@ -745,6 +763,17 @@ actor RoomClient {
     private var regressionSend: ((ProtocolMessage) -> Void)?
 
     static func runRepeatedRecoveryRegression() async -> Bool {
+        for serverSeen in [Int64(200), Int64(400)] {
+            let warmClient = RoomClient(roomId: "ws4/warm-regression", doc: LoroDoc(),
+                                        urlProvider: { nil }, events: { _ in },
+                                        adoptSnapshot: { previous, replacement in
+                                            DocDisk.preserveLocalOperations(from: previous, in: replacement)
+                                        })
+            guard await warmClient.exerciseWarmShallowRecovery(serverSeen: serverSeen) else {
+                await E2ERunner.log("FAIL Crew warm shallow cache session/status recovery: seen=\(serverSeen)")
+                return false
+            }
+        }
         let probeClient = RoomClient(roomId: "ws4/probe-regression", doc: LoroDoc(),
                                      urlProvider: { nil }, events: { _ in },
                                      adoptSnapshot: { _, _ in false })
@@ -810,6 +839,91 @@ actor RoomClient {
             return false
         }
         return true
+    }
+
+    private func exerciseWarmShallowRecovery(serverSeen: Int64) async -> Bool {
+        var uploads: [([[UInt8]], BatchId)] = []
+        regressionSend = { message in
+            if case .docUpdate(.loro, _, let bytes, let batch) = message { uploads.append((bytes, batch)) }
+        }
+        defer { regressionSend = nil; stop() }
+        do {
+            let source = LoroDoc()
+            let chat = try source.getMap(id: "chats").getOrCreateContainer(key: "old", child: LoroMap())
+            for (key, value) in ["id": "old", "deviceId": "host", "title": "Cached session"] {
+                try chat.insert(key: key, v: value)
+            }
+            try chat.insert(key: "lastSeenAt", v: Int64(100))
+            let ref = try source.getMap(id: "sessionRefs").getOrCreateContainer(key: "old", child: LoroMap())
+            try ref.insert(key: "userId", v: "reader")
+            try ref.insert(key: "chatId", v: "old")
+            try ref.insert(key: "addedAt", v: Int64(1))
+            let status = try source.getMap(id: "sessions").getOrCreateContainer(key: "old", child: LoroMap())
+            try status.insert(key: "chatId", v: "old")
+            try status.insert(key: "deviceId", v: "host")
+            try status.insert(key: "status", v: "idle")
+            try status.insert(key: "updatedAt", v: Int64(1))
+            source.commit()
+            doc = LoroDoc()
+            _ = try doc.importWith(bytes: source.export(mode: .shallowSnapshot(frontiers: source.stateFrontiers())), origin: "disk")
+            guard let localChat = doc.getMap(id: "chats").get(key: "old")?.asLoroMap() else { return false }
+            try localChat.insert(key: "lastSeenAt", v: Int64(300))
+            doc.commit()
+
+            try chat.insert(key: "lastSeenAt", v: serverSeen)
+            source.commit()
+            // Two committed advances leave a dependency below the new shallow
+            // boundary; a one-op advance can still merge directly into the cache.
+            try chat.insert(key: "lastMessageAt", v: Int64(1_000))
+            source.commit()
+            let baselineVersion = source.oplogVv()
+            let baseline = try source.export(mode: .shallowSnapshot(frontiers: source.stateFrontiers()))
+            let newest = try source.getMap(id: "chats").getOrCreateContainer(key: "new", child: LoroMap())
+            try newest.insert(key: "id", v: "new")
+            try newest.insert(key: "deviceId", v: "host")
+            try newest.insert(key: "title", v: "Newest recovered session")
+            try newest.insert(key: "lastMessageAt", v: Int64(2_000))
+            let newRef = try source.getMap(id: "sessionRefs").getOrCreateContainer(key: "new", child: LoroMap())
+            try newRef.insert(key: "userId", v: "reader")
+            try newRef.insert(key: "chatId", v: "new")
+            try newRef.insert(key: "addedAt", v: Int64(2))
+            try status.insert(key: "status", v: "working")
+            try status.insert(key: "updatedAt", v: Int64(2_000))
+            source.commit()
+            let tail = try source.export(mode: .updates(from: baselineVersion))
+            let receiver = LoroDoc()
+            _ = try receiver.importWith(bytes: baseline, origin: "server")
+            _ = try receiver.importWith(bytes: tail, origin: "server")
+
+            await onJoinOk(crdt: .loro, version: [UInt8](source.oplogVv().encode()))
+            guard uploads.isEmpty, recovering else { return false }
+            await applyRemote(crdt: .loro, updates: [[UInt8](baseline)])
+            guard uploads.isEmpty, recovering,
+                  doc.getMap(id: "chats").get(key: "new") == nil else { return false }
+            await applyRemote(crdt: .loro, updates: [[UInt8](tail)])
+            if serverSeen < 300 {
+                guard !uploads.isEmpty, recovering else { return false }
+                for (updates, batch) in uploads {
+                    for bytes in updates {
+                        let imported = try receiver.importWith(bytes: Data(bytes), origin: "phone")
+                        guard imported.pending?.isEmpty ?? true else { return false }
+                    }
+                    await onAck(crdt: .loro, refId: batch, status: .ok)
+                }
+            } else {
+                guard uploads.isEmpty else { return false }
+            }
+            guard !recovering, let projected = WorkspaceStore.decodeProjection(from: doc, userId: "reader") else { return false }
+            return projected.lists.overviewChats.first?.id == "new"
+                && projected.chats.first(where: { $0.id == "old" })?.lastSeenAt == max(serverSeen, 300)
+                && projected.sessions["old"]?.updatedAt == 2_000
+                && effectiveStatus(projected.sessions["old"], now: 2_000) == .working
+                && receiver.getMap(id: "chats").get(key: "old")?.asLoroMap()?
+                    .get(key: "lastSeenAt")?.asValue()?.i64Value == max(serverSeen, 300)
+        } catch {
+            await E2ERunner.log("FAIL Crew warm shallow recovery error: \(error)")
+            return false
+        }
     }
 
     private func exerciseBroadcastProbe() async -> Bool {
