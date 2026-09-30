@@ -851,6 +851,11 @@ final class AppModel {
         sessionStores.values.forEach { $0.flushToDisk() }
     }
 
+    func refreshSync() async {
+        await workspace?.probeSync()
+        for store in sessionStores.values { await store.probeSync() }
+    }
+
     /// Diagnostics access (live e2e probe).
     var diagnosticsConfig: AppConfig? { config }
 
