@@ -43,6 +43,7 @@ actor RoomClient {
     static let roomProbeAfterNs: UInt64 = 900_000_000_000
     static let roomProbeMaxNs: UInt64 = 4 * 3_600_000_000_000
     static let probeReplyGraceNs: UInt64 = 30_000_000_000
+    static let probeOnDemandMinQuietNs: UInt64 = 30_000_000_000
     static let livenessTickNs: UInt64 = 5_000_000_000
 
     let roomId: String
@@ -87,6 +88,7 @@ actor RoomClient {
     private var backfillStartedAt: DispatchTime?
     private var joinIsProbe = false
     private var lastLorRx = DispatchTime.now()
+    private var lastPushedRx = DispatchTime.now()
     private var probeIntervalNs = RoomClient.roomProbeAfterNs
     private var lastProbeAt: DispatchTime?
 
@@ -131,6 +133,18 @@ actor RoomClient {
         joinedLor = false
     }
 
+    /// Match desktop foreground probes: ACKs and pongs do not prove that
+    /// broadcasts are reaching this replica. Coalesce behind any active join.
+    func probe(at instant: DispatchTime? = nil) async {
+        let now = (instant ?? .now()).uptimeNanoseconds
+        guard !closed, joinedLor, joinSentAt == nil, backfillStartedAt == nil,
+              now >= lastPushedRx.uptimeNanoseconds,
+              now - lastPushedRx.uptimeNanoseconds
+                >= RoomClient.probeOnDemandMinQuietNs else { return }
+        probeIntervalNs = RoomClient.roomProbeAfterNs
+        await sendProbe()
+    }
+
     private func connect() {
         guard !closed else { return }
         generation += 1
@@ -152,6 +166,7 @@ actor RoomClient {
         backfillStartedAt = nil
         joinIsProbe = false
         lastLorRx = .now()
+        lastPushedRx = lastLorRx
         probeIntervalNs = RoomClient.roomProbeAfterNs
         lastProbeAt = nil
 
@@ -279,9 +294,9 @@ actor RoomClient {
     /// hibernating-but-healthy DO is simply woken by the probe and answers —
     /// hibernation is NOT death, which is why probes run in minutes while
     /// the transport lease runs in seconds.
-    private func livenessTick(gen: Int) async {
-        guard gen == generation, socket != nil, !closed else { return }
-        let now = DispatchTime.now().uptimeNanoseconds
+    private func livenessTick(gen: Int, at instant: DispatchTime = .now()) async {
+        guard gen == generation, !closed else { return }
+        let now = instant.uptimeNanoseconds
         if let sent = joinSentAt {
             let base = max(sent.uptimeNanoseconds, lastLorRx.uptimeNanoseconds)
             if now - base > RoomClient.joinDeadlineNs {
@@ -301,21 +316,19 @@ actor RoomClient {
             }
             return
         }
-        if now - lastLorRx.uptimeNanoseconds > probeIntervalNs {
-            // Quiet room: rejoin as a liveness probe. Consecutive quiet
-            // probes back off so a dormant chat costs a handful of DO wakes
-            // a day; any organic %LOR traffic resets the cadence. Probe
-            // state is armed BEFORE the send suspends — the actor is
-            // reentrant across the await, so the answer could otherwise be
-            // handled while joinIsProbe is still false and replay join side
-            // effects.
-            joinSentAt = .now()
-            joinIsProbe = true
-            lastProbeAt = .now()
+        if joinedLor, now - lastPushedRx.uptimeNanoseconds > probeIntervalNs {
             probeIntervalNs = min(probeIntervalNs * 2, RoomClient.roomProbeMaxNs)
-            await send(.joinRequest(crdt: .loro, roomId: roomId, auth: [],
-                                    version: localVersionBytes()))
+            await sendProbe()
         }
+    }
+
+    private func sendProbe() async {
+        // Arm before send suspends; the answer may arrive during that await.
+        joinSentAt = .now()
+        joinIsProbe = true
+        lastProbeAt = .now()
+        await send(.joinRequest(crdt: .loro, roomId: roomId, auth: [],
+                                version: localVersionBytes()))
     }
 
     // MARK: Inbound
@@ -335,20 +348,20 @@ actor RoomClient {
     }
 
     private func handleFrame(_ frame: ProtocolMessage, gen: Int) async {
-        // Advance the room-liveness clock for %LOR frames only: %EPH presence
-        // keeps flowing from a doc-wedged DO, so letting it count silenced
-        // the probe on exactly the room that wedged (room.rs, round-2
-        // adversarial finding). Frames arriving inside a probe's own reply
-        // window must not reset the probe backoff, or every probe would
-        // reset its own decay.
+        // All %LOR frames feed the join deadline. Only server-pushed frames
+        // feed the probe clock: own-write ACKs can mask a broken broadcast path.
         if crdtOf(frame) == .loro {
             lastLorRx = .now()
-            if let at = lastProbeAt,
-               DispatchTime.now().uptimeNanoseconds - at.uptimeNanoseconds
-                   <= RoomClient.probeReplyGraceNs {
-                // Probe's own reply — leave the backoff decaying.
+            if case .ack = frame {
+                // ACK proves upload admission, not download freshness.
             } else {
-                probeIntervalNs = RoomClient.roomProbeAfterNs
+                lastPushedRx = lastLorRx
+                if lastProbeAt.map({
+                    lastLorRx.uptimeNanoseconds - $0.uptimeNanoseconds
+                        <= RoomClient.probeReplyGraceNs
+                }) != true {
+                    probeIntervalNs = RoomClient.roomProbeAfterNs
+                }
             }
         }
         switch frame {
@@ -732,6 +745,13 @@ actor RoomClient {
     private var regressionSend: ((ProtocolMessage) -> Void)?
 
     static func runRepeatedRecoveryRegression() async -> Bool {
+        let probeClient = RoomClient(roomId: "ws4/probe-regression", doc: LoroDoc(),
+                                     urlProvider: { nil }, events: { _ in },
+                                     adoptSnapshot: { _, _ in false })
+        guard await probeClient.exerciseBroadcastProbe() else {
+            await E2ERunner.log("FAIL Crew stale-broadcast foreground recovery")
+            return false
+        }
         for userId in ["reader-alpha", "reader-beta"] {
             let connectionEvents = OSAllocatedUnfairLock(initialState: [Bool]())
             let client = RoomClient(roomId: "ws4/synthetic-project", doc: LoroDoc(),
@@ -790,6 +810,50 @@ actor RoomClient {
             return false
         }
         return true
+    }
+
+    private func exerciseBroadcastProbe() async -> Bool {
+        var joins = 0
+        regressionSend = { message in
+            if case .joinRequest(.loro, _, _, _) = message { joins += 1 }
+        }
+        defer { regressionSend = nil; stop() }
+        do {
+            await onJoinOk(crdt: .loro, version: [])
+            let pushed = lastPushedRx
+            await handleFrame(.ack(crdt: .loro, roomId: roomId, refId: .random(), status: .ok), gen: generation)
+            await livenessTick(gen: generation, at: DispatchTime(
+                uptimeNanoseconds: pushed.uptimeNanoseconds + RoomClient.roomProbeAfterNs + 1))
+            guard joins == 1, joinIsProbe else { return false }
+            await probe() // Outstanding join must not be replaced.
+            guard joins == 1 else { return false }
+            await handleFrame(.joinResponseOk(crdt: .loro, roomId: roomId, permission: "write",
+                                             version: [], extra: []), gen: generation)
+            await probe()
+            guard joins == 1 else { return false } // Fresh pushes need no probe.
+            let quiet = DispatchTime(uptimeNanoseconds: lastPushedRx.uptimeNanoseconds
+                                     + RoomClient.probeOnDemandMinQuietNs)
+            await handleFrame(.ack(crdt: .loro, roomId: roomId, refId: .random(), status: .ok), gen: generation)
+            await probe(at: quiet)
+            guard joins == 2, joinIsProbe else { return false }
+
+            // The rejoin backfills the missing newest member before readiness.
+            let source = LoroDoc()
+            let chat = try source.getMap(id: "chats").getOrCreateContainer(key: "newest", child: LoroMap())
+            try chat.insert(key: "id", v: "newest")
+            try chat.insert(key: "deviceId", v: "host")
+            try chat.insert(key: "title", v: "Newest session")
+            let ref = try source.getMap(id: "sessionRefs").getOrCreateContainer(key: "member", child: LoroMap())
+            try ref.insert(key: "userId", v: "reader")
+            try ref.insert(key: "chatId", v: "newest")
+            try ref.insert(key: "addedAt", v: Int64(1))
+            source.commit()
+            await onJoinOk(crdt: .loro, version: [UInt8](source.oplogVv().encode()))
+            guard recovering else { return false }
+            await applyRemote(crdt: .loro, updates: [[UInt8](try source.export(mode: .snapshot))])
+            return !recovering && WorkspaceStore.decodeProjection(from: doc, userId: "reader")?
+                .lists.overviewChats.first?.title == "Newest session"
+        } catch { return false }
     }
 
     private func exerciseCatchupAcknowledgement(

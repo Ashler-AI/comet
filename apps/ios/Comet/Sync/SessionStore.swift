@@ -187,6 +187,8 @@ final class SessionStore {
         saver?.flush()
     }
 
+    func probeSync() async { await room?.probe() }
+
     func stop() {
         roomEpoch &+= 1
         hydrationTask?.cancel()

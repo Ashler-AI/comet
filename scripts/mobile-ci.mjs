@@ -20,8 +20,8 @@ const work = path.join(process.env.RUNNER_TEMP, "crew-mobile");
 for (const directory of [logs, release, work]) mkdirSync(directory, { recursive: true });
 const environment = process.env.CREW_MOBILE_ENVIRONMENT ?? "staging";
 const profiles = {
-  staging: { scheme: "Crew Staging", bundleId: "ai.ashler.crew.staging", build: "24", suffix: "-Staging", name: "Crew-Staging" },
-  production: { scheme: "Comet", bundleId: "ai.ashler.crew", build: "18", suffix: "", name: "Crew" },
+  staging: { scheme: "Crew Staging", bundleId: "ai.ashler.crew.staging", build: "26", suffix: "-Staging", name: "Crew-Staging" },
+  production: { scheme: "Comet", bundleId: "ai.ashler.crew", build: "19", suffix: "", name: "Crew" },
 };
 if (!Object.hasOwn(profiles, environment)) throw new Error(`Unsupported mobile environment: ${environment}`);
 const { scheme, bundleId, build, suffix, name } = profiles[environment];
@@ -119,7 +119,7 @@ async function verifySimulator(app) {
   // A newly created simulator has no prior auth, preferences, or stale markers.
   // This hook enters demo mode; its APNs probe injects URLProtocol and never
   // requests notification authorization, registers with APNs, or uses live auth.
-  run("xcrun", ["simctl", "launch", "--terminate-running-process", simulator, bundleId, "-visibility-e2e"], { log: "simulator.log" });
+  run("xcrun", ["simctl", "launch", "--terminate-running-process", simulator, bundleId, "-visibility-e2e"], { timeout: 300_000, log: "simulator.log" });
   const deadline = Date.now() + 180_000;
   while (Date.now() < deadline) {
     const text = snapshotE2ELog();

@@ -31,11 +31,11 @@ Production and staging use the same Swift target with separate checked-in scheme
 bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
 
 ```sh
-# Crew 0.1.119 production: Crew, ai.ashler.crew, version 1.0 build 18
+# Production candidate: Crew, ai.ashler.crew, version 1.0 build 19
 xcodebuild -project Comet.xcodeproj -scheme Comet \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 
-# Crew 0.1.119 staging: Crew Staging, ai.ashler.crew.staging, version 1.0 build 24
+# Staging candidate: Crew Staging, ai.ashler.crew.staging, version 1.0 build 26
 xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 ```
@@ -65,8 +65,8 @@ The artifact `crew-mobile-<environment>-<source SHA>` contains:
 
 | Environment | Device archive | Simulator app package |
 | --- | --- | --- |
-| staging | `Crew-Staging-1.0-24-unsigned.xcarchive.tar.gz` | `Crew-Staging-1.0-24-simulator-arm64.tar.gz` |
-| production | `Crew-1.0-18-unsigned.xcarchive.tar.gz` | `Crew-1.0-18-simulator-arm64.tar.gz` |
+| staging | `Crew-Staging-1.0-26-unsigned.xcarchive.tar.gz` | `Crew-Staging-1.0-26-simulator-arm64.tar.gz` |
+| production | `Crew-1.0-19-unsigned.xcarchive.tar.gz` | `Crew-1.0-19-simulator-arm64.tar.gz` |
 
 Both also include `SHA256SUMS`, `source-sha.txt`, `provenance.json`, `e2e.log`,
 and `archive-signed.entitlements`. Artifacts originate in
@@ -91,6 +91,28 @@ produce these build candidates.
 `native-verification.yml` is a separate Rust/desktop verification workflow. It
 has no dispatch inputs and runs only on pushes to `verify/native-lifecycle-*`
 or `verify/native-startup-*`; it neither creates nor signs mobile archives.
+
+### Recent-session room recovery
+
+Foregrounding Crew probes quiet workspace and
+open session rooms, matching desktop's 30-second quiet-room gate. An outstanding
+join coalesces repeated refreshes; a missed answer uses the existing bounded
+reconnect path. Write acknowledgements and transport pongs do not reset the
+broadcast-freshness clock, so a room that still accepts writes cannot indefinitely
+hide missing session updates. Background probes retain their existing idle backoff.
+Recovery preserves cached documents and local operations; it does not reset shared
+room history, sign the user out, or widen principal/project membership.
+
+Corrected source `cbd7dc52c9d8dfc7edf41304aba139838110c4d6` passed all ten mobile
+scenarios and device archiving in [production CI](https://github.com/Ashler-AI/comet/actions/runs/36668250877).
+Its checksum-verified simulator binary was exercised against a real local Wrangler
+edge with one workspace broadcast deliberately withheld. Foregrounding, without
+restarting, issued one rejoin, received the missing backfill, and displayed the newest
+session first. The preceding staging build 25 stayed stale under the same fault.
+This is simulator proof, not a physical-phone acceptance claim. No shared room was
+reset and no active desktop engine was restarted. Local typechecks were intentionally
+skipped. The required opposite-provider review attempt failed with `MODULE_NOT_FOUND`
+because this repository lacks the checked-in review launcher; no review passed.
 
 ### Crew 0.1.119 upload evidence
 
