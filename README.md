@@ -2,7 +2,7 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
-## Unreleased: causal workspace retention
+## Crew 0.1.134 release candidate
 
 Workspace persistence and edge folding retain available causal history rather
 than independently replacing each replica with a state-only snapshot. Desktop
@@ -14,12 +14,24 @@ Previously discarded dependencies cannot be recreated by reconnecting or by
 this upgrade; divergent existing replicas require a backed-up, explicit recovery.
 Deploy the matching edge before upgrading controllers and hosts.
 
+The candidate also publishes ordinary remote-session status through existing
+session rooms, so Devbox activity indicators do not depend on workspace backfill.
+Canonical controls preserve an existing bare-chat writer's live execution key.
+
+The local headed 0.1.134 demo admitted a mock prompt, displayed the working strip
+and Stop affordance, and returned to idle. Focused native regressions and the
+38-test edge room authorization suite passed. The required opposite-provider
+review attempt could not start: this repository lacks
+`skills/local-code-review/scripts/opencodereview.mjs` (`MODULE_NOT_FOUND`). Local
+typechecks were intentionally skipped; remote CI retains its required checks.
+Production promotion remains gated on captain verification of restarted staging.
+
 ## Crew 0.1.133 release candidate
 
 The 0.1.133 candidate introduced native state-only persistence before joining
 and edge workspace shallow compaction under the session-document retention
 policy. It preserves visible rows, but independent offline frontiers can lose
-the dependencies required to merge. The unreleased correction above removes
+the dependencies required to merge. The 0.1.134 correction above removes
 that unsafe workspace compaction; transcripts remain independently durable in
 their session documents.
 

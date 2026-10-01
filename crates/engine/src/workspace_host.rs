@@ -910,7 +910,7 @@ impl WorkspaceHost {
             return Ok(());
         };
         if crate::session_activity::room_projection(&reference, self.project_scope())
-            != Some(projection.cloned())
+            .as_ref().map(Option::as_ref) != Some(projection)
             || owner_subject != self.owner_subject()
             || reference.environment.as_ref().is_some_and(|environment| environment.owner_principal != owner_subject)
         {
