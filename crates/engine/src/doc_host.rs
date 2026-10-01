@@ -1159,6 +1159,20 @@ impl DocHost {
     /// writer receives the same `SessionDoc` and publications CRDT-merge in one room.
     fn bind_session_execution_key(&self, handle: &Arc<ChatDocHandle>, session_id: &str) -> String {
         let key = format!("{}::session::{session_id}", handle.chat_id);
+        // Publishing a canonical room record must not rekey an existing bare
+        // writer: typed Stop/Steer/Input controls need its live channels too.
+        if session_id == handle.chat_id
+            && self.inner.sessions.get().is_some_and(|sessions| {
+                sessions.session_status(&handle.chat_id).is_some_and(|bare| {
+                    matches!(
+                        bare.status,
+                        comet_proto::SessionStatus::Working | comet_proto::SessionStatus::AwaitingInput
+                    ) || sessions.session_status(&key).is_none()
+                })
+            })
+        {
+            return handle.chat_id.clone();
+        }
         lock(&self.inner.handles).insert(key.clone(), handle.clone());
         key
     }
@@ -1223,7 +1237,7 @@ impl DocHost {
         Ok(())
     }
 
-    /// Mirror only an owned, bound agent execution into its shared session room.
+    /// Mirror an owned execution into its shared room, including legacy bare-chat runs.
     /// Called synchronously under the engine status lock to preserve turn order.
     pub(crate) fn record_agent_session(
         &self,
@@ -1232,25 +1246,54 @@ impl DocHost {
         let Some(handle) = lock(&self.inner.handles).get(&status.chat_id).cloned() else {
             return Ok(());
         };
-        let Some(session_id) = status
+        if status.device_id != self.device_id() {
+            return Ok(());
+        }
+        let bare = status.chat_id == handle.chat_id;
+        let session_id = if bare {
+            handle.chat_id.as_str()
+        } else if let Some(session_id) = status
             .chat_id
             .strip_prefix(handle.chat_id.as_str())
             .and_then(|suffix| suffix.strip_prefix("::session::"))
-        else {
+        {
+            session_id
+        } else {
             return Ok(());
         };
-        let Some(mut session) = handle
-            .doc
-            .collaboration_snapshot()?
-            .sessions
-            .into_iter()
-            .find(|session| {
-                session.session_id == session_id
-                    && session.owner_device_id == self.device_id()
-                    && session.owner_device_id == status.device_id
-            })
-        else {
-            return Ok(());
+        let snapshot = handle.doc.collaboration_snapshot()?;
+        let existing = snapshot.sessions.into_iter().find(|session| {
+            session.session_id == session_id && session.chat_id == handle.chat_id
+        });
+        let mut session = match existing {
+            Some(session) if session.owner_device_id == self.device_id()
+                && self.workspace().is_none_or(|workspace| workspace.owner_subject() == session.owner_subject) => session,
+            Some(_) => return Ok(()),
+            None if bare => {
+                let Some(workspace) = self.workspace().filter(|ws| ws.is_host(&handle.chat_id)) else {
+                    return Ok(());
+                };
+                AgentSessionRecord {
+                    session_id: session_id.to_string(),
+                    chat_id: handle.chat_id.clone(),
+                    owner_subject: workspace.owner_subject().to_string(),
+                    owner_device_id: self.device_id().to_string(),
+                    source: if comet_proto::parse_scaffold_device_id(self.device_id()).is_some() {
+                        comet_proto::AgentSessionSource::Scaffold
+                    } else {
+                        comet_proto::AgentSessionSource::Local
+                    },
+                    environment: None,
+                    harness: Some(self.harness_for(&handle.chat_id)),
+                    model: workspace.chat_config(&handle.chat_id).and_then(|config| config.model),
+                    harness_session_id: None,
+                    status: None,
+                    updated_at: None,
+                    created_at: status.started_at.unwrap_or(status.updated_at).timestamp_millis(),
+                    unknown: Default::default(),
+                }
+            }
+            None => return Ok(()),
         };
         let updated_at = status.updated_at.timestamp_millis();
         if session.status == Some(status.status) && session.updated_at == Some(updated_at) {
@@ -2157,16 +2200,16 @@ impl DocHost {
                 }
                 let harness = self.harness_for(chat_id);
                 sessions
-                    .dispatch(chat_id, harness, request.clone(), Some(message_id.clone()))
+                    .dispatch(&self.chat_execution_key(handle)?, harness, request.clone(), Some(message_id.clone()))
                     .await?;
                 Ok((SessionCommandStatus::Applied, None))
             }
             SessionCommandPayload::Steer { prompt, message_id } => {
-                self.execute_steer(sessions, chat_id, chat_id, prompt, message_id)
+                self.execute_steer(sessions, &self.chat_execution_key(handle)?, chat_id, prompt, message_id)
                     .await
             }
             SessionCommandPayload::Queue { prompt, message_id } => {
-                self.execute_queue(sessions, chat_id, chat_id, prompt, message_id)
+                self.execute_queue(sessions, &self.chat_execution_key(handle)?, chat_id, prompt, message_id)
                     .await
             }
             SessionCommandPayload::PeerMessage {
@@ -3048,7 +3091,7 @@ mod authority_tests {
                 (Some(SessionStatus::Working), Some(1))
             );
 
-            // Replay, a bare chat key, and another device's agent cannot append.
+            // Replay and another device's agent cannot append.
             host.record_agent_session(&source).unwrap();
             for chat_id in ["chat-a", other_key.as_str()] {
                 let unrelated = comet_proto::Session {

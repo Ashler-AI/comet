@@ -139,15 +139,20 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
    workspace reset-log stay denied. Native handoffs publish status under the canonical chat
    identity while retaining private execution IDs for turn guards. Terminal transitions advance
    `lastMessageAt`, including tool-only turns; heartbeats and repeated idle teardown do not
-   manufacture unread activity. No per-session sidebar subscription or activity side channel.
+   manufacture unread activity. Ordinary hosts also publish their canonical room status,
+   without rekeying existing bare-chat writers. Controllers observe pinned remote rooms
+   through existing DocHost handles and merge a principal-local activity watch ahead of
+   stale workspace status; locally hosted runs keep direct live-status precedence.
 
-   *Why a workspace doc and not N tiny docs:* the sidebar needs one subscription for the whole
-   list (grouping, resort animations, unseen markers); one doc = one room connection + one mirror.
-   Workspace snapshots use bounded shallow history: the edge retains current state plus a
-   three-day causal boundary, and native clients persist state-only snapshots before joining.
-   A peer older than the retained boundary re-syncs current workspace metadata instead of
-   forcing every active reader to materialize unbounded superseded operations. Session
-   transcripts remain independently durable in their per-session documents.
+   *Why a workspace doc and not N tiny metadata docs:* the sidebar consumes one engine
+   subscription for the whole list (grouping, resort animations, unseen markers).
+   Shared metadata remains one workspace room and mirror; remote-room activity observers
+   keep liveness independent of workspace materialization.
+   Workspace history uses **lossless snapshot folding**, not age- or size-based shallow trimming:
+   disconnected writers may still depend on any retained operation. This trades increasing
+   retained history for correct offline merges; transcript-room retention is separate. Fresh
+   readers receive the persisted baseline followed by ordered accepted deltas, avoiding a
+   whole-history export for every sign-in.
 
    Authorized workspace recovery may atomically replace a wedged room with one bounded complete
    snapshot. The edge validates the snapshot envelope and enforces an 8 MiB observed-byte limit

@@ -1,6 +1,6 @@
-//! Local-controller projection of exact Scaffold rooms into sidebar activity.
+//! Local-controller projection of pinned session rooms into live activity.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use comet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
@@ -15,16 +15,20 @@ fn projected_rooms(
     refs: &[SessionRef],
     chats: &[Chat],
     project: &str,
-) -> HashMap<String, SessionRoomProjection> {
-    let archived: HashSet<_> = chats
-        .iter()
-        .filter(|chat| chat.archived)
-        .map(|chat| chat.id.as_str())
-        .collect();
+    local_device: &str,
+) -> HashMap<String, Option<SessionRoomProjection>> {
+    let chats: HashMap<_, _> = chats.iter().map(|chat| (chat.id.as_str(), chat)).collect();
     refs.iter()
-        .filter(|reference| !archived.contains(reference.chat_id.as_str()))
         .filter_map(|reference| {
-            projection(reference, project).map(|scope| (reference.chat_id.clone(), scope))
+            let chat = chats.get(reference.chat_id.as_str());
+            if chat.is_some_and(|chat| chat.archived) {
+                return None;
+            }
+            let scope = room_projection(reference, project)?;
+            if scope.is_none() && chat.is_none_or(|chat| chat.device_id == local_device) {
+                return None;
+            }
+            Some((reference.chat_id.clone(), scope))
         })
         .collect()
 }
@@ -38,12 +42,14 @@ impl SessionActivity {
         let task = tokio::spawn(async move {
             // Dropping the set aborts every room observer, including at shutdown.
             let mut tasks = JoinSet::new();
-            let mut rooms: HashMap<String, (SessionRoomProjection, AbortHandle)> = HashMap::new();
+            // ponytail: one observer per pinned remote room; batch subscriptions if
+            // remote pins outgrow the warm-doc budget. DocHost reuses open handles.
+            let mut rooms: HashMap<String, (Option<SessionRoomProjection>, AbortHandle)> = HashMap::new();
             loop {
                 let wanted = {
                     let chat_rows = chats.borrow_and_update();
                     let ref_rows = refs.borrow_and_update();
-                    projected_rooms(&ref_rows, &chat_rows, workspace.project_scope())
+                    projected_rooms(&ref_rows, &chat_rows, workspace.project_scope(), workspace.device_id())
                 };
                 rooms.retain(|id, (scope, task)| {
                     if wanted.get(id) == Some(scope) && !task.is_finished() {
@@ -57,10 +63,11 @@ impl SessionActivity {
                     if rooms.contains_key(&id) {
                         continue;
                     }
-                    match host.open_projection(&id, Some(&scope)) {
+                    match host.open_projection(&id, scope.as_ref()) {
                         Ok(handle) => {
                             let target = workspace.clone();
                             let room = scope.clone();
+                            let chat_id = id.clone();
                             let task = tasks.spawn(async move {
                                 let mut messages = handle.watch_messages();
                                 let mut previous = None;
@@ -71,8 +78,8 @@ impl SessionActivity {
                                         let tail = messages.borrow_and_update();
                                         handle.doc().collaboration_snapshot().map(|snapshot| {
                                             let Some(agent) = snapshot.sessions.iter().find(|agent| {
-                                                agent.session_id == room.session_id && agent.chat_id == room.session_id
-                                                    && agent.source == comet_proto::AgentSessionSource::Scaffold
+                                                agent.session_id == chat_id && agent.chat_id == chat_id
+                                                    && (room.is_none() || agent.source == comet_proto::AgentSessionSource::Scaffold)
                                             }) else { return Ok(()); };
                                             let latest = tail.entries.iter().rev().find(|entry| {
                                                 entry.role == MessageRole::Assistant && match snapshot.message_provenance.iter()
@@ -104,6 +111,7 @@ impl SessionActivity {
                                             let mut status = source_status;
                                             let mut updated_at = source_at;
                                             if let Some(entry) = latest
+                                                && room.is_some()
                                                 && (status == SessionStatus::Working || entry.created_at > source_at)
                                                 && entry.status == Some(MessageStatus::Streaming) {
                                                 status = if entry.parts.iter().any(|part| matches!(part, MessagePart::Input { resolved: false, .. })) {
@@ -116,8 +124,8 @@ impl SessionActivity {
                                             let Some(updated_at) = DateTime::<Utc>::from_timestamp_millis(updated_at) else { return Ok(()); };
                                             let last_message_at = tail.entries.iter().map(|entry| entry.created_at)
                                                 .chain(completed.then_some(source_at)).max();
-                                            target.record_scaffold_activity(&room, &Session {
-                                                chat_id: room.session_id.clone(),
+                                            target.record_session_activity(room.as_ref(), &agent.owner_subject, &Session {
+                                                chat_id: chat_id.clone(),
                                                 device_id: agent.owner_device_id.clone(),
                                                 status,
                                                 started_at: None,
@@ -127,8 +135,8 @@ impl SessionActivity {
                                     };
                                     match result {
                                         Ok(Ok(())) => {}
-                                        Ok(Err(error)) => tracing::warn!(chat = %room.session_id, %error, "workspace activity projection failed"),
-                                        Err(error) => tracing::warn!(chat = %room.session_id, %error, "session activity snapshot failed"),
+                                        Ok(Err(error)) => tracing::warn!(chat = %chat_id, %error, "workspace activity projection failed"),
+                                        Err(error) => tracing::warn!(chat = %chat_id, %error, "session activity snapshot failed"),
                                     }
                                     if messages.changed().await.is_err() {
                                         break;
@@ -160,6 +168,17 @@ impl SessionActivity {
 impl Drop for SessionActivity {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// `None` means an invalid explicit route, not permission to join the default room.
+pub(crate) fn room_projection(reference: &SessionRef, project: &str) -> Option<Option<SessionRoomProjection>> {
+    if reference.environment.as_ref().is_some_and(|environment| {
+        matches!(environment.source, SessionEnvironmentSource::Scaffold { .. })
+    }) {
+        projection(reference, project).map(Some)
+    } else {
+        Some(None)
     }
 }
 
@@ -207,6 +226,111 @@ mod tests {
         })
         .await
         .expect("activity projection did not arrive")
+    }
+
+    #[tokio::test]
+    async fn ordinary_remote_room_status_survives_stale_workspace_and_fences_owners() {
+        let setup = |device: &str| {
+            let temp = tempfile::tempdir().unwrap();
+            let store = std::sync::Arc::new(comet_sync::DocsStore::open(temp.path()).unwrap());
+            let workspace = WorkspaceHost::open(store.clone(), crate::WorkspaceHostConfig {
+                device_id: device.into(), device_name: "Test".into(), platform: "test".into(),
+                project_scope: "project".into(), user_id: "owner".into(), edge: None,
+            }).unwrap();
+            workspace.create_space("remote-space", "remote", "/tmp", None, false).unwrap();
+            workspace.create_chat("remote-chat", "remote-space", None, None).unwrap();
+            let host = DocHost::new(store, crate::DocHostConfig {
+                device_id: device.into(), default_harness: HarnessId::Mock, edge: None,
+            });
+            host.set_workspace(workspace.clone());
+            (temp, workspace, host)
+        };
+        let (_remote_temp, _remote_workspace, remote) = setup("remote");
+        let (_desktop_temp, workspace, desktop) = setup("desktop");
+        workspace.create_space("local-space", "desktop", "/tmp/local", None, false).unwrap();
+        workspace.create_chat("local-chat", "local-space", None, None).unwrap();
+        let remote_room = remote.open("remote-chat").unwrap();
+        let desktop_room = desktop.open("remote-chat").unwrap();
+        let mut current = Session {
+            chat_id: "remote-chat".into(), device_id: "remote".into(),
+            status: SessionStatus::Working, started_at: None,
+            updated_at: DateTime::from_timestamp_millis(1_000).unwrap(),
+        };
+        // Existing bare-chat agents acquire the canonical record on their next
+        // status/heartbeat, without a Start command or a different execution key.
+        remote.record_agent_session(&current).unwrap();
+        remote_room.doc().push_message(&SessionMessageEntry {
+            id: "old-stream".into(), role: MessageRole::Assistant,
+            parts: vec![MessagePart::Text { id: "text".into(), text: "old content".into() }],
+            created_at: 2_000, device_id: "remote".into(), status: Some(MessageStatus::Streaming),
+            continuation_of: None, peer_message: None,
+        }).unwrap();
+        let sync_room = || {
+            desktop_room.doc().doc().import(&remote_room.doc().doc()
+                .export(loro::ExportMode::Snapshot).unwrap()).unwrap();
+        };
+        sync_room();
+        let local = Session {
+            chat_id: "local-chat".into(), device_id: "desktop".into(),
+            status: SessionStatus::Working, started_at: None,
+            updated_at: DateTime::from_timestamp_millis(100_000).unwrap(),
+        };
+        let abandoned = Session { device_id: "desktop".into(), status: SessionStatus::Idle, ..current.clone() };
+        let (local_tx, local_rx) = watch::channel(vec![local.clone(), abandoned]);
+        let mut sessions = workspace.merged_sessions_watch(local_rx);
+        let mut workspace_rows = workspace.watch_session_rows();
+        let mut chats = workspace.watch_chats();
+        let bridge = SessionActivity::start(desktop, workspace.clone());
+        let rows = receive(&mut sessions, |rows| rows.iter().any(|row| {
+            row.chat_id == "remote-chat" && row.device_id == "remote"
+        })).await;
+        let old = rows.iter().find(|row| row.chat_id == "remote-chat").unwrap();
+        assert_eq!(old.updated_at.timestamp_millis(), 1_000);
+        assert_eq!(comet_proto::view::effective_indicator(Some(old),
+            DateTime::from_timestamp_millis(100_000).unwrap()), comet_proto::view::Indicator::None,
+            "a static streaming snapshot is not a current heartbeat");
+
+        for (status, at, sidebar) in [
+            (SessionStatus::Working, 100_000, ChatIndicator::Working),
+            (SessionStatus::Working, 110_000, ChatIndicator::Working),
+            (SessionStatus::AwaitingInput, 110_001, ChatIndicator::AwaitingInput),
+            (SessionStatus::Working, 110_002, ChatIndicator::Working),
+            (SessionStatus::Idle, 110_003, ChatIndicator::Completed),
+            (SessionStatus::Working, 110_004, ChatIndicator::Working),
+            (SessionStatus::Errored, 110_005, ChatIndicator::Errored),
+        ] {
+            current.status = status;
+            current.updated_at = DateTime::from_timestamp_millis(at).unwrap();
+            remote.record_agent_session(&current).unwrap();
+            sync_room();
+            receive(&mut sessions, |rows| rows.iter().any(|row| row == &current)).await;
+            let stale = Session { status: SessionStatus::Idle,
+                updated_at: DateTime::from_timestamp_millis(0).unwrap(), ..current.clone() };
+            workspace.record_session(&stale);
+            receive(&mut workspace_rows, |rows| rows.iter().any(|row| row == &stale)).await;
+            let rows = receive(&mut sessions, |rows| rows.iter().any(|row| row == &current)).await;
+            assert_eq!(workspace.doc().read_sessions().unwrap().iter()
+                .find(|row| row.chat_id == "remote-chat"), Some(&stale));
+            assert_eq!(rows.iter().find(|row| row.chat_id == "local-chat"), Some(&local),
+                "local live state still wins");
+            let chat = workspace.doc().chat("remote-chat").unwrap().unwrap();
+            assert_eq!(comet_proto::view::display_status(&chat,
+                rows.iter().find(|row| row.chat_id == "remote-chat"),
+                current.updated_at + chrono::Duration::milliseconds(10)), sidebar);
+        }
+        let before = workspace.doc().read_sessions().unwrap();
+        let foreign = Session { device_id: "foreign".into(), status: SessionStatus::Working, ..current.clone() };
+        workspace.record_session_activity(None, "owner", &foreign, Some(120_000)).unwrap();
+        workspace.record_session_activity(None, "foreign-principal", &current, Some(120_000)).unwrap();
+        assert_eq!(workspace.doc().read_sessions().unwrap(), before);
+        assert_eq!(sessions.borrow().iter().find(|row| row.chat_id == "remote-chat"), Some(&current));
+        local_tx.send_replace(vec![local]);
+        workspace.remove_session_ref("remote-chat").unwrap();
+        receive(&mut chats, |rows| rows.iter().all(|row| row.id != "remote-chat")).await;
+        receive(&mut sessions, |rows| rows.iter().all(|row| row.chat_id != "remote-chat")).await;
+        workspace.record_session_activity(None, "owner", &current, Some(120_000)).unwrap();
+        assert_eq!(workspace.doc().read_sessions().unwrap(), before);
+        drop(bridge);
     }
 
     #[tokio::test]
@@ -281,7 +405,7 @@ mod tests {
                         session_id: id.into(),
                         chat_id: "chat".into(),
                         owner_subject: "owner".into(),
-                        owner_device_id: "remote".into(),
+                        owner_device_id: "comet-scaffold-sandbox-e1".into(),
                         source: AgentSessionSource::Scaffold,
                         environment: None,
                         harness: None,
@@ -307,7 +431,7 @@ mod tests {
                     text: "Working".into(),
                 }],
                 created_at: 2_100,
-                device_id: "remote".into(),
+                device_id: "comet-scaffold-sandbox-e1".into(),
                 status: Some(MessageStatus::Streaming),
                 continuation_of: None,
                 peer_message: None,
@@ -338,7 +462,7 @@ mod tests {
         workspace.set_chat_archived("chat", true).unwrap();
         let archived = receive(&mut chats, |chats| chats[0].archived).await;
         assert!(
-            projected_rooms(std::slice::from_ref(&reference), &archived, "project").is_empty(),
+            projected_rooms(std::slice::from_ref(&reference), &archived, "project", "local").is_empty(),
             "archived sessions must not keep room observers alive"
         );
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
@@ -461,8 +585,9 @@ mod tests {
         publish("chat", SessionStatus::Working, 6_000);
         // Even a queued observer delivery cannot write after the synchronous unpin.
         workspace
-            .record_scaffold_activity(
-                &room,
+            .record_session_activity(
+                Some(&room),
+                "owner",
                 &Session {
                     status: SessionStatus::Working,
                     updated_at: now,

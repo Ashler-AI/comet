@@ -106,15 +106,6 @@ impl WorkspaceDoc {
             .map_err(|e| DocError::Schema(e.to_string()))
     }
 
-    /// Export current workspace state with only the causal boundary needed for
-    /// future merges. Workspace metadata is high-churn and full-history
-    /// snapshots eventually exceed the edge room's materialization budget.
-    pub fn export_compacted_snapshot(&self) -> Result<Vec<u8>, DocError> {
-        self.doc
-            .export(ExportMode::state_only(None))
-            .map_err(|e| DocError::Schema(e.to_string()))
-    }
-
     // ── devices ─────────────────────────────────────────────────────────────
 
     /// Upsert a full device row (writer discipline: callers pass their OWN device).
@@ -1660,30 +1651,27 @@ mod tests {
         assert_eq!(a.chat("chat-1").unwrap().unwrap().device_id, "dev-a");
     }
     #[test]
-    fn persisted_snapshot_bounds_history_and_remains_mergeable() {
+    fn persisted_offline_edits_merge_after_reload() {
+        let reload = |workspace: &WorkspaceDoc| {
+            let doc = LoroDoc::new();
+            doc.import(&workspace.export_snapshot().unwrap()).unwrap();
+            WorkspaceDoc::from_doc(doc)
+        };
         let a = WorkspaceDoc::new();
         a.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
-        for revision in 0..500 {
-            a.rename_chat("chat-1", &format!("revision-{revision}"))
-                .unwrap();
-        }
-        let full = a.doc().export(ExportMode::Snapshot).unwrap();
-        let persisted = a.export_compacted_snapshot().unwrap();
-        assert!(persisted.len() * 2 < full.len());
+        let b = reload(&a);
 
-        let b = WorkspaceDoc::from_doc({
-            let doc = LoroDoc::new();
-            doc.import(&persisted).unwrap();
-            doc
-        });
-        assert_eq!(a.read_all().unwrap(), b.read_all().unwrap());
-
+        // Each replica persists a different offline frontier before reconnecting.
         a.rename_chat("chat-1", "from-a").unwrap();
         b.set_chat_archived("chat-1", true).unwrap();
+        let a = reload(&a);
+        let b = reload(&b);
         cross_sync(&a, &b);
-        assert_eq!(a.read_all().unwrap(), b.read_all().unwrap());
-        let chat = a.chat("chat-1").unwrap().unwrap();
-        assert_eq!(chat.title.as_deref(), Some("from-a"));
-        assert!(chat.archived);
+
+        for workspace in [&a, &b] {
+            let chat = workspace.chat("chat-1").unwrap().unwrap();
+            assert_eq!(chat.title.as_deref(), Some("from-a"));
+            assert!(chat.archived);
+        }
     }
 }

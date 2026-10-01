@@ -125,6 +125,8 @@ struct WorkspaceHostInner {
     chats_tx: watch::Sender<Vec<Chat>>,
     devices_tx: watch::Sender<Vec<Device>>,
     sessions_tx: watch::Sender<Vec<Session>>,
+    /// Current session-room status, independent of workspace CRDT materialization.
+    room_sessions_tx: watch::Sender<Vec<(SessionRef, Session)>>,
     spaces_tx: watch::Sender<Vec<Space>>,
     session_refs_tx: watch::Sender<Vec<SessionRef>>,
     worktree_deletions_tx: watch::Sender<Vec<WorktreeDeletionStage>>,
@@ -267,7 +269,7 @@ fn backfill_local_session_refs(
         checked.insert(chat.id.clone());
     }
     if changed {
-        store.save_snapshot(WORKSPACE_DOC_ID, &doc.export_compacted_snapshot()?)?;
+        store.save_snapshot(WORKSPACE_DOC_ID, &doc.export_snapshot()?)?;
     }
     Ok(())
 }
@@ -299,17 +301,11 @@ impl WorkspaceHost {
     ) -> Result<Self, EngineError> {
         let doc = match store.load_snapshot(WORKSPACE_DOC_ID)? {
             Some(bytes) => {
-                let historical = loro::LoroDoc::new();
-                historical.import(&bytes).map_err(|e| {
+                let doc = loro::LoroDoc::new();
+                doc.import(&bytes).map_err(|e| {
                     EngineError::Other(format!("workspace snapshot import failed: {e}"))
                 })?;
-                let compacted = WorkspaceDoc::from_doc(historical).export_compacted_snapshot()?;
-                store.save_snapshot(WORKSPACE_DOC_ID, &compacted)?;
-                let live = loro::LoroDoc::new();
-                live.import(&compacted).map_err(|e| {
-                    EngineError::Other(format!("compacted workspace snapshot import failed: {e}"))
-                })?;
-                WorkspaceDoc::from_doc(live)
+                WorkspaceDoc::from_doc(doc)
             }
             None => WorkspaceDoc::new(),
         };
@@ -371,6 +367,7 @@ impl WorkspaceHost {
         let (chats_tx, _) = watch::channel(state.chats);
         let (devices_tx, _) = watch::channel(state.devices);
         let (sessions_tx, _) = watch::channel(state.sessions);
+        let (room_sessions_tx, _) = watch::channel(Vec::new());
         let (spaces_tx, _) = watch::channel(state.spaces);
         let (session_refs_tx, _) = watch::channel(state.session_refs);
         let (worktree_deletions_tx, _) = watch::channel(state.worktree_deletions);
@@ -383,6 +380,7 @@ impl WorkspaceHost {
                 chats_tx,
                 devices_tx,
                 sessions_tx,
+                room_sessions_tx,
                 spaces_tx,
                 session_refs_tx,
                 worktree_deletions_tx,
@@ -488,6 +486,10 @@ impl WorkspaceHost {
 
     pub fn device_id(&self) -> &str {
         &self.inner.config.device_id
+    }
+
+    pub(crate) fn owner_subject(&self) -> &str {
+        &self.inner.config.user_id
     }
 
     pub fn doc(&self) -> &WorkspaceDoc {
@@ -652,8 +654,8 @@ impl WorkspaceHost {
             .remove_session_ref(&self.inner.config.user_id, chat_id)?)
     }
 
-    /// WatchSessions source: remote devices' rows from the workspace doc merged with
-    /// this engine's live status watch (the local view is fresher for our own runs).
+    /// WatchSessions merges workspace snapshots with current owned remote-room
+    /// activity and this engine's live status (which wins for locally hosted runs).
     pub fn merged_sessions_watch(
         &self,
         local: watch::Receiver<Vec<Session>>,
@@ -661,12 +663,14 @@ impl WorkspaceHost {
         let mut rows = self.watch_session_rows();
         let mut local = local;
         let mut refs = self.watch_session_refs();
+        let mut room_rows = self.inner.room_sessions_tx.subscribe();
         let device_id = self.inner.config.device_id.clone();
         let (tx, rx) = watch::channel(merge_sessions(
             &device_id,
             &rows.borrow(),
             &local.borrow(),
             &refs.borrow(),
+            &room_rows.borrow(),
         ));
         tokio::spawn(async move {
             loop {
@@ -674,12 +678,14 @@ impl WorkspaceHost {
                     changed = rows.changed() => if changed.is_err() { break },
                     changed = local.changed() => if changed.is_err() { break },
                     changed = refs.changed() => if changed.is_err() { break },
+                    changed = room_rows.changed() => if changed.is_err() { break },
                 }
                 let merged = merge_sessions(
                     &device_id,
                     &rows.borrow_and_update(),
                     &local.borrow_and_update(),
                     &refs.borrow_and_update(),
+                    &room_rows.borrow_and_update(),
                 );
                 if tx.send(merged).is_err() {
                     break; // no receivers left
@@ -888,9 +894,10 @@ impl WorkspaceHost {
 
     /// Project session-room activity without rewriting chat metadata or seen state.
     /// The membership lock also fences a watcher racing an unpin or route change.
-    pub(crate) fn record_scaffold_activity(
+    pub(crate) fn record_session_activity(
         &self,
-        projection: &comet_proto::SessionRoomProjection,
+        projection: Option<&comet_proto::SessionRoomProjection>,
+        owner_subject: &str,
         session: &Session,
         last_message_at: Option<i64>,
     ) -> Result<(), EngineError> {
@@ -902,11 +909,40 @@ impl WorkspaceHost {
         else {
             return Ok(());
         };
-        if crate::session_activity::projection(&reference, self.project_scope()).as_ref()
-            != Some(projection)
+        if crate::session_activity::room_projection(&reference, self.project_scope())
+            .as_ref().map(Option::as_ref) != Some(projection)
+            || owner_subject != self.owner_subject()
+            || reference.environment.as_ref().is_some_and(|environment| environment.owner_principal != owner_subject)
         {
             return Ok(());
         }
+        match reference.environment.as_ref().map(|environment| &environment.source) {
+            Some(comet_proto::SessionEnvironmentSource::Scaffold { sandbox_id, lifecycle_epoch, .. }) => {
+                if !comet_proto::parse_scaffold_device_id(&session.device_id).is_some_and(|(sandbox, epoch)| {
+                    sandbox == sandbox_id && lifecycle_epoch.is_none_or(|expected| expected == epoch)
+                }) {
+                    return Ok(());
+                }
+            }
+            _ => {
+                if self.inner.doc.chat(&session.chat_id)?.is_none_or(|chat| chat.device_id != session.device_id) {
+                    return Ok(());
+                }
+            }
+        }
+        // Consumers read this watch directly; a workspace import may remain pending
+        // forever when peers have incompatible shallow frontiers.
+        self.inner.room_sessions_tx.send_if_modified(|rows| {
+            if let Some(row) = rows.iter_mut().find(|(_, row)| row.chat_id == session.chat_id) {
+                if row.0.environment == reference.environment && row.1 == *session {
+                    return false;
+                }
+                *row = (reference.clone(), session.clone());
+            } else {
+                rows.push((reference.clone(), session.clone()));
+            }
+            true
+        });
         if self
             .inner
             .sessions_tx
@@ -1407,6 +1443,16 @@ impl WorkspaceHostInner {
             )?;
             state.session_refs = self.doc.read_session_refs_for(&self.config.user_id)?;
             retain_visible_sessions(&mut state.chats, &mut state.sessions, &state.session_refs);
+            self.room_sessions_tx.send_if_modified(|rows| {
+                let before = rows.len();
+                rows.retain(|(observed, session)| state.session_refs.iter().any(|reference| {
+                    reference.chat_id == session.chat_id && reference.added_at == observed.added_at
+                        && reference.environment == observed.environment
+                        && (crate::session_activity::projection(reference, &self.config.project_scope).is_some()
+                            || state.chats.iter().any(|chat| chat.id == session.chat_id && chat.device_id == session.device_id))
+                }));
+                before != rows.len()
+            });
             Ok(state)
         })() {
             Ok(mut state) => {
@@ -1517,7 +1563,7 @@ impl WorkspaceHostInner {
     }
 
     fn save_snapshot(&self) {
-        match self.doc.export_compacted_snapshot() {
+        match self.doc.export_snapshot() {
             Ok(bytes) => {
                 if let Err(err) = self.store.save_snapshot(WORKSPACE_DOC_ID, &bytes) {
                     tracing::warn!(error = %err, "workspace snapshot save failed");
@@ -1578,32 +1624,39 @@ impl WorkspaceHostInner {
     }
 }
 
-/// Scaffold references use their projected remote row, never an abandoned local
-/// run. Other chats keep local live status precedence. Sorted by chat id.
+/// Owned remote-room status wins over workspace snapshots and abandoned local runs.
+/// Locally hosted sessions keep live status precedence. Sorted by chat id.
 fn merge_sessions(
     device_id: &str,
     rows: &[Session],
     local: &[Session],
     refs: &[SessionRef],
+    room_rows: &[(SessionRef, Session)],
 ) -> Vec<Session> {
-    let remote: std::collections::HashSet<&str> = refs
-        .iter()
-        .filter(|reference| {
+    let projected = room_rows.iter().filter(|(observed, session)| {
+        refs.iter().any(|reference| reference.chat_id == session.chat_id
+            && reference.added_at == observed.added_at && reference.environment == observed.environment)
+    }).map(|(_, session)| session);
+    let remote: std::collections::HashSet<&str> = projected.clone()
+        .filter(|session| session.device_id != device_id)
+        .map(|session| session.chat_id.as_str())
+        .chain(refs.iter().filter(|reference| {
             comet_proto::parse_scaffold_device_id(device_id).is_none()
                 && reference.environment.as_ref().is_some_and(|environment| {
-                    matches!(
-                        environment.source,
-                        comet_proto::SessionEnvironmentSource::Scaffold { .. }
-                    )
+                    matches!(environment.source, comet_proto::SessionEnvironmentSource::Scaffold { .. })
                 })
-        })
-        .map(|reference| reference.chat_id.as_str())
+        }).map(|reference| reference.chat_id.as_str()))
         .collect();
     let mut merged: std::collections::HashMap<String, Session> = rows
         .iter()
         .filter(|s| s.device_id != device_id || remote.contains(s.chat_id.as_str()))
         .map(|s| (s.chat_id.clone(), s.clone()))
         .collect();
+    for session in projected {
+        if session.device_id != device_id {
+            merged.insert(session.chat_id.clone(), session.clone());
+        }
+    }
     for session in local
         .iter()
         .filter(|s| !remote.contains(s.chat_id.as_str()))
@@ -1796,7 +1849,7 @@ mod tests {
         let mut live = session("chat-a::session::chat-a", "device-a");
         live.status = SessionStatus::Working;
         let child = session("chat-a::session::child", "device-a");
-        let merged = merge_sessions("device-a", &[], &[live.clone(), child.clone()], &[]);
+        let merged = merge_sessions("device-a", &[], &[live.clone(), child.clone()], &[], &[]);
         assert_eq!(merged.len(), 3);
         assert_eq!(
             merged
@@ -1808,7 +1861,7 @@ mod tests {
         );
         assert!(merged.contains(&live));
         assert!(merged.contains(&child));
-        let only_child = merge_sessions("device-a", &[], &[child.clone()], &[]);
+        let only_child = merge_sessions("device-a", &[], &[child.clone()], &[], &[]);
         assert_eq!(only_child, vec![child]);
     }
 
@@ -2064,41 +2117,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_compacts_legacy_workspace_history_before_sync() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(comet_sync::DocsStore::open(temp.path()).unwrap());
+    async fn offline_workspace_edits_merge_after_save_and_reopen() {
+        let open = |store, device_id: &str| {
+            WorkspaceHost::open(
+                store,
+                WorkspaceHostConfig {
+                    device_id: device_id.into(),
+                    device_name: "Test".into(),
+                    platform: "test".into(),
+                    project_scope: "project-a".into(),
+                    user_id: "user-a".into(),
+                    edge: None,
+                },
+            )
+            .unwrap()
+        };
+        let temp_a = tempfile::tempdir().unwrap();
+        let temp_b = tempfile::tempdir().unwrap();
+        let store_a = std::sync::Arc::new(comet_sync::DocsStore::open(temp_a.path()).unwrap());
+        let store_b = std::sync::Arc::new(comet_sync::DocsStore::open(temp_b.path()).unwrap());
         let seed = comet_doc::WorkspaceDoc::new();
         seed.upsert_chat(&chat("session-a", "device-a")).unwrap();
-        for revision in 0..500 {
-            seed.rename_chat("session-a", &format!("revision-{revision}"))
-                .unwrap();
+        let baseline = seed.export_snapshot().unwrap();
+        for store in [&store_a, &store_b] {
+            store.save_snapshot(super::WORKSPACE_DOC_ID, &baseline).unwrap();
         }
-        let full = seed.doc().export(loro::ExportMode::Snapshot).unwrap();
-        store.save_snapshot(super::WORKSPACE_DOC_ID, &full).unwrap();
 
-        let host = WorkspaceHost::open(
-            store,
-            WorkspaceHostConfig {
-                device_id: "device-a".into(),
-                device_name: "Test".into(),
-                platform: "test".into(),
-                project_scope: "project-a".into(),
-                user_id: "user-a".into(),
-                edge: None,
-            },
-        )
-        .unwrap();
-        let compacted = host.doc().doc().export(loro::ExportMode::Snapshot).unwrap();
-        assert!(compacted.len() * 2 < full.len());
-        assert_eq!(
-            host.doc()
-                .chat("session-a")
-                .unwrap()
-                .unwrap()
-                .title
-                .as_deref(),
-            Some("revision-499")
-        );
+        let a = open(store_a.clone(), "device-a");
+        let b = open(store_b.clone(), "device-b");
+        a.doc().rename_chat("session-a", "from-a").unwrap();
+        b.doc().set_chat_archived("session-a", true).unwrap();
+        a.flush();
+        b.flush();
+        drop(a);
+        drop(b);
+
+        let a = open(store_a, "device-a");
+        let b = open(store_b, "device-b");
+        let a_update = a
+            .doc()
+            .doc()
+            .export(loro::ExportMode::updates(&b.doc().doc().oplog_vv()))
+            .unwrap();
+        let b_update = b
+            .doc()
+            .doc()
+            .export(loro::ExportMode::updates(&a.doc().doc().oplog_vv()))
+            .unwrap();
+        b.doc().doc().import(&a_update).unwrap();
+        a.doc().doc().import(&b_update).unwrap();
+
+        for host in [&a, &b] {
+            let chat = host.doc().chat("session-a").unwrap().unwrap();
+            assert_eq!(chat.title.as_deref(), Some("from-a"));
+            assert!(chat.archived);
+        }
     }
 
     #[tokio::test]
