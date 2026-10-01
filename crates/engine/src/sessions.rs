@@ -260,6 +260,8 @@ impl Drop for DispatchPreparationGuard {
 
 struct RunHandle {
     run_id: String,
+    supervision_token: String,
+    supervision: watch::Sender<usize>,
     user_message_id: String,
     route: RunRoute,
     steerable: bool,
@@ -282,6 +284,19 @@ struct RunHandle {
     cancel: watch::Sender<bool>,
     engine_tx: mpsc::UnboundedSender<AgentEvent>,
     pending_inputs: PendingInputs,
+}
+
+/// Connection-owned: old subscriptions can only release their own run's counter.
+pub(crate) struct SupervisionLease {
+    pub run_id: String,
+    pub interrupt: CancellationToken,
+    holders: watch::Sender<usize>,
+}
+
+impl Drop for SupervisionLease {
+    fn drop(&mut self) {
+        self.holders.send_modify(|count| *count -= 1);
+    }
 }
 
 struct RouteRestartState {
@@ -517,6 +532,32 @@ impl SessionsEngine {
             .get()
             .map(|auth| RunAuthIdentity::from(&auth.state()))
             .unwrap_or(RunAuthIdentity::Unattached)
+    }
+
+    pub(crate) fn retain_supervision(
+        &self,
+        chat_id: &str,
+        token: &str,
+    ) -> Result<SupervisionLease, EngineError> {
+        let runs = lock(&self.inner.runs);
+        self.require_running()?;
+        let handle = runs
+            .iter()
+            .find_map(|(id, handle)| {
+                (handle.supervision_token == token
+                    && self.inner.workspace_continuation_id(id) == chat_id
+                    && handle.steerable
+                    && !handle.interrupt_token.is_cancelled()
+                    && handle.route.auth_identity == self.auth_identity())
+                .then_some(handle)
+            })
+            .ok_or_else(|| EngineError::Other("no authorized live supervision run".into()))?;
+        handle.supervision.send_modify(|count| *count += 1);
+        Ok(SupervisionLease {
+            run_id: handle.run_id.clone(),
+            interrupt: handle.interrupt_token.clone(),
+            holders: handle.supervision.clone(),
+        })
     }
 
     fn dispatch_lock(&self, chat_id: &str) -> Arc<AsyncMutex<()>> {
@@ -1140,6 +1181,8 @@ impl SessionsEngine {
             resume_injected = request.resume.is_some();
         }
         let run_id = new_id();
+        let supervision_token = new_id();
+        let (supervision, supervision_rx) = watch::channel(0);
         let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (engine_tx, engine_rx) = mpsc::unbounded_channel::<AgentEvent>();
@@ -1169,6 +1212,7 @@ impl SessionsEngine {
             context: Some(RunContext {
                 session_id: self.inner.workspace_continuation_id(chat_id),
                 ipc_port: self.inner.ipc_port,
+                supervision_token: Some(supervision_token.clone()),
                 inference,
                 fork_from: fork_from.as_ref().map(|fork| fork.session_id.clone()),
             }),
@@ -1208,6 +1252,8 @@ impl SessionsEngine {
                 RunHandle {
                     user_message_id: user_id.clone(),
                     run_id: run_id.clone(),
+                    supervision_token,
+                    supervision,
                     route: requested_route.clone(),
                     steerable: harness.supports_steering(),
                     steering_mode: harness.steering_mode(),
@@ -1338,6 +1384,7 @@ impl SessionsEngine {
             stream,
             engine_rx,
             cancel_rx,
+            supervision_rx,
             RunResumeState {
                 user_message_id: user_id,
                 resume_injected,
@@ -2496,6 +2543,7 @@ async fn drive_run(
     mut stream: BoxStream<'static, Result<AgentEvent, HarnessError>>,
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
     mut cancel_rx: watch::Receiver<bool>,
+    mut supervision_rx: watch::Receiver<usize>,
     resume_state: RunResumeState,
     inference_token: Option<String>,
     _activity: RunTaskGuard,
@@ -2556,6 +2604,7 @@ async fn drive_run(
                 );
                 continue;
             }
+            _ = supervision_rx.changed() => continue,
             _ = tokio::time::sleep_until(
                 interrupt_deadline.unwrap_or_else(tokio::time::Instant::now)
             ), if interrupt_deadline.is_some() => AgentEvent::Done {
@@ -2568,20 +2617,26 @@ async fn drive_run(
                 inner.touch_session(&chat_id);
                 continue;
             }
-            // Idle reaper (comet SESSION_IDLE_MS): a parked persistent session
-            // nobody returned to in 30 minutes releases its child. The turn
-            // was finalized at Done, so this end is clean — no aborted stamp.
+            // Retention only suspends idle retirement, never cancellation or stream
+            // teardown. Release uses the original idle deadline, not a new grace period.
             _ = tokio::time::sleep_until(
                 idle_since.map(|at| at + SESSION_IDLE).unwrap_or_else(tokio::time::Instant::now)
-            ), if idle_since.is_some() => {
-                tracing::info!(chat = %chat_id, "reaping idle persistent session");
-                if let Some(token) = lock(&inner.runs)
-                    .get(&chat_id)
-                    .filter(|h| h.run_id == run_id)
-                    .map(|h| h.interrupt_token.clone())
-                {
-                    token.cancel();
+            ), if idle_since.is_some() && *supervision_rx.borrow() == 0 => {
+                // Serialize retirement with dispatch and retention admission. A
+                // deadline selected just before either acquired the lock is stale.
+                let mut runs = lock(&inner.runs);
+                if let Some(handle) = runs.get_mut(&chat_id).filter(|h| h.run_id == run_id) {
+                    if handle.turn_active {
+                        idle_since = None;
+                        continue;
+                    }
+                    if *handle.supervision.borrow() != 0 {
+                        continue;
+                    }
+                    handle.steerable = false;
+                    handle.interrupt_token.cancel();
                 }
+                tracing::info!(chat = %chat_id, "reaping idle persistent session");
                 break SessionStatus::Idle;
             }
             Some(event) = engine_rx.recv() => event,
@@ -3271,6 +3326,8 @@ mod tests {
             "chat".into(),
             RunHandle {
                 run_id: "run".into(),
+                supervision_token: new_id(),
+                supervision: watch::channel(0).0,
                 user_message_id: "user".into(),
                 route: RunRoute::new(
                     HarnessId::Mock,
@@ -3935,6 +3992,116 @@ mod tests {
             .chain(futures::stream::pending())
             .boxed())
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervision_retains_only_the_authorized_live_run_until_last_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = bare_sessions(&dir.path().join("journal"));
+        sessions.set_doc_host(DocHost::new(
+            Arc::new(DocsStore::open(dir.path().join("store")).unwrap()),
+            DocHostConfig {
+                device_id: "test-device".into(),
+                default_harness: HarnessId::Omp,
+                edge: None,
+            },
+        ));
+        sessions.inner.registry.register(Arc::new(TakeoverHarness {
+            runs: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            stops: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            fail_cleanup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }));
+        async fn park(sessions: &SessionsEngine) -> (String, String) {
+            let run = sessions
+                .dispatch("primary", HarnessId::Omp, test_request("hello", None), None)
+                .await
+                .unwrap();
+            sessions
+                .watch_sessions()
+                .wait_for(|rows| {
+                    rows.iter()
+                        .any(|s| s.chat_id == "primary" && s.status == SessionStatus::Idle)
+                })
+                .await
+                .unwrap();
+            let token = lock(&sessions.inner.runs)["primary"]
+                .supervision_token
+                .clone();
+            (run, token)
+        }
+        let elapsed = std::time::Duration::from_secs(31 * 60);
+        let (ordinary, expired_token) = park(&sessions).await;
+        let ordinary_retired = lock(&sessions.inner.runs)["primary"]
+            .interrupt_token
+            .clone();
+        tokio::time::advance(elapsed).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            ordinary_retired.cancelled(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !sessions.is_live("primary", &ordinary),
+            "ordinary idle retirement"
+        );
+        assert!(
+            sessions
+                .retain_supervision("primary", &expired_token)
+                .is_err()
+        );
+
+        let (retained, token) = park(&sessions).await;
+        assert!(sessions.retain_supervision("other", &token).is_err());
+        assert!(
+            sessions
+                .retain_supervision("primary", &expired_token)
+                .is_err()
+        );
+        let first = sessions.retain_supervision("primary", &token).unwrap();
+        let last = sessions.retain_supervision("primary", &token).unwrap();
+        let retired = last.interrupt.clone();
+        tokio::time::advance(elapsed).await;
+        tokio::task::yield_now().await;
+        assert!(sessions.is_live("primary", &retained));
+        drop(first);
+        tokio::task::yield_now().await;
+        assert!(
+            sessions.is_live("primary", &retained),
+            "second obligation still owns run"
+        );
+        drop(last);
+        tokio::time::timeout(std::time::Duration::from_secs(1), retired.cancelled())
+            .await
+            .unwrap();
+        assert!(
+            !sessions.is_live("primary", &retained),
+            "last release restores expired deadline"
+        );
+
+        let (cancelled, old_token) = park(&sessions).await;
+        let stale = sessions.retain_supervision("primary", &old_token).unwrap();
+        stale.interrupt.cancel();
+        assert!(sessions.retain_supervision("primary", &old_token).is_err());
+        sessions.interrupt("primary").await.unwrap();
+        assert!(!sessions.is_live("primary", &cancelled));
+        assert!(stale.interrupt.is_cancelled());
+        assert!(sessions.retain_supervision("primary", &old_token).is_err());
+        let (replacement, new_token) = park(&sessions).await;
+        let current = sessions.retain_supervision("primary", &new_token).unwrap();
+        drop(stale);
+        assert!(sessions.retain_supervision("primary", &old_token).is_err());
+        tokio::time::advance(elapsed).await;
+        tokio::task::yield_now().await;
+        assert!(
+            sessions.is_live("primary", &replacement),
+            "stale release cannot affect replacement"
+        );
+        sessions.shutdown().await;
+        assert!(current.interrupt.is_cancelled());
+        assert!(sessions.retain_supervision("primary", &new_token).is_err());
+        assert!(!sessions.is_live("primary", &replacement));
     }
 
     #[tokio::test]

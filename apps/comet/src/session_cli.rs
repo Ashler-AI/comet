@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 pub enum SessionCommand {
     /// Print the current session id supplied to this agent run.
     Current,
+    /// Hold this exact live run for supervision until this attached process exits.
+    /// Prints one JSON receipt when retained. Terminate/reap the child to release.
+    Supervise,
     /// Add an exact session id to this workspace's shared sessions.
     Add { chat_id: String },
     /// Remove a shared-session reference from this workspace.
@@ -88,6 +91,33 @@ pub async fn run(command: SessionCommand, ipc_port: u16) -> anyhow::Result<()> {
     }
 
     let command = match command {
+        SessionCommand::Supervise => {
+            let params = comet_rpc::RetainSessionSupervisionParams {
+                chat_id: current_session_id(None)?,
+                token: std::env::var("COMET_SUPERVISION_TOKEN")
+                    .ok().filter(|token| !token.is_empty())
+                    .ok_or_else(|| anyhow!(
+                        "this run has no Crew supervision capability; start a fresh run in a supporting engine"
+                    ))?,
+            };
+            let client = connect_engine(ipc_port).await?;
+            let mut retained = client
+                .subscribe(
+                    comet_rpc::methods::RETAIN_SESSION_SUPERVISION,
+                    serde_json::to_value(params)?,
+                )
+                .await
+                .context("Crew supervision is unavailable")?;
+            let receipt = retained.recv().await.ok_or_else(|| {
+                anyhow!("Crew supervision rejected or unsupported; no live run was retained")
+            })?;
+            println!("{}", serde_json::to_string(&receipt)?);
+            std::io::Write::flush(&mut std::io::stdout())?;
+            let _ = retained.recv().await;
+            return Err(anyhow!(
+                "Crew supervision ended; the run or engine is no longer live"
+            ));
+        }
         SessionCommand::Handoff {
             chat_id,
             prompt_file,
@@ -115,7 +145,7 @@ pub async fn run(command: SessionCommand, ipc_port: u16) -> anyhow::Result<()> {
     let client = connect_engine(ipc_port).await?;
 
     match command {
-        SessionCommand::Current | SessionCommand::Handoff { .. } => {
+        SessionCommand::Current | SessionCommand::Handoff { .. } | SessionCommand::Supervise => {
             unreachable!("handled before connecting")
         }
         SessionCommand::Add { chat_id } => {
