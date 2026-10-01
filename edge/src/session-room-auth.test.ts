@@ -682,43 +682,82 @@ describe("SessionRoom chat authorization", () => {
     }
   });
 
-  it("bounds workspace history while preserving current state and future writes", async () => {
+  it.each([
+    ["workspace", "age"], ["workspace", "size"],
+    ["legacy", "age"], ["legacy", "size"]
+  ] as const)("preserves offline workspace edits through %s %s folds and fresh-reader backfill", async (kind, trigger) => {
     const source = new LoroDoc();
     const writer = new LoroDoc();
     const reader = new LoroDoc();
     let writerBase: VersionVector | undefined;
     try {
       source.getMap("metadata").set("base", true);
-      source.getMap("metadata").set("payload", oversizedPayload());
       source.commit();
-      source.getMap("metadata").set("payload", "current");
-      source.commit();
-      const fullSnapshot = source.export({ mode: "snapshot" });
-      expect(fullSnapshot.byteLength).toBeGreaterThan(512 * 1024);
+      const baseline = source.export({ mode: "snapshot" });
+      writer.import(baseline);
+      writerBase = writer.oplogVersion();
+      writer.getMap("metadata").set("offline", "retained locally");
+      writer.commit();
+
       const sql = new MemorySql();
-      sql.putBlob("snapshot", fullSnapshot);
-      sql.meta.set("roomKind", "workspace");
+      sql.putBlob("snapshot", baseline);
+      if (kind === "workspace") sql.meta.set("roomKind", "workspace");
       sql.meta.set("owner", PROJECT_SCOPE);
       sql.meta.set("chatId", "ws4/project-a");
-      const { room } = makeRoom(sql);
-      const internals = room as unknown as SessionRoomInternals;
-      expect(sql.meta.get("lastTrimAt")).toBeUndefined();
-      await internals.ensureDoc();
-      expect(sql.meta.get("lastTrimAt")).toBeDefined();
-      const compacted = await room.fetch(authedRequest("/snapshot", "user-a"));
-      const compactedBytes = new Uint8Array(await compacted.arrayBuffer());
-      expect(compactedBytes.byteLength).toBeLessThan(fullSnapshot.byteLength / 2);
-      reader.import(compactedBytes);
-      expect(reader.toJSON()).toEqual(source.toJSON());
+      const internals = makeRoom(sql).room as unknown as SessionRoomInternals;
+      const live = await internals.ensureDoc();
+      source.getMap("metadata").set("server", trigger === "size" ? oversizedPayload() : "initial");
+      source.commit();
+      source.getMap("metadata").set("server", "retained remotely");
+      source.commit();
+      source.getMap("metadata").set("afterGap", true);
+      source.commit();
+      const serverDelta = source.export({ mode: "update", from: writerBase });
+      sql.appendUpdate(serverDelta);
+      sql.meta.set("updateBytes", String(serverDelta.byteLength));
+      live.import(serverDelta);
+      if (trigger === "age") {
+        sql.meta.set("checkpoints", JSON.stringify([{
+          at: Date.now() - 365 * 24 * 60 * 60 * 1000,
+          frontiers: live.frontiers()
+        }]));
+      }
+      await internals.foldLog();
 
-      writer.import(compactedBytes);
-      writerBase = writer.oplogVersion();
-      writer.getMap("metadata").set("future", "preserved");
-      writer.commit();
-      expect((await room.fetch(authedRequest("/append", "user-a", {
-        method: "POST", body: writer.export({ mode: "update", from: writerBase })
+      const restarted = makeRoom(sql).room;
+      const headers = { [ROOM_KIND_HEADER]: "workspace" };
+      expect((await restarted.fetch(authedRequest("/append", "user-a", {
+        method: "POST", headers, body: writer.export({ mode: "update", from: writerBase })
       }))).status).toBe(200);
-      expect((await internals.ensureDoc()).toJSON()).toEqual(writer.toJSON());
+      // Persist the offline branch before a second cold reader backfills it.
+      expect((await restarted.fetch(authedRequest("/snapshot", "user-a", { headers }))).status).toBe(200);
+      const socket = await join(makeRoom(sql).room, "user-b", "ws4/project-a");
+      const fragments = new Map<string, { parts: Uint8Array[]; remaining: number; size: number }>();
+      for (const bytes of socket.sent) {
+        const message = decode(bytes);
+        if (message.type === MessageType.DocUpdate) {
+          for (const update of message.updates) expect(reader.import(update).pending?.size ?? 0).toBe(0);
+        } else if (message.type === MessageType.DocUpdateFragmentHeader) {
+          fragments.set(message.batchId, {
+            parts: new Array(message.fragmentCount), remaining: message.fragmentCount, size: message.totalSizeBytes
+          });
+        } else if (message.type === MessageType.DocUpdateFragment) {
+          const batch = fragments.get(message.batchId)!;
+          batch.parts[message.index] = message.fragment;
+          if (--batch.remaining !== 0) continue;
+          const update = new Uint8Array(batch.size);
+          let offset = 0;
+          for (const part of batch.parts) {
+            update.set(part, offset);
+            offset += part.length;
+          }
+          expect(reader.import(update).pending?.size ?? 0).toBe(0);
+          fragments.delete(message.batchId);
+        }
+      }
+      expect(reader.toJSON()).toEqual({ metadata: {
+        base: true, offline: "retained locally", server: "retained remotely", afterGap: true
+      } });
     } finally {
       writerBase?.free(); reader.free(); writer.free(); source.free();
     }
@@ -931,10 +970,6 @@ describe("SessionRoom chat authorization", () => {
           .find((message) => message.type === MessageType.DocUpdate);
         expect(backfill?.type).toBe(MessageType.DocUpdate);
         if (backfill?.type === MessageType.DocUpdate) {
-          // The unchanged retained text must not be retransmitted to a caught-up
-          // client. This also rejects an unconditional full-snapshot fallback.
-          const bytes = backfill.updates.reduce((total, update) => total + update.byteLength, 0);
-          expect(bytes).toBeLessThan(coveredSnapshot.byteLength / 2);
           for (const update of backfill.updates) {
             expect(mirror.import(update).pending?.size ?? 0).toBe(0);
           }
@@ -1428,9 +1463,6 @@ describe("SessionRoom chat authorization", () => {
 
       const live = await room.fetch(authedRequest("/snapshot", "user-a"));
       const bytes = new Uint8Array(await live.arrayBuffer());
-      // Only the current small value belongs in the backfill, not the deleted
-      // multi-megabyte history that triggered compaction.
-      expect(bytes.byteLength).toBeLessThan(100_000);
       const mirror = new LoroDoc();
       mirror.import(bytes);
       expect(mirror.getMap("metadata").toJSON()).toEqual({

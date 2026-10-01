@@ -269,7 +269,7 @@ fn backfill_local_session_refs(
         checked.insert(chat.id.clone());
     }
     if changed {
-        store.save_snapshot(WORKSPACE_DOC_ID, &doc.export_compacted_snapshot()?)?;
+        store.save_snapshot(WORKSPACE_DOC_ID, &doc.export_snapshot()?)?;
     }
     Ok(())
 }
@@ -301,17 +301,11 @@ impl WorkspaceHost {
     ) -> Result<Self, EngineError> {
         let doc = match store.load_snapshot(WORKSPACE_DOC_ID)? {
             Some(bytes) => {
-                let historical = loro::LoroDoc::new();
-                historical.import(&bytes).map_err(|e| {
+                let doc = loro::LoroDoc::new();
+                doc.import(&bytes).map_err(|e| {
                     EngineError::Other(format!("workspace snapshot import failed: {e}"))
                 })?;
-                let compacted = WorkspaceDoc::from_doc(historical).export_compacted_snapshot()?;
-                store.save_snapshot(WORKSPACE_DOC_ID, &compacted)?;
-                let live = loro::LoroDoc::new();
-                live.import(&compacted).map_err(|e| {
-                    EngineError::Other(format!("compacted workspace snapshot import failed: {e}"))
-                })?;
-                WorkspaceDoc::from_doc(live)
+                WorkspaceDoc::from_doc(doc)
             }
             None => WorkspaceDoc::new(),
         };
@@ -1569,7 +1563,7 @@ impl WorkspaceHostInner {
     }
 
     fn save_snapshot(&self) {
-        match self.doc.export_compacted_snapshot() {
+        match self.doc.export_snapshot() {
             Ok(bytes) => {
                 if let Err(err) = self.store.save_snapshot(WORKSPACE_DOC_ID, &bytes) {
                     tracing::warn!(error = %err, "workspace snapshot save failed");
@@ -2123,41 +2117,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_compacts_legacy_workspace_history_before_sync() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(comet_sync::DocsStore::open(temp.path()).unwrap());
+    async fn offline_workspace_edits_merge_after_save_and_reopen() {
+        let open = |store, device_id: &str| {
+            WorkspaceHost::open(
+                store,
+                WorkspaceHostConfig {
+                    device_id: device_id.into(),
+                    device_name: "Test".into(),
+                    platform: "test".into(),
+                    project_scope: "project-a".into(),
+                    user_id: "user-a".into(),
+                    edge: None,
+                },
+            )
+            .unwrap()
+        };
+        let temp_a = tempfile::tempdir().unwrap();
+        let temp_b = tempfile::tempdir().unwrap();
+        let store_a = std::sync::Arc::new(comet_sync::DocsStore::open(temp_a.path()).unwrap());
+        let store_b = std::sync::Arc::new(comet_sync::DocsStore::open(temp_b.path()).unwrap());
         let seed = comet_doc::WorkspaceDoc::new();
         seed.upsert_chat(&chat("session-a", "device-a")).unwrap();
-        for revision in 0..500 {
-            seed.rename_chat("session-a", &format!("revision-{revision}"))
-                .unwrap();
+        let baseline = seed.export_snapshot().unwrap();
+        for store in [&store_a, &store_b] {
+            store.save_snapshot(super::WORKSPACE_DOC_ID, &baseline).unwrap();
         }
-        let full = seed.doc().export(loro::ExportMode::Snapshot).unwrap();
-        store.save_snapshot(super::WORKSPACE_DOC_ID, &full).unwrap();
 
-        let host = WorkspaceHost::open(
-            store,
-            WorkspaceHostConfig {
-                device_id: "device-a".into(),
-                device_name: "Test".into(),
-                platform: "test".into(),
-                project_scope: "project-a".into(),
-                user_id: "user-a".into(),
-                edge: None,
-            },
-        )
-        .unwrap();
-        let compacted = host.doc().doc().export(loro::ExportMode::Snapshot).unwrap();
-        assert!(compacted.len() * 2 < full.len());
-        assert_eq!(
-            host.doc()
-                .chat("session-a")
-                .unwrap()
-                .unwrap()
-                .title
-                .as_deref(),
-            Some("revision-499")
-        );
+        let a = open(store_a.clone(), "device-a");
+        let b = open(store_b.clone(), "device-b");
+        a.doc().rename_chat("session-a", "from-a").unwrap();
+        b.doc().set_chat_archived("session-a", true).unwrap();
+        a.flush();
+        b.flush();
+        drop(a);
+        drop(b);
+
+        let a = open(store_a, "device-a");
+        let b = open(store_b, "device-b");
+        let a_update = a
+            .doc()
+            .doc()
+            .export(loro::ExportMode::updates(&b.doc().doc().oplog_vv()))
+            .unwrap();
+        let b_update = b
+            .doc()
+            .doc()
+            .export(loro::ExportMode::updates(&a.doc().doc().oplog_vv()))
+            .unwrap();
+        b.doc().doc().import(&a_update).unwrap();
+        a.doc().doc().import(&b_update).unwrap();
+
+        for host in [&a, &b] {
+            let chat = host.doc().chat("session-a").unwrap().unwrap();
+            assert_eq!(chat.title.as_deref(), Some("from-a"));
+            assert!(chat.archived);
+        }
     }
 
     #[tokio::test]

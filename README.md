@@ -2,14 +2,26 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Unreleased: causal workspace retention
+
+Workspace persistence and edge folding retain available causal history rather
+than independently replacing each replica with a state-only snapshot. Desktop
+and Devbox edits made while disconnected can therefore merge after both hosts
+save and restart. Session-document retention is unchanged.
+
+This keeps more workspace history in exchange for preserving offline edits.
+Previously discarded dependencies cannot be recreated by reconnecting or by
+this upgrade; divergent existing replicas require a backed-up, explicit recovery.
+Deploy the matching edge before upgrading controllers and hosts.
+
 ## Crew 0.1.133 release candidate
 
-Workspace CRDT history is now bounded without removing sessions: native clients
-persist state-only snapshots before joining, and the edge shallow-compacts
-workspace history under the same retention policy as session documents. Current
-chat, archive, session, device, space, and worktree state remains intact; stale
-peers resynchronize current metadata while transcripts remain independently
-durable in their session documents.
+The 0.1.133 candidate introduced native state-only persistence before joining
+and edge workspace shallow compaction under the session-document retention
+policy. It preserves visible rows, but independent offline frontiers can lose
+the dependencies required to merge. The unreleased correction above removes
+that unsafe workspace compaction; transcripts remain independently durable in
+their session documents.
 
 The retained staging workspace shrinks from 15,359,379 bytes to 2,272,109 bytes
 while preserving all 1,577 chat rows and 1,465 session rows. The Scaffold runtime

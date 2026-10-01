@@ -10,10 +10,10 @@
  *   ops is healed by normal CRDT resync from the host on reconnect).
  * - `snapshot` blob — the doc's current snapshot. Two-level compaction:
  *   LOG FOLD (whenever the update log passes COMPACT_LOG_BYTES): re-export a
- *   full snapshot and clear the log — loses nothing. HISTORY TRIM retains the
- *   current state and a shallow causal boundary while discarding superseded
- *   operations. Peers older than that boundary take the stale-peer full-resync
- *   path; session transcripts remain independently durable.
+ *   full snapshot and clear the log — loses nothing. HISTORY TRIM applies only
+ *   to session transcripts: it retains current state and a shallow causal
+ *   boundary; older peers take the stale-peer full-resync path. Workspace and
+ *   unknown legacy rooms retain every causal operation for offline writers.
  * - `tail` blob — materialized last-N-messages JSON, recomputed lazily on
  *   GET /tail when dirty (§5 L2).
  * - `diff` blob — latest-only working-tree diff sidecar, overwritten on each
@@ -1729,10 +1729,9 @@ export class SessionRoom implements DurableObject {
    * `this.doc`). Best-effort: any export failure leaves the room to the
    * caller's lossless fold. */
   private async trimHistoryIfDue(doc: LoroDoc, now: number): Promise<boolean> {
-    // Pending dependencies mean the materialized state is incomplete. Unknown
-    // legacy rooms stay lossless until a trusted request classifies them.
-    const kind = this.getMeta("roomKind");
-    if ((kind !== "session" && kind !== "workspace") || this.docPendingEnds?.size) return false;
+    // Offline workspace writers may still depend on any accepted operation.
+    // Pending dependencies also mean the materialized state is incomplete.
+    if (this.retainsWorkspaceHistory() || this.docPendingEnds?.size) return false;
     const checkpoints = JSON.parse(this.getMeta("checkpoints") ?? "[]") as FrontierCheckpoint[];
     const cutoff = checkpoints.filter((c) => now - c.at >= RETAIN_MS).pop();
     let frontiers: { peer: `${number}`; counter: number }[];
