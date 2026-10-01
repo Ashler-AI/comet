@@ -59,13 +59,27 @@ impl std::fmt::Debug for InferenceRoute {
 
 /// Engine-owned context exposed to an agent child process. This is launch
 /// metadata, not user-authored run configuration or prompt content.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RunContext {
     pub session_id: String,
     pub ipc_port: u16,
+    /// Ephemeral capability for this exact run's native supervision subscription.
+    pub supervision_token: Option<String>,
     pub inference: Option<InferenceRoute>,
     /// Source native session for a one-shot fork; never exported to the child environment.
     pub fork_from: Option<String>,
+}
+
+impl std::fmt::Debug for RunContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunContext")
+            .field("session_id", &self.session_id)
+            .field("ipc_port", &self.ipc_port)
+            .field("supervision_token", &"[redacted]")
+            .field("inference", &self.inference)
+            .field("fork_from", &self.fork_from)
+            .finish()
+    }
 }
 
 /// Host-side controls handed to a run: input-request bridge + steering mailbox.
@@ -230,6 +244,7 @@ pub(crate) fn apply_run_context(cmd: &mut tokio::process::Command, context: Opti
     // Never inherit a stale context from the engine's own launch environment.
     cmd.env_remove("COMET_SESSION_ID")
         .env_remove("COMET_IPC_PORT")
+        .env_remove("COMET_SUPERVISION_TOKEN")
         .env_remove("COMET_INFERENCE_TOKEN")
         .env_remove("PRIME_AGENT_AUTH_GATEWAY_URL")
         .env_remove("OMP_AUTH_GATEWAY_URL")
@@ -237,6 +252,9 @@ pub(crate) fn apply_run_context(cmd: &mut tokio::process::Command, context: Opti
     if let Some(context) = context {
         cmd.env("COMET_SESSION_ID", &context.session_id)
             .env("COMET_IPC_PORT", context.ipc_port.to_string());
+        if let Some(token) = &context.supervision_token {
+            cmd.env("COMET_SUPERVISION_TOKEN", token);
+        }
         if let Some(inference) = &context.inference {
             // OMP_AUTH_BROKER_* is OMP's credential-vault protocol, not an
             // inference gateway. Shared Comet runs instead load the bundled
@@ -362,6 +380,7 @@ mod run_context_tests {
             Some(&RunContext {
                 session_id: "session-123".into(),
                 ipc_port: 38117,
+                supervision_token: None,
                 inference: None,
                 fork_from: None,
             }),
@@ -391,6 +410,7 @@ mod run_context_tests {
             Some(&RunContext {
                 session_id: "session-123".into(),
                 ipc_port: 38117,
+                supervision_token: None,
                 inference: Some(route.clone()),
                 fork_from: None,
             }),

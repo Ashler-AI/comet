@@ -2434,6 +2434,30 @@ impl RpcService for EngineRpc {
                 }
                 RpcReply::value(&serde_json::json!({ "commandId": command_id }))
             }
+            methods::RETAIN_SESSION_SUPERVISION => {
+                let p: comet_rpc::RetainSessionSupervisionParams = parse_params(params)?;
+                let lease = self
+                    .sessions
+                    .retain_supervision(&p.chat_id, &p.token)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let receipt = serde_json::json!({
+                    "chatId": p.chat_id, "runId": lease.run_id, "retained": true,
+                });
+                Ok(RpcReply::Stream(
+                    futures::stream::unfold(
+                        (lease, Some(receipt)),
+                        |(lease, receipt)| async move {
+                            if let Some(receipt) = receipt {
+                                Some((receipt, (lease, None)))
+                            } else {
+                                lease.interrupt.cancelled().await;
+                                None
+                            }
+                        },
+                    )
+                    .boxed(),
+                ))
+            }
             methods::WATCH_OMP_RECOVERY => {
                 let p: ChatParams = parse_params(params)?;
                 // Use the same room access/projection gate as transcript watches.

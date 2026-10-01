@@ -44,6 +44,8 @@ pub mod methods {
     pub const TAKE_OVER_OMP_SESSION: &str = "TakeOverOmpSession";
     /// Current OMP recovery phase followed by event-driven updates for one chat.
     pub const WATCH_OMP_RECOVERY: &str = "WatchOmpRecovery";
+    /// Hold one exact live run while this authenticated subscription remains open.
+    pub const RETAIN_SESSION_SUPERVISION: &str = "RetainSessionSupervision";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
     /// Read one older transcript page before an opaque raw-list cursor.
     pub const READ_DOC_MESSAGES: &str = "ReadDocMessages";
@@ -204,6 +206,14 @@ pub struct ReadCheckoutDiffResult {
 #[serde(rename_all = "camelCase")]
 pub struct SessionRefParams {
     pub chat_id: String,
+}
+
+/// Run capability is supplied only by the engine's child environment, never a prompt.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetainSessionSupervisionParams {
+    pub chat_id: String,
+    pub token: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
