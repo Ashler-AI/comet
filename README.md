@@ -95,6 +95,21 @@ ordinary hosts after deployment. Scaffold lifecycle and grant checks are unchang
 The two-engine collaboration smoke covers ordinary remote legacy and typed Local
 start/response/steer/stop, foreign-principal denial, and existing Scaffold revocation.
 
+## Unreleased: ordinary remote activity
+
+Ordinary remote hosts, including Namespace Devboxes, publish owned status and
+heartbeats through their existing session rooms. Controllers merge that activity
+into `WatchSessions` independently of workspace backfill, keeping sidebar and
+composer indicators aligned when workspace synchronization is stalled. Local
+engine status still wins for locally hosted sessions. Membership and owner checks
+fence remote activity; static streaming snapshots do not count as fresh heartbeats.
+
+Canonical session controls keep an existing bare-chat writer's live execution key,
+so publishing its room record does not strand Stop, steering, or input answers.
+Upgrade both controller and host; already-running older binaries do not acquire
+this behavior from a desktop-only update. This change does not reset or repair
+previously divergent workspace histories.
+
 ## Unreleased: shared session discovery
 
 `comet session search --query "upload retries"` searches generated and display

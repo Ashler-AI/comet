@@ -801,6 +801,52 @@ async fn interrupt_stamps_streaming_entry_aborted() {
 }
 
 #[tokio::test]
+async fn canonical_room_control_stops_existing_legacy_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: vec![AgentEvent::TextDelta { text: "still working".into() }],
+            step_delay: Duration::from_millis(5),
+            hang_until_interrupt: true,
+            steering_mode: SteeringMode::StepBoundary,
+        }),
+    );
+    core.workspace.claim_chat(CHAT, Some("/tmp")).unwrap();
+    let handle = core.doc_host.open(CHAT).unwrap();
+    let client = comet_rpc::memory_client(core.rpc_service());
+    client.call(comet_rpc::methods::QUEUE_COMMAND, serde_json::json!({
+        "chatId": CHAT,
+        "command": SessionCommandPayload::Run {
+            request: run_request("legacy turn"), message_id: "legacy-user".into(),
+        },
+    })).await.unwrap();
+    wait_for(|| entries(&core).iter().any(|entry| {
+        entry.role == MessageRole::Assistant && entry.status == Some(MessageStatus::Streaming)
+    }), "legacy writer streaming").await;
+    assert!(handle.doc().collaboration_snapshot().unwrap().sessions.iter().any(|session| {
+        session.session_id == CHAT && session.status == Some(SessionStatus::Working)
+    }));
+
+    // The UI selects the published canonical record and sends a typed Stop.
+    // It must reach the original bare writer, not a new ::session:: execution.
+    let mut stop = controller_payload(&core, "canonical-stop", SessionCommandPayload::Interrupt {});
+    if let SessionCommandPayload::Control { session_id, .. } = &mut stop {
+        *session_id = CHAT.into();
+    }
+    client.call(comet_rpc::methods::QUEUE_COMMAND, serde_json::json!({
+        "chatId": CHAT, "command": stop,
+    })).await.unwrap();
+    wait_for(|| entries(&core).iter().any(|entry| {
+        entry.role == MessageRole::Assistant && entry.status == Some(MessageStatus::Aborted)
+    }), "canonical Stop aborts legacy turn").await;
+    wait_for(|| core.sessions.session_status(CHAT).is_some_and(|session| {
+        session.status == SessionStatus::Idle
+    }), "legacy writer becomes idle").await;
+    core.shutdown().await;
+}
+
+#[tokio::test]
 async fn explicit_queue_waits_for_the_next_turn_across_step_boundary_harnesses() {
     let dir = tempfile::tempdir().unwrap();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
