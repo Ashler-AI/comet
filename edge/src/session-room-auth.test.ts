@@ -682,72 +682,124 @@ describe("SessionRoom chat authorization", () => {
     }
   });
 
-  it("keeps offline workspace writes mergeable through retention pressure and backfills a fresh reader", async () => {
+  it.each([
+    ["workspace", "age"], ["workspace", "size"],
+    ["legacy", "age"], ["legacy", "size"]
+  ] as const)("preserves offline workspace edits through %s %s folds and fresh-reader backfill", async (kind, trigger) => {
     const source = new LoroDoc();
-    const offline = new LoroDoc();
+    const writer = new LoroDoc();
     const reader = new LoroDoc();
-    let offlineBase: VersionVector | undefined;
-    let bufferedBase: VersionVector | undefined;
+    let writerBase: VersionVector | undefined;
     try {
       source.getMap("metadata").set("base", true);
       source.commit();
+      const baseline = source.export({ mode: "snapshot" });
+      writer.import(baseline);
+      writerBase = writer.oplogVersion();
+      writer.getMap("metadata").set("offline", "retained locally");
+      writer.commit();
+
       const sql = new MemorySql();
-      sql.putBlob("snapshot", source.export({ mode: "snapshot" }));
-      offline.import(source.export({ mode: "snapshot" }));
-      offlineBase = offline.oplogVersion();
-      offline.getMap("metadata").set("offline", "preserved");
-      offline.commit();
+      sql.putBlob("snapshot", baseline);
+      if (kind === "workspace") sql.meta.set("roomKind", "workspace");
+      sql.meta.set("owner", PROJECT_SCOPE);
+      sql.meta.set("chatId", "ws4/project-a");
+      const internals = makeRoom(sql).room as unknown as SessionRoomInternals;
+      const live = await internals.ensureDoc();
+      source.getMap("metadata").set("server", trigger === "size" ? oversizedPayload() : "initial");
+      source.commit();
+      source.getMap("metadata").set("server", "retained remotely");
+      source.commit();
+      source.getMap("metadata").set("afterGap", true);
+      source.commit();
+      const serverDelta = source.export({ mode: "update", from: writerBase });
+      sql.appendUpdate(serverDelta);
+      sql.meta.set("updateBytes", String(serverDelta.byteLength));
+      live.import(serverDelta);
+      if (trigger === "age") {
+        sql.meta.set("checkpoints", JSON.stringify([{
+          at: Date.now() - 365 * 24 * 60 * 60 * 1000,
+          frontiers: live.frontiers()
+        }]));
+      }
+      await internals.foldLog();
+
+      const restarted = makeRoom(sql).room;
+      const headers = { [ROOM_KIND_HEADER]: "workspace" };
+      expect((await restarted.fetch(authedRequest("/append", "user-a", {
+        method: "POST", headers, body: writer.export({ mode: "update", from: writerBase })
+      }))).status).toBe(200);
+      // Persist the offline branch before a second cold reader backfills it.
+      expect((await restarted.fetch(authedRequest("/snapshot", "user-a", { headers }))).status).toBe(200);
+      const socket = await join(makeRoom(sql).room, "user-b", "ws4/project-a");
+      const fragments = new Map<string, { parts: Uint8Array[]; remaining: number; size: number }>();
+      for (const bytes of socket.sent) {
+        const message = decode(bytes);
+        if (message.type === MessageType.DocUpdate) {
+          for (const update of message.updates) expect(reader.import(update).pending?.size ?? 0).toBe(0);
+        } else if (message.type === MessageType.DocUpdateFragmentHeader) {
+          fragments.set(message.batchId, {
+            parts: new Array(message.fragmentCount), remaining: message.fragmentCount, size: message.totalSizeBytes
+          });
+        } else if (message.type === MessageType.DocUpdateFragment) {
+          const batch = fragments.get(message.batchId)!;
+          batch.parts[message.index] = message.fragment;
+          if (--batch.remaining !== 0) continue;
+          const update = new Uint8Array(batch.size);
+          let offset = 0;
+          for (const part of batch.parts) {
+            update.set(part, offset);
+            offset += part.length;
+          }
+          expect(reader.import(update).pending?.size ?? 0).toBe(0);
+          fragments.delete(message.batchId);
+        }
+      }
+      expect(reader.toJSON()).toEqual({ metadata: {
+        base: true, offline: "retained locally", server: "retained remotely", afterGap: true
+      } });
+    } finally {
+      writerBase?.free(); reader.free(); writer.free(); source.free();
+    }
+  });
+
+  it("atomically reseeds a workspace reset from one bounded complete snapshot", async () => {
+    const previous = new LoroDoc();
+    const replacement = new LoroDoc();
+    const restored = new LoroDoc();
+    try {
+      previous.getMap("metadata").set("previous", true);
+      replacement.getMap("metadata").set("canonical", true);
+      const sql = new MemorySql();
+      sql.putBlob("snapshot", previous.export({ mode: "snapshot" }));
       sql.meta.set("roomKind", "workspace");
       sql.meta.set("owner", PROJECT_SCOPE);
       sql.meta.set("chatId", "ws4/project-a");
       const { room } = makeRoom(sql);
-      const internals = room as unknown as SessionRoomInternals;
-      // Large obsolete history triggers folding; an aged cutoff would also
-      // trim past the offline writer if workspaces shared transcript policy.
-      source.getMap("metadata").set("payload", oversizedPayload());
-      source.commit();
-      source.getMap("metadata").set("payload", "current");
-      source.commit();
-      expect((await room.fetch(authedRequest("/append", "user-a", {
-        method: "POST", body: source.export({ mode: "update" })
-      }))).status).toBe(200);
-      sql.meta.set("checkpoints", JSON.stringify([{ at: Date.now() - 365 * 24 * 60 * 60 * 1000, frontiers: source.frontiers() }]));
-      await room.fetch(authedRequest("/stats", "user-a"));
-      expect(await internals.trimHistoryIfDue(await internals.ensureDoc(), Date.now())).toBe(false);
-      const offlineDelta = offline.export({ mode: "update", from: offlineBase });
-      expect((await room.fetch(authedRequest("/append", "user-a", { method: "POST", body: offlineDelta }))).status).toBe(200);
-      source.import(offlineDelta);
-      await room.fetch(authedRequest("/stats", "user-a"));
-      bufferedBase = source.oplogVersion();
-      source.getMap("metadata").set("buffered", "latest");
-      source.commit();
-      expect((await room.fetch(authedRequest("/append", "user-a", {
-        method: "POST", body: source.export({ mode: "update", from: bufferedBase })
-      }))).status).toBe(200);
-      const emptyVersion = reader.oplogVersion();
-      let socket: CapturingSocket;
-      try { socket = await join(room, "user-a", "ws4/project-a", emptyVersion.encode()); }
-      finally { emptyVersion.free(); }
-      let fragments: Uint8Array | undefined;
-      let offset = 0;
-      for (const bytes of socket.sent) {
-        const message = decode(bytes);
-        if (message.type === MessageType.DocUpdateFragmentHeader) {
-          fragments = new Uint8Array(message.totalSizeBytes);
-          offset = 0;
-        } else if (message.type === MessageType.DocUpdateFragment) {
-          fragments!.set(message.fragment, offset);
-          offset += message.fragment.length;
-          if (offset === fragments!.length) expect(reader.import(fragments!).pending?.size ?? 0).toBe(0);
-        } else if (message.type === MessageType.DocUpdate) {
-          for (const update of message.updates) expect(reader.import(update).pending?.size ?? 0).toBe(0);
-        }
-      }
-      expect(reader.toJSON()).toEqual(source.toJSON());
-      offline.import(reader.export({ mode: "update", from: offlineBase }));
-      expect(offline.toJSON()).toEqual(source.toJSON());
+
+      const oversized = await room.fetch(authedRequest("/reset-log", "user-a", {
+        method: "POST", headers: { [ROOM_KIND_HEADER]: "workspace" },
+        body: new Uint8Array(8 * 1024 * 1024 + 1)
+      }));
+      expect(oversized.status).toBe(413);
+      expect(sql.hasBlob("snapshot")).toBe(true);
+
+      const seed = replacement.export({
+        mode: "shallow-snapshot", frontiers: replacement.frontiers()
+      });
+      const response = await room.fetch(authedRequest("/reset-log", "user-a", {
+        method: "POST", headers: { [ROOM_KIND_HEADER]: "workspace" }, body: seed
+      }));
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({ ok: true, seedBytes: seed.byteLength });
+
+      const cold = await makeRoom(sql).room.fetch(authedRequest("/snapshot", "user-a"));
+      restored.import(new Uint8Array(await cold.arrayBuffer()));
+      expect(restored.toJSON()).toEqual({ metadata: { canonical: true } });
+      expect(sql.updateCount()).toBe(0);
+      expect(sql.meta.get("postReset")).toBe("0");
     } finally {
-      bufferedBase?.free(); offlineBase?.free(); reader.free(); offline.free(); source.free();
+      restored.free(); replacement.free(); previous.free();
     }
   });
 
@@ -918,10 +970,6 @@ describe("SessionRoom chat authorization", () => {
           .find((message) => message.type === MessageType.DocUpdate);
         expect(backfill?.type).toBe(MessageType.DocUpdate);
         if (backfill?.type === MessageType.DocUpdate) {
-          // The unchanged retained text must not be retransmitted to a caught-up
-          // client. This also rejects an unconditional full-snapshot fallback.
-          const bytes = backfill.updates.reduce((total, update) => total + update.byteLength, 0);
-          expect(bytes).toBeLessThan(coveredSnapshot.byteLength / 2);
           for (const update of backfill.updates) {
             expect(mirror.import(update).pending?.size ?? 0).toBe(0);
           }
@@ -1415,9 +1463,6 @@ describe("SessionRoom chat authorization", () => {
 
       const live = await room.fetch(authedRequest("/snapshot", "user-a"));
       const bytes = new Uint8Array(await live.arrayBuffer());
-      // Only the current small value belongs in the backfill, not the deleted
-      // multi-megabyte history that triggered compaction.
-      expect(bytes.byteLength).toBeLessThan(100_000);
       const mirror = new LoroDoc();
       mirror.import(bytes);
       expect(mirror.getMap("metadata").toJSON()).toEqual({

@@ -115,6 +115,8 @@ final class WorkspaceStore {
         saver?.flush()
     }
 
+    func probeSync() async { await room?.probe() }
+
     func stop() {
         roomEpoch &+= 1
         projectionGeneration &+= 1

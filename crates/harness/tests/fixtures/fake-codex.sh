@@ -49,6 +49,16 @@ tid=$(rid "$turnline")
 
 case "$turnline" in
 
+*scenario:sol-default*)
+  has "$thread_line" '"model":"gpt-6-sol"' ||
+    { fail_turn "$tid" "default thread model was not GPT-6 Sol"; exit 0; }
+  for want in '"model":"gpt-6-sol"' '"effort":"high"'; do
+    has "$turnline" "$want" || { fail_turn "$tid" "default turn param missing: $want"; exit 0; }
+  done
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}'
+  ;;
+
 *scenario:happy*)
   # Verify the turn/start + thread/start params the harness must send.
   for want in '"method":"turn/start"' '"effort":"ultra"' '"model":"gpt-5.6-sol"' \

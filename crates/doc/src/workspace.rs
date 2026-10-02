@@ -99,7 +99,7 @@ impl WorkspaceDoc {
         &self.doc
     }
 
-    /// Export a snapshot (persistence) — `ExportMode::Snapshot`.
+    /// Export full history for CRDT synchronization with an independent peer.
     pub fn export_snapshot(&self) -> Result<Vec<u8>, DocError> {
         self.doc
             .export(ExportMode::Snapshot)
@@ -1649,5 +1649,29 @@ mod tests {
         ));
         // Everything else on the row survived the conflict.
         assert_eq!(a.chat("chat-1").unwrap().unwrap().device_id, "dev-a");
+    }
+    #[test]
+    fn persisted_offline_edits_merge_after_reload() {
+        let reload = |workspace: &WorkspaceDoc| {
+            let doc = LoroDoc::new();
+            doc.import(&workspace.export_snapshot().unwrap()).unwrap();
+            WorkspaceDoc::from_doc(doc)
+        };
+        let a = WorkspaceDoc::new();
+        a.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
+        let b = reload(&a);
+
+        // Each replica persists a different offline frontier before reconnecting.
+        a.rename_chat("chat-1", "from-a").unwrap();
+        b.set_chat_archived("chat-1", true).unwrap();
+        let a = reload(&a);
+        let b = reload(&b);
+        cross_sync(&a, &b);
+
+        for workspace in [&a, &b] {
+            let chat = workspace.chat("chat-1").unwrap().unwrap();
+            assert_eq!(chat.title.as_deref(), Some("from-a"));
+            assert!(chat.archived);
+        }
     }
 }

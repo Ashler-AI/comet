@@ -257,7 +257,7 @@ fn inference_binding(
         .map(str::to_string)
         .or_else(|| match harness {
             HarnessId::ClaudeCode => Some("claude-opus-5".into()),
-            HarnessId::Codex => Some("gpt-5.6-sol".into()),
+            HarnessId::Codex => Some("gpt-6-sol".into()),
             _ => None,
         })?;
     let lower = selected.to_ascii_lowercase();

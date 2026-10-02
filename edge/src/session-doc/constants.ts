@@ -13,19 +13,17 @@ export const MSG_INLINE_MAX = 256 * 1024;
 
 /** Shallow-compaction retention: the DO re-exports a shallow snapshot at the
  * `now − RETAIN_DAYS` frontier when the update log grows past
- * {@link COMPACT_LOG_BYTES}. Trimmed op history is discarded permanently;
- * state is fully preserved. A peer offline longer than this re-syncs fresh and
- * re-submits its unacked entries at the app layer (idempotent by entry id).
+ * {@link COMPACT_LOG_BYTES}. Current state is preserved while superseded op
+ * history is discarded. A peer offline beyond this boundary re-syncs current
+ * state; session entries remain idempotent by entry id, workspace state remains
+ * locally persisted, and transcripts live in independent session documents.
  *
- * 30 days proved fatal in practice (2026-08-04): the ws3-era rooms were ~12
- * days old, so no frontier checkpoint was ever past retention and HISTORY
- * TRIM had never run ANYWHERE — every doc carried full op history from birth.
- * A high-churn workspace room (6 devices flipping session rows all day) plus
- * a dozen chat docs co-materialized in one isolate's loro-wasm heap (which
- * only ever grows) hit the DO memory limit, poisoning every byte-exporting
- * wasm call and silently wedging joins fleet-wide. Presence/status rows do
- * not need weeks of op history; 3 days keeps materialized docs small while a
- * briefly-offline device still diff-syncs. */
+ * 30 days proved fatal in practice (2026-08-04): rooms were ~12 days old, so
+ * no frontier checkpoint was past retention and every doc carried full history
+ * from birth. A high-churn workspace room plus chat docs co-materialized in one
+ * isolate exhausted the shared loro-wasm heap. Three days bounds materialized
+ * history while allowing briefly-offline devices to diff-sync.
+ */
 export const RETAIN_DAYS = 3;
 
 /** Update-log size that triggers a compaction pass in the session DO.

@@ -275,21 +275,24 @@ describe("Crew sealed notification credentials", () => {
       const notifications = new WorkspaceNotifications(storage, env as Env);
       expect((await notifications.register(registration(), "alice", scaffoldBearer)).status).toBe(200);
       const events = pendingAttention(notifications);
-      for (const unavailable of [
-        () => new Response(null, { status: 503 }),
-        () => new Response(null, { status: 429 }),
-        () => { throw new Error("authority unavailable"); },
-        () => new Response("not json"),
-        () => Response.json(null)
-      ]) {
+      for (const [unavailable, expectedAttempts] of [
+        [() => new Response(null, { status: 503 }), 2],
+        [() => new Response(null, { status: 429 }), 2],
+        [() => { throw new Error("authority unavailable"); }, 2],
+        [() => new Response("not json"), 1],
+        [() => Response.json(null), 1]
+      ] as const) {
         authority = unavailable;
+        const callsBefore = fetcher.mock.calls.length;
         await notifications.deliver(events, env.SCAFFOLD_PROJECT_SCOPE);
         expect(db.prepare("SELECT COUNT(*) AS count FROM notification_devices").get()!.count).toBe(1);
+        expect(fetcher.mock.calls).toHaveLength(callsBefore + expectedAttempts);
       }
       authority = () => new Response(null, { status });
+      const callsBeforeRejection = fetcher.mock.calls.length;
       await notifications.deliver(events, env.SCAFFOLD_PROJECT_SCOPE);
       expect(db.prepare("SELECT * FROM notification_devices").all()).toEqual([]);
-      expect(fetcher.mock.calls).toHaveLength(6);
+      expect(fetcher.mock.calls).toHaveLength(callsBeforeRejection + 1);
     } finally { db.close(); }
   });
 

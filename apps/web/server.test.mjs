@@ -176,6 +176,34 @@ test('RPC recovers from a failed dial without a close event and ignores the reti
   assert.deepEqual(await reply, { capabilities: ['session.read'] });
 });
 
+test('RPC timeout carries method, request id, and elapsed time', async t => {
+  const frames = [];
+  const logs = [];
+  const now = [1_000, 31_005];
+  t.mock.method(Date, 'now', () => now.shift());
+  t.mock.method(globalThis, 'setTimeout', (callback, delay) => {
+    assert.equal(delay, 30000);
+    queueMicrotask(callback);
+    return 1;
+  });
+  t.mock.method(console, 'error', (...args) => logs.push(args));
+  const rpc = new CrewRpc(39400);
+  rpc.socket = { readyState: WebSocket.OPEN, send: frame => frames.push(JSON.parse(frame)) };
+
+  await assert.rejects(
+    rpc.call('ReadSessionCommand', { commandId: 'command-a' }),
+    /Crew request timed out: method=ReadSessionCommand id=1 elapsed_ms=30005/,
+  );
+  assert.deepEqual(frames, [
+    { id: 1, method: 'ReadSessionCommand', params: { commandId: 'command-a' } },
+    { id: 1, cancel: true },
+  ]);
+  assert.deepEqual(logs, [[
+    'Crew RPC request timed out',
+    { method: 'ReadSessionCommand', id: 1, elapsedMs: 30005 },
+  ]]);
+});
+
 test('deployment session connects and admits messages and controls without legacy chat rows', async t => {
   const f = await fixture(t);
   const watches = new Map();

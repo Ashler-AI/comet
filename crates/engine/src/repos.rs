@@ -89,7 +89,7 @@ pub struct CheckoutIdentity {
     pub git_dir: PathBuf,
 }
 
-/// Best-effort home directory (the `ListFolders` default and worktree root base).
+/// Best-effort home directory (the worktree root base and folder-list fallback).
 pub(crate) fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .filter(|s| !s.is_empty())
@@ -100,6 +100,18 @@ pub(crate) fn home_dir() -> PathBuf {
                 .map(PathBuf::from)
         })
         .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+fn default_folder_dir_from(value: Option<std::ffi::OsString>, fallback: PathBuf) -> PathBuf {
+    value
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or(fallback)
+}
+
+fn default_folder_dir() -> PathBuf {
+    default_folder_dir_from(std::env::var_os("COMET_DEFAULT_FOLDER"), home_dir())
 }
 
 /// Where new worktrees live. Deliberately NOT under the backend data dir —
@@ -776,7 +788,7 @@ impl Repos {
 
     // ── ListFolders ─────────────────────────────────────────────────────────
 
-    /// One directory level (home by default): dotfiles hidden, directories first,
+    /// One directory level (configured root, or home by default): dotfiles hidden, directories first,
     /// capped at [`FOLDER_LIST_MAX_ENTRIES`] with a `truncated` flag. The walk runs
     /// in a spawned blocking task under a 6s wall-clock ceiling — a wedged path
     /// (dead mount, permission-gated folder) fails this listing without blocking
@@ -852,7 +864,7 @@ impl Repos {
     ) -> Result<FolderListing, EngineError> {
         let target = match path.filter(|p| !p.trim().is_empty()) {
             Some(p) => absolutize(Path::new(&p)),
-            None => home_dir(),
+            None => default_folder_dir(),
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
         let spawned = std::thread::Builder::new()
@@ -1127,6 +1139,18 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_folder_dir_requires_absolute_override() {
+        let home = PathBuf::from("/home/test");
+        for value in [None, Some("".into()), Some("relative".into())] {
+            assert_eq!(default_folder_dir_from(value, home.clone()), home);
+        }
+        assert_eq!(
+            default_folder_dir_from(Some("/workspaces".into()), home),
+            PathBuf::from("/workspaces")
+        );
+    }
 
     #[tokio::test]
     async fn worktree_allocation_uses_last_available_name() {

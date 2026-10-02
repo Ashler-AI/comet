@@ -10,6 +10,83 @@ another full resync, which could keep an active room in a reconnect loop after
 a brief internet outage. Corrupt imports and gaps discovered on synchronized
 connections retain bounded full-backfill recovery; local writes are preserved.
 
+## Crew 0.1.134 release candidate
+
+Workspace persistence and edge folding retain available causal history rather
+than independently replacing each replica with a state-only snapshot. Desktop
+and Devbox edits made while disconnected can therefore merge after both hosts
+save and restart. Session-document retention is unchanged.
+
+This keeps more workspace history in exchange for preserving offline edits.
+Previously discarded dependencies cannot be recreated by reconnecting or by
+this upgrade; divergent existing replicas require a backed-up, explicit recovery.
+Deploy the matching edge before upgrading controllers and hosts.
+
+The candidate also publishes ordinary remote-session status through existing
+session rooms, so Devbox activity indicators do not depend on workspace backfill.
+Canonical controls preserve an existing bare-chat writer's live execution key.
+
+The local headed 0.1.134 demo admitted a mock prompt, displayed the working strip
+and Stop affordance, and returned to idle. Focused native regressions and the
+38-test edge room authorization suite passed. The required opposite-provider
+review attempt could not start: this repository lacks
+`skills/local-code-review/scripts/opencodereview.mjs` (`MODULE_NOT_FOUND`). Local
+typechecks were intentionally skipped; remote CI retains its required checks.
+Production promotion remains gated on captain verification of restarted staging.
+
+## Crew 0.1.133 release candidate
+
+The 0.1.133 candidate introduced native state-only persistence before joining
+and edge workspace shallow compaction under the session-document retention
+policy. It preserves visible rows, but independent offline frontiers can lose
+the dependencies required to merge. The 0.1.134 correction above removes
+that unsafe workspace compaction; transcripts remain independently durable in
+their session documents.
+
+The retained staging workspace shrinks from 15,359,379 bytes to 2,272,109 bytes
+while preserving all 1,577 chat rows and 1,465 session rows. The Scaffold runtime
+contract stays `scaffold.comet-runtime.v1`.
+The local headed demo built 0.1.133, admitted a mock workspace-compaction
+smoke prompt, and rendered the streamed response.
+Opposite-provider review could not start because this repository has no checked-in
+review launcher. Local typechecks were intentionally skipped.
+
+## Crew 0.1.132 release candidate
+
+Archived remote sessions no longer retain background room observers, so active
+Devbox transcripts and status updates are not starved by old session history.
+Crew-owned Namespace forwards run in an isolated process group; their 30-minute
+lease now stops helper subprocesses as well as the top-level `devbox` command.
+
+This candidate includes the mobile shallow-cache recovery in
+[PR #56](https://github.com/Ashler-AI/comet/pull/56) and the Devbox streaming/forward
+fixes in [PR #58](https://github.com/Ashler-AI/comet/pull/58). Mobile candidates are
+Crew Staging **1.0 (28)** and Crew **1.0 (21)**. The Scaffold runtime contract stays
+`scaffold.comet-runtime.v1`; both Scaffold image lanes must pin the verified release's
+version, private bucket, and Linux x86_64 digest together.
+
+The local headed demo built 0.1.132, admitted a mock release-smoke prompt, and rendered
+its streamed response. Desktop production promotion and both Scaffold pin changes
+remain gated on captain verification of the restarted staging desktop app. Inference
+review could not start because this repository lacks the checked-in opposite-provider
+launcher; local typechecks were intentionally skipped.
+
+Release verification dropped a redundant callback-RPC-count test that assumed a
+background tunnel request ran before message admission. The failed-tunnel and
+hung-tunnel regressions still verify that forwarding does not block sends.
+
+Crew **0.1.132** staging published from `4346d8a3612de0e988998a66e7eec25bff83c2c6`
+in [release run 36765542374](https://github.com/Ashler-AI/comet/actions/runs/36765542374).
+The run verified the signed macOS candidate and read back the desktop,
+desktop-staging, and Scaffold staging channels. Production must reuse this exact
+`candidate_run_id` after captain approval; no production publication or Scaffold
+image-pin changes have been performed. Crew Staging mobile **1.0 (28)** is available
+in the existing Ashler Internal TestFlight group; production mobile **1.0 (21)**
+is verified and prepared but not uploaded. See
+[mobile publication evidence](apps/ios/README.md#crew-01132-mobile-release-evidence).
+Downloaded macOS distributions also passed checksums, strict same-team signatures,
+stapler and Gatekeeper checks, with matching DMG/updater bundles. Candidate SHA-256:
+`952d02d9ac401398dd439d56ad12340fa038d3af5a8a2bc1ee972133e0bbdcfc`.
 
 ## Crew 0.1.119: Namespace Devboxes
 
@@ -49,6 +126,21 @@ Deploy the matching edge before updating clients and hosts, and reconnect
 ordinary hosts after deployment. Scaffold lifecycle and grant checks are unchanged.
 The two-engine collaboration smoke covers ordinary remote legacy and typed Local
 start/response/steer/stop, foreign-principal denial, and existing Scaffold revocation.
+
+## Unreleased: ordinary remote activity
+
+Ordinary remote hosts, including Namespace Devboxes, publish owned status and
+heartbeats through their existing session rooms. Controllers merge that activity
+into `WatchSessions` independently of workspace backfill, keeping sidebar and
+composer indicators aligned when workspace synchronization is stalled. Local
+engine status still wins for locally hosted sessions. Membership and owner checks
+fence remote activity; static streaming snapshots do not count as fresh heartbeats.
+
+Canonical session controls keep an existing bare-chat writer's live execution key,
+so publishing its room record does not strand Stop, steering, or input answers.
+Upgrade both controller and host; already-running older binaries do not acquire
+this behavior from a desktop-only update. This change does not reset or repair
+previously divergent workspace histories.
 
 ## Unreleased: shared session discovery
 
@@ -182,8 +274,50 @@ catalog, and every run still passes the existing Agent Auth checks.
 The bundled `crates/harness/src/omp/scaffold-models.json` is generated from the
 canonical Platform `ompInferenceModelCatalog`, with its source commit recorded
 in the file. It is a release snapshot, not a live availability promise. Refresh
-it with `node scripts/sync-omp-model-catalog.mjs <platform commit SHA>`; do not
-hand-edit the model list. Unknown source formats fail regeneration.
+it with `node scripts/sync-omp-model-catalog.mjs <platform commit SHA>`; unknown
+source formats fail regeneration. Released `claude-opus-5-5` uses the confirmed
+`low`, `medium`, `high`, `xhigh`, `max` effort ladder. New selections without a
+saved effort start at `medium`; valid saved or explicit choices are preserved.
+Claude Code's existing Fable 5.1 default is unchanged.
+
+Released `gpt-6-sol` and `gpt-6-luna` are available in the Codex, OMP/Scaffold,
+Prime Agent, and mobile catalogs. Codex defaults and implicit legacy Sol defaults
+now select `gpt-6-sol` at `high` effort; explicit saved models and efforts remain
+unchanged. Astra and Anthropic defaults are unchanged. Both new models support
+1,050,000 context tokens, 922,000 maximum input tokens, and 128,000 output tokens.
+Crew exposes `low`, `medium`, `high`, `xhigh`, and `max`; provider `none` is not
+represented in Crew's shared effort enum. Tool-bearing reasoning uses the existing
+Responses API routes, not Chat Completions. The OMP/Prime gateway records the base
+per-million input/cache-read/output rates ($2/$0.20/$10 for Sol,
+$0.10/$0.01/$0.50 for Luna); requests above 272K input tokens incur the provider's
+2x input/cache and 1.5x output multipliers.
+
+`gpt-6.1-sol` is also selectable in Codex, OMP/Scaffold, Prime Agent, and mobile
+catalogs with the same context/output limits and `low`–`max` efforts; Crew's
+existing defaults remain unchanged. Its base input/cached-input/output rates
+are $2/$0.10/$10 per million tokens.
+
+The Crew OMP/Prime gateway registers Opus 5.5 with 1,000,000 context tokens,
+128,000 output tokens, and per-million-token costs of $4 input, $20 output,
+$0.20 cache read, and $5 for 5-minute cache writes. The provider uses adaptive
+thinking with `display: "summarized"`, so progress arrives in the existing
+reasoning stream. Signed thinking and conversation history are not rewritten.
+Forced `tool_choice` is preserved for an upstream error, never changed to `auto`.
+Keep conversations append-only; editing old turns or changing the system prompt
+or tools can invalidate signed thinking. Direct user-owned OMP provider overrides
+remain authoritative and require their own compatible model configuration.
+
+Native Claude Code owns its Messages transport and signed history; Crew passes
+the exact model ID and supported `--effort` flag, rather than inventing transport
+flags. Opus 5.5 has native 1M context and always-on adaptive thinking, so Crew
+does not offer its old context/thinking toggles or unverified CLI options.
+Use a current Claude Code supporting this release. See the
+[official model overview](https://platform.claude.com/docs/en/models/opus-5-5/overview)
+and [migration guide](https://platform.claude.com/docs/en/models/opus-5-5/migration-guide).
+
+The focused transport smoke runs the installed OMP against a credential-free
+loopback server, exercises a real read tool, and verifies signed thinking replay:
+`node scripts/omp-gateway-revival-smoke.mjs /path/to/omp --opus-only`.
 
 Catalog regressions cover credential-free defaults, local overrides/custom
 providers, deduplication, and preservation of the Scaffold-scoped catalog.

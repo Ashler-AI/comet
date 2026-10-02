@@ -43,6 +43,48 @@ function stripProviderPrefix(model: GatewayModel): string {
 
 function modelConfig(model: GatewayModel) {
   const id = stripProviderPrefix(model);
+  if (model.owned_by === "anthropic" && id === "claude-opus-5-5") {
+    return {
+      id,
+      name: "Opus 5.5",
+      reasoning: true,
+      thinking: {
+        mode: "anthropic-adaptive" as const,
+        efforts: ["low", "medium", "high", "xhigh", "max"] as const,
+        defaultLevel: "medium" as const,
+        supportsDisplay: true,
+        prefixBinding: true,
+      },
+      input: ["text", "image"] as Array<"text" | "image">,
+      cost: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 },
+      contextWindow: 1_000_000,
+      maxTokens: 128_000,
+      compat: {
+        requiresThinkingEnabled: true,
+        signingEndpoint: true,
+        replayUnsignedThinking: false,
+        // OMP otherwise silently rewrites any/tool to auto. Preserve the
+        // caller's choice so the upstream rejects unsupported forced use.
+        supportsForcedToolChoice: true,
+      },
+    };
+  }
+  if (model.owned_by === "openai-codex" && (
+    id === "gpt-6-sol" || id === "gpt-6.1-sol" || id === "gpt-6-luna"
+  )) {
+    return {
+      id,
+      name: id,
+      reasoning: true,
+      input: ["text", "image"] as Array<"text" | "image">,
+      // Base rates; above 272K input the provider charges 2x input/cache and 1.5x output.
+      cost: id === "gpt-6-luna"
+        ? { input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 }
+        : { input: 2, output: 10, cacheRead: id === "gpt-6.1-sol" ? 0.1 : 0.2, cacheWrite: 2.5 },
+      contextWindow: 1_050_000,
+      maxTokens: 128_000,
+    };
+  }
   return {
     id,
     name: id,

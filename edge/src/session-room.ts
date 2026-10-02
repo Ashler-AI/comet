@@ -10,10 +10,10 @@
  *   ops is healed by normal CRDT resync from the host on reconnect).
  * - `snapshot` blob — the doc's current snapshot. Two-level compaction:
  *   LOG FOLD (whenever the update log passes COMPACT_LOG_BYTES): re-export a
- *   full snapshot and clear the log — loses nothing. Workspace documents use
- *   lossless folds only so offline writers remain mergeable. Session HISTORY
- *   TRIM retains its existing age/size policy: export a shallow snapshot at a
- *   retained frontier, permanently discarding older history (§3.1).
+ *   full snapshot and clear the log — loses nothing. HISTORY TRIM applies only
+ *   to session transcripts: it retains current state and a shallow causal
+ *   boundary; older peers take the stale-peer full-resync path. Workspace and
+ *   unknown legacy rooms retain every causal operation for offline writers.
  * - `tail` blob — materialized last-N-messages JSON, recomputed lazily on
  *   GET /tail when dirty (§5 L2).
  * - `diff` blob — latest-only working-tree diff sidecar, overwritten on each
@@ -107,6 +107,39 @@ const MAX_FRAGMENT_COUNT = 1024;
 const MAX_PRESENCE_UPDATE_BYTES = 16 * 1024;
 const WORKSPACE_PRESENCE_TTL_MS = 30_000;
 const MAX_WORKSPACE_PRESENCE_PEERS = 128;
+/** Atomic workspace recovery accepts one already-compacted canonical snapshot. */
+const MAX_RESET_SEED_BYTES = 8 * 1024 * 1024;
+
+const readBoundedBody = async (request: Request, maxBytes: number): Promise<Uint8Array | null> => {
+  const advertised = Number(request.headers.get("content-length"));
+  if (Number.isFinite(advertised) && advertised > maxBytes) return null;
+  const reader = request.body?.getReader();
+  if (!reader) return new Uint8Array();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (size + value.byteLength > maxBytes) {
+        await reader.cancel();
+        return null;
+      }
+      chunks.push(value);
+      size += value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  if (chunks.length === 1) return chunks[0]!;
+  const body = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+};
 
 /** Validates the typed JSON carried inside a Loro ephemeral participant value. */
 export const isValidParticipantCursor = (cursor: unknown, text?: string): boolean => {
@@ -569,27 +602,50 @@ export class SessionRoom implements DurableObject {
       if (!capabilities.includes("session.control")) {
         return json({ error: "forbidden" }, 403);
       }
-      // WEDGE BREAK: drop the persisted update log + snapshot so the NEXT cold
-      // `ensureDoc` starts from empty instead of replaying a log so large it
-      // exceeds the DO CPU limit and resets before any client can join (which
-      // also blocks the compaction that would have shrunk it — a permanent
-      // wedge). Deliberately does NOT call `ensureDoc`, so it stays cheap
-      // enough to land on an already-wedged DO. State is not lost: every engine
-      // holds the full workspace doc locally and re-uploads it on the next join
-      // (CRDT merge), exactly like the `ws3` fresh-namespace recovery. Presence
-      // is ephemeral and simply re-published. Owner/chatId meta are preserved.
+      // WEDGE BREAK: replace the persisted workspace state without first
+      // materializing the potentially oversized old document. An optional
+      // bounded complete snapshot makes recovery deterministic when several
+      // clients have incompatible shallow-history boundaries; an empty body
+      // retains the legacy clear-and-reupload behavior.
       if (!workspace) {
         if (!owner) return json({ error: "not_found" }, 404);
         if (owner !== projectScope) return json({ error: "forbidden" }, 403);
       }
+      const seed = await readBoundedBody(request, MAX_RESET_SEED_BYTES);
+      if (seed === null) return json({ error: "too_large" }, 413);
+      if (seed.byteLength > 0) {
+        if (!workspace) return json({ error: "workspace_seed_required" }, 400);
+        try {
+          const metadata = decodeImportBlobMeta(seed, false);
+          try {
+            if (metadata.mode !== "snapshot" && metadata.mode !== "shallow-snapshot" && metadata.mode !== "outdated-snapshot") {
+              return json({ error: "complete_snapshot_required" }, 400);
+            }
+          } finally {
+            metadata.partialStartVersionVector.free();
+            metadata.partialEndVersionVector.free();
+          }
+        } catch {
+          return json({ error: "invalid_snapshot" }, 400);
+        }
+      }
       const before = [...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM updates")][0]?.n as
         | number
         | undefined;
-      this.dropLog();
+      this.ctx.storage.transactionSync(() => {
+        this.dropLog();
+        if (seed.byteLength > 0) {
+          this.blobs.put("snapshot", seed);
+          this.setMeta("postReset", "0");
+          this.setMeta("tailDirty", "1");
+          this.setMeta("backupDirty", "1");
+        }
+        this.setMeta("replayAttempts", "0");
+      });
       this.doc?.free(); // release the wasm memory, don't wait on GC finalizers
-      this.doc = undefined; // force a fresh (empty) materialization next join
+      this.doc = undefined; // force materialization from the replacement state
       this.closeSocketsForRoomReset();
-      return json({ ok: true, clearedUpdateRows: before ?? 0 });
+      return json({ ok: true, clearedUpdateRows: before ?? 0, seedBytes: seed.byteLength });
     }
     return new Response("not found", { status: 404 });
   }
@@ -1673,9 +1729,8 @@ export class SessionRoom implements DurableObject {
    * `this.doc`). Best-effort: any export failure leaves the room to the
    * caller's lossless fold. */
   private async trimHistoryIfDue(doc: LoroDoc, now: number): Promise<boolean> {
-    // Workspace writers can remain offline indefinitely. Neither an age nor a
-    // size threshold proves their operations are above a safe causal boundary.
-    // Unknown legacy rooms stay lossless until a trusted request classifies them.
+    // Offline workspace writers may still depend on any accepted operation.
+    // Pending dependencies also mean the materialized state is incomplete.
     if (this.retainsWorkspaceHistory() || this.docPendingEnds?.size) return false;
     const checkpoints = JSON.parse(this.getMeta("checkpoints") ?? "[]") as FrontierCheckpoint[];
     const cutoff = checkpoints.filter((c) => now - c.at >= RETAIN_MS).pop();
@@ -1683,14 +1738,11 @@ export class SessionRoom implements DurableObject {
     // The durable lastTrimAt marker identifies the cutoff already applied.
     // A cold start or regular snapshot re-export must not re-trim that cutoff,
     // regardless of the materialized document's shallow status.
+    const retainedBytes = (this.blobs.byteLength("snapshot") ?? 0) +
+      Number(this.getMeta("updateBytes") ?? "0") + this.pendingBytes;
     if (cutoff && this.getMeta("lastTrimAt") !== String(cutoff.at)) {
       frontiers = cutoff.frontiers.map((f) => ({ peer: f.peer as `${number}`, counter: f.counter }));
-    } else if (
-      (this.blobs.byteLength("snapshot") ?? 0) +
-        Number(this.getMeta("updateBytes") ?? "0") +
-        this.pendingBytes >
-      TRIM_FORCE_BYTES
-    ) {
+    } else if (retainedBytes > TRIM_FORCE_BYTES) {
       // Include buffered backfills: oversized updates fold without first
       // becoming log rows. Otherwise their history misses the force-trim
       // budget until a later flush or cold start.
@@ -1716,7 +1768,8 @@ export class SessionRoom implements DurableObject {
       // leaks it into the shared wasm heap exactly when trimming was
       // supposed to relieve it (see handleJoin).
       if (doc !== fresh) doc.free();
-    } catch {
+    } catch (error) {
+      console.error("history trim failed", `room=${this.getMeta("chatId") ?? "?"}`, String(error));
       return false;
     }
     // The live document is already replaced before yielding, so accepted writes

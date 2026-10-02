@@ -102,6 +102,9 @@ pub mod methods {
     pub const LOCAL_DEVICE: &str = "LocalDevice";
     /// Explicit local-controller wake of a registered Namespace device. Never forwarded.
     pub const WAKE_DEVICE: &str = "WakeDevice";
+    /// Start the bounded Namespace auth callback tunnel without waking or relinking the device.
+    /// IPC-only; never relay-forwarded.
+    pub const ENSURE_DEVBOX_CALLBACK_FORWARD: &str = "EnsureDevboxCallbackForward";
     /// Non-secret edge grant metadata for a deployment-bound Scaffold host.
     /// IPC-only; local controllers use it to reuse an already-running host.
     pub const SCAFFOLD_HOST_AUTHORITY: &str = "ScaffoldHostAuthority";

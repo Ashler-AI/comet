@@ -1,7 +1,7 @@
 {
   "source": {
     "repository": "Ashler-AI/ashler-platform",
-    "revision": "a9d27fc871877242952bded20136bf44f8679139",
+    "revision": "11c6555ae3d07fc9057ee6fa4dfee35e2b013532",
     "path": "internal/scaffold/control-plane/worker/src/omp-auth-broker.ts"
   },
   "models": [
@@ -53,6 +53,42 @@
         "low",
         "medium",
         "high"
+      ]
+    },
+    {
+      "id": "openai-codex/gpt-6-sol",
+      "label": "gpt-6-sol",
+      "description": "1,050,000 context · 922,000 max input · 128,000 max output · Scaffold model · account access checked when starting a run",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    {
+      "id": "openai-codex/gpt-6-luna",
+      "label": "gpt-6-luna",
+      "description": "1,050,000 context · 922,000 max input · 128,000 max output · Scaffold model · account access checked when starting a run",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    {
+      "id": "openai-codex/gpt-6.1-sol",
+      "label": "gpt-6.1-sol",
+      "description": "1,050,000 context · 922,000 max input · 128,000 max output · Scaffold model · account access checked when starting a run",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
       ]
     },
     {
@@ -139,6 +175,18 @@
         "low",
         "medium",
         "high"
+      ]
+    },
+    {
+      "id": "anthropic/claude-opus-5-5",
+      "label": "claude-opus-5-5",
+      "description": "Scaffold model · account access checked when starting a run",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
       ]
     }
   ]
