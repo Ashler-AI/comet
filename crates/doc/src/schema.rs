@@ -303,6 +303,45 @@ impl SessionDoc {
         Ok(())
     }
 
+    /// Merge recovered output without replacing room metadata or replaying commands.
+    pub fn reconcile_message(&self, entry: &SessionMessageEntry) -> Result<(), DocError> {
+        let messages = self.doc.get_list("messages");
+        for index in 0..messages.len() {
+            let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) = messages.get(index) else { continue; };
+            if optional_string(&map, "id").as_deref() != Some(entry.id.as_str()) { continue; }
+            let current = entry_from_json(map.get_deep_value().to_json_value())?;
+            if current == *entry { return Ok(()); }
+            let conflict = || DocError::Schema(format!("recovered message {} conflicts with canonical output", entry.id));
+            if current.device_id != entry.device_id || current.role != entry.role
+                || current.created_at != entry.created_at || current.continuation_of != entry.continuation_of
+                || current.peer_message != entry.peer_message {
+                return Err(conflict());
+            }
+            if current.role != MessageRole::Assistant { return Err(conflict()); }
+            if current.status != Some(MessageStatus::Streaming) {
+                if matches!(current.status, Some(MessageStatus::Complete | MessageStatus::Aborted))
+                    && entry.status == Some(MessageStatus::Streaming)
+                    && (recovery_parts_are_prefix(&entry.parts, &current.parts)
+                        || recovery_parts_are_prefix(&current.parts, &entry.parts)) {
+                    return Ok(());
+                }
+                return Err(conflict());
+            }
+            if !matches!(entry.status, Some(MessageStatus::Streaming | MessageStatus::Complete | MessageStatus::Aborted))
+                || !recovery_parts_are_prefix(&current.parts, &entry.parts) { return Err(conflict()); }
+            let parts = match map.get("parts") {
+                Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) => parts,
+                _ => return Err(conflict()),
+            };
+            if parts.len() > 0 { parts.delete(0, parts.len())?; }
+            for part in &entry.parts { push_part(&parts, part)?; }
+            map.insert("status", status_str(entry.status.expect("checked recovery status")))?;
+            self.doc.commit();
+            return Ok(());
+        }
+        self.push_message(entry)
+    }
+
     /// Read message ids without materializing parts or text bodies.
     pub fn message_ids(&self) -> HashSet<String> {
         let messages = self.doc.get_list("messages");
@@ -895,6 +934,25 @@ impl SessionDoc {
             .export(ExportMode::Snapshot)
             .map_err(|e| DocError::Schema(e.to_string()))
     }
+}
+
+fn recovery_parts_are_prefix(old: &[MessagePart], new: &[MessagePart]) -> bool {
+    old.len() <= new.len() && old.iter().zip(new).all(|(old, new)| {
+        if old == new { return true; }
+        match (old, new) {
+            (MessagePart::Text { id: a, text: old }, MessagePart::Text { id: b, text: new }) => a == b && new.starts_with(old),
+            (MessagePart::Tool { id: a, call: old_call, is_error: old_error, resolved: before },
+             MessagePart::Tool { id: b, call: new_call, is_error: new_error, resolved: after }) =>
+                a == b && (!*before || (*after && old_call == new_call && old_error == new_error)),
+            (MessagePart::Input { id: a, request_id: old_id, questions: old, resolved: before },
+             MessagePart::Input { id: b, request_id: new_id, questions: new, resolved: after }) =>
+                a == b && old_id == new_id && old == new && (!*before || *after),
+            (MessagePart::Thinking { id: a, started: old_started, completed: before },
+             MessagePart::Thinking { id: b, started: new_started, completed: after }) =>
+                a == b && (!*old_started || *new_started) && (!*before || *after),
+            _ => false,
+        }
+    })
 }
 
 fn write_entry_scalar_fields(map: &LoroMap, entry: &SessionMessageEntry) -> Result<(), DocError> {
