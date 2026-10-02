@@ -962,7 +962,7 @@ impl WorkspaceHost {
             .find(|row| row.chat_id == session.chat_id)
             != Some(session)
         {
-            self.record_session(session);
+            self.inner.doc.upsert_session(session)?;
         }
         if self.inner.doc.chat(&session.chat_id)?.is_none() {
             self.inner.doc.upsert_chat(&Chat {
@@ -1669,7 +1669,10 @@ fn merge_sessions(
             projected.chat_id = chat_id.to_string();
             merged.insert(projected.chat_id.clone(), projected);
         }
-        merged.insert(session.chat_id.clone(), session.clone());
+        // A stale local observer cannot replace another device's room owner.
+        if merged.get(&session.chat_id).is_none_or(|row| row.device_id == device_id) {
+            merged.insert(session.chat_id.clone(), session.clone());
+        }
     }
     let mut list: Vec<Session> = merged.into_values().collect();
     list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));

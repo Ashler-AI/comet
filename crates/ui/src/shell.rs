@@ -4064,6 +4064,12 @@ impl Shell {
                 .rounded_full()
                 .bg(theme.attention)
                 .into_any_element(),
+            comet_proto::ChatIndicator::Unreachable => div()
+                .text_size(px(10.5))
+                .line_height(px(13.0))
+                .text_color(theme.text_muted)
+                .child("Unreachable")
+                .into_any_element(),
             comet_proto::ChatIndicator::Idle => div()
                 .text_size(px(10.5))
                 .line_height(px(13.0))
@@ -7979,6 +7985,10 @@ impl Shell {
             // No label: the QuestionPanel right below IS the awaiting-input
             // surface — a strip caption above it was redundant (user request).
             Indicator::AwaitingInput => strip.into_any_element(),
+            Indicator::Unreachable => strip
+                .text_color(theme.text_muted)
+                .child(SharedString::from("Owner unreachable — status is stale"))
+                .into_any_element(),
             Indicator::Errored => strip
                 .text_color(theme.danger)
                 .child(SharedString::from("Run failed"))

@@ -359,9 +359,6 @@ struct Inner {
     hubs: Mutex<HashMap<String, broadcast::Sender<JournaledEvent>>>,
     statuses: Mutex<HashMap<String, Session>>,
     sessions_tx: watch::Sender<Vec<Session>>,
-    /// Last dispatched request per chat — the steer→new-turn fallback re-derives its
-    /// run config from this (chat config rows land with the workspace doc in M4).
-    last_requests: Mutex<HashMap<String, RunRequest>>,
     /// Harness-native session ids per chat (resume continuity across turns) —
     /// the live-process cache over the durable copy on the workspace chat row
     /// (comet kept the same pair on `chats.harness_session_id`). An empty
@@ -416,7 +413,6 @@ impl SessionsEngine {
                 hubs: Mutex::new(HashMap::new()),
                 statuses: Mutex::new(HashMap::new()),
                 sessions_tx,
-                last_requests: Mutex::new(HashMap::new()),
                 harness_sessions: Mutex::new(HashMap::new()),
                 shutting_down: CancellationToken::new(),
                 admission: RwLock::new(()),
@@ -520,7 +516,9 @@ impl SessionsEngine {
     }
 
     fn dispatch_lock(&self, chat_id: &str) -> Arc<AsyncMutex<()>> {
+        self.inner.prune_inactive_state();
         let mut locks = lock(&self.inner.dispatch_locks);
+        locks.retain(|_, value| value.strong_count() > 0);
         if let Some(dispatch_lock) = locks.get(chat_id).and_then(Weak::upgrade) {
             return dispatch_lock;
         }
@@ -647,9 +645,18 @@ impl SessionsEngine {
         })
     }
 
-    /// The last request dispatched for a chat (steer→new-turn fallback).
+    /// Read the last admitted request from its durable context, without retaining
+    /// every prompt and attachment in memory after a run finishes.
     pub fn last_request(&self, chat_id: &str) -> Option<RunRequest> {
-        lock(&self.inner.last_requests).get(chat_id).cloned()
+        match self.inner.journal.read_context::<(RunAuthIdentity, String, HarnessId, RunRequest)>(chat_id) {
+            Ok(Some((identity, device_id, _, request)))
+                if identity == self.auth_identity() && device_id == self.inner.device_id => Some(request),
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(chat = %chat_id, %error, "last request recovery failed");
+                None
+            }
+        }
     }
 
     pub(crate) fn recovered_context(&self, execution_key: &str) -> Result<RunRequest, EngineError> {
@@ -688,6 +695,7 @@ impl SessionsEngine {
     ) -> Result<(Vec<JournaledEvent>, broadcast::Receiver<JournaledEvent>), EngineError> {
         let rx = {
             let mut hubs = lock(&self.inner.hubs);
+            hubs.retain(|_, hub| hub.receiver_count() > 0);
             hubs.entry(chat_id.to_string())
                 .or_insert_with(|| broadcast::channel(1024).0)
                 .subscribe()
@@ -1048,7 +1056,6 @@ impl SessionsEngine {
             }
         };
         if let ExistingRunDecision::Routed { run_id, status } = &existing {
-            lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
             let handle = self.doc_handle(chat_id)?;
             let peer_message = handle.write_user_message_with_status(
                 &user_id,
@@ -1323,7 +1330,6 @@ impl SessionsEngine {
                 return Err(err.into());
             }
         };
-        lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
         if harness_id == HarnessId::Omp {
             self.inner.set_recovery(chat_id, "completed", None);
         }
@@ -2075,7 +2081,6 @@ impl Inner {
                 journal_seq: self.journal.last_event(chat_id)?.map_or(0, |(seq, _)| seq),
             },
         )?;
-        lock(&self.last_requests).insert(chat_id.to_string(), request);
         Ok(())
     }
     fn set_recovery(&self, chat_id: &str, phase: &str, error: Option<String>) {
@@ -2908,14 +2913,10 @@ async fn drive_run(
             }
             if *status == DoneStatus::Completed && !nothing_streamed {
                 if let (Some(titles), Some(host)) = (inner.titles.get(), inner.doc_host.get()) {
-                    if let Err(error) = doc_ref
-                        .doc()
-                        .get_map("meta")
-                        .insert("directoryCompletedTurn", entry_id.as_str())
+                    if let Err(error) = doc_ref.set_completed_turn(&entry_id)
                     {
                         tracing::warn!(%error, "completed title marker failed");
                     } else {
-                        doc_ref.doc().commit();
                         titles.completed(chat_id.clone(), host.clone());
                     }
                 }

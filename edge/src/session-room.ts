@@ -5,9 +5,8 @@
  * the scope on first use and rejects cross-scope access.
  *
  * Persistence model:
- * - `updates` — append-only incoming update log, buffered in memory during
- *   active streams and flushed every ~DO_FLUSH_MS (a crash losing buffered
- *   ops is healed by normal CRDT resync from the host on reconnect).
+ * - `updates` — accepted incoming deltas, written transactionally before ACK.
+ *   storage.sync() is the durable boundary; publisher and edge may both restart.
  * - `snapshot` blob — the doc's current snapshot. Two-level compaction:
  *   LOG FOLD (whenever the update log passes COMPACT_LOG_BYTES): re-export a
  *   full snapshot and clear the log — loses nothing. HISTORY TRIM applies only
@@ -20,8 +19,8 @@
  *   host publish (§6.1).
  * - Ephemeral presence (%EPH room) is memory-only by construction.
  *
- * Hibernation discipline: no wall-clock JS timers except the flush debounce
- * (which only exists while traffic keeps the DO awake anyway); scheduled work
+ * Hibernation discipline: timers only release idle caches and fragment batches;
+ * scheduled work
  * (checkpoints, history trim, R2 backup §3.3) rides the durable alarm.
  */
 import { LoroDoc, EphemeralStore, VersionVector, decodeImportBlobMeta } from "loro-crdt";
@@ -43,7 +42,6 @@ import {
 import {
   COMPACT_LOG_BYTES,
   COMPACT_LOG_ROWS,
-  DO_FLUSH_MS,
   RETAIN_DAYS,
   materializeTail
 } from "./session-doc";
@@ -95,9 +93,9 @@ export const canonicalSessionId = (value: string | undefined): string | undefine
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RETAIN_MS = RETAIN_DAYS * DAY_MS;
-/** Consecutive cold-replay deaths (CPU-limit kills mid-`ensureDoc`) before the
- * room concludes it is wedged and drops its own log — see `ensureDoc`. */
+/** Session-only replay reset policy. Workspace history is never reset or gated. */
 const REPLAY_CRASH_LIMIT = 3;
+const FRAGMENT_TTL_MS = 30_000;
 /** Payload bytes per outbound fragment (leaves room for the envelope). */
 const FRAGMENT_BYTES = 200_000;
 /** Match the sync client's healthy-snapshot limits, shared across each
@@ -280,6 +278,7 @@ interface FragmentBatch {
   receivedBytes: number;
   totalSize: number;
   header: DocUpdateFragmentHeader;
+  expiresAt: number;
 }
 interface WorkspacePresenceEntry {
   expiresAt: number;
@@ -306,13 +305,10 @@ export class SessionRoom implements DurableObject {
    * allocation while letting fresh joiners observe peers before the next
    * 15-second heartbeat. Lost on hibernation by design. */
   private readonly workspacePresence = new Map<string, WorkspacePresenceEntry>();
-  private pending: Uint8Array[] = [];
-  private pendingBytes = 0;
-  private flushTimer: ReturnType<typeof setTimeout> | undefined;
-  private flushInFlight: Promise<void> | undefined;
   /** In-memory fragment reassembly. Lost on hibernation → the sender gets a
    * FragmentTimeout ack for the unknown batch and resends — self-healing. */
   private readonly fragments = new Map<WebSocket, Map<string, FragmentBatch>>();
+  private fragmentTimer: number | undefined;
   /** Revocations delivered while this instance is live close the TOCTOU gap
    * between an authority response and a handler's final mutation/send. */
   private readonly revokedGrants = new Set<string>();
@@ -515,6 +511,8 @@ export class SessionRoom implements DurableObject {
         // (2026-07-30: this creeping toward the CPU limit was invisible).
         lastReplayMs: Number(this.getMeta("lastReplayMs") ?? "0"),
         lastReplayRows: Number(this.getMeta("lastReplayRows") ?? "0"),
+        lastReplayBatches: Number(this.getMeta("lastReplayBatches") ?? "0"),
+        lastColdMs: Number(this.getMeta("lastColdMs") ?? "0"),
         // True between a wedge-break log drop and the first re-uploaded state
         // (the nightly backup is paused in that window).
         postReset: this.getMeta("postReset") === "1",
@@ -589,6 +587,7 @@ export class SessionRoom implements DurableObject {
         return json({ error: "invalid_update" }, 400);
       }
       if (workspace) this.notifyWorkspace(doc, projectScope);
+      await this.ctx.storage.sync();
       // Converge live peers: relay the update to connected %LOR sockets.
       const roomId = this.getMeta("chatId") ?? "";
       for (const ws of this.ctx.getWebSockets()) {
@@ -920,9 +919,6 @@ export class SessionRoom implements DurableObject {
         for (const row of this.ctx.storage.sql.exec("SELECT bytes FROM updates ORDER BY seq")) {
           if (!this.sendUpdates(ws, message.crdt, message.roomId, [new Uint8Array(row.bytes as ArrayBuffer)])) return;
         }
-        for (const update of this.pending) {
-          if (!this.sendUpdates(ws, message.crdt, message.roomId, [update])) return;
-        }
       }
       // The full join answer completed without a WASM failure.
       // Without this reset, occasional transient RangeErrors accumulated
@@ -1043,6 +1039,9 @@ export class SessionRoom implements DurableObject {
         return;
       }
       if (state.workspace) this.notifyWorkspace(doc, state.projectScope);
+      await this.ctx.storage.sync();
+      // The grant may expire or be revoked while durable persistence yields.
+      if (!(await this.authorizeSocket(ws, state)) || ws.readyState !== WebSocket.OPEN) return;
       this.ack(ws, { crdt, roomId }, UpdateStatusCode.Ok, batchId);
       await this.relay(ws, crdt, roomId, updates);
       return;
@@ -1087,13 +1086,11 @@ export class SessionRoom implements DurableObject {
       }
     });
     if (snapshotIndex < 0) {
-      // The DO cannot interleave another request in this synchronous section.
-      // Apply ordinary deltas incrementally, publishing/recording nothing until
-      // the whole batch materializes. Reconstruct accepted state only on failure.
+      // Reject a whole batch atomically. Only fully materialized deltas enter SQL.
+      // Reconstruct accepted state from its durable baseline only on failure.
+      const before = doc.oplogFrontiers();
       const retainedPending = this.docPendingEnds;
       let pendingEnds = retainedPending ? new Map(retainedPending) : undefined;
-      const pendingCount = this.pending.length;
-      const pendingBytes = this.pendingBytes;
       try {
         for (const update of updates) {
           if (update.length === 0) continue;
@@ -1104,17 +1101,15 @@ export class SessionRoom implements DurableObject {
           }
         }
         this.assertLoroMaterialized(doc, pendingEnds);
-        // Rare out-of-order healing needs a normalized baseline for fresh peers.
-        const baseline = pendingEnds?.size ? doc.export({ mode: "snapshot" }) : undefined;
-        this.ctx.storage.transactionSync(() => {
-          if (baseline) this.blobs.put("snapshot", baseline);
-          this.recordLoroUpdates(updates);
-        });
+        const after = doc.oplogFrontiers();
+        const changed = before.length !== after.length ||
+          !before.every((head) => after.some((other) => head.peer === other.peer && head.counter === other.counter));
+        if (changed || retainedPending?.size) {
+          this.recordLoroUpdates(doc, updates, Boolean(pendingEnds?.size));
+        }
         this.docPendingEnds = undefined;
         return doc;
       } catch (error) {
-        this.pending.length = pendingCount;
-        this.pendingBytes = pendingBytes;
         this.doc = undefined;
         doc.free();
         let restored: LoroDoc | undefined;
@@ -1122,11 +1117,8 @@ export class SessionRoom implements DurableObject {
           restored = new LoroDoc();
           const baseline = this.blobs.get("snapshot");
           if (baseline?.length) restored.import(baseline);
-          for (const row of this.ctx.storage.sql.exec("SELECT bytes FROM updates ORDER BY seq")) {
-            restored.import(new Uint8Array(row.bytes as ArrayBuffer));
-          }
-          for (const update of this.pending) restored.import(update);
-          this.assertLoroMaterialized(restored);
+          const pendingEnds = this.replayLog(restored).pendingEnds;
+          this.assertLoroMaterialized(restored, pendingEnds);
           this.doc = restored;
           this.docPendingEnds = retainedPending;
         } catch (rollbackError) {
@@ -1142,7 +1134,6 @@ export class SessionRoom implements DurableObject {
     let candidate = new LoroDoc();
     let ownsCandidate = true;
     let previousVersion: VersionVector | undefined;
-    let mergedBaseline = false;
     let pendingEnds: Map<PeerID, number> | undefined;
     const replay = (update: Uint8Array): void => {
       if (update.length === 0) return;
@@ -1183,7 +1174,6 @@ export class SessionRoom implements DurableObject {
             candidate = doc.fork();
             incoming.free();
             replay(baseline);
-            mergedBaseline = true;
           } else if (coverage === undefined) {
             const retainedSince = doc.shallowSinceVV();
             try {
@@ -1195,14 +1185,20 @@ export class SessionRoom implements DurableObject {
             // Preserve unique operations already folded into the old baseline.
             // Exporting a delta is lossless only above its shallow boundary.
             replay(doc.export({ mode: "update", from: candidateVersion }));
-            mergedBaseline = true;
           }
         } finally { candidateVersion.free(); }
       }
-      for (const row of this.ctx.storage.sql.exec("SELECT bytes FROM updates ORDER BY seq")) {
-        replay(new Uint8Array(row.bytes as ArrayBuffer));
+      if (this.docPendingEnds?.size) {
+        const retained = this.replayLog(candidate).pendingEnds;
+        for (const [peer, end] of this.docPendingEnds) {
+          pendingEnds ??= new Map();
+          pendingEnds.set(peer, Math.max(pendingEnds.get(peer) ?? 0, end));
+        }
+        for (const [peer, end] of retained ?? []) {
+          pendingEnds ??= new Map();
+          pendingEnds.set(peer, Math.max(pendingEnds.get(peer) ?? 0, end));
+        }
       }
-      for (const update of this.pending) replay(update);
       for (let i = 0; i < updates.length; i++) {
         if (i !== snapshotIndex) replay(updates[i]);
       }
@@ -1212,21 +1208,10 @@ export class SessionRoom implements DurableObject {
         const coverage = mergedVersion.compare(previousVersion);
         if (coverage === undefined || coverage < 0) throw new Error("import lost retained operations");
       } finally { mergedVersion.free(); }
-      // Concurrent branches and healed out-of-order deltas need the validated
-      // union as baseline, not their potentially incomplete historical order.
-      if (mergedBaseline || pendingEnds?.size) baseline = candidate.export({ mode: "snapshot" });
-      const pendingCount = this.pending.length;
-      const pendingBytes = this.pendingBytes;
-      try {
-        this.ctx.storage.transactionSync(() => {
-          this.blobs.put("snapshot", baseline);
-          this.recordLoroUpdates(updates, snapshotIndex);
-        });
-      } catch (error) {
-        this.pending.length = pendingCount;
-        this.pendingBytes = pendingBytes;
-        throw error;
-      }
+      // Persist the validated union, never the publisher's partial baseline.
+      // Replacement and log deletion share a synchronous transaction, so writes
+      // accepted while storage.sync yields stay in the new log.
+      this.recordLoroUpdates(candidate, updates, true);
       this.doc = candidate;
       this.docPendingEnds = undefined;
       ownsCandidate = false;
@@ -1278,30 +1263,50 @@ export class SessionRoom implements DurableObject {
     }
   }
 
-  /** Durability bookkeeping for accepted %LOR updates: buffer for the flush
-   * batch, dirty the tail/backup caches, keep the daily alarm armed. */
-  private recordLoroUpdates(updates: Uint8Array[], persistedSnapshotIndex = -1): void {
-    let real = false;
-    for (let i = 0; i < updates.length; i++) {
-      const update = updates[i];
-      if (update.length === 0) continue;
-      real = true;
-      if (i === persistedSnapshotIndex) continue;
-      this.pending.push(update);
-      this.pendingBytes += update.length;
-    }
-    // A batch of only zero-length updates (empty POST /append body, empty
-    // DocUpdate frame) recorded nothing: it must not dirty caches, arm the
-    // alarm, or — critically — clear postReset, which would re-expose the
-    // disaster backup to an empty-doc overwrite (round-2 review finding).
-    if (!real) return;
-    this.setMeta("tailDirty", "1");
-    this.setMeta("backupDirty", "1");
-    // Real state landed — the backup may advance past a wedge-break drop
-    // (the monotonic VV gate in alarm() still has the final say).
-    this.setMeta("postReset", "0");
-    this.scheduleFlush();
+  /** Commit accepted bytes and fold status churn without discarding CRDT history.
+   * No accepted payload remains in a volatile JS buffer after this returns. */
+  private recordLoroUpdates(doc: LoroDoc, updates: Uint8Array[], forceSnapshot = false): void {
+    const bytes = updates.reduce((total, update) => total + update.byteLength, 0);
+    if (!bytes) return;
+    const logBytes = Number(this.getMeta("updateBytes") ?? "0") + bytes;
+    const rows = Number([...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM updates")][0]?.n ?? 0);
+    const fold = forceSnapshot || logBytes >= COMPACT_LOG_BYTES ||
+      rows + updates.length >= COMPACT_LOG_ROWS || updates.some((update) => update.byteLength > CHUNK_BYTES);
+    // Export before mutating SQL: a WASM failure cannot partially admit a batch.
+    const snapshot = fold ? doc.export({ mode: "snapshot" }) : undefined;
+    this.ctx.storage.transactionSync(() => {
+      if (snapshot) {
+        this.blobs.put("snapshot", snapshot);
+        this.ctx.storage.sql.exec("DELETE FROM updates");
+        this.setMeta("updateBytes", "0");
+      } else {
+        const now = Date.now();
+        for (const update of updates) {
+          if (!update.byteLength) continue;
+          const value = update.byteOffset === 0 && update.byteLength === update.buffer.byteLength
+            ? update.buffer : update.buffer.slice(update.byteOffset, update.byteOffset + update.byteLength);
+          this.ctx.storage.sql.exec("INSERT INTO updates (bytes, received_at) VALUES (?, ?)", value, now);
+        }
+        this.setMeta("updateBytes", String(logBytes));
+      }
+      this.setMeta("tailDirty", "1");
+      this.setMeta("backupDirty", "1");
+      this.setMeta("postReset", "0");
+    });
     this.markActivity();
+  }
+
+  private pruneFragments(now: number): void {
+    for (const [socket, batches] of this.fragments) {
+      for (const [id, batch] of batches) if (batch.expiresAt <= now) batches.delete(id);
+      if (!batches.size) this.fragments.delete(socket);
+    }
+    clearTimeout(this.fragmentTimer);
+    this.fragmentTimer = undefined;
+    if (this.fragments.size) {
+      const expiry = Math.min(...[...this.fragments.values()].flatMap((batches) => [...batches.values()].map((batch) => batch.expiresAt)));
+      this.fragmentTimer = setTimeout(() => this.pruneFragments(Date.now()), Math.max(1, expiry - now));
+    }
   }
 
   private handleFragmentHeader(
@@ -1313,6 +1318,7 @@ export class SessionRoom implements DurableObject {
       this.ack(ws, message, UpdateStatusCode.PermissionDenied, message.batchId);
       return;
     }
+    this.pruneFragments(Date.now());
     let batches = this.fragments.get(ws);
     if (
       !Number.isSafeInteger(message.fragmentCount) ||
@@ -1327,10 +1333,13 @@ export class SessionRoom implements DurableObject {
     }
     let reservedBytes = message.totalSizeBytes;
     let reservedParts = message.fragmentCount;
-    for (const [id, batch] of batches ?? []) {
-      if (id === message.batchId) continue;
-      reservedBytes += batch.totalSize;
-      reservedParts += batch.parts.length;
+    // The WASM heap is isolate-shared: a per-socket budget still admits N*64MiB.
+    for (const [socket, inFlight] of this.fragments) {
+      for (const [id, batch] of inFlight) {
+        if (socket === ws && id === message.batchId) continue;
+        reservedBytes += batch.totalSize;
+        reservedParts += batch.parts.length;
+      }
     }
     if (reservedBytes > MAX_REASSEMBLED_BYTES || reservedParts > MAX_FRAGMENT_COUNT) {
       this.ack(ws, message, UpdateStatusCode.PayloadTooLarge, message.batchId);
@@ -1345,8 +1354,10 @@ export class SessionRoom implements DurableObject {
       received: 0,
       receivedBytes: 0,
       totalSize: message.totalSizeBytes,
-      header: message
+      header: message,
+      expiresAt: Date.now() + FRAGMENT_TTL_MS
     });
+    this.pruneFragments(Date.now());
   }
 
   private async handleFragment(
@@ -1354,6 +1365,7 @@ export class SessionRoom implements DurableObject {
     state: SocketState,
     message: { crdt: CrdtType; roomId: string; batchId: `0x${string}`; index: number; fragment: Uint8Array }
   ): Promise<void> {
+    this.pruneFragments(Date.now());
     const batch = this.fragments.get(ws)?.get(message.batchId);
     if (!batch) {
       // Unknown batch (e.g. header lost to hibernation) — tell the sender to
@@ -1379,7 +1391,8 @@ export class SessionRoom implements DurableObject {
       this.ack(ws, message, UpdateStatusCode.PayloadTooLarge, message.batchId);
       return;
     }
-    batch.parts[message.index] = message.fragment;
+    // Retain only fragment bytes, not the larger decoded frame's backing buffer.
+    batch.parts[message.index] = message.fragment.slice();
     batch.received++;
     batch.receivedBytes += message.fragment.length;
     if (batch.received < batch.parts.length) return;
@@ -1390,11 +1403,12 @@ export class SessionRoom implements DurableObject {
     }
     const total = new Uint8Array(batch.totalSize);
     let off = 0;
-    for (const part of batch.parts) {
-      // Every index was received exactly once before reaching this loop.
+    for (let i = 0; i < batch.parts.length; i++) {
+      const part = batch.parts[i];
       if (part === undefined) throw new Error("incomplete fragment batch");
       total.set(part, off);
       off += part.length;
+      batch.parts[i] = undefined;
     }
     await this.applyUpdates(ws, state, message.crdt, message.roomId, message.batchId, [total]);
   }
@@ -1412,11 +1426,25 @@ export class SessionRoom implements DurableObject {
       this.docLoad = undefined;
     }
   }
+  /** Materialize the complete journal union after bootstrapping its snapshot. */
+  private replayLog(doc: LoroDoc): { rows: number; batches: number; pendingEnds?: Map<PeerID, number> } {
+    const updates: Uint8Array[] = [];
+    for (const row of this.ctx.storage.sql.exec("SELECT bytes FROM updates ORDER BY seq")) {
+      updates.push(new Uint8Array(row.bytes as ArrayBuffer));
+    }
+    if (!updates.length) return { rows: 0, batches: 0 };
+    const imported = doc.importBatch(updates);
+    let pendingEnds: Map<PeerID, number> | undefined;
+    for (const [peer, span] of imported.pending ?? []) {
+      pendingEnds ??= new Map();
+      pendingEnds.set(peer, Math.max(pendingEnds.get(peer) ?? 0, span.end));
+    }
+    return { rows: updates.length, batches: 1, pendingEnds };
+  }
 
   private async materializeDoc(): Promise<LoroDoc> {
-    // Session transcripts retain their existing bounded replay recovery policy.
-    // Workspace/unknown rooms must preserve accepted history even after repeated
-    // resource failures: no assumption that another device retains every op.
+    // A crash counter is telemetry, not evidence that accepted workspace bytes
+    // are disposable or that a subsequent complete replay cannot heal the room.
     let attempts = Number(this.getMeta("replayAttempts") ?? "0");
     // Replay failures must not permanently lock a workspace, even after a
     // transient resource failure or a deployment that fixes replay itself.
@@ -1434,15 +1462,7 @@ export class SessionRoom implements DurableObject {
       attempts = 0;
     }
     this.setMeta("replayAttempts", String(attempts + 1));
-    // INCIDENT (2026-07-30): a CPU-limit kill ROLLS BACK the event's
-    // uncommitted storage writes — so the increment above died with every
-    // crash, the count never reached the limit, and the wedge break never
-    // fired on the exact failure it was built for. The ws3 workspace room
-    // died 7 times in two minutes and then sat wedged for 3+ hours until a
-    // manual engine restart. sync() makes the count durable BEFORE the risky
-    // replay below, so consecutive deaths are actually counted; clients
-    // redialing on their join deadline (crates/sync/src/room.rs) supply the
-    // attempts, and the room self-heals within REPLAY_CRASH_LIMIT dials.
+    // Persist telemetry before crossing WASM so resource deaths remain visible.
     await this.ctx.storage.sync();
     const started = Date.now();
     const doc = new LoroDoc();
@@ -1464,30 +1484,22 @@ export class SessionRoom implements DurableObject {
         return await this.rejectPersistedLoroState(doc, "snapshot", error);
       }
     }
-    const updates: Uint8Array[] = [];
     let rows = 0;
-    for (const row of this.ctx.storage.sql.exec("SELECT bytes FROM updates ORDER BY seq")) {
-      rows++;
-      updates.push(new Uint8Array(row.bytes as ArrayBuffer));
-    }
-    for (const update of this.pending) updates.push(update);
+    let batches = 0;
     try {
-      // Materialize all deltas once, not once per small persisted update.
-      replay(updates);
+      const replayed = this.replayLog(doc);
+      rows = replayed.rows;
+      batches = replayed.batches;
+      for (const [peer, end] of replayed.pendingEnds ?? []) {
+        pendingEnds ??= new Map();
+        pendingEnds.set(peer, Math.max(pendingEnds.get(peer) ?? 0, end));
+      }
     } catch (error) {
-      return await this.rejectPersistedLoroState(doc, "update log", error);
+      return await this.rejectPersistedLoroState(doc, "update journal", error);
     }
     this.setMeta("replayAttempts", "0");
-    // Scope the crash budget to the replay ALONE: without this second sync, a
-    // CPU kill later in the same event (a backfill export for a fresh client,
-    // the alarm's shallow trim) would roll back this reset while the synced
-    // increment above survives — three such deaths would wedge-break a room
-    // whose replay is perfectly healthy (adversarial-review finding). One
-    // extra sync, cold path only. Deliberate consequence: a deterministic
-    // POST-replay death (a doc so big its snapshot export blows the CPU
-    // limit) gets no automatic wedge-break — destroying state over an export
-    // problem is worse than looping loudly. That class is watched via
-    // lastReplayMs creep and escaped manually with POST /reset-log.
+    // Reset only after a successful replay; later export failures never reset
+    // accepted workspace state. Both old and current clients keep their history.
     await this.ctx.storage.sync();
     // Cold-start telemetry (Workers Logs + /stats): the replay cost is the
     // wedge risk — watch lastReplayMs trend toward the CPU limit to catch the
@@ -1495,6 +1507,7 @@ export class SessionRoom implements DurableObject {
     const replayMs = Date.now() - started;
     this.setMeta("lastReplayMs", String(replayMs));
     this.setMeta("lastReplayRows", String(rows));
+    this.setMeta("lastReplayBatches", String(batches));
     console.log(
       `cold replay: ${replayMs}ms, ${rows} rows, snapshot ${snapshot?.length ?? 0}B, attempt ${attempts + 1}`,
       `room=${this.getMeta("chatId") ?? "?"}`
@@ -1509,6 +1522,18 @@ export class SessionRoom implements DurableObject {
       } finally { version.free(); }
     }
     this.docPendingEnds = pendingEnds?.size ? pendingEnds : undefined;
+    // Migrate long legacy journals once. Never fold unresolved accepted history:
+    // only a peer carrying its missing dependencies can complete that baseline.
+    if (rows >= COMPACT_LOG_ROWS && !this.docPendingEnds) {
+      this.assertLoroMaterialized(doc);
+      const baseline = doc.export({ mode: "snapshot" });
+      this.ctx.storage.transactionSync(() => {
+        this.blobs.put("snapshot", baseline);
+        this.ctx.storage.sql.exec("DELETE FROM updates");
+        this.setMeta("updateBytes", "0");
+      });
+      await this.ctx.storage.sync();
+    }
     // Record a frontier checkpoint on cold start too: the alarm only records
     // while WRITES keep it armed, so an idle room never aged into trim
     // eligibility — it could never shrink, ever. One checkpoint a day max.
@@ -1530,14 +1555,11 @@ export class SessionRoom implements DurableObject {
     if (await this.trimHistoryIfDue(doc, Date.now())) {
       console.log(`history trimmed on cold start room=${this.getMeta("chatId") ?? "?"}`);
     }
+    this.setMeta("lastColdMs", String(Date.now() - started));
     return this.doc;
   }
 
-  /** Idle-doc release (see DOC_IDLE_RELEASE_MS): a debounced timer frees the
-   * materialized doc after a quiet minute. Timer only exists while traffic
-   * keeps the DO awake — same hibernation discipline as the flush debounce.
-   * Buffered `pending` updates survive a release: cold replay re-imports
-   * them (see ensureDoc). */
+  /** Free idle WASM handles; accepted history already lives in SQL. */
   private touchDoc(): void {
     this.lastDocUse = Date.now();
     if (this.docIdleTimer) return;
@@ -1546,17 +1568,20 @@ export class SessionRoom implements DurableObject {
 
   private releaseIdleDoc(): void {
     this.docIdleTimer = undefined;
-    if (!this.doc) return;
+    if (!this.doc && !this.eph) return;
     const idle = Date.now() - this.lastDocUse;
-    if (idle < DOC_IDLE_RELEASE_MS) {
+    if (idle < DOC_IDLE_RELEASE_MS || this.docLoad) {
       this.docIdleTimer = setTimeout(
         () => this.releaseIdleDoc(),
         Math.max(DOC_IDLE_RELEASE_MS - idle, 1_000) + 500
       );
       return;
     }
-    this.doc.free();
+    this.doc?.free();
     this.doc = undefined;
+    this.eph?.free();
+    this.eph = undefined;
+    this.workspacePresence.clear();
   }
 
   private closeSocketsForRoomReset(): void {
@@ -1604,9 +1629,7 @@ export class SessionRoom implements DurableObject {
     this.setMeta("updateBytes", "0");
     this.setMeta("checkpoints", "[]");
     this.setMeta("lastTrimAt", "");
-    this.pending = [];
     this.docPendingEnds = undefined;
-    this.pendingBytes = 0;
     // Until an engine re-uploads real state, anything materialized from here
     // is empty — postReset gates the nightly R2 put so the DISASTER backup
     // cannot be overwritten by the emptied doc. Without it, the durable crash
@@ -1619,6 +1642,7 @@ export class SessionRoom implements DurableObject {
   }
 
   private ensureEph(): EphemeralStore {
+    this.touchDoc();
     if (!this.eph) this.eph = new EphemeralStore(30_000);
     return this.eph;
   }
@@ -1661,78 +1685,16 @@ export class SessionRoom implements DurableObject {
 
   // ── durability: flush, compaction, backups ───────────────────────────────
 
-  private scheduleFlush(): void {
-    if (this.flushTimer) return;
-    this.flushTimer = setTimeout(() => {
-      this.flushTimer = undefined;
-      void this.flush();
-    }, DO_FLUSH_MS);
-  }
-
   private async flush(): Promise<void> {
-    if (this.flushInFlight) {
-      await this.flushInFlight;
-      return this.flush();
+    // Admission already persisted the log. Retain session-only trimming on
+    // maintenance reads without putting workspace exports on every stats read.
+    if (!this.retainsWorkspaceHistory() && (this.blobs.byteLength("snapshot") ?? 0) > TRIM_FORCE_BYTES) {
+      await this.foldLog();
     }
-    this.flushInFlight = this.flushPending();
-    try {
-      await this.flushInFlight;
-    } finally {
-      this.flushInFlight = undefined;
-    }
+    await this.ctx.storage.sync();
   }
 
-  private async flushPending(): Promise<void> {
-    if (this.flushTimer) {
-      clearTimeout(this.flushTimer);
-      this.flushTimer = undefined;
-    }
-    if (this.pending.length === 0) return;
-    // A full backfill can exceed SQLite's per-value limit before the normal
-    // post-insert fold runs. Persist it through the existing chunked snapshot
-    // store instead; never split a Loro update into independently imported rows.
-    if (this.pending.some((update) => update.byteLength > CHUNK_BYTES)) {
-      const count = this.pending.length;
-      const bytes = this.pendingBytes;
-      await this.foldLog();
-      // Compaction yields for durability. Keep later arrivals buffered; the
-      // serialized flush boundary prevents another flush from draining them.
-      this.pending.splice(0, count);
-      this.pendingBytes -= bytes;
-      return;
-    }
-    const now = Date.now();
-    for (const update of this.pending) {
-      this.ctx.storage.sql.exec(
-        "INSERT INTO updates (bytes, received_at) VALUES (?, ?)",
-        update.buffer.slice(update.byteOffset, update.byteOffset + update.byteLength),
-        now
-      );
-    }
-    const logBytes = Number(this.getMeta("updateBytes") ?? "0") + this.pendingBytes;
-    this.setMeta("updateBytes", String(logBytes));
-    this.pending = [];
-    this.pendingBytes = 0;
-    // Fold on EITHER budget: bytes bounds one huge update, rows bounds many
-    // tiny ones — a cold `ensureDoc` replay pays per-import overhead per row,
-    // so a high row count is as expensive as a high byte count (see
-    // COMPACT_LOG_ROWS). COUNT(*) is a cheap indexed read, once per flush.
-    if (logBytes > COMPACT_LOG_BYTES) {
-      await this.foldLog();
-      return;
-    }
-    const rows = [...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM updates")][0]?.n as
-      | number
-      | undefined;
-    if ((rows ?? 0) > COMPACT_LOG_ROWS) await this.foldLog();
-  }
-
-  /** LOG FOLD: snapshot re-export + clear the update log. Prefers a shallow
-   * trim when one is due — waiting for the DAILY alarm meant a heap-pressed
-   * colo (2026-08-04 wasm exhaustion) kept thrash-cycling for up to a day
-   * after the retention fix deployed; a high-churn room folds every ~400
-   * rows, so trimming here converges in minutes instead. Falls back to the
-   * lossless full snapshot when no trim is due (or the trim export fails). */
+  /** Maintenance fold. Workspace folds are lossless; session trimming is unchanged. */
   private async foldLog(): Promise<void> {
     await this.ensureDoc();
     let doc = this.doc;
@@ -1744,9 +1706,13 @@ export class SessionRoom implements DurableObject {
     doc = this.doc;
     if (!doc) throw new Error("document released during log fold");
     this.assertLoroMaterialized(doc, this.docPendingEnds);
-    this.blobs.put("snapshot", doc.export({ mode: "snapshot" }));
-    this.ctx.storage.sql.exec("DELETE FROM updates");
-    this.setMeta("updateBytes", "0");
+    const snapshot = doc.export({ mode: "snapshot" });
+    this.ctx.storage.transactionSync(() => {
+      this.blobs.put("snapshot", snapshot);
+      this.ctx.storage.sql.exec("DELETE FROM updates");
+      this.setMeta("updateBytes", "0");
+    });
+    await this.ctx.storage.sync();
   }
 
   private retainsWorkspaceHistory(): boolean {
@@ -1772,13 +1738,10 @@ export class SessionRoom implements DurableObject {
     // A cold start or regular snapshot re-export must not re-trim that cutoff,
     // regardless of the materialized document's shallow status.
     const retainedBytes = (this.blobs.byteLength("snapshot") ?? 0) +
-      Number(this.getMeta("updateBytes") ?? "0") + this.pendingBytes;
+      Number(this.getMeta("updateBytes") ?? "0");
     if (cutoff && this.getMeta("lastTrimAt") !== String(cutoff.at)) {
       frontiers = cutoff.frontiers.map((f) => ({ peer: f.peer as `${number}`, counter: f.counter }));
     } else if (retainedBytes > TRIM_FORCE_BYTES) {
-      // Include buffered backfills: oversized updates fold without first
-      // becoming log rows. Otherwise their history misses the force-trim
-      // budget until a later flush or cold start.
       // No aged checkpoint but the full history is already a heap hazard:
       // trim at the current frontier (see TRIM_FORCE_BYTES).
       frontiers = doc.frontiers().map((f) => ({ peer: String(f.peer) as `${number}`, counter: f.counter }));
@@ -1790,12 +1753,20 @@ export class SessionRoom implements DurableObject {
         mode: "shallow-snapshot",
         frontiers
       });
-      this.blobs.put("snapshot", shallow);
-      this.ctx.storage.sql.exec("DELETE FROM updates");
-      this.setMeta("updateBytes", "0");
-      this.setMeta("lastTrimAt", String(cutoff?.at ?? now));
       const fresh = new LoroDoc();
-      fresh.import(shallow);
+      try {
+        fresh.import(shallow);
+        this.assertLoroMaterialized(fresh);
+        this.ctx.storage.transactionSync(() => {
+          this.blobs.put("snapshot", shallow);
+          this.ctx.storage.sql.exec("DELETE FROM updates");
+          this.setMeta("updateBytes", "0");
+          this.setMeta("lastTrimAt", String(cutoff?.at ?? now));
+        });
+      } catch (error) {
+        fresh.free();
+        throw error;
+      }
       this.doc = fresh;
       // Free the replaced full-history doc NOW — waiting on GC finalizers
       // leaks it into the shared wasm heap exactly when trimming was

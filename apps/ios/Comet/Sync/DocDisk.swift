@@ -153,7 +153,6 @@ enum DocDisk {
         let url = intentURL(for: id).appendingPathExtension("\(commandId).outcome")
         try JSONEncoder().encode(value).write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
     }
-
     /// Retain legacy/blocked records before adopting an unrelated ancestry.
     static func retainRecoveryOriginal(doc: LoroDoc, id: String) throws {
         let url = self.url(for: id).appendingPathExtension("recovery")

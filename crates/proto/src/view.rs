@@ -33,6 +33,8 @@ pub enum Indicator {
     Working,
     AwaitingInput,
     Errored,
+    /// The last owner status was active, but its liveness has expired.
+    Unreachable,
 }
 
 /// A `Working`/`AwaitingInput` session older than this is treated as dead — a
@@ -53,7 +55,7 @@ pub fn effective_indicator(session: Option<&Session>, now: DateTime<Utc>) -> Ind
                 .signed_duration_since(session.updated_at)
                 .num_milliseconds();
             if age_ms > SESSION_STALE_MS {
-                Indicator::None
+                Indicator::Unreachable
             } else if session.status == SessionStatus::Working {
                 Indicator::Working
             } else {
@@ -80,7 +82,7 @@ pub fn effective_agent_indicator(
         Some(SessionStatus::Working | SessionStatus::AwaitingInput) => {
             let updated_at = session.updated_at.unwrap_or(session.created_at);
             if now.timestamp_millis().saturating_sub(updated_at) > SESSION_STALE_MS {
-                Indicator::None
+                Indicator::Unreachable
             } else if session.status == Some(SessionStatus::Working) {
                 Indicator::Working
             } else {
@@ -94,8 +96,11 @@ pub fn effective_agent_indicator(
 /// synced seen marker decides completed-vs-idle. Staleness gating rides on
 /// [`effective_indicator`]; the derivation itself is [`crate::chat_indicator`].
 pub fn display_status(chat: &Chat, session: Option<&Session>, now: DateTime<Utc>) -> ChatIndicator {
-    let live = session.filter(|s| effective_indicator(Some(s), now) != Indicator::None);
-    crate::chat_indicator(chat, live)
+    match effective_indicator(session, now) {
+        Indicator::Unreachable => ChatIndicator::Unreachable,
+        Indicator::None => crate::chat_indicator(chat, None),
+        _ => crate::chat_indicator(chat, session),
+    }
 }
 
 /// Attention bucket for the sidebar's Active list — lower is more urgent.
@@ -103,6 +108,7 @@ pub fn attention_rank(status: ChatIndicator) -> u8 {
     match status {
         ChatIndicator::AwaitingInput => 0,
         ChatIndicator::Errored => 1,
+        ChatIndicator::Unreachable => 1,
         ChatIndicator::Working => 2,
         ChatIndicator::Completed => 3,
         ChatIndicator::Idle => 4,

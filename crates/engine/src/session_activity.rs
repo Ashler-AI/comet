@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use comet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
 use comet_proto::{
     Chat, Session, SessionEnvironmentSource, SessionRef, SessionRoomProjection, SessionStatus,
 };
@@ -70,8 +69,6 @@ impl SessionActivity {
                             let chat_id = id.clone();
                             let task = tasks.spawn(async move {
                                 let mut messages = handle.watch_messages();
-                                let mut previous = None;
-                                let mut streamed_at = None;
                                 let mut previous_status = None;
                                 loop {
                                     let result = {
@@ -81,47 +78,16 @@ impl SessionActivity {
                                                 agent.session_id == chat_id && agent.chat_id == chat_id
                                                     && (room.is_none() || agent.source == comet_proto::AgentSessionSource::Scaffold)
                                             }) else { return Ok(()); };
-                                            let latest = tail.entries.iter().rev().find(|entry| {
-                                                entry.role == MessageRole::Assistant && match snapshot.message_provenance.iter()
-                                                    .find(|provenance| provenance.message_id == entry.id) {
-                                                    Some(provenance) => provenance.session_id == agent.session_id,
-                                                    None => entry.device_id == agent.owner_device_id
-                                                        && snapshot.sessions.iter().filter(|other| other.owner_device_id == agent.owner_device_id).count() == 1,
-                                                }
-                                            });
-                                            // Only newly observed streaming content refreshes old-runtime
-                                            // liveness. A snapshot/reconnect or publication-only commit does not.
-                                            if previous.as_ref().is_some_and(|old| Some(old) != latest)
-                                                && latest.is_some_and(|entry| entry.status == Some(MessageStatus::Streaming)) {
-                                                streamed_at = Some(crate::now_ms());
-                                            }
-                                            if previous.as_ref().map(|entry: &SessionMessageEntry| &entry.id) != latest.map(|entry| &entry.id) {
-                                                streamed_at = None;
-                                            }
-                                            if previous.as_ref() != latest {
-                                                previous = latest.cloned();
-                                            }
-                                            let source_status = agent.status.unwrap_or(SessionStatus::Idle);
-                                            let completed = previous_status.is_some_and(|status| {
-                                                matches!(status, SessionStatus::Working | SessionStatus::AwaitingInput)
-                                                    && matches!(source_status, SessionStatus::Idle | SessionStatus::Errored)
-                                            });
-                                            previous_status = Some(source_status);
+                                            // Transcript segments are not turn boundaries or liveness evidence.
+                                            // Only the owning runtime may publish working, idle, or input state.
+                                            let Some(status) = agent.status else { return Ok(()); };
                                             let source_at = agent.updated_at.unwrap_or(agent.created_at);
-                                            let mut status = source_status;
-                                            let mut updated_at = source_at;
-                                            if let Some(entry) = latest
-                                                && room.is_some()
-                                                && (status == SessionStatus::Working || entry.created_at > source_at)
-                                                && entry.status == Some(MessageStatus::Streaming) {
-                                                status = if entry.parts.iter().any(|part| matches!(part, MessagePart::Input { resolved: false, .. })) {
-                                                    SessionStatus::AwaitingInput
-                                                } else {
-                                                    SessionStatus::Working
-                                                };
-                                                updated_at = updated_at.max(entry.created_at).max(streamed_at.unwrap_or(i64::MIN));
-                                            }
-                                            let Some(updated_at) = DateTime::<Utc>::from_timestamp_millis(updated_at) else { return Ok(()); };
+                                            let completed = previous_status.is_some_and(|old| {
+                                                matches!(old, SessionStatus::Working | SessionStatus::AwaitingInput)
+                                                    && matches!(status, SessionStatus::Idle | SessionStatus::Errored)
+                                            });
+                                            previous_status = Some(status);
+                                            let Some(updated_at) = DateTime::<Utc>::from_timestamp_millis(source_at) else { return Ok(()); };
                                             let last_message_at = tail.entries.iter().map(|entry| entry.created_at)
                                                 .chain(completed.then_some(source_at)).max();
                                             target.record_session_activity(room.as_ref(), &agent.owner_subject, &Session {
@@ -207,6 +173,7 @@ pub(crate) fn projection(reference: &SessionRef, project: &str) -> Option<Sessio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use comet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
     use comet_proto::{
         AgentSessionRecord, AgentSessionSource, COLLABORATION_SCHEMA_VERSION, ChatIndicator,
         CollaborationScope, HarnessId, PublicationRecord, PublicationValue, ScaffoldLifecycle,

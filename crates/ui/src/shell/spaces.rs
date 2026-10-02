@@ -453,6 +453,7 @@ pub(super) fn status_dot_color(status: ChatIndicator, theme: &Theme) -> gpui::Hs
         // working" at a glance.
         ChatIndicator::AwaitingInput => theme.accent.opacity(0.9),
         ChatIndicator::Errored => theme.danger,
+        ChatIndicator::Unreachable => theme.text_muted,
         // Green: finished-but-unseen reads as "ready for you".
         ChatIndicator::Completed => {
             theme.success.opacity(0.9) // emerald-400

@@ -26,28 +26,11 @@ export const MSG_INLINE_MAX = 256 * 1024;
  */
 export const RETAIN_DAYS = 3;
 
-/** Update-log size that triggers a compaction pass in the session DO.
- *
- * Cold-start cost (`ensureDoc` after a hibernation or a CPU-limit reset)
- * replays the snapshot plus every logged update, so this cap is really a
- * cold-start budget. 8 MiB was too generous for a high-churn room like the
- * per-user workspace doc (3 devices writing device/session rows continuously):
- * the log grew large enough that a cold replay exceeded the DO's per-invocation
- * CPU limit, the runtime reset the DO, every client reconnected into another
- * cold start, and the memory-only presence store was wiped each time — so
- * devices flapped permanently offline. 2 MiB keeps the replay cheap. */
-export const COMPACT_LOG_BYTES = 2 * 1024 * 1024;
-
-/** Update-log ROW count that also triggers a compaction pass. Cold-start cost
- * scales with the NUMBER of `doc.import()` calls (one WASM boundary crossing
- * each), not just their total bytes — a workspace room accumulates thousands
- * of tiny row/presence-adjacent updates well under {@link COMPACT_LOG_BYTES}.
- * Fold on row count too so many-small-updates can't blow the cold-start
- * budget the byte cap alone would miss. 1500 proved too generous: a per-user
- * workspace room wedged its cold replay at ~1400 rows (Jul 2026), under the
- * trigger — folding is cheap while the doc is hot (one snapshot export), so
- * fold early and keep cold replays trivially affordable. */
-export const COMPACT_LOG_ROWS = 400;
+/** Bound the durable delta tail, not retained history. Lossless warm folds keep
+ * a restarted room at one lazy baseline plus at most 31 tiny deltas. The former
+ * 400-row gate missed a measured 343-row, 31-second workspace replay. */
+export const COMPACT_LOG_BYTES = 256 * 1024;
+export const COMPACT_LOG_ROWS = 32;
 
 /** Soft ceiling: past this much doc state the UI nudges toward a fresh
  * session. No enforcement machinery — a product stance, not a limit. */

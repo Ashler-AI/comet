@@ -117,6 +117,25 @@ fn canonical_session_id(value: &str) -> Option<String> {
     uuid::Uuid::parse_str(value).ok().map(|id| id.to_string())
 }
 
+fn validate_public_chat_routes(params: &serde_json::Value) -> Result<(), RpcError> {
+    for field in ["chatId", "sourceChatId", "targetChatId"] {
+        if params.get(field).and_then(|id| id.as_str()).is_some_and(|id| id.contains("::session::")) {
+            return Err(RpcError::BadParams(format!("{field} must be a public chat id")));
+        }
+    }
+    Ok(())
+}
+
+fn validate_command_lifetime(issued_at: Option<i64>, expires_at: Option<i64>, now: i64) -> Result<(), RpcError> {
+    match (issued_at, expires_at) {
+        (None, None) => Ok(()),
+        (Some(issued), Some(expires))
+            if issued <= now && now < expires && expires > issued
+                && expires <= issued.saturating_add(24 * 60 * 60 * 1_000) => Ok(()),
+        _ => Err(RpcError::BadParams("invalid command lifetime".into())),
+    }
+}
+
 fn peer_reply_result(reply: PeerReply) -> PeerReplyResult {
     PeerReplyResult {
         command_id: reply.command_id,
@@ -326,6 +345,10 @@ struct QueueCommandParams {
     command_id: Option<String>,
     #[serde(default)]
     preparation_generation: Option<String>,
+    #[serde(default)]
+    issued_at: Option<i64>,
+    #[serde(default)]
+    expires_at: Option<i64>,
     #[serde(default)]
     bootstrap: Option<PeerCommandBootstrap>,
 }
@@ -1848,7 +1871,9 @@ impl RpcService for EngineRpc {
         authority: comet_rpc::PeerCommandAuthority,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, RpcError> {
+        validate_public_chat_routes(&params)?;
         let mut p: QueueCommandParams = parse_params(params)?;
+        validate_command_lifetime(p.issued_at, p.expires_at, crate::now_ms())?;
         let auth = self.auth()?.state();
         if self.runtime_profile == RuntimeProfile::ScaffoldHost
             || auth.user().map(|user| user.id.as_str()) != Some(authority.subject.as_str())
@@ -1944,11 +1969,14 @@ impl RpcService for EngineRpc {
             None => {
                 self.install_local_owner_grant(&p.command)?;
                 self.doc_host
-                    .queue_command_with_id(&p.chat_id, &command_id, p.command.clone())
+                    .queue_command_with_id_at(&p.chat_id, &command_id, p.command.clone(), p.issued_at, p.expires_at)
                     .map_err(|error| RpcError::Failed(error.to_string()))?
             }
         };
-        if entry.payload != p.command || !self.doc_host.has_local_command_provenance(&entry) {
+        if entry.payload != p.command || !self.doc_host.has_local_command_provenance(&entry)
+            || p.issued_at.is_some_and(|issued| entry.issued_at != issued)
+            || p.expires_at.is_some_and(|expires| entry.expires_at != Some(expires))
+        {
             return Err(RpcError::Failed("command_id_conflict".into()));
         }
         self.workspace
@@ -1958,6 +1986,7 @@ impl RpcService for EngineRpc {
     }
 
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
+        validate_public_chat_routes(&params)?;
         // Device-addressed routing: forward calls that target another device over its
         // relay. The target compares the id to its own, so forwards cannot loop.
         if forwardable(method)
@@ -2357,6 +2386,7 @@ impl RpcService for EngineRpc {
             }
             methods::QUEUE_COMMAND => {
                 let p: QueueCommandParams = parse_params(params)?;
+                validate_command_lifetime(p.issued_at, p.expires_at, crate::now_ms())?;
                 if ordinary_peer_command(&p.command)
                     && let Some(chat) = self
                         .workspace
@@ -2389,6 +2419,8 @@ impl RpcService for EngineRpc {
                                 "commandId": command_id,
                                 "command": p.command,
                                 "bootstrap": bootstrap,
+                                "issuedAt": p.issued_at,
+                                "expiresAt": p.expires_at,
                             }),
                         )
                         .await
@@ -2454,10 +2486,10 @@ impl RpcService for EngineRpc {
                 self.install_local_owner_grant(&p.command)?;
                 let command_id = if let Some(command_id) = p.command_id {
                     self.doc_host
-                        .queue_command_with_id(&p.chat_id, &command_id, p.command)
+                        .queue_command_with_id_at(&p.chat_id, &command_id, p.command, p.issued_at, p.expires_at)
                         .map(|entry| entry.id)
                 } else {
-                    self.doc_host.queue_command(&p.chat_id, p.command)
+                    self.doc_host.queue_command_at(&p.chat_id, p.command, p.issued_at, p.expires_at)
                 }
                 .map_err(|e| RpcError::Failed(e.to_string()))?;
                 if let Some(startup) = startup.as_mut() {

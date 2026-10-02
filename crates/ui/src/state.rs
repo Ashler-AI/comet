@@ -429,31 +429,6 @@ fn shared_session_preview(entries: &[SessionMessageEntry]) -> Option<(String, St
     Some((entry.id.clone(), preview))
 }
 
-fn agent_indicator_with_transcript(
-    session: Option<&comet_proto::AgentSessionRecord>,
-    transcript: &[SessionMessageEntry],
-    now: DateTime<Utc>,
-) -> Indicator {
-    let indicator = effective_agent_indicator(session, now);
-    let Some(session) = session else {
-        return indicator;
-    };
-    let run_started_at = session.updated_at.unwrap_or(session.created_at);
-    let latest_run_entry = transcript.iter().rev().find(|entry| {
-        entry.role == MessageRole::Assistant
-            && entry.device_id == session.owner_device_id
-            && entry.created_at >= run_started_at
-    });
-    match latest_run_entry.and_then(|entry| entry.status) {
-        Some(MessageStatus::Streaming) => Indicator::Working,
-        Some(MessageStatus::Complete | MessageStatus::Aborted)
-            if indicator == Indicator::Working =>
-        {
-            Indicator::None
-        }
-        _ => indicator,
-    }
-}
 
 pub(crate) fn session_ref_fallback(chat_id: &str) -> String {
     format!("Session {}", chat_id.chars().take(8).collect::<String>())
@@ -2180,7 +2155,7 @@ impl AppState {
 
     pub fn agent_indicator_for(&self, session_id: &str, now: DateTime<Utc>) -> Indicator {
         let selected_chat = self.selected_chat.as_deref();
-        agent_indicator_with_transcript(
+        effective_agent_indicator(
             self.collaboration
                 .as_ref()
                 .and_then(|snapshot| {
@@ -2190,7 +2165,6 @@ impl AppState {
                         .find(|session| session.session_id == session_id)
                 })
                 .filter(|session| Some(session.chat_id.as_str()) == selected_chat),
-            &self.transcript,
             now,
         )
     }
@@ -5383,9 +5357,9 @@ mod tests {
         // Fresh working session shows.
         let fresh = session("c", SessionStatus::Working, 10, now);
         assert_eq!(effective_indicator(Some(&fresh), now), Indicator::Working);
-        // Stale working session is suppressed — crashed backend, not eternal spinner.
+        // Expired active owners are unreachable, never successful completions.
         let stale = session("c", SessionStatus::Working, 46, now);
-        assert_eq!(effective_indicator(Some(&stale), now), Indicator::None);
+        assert_eq!(effective_indicator(Some(&stale), now), Indicator::Unreachable);
         // Exactly at the boundary still shows (strictly-older-than semantics).
         let edge = session("c", SessionStatus::Working, 45, now);
         assert_eq!(effective_indicator(Some(&edge), now), Indicator::Working);
@@ -5405,47 +5379,12 @@ mod tests {
         let stale = agent_session("c", SessionStatus::Working, 46, now);
         assert_eq!(
             effective_agent_indicator(Some(&stale), now),
-            Indicator::None
+            Indicator::Unreachable
         );
         let awaiting = agent_session("c", SessionStatus::AwaitingInput, 5, now);
         assert_eq!(
             effective_agent_indicator(Some(&awaiting), now),
             Indicator::AwaitingInput
-        );
-        let mut streaming = transcript_entry("streaming");
-        streaming.status = Some(MessageStatus::Streaming);
-        streaming.device_id = stale.owner_device_id.clone();
-        streaming.created_at = now.timestamp_millis();
-        assert_eq!(
-            agent_indicator_with_transcript(Some(&stale), &[streaming], now),
-            Indicator::Working,
-            "live transcript activity must keep a long-running remote turn visible"
-        );
-        let idle = agent_session("c", SessionStatus::Idle, 0, now);
-        assert_eq!(
-            agent_indicator_with_transcript(Some(&idle), &[], now),
-            Indicator::None,
-            "the owner's terminal publication must clear the remote working state"
-        );
-        let fresh_working = agent_session("c", SessionStatus::Working, 5, now);
-        let mut completed = transcript_entry("completed");
-        completed.status = Some(MessageStatus::Complete);
-        completed.device_id = fresh_working.owner_device_id.clone();
-        completed.created_at = now.timestamp_millis();
-        assert_eq!(
-            agent_indicator_with_transcript(
-                Some(&fresh_working),
-                std::slice::from_ref(&completed),
-                now,
-            ),
-            Indicator::None,
-            "a completed owner transcript must bridge older owners that lack terminal publications"
-        );
-        completed.created_at = fresh_working.updated_at.unwrap() - 1;
-        assert_eq!(
-            agent_indicator_with_transcript(Some(&fresh_working), &[completed], now),
-            Indicator::Working,
-            "a completed prior turn must not hide the next turn before its first frame"
         );
     }
 
@@ -5466,7 +5405,7 @@ mod tests {
         let awaiting_stale = session("c", SessionStatus::AwaitingInput, 300, now);
         assert_eq!(
             effective_indicator(Some(&awaiting_stale), now),
-            Indicator::None
+            Indicator::Unreachable
         );
     }
 
