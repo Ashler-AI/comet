@@ -1399,9 +1399,12 @@ impl Session {
                     if complete {
                         imported = true;
                     } else {
+                        // A join streams its snapshot and journal separately; a valid
+                        // prefix can trail required_remote while catch-up is underway.
+                        let request_backfill = result.is_err() || self.synchronized;
                         self.begin_sync();
-                        tracing::warn!(room = %self.room_id, error = ?result.err(), "remote update did not materialize; requesting full backfill");
-                        if self.join_sent_at.is_none() {
+                        if request_backfill && self.join_sent_at.is_none() {
+                            tracing::warn!(room = %self.room_id, error = ?result.err(), "remote update did not materialize; requesting full backfill");
                             if self.full_resyncs >= MAX_FULL_RESYNCS {
                                 return Err(SyncError::Loro(
                                     "remote history remains incomplete after full backfill".into(),

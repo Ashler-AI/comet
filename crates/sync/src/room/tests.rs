@@ -1147,6 +1147,49 @@ async fn initial_readiness_waits_for_materialized_server_state() {
 }
 
 #[tokio::test]
+async fn reconnect_backfill_waits_for_snapshot_and_journal() {
+    let server = LoroDoc::new();
+    server.get_text("t").insert(0, "before outage").unwrap();
+    server.commit();
+    let baseline = server.export(ExportMode::Snapshot).unwrap();
+    let doc = LoroDoc::new();
+    doc.import(&baseline).unwrap();
+    let mut backfill = vec![baseline];
+    for suffix in [" during outage", " after reconnect"] {
+        let from = server.oplog_vv();
+        server
+            .get_text("t")
+            .insert(doc_text(&server).len(), suffix)
+            .unwrap();
+        server.commit();
+        backfill.push(server.export(ExportMode::updates(&from)).unwrap());
+    }
+    let (mut session, _wire) = readiness_session(doc);
+    let mut ready = None;
+    session
+        .on_join_ok(
+            CrdtType::Loro,
+            server.oplog_vv().encode(),
+            Permission::Write,
+            true,
+        )
+        .await
+        .unwrap();
+    for update in backfill {
+        session
+            .apply_remote(CrdtType::Loro, vec![update])
+            .await
+            .unwrap();
+        session.finish_sync(&mut ready);
+    }
+    assert_eq!(
+        doc_text(&session.doc),
+        "before outage during outage after reconnect"
+    );
+    assert!(session.stats.snapshot().connected);
+}
+
+#[tokio::test]
 async fn pending_remote_operations_survive_stale_join_and_unrelated_import() {
     let source = LoroDoc::new();
     source
@@ -1189,7 +1232,7 @@ async fn pending_remote_operations_survive_stale_join_and_unrelated_import() {
         Err(oneshot::error::TryRecvError::Empty)
     ));
     assert!(!session.stats.snapshot().connected);
-    // The join triggered by the incomplete unrelated import is still pending.
+    // A subsequent stale join must not forget the missing dependency.
     session
         .on_join_ok(
             CrdtType::Loro,

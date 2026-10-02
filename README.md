@@ -2,6 +2,15 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Unreleased: room catch-up after network interruptions
+
+Crew waits for a room's snapshot and update journal to finish catching up before
+reporting it connected. Valid intermediate backfill frames no longer request
+another full resync, which could keep an active room in a reconnect loop after
+a brief internet outage. Corrupt imports and gaps discovered on synchronized
+connections retain bounded full-backfill recovery; local writes are preserved.
+
+
 ## Crew 0.1.119: Namespace Devboxes
 
 Namespace hosts advertise a **Devbox** environment separately from their Linux OS
