@@ -2,13 +2,19 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
-## Unreleased: room catch-up after network interruptions
+## Crew 0.1.135 release candidate: network catch-up
 
 Crew waits for a room's snapshot and update journal to finish catching up before
 reporting it connected. Valid intermediate backfill frames no longer request
 another full resync, which could keep an active room in a reconnect loop after
 a brief internet outage. Corrupt imports and gaps discovered on synchronized
 connections retain bounded full-backfill recovery; local writes are preserved.
+
+The new regression failed before the correction; all 42 sync tests passed after it.
+An isolated live WebSocket smoke recovered from connection loss, consumed a streamed
+snapshot and journal, and converged an offline draft with zero full resyncs. The
+headed demo loaded its mock transcript; installed clients were not replaced with
+development binaries. Local typechecks were intentionally skipped.
 
 ## Crew 0.1.134 release candidate
 
