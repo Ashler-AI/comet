@@ -150,6 +150,8 @@ async function verifySimulator(app) {
           const surface = snapshotE2ELog();
           if (/\bFAIL\b/.test(surface)) throw new Error(`${prefix} surface failed:\n${surface}`);
           if (surface.includes(marker)) {
+            // ponytail: fixed navigation settle; use a render-ready hook if startup exceeds one second.
+            await sleep(1_000);
             run("xcrun", ["simctl", "io", simulator, "screenshot", path.join(logs, `${prefix}-surface.png`)]);
             writeFileSync(path.join(logs, `${prefix}-e2e.log`), surface);
             break;
