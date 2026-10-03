@@ -58,6 +58,8 @@ pub mod methods {
     pub const FORK_SESSION: &str = "ForkSession";
     /// Transfer native context to Scaffold and queue its initial remote command.
     pub const HANDOFF_SESSION_TO_SCAFFOLD: &str = "HandoffSessionToScaffold";
+    /// Recover only an explicitly accepted native handoff target; never create.
+    pub const RECOVER_SESSION_HANDOFF_TO_SCAFFOLD: &str = "RecoverSessionHandoffToScaffold";
     /// Create and attach a Scaffold environment, transferring native session context.
     pub const PREPARE_SCAFFOLD_SESSION: &str = "PrepareScaffoldSession";
     /// Retain an interrupted preparation without changing newer attempts or admission.
@@ -278,6 +280,15 @@ pub struct HandoffSessionToScaffoldParams {
     pub prompt: String,
     #[serde(default)]
     pub database_environment: comet_proto::ScaffoldDatabaseEnvironment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoverSessionHandoffToScaffoldParams {
+    #[serde(flatten)]
+    pub handoff: HandoffSessionToScaffoldParams,
+    pub recover_chat_id: String,
+    pub recover_sandbox_id: String,
 }
 
 /// Receipt for a transferred native session with its initial remote command queued.

@@ -2394,6 +2394,39 @@ impl RpcService for EngineRpc {
                 let starts_session = matches!(&p.command, SessionCommandPayload::Run { .. })
                     || matches!(&p.command, SessionCommandPayload::Control { action, .. }
                         if matches!(action.as_ref(), comet_doc::SessionControlAction::Start { .. }));
+                let _preparation = if starts_session
+                    && self.runtime_profile == RuntimeProfile::LocalController
+                    && self.scaffold.is_some()
+                {
+                    let scope = self
+                        .workspace
+                        .session_environment(&p.chat_id)
+                        .map_err(|error| RpcError::Failed(error.to_string()))?
+                        .filter(|environment| {
+                            matches!(
+                                environment.source,
+                                SessionEnvironmentSource::Scaffold { .. }
+                            )
+                        })
+                        .map(|environment| environment.scope);
+                    let scope = match scope {
+                        Some(scope) => Some(scope),
+                        None if p.preparation_generation.is_some() => Some(CollaborationScope {
+                            project_id: self.workspace.project_scope().to_string(),
+                            deployment_id: Some(self.scaffold()?.deployment_id().to_string()),
+                            session_id: Some(p.chat_id.clone()),
+                            unknown: Default::default(),
+                        }),
+                        None => None,
+                    };
+                    scope.map(|scope| {
+                        self.scaffold()?.preparation_gate(&scope).try_lock_owned().map_err(|_| RpcError::Failed(
+                            "Scaffold session preparation already in progress; wait for the existing request".into()
+                        ))
+                    }).transpose()?
+                } else {
+                    None
+                };
                 let mut startup = if starts_session {
                     scaffold_session::PreparationOutcome::for_command(
                         self,
@@ -2874,6 +2907,10 @@ impl RpcService for EngineRpc {
             methods::HANDOFF_SESSION_TO_SCAFFOLD => {
                 let p = parse_params(params)?;
                 RpcReply::value(&self.handoff_session_to_scaffold(p).await?)
+            }
+            methods::RECOVER_SESSION_HANDOFF_TO_SCAFFOLD => {
+                let p = parse_params(params)?;
+                RpcReply::value(&self.recover_session_handoff_to_scaffold(p).await?)
             }
             methods::PREPARE_SCAFFOLD_SESSION => {
                 let p = parse_params(params)?;

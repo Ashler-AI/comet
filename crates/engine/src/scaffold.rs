@@ -243,8 +243,7 @@ impl ScaffoldError {
         matches!(
             self,
             Self::Transport {
-                cause:
-                    ScaffoldTransportCause::RequestTimeout
+                cause: ScaffoldTransportCause::RequestTimeout
                     | ScaffoldTransportCause::ConnectionResetOrClosed,
                 before_response: true,
                 ..
@@ -394,22 +393,52 @@ impl ScaffoldClient {
         self.crew_directory_request("search", input).await
     }
 
-    pub async fn get_crew_session(&self, session_id: &str, deployment_id: Option<&str>) -> Result<Value, ScaffoldError> {
-        self.crew_directory_request("get", &serde_json::json!({"sessionId": session_id, "deploymentId": deployment_id})).await
+    pub async fn get_crew_session(
+        &self,
+        session_id: &str,
+        deployment_id: Option<&str>,
+    ) -> Result<Value, ScaffoldError> {
+        self.crew_directory_request(
+            "get",
+            &serde_json::json!({"sessionId": session_id, "deploymentId": deployment_id}),
+        )
+        .await
     }
 
     pub async fn upsert_crew_session(&self, input: &Value) -> Result<Value, ScaffoldError> {
         self.crew_directory_request("upsert", input).await
     }
 
-    async fn crew_directory_request(&self, operation: &str, input: &Value) -> Result<Value, ScaffoldError> {
-        let body = serde_json::to_vec(input).map_err(|_| ScaffoldError::InvalidResponse("invalid directory request".into()))?;
+    async fn crew_directory_request(
+        &self,
+        operation: &str,
+        input: &Value,
+    ) -> Result<Value, ScaffoldError> {
+        let body = serde_json::to_vec(input)
+            .map_err(|_| ScaffoldError::InvalidResponse("invalid directory request".into()))?;
         if body.len() > 60 * 1024 {
-            return Err(ScaffoldError::InvalidResponse("directory request exceeds 60 KiB".into()));
+            return Err(ScaffoldError::InvalidResponse(
+                "directory request exceeds 60 KiB".into(),
+            ));
         }
-        let bearer = self.bearer.token().await.filter(|value| !value.trim().is_empty()).ok_or(ScaffoldError::AuthUnavailable)?;
-        let response = self.http.post(self.origin.join(&format!("/api/crew-directory/{operation}")).expect("directory API path"))
-            .bearer_auth(bearer).header(reqwest::header::CONTENT_TYPE, "application/json").body(body).send().await?;
+        let bearer = self
+            .bearer
+            .token()
+            .await
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(ScaffoldError::AuthUnavailable)?;
+        let response = self
+            .http
+            .post(
+                self.origin
+                    .join(&format!("/api/crew-directory/{operation}"))
+                    .expect("directory API path"),
+            )
+            .bearer_auth(bearer)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await?;
         Self::bounded_json(response).await
     }
 
@@ -418,23 +447,51 @@ impl ScaffoldClient {
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await? {
             if body.len() + chunk.len() > 128 * 1024 {
-                return Err(ScaffoldError::InvalidResponse("response exceeds 128 KiB".into()));
+                return Err(ScaffoldError::InvalidResponse(
+                    "response exceeds 128 KiB".into(),
+                ));
             }
             body.extend_from_slice(&chunk);
         }
-        if !status.is_success() { return Err(api_error(status, &body)); }
-        serde_json::from_slice(&body).map_err(|_| ScaffoldError::InvalidResponse("invalid JSON response".into()))
+        if !status.is_success() {
+            return Err(api_error(status, &body));
+        }
+        serde_json::from_slice(&body)
+            .map_err(|_| ScaffoldError::InvalidResponse("invalid JSON response".into()))
     }
 
-    pub(crate) async fn generate_crew_title(&self, session_id: &str, deployment_id: Option<&str>, input: &str) -> Result<String, ScaffoldError> {
+    pub(crate) async fn generate_crew_title(
+        &self,
+        session_id: &str,
+        deployment_id: Option<&str>,
+        input: &str,
+    ) -> Result<String, ScaffoldError> {
         // The authenticated gateway fixes gpt-5.6-luna and a session-isolated
         // authority/conversation; device grants cannot obtain general inference.
-        let value = self.crew_directory_request("title", &serde_json::json!({
-            "sessionId": session_id, "deploymentId": deployment_id, "input": input,
-        })).await?;
-        let title = value.get("title").and_then(Value::as_str).unwrap_or_default();
-        let title = title.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(140).collect::<String>();
-        if title.is_empty() { return Err(ScaffoldError::InvalidResponse("title response is empty".into())); }
+        let value = self
+            .crew_directory_request(
+                "title",
+                &serde_json::json!({
+                    "sessionId": session_id, "deploymentId": deployment_id, "input": input,
+                }),
+            )
+            .await?;
+        let title = value
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let title = title
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(140)
+            .collect::<String>();
+        if title.is_empty() {
+            return Err(ScaffoldError::InvalidResponse(
+                "title response is empty".into(),
+            ));
+        }
         Ok(title)
     }
 
@@ -792,6 +849,56 @@ impl ScaffoldClient {
         Ok(())
     }
 
+    async fn require_absent_omp_session(
+        &self,
+        sandbox_id: &str,
+        artifact: &OmpHandoffArchive,
+        remote_cwd: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ScaffoldError> {
+        let verify_path = format!(".scaffold/omp-probe-{}.py", uuid::Uuid::new_v4().simple());
+        self.put_file(
+            sandbox_id,
+            &verify_path,
+            VERIFY_HANDOFF_PYTHON,
+            cancellation,
+        )
+        .await?;
+        let argv = vec![
+            "python3".to_string(),
+            verify_path.clone(),
+            "--probe".to_string(),
+            artifact.storage_relative_path.clone(),
+            artifact.sha256.clone(),
+            artifact.byte_count.to_string(),
+            artifact.native_session_id.clone(),
+            artifact.cwd.clone(),
+            remote_cwd.to_string(),
+        ];
+        let result = self
+            .exec(
+                sandbox_id,
+                &ExecBody {
+                    argv: &argv,
+                    mode: "inline",
+                    timeout_ms: 10_000,
+                },
+                cancellation,
+            )
+            .await;
+        self.remove_file(sandbox_id, &verify_path, &CancellationToken::new())
+            .await;
+        let result = result?;
+        if !result.ok || result.exit_code != Some(0) {
+            return Err(ScaffoldError::HandoffStage("omp_session_probe"));
+        }
+        match result.stdout.as_deref().map(str::trim) {
+            Some("absent") => Ok(()),
+            Some("present") => Err(ScaffoldError::HandoffStage("omp_session_already_imported")),
+            _ => Err(ScaffoldError::HandoffStage("omp_session_probe")),
+        }
+    }
+
     async fn handoff_omp_session(
         &self,
         sandbox_id: &str,
@@ -829,10 +936,17 @@ impl ScaffoldClient {
         // Do not start OMP here: that would create a second writer. The
         // ordinary first remote RunRequest resumes the returned native id after
         // the verified transcript has been materialized in the active profile.
+        let verify_path = format!(".scaffold/omp-import-{}.py", uuid::Uuid::new_v4().simple());
+        self.put_file(
+            sandbox_id,
+            &verify_path,
+            VERIFY_HANDOFF_PYTHON,
+            cancellation,
+        )
+        .await?;
         let verify_argv = vec![
             "python3".to_string(),
-            "-c".to_string(),
-            VERIFY_HANDOFF_PYTHON.to_string(),
+            verify_path.clone(),
             grant.destination_path.clone(),
             artifact.storage_relative_path.clone(),
             artifact.sha256.clone(),
@@ -851,7 +965,10 @@ impl ScaffoldClient {
                 },
                 cancellation,
             )
-            .await?;
+            .await;
+        self.remove_file(sandbox_id, &verify_path, &CancellationToken::new())
+            .await;
+        let verified = verified?;
         if !verified.ok
             || verified.exit_code != Some(0)
             || verified.stdout.as_deref().map(str::trim) != Some("verified")
@@ -1023,6 +1140,7 @@ impl ScaffoldClient {
         &self,
         sandbox_id: &str,
         snapshot: &WorktreeHandoffArchive,
+        remote_cwd: String,
         cancellation: &CancellationToken,
     ) -> Result<String, ScaffoldError> {
         const DESTINATION: &str = ".scaffold/crew-handoff-staging";
@@ -1092,11 +1210,6 @@ impl ScaffoldClient {
         self.remove_file(sandbox_id, &verify_path, cancellation)
             .await;
         let verified = verified?;
-        let remote_cwd = if snapshot.cwd_relative_path.is_empty() {
-            SCAFFOLD_HANDOFF_CWD.to_string()
-        } else {
-            format!("{SCAFFOLD_HANDOFF_CWD}/{}", snapshot.cwd_relative_path)
-        };
         let expected = format!("verified:{}:{remote_cwd}", snapshot.manifest_sha256);
         if !verified.ok
             || verified.exit_code != Some(0)
@@ -1688,6 +1801,8 @@ MAX_CHECKOUT_BYTES = 1024 * 1024 * 1024
 MAX_HISTORY_BYTES = 4 * 1024 * 1024 * 1024
 MAX_OBJECTS = 250000
 MAX_FILES = 25000
+# Bound directory traversal independently of the regular-file/symlink budget.
+MAX_DIRECTORIES = 25000
 MAX_MEMORY = 512 * 1024 * 1024
 deadline = time.monotonic() + 50
 
@@ -1798,23 +1913,25 @@ def inspect_objects(workspace):
         count += 1; expanded += size
         if size > MAX_TOTAL or count > MAX_OBJECTS or expanded > MAX_HISTORY_BYTES: raise SystemExit(45)
     listing = git(workspace, ["ls-tree", "-r", "-t", "-l", "-z", expected_base], True)
-    count, expanded = 0, 0
+    count, directories, expanded = 0, 0, 0
     for entry in listing.split(b"\0"):
         if not entry: continue
         metadata, path = entry.split(b"\t", 1)
         mode, kind, oid, size = metadata.split()
         safe_path(path.decode("utf-8"))
-        count += 1
-        if count > MAX_FILES: raise SystemExit(45)
-        if kind == b"tree" and mode == b"040000": continue
+        if kind == b"tree" and mode == b"040000":
+            directories += 1
+            if directories > MAX_DIRECTORIES: raise SystemExit(45)
+            continue
         # Gitlinks cannot be reconstructed from the source repository's bundle.
         if kind != b"blob" or mode not in (b"100644", b"100755", b"120000"): raise SystemExit(45)
+        count += 1
         size = int(size)
         expanded += size
         if size < 0 or count > MAX_FILES or expanded > MAX_CHECKOUT_BYTES: raise SystemExit(45)
 
 def inspect_materialized_tree(workspace):
-    count, expanded = 0, 0
+    count, directories, expanded = 0, 0, 0
     for root, dirs, files in os.walk(workspace, followlinks=False):
         if pathlib.Path(root) == workspace: dirs.remove(".git")
         for name in [*dirs, *files]:
@@ -1822,6 +1939,10 @@ def inspect_materialized_tree(workspace):
             rel = candidate.relative_to(workspace)
             safe_path(rel.as_posix())
             info = candidate.lstat()
+            if stat.S_ISDIR(info.st_mode):
+                directories += 1
+                if directories > MAX_DIRECTORIES: raise SystemExit(46)
+                continue
             count += 1
             if stat.S_ISLNK(info.st_mode):
                 target = os.readlink(candidate)
@@ -1837,7 +1958,7 @@ def inspect_materialized_tree(workspace):
                 if resolved_parts and resolved_parts[0] in (".git", ".scaffold"): raise SystemExit(46)
                 expanded += info.st_size
             elif stat.S_ISREG(info.st_mode): expanded += info.st_size
-            elif not stat.S_ISDIR(info.st_mode): raise SystemExit(46)
+            else: raise SystemExit(46)
             if count > MAX_FILES or expanded > MAX_CHECKOUT_BYTES: raise SystemExit(46)
 
 temporary = None
@@ -1999,18 +2120,20 @@ finally:
 "#;
 
 const VERIFY_HANDOFF_PYTHON: &str = r#"import hashlib, json, os, pathlib, shutil, stat, sys, tempfile, uuid
-staging_root = pathlib.Path(sys.argv[1]).resolve(strict=True)
-workspace = pathlib.Path("/workspace/ashler-platform").resolve(strict=True)
-if workspace not in staging_root.parents or staging_root.relative_to(workspace).as_posix() != ".scaffold/omp-handoff-staging":
-    raise SystemExit(20)
+probe_only = sys.argv[1] == "--probe"
+if not probe_only:
+    staging_root = pathlib.Path(sys.argv[1]).resolve(strict=True)
+    workspace = pathlib.Path("/workspace/ashler-platform").resolve(strict=True)
+    if workspace not in staging_root.parents or staging_root.relative_to(workspace).as_posix() != ".scaffold/omp-handoff-staging":
+        raise SystemExit(20)
 handoff_root = pathlib.Path("/workspace/crew-handoff")
 workspace = pathlib.Path(sys.argv[7])
-if workspace != workspace.resolve(strict=True) or not workspace.is_dir() or (workspace != handoff_root and handoff_root not in workspace.parents):
+if workspace != workspace.resolve(strict=not probe_only) or (not probe_only and not workspace.is_dir()) or (workspace != handoff_root and handoff_root not in workspace.parents):
     raise SystemExit(29)
 rel = pathlib.PurePosixPath(sys.argv[2])
 if rel.is_absolute() or not rel.parts or any(p in ("", ".", "..") for p in rel.parts):
     raise SystemExit(21)
-staged = staging_root.joinpath(*rel.parts)
+if not probe_only: staged = staging_root.joinpath(*rel.parts)
 expected_sha, expected_bytes = sys.argv[3], int(sys.argv[4])
 if len(expected_sha) != 64 or any(c not in "0123456789abcdef" for c in expected_sha):
     raise SystemExit(29)
@@ -2122,14 +2245,15 @@ def secure_dirs(root, parts):
     return current
 
 try:
-    try:
-        staged_resolved = staged.resolve(strict=True)
-    except (FileNotFoundError, OSError):
-        raise SystemExit(22)
-    if staging_root not in staged_resolved.parents or staged_resolved != staged:
-        raise SystemExit(22)
-    if not exact_file(staged, 0o600, expected_digest):
-        raise SystemExit(22)
+    if not probe_only:
+        try:
+            staged_resolved = staged.resolve(strict=True)
+        except (FileNotFoundError, OSError):
+            raise SystemExit(22)
+        if staging_root not in staged_resolved.parents or staged_resolved != staged:
+            raise SystemExit(22)
+        if not exact_file(staged, 0o600, expected_digest):
+            raise SystemExit(22)
 
     runtime_value = os.environ.get("SCAFFOLD_RUNTIME_DIR", "")
     runtime_input = pathlib.Path(runtime_value)
@@ -2162,6 +2286,58 @@ try:
     agent_dir = models_path.parent
     if tuple(agent_dir.parts[-4:]) != (".omp", "profiles", "scaffold-host", "agent") or not exact_dir(agent_dir):
         raise SystemExit(28)
+    if probe_only:
+        parent = agent_dir / "sessions" / omp_session_dir_name(workspace)
+        for directory in (parent.parent, parent):
+            if directory.is_symlink() or (directory.exists() and not exact_dir(directory)):
+                raise SystemExit(25)
+        target = parent / rel.name
+        if target.exists() or target.is_symlink():
+            print("present"); raise SystemExit(0)
+        roots = [agent_dir / "sessions"]
+        home_root = pathlib.Path.home().resolve(strict=True) / os.environ.get("PI_CONFIG_DIR", ".omp") / "profiles/scaffold-host/agent/sessions"
+        if home_root not in roots: roots.append(home_root)
+        xdg = os.environ.get("XDG_DATA_HOME", "")
+        if xdg:
+            xdg_profile = pathlib.Path(xdg) / "omp/profiles/scaffold-host"
+            if not xdg_profile.is_absolute(): raise SystemExit(25)
+            if xdg_profile.exists(): roots.append(xdg_profile / "sessions")
+        pending, entries, observed = list(roots), 0, 0
+        while pending:
+            directory = pending.pop()
+            if directory.is_symlink(): raise SystemExit(25)
+            try: children = os.scandir(directory)
+            except FileNotFoundError:
+                if directory not in roots: raise SystemExit(25)
+                continue
+            with children:
+                for entry in children:
+                    entries += 1
+                    if entries > 4096: raise SystemExit(25)
+                    mode = entry.stat(follow_symlinks=False).st_mode
+                    if stat.S_ISDIR(mode):
+                        pending.append(pathlib.Path(entry.path)); continue
+                    if not stat.S_ISREG(mode): raise SystemExit(25)
+                    if not entry.name.endswith(".jsonl"): continue
+                    fd = os.open(entry.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                    with os.fdopen(fd, "rb") as journal:
+                        if not stat.S_ISREG(os.fstat(journal.fileno()).st_mode): raise SystemExit(25)
+                        scanned, identified = 0, False
+                        while scanned < 65536:
+                            line = journal.readline(65537 - scanned)
+                            if not line: break
+                            scanned += len(line); observed += len(line)
+                            if scanned > 65536 or observed > 16 * 1024 * 1024: raise SystemExit(25)
+                            try: record = json.loads(line)
+                            except (UnicodeDecodeError, ValueError): continue
+                            if isinstance(record, dict) and record.get("type") == "session":
+                                native_id = record.get("id")
+                                if not isinstance(native_id, str) or not native_id: raise SystemExit(25)
+                                if native_id == expected_native_id:
+                                    print("present"); raise SystemExit(0)
+                                identified = True; break
+                        if not identified: raise SystemExit(25)
+        print("absent"); raise SystemExit(0)
     os.chmod(agent_dir, 0o700, follow_symlinks=False)
 
 
@@ -2193,8 +2369,9 @@ try:
         except FileNotFoundError: pass
     print("verified")
 finally:
-    try: staged.unlink()
-    except FileNotFoundError: pass
+    if not probe_only:
+        try: staged.unlink()
+        except FileNotFoundError: pass
 "#;
 
 fn device_join_grant_id(credential: &str) -> Option<String> {
@@ -2742,10 +2919,24 @@ impl ScaffoldRuntime {
                     ScaffoldError::OmpSessionHandoffFailed
                 })??;
                 let _handoff_permit = handoff_permit;
+                let prospective_cwd = if worktree.cwd_relative_path.is_empty() {
+                    SCAFFOLD_HANDOFF_CWD.to_string()
+                } else {
+                    format!("{SCAFFOLD_HANDOFF_CWD}/{}", worktree.cwd_relative_path)
+                };
+                self.inner
+                    .client
+                    .require_absent_omp_session(
+                        &sandbox_id,
+                        &artifact,
+                        &prospective_cwd,
+                        cancellation,
+                    )
+                    .await?;
                 let remote_cwd = self
                     .inner
                     .client
-                    .handoff_worktree(&sandbox_id, &worktree, cancellation)
+                    .handoff_worktree(&sandbox_id, &worktree, prospective_cwd, cancellation)
                     .await
                     .inspect_err(|error| {
                         tracing::warn!(error = %error, "Scaffold worktree handoff upload failed");
@@ -4599,150 +4790,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn omp_handoff_uses_one_use_raw_tar_and_verifies_without_starting_omp() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
-        let upload_url = format!("{origin}/one-use-upload");
-        let responses = [
-            r#"{"ok":true,"exitCode":0}"#.to_string(),
-            serde_json::json!({
-                "ok": true,
-                "upload": {
-                    "url": upload_url,
-                    "token": "single_use_upload_secret",
-                    "tokenEnv": "SCAFFOLD_UPLOAD_TOKEN",
-                    "destinationPath": ".scaffold/omp-handoff-staging",
-                    "expiresAt": chrono::Utc::now().checked_add_signed(chrono::Duration::minutes(1)).unwrap().to_rfc3339(),
-                    "command": "SCAFFOLD_UPLOAD_TOKEN=single_use_upload_secret curl ..."
-                }
-            })
-            .to_string(),
-            "{}".to_string(),
-            r#"{"ok":true,"exitCode":0,"stdout":"verified\n"}"#.to_string(),
-        ];
-        let captured = tokio::spawn(async move {
-            let mut requests = Vec::new();
-            for body in responses {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut bytes = Vec::new();
-                loop {
-                    let mut chunk = [0_u8; 4096];
-                    let read = stream.read(&mut chunk).await.unwrap();
-                    if read == 0 {
-                        break;
-                    }
-                    bytes.extend_from_slice(&chunk[..read]);
-                    if let Some(header_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let len = String::from_utf8_lossy(&bytes[..header_end])
-                            .lines()
-                            .find_map(|line| {
-                                line.to_ascii_lowercase()
-                                    .strip_prefix("content-length:")
-                                    .and_then(|value| value.trim().parse::<usize>().ok())
-                            })
-                            .unwrap_or(0);
-                        if bytes.len() >= header_end + 4 + len {
-                            break;
-                        }
-                    }
-                }
-                requests.push(bytes);
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    body.len(),
-                    body,
-                );
-                stream.write_all(response.as_bytes()).await.unwrap();
-            }
-            requests
-        });
-
-        let bytes = b"{\"type\":\"session\",\"id\":\"native-1\",\"cwd\":\"/repo\"}\n".to_vec();
-        let source = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(source.path(), &bytes).unwrap();
-        let captured_artifact = crate::omp_session_artifact::capture_omp_session_file(
-            source.path(),
-            std::path::Path::new("by-cwd/native-1.jsonl"),
-            "native-1",
-            "/repo",
-            &CancellationToken::new(),
-        )
-        .unwrap();
-        let artifact =
-            prepare_omp_handoff_archive(captured_artifact, &CancellationToken::new()).unwrap();
-        let client = ScaffoldClient::new(
-            &origin,
-            "project-a",
-            Arc::new(StaticToken("scaffold_control_secret".into())),
-        )
-        .unwrap();
-        let remote_cwd = client
-            .handoff_omp_session(
-                "sandbox-a",
-                &artifact,
-                SCAFFOLD_HANDOFF_CWD,
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(remote_cwd, SCAFFOLD_HANDOFF_CWD);
-
-        let requests = captured.await.unwrap();
-        assert_eq!(requests.len(), 4);
-        let cleanup = String::from_utf8_lossy(&requests[0]);
-        assert!(cleanup.contains(r#"["rm","-rf","--",".scaffold/omp-handoff-staging"]"#));
-        let grant = String::from_utf8_lossy(&requests[1]);
-        assert!(grant.starts_with("POST /api/code-sandboxes/sandbox-a/uploads HTTP/1.1"));
-        assert!(grant.contains(r#"{"destinationPath":".scaffold/omp-handoff-staging"}"#));
-        assert!(!grant.contains("single_use_upload_secret"));
-
-        let upload_header_end = requests[2]
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .unwrap();
-        let upload_headers = String::from_utf8_lossy(&requests[2][..upload_header_end]);
-        assert!(upload_headers.starts_with("POST /one-use-upload HTTP/1.1"));
-        assert!(
-            upload_headers
-                .to_ascii_lowercase()
-                .contains("content-type: application/x-tar")
-        );
-        assert!(upload_headers.contains("authorization: Bearer single_use_upload_secret"));
-        assert!(
-            upload_headers
-                .to_ascii_lowercase()
-                .contains("content-length:")
-        );
-        let tar = &requests[2][upload_header_end + 4..];
-        assert_eq!(
-            &tar[.."by-cwd/native-1.jsonl".len()],
-            b"by-cwd/native-1.jsonl"
-        );
-        assert_eq!(&tar[100..107], b"0000600");
-        assert_eq!(&tar[512..512 + bytes.len()], bytes);
-        assert_eq!(tar.len() as u64, artifact.archive_byte_count);
-
-        let verify = String::from_utf8_lossy(&requests[3]);
-        assert!(verify.starts_with("POST /api/code-sandboxes/sandbox-a/exec HTTP/1.1"));
-        let verify_body = verify.split_once("\r\n\r\n").unwrap().1;
-        assert!(verify_body.contains("omp-inference/profile.json"));
-        assert!(verify_body.contains("modelsPath"));
-        assert!(verify_body.contains("secure_dirs(agent_dir"));
-        assert!(verify_body.contains("omp_session_dir_name(workspace)"));
-        assert!(!verify_body.contains("/workspace/.omp"));
-        assert!(verify_body.contains(".scaffold/omp-handoff-staging"));
-        assert!(verify_body.contains("staged.unlink()"));
-        assert!(verify_body.contains("by-cwd/native-1.jsonl"));
-        assert!(verify_body.contains(&artifact.sha256));
-        assert!(!verify_body.contains("single_use_upload_secret"));
-        assert!(!verify_body.contains("omp acp"));
-        assert!(!verify_body.contains("session/load"));
-        assert!(verify_body.contains("copy_rebound_session"));
-        assert!(verify_body.contains(r#"record[\"cwd\"] = str(workspace)"#));
-        assert!(!verify_body.contains("handoff-sources"));
-    }
-
-    #[tokio::test]
     async fn worktree_handoff_streams_a_manifest_bound_archive() {
         let repo = tempfile::tempdir().unwrap();
         for args in [
@@ -4883,7 +4930,12 @@ mod tests {
         )
         .unwrap();
         client
-            .handoff_worktree("sandbox-a", &snapshot, &CancellationToken::new())
+            .handoff_worktree(
+                "sandbox-a",
+                &snapshot,
+                SCAFFOLD_HANDOFF_CWD.to_string(),
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
 
@@ -5361,6 +5413,13 @@ mod tests {
             "object_count",
             "shallow_snapshot",
             "import_expansion",
+            "directory_heavy_at_file_limit",
+            "committed_file_over_limit",
+            "overlay_symlink_over_limit",
+            "committed_directory_over_limit",
+            "cwd_directory_over_limit",
+            "reserved_directory",
+            "metadata_symlink",
         ] {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().canonicalize().unwrap();
@@ -5393,6 +5452,37 @@ mod tests {
                     symlink("../../platform", source.join("nested/escape")).unwrap();
                     symlink("nested/escape/sentinel", source.join("chain")).unwrap();
                 }
+                "directory_heavy_at_file_limit"
+                | "committed_file_over_limit"
+                | "overlay_symlink_over_limit" => {
+                    // Twelve files (including a directory symlink) and three real
+                    // directories mirror the file/directory split of a large source.
+                    for index in 0..11 {
+                        let directory = source.join(format!("group-{}", index % 3));
+                        std::fs::create_dir_all(&directory).unwrap();
+                        std::fs::write(directory.join(format!("file-{index}")), "file\n").unwrap();
+                    }
+                    symlink("group-0", source.join("directory-link")).unwrap();
+                    if scenario == "committed_file_over_limit" {
+                        std::fs::write(source.join("extra"), "one file too many\n").unwrap();
+                    }
+                }
+                "committed_directory_over_limit" => {
+                    for index in 0..4 {
+                        let directory = source.join(format!("group-{index}"));
+                        std::fs::create_dir(&directory).unwrap();
+                        std::fs::write(directory.join("file"), "file\n").unwrap();
+                    }
+                }
+                "cwd_directory_over_limit" => {
+                    std::fs::write(source.join("file"), "file\n").unwrap();
+                    std::fs::create_dir_all(source.join("one/two/three/four")).unwrap();
+                }
+                "reserved_directory" => {
+                    std::fs::create_dir(source.join(".scaffold")).unwrap();
+                    std::fs::write(source.join(".scaffold/file"), "metadata\n").unwrap();
+                }
+                "metadata_symlink" => symlink(".git", source.join("metadata-link")).unwrap(),
                 "object_expansion" => {
                     std::fs::write(source.join("large"), vec![b'x'; 2 * 1024 * 1024]).unwrap()
                 }
@@ -5418,10 +5508,19 @@ mod tests {
             }
             git(&["add", "."]);
             git(&["commit", "-qm", "source"]);
-            let snapshot = crate::worktree_handoff::capture_worktree_handoff(&source).unwrap();
+            if scenario == "overlay_symlink_over_limit" {
+                symlink("group-1", source.join("extra-link")).unwrap();
+            }
+            let cwd = if scenario == "cwd_directory_over_limit" {
+                source.join("one/two/three/four")
+            } else {
+                source.clone()
+            };
+            let snapshot = crate::worktree_handoff::capture_worktree_handoff(&cwd).unwrap();
             assert_eq!(
-                snapshot.entry_count, 0,
-                "the rejected content is committed, not overlay"
+                snapshot.entry_count,
+                usize::from(scenario == "overlay_symlink_over_limit"),
+                "only the extra symlink belongs to the overlay"
             );
             let staging = platform.join(".scaffold/crew-handoff-staging");
             std::fs::create_dir_all(&staging).unwrap();
@@ -5450,7 +5549,9 @@ mod tests {
                 .replace(
                     "MAX_CHECKOUT_BYTES = 1024 * 1024 * 1024",
                     "MAX_CHECKOUT_BYTES = 1024 * 1024",
-                );
+                )
+                .replace("MAX_FILES = 25000", "MAX_FILES = 12")
+                .replace("MAX_DIRECTORIES = 25000", "MAX_DIRECTORIES = 3");
             let script = if scenario == "import_expansion" {
                 script.replace(
                     "MAX_HISTORY_BYTES = 4 * 1024 * 1024 * 1024",
@@ -5476,6 +5577,39 @@ mod tests {
                 ])
                 .output()
                 .unwrap();
+            assert!(!staging.exists(), "{scenario} must clean up staging");
+            assert!(
+                std::fs::read_dir(&root).unwrap().all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".crew-handoff-")),
+                "{scenario} must clean up the transactional checkout"
+            );
+            if scenario == "directory_heavy_at_file_limit" {
+                assert!(
+                    result.status.success(),
+                    "directories must not consume the file budget: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                for index in 0..11 {
+                    assert_eq!(
+                        std::fs::read(remote.join(format!("group-{}/file-{index}", index % 3)))
+                            .unwrap(),
+                        b"file\n"
+                    );
+                }
+                assert_eq!(
+                    std::fs::read_link(remote.join("directory-link")).unwrap(),
+                    std::path::Path::new("group-0")
+                );
+                assert!(!remote.join("sentinel").exists());
+                assert_eq!(
+                    std::fs::read(platform.join("sentinel")).unwrap(),
+                    b"platform\n"
+                );
+                continue;
+            }
             if scenario == "shallow_snapshot" {
                 assert!(
                     result.status.success(),
@@ -5503,10 +5637,14 @@ mod tests {
             }
             assert_eq!(
                 result.status.code(),
-                Some(if matches!(scenario, "absolute" | "chain") {
-                    46
-                } else {
-                    45
+                Some(match scenario {
+                    "absolute"
+                    | "chain"
+                    | "metadata_symlink"
+                    | "overlay_symlink_over_limit"
+                    | "cwd_directory_over_limit" => 46,
+                    "reserved_directory" => 43,
+                    _ => 45,
                 }),
                 "{scenario} must fail at the safety bound before publication: {}",
                 String::from_utf8_lossy(&result.stderr)
@@ -5593,6 +5731,9 @@ mod tests {
         let run = |script: &str| {
             Command::new("python3")
                 .env("SCAFFOLD_RUNTIME_DIR", &runtime)
+                .env("HOME", root.join("runtime-home"))
+                .env_remove("XDG_DATA_HOME")
+                .env_remove("PI_CONFIG_DIR")
                 .args([
                     "-c",
                     script,
@@ -5610,6 +5751,47 @@ mod tests {
                 .output()
                 .unwrap()
         };
+        let probe = |cwd: &std::path::Path| {
+            Command::new("python3")
+                .env("SCAFFOLD_RUNTIME_DIR", &runtime)
+                .env("HOME", root.join("runtime-home"))
+                .env_remove("XDG_DATA_HOME")
+                .env_remove("PI_CONFIG_DIR")
+                .args([
+                    "-c",
+                    &script,
+                    "--probe",
+                    "by-cwd/native-1.jsonl",
+                    &sha,
+                    &bytes.len().to_string(),
+                    "native-1",
+                    "/repo",
+                    cwd.to_str().unwrap(),
+                ])
+                .output()
+                .unwrap()
+        };
+        std::fs::set_permissions(&profile_agent_dir, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let absent = probe(&remote_cwd);
+        assert!(
+            absent.status.success(),
+            "{}",
+            String::from_utf8_lossy(&absent.stderr)
+        );
+        assert_eq!(absent.stdout, b"absent\n");
+        assert!(!profile_agent_dir.join("sessions").exists());
+        assert_eq!(
+            std::fs::metadata(&profile_agent_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        let prospective = remote_cwd.join("not-created");
+        assert_eq!(probe(&prospective).stdout, b"absent\n");
+        assert!(!prospective.exists());
         std::fs::write(&staged, bytes).unwrap();
         std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600)).unwrap();
         let first = run(&script);
@@ -5660,6 +5842,29 @@ mod tests {
                 & 0o777,
             0o700
         );
+        let present = probe(&remote_cwd);
+        assert!(
+            present.status.success(),
+            "{}",
+            String::from_utf8_lossy(&present.stderr)
+        );
+        assert_eq!(present.stdout, b"present\n");
+        assert_eq!(std::fs::read(&target).unwrap(), transformed);
+        let renamed = target.with_file_name("renamed.jsonl");
+        std::fs::rename(&target, &renamed).unwrap();
+        assert_eq!(probe(&remote_cwd).stdout, b"present\n");
+        let relocated = sessions.join("other-cwd");
+        std::fs::create_dir(&relocated).unwrap();
+        std::fs::rename(&renamed, relocated.join("renamed.jsonl")).unwrap();
+        assert_eq!(probe(&remote_cwd).stdout, b"present\n");
+        std::fs::rename(relocated.join("renamed.jsonl"), &target).unwrap();
+        let saved = profile_agent_dir.join("saved-native.jsonl");
+        std::fs::rename(&target, &saved).unwrap();
+        let unknown = sessions.join("unknown.jsonl");
+        std::fs::write(&unknown, b"not a complete native header\n").unwrap();
+        assert_eq!(probe(&prospective).status.code(), Some(25));
+        std::fs::remove_file(&unknown).unwrap();
+        std::fs::rename(&saved, &target).unwrap();
 
         // Re-uploading identical bytes is an exact, safe no-op at the destination.
         std::fs::write(&staged, bytes).unwrap();
@@ -5674,6 +5879,10 @@ mod tests {
         let mismatch = run(&script);
         assert!(!mismatch.status.success());
         assert!(!staged.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"different");
+        std::fs::rename(&sessions, profile_agent_dir.join("saved-sessions")).unwrap();
+        std::os::unix::fs::symlink(profile_agent_dir.join("saved-sessions"), &sessions).unwrap();
+        assert_eq!(probe(&remote_cwd).status.code(), Some(25));
         assert_eq!(std::fs::read(&target).unwrap(), b"different");
     }
 }
