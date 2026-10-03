@@ -107,6 +107,13 @@ showed retained originals and manual retry; native accessibility and a fresh
 screenshot of the downloaded simulator app verified the Unreachable strip.
 CI surface capture now allows its navigation transition to finish before capture.
 
+The settled screenshot exposed a navigation-dismissed recovery modal. The follow-up
+in [PR #72](https://github.com/Ashler-AI/comet/pull/72) replaces it with persistent
+inline recovery feedback and explicit retry, without changing retained records or
+retry authority. [CI 37137327017](https://github.com/Ashler-AI/comet/actions/runs/37137327017)
+passed all 21 markers and archived source `3b873c801f26a78146ff6210296871c2d0158500`;
+its settled screenshots show both the blocked banner/retry and Unreachable strip.
+
 The archive is still ad-hoc signed and is **not yet published to TestFlight**.
 Production build 21, tester memberships and account permissions are unchanged.
 No local compilation or typechecks were run for this mobile update; physical-phone
