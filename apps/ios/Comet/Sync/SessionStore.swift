@@ -691,7 +691,7 @@ final class SessionStore {
     }
 
     struct PublicationCache {
-        var count = 0
+        var count: UInt32 = 0
         var anchors: [String: [String: LoroValue]] = [:]
     }
 

@@ -97,7 +97,7 @@ final class WorkspaceStore {
         guard recordIntents[index] != nil || recordIntents.count < 1024 else {
             throw MobileSessionError.unavailable("Crew retains 1024 unresolved workspace edits. Recover them before editing more records.")
         }
-        var intent = recordIntents[index] ?? DocDisk.RecordIntent(root: root, key: key, before: try DocDisk.recordData(before))
+        var intent = try recordIntents[index] ?? DocDisk.RecordIntent(root: root, key: key, before: DocDisk.recordData(before))
         if let prior = recordIntents[index] {
             guard prior.intermediates.count < 16 else {
                 throw MobileSessionError.unavailable("Crew retains 16 intermediate edits to this record. Recover them before editing it again.")
