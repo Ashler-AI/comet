@@ -1226,7 +1226,10 @@ impl EngineRpc {
         let deployment_id = projection.map(|scope| scope.deployment_id.as_str());
         let local_device =
             comet_proto::parse_scaffold_device_id(self.doc_host.device_id()).is_none();
-        if local_device && target_device_id.is_none() {
+        if local_device && (target_device_id.is_none()
+            || (projection.is_none()
+                && target_device_id == Some(self.doc_host.device_id())
+                && self.doc_host.is_locally_hosted(target_chat_id))) {
             self.doc_host
                 .open_projection(target_chat_id, projection)
                 .map_err(|error| RpcError::Failed(error.to_string()))?;

@@ -1619,7 +1619,8 @@ impl SessionsEngine {
                 continue;
             }
             let result = (|| -> Result<(), EngineError> {
-                if self.inner.journal.recovery_retired(&chat_id)? {
+                let retired = self.inner.journal.recovery_retired(&chat_id)?;
+                if retired && !chat_id.contains("::session::") {
                     return Ok(());
                 }
                 let context: Option<(RunAuthIdentity, String, HarnessId, RunRequest)> =
@@ -1652,7 +1653,22 @@ impl SessionsEngine {
                     ));
                 }
                 let pending = self.pending_run(&chat_id)?;
-                if pending.is_none() && !stale.contains(&chat_id) {
+                // Completed private journals still contain output stranded before
+                // canonical aliases were restored. Repair the document binding after
+                // the durable identity checks, without dispatching the old request.
+                if context.is_some() && chat_id.contains("::session::") {
+                    self.doc_handle(&chat_id)?;
+                }
+                if retired || (pending.is_none() && !stale.contains(&chat_id)) {
+                    if self.inner.workspace_continuation_id(&chat_id) != chat_id
+                        && let Some((_, AgentEvent::Done { status, .. })) = self.inner.journal.last_event(&chat_id)?
+                    {
+                        self.set_status(&chat_id, if status == DoneStatus::Errored {
+                            SessionStatus::Errored
+                        } else {
+                            SessionStatus::Idle
+                        }, false);
+                    }
                     return Ok(());
                 }
                 let handle = self.doc_handle(&chat_id)?;
@@ -3744,6 +3760,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retired_private_output_is_published_without_replaying_its_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = bare_sessions(&dir.path().join("journal"));
+        let store = Arc::new(comet_sync::DocsStore::open(dir.path().join("store")).unwrap());
+        let public = uuid::Uuid::new_v4().to_string();
+        let execution = format!("{public}::session::{public}");
+        let workspace = crate::WorkspaceHost::open(store.clone(), crate::workspace_host::WorkspaceHostConfig {
+            device_id: "test-device".into(), device_name: "test".into(), platform: "test".into(),
+            project_scope: "project-a".into(), user_id: "owner-a".into(), edge: None,
+        }).unwrap();
+        workspace.claim_chat(&public, Some("/workspace")).unwrap();
+        let private = comet_doc::SessionDoc::init(&execution).unwrap();
+        let output = comet_doc::SessionMessageEntry {
+            id: "finished-report".into(), role: comet_doc::MessageRole::Assistant,
+            parts: vec![comet_doc::MessagePart::Text { id: "report-text".into(), text: "Verified report path".into() }],
+            created_at: 100, device_id: "test-device".into(),
+            status: Some(comet_doc::MessageStatus::Complete), continuation_of: None, peer_message: None,
+        };
+        private.push_message(&output).unwrap();
+        store.save_snapshot(&execution, &private.export_snapshot().unwrap()).unwrap();
+        let host = crate::DocHost::new(store, crate::DocHostConfig {
+            device_id: "test-device".into(), default_harness: HarnessId::Mock, edge: None,
+        });
+        host.set_workspace(workspace);
+        sessions.set_doc_host(host.clone());
+        sessions.inner.journal.save_context(&execution, &(
+            sessions.auth_identity(), "test-device", HarnessId::Mock,
+            test_request("Do not repeat the completed report task", None),
+        )).unwrap();
+        sessions.inner.journal.append(&execution, &AgentEvent::Done {
+            status: DoneStatus::Completed, result: None, error: None, session_id: None,
+        }).unwrap();
+        sessions.inner.journal.retire_recovery(&execution).unwrap();
+        assert_eq!(sessions.recover_stale().unwrap(), 0);
+        assert_eq!(host.open(&public).unwrap().doc().read_entry(&output.id).unwrap(), Some(output));
+        assert!(sessions.pending_run(&execution).unwrap().is_none());
+        assert!(matches!(sessions.inner.journal.last_event(&execution).unwrap(),
+            Some((_, AgentEvent::Done { status: DoneStatus::Completed, .. }))));
+    }
+
+    #[tokio::test]
     async fn retired_request_never_replays_across_terminal_crash_boundaries() {
         let dir = tempfile::tempdir().unwrap();
         let sessions = bare_sessions(dir.path());
@@ -4152,7 +4209,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DocsStore::open(dir.path().join("store")).unwrap());
         let host = DocHost::new(
-            store,
+            store.clone(),
             DocHostConfig {
                 device_id: "test-device".into(),
                 default_harness: HarnessId::Omp,
@@ -4177,7 +4234,15 @@ mod tests {
             sessions.set_doc_host(host.clone());
             sessions
         };
-        let key = "transferred::session::transferred";
+        let public = uuid::Uuid::new_v4().to_string();
+        let execution = format!("{public}::session::{public}");
+        let key = execution.as_str();
+        let workspace = crate::WorkspaceHost::open(store, crate::workspace_host::WorkspaceHostConfig {
+            device_id: "test-device".into(), device_name: "test".into(), platform: "test".into(),
+            project_scope: "project-a".into(), user_id: "owner-a".into(), edge: None,
+        }).unwrap();
+        workspace.claim_chat(&public, Some("/workspace/transferred")).unwrap();
+        host.set_workspace(workspace);
         let sessions = open();
         let mut request = test_request("transferred turn", Some("native-takeover-session"));
         request.cwd = "/workspace/transferred".into();

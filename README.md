@@ -2,6 +2,36 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Crew 0.1.136 release candidate: canonical recovered rooms
+
+Recovered execution journals keep their private execution keys, but resolve to
+the owned canonical session UUID before selecting a transcript writer or room.
+Lost in-memory aliases no longer create `UUID::session::UUID` documents or dial
+permanent-404 room addresses. Completed private output is reconciled by stable
+message ID; canonical metadata and terminal outcomes are retained, private
+snapshots remain backed up, and pending commands are not copied or executed.
+
+An existing running writer is not retargeted by Take over: that operation can
+retry an interrupted request. Finish or checkpoint current work before a
+controlled host upgrade; do not use takeover to repair a live transcript view.
+Divergent private/canonical message identity or content fails visibly without
+discarding either copy.
+
+Completion activity updates only timestamp fields, so a concurrent user rename
+is not erased by a stale full-row write. Replies to verified same-device sessions
+stay local when unscoped, rather than depending on an available Edge relay.
+
+All 345 document/engine unit tests passed. An isolated actual headless runtime
+recovered stranded output after restart, retained the private backup, omitted
+its pending command, and completed a distinct public turn without replaying the
+original request. The headed demo rendered the recovered history and completed
+one new turn; its original user message and follow-up each appeared exactly once.
+The peer-message, two-engine convergence, and restart suites passed 18 tests;
+one authenticated paid-provider test remains intentionally ignored. The actual
+native CLI smoke verified immutable retries, correlated replies, and restart
+recovery with an offline Edge endpoint.
+No installed engine was replaced; local typechecks were intentionally skipped.
+
 ## Crew 0.1.135 release candidate: network catch-up
 
 Crew waits for a room's snapshot and update journal to finish catching up before

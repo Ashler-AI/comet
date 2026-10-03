@@ -924,7 +924,7 @@ impl DocHost {
     /// can never serve, so the join loop would retry a permanent 404 forever.
     /// Those docs stay local regardless of which controller they acquire.
     fn chat_allows_room_join(&self, chat_id: &str) -> bool {
-        !chat_id.starts_with("local-chat-")
+        !chat_id.starts_with("local-chat-") && !chat_id.contains("::session::")
     }
 
     fn start_room_join(&self, handle: Arc<ChatDocHandle>) {
@@ -1028,6 +1028,68 @@ impl DocHost {
             self.start_room_join(handle.clone());
             return Ok(handle);
         }
+        if let Some((public_id, session_id)) = chat_id.split_once("::session::") {
+            let public = uuid::Uuid::parse_str(public_id)
+                .map_err(|_| EngineError::Other("invalid recovered public session id".into()))?
+                .to_string();
+            let session = uuid::Uuid::parse_str(session_id)
+                .map_err(|_| EngineError::Other("invalid recovered agent session id".into()))?
+                .to_string();
+            let handle = self.open(&public)?;
+            let owned = handle.doc.collaboration_snapshot()?.sessions.iter().any(|record| {
+                record.session_id == session && record.chat_id == public
+                    && record.owner_device_id == self.device_id()
+            }) || (session == public && self.workspace().is_some_and(|workspace| {
+                workspace.doc().chat(&public).ok().flatten()
+                    .is_some_and(|chat| chat.device_id == self.device_id())
+            }));
+            if !owned {
+                return Err(EngineError::Other("recovered execution has no matching owned public session".into()));
+            }
+            if let Some(bytes) = self.inner.store.load_snapshot(chat_id)? {
+                let private_raw = loro::LoroDoc::new();
+                let imported = private_raw.import(&bytes)
+                    .map_err(|error| EngineError::Other(format!("private output snapshot is invalid: {error}")))?;
+                if imported.pending.as_ref().is_some_and(|pending| !pending.is_empty())
+                    || private_raw.is_detached() || private_raw.state_vv() != private_raw.oplog_vv() {
+                    return Err(EngineError::Other("private output snapshot is incomplete".into()));
+                }
+                let private = SessionDoc::from_doc(private_raw);
+                if !matches!(private.chat_id().as_deref(), Some(id) if id == chat_id || id == public) {
+                    return Err(EngineError::Other("private output snapshot has a different identity".into()));
+                }
+                let base = handle.doc.doc().oplog_vv();
+                let candidate_raw = loro::LoroDoc::new();
+                candidate_raw.import(&handle.doc.export_snapshot()?)
+                    .map_err(|error| EngineError::Other(error.to_string()))?;
+                let candidate = SessionDoc::from_doc(candidate_raw);
+                for entry in private.read_entries()? {
+                    if entry.role == MessageRole::Assistant && entry.device_id != self.device_id() {
+                        return Err(EngineError::Other("private output belongs to another device".into()));
+                    }
+                    // Recovery can echo an accepted user message with a new local
+                    // timestamp. Its authoritative original is never rewritten.
+                    if let Some(current) = candidate.read_entry(&entry.id)?
+                        && current.role == MessageRole::User && entry.role == MessageRole::User
+                        && current.parts == entry.parts
+                        && handle.doc.read_command(&entry.id)?
+                            .is_some_and(|command| command.status == SessionCommandStatus::Applied)
+                    {
+                        continue;
+                    }
+                    candidate.reconcile_message(&entry)?;
+                }
+                let delta = candidate.doc().export(loro::ExportMode::updates(&base))
+                    .map_err(|error| EngineError::Other(error.to_string()))?;
+                handle.doc.doc().import(&delta)
+                    .map_err(|error| EngineError::Other(error.to_string()))?;
+                self.inner.store.save_snapshot(&public, &handle.doc.export_snapshot()?)?;
+            }
+            // The journal retains its private execution key. Its writer and room
+            // must share the canonical handle even after the warm alias was lost.
+            lock(&self.inner.handles).insert(chat_id.to_string(), handle.clone());
+            return Ok(handle);
+        }
         self.open(chat_id)
     }
 
@@ -1078,6 +1140,9 @@ impl DocHost {
         chat_id: &str,
         projection: Option<&SessionRoomProjection>,
     ) -> Result<Arc<ChatDocHandle>, EngineError> {
+        if chat_id.contains("::session::") {
+            return Err(EngineError::Other("private execution keys cannot open public documents".into()));
+        }
         if let Some(projection) = projection
             && (projection.project_id != self.workspace().map_or("", WorkspaceHost::project_scope)
                 || projection.session_id != chat_id
@@ -1341,6 +1406,12 @@ impl DocHost {
             && execution_key == format!("{}::session::{}", handle.chat_id, handle.chat_id)
         {
             return handle.chat_id.clone();
+        }
+        if let Some((public, session)) = execution_key.split_once("::session::")
+            && public == session
+            && let Ok(id) = uuid::Uuid::parse_str(public)
+        {
+            return id.to_string();
         }
         execution_key.to_string()
     }
@@ -3724,6 +3795,87 @@ mod authority_tests {
             lock(&execution_handle.room_projection).as_ref(),
             Some(&projection)
         );
+    }
+
+    #[tokio::test]
+    async fn recovered_execution_alias_restores_the_owned_canonical_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let public = uuid::Uuid::new_v4().to_string();
+        let execution = format!("{public}::session::{public}");
+        let workspace = WorkspaceHost::open(
+            store.clone(),
+            crate::workspace_host::WorkspaceHostConfig {
+                device_id: "device-a".into(), device_name: "test".into(), platform: "test".into(),
+                project_scope: "project-a".into(), user_id: "owner-a".into(), edge: None,
+            },
+        ).unwrap();
+        workspace.claim_chat(&public, Some("/workspace")).unwrap();
+        let canonical = SessionDoc::init(&public).unwrap();
+        canonical.push_message(&SessionMessageEntry {
+            id: "saved-output".into(), role: MessageRole::Assistant,
+            parts: vec![MessagePart::Text { id: "text".into(), text: "Saved report output".into() }],
+            created_at: 100, device_id: "device-a".into(), status: Some(MessageStatus::Complete),
+            continuation_of: None, peer_message: None,
+        }).unwrap();
+        store.save_snapshot(&public, &canonical.export_snapshot().unwrap()).unwrap();
+        // Older flushes also cached a canonical document under its warm alias.
+        let private = SessionDoc::init(&public).unwrap();
+        let private_output = SessionMessageEntry {
+            id: "private-report-output".into(), role: MessageRole::Assistant,
+            parts: vec![MessagePart::Text { id: "private-text".into(), text: "Completed report details".into() }],
+            created_at: 150, device_id: "device-a".into(), status: Some(MessageStatus::Complete),
+            continuation_of: None, peer_message: None,
+        };
+        private.push_message(&private_output).unwrap();
+        private.queue_command(&comet_doc::SessionCommandEntry {
+            id: "private-pending-command".into(), payload: SessionCommandPayload::Interrupt {},
+            issued_by: "device-a".into(), issued_at: 100, based_on: None, expires_at: None,
+            status: SessionCommandStatus::Pending, resolution: None,
+        }).unwrap();
+        let private_bytes = private.export_snapshot().unwrap();
+        store.save_snapshot(&execution, &private_bytes).unwrap();
+        let host = DocHost::new(store.clone(), DocHostConfig {
+            device_id: "device-a".into(), default_harness: HarnessId::Mock, edge: None,
+        });
+        host.set_workspace(workspace);
+        assert_eq!(host.workspace_continuation_id(&execution), public);
+        let recovered = host.open_existing_or_local(&execution).unwrap();
+        assert_eq!(recovered.chat_id(), public);
+        assert_eq!(recovered.doc().read_entry("saved-output").unwrap(), canonical.read_entry("saved-output").unwrap());
+        assert_eq!(recovered.doc().read_entry(&private_output.id).unwrap(), Some(private_output.clone()));
+        assert!(recovered.doc().read_command("private-pending-command").unwrap().is_none());
+        let observer = host.open(&public).unwrap();
+        let continued = SessionMessageEntry {
+            id: "continued-output".into(), role: MessageRole::Assistant,
+            parts: vec![MessagePart::Text { id: "continued-text".into(), text: "New canonical output".into() }],
+            created_at: 200, device_id: "device-a".into(), status: Some(MessageStatus::Complete),
+            continuation_of: None, peer_message: None,
+        };
+        recovered.doc().push_message(&continued).unwrap();
+        assert_eq!(observer.doc().read_entry(&continued.id).unwrap(), Some(continued));
+        host.flush_all();
+        assert_eq!(store.load_snapshot(&execution).unwrap(), Some(private_bytes));
+        assert!(host.open(&execution).is_err());
+    }
+
+    #[tokio::test]
+    async fn recovered_alias_cannot_claim_another_devices_public_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let public = uuid::Uuid::new_v4().to_string();
+        let workspace = WorkspaceHost::open(store.clone(), crate::workspace_host::WorkspaceHostConfig {
+            device_id: "device-b".into(), device_name: "test".into(), platform: "test".into(),
+            project_scope: "project-a".into(), user_id: "owner-a".into(), edge: None,
+        }).unwrap();
+        workspace.claim_chat(&public, Some("/workspace")).unwrap();
+        let host = DocHost::new(store.clone(), DocHostConfig {
+            device_id: "device-a".into(), default_harness: HarnessId::Mock, edge: None,
+        });
+        host.set_workspace(workspace);
+        let execution = format!("{public}::session::{public}");
+        assert!(host.open_existing_or_local(&execution).is_err());
+        assert!(store.load_snapshot(&execution).unwrap().is_none());
     }
 
     #[tokio::test]

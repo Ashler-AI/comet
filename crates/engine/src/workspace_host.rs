@@ -1215,19 +1215,7 @@ impl WorkspaceHost {
         last_message_at: Option<i64>,
         created_at: Option<i64>,
     ) -> Result<bool, EngineError> {
-        let Some(mut chat) = self.inner.doc.chat(chat_id)? else {
-            return Ok(false);
-        };
-        if let Some(ms) = last_message_at {
-            chat.last_message_at = chrono::DateTime::<Utc>::from_timestamp_millis(ms);
-        }
-        if let Some(ms) = created_at
-            && let Some(at) = chrono::DateTime::<Utc>::from_timestamp_millis(ms)
-        {
-            chat.created_at = at;
-        }
-        self.inner.doc.upsert_chat(&chat)?;
-        Ok(true)
+        Ok(self.inner.doc.set_chat_activity(chat_id, last_message_at, created_at)?)
     }
 
     /// Re-home a chat to another device (tooling/seeds; a future device
@@ -2171,6 +2159,34 @@ mod tests {
             let chat = host.doc().chat("session-a").unwrap().unwrap();
             assert_eq!(chat.title.as_deref(), Some("from-a"));
             assert!(chat.archived);
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_activity_preserves_concurrent_title() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(comet_sync::DocsStore::open(temp.path()).unwrap());
+        let host = WorkspaceHost::open(store, WorkspaceHostConfig {
+            device_id: "device-a".into(), device_name: "Test".into(), platform: "test".into(),
+            project_scope: "project-a".into(), user_id: "user-a".into(), edge: None,
+        }).unwrap();
+        let id = "00000000-0000-4000-8000-000000000001";
+        host.doc().upsert_chat(&chat(id, "device-a")).unwrap();
+        let remote = loro::LoroDoc::new();
+        remote.import(&host.doc().export_snapshot().unwrap()).unwrap();
+        let remote = comet_doc::WorkspaceDoc::from_doc(remote);
+        remote.rename_chat(id, "User's concurrent title").unwrap();
+        host.doc().set_chat_last_message(id, "Completed turn", Utc.timestamp_millis_opt(1_500).unwrap()).unwrap();
+        host.set_chat_activity(id, Some(2_000), Some(1_000)).unwrap();
+        let local_update = host.doc().export_snapshot().unwrap();
+        let remote_update = remote.export_snapshot().unwrap();
+        host.doc().doc().import(&remote_update).unwrap();
+        remote.doc().import(&local_update).unwrap();
+        for doc in [host.doc(), &remote] {
+            let row = doc.chat(id).unwrap().unwrap();
+            assert_eq!(row.title.as_deref(), Some("User's concurrent title"));
+            assert_eq!(row.last_message_at.unwrap().timestamp_millis(), 2_000);
+            assert_eq!(row.created_at.timestamp_millis(), 1_000);
         }
     }
 

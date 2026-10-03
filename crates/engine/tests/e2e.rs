@@ -23,10 +23,10 @@ use comet_proto::{
 };
 use comet_sync::DocsStore;
 
-const CHAT: &str = "chat-e2e";
+const CHAT: &str = "11111111-1111-4111-8111-111111111111";
 const VIEWER: &str = "viewer-device";
-const SESSION: &str = "session-e2e";
-const EXECUTION_KEY: &str = "chat-e2e::session::session-e2e";
+const SESSION: &str = "22222222-2222-4222-8222-222222222222";
+const EXECUTION_KEY: &str = "11111111-1111-4111-8111-111111111111::session::22222222-2222-4222-8222-222222222222";
 
 fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
