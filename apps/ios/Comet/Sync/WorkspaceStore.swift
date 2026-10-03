@@ -90,7 +90,7 @@ final class WorkspaceStore {
     private func writeRecord(root: String, key: String, after: LoroValue?) throws {
         guard !recordJournalBlocked else { throw MobileSessionError.unavailable(recoveryFailure ?? "Crew workspace recovery is blocked.") }
         let before = try DocDisk.recordValue(in: doc, root: root, key: key)
-        if before == after { return }
+        if before == after { project(); return }
         let index = root + ":" + key
         // ponytail: coalesce mutable record goals, cap at 1024 unacknowledged
         // keys; a database journal is only needed beyond this mobile ceiling.
