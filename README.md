@@ -612,7 +612,7 @@ Starting with **0.1.137**, recover a failed import into its preserved target:
 Both target flags are required. Recovery uses a separate RPC so older engines
 refuse rather than silently creating another sandbox. The accepted owner,
 project/deployment/session, sandbox, database and agent route must still match.
-**0.1.138** validates the requested route from the owner-scoped sandbox's stored
+**0.1.139** validates the requested route from the owner-scoped sandbox's stored
 `agentRoute`, not a post-inference account-attribution receipt. Missing or changed
 routes fail closed; an unused or paused sandbox needs no prior inference receipt.
 Imported native context, admitted commands and active runs refuse recovery;
