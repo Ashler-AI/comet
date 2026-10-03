@@ -17,11 +17,19 @@ controlled host upgrade; do not use takeover to repair a live transcript view.
 Divergent private/canonical message identity or content fails visibly without
 discarding either copy.
 
-All 344 document/engine unit tests passed. An isolated actual headless runtime
+Completion activity updates only timestamp fields, so a concurrent user rename
+is not erased by a stale full-row write. Replies to verified same-device sessions
+stay local when unscoped, rather than depending on an available Edge relay.
+
+All 345 document/engine unit tests passed. An isolated actual headless runtime
 recovered stranded output after restart, retained the private backup, omitted
 its pending command, and completed a distinct public turn without replaying the
 original request. The headed demo rendered the recovered history and completed
 one new turn; its original user message and follow-up each appeared exactly once.
+The peer-message, two-engine convergence, and restart suites passed 18 tests;
+one authenticated paid-provider test remains intentionally ignored. The actual
+native CLI smoke verified immutable retries, correlated replies, and restart
+recovery with an offline Edge endpoint.
 No installed engine was replaced; local typechecks were intentionally skipped.
 
 ## Crew 0.1.135 release candidate: network catch-up

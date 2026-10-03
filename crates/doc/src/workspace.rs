@@ -278,8 +278,7 @@ impl WorkspaceDoc {
         )?;
         set_opt_ms(&row, "lastMessageAt", chat.last_message_at)?;
         row.insert("createdAt", chat.created_at.timestamp_millis())?;
-        // Preserved on full-row upserts (set_chat_activity/set_chat_host read →
-        // modify → upsert; dropping these here would silently amnesia the chat).
+        // Preserve harness continuation metadata on full-row host updates.
         set_opt_str(&row, "harnessSessionId", chat.harness_session_id.as_deref())?;
         set_opt_str(
             &row,
@@ -573,6 +572,28 @@ impl WorkspaceDoc {
         };
         row.insert("lastMessagePreview", preview)?;
         row.insert("lastMessageAt", at.timestamp_millis())?;
+        self.doc.commit();
+        Ok(true)
+    }
+
+    /// Update only activity timestamps; never rewrite concurrent user metadata.
+    pub fn set_chat_activity(
+        &self,
+        chat_id: &str,
+        last_message_at: Option<i64>,
+        created_at: Option<i64>,
+    ) -> Result<bool, DocError> {
+        let Some(row) = self.existing_row("chats", chat_id) else {
+            return Ok(false);
+        };
+        if let Some(ms) = last_message_at {
+            set_opt_ms(&row, "lastMessageAt", DateTime::<Utc>::from_timestamp_millis(ms))?;
+        }
+        if let Some(ms) = created_at
+            && let Some(at) = DateTime::<Utc>::from_timestamp_millis(ms)
+        {
+            row.insert("createdAt", at.timestamp_millis())?;
+        }
         self.doc.commit();
         Ok(true)
     }
