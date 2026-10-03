@@ -621,6 +621,12 @@ profile before any worktree replacement, including renamed journals and lost
 import responses. Incomplete inspection fails closed. Preparation and initial
 command admission share the same scope gate, including ordinary Start/Run RPCs.
 
+Starting with **0.1.140**, pause, resume and stop requests have a five-minute
+deadline for VM placement and runtime bootstrap. Metadata requests and connection
+establishment retain their 30-second limits. Cancellation interrupts both the
+request and an incomplete response body; longer lifecycle waits never enable a
+creation fallback or relax ownership, source, database or route checks.
+
 Handoff chats publish running, waiting, and terminal status under their chat ID,
 including follow-up turns. Mobile follow-ups use a desktop controller, not the
 ephemeral sandbox host: attachment resumes a paused sandbox and confirms its
@@ -636,7 +642,7 @@ is a known source ancestor and the only bundle boundary, the archive contains on
 the Git delta after that commit; matching HEADs transfer no Git objects. Dirty and untracked files remain
 a separate verified overlay. The 256 MiB archive limit is unchanged.
 Archive uploads have a five-minute total request deadline, separate from the
-30-second control-request deadline. Cancellation still stops an in-flight upload.
+30-second metadata-request deadline. Cancellation still stops an in-flight upload.
 The worktree and native-context verifiers run from temporary sandbox files rather
 than exceeding the runtime's 16 KiB exec-argument limit with inline program text.
 The reconstructed checkout has a separate 1 GiB byte budget; compressed Git

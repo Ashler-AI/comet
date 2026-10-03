@@ -35,6 +35,8 @@ use crate::omp_session_artifact::CapturedOmpSessionFile;
 use crate::worktree_handoff::{MAX_HANDOFF_ARCHIVE_BYTES, WorktreeHandoffArchive};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+// VM placement and runtime bootstrap can outlive the metadata request deadline.
+const LIFECYCLE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const RUNTIME_START_POLL: Duration = Duration::from_millis(500);
 // At 30 seconds per request, two retries cap a persistent timeout at about
 // 90 seconds plus two lifecycle-validation poll delays.
@@ -451,6 +453,7 @@ impl ScaffoldClient {
                 url,
                 Option::<&()>::None,
                 &CancellationToken::new(),
+                None,
             )
             .await?;
         Ok(response.accounts)
@@ -465,7 +468,13 @@ impl ScaffoldClient {
             .join("/api/agent-accounts/import")
             .expect("static account import path");
         let response: RemoteAgentAccountEnvelope = self
-            .request(Method::POST, url, Some(account), &CancellationToken::new())
+            .request(
+                Method::POST,
+                url,
+                Some(account),
+                &CancellationToken::new(),
+                None,
+            )
             .await?;
         Ok(response.account)
     }
@@ -485,6 +494,7 @@ impl ScaffoldClient {
                 url,
                 Option::<&()>::None,
                 &CancellationToken::new(),
+                None,
             )
             .await?;
         Ok(())
@@ -499,7 +509,7 @@ impl ScaffoldClient {
             .join("/api/agent-auth/v2/authority")
             .expect("static Agent Auth authority path");
         let body = serde_json::json!({});
-        self.request(Method::POST, url, Some(&body), cancellation)
+        self.request(Method::POST, url, Some(&body), cancellation, None)
             .await
     }
 
@@ -597,7 +607,7 @@ impl ScaffoldClient {
             .expect("Scaffold origin is hierarchical")
             .pop_if_empty()
             .push(logical_session_id);
-        self.request(Method::GET, url, Option::<&()>::None, cancellation)
+        self.request(Method::GET, url, Option::<&()>::None, cancellation, None)
             .await
     }
 
@@ -613,6 +623,7 @@ impl ScaffoldClient {
                 self.code_sandboxes_url(),
                 Option::<&()>::None,
                 cancellation,
+                None,
             )
             .await?;
         if !response.ok {
@@ -640,6 +651,7 @@ impl ScaffoldClient {
                 self.sandbox_url(sandbox_id, None)?,
                 Option::<&()>::None,
                 cancellation,
+                None,
             )
             .await?;
         response.sandbox.into_environment(scope.clone())
@@ -716,6 +728,7 @@ impl ScaffoldClient {
                 self.code_sandboxes_url(),
                 Some(&body),
                 cancellation,
+                None,
             )
             .await?;
         response.sandbox.into_environment(scope.clone())
@@ -764,6 +777,7 @@ impl ScaffoldClient {
                 self.sandbox_url(sandbox_id, Some("agent-route"))?,
                 Some(&AgentRouteBody { agent_route }),
                 cancellation,
+                None,
             )
             .await?;
         response.sandbox.into_environment(scope.clone())
@@ -783,6 +797,7 @@ impl ScaffoldClient {
                 self.sandbox_url(sandbox_id, Some(action))?,
                 Some(&EmptyBody {}),
                 cancellation,
+                Some(LIFECYCLE_REQUEST_TIMEOUT),
             )
             .await?;
         response.sandbox.into_environment(scope.clone())
@@ -891,6 +906,7 @@ impl ScaffoldClient {
                     destination_path: DESTINATION,
                 }),
                 cancellation,
+                None,
             )
             .await?;
         if !grant.ok {
@@ -963,6 +979,7 @@ impl ScaffoldClient {
             self.sandbox_url(sandbox_id, Some("exec"))?,
             Some(body),
             cancellation,
+            None,
         )
         .await
     }
@@ -982,6 +999,7 @@ impl ScaffoldClient {
                 url,
                 Some(&serde_json::json!({ "content": content })),
                 cancellation,
+                None,
             )
             .await?;
         Ok(())
@@ -1013,6 +1031,7 @@ impl ScaffoldClient {
         url: Url,
         body: Option<&B>,
         cancellation: &CancellationToken,
+        timeout: Option<Duration>,
     ) -> Result<T, ScaffoldError>
     where
         T: for<'de> Deserialize<'de>,
@@ -1029,6 +1048,9 @@ impl ScaffoldClient {
             .request(method, url)
             .bearer_auth(&bearer)
             .header(reqwest::header::ACCEPT, "application/json");
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
         if let Some(body) = body {
             request = request.json(body);
         }
@@ -1052,7 +1074,11 @@ impl ScaffoldClient {
         // The bearer is dropped before any response body is retained or decoded.
         drop(bearer);
         let status = response.status();
-        let bytes = response.bytes().await?;
+        let bytes = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(ScaffoldError::Cancelled),
+            bytes = response.bytes() => bytes?,
+        };
         if !status.is_success() {
             return Err(api_error(status, &bytes));
         }
@@ -1128,6 +1154,7 @@ impl ScaffoldClient {
                     destination_path: DESTINATION,
                 }),
                 cancellation,
+                None,
             )
             .await?;
         if !grant.ok {
@@ -3624,6 +3651,106 @@ mod tests {
             authority_scope: Some("user:identity:owner-1".into()),
             expires_at: "2099-01-01T00:00:00Z".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_deadline_does_not_relax_metadata_reads() {
+        for lifecycle in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let mut chunk = [0_u8; 1024];
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&chunk[..count]);
+                    assert!(request.len() < 8192);
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let body = sandbox("resuming");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+            let mut client = ScaffoldClient::new(
+                origin,
+                "project-a",
+                Arc::new(StaticToken("owner-scoped-bearer".into())),
+            )
+            .unwrap();
+            client.http = scaffold_http_client(Some(Duration::from_millis(50))).unwrap();
+            let cancellation = CancellationToken::new();
+            let result = if lifecycle {
+                client.resume("sandbox-a", &scope(), &cancellation).await
+            } else {
+                client.inspect("sandbox-a", &scope(), &cancellation).await
+            };
+            if lifecycle {
+                let environment = result.unwrap();
+                assert_eq!(environment.owner_principal, "alice@example.com");
+                assert_eq!(environment.scope, scope());
+                assert!(matches!(
+                    environment.source,
+                    SessionEnvironmentSource::Scaffold {
+                        lifecycle: comet_proto::ScaffoldLifecycle::Resuming,
+                        ..
+                    }
+                ));
+            } else {
+                assert_eq!(
+                    result.unwrap_err().transport_cause(),
+                    Some(ScaffoldTransportCause::RequestTimeout)
+                );
+            }
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_cancellation_interrupts_an_incomplete_response_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let (headers_sent, headers_received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut chunk = [0_u8; 1024];
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&chunk[..count]);
+                assert!(request.len() < 8192);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\nconnection: close\r\n\r\n{")
+                .await
+                .unwrap();
+            headers_sent.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let client = ScaffoldClient::new(
+            origin,
+            "project-a",
+            Arc::new(StaticToken("owner-scoped-bearer".into())),
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        let cancelled = cancellation.clone();
+        let request =
+            tokio::spawn(async move { client.resume("sandbox-a", &scope(), &cancelled).await });
+        headers_received.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), request).await;
+        server.abort();
+        assert!(matches!(
+            result.unwrap().unwrap(),
+            Err(ScaffoldError::Cancelled)
+        ));
     }
 
     #[tokio::test]
