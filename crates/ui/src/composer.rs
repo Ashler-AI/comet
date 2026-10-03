@@ -7539,6 +7539,8 @@ mod tests {
         });
         cx.condition(&composer, |_, _| rpc.sends.load(SeqCst) == 2)
             .await;
+        cx.condition(&composer, |_, _| rpc.forwards.load(SeqCst) == 1)
+            .await;
         assert_eq!(rpc.wakes.load(SeqCst), 1);
         assert_eq!(rpc.forwards.load(SeqCst), 1);
     }
