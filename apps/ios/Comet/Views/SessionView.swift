@@ -158,12 +158,6 @@ struct SessionView: View {
         } message: {
             Text(store?.sendFailure ?? "Unknown error")
         }
-        .alert("Crew recovery blocked", isPresented: Binding(
-            get: { store?.recoveryFailure != nil },
-            set: { _ in }
-        )) {
-            Button("Retry recovery") { Task { await store?.retryRecovery() } }
-        } message: { Text(store?.recoveryFailure ?? "") }
         .sheet(isPresented: $showConfig) {
             if let chat {
                 let harness = chat.config?.harness ?? "claude-code"
@@ -306,6 +300,19 @@ struct SessionView: View {
             let now = Int64(timeline.date.timeIntervalSince1970 * 1000)
             let activity = model.activity(chatId: chatId, now: now)
             VStack(spacing: 0) {
+                if let failure = store.recoveryFailure {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(failure)
+                            .font(Theme.sans(12))
+                            .foregroundStyle(Theme.attention)
+                        Button("Retry recovery") { Task { await store.retryRecovery() } }
+                            .font(Theme.sans(12))
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 26)
+                    .padding(.vertical, 8)
+                }
+
                 // The status strip floats over the transcript's faded bottom edge
                 // instead of stacking below it — the loader sits on the
                 // transparent zone and content is never pushed around.
