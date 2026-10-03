@@ -9,6 +9,108 @@ import Loro
 import os
 
 enum DocDisk {
+    struct RecordIntent: Codable {
+        var id = UUID().uuidString.lowercased()
+        var root: String
+        var key: String
+        var before: Data?
+        var after: Data?
+        var version: Data?
+        var intermediates: [Data?] = []
+        var index: String { root + ":" + key }
+
+        enum CodingKeys: String, CodingKey { case id, root, key, before, after, version, intermediates }
+        init(root: String, key: String, before: Data?) {
+            self.root = root; self.key = key; self.before = before
+            after = nil; version = nil
+        }
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            id = try c.decode(String.self, forKey: .id)
+            root = try c.decode(String.self, forKey: .root); key = try c.decode(String.self, forKey: .key)
+            before = try c.decodeIfPresent(Data.self, forKey: .before)
+            after = try c.decodeIfPresent(Data.self, forKey: .after)
+            version = try c.decodeIfPresent(Data.self, forKey: .version)
+            intermediates = try c.decodeIfPresent([Data?].self, forKey: .intermediates) ?? []
+        }
+    }
+
+    static func recordValue(in doc: LoroDoc, root: String, key: String) throws -> LoroValue? {
+        guard let item = doc.getMap(id: root).get(key: key) else { return nil }
+        guard let value = item.asValue() ?? item.asLoroMap()?.getDeepValue() else {
+            throw MobileSessionError.unavailable("Crew cannot reconcile the retained \(root) record \(key). Its original is retained.")
+        }
+        return value
+    }
+
+    static func recordData(_ value: LoroValue?) throws -> Data? {
+        guard let value else { return nil }
+        return try JSONSerialization.data(withJSONObject: value.jsonObject, options: [.sortedKeys, .fragmentsAllowed])
+    }
+
+    static func recordValue(_ bytes: Data?) throws -> LoroValue? {
+        guard let bytes else { return nil }
+        return LoroValue.fromJSON(try JSONSerialization.jsonObject(with: bytes, options: .fragmentsAllowed))
+    }
+
+    /// Replay logical records, never command lists or remote-owned identities.
+    static func applyRecordChange(root: String, key: String, before: LoroValue?, after: LoroValue?, in doc: LoroDoc,
+                                  alternatives: [LoroValue?] = []) throws {
+        let server = try recordValue(in: doc, root: root, key: key)
+        if server == after { return }
+        var before = before
+        if let desired = after?.mapValue, let remote = server?.mapValue, !alternatives.isEmpty {
+            let bases = [before] + alternatives
+            guard let match = bases.firstIndex(where: { value in
+                let base = value?.mapValue ?? [:]
+                return Set(base.keys).union(desired.keys).allSatisfy { field in
+                    base[field] == desired[field] || remote[field] == desired[field] || remote[field] == base[field] ||
+                    (root == "chats" && field == "lastSeenAt" && desired[field]?.i64Value != nil && remote[field]?.i64Value != nil)
+                }
+            }) else { throw MobileSessionError.unavailable("Crew recovery conflicts with retained intermediate edits on \(root)/\(key). Original intents are retained.") }
+            before = bases[match]
+        }
+        let map = doc.getMap(id: root)
+        if let desired = after?.mapValue {
+            let base = before?.mapValue ?? [:]
+            let remote = server?.mapValue ?? [:]
+            guard (before == nil || before?.mapValue != nil),
+                  (server == nil || server?.mapValue != nil),
+                  before == nil || server != nil else {
+                throw MobileSessionError.unavailable("Crew recovery conflicts with the authoritative \(root) record \(key), including a remote deletion. The original intent is retained.")
+            }
+            for field in ["id", "chatId", "userId", "deviceId"] where base[field] != nil {
+                guard desired[field] == base[field], remote[field] == base[field] else {
+                    throw MobileSessionError.unavailable("Crew recovery cannot replace record ownership or identity (\(field)).")
+                }
+            }
+            let row = try map.getOrCreateContainer(key: key, child: LoroMap())
+            // Legacy scalar records may become containers. Preserve every
+            // remote field when doing so, not just this intent's changed fields.
+            if row.getDeepValue().mapValue?.isEmpty == true, !remote.isEmpty {
+                for (field, value) in remote { try row.insert(key: field, v: value) }
+            }
+            for field in Set(base.keys).union(desired.keys) where base[field] != desired[field] {
+                if remote[field] == desired[field] { continue }
+                if root == "chats", field == "lastSeenAt", let value = desired[field],
+                   let desiredAt = value.i64Value, let serverAt = remote[field]?.i64Value {
+                    if desiredAt > serverAt { try row.insert(key: field, v: value) }
+                    continue
+                }
+                guard remote[field] == base[field], isRecoveryValue(desired[field]) else {
+                    throw MobileSessionError.unavailable("Crew recovery conflicts on \(root)/\(key)/\(field). Both the original intent and authoritative record are retained.")
+                }
+                if let value = desired[field] { try row.insert(key: field, v: value) }
+                else { try row.delete(key: field) }
+            }
+        } else {
+            guard server == before, isRecoveryValue(after) else {
+                throw MobileSessionError.unavailable("Crew recovery conflicts on \(root)/\(key). The original intent is retained.")
+            }
+            if let after { try map.insert(key: key, v: after) }
+            else { try map.delete(key: key) }
+        }
+    }
     static var directory: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory,
                                             in: .userDomainMask)[0]
@@ -20,6 +122,45 @@ enum DocDisk {
     static func url(for id: String) -> URL {
         let safe = id.replacingOccurrences(of: "/", with: "_")
         return directory.appendingPathComponent("\(safe).loro")
+    }
+
+    static func intentURL(for id: String) -> URL {
+        url(for: id).deletingPathExtension().appendingPathExtension("intents")
+    }
+
+    static func saveIntents<T: Encodable>(_ value: T, id: String) throws {
+        let data = try JSONEncoder().encode(value)
+        guard data.count <= 64 * 1024 * 1024 else {
+            throw MobileSessionError.unavailable("The retained Crew intent journal exceeds its safe size limit; existing originals are retained.")
+        }
+        try data.write(to: intentURL(for: id), options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+    }
+
+    static func loadIntents<T: Decodable>(_ type: T.Type, id: String) throws -> T? {
+        let url = intentURL(for: id)
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        guard let size = attributes[.size] as? NSNumber, size.int64Value <= 64 * 1024 * 1024 else {
+            throw MobileSessionError.unavailable("The retained Crew intent journal exceeds its safe size limit; the original is retained.")
+        }
+        return try JSONDecoder().decode(type, from: Data(contentsOf: url))
+    }
+
+    static func retainOutcome<T: Encodable>(_ value: T, id: String, commandId: String) throws {
+        guard UUID(uuidString: commandId) != nil else {
+            throw MobileSessionError.unavailable("Crew retained an invalid command identity.")
+        }
+        let url = intentURL(for: id).appendingPathExtension("\(commandId).outcome")
+        try JSONEncoder().encode(value).write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+    }
+
+    /// Retain legacy/blocked records before adopting an unrelated ancestry.
+    static func retainRecoveryOriginal(doc: LoroDoc, id: String) throws {
+        let url = self.url(for: id).appendingPathExtension("recovery")
+        // The first original is the valuable one; later stale replicas must not
+        // overwrite evidence or silently revive a legacy command.
+        guard !FileManager.default.fileExists(atPath: url.path) else { return }
+        try doc.export(mode: .snapshot).write(to: url, options: .atomic)
     }
 
     /// Import the saved snapshot, if any. Returns whether anything loaded.
@@ -136,61 +277,25 @@ enum DocDisk {
         guard let reconstructed = base.frontiersToVv(frontiers: baseFrontiers),
               reconstructed == common
         else { return false }
-        let delta = try base.diff(a: baseFrontiers, b: base.oplogFrontiers())
         // forkAt is unsupported for shallow docs. Reuse this isolated fork as
         // the read-only base; its oplog deliberately retains the local edits.
         try base.checkout(frontiers: baseFrontiers)
         guard base.stateVv() == common else { return false }
         let candidate = replacement.fork()
-
-        // applyDiff is a state replay, NOT a concurrent CRDT merge. Map value
-        // edits commute on disjoint keys; positional/list/tree/text changes do
-        // not. Container creation/replacement also remaps IDs and can silently
-        // skip unreachable children. Fail closed for those cases rather than
-        // flattening containers or overwriting concurrent server changes.
-        let replay = DiffBatch()
-        for entry in delta.getDiff() {
-            guard case .map(let changes) = entry.diff,
-                  let baseMap = base.getContainer(id: entry.cid)?.asLoroMap(),
-                  let serverMap = candidate.getContainer(id: entry.cid)?.asLoroMap(),
-                  !baseMap.isDeleted(), !serverMap.isDeleted(),
-                  case .map(let baseValues) = baseMap.getValue(),
-                  case .map(let serverValues) = serverMap.getValue()
-            else { return false }
-            var pending: [String: ValueOrContainer?] = [:]
-            for (key, updated) in changes.updated {
-                let desired: LoroValue?
-                if let updated {
-                    guard let value = updated.asValue(), isRecoveryValue(value)
-                    else { return false }
-                    desired = value
-                } else {
-                    desired = nil
-                }
-                // The host may already have materialized the same intent under
-                // other operation IDs. Do not rewrite it or change precedence.
-                if serverValues[key] == desired { continue }
-                if key == "lastSeenAt", let chatId = serverValues["id"]?.stringValue,
-                   replacement.getMap(id: "chats").get(key: chatId)?.asLoroMap()?.id() == entry.cid,
-                   let desiredAt = desired?.i64Value, let serverAt = serverValues[key]?.i64Value {
-                    // Seen markers are monotonic across devices. A newer server
-                    // receipt already covers this intent; never move it backward.
-                    if serverAt >= desiredAt { continue }
-                } else {
-                    guard baseValues[key] == serverValues[key],
-                          isRecoveryValue(baseValues[key]) else { return false }
-                }
-                // updateValue retains a nil payload as a deletion entry.
-                pending.updateValue(updated, forKey: key)
-            }
-            if !pending.isEmpty {
-                if let _ = replay.push(cid: entry.cid, diff: .map(diff: MapDelta(updated: pending))) {
-                    return false
-                }
+        guard let before = base.getDeepValue().mapValue,
+              let after = previous.getDeepValue().mapValue else { return false }
+        // Mobile-owned workspace edits are records, not positional operations.
+        // Recreate new record containers by logical key; never replay command
+        // lists or overwrite a concurrent host mutation.
+        let writable: Set<String> = ["chats", "spaces", "sessionRefs", "devices", "worktreeDeletions"]
+        for name in Set(before.keys).union(after.keys) where before[name] != after[name] {
+            guard writable.contains(name),
+                  let old = before[name]?.mapValue ?? (before[name] == nil ? [:] : nil),
+                  let desired = after[name]?.mapValue else { return false }
+            for key in Set(old.keys).union(desired.keys) where old[key] != desired[key] {
+                try applyRecordChange(root: name, key: key, before: old[key], after: desired[key], in: candidate)
             }
         }
-        if replay.getDiff().isEmpty { return true }
-        try candidate.applyDiff(diff: replay)
         candidate.commit()
         return try importRecovery(from: candidate, into: replacement, since: snapshotVersion)
     }
@@ -217,13 +322,22 @@ enum DocDisk {
         try? data.write(to: url(for: id), options: .atomic)
     }
 
+    static func saveReplacement(doc: LoroDoc, id: String) throws {
+        let bytes = try doc.export(mode: .snapshot)
+        guard !doc.isDetached(), doc.stateVv() == doc.oplogVv() else {
+            throw MobileSessionError.unavailable("Crew recovery snapshot did not materialize completely.")
+        }
+        try bytes.write(to: url(for: id), options: .atomic)
+    }
+
     /// LRU-prune session snapshots (the workspace doc is always kept).
     static func prune(keep: Int) {
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(at: directory,
                                                       includingPropertiesForKeys: [.contentModificationDateKey])
         else { return }
-        let sessions = files.filter { !$0.lastPathComponent.hasPrefix("ws4_") }
+        // Intent journals and recovery originals are never disposable caches.
+        let sessions = files.filter { $0.pathExtension == "loro" && $0.lastPathComponent.hasPrefix("scoped-") }
         guard sessions.count > keep else { return }
         let sorted = sessions.sorted {
             let a = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
@@ -259,12 +373,14 @@ final class DocSaver {
 
     /// Keep one saver/timer bound to the adopted replica. A pending old-cache
     /// write must never overwrite the recovered snapshot after the handoff.
-    func replaceDocument(with replacement: LoroDoc) {
+    func replaceDocument(with replacement: LoroDoc, recordIntents: [DocDisk.RecordIntent]? = nil) throws {
+        if let recordIntents { try DocDisk.saveIntents(recordIntents, id: docId) }
+        try DocDisk.saveReplacement(doc: replacement, id: docId)
         saveTask?.cancel()
         saveTask = nil
         saveDeadline = nil
         doc = replacement
-        poke()
+        dirty = false
     }
 
     func poke() {
@@ -298,3 +414,84 @@ final class DocSaver {
         DocDisk.save(doc: doc, id: docId)
     }
 }
+
+#if DEBUG
+extension DocDisk {
+    @MainActor
+    static func runRecordRecoveryRegression() -> Bool {
+        let cacheId = "recovery-regression-\(UUID().uuidString.lowercased())"
+        defer {
+            try? FileManager.default.removeItem(at: url(for: cacheId))
+            try? FileManager.default.removeItem(at: intentURL(for: cacheId))
+        }
+        do {
+            let source = LoroDoc()
+            let row = try source.getMap(id: "chats").getOrCreateContainer(key: "existing", child: LoroMap())
+            try row.insert(key: "id", v: "existing")
+            try row.insert(key: "deviceId", v: "owner")
+            try row.insert(key: "title", v: "Original")
+            try row.insert(key: "lastSeenAt", v: Int64(10))
+            source.commit()
+            let retainedBase = try recordData(recordValue(in: source, root: "chats", key: "existing"))
+            let local = source.fork()
+            let offlineRow = try local.getMap(id: "chats").getOrCreateContainer(key: "offline", child: LoroMap())
+            try offlineRow.insert(key: "id", v: "offline")
+            try offlineRow.insert(key: "deviceId", v: "owner")
+            try offlineRow.insert(key: "title", v: "Created offline")
+            try offlineRow.insert(key: "config", v: LoroValue.fromJSON(["model": "retained", "nested": ["sandbox": "workspace-write"]]))
+            local.commit()
+            try offlineRow.insert(key: "title", v: "Renamed offline")
+            let localExisting = local.getMap(id: "chats").get(key: "existing")!.asLoroMap()!
+            try localExisting.insert(key: "title", v: "Edited offline")
+            try localExisting.insert(key: "lastSeenAt", v: Int64(20))
+            local.commit()
+            save(doc: local, id: cacheId)
+            guard let cached = loadReplica(id: cacheId) else { return false }
+            try row.insert(key: "lastSeenAt", v: Int64(30))
+            try row.insert(key: "archived", v: true)
+            source.commit()
+            let floor = source.stateFrontiers()
+            try row.insert(key: "lastSeenAt", v: Int64(40))
+            source.commit()
+            guard let replacement = replacementSnapshot(bytes: try source.export(mode: .shallowSnapshot(frontiers: floor))),
+                  preserveLocalOperations(from: cached, in: replacement),
+                  let records = replacement.getDeepValue().mapValue?["chats"]?.mapValue,
+                  records["offline"]?.mapValue?["title"]?.stringValue == "Renamed offline",
+                  records["offline"]?.mapValue?["config"]?.mapValue?["nested"]?.mapValue?["sandbox"]?.stringValue == "workspace-write",
+                  records["existing"]?.mapValue?["title"]?.stringValue == "Edited offline",
+                  records["existing"]?.mapValue?["archived"]?.boolValue == true,
+                  records["existing"]?.mapValue?["lastSeenAt"]?.i64Value == 40,
+                  replacement.stateVv().includesVv(other: source.stateVv()) else { return false }
+            // A deleted authoritative record cannot be revived by an offline edit.
+            try source.getMap(id: "chats").delete(key: "existing")
+            source.commit()
+            guard let tombstone = replacementSnapshot(bytes: try source.export(mode: .shallowSnapshot(frontiers: source.stateFrontiers()))) else { return false }
+            let authoritative = tombstone.getDeepValue()
+            let original = cached.getDeepValue()
+            let originalVersion = cached.stateVv()
+            let cacheBytes = try Data(contentsOf: url(for: cacheId))
+            var intent = RecordIntent(root: "chats", key: "existing", before: retainedBase)
+            intent.after = try recordData(recordValue(in: cached, root: "chats", key: "existing"))
+            try saveIntents([intent], id: cacheId)
+            let journalBytes = try Data(contentsOf: intentURL(for: cacheId))
+            let snapshotVersion = tombstone.stateVv()
+            do {
+                _ = try rebaseLocalChanges(from: cached, into: tombstone, since: snapshotVersion)
+                return false
+            } catch MobileSessionError.unavailable(_) {
+                // The authoritative deletion conflicts with the retained edit.
+            }
+            guard tombstone.stateVv() == snapshotVersion, tombstone.oplogVv() == snapshotVersion,
+                  tombstone.getDeepValue() == authoritative,
+                  tombstone.getMap(id: "chats").get(key: "existing") == nil,
+                  cached.stateVv() == originalVersion, cached.oplogVv() == originalVersion,
+                  cached.getDeepValue() == original,
+                  try Data(contentsOf: url(for: cacheId)) == cacheBytes,
+                  try Data(contentsOf: intentURL(for: cacheId)) == journalBytes,
+                  loadReplica(id: cacheId)?.getDeepValue() == original else { return false }
+            E2ERunner.log("OK Crew saved record recovery: nested create rename edit, monotonic seen, remote tombstone conflict retained")
+            return true
+        } catch { E2ERunner.log("FAIL Crew saved record recovery: \(error)"); return false }
+    }
+}
+#endif

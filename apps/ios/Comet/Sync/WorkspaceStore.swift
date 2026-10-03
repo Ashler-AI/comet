@@ -43,6 +43,7 @@ final class WorkspaceStore {
     private(set) var sessionRefs: [SessionRef] = []
     private(set) var presence: [String: Int64] = [:]  // deviceId → last heartbeat ms
     private(set) var connected = false
+    private(set) var recoveryFailure: String?
 
     private(set) var doc = LoroDoc()
     private var room: RoomClient?
@@ -51,9 +52,100 @@ final class WorkspaceStore {
     @ObservationIgnored private var roomReadyGeneration: UInt64?
     private let config: AppConfig
     @ObservationIgnored var onProjection: (() -> Void)?
+    @ObservationIgnored private var recordIntents: [String: DocDisk.RecordIntent] = [:]
+    @ObservationIgnored private var recordJournalBlocked = false
+    private var recordCacheId: String { config.documentCacheId(roomId: "ws4/\(config.projectScope)") }
+
+    private func loadRecordIntents() {
+        do {
+            let intents = try DocDisk.loadIntents([DocDisk.RecordIntent].self, id: recordCacheId) ?? []
+            let roots: Set<String> = ["chats", "spaces", "sessionRefs", "worktreeDeletions"]
+            guard intents.count <= 1024, Set(intents.map(\.index)).count == intents.count,
+                  intents.allSatisfy({ roots.contains($0.root) && !$0.key.isEmpty && UUID(uuidString: $0.id) != nil && $0.intermediates.count <= 16 }) else {
+                throw MobileSessionError.unavailable("Crew workspace intent records are invalid or exceed their retention limit.")
+            }
+            for intent in intents where intent.root == "sessionRefs" {
+                let value = try DocDisk.recordValue(intent.after) ?? DocDisk.recordValue(intent.before)
+                guard let record = value?.mapValue, record["userId"]?.stringValue == config.userId,
+                      let chatId = record["chatId"]?.stringValue, intent.key == sessionRefKey(chatId: chatId) else {
+                    throw MobileSessionError.unavailable("Crew cannot recover a membership intent for another principal.")
+                }
+            }
+            recordIntents = Dictionary(uniqueKeysWithValues: intents.map { ($0.index, $0) })
+            recordJournalBlocked = false
+        } catch { recordJournalBlocked = true; recoveryFailure = "Crew workspace intent recovery is blocked: \(error.localizedDescription). The original journal is retained." }
+    }
+
+    private func persistRecordIntents() throws {
+        guard !recordJournalBlocked else { throw MobileSessionError.unavailable(recoveryFailure ?? "Crew workspace intent recovery is blocked.") }
+        try DocDisk.saveIntents(Array(recordIntents.values), id: recordCacheId)
+    }
+
+    private func blockRecordRecovery(_ error: Error) {
+        recoveryFailure = error.localizedDescription
+        connected = false
+        if let room { Task { await room.stop() } }
+    }
+
+    private func writeRecord(root: String, key: String, after: LoroValue?) throws {
+        guard !recordJournalBlocked else { throw MobileSessionError.unavailable(recoveryFailure ?? "Crew workspace recovery is blocked.") }
+        let before = try DocDisk.recordValue(in: doc, root: root, key: key)
+        if before == after { project(); return }
+        let index = root + ":" + key
+        // ponytail: coalesce mutable record goals, cap at 1024 unacknowledged
+        // keys; a database journal is only needed beyond this mobile ceiling.
+        guard recordIntents[index] != nil || recordIntents.count < 1024 else {
+            throw MobileSessionError.unavailable("Crew retains 1024 unresolved workspace edits. Recover them before editing more records.")
+        }
+        var intent = try recordIntents[index] ?? DocDisk.RecordIntent(root: root, key: key, before: DocDisk.recordData(before))
+        if let prior = recordIntents[index] {
+            guard prior.intermediates.count < 16 else {
+                throw MobileSessionError.unavailable("Crew retains 16 intermediate edits to this record. Recover them before editing it again.")
+            }
+            intent.intermediates.append(prior.after)
+        }
+        intent.after = try DocDisk.recordData(after)
+        intent.version = nil
+        recordIntents[index] = intent
+        // No CRDT operation can reach a room before its independent goal is
+        // durable. This also covers termination before the debounced snapshot.
+        try persistRecordIntents()
+        try DocDisk.applyRecordChange(root: root, key: key, before: before, after: after, in: doc)
+        doc.commit()
+        intent.version = doc.oplogVv().encode()
+        recordIntents[index] = intent
+        try persistRecordIntents()
+        project()
+    }
+
+    private func mutateRecord(root: String, key: String, _ mutate: (LoroMap) throws -> Void) throws {
+        let candidate = LoroDoc()
+        let row = candidate.getMap(id: "record")
+        if let values = try DocDisk.recordValue(in: doc, root: root, key: key)?.mapValue {
+            for (field, value) in values { try row.insert(key: field, v: value) }
+        }
+        try mutate(row)
+        try writeRecord(root: root, key: key, after: row.getDeepValue())
+    }
+
+    private func acknowledgeRecordIntents(_ bytes: Data) {
+        do {
+            let version = try VersionVector.decode(bytes: bytes)
+            let covered = recordIntents.filter { _, intent in
+                guard let bytes = intent.version, let required = try? VersionVector.decode(bytes: bytes) else { return false }
+                return version.includesVv(other: required)
+            }
+            for (index, intent) in covered {
+                try DocDisk.retainOutcome(intent, id: recordCacheId, commandId: intent.id)
+                recordIntents.removeValue(forKey: index)
+            }
+            if !covered.isEmpty { try persistRecordIntents() }
+        } catch { blockRecordRecovery(error) }
+    }
 
     init(config: AppConfig) {
         self.config = config
+        loadRecordIntents()
     }
 
     @ObservationIgnored private var saver: DocSaver?
@@ -64,10 +156,20 @@ final class WorkspaceStore {
         let epoch = roomEpoch
         let roomId = "ws4/\(config.projectScope)"
         let cacheId = config.documentCacheId(roomId: roomId)
+        guard !recordJournalBlocked else { project(); return }
         // Hydrate locally before joining; materialize the sidebar off-main.
-        _ = DocDisk.load(into: doc, id: cacheId)
+        if doc.oplogVv() == VersionVector() {
+            if let cached = DocDisk.loadReplica(id: cacheId) { doc = cached }
+            else if cacheId.hasPrefix("workspace-") {
+                let legacyId = String(cacheId.dropFirst("workspace-".count))
+                if let legacy = DocDisk.loadReplica(id: legacyId) {
+                    do { try DocDisk.saveReplacement(doc: legacy, id: cacheId); doc = legacy }
+                    catch { recoveryFailure = "Crew could not migrate the scoped workspace cache: \(error.localizedDescription)" }
+                }
+            }
+        }
         saver = DocSaver(docId: cacheId, doc: doc)
-        let client = RoomClient(roomId: roomId, doc: doc) { [config] in
+        let client = RoomClient(roomId: roomId, doc: doc, recoverApplicationIntents: !recordIntents.isEmpty) { [config] in
             await config.workspaceSocketURL()
         } events: { [weak self] event in
             Task { @MainActor [weak self] in
@@ -98,14 +200,48 @@ final class WorkspaceStore {
     }
 
     private func adoptSnapshot(previous: LoroDoc, replacement: LoroDoc) -> Bool {
-        guard doc === previous, let room,
-              DocDisk.preserveLocalOperations(from: previous, in: replacement) else { return false }
+        guard doc === previous, let room else { return false }
+        do {
+            try DocDisk.retainRecoveryOriginal(doc: previous, id: config.documentCacheId(roomId: "ws4/\(config.projectScope)"))
+            var pending = recordIntents
+            let authoritative = replacement.oplogVv()
+            if recordIntents.isEmpty {
+                guard DocDisk.preserveLocalOperations(from: previous, in: replacement) else {
+                    recoveryFailure = "Crew found conflicting workspace records. The original cache is retained."
+                    return false
+                }
+            } else {
+                // The journal is the application delta, independent of the old
+                // cache's retained ancestry. Never reissue an already-covered
+                // operation (including a subsequent remote tombstone).
+                for (index, intent) in recordIntents {
+                    if let bytes = intent.version, let required = try? VersionVector.decode(bytes: bytes),
+                       authoritative.includesVv(other: required) {
+                        try DocDisk.retainOutcome(intent, id: recordCacheId, commandId: intent.id)
+                        pending.removeValue(forKey: index)
+                        continue
+                    }
+                    try DocDisk.applyRecordChange(root: intent.root, key: intent.key,
+                        before: try DocDisk.recordValue(intent.before), after: try DocDisk.recordValue(intent.after), in: replacement,
+                        alternatives: try intent.intermediates.map { try DocDisk.recordValue($0) })
+                }
+                replacement.commit()
+                let required = replacement.oplogVv().encode()
+                for index in pending.keys { pending[index]?.version = required }
+            }
+            if let saver {
+                try saver.replaceDocument(with: replacement, recordIntents: Array(pending.values))
+            } else {
+                try DocDisk.saveIntents(Array(pending.values), id: recordCacheId)
+                try DocDisk.saveReplacement(doc: replacement, id: recordCacheId)
+            }
+            recordIntents = pending
+        } catch { recoveryFailure = error.localizedDescription; return false }
         // No suspension between the final local-op merge and binding swap.
         // Keep projections, presence, relays, and all non-doc store state alive.
         subscriptions.removeAll()
         doc = replacement
         subscribeLocalUpdates(client: room)
-        saver?.replaceDocument(with: replacement)
         scheduleProjection()
         return true
     }
@@ -113,11 +249,20 @@ final class WorkspaceStore {
     /// Backgrounding hook: persist immediately.
     func flushToDisk() {
         saver?.flush()
+        do { try persistRecordIntents() } catch { blockRecordRecovery(error) }
     }
 
-    func probeSync() async { await room?.probe() }
+    func probeSync() async { await room?.probe(force: true) }
+    func retryRecovery() async {
+        if recordJournalBlocked { loadRecordIntents() }
+        guard !recordJournalBlocked else { return }
+        recoveryFailure = nil
+        stop()
+        start()
+    }
 
     func stop() {
+        do { try persistRecordIntents() } catch { recoveryFailure = error.localizedDescription }
         roomEpoch &+= 1
         projectionGeneration &+= 1
         projectionTask?.cancel()
@@ -135,6 +280,7 @@ final class WorkspaceStore {
     private func handle(_ event: RoomEvent) {
         switch event {
         case .connected:
+            recoveryFailure = nil
             roomReadyGeneration = projectionGeneration &+ 1
             scheduleProjection()
         case .disconnected:
@@ -145,6 +291,12 @@ final class WorkspaceStore {
             saver?.poke()
         case .ephemeralUpdate:
             projectPresence()
+        case .recoveryBlocked(let message):
+            connected = false
+            roomReadyGeneration = nil
+            recoveryFailure = message
+        case .localChangesAcknowledged(let version):
+            acknowledgeRecordIntents(version)
         }
     }
 
@@ -684,10 +836,22 @@ final class WorkspaceStore {
 
     /// Ordinary commands must be admitted on their actual host. A different
     /// desktop's local trust record cannot authorize this host's ledger drain.
-    func sendSessionCommand(chatId: String, payload: SessionCommandPayload) async throws {
+    func sendSessionCommand(chatId: String, payload: SessionCommandPayload,
+                            admission: MobileCommandAdmission) async throws {
+        guard admission.expiresAt > nowMs(), admission.scaffold == nil,
+              AppConfig.canonicalSessionId(chatId) == chatId,
+              let scope = admission.scope, scope.projectId == config.projectScope, scope.sessionId == chatId else {
+            throw MobileSessionError.unavailable("This Crew instruction is expired or has different authority.")
+        }
+        guard scope.deploymentId == nil else {
+            throw MobileSessionError.unavailable("This Crew instruction targets an explicit deployment. The legacy desktop command route cannot authorize it; its original draft and scope are retained. Use its scoped Scaffold authority or open it on the owner in Crew.")
+        }
         guard let hostDeviceId = chat(id: chatId)?.deviceId
-            ?? sessions[chatId]?.deviceId, !hostDeviceId.isEmpty else {
+            ?? sessions[chatId]?.deviceId ?? admission.hostDeviceId, !hostDeviceId.isEmpty else {
             throw MobileSessionError.unavailable("This session has no known desktop host")
+        }
+        guard admission.hostDeviceId == hostDeviceId else {
+            throw MobileSessionError.unavailable("The Crew session owner changed. The retained instruction was not sent.")
         }
         var command: [String: Any] = ["kind": payload.kind]
         switch payload {
@@ -705,24 +869,38 @@ final class WorkspaceStore {
         }
         struct Reply: Decodable { var commandId: String }
         let commandRelay = DeviceRelayClient(deviceId: hostDeviceId, config: config,
-                                             controlSessionId: chatId)
+                                             controlSessionId: chatId, controlDeploymentId: scope.deploymentId)
         let _: Reply = try await commandRelay.call(
             method: "AdmitPeerCommand",
             params: [
                 "chatId": chatId,
-                "commandId": payload.messageId ?? UUID().uuidString.lowercased(),
+                "commandId": admission.commandId,
+                "issuedAt": admission.issuedAt,
+                "expiresAt": admission.expiresAt,
                 "command": command,
             ]
         )
     }
 
-    func sendScaffoldCommand(controllerDeviceId: String,
-                             environment: SessionEnvironment,
+    func sendScaffoldCommand(environment: SessionEnvironment,
                              payload: SessionCommandPayload,
-                             preparationGeneration: String? = nil) async throws {
-        let route = try await scaffoldRoute(controllerDeviceId: controllerDeviceId, environment: environment)
-        try await queueScaffoldCommand(route: route, payload: payload,
-                                       preparationGeneration: preparationGeneration)
+                             admission: MobileCommandAdmission) async throws {
+        guard admission.expiresAt > nowMs(), let authority = admission.scaffold,
+              admission.scope == authority.environment.scope,
+              authority.environment.scope == environment.scope,
+              authority.environment.ownerPrincipal == environment.ownerPrincipal,
+              authority.environment.source.sandboxId == environment.source.sandboxId,
+              authority.environment.source.lifecycleEpoch == environment.source.lifecycleEpoch,
+              authority.projection.projectId == config.projectScope,
+              authority.projection.sessionId == environment.scope.sessionId,
+              authority.projection.deploymentId == environment.scope.deploymentId else {
+            throw MobileSessionError.unavailable("This retained Crew instruction has expired or its authority changed. Review it before sending a new instruction.")
+        }
+        // Revalidate the original grant on admission; never attach/resume merely
+        // to retry a send or exchange a revoked grant for fresh authority.
+        try await queueScaffoldCommand(route: authority.route, payload: payload,
+                                       preparationGeneration: authority.preparationGeneration,
+                                       admission: admission)
     }
 
     func scaffoldRoute(controllerDeviceId: String, environment: SessionEnvironment) async throws -> ScaffoldControlRoute {
@@ -737,8 +915,9 @@ final class WorkspaceStore {
 
     func openScaffoldSession(controllerDeviceId: String, sandboxId: String,
                              scope: CollaborationScope, ownerPrincipal: String? = nil) async throws -> ScaffoldControlRoute {
-        guard scope.projectId == config.projectScope, scope.deploymentId == config.projectScope,
-              scope.sessionId != nil else {
+        guard scope.projectId == config.projectScope,
+              let deploymentId = scope.deploymentId, !deploymentId.isEmpty,
+              let sessionId = scope.sessionId, AppConfig.canonicalSessionId(sessionId) == sessionId else {
             throw MobileSessionError.unavailable("Open this session in Crew for its project and deployment")
         }
         let attachment = try await attachScaffoldEnvironment(
@@ -814,7 +993,8 @@ final class WorkspaceStore {
 
     private func queueScaffoldCommand(route: ScaffoldControlRoute,
                                       payload: SessionCommandPayload,
-                                      preparationGeneration: String?) async throws {
+                                      preparationGeneration: String?,
+                                      admission: MobileCommandAdmission) async throws {
         let actionPayload: [String: Any]
         switch payload {
         case .run(let request, let messageId):
@@ -849,7 +1029,9 @@ final class WorkspaceStore {
         struct Reply: Decodable { var commandId: String }
         var params: [String: Any] = [
             "chatId": route.projection.sessionId,
-            "commandId": payload.messageId ?? UUID().uuidString.lowercased(),
+            "commandId": admission.commandId,
+            "issuedAt": admission.issuedAt,
+            "expiresAt": admission.expiresAt,
             "command": command,
         ]
         if case .run = payload, let preparationGeneration {
@@ -890,34 +1072,26 @@ final class WorkspaceStore {
 
     @discardableResult
     func addSessionRef(chatId: String, environment: SessionEnvironment? = nil) -> SessionRef? {
-        let map = doc.getMap(id: "sessionRefs")
         do {
-            let row = try map.getOrCreateContainer(
-                key: sessionRefKey(chatId: chatId), child: LoroMap()
-            )
-            try row.insert(key: "userId", v: config.userId)
-            try row.insert(key: "chatId", v: chatId)
-            let addedAt = row.get(key: "addedAt")?.asValue()?.i64Value ?? nowMs()
-            try row.insert(key: "addedAt", v: addedAt)
-            if let environment, let value = LoroValue.fromEncodable(environment) {
-                try row.insert(key: "environment", v: value)
+            var addedAt: Int64 = 0
+            try mutateRecord(root: "sessionRefs", key: sessionRefKey(chatId: chatId)) { row in
+                try row.insert(key: "userId", v: config.userId)
+                try row.insert(key: "chatId", v: chatId)
+                addedAt = row.get(key: "addedAt")?.asValue()?.i64Value ?? nowMs()
+                try row.insert(key: "addedAt", v: addedAt)
+                if let environment, let value = LoroValue.fromEncodable(environment) { try row.insert(key: "environment", v: value) }
             }
-            doc.commit()
-            project()
             return SessionRef(chatId: chatId, addedAt: addedAt, environment: environment)
         } catch {
+            blockRecordRecovery(error)
             return nil
         }
     }
 
     /// Remove only this workspace's membership; the `s2/{chatId}` room remains.
     func removeSessionRef(chatId: String) {
-        let map = doc.getMap(id: "sessionRefs")
-        do {
-            try map.delete(key: sessionRefKey(chatId: chatId))
-            doc.commit()
-            project()
-        } catch {}
+        do { try writeRecord(root: "sessionRefs", key: sessionRefKey(chatId: chatId), after: nil) }
+        catch { blockRecordRecovery(error) }
     }
 
 
@@ -950,20 +1124,19 @@ final class WorkspaceStore {
 
     private func putChat(chatId: String, space: Space, config chatConfig: ChatConfig,
                          branch: String?, cwd: String) throws {
-        let map = doc.getMap(id: "chats")
-        let row = try map.getOrCreateContainer(key: chatId, child: LoroMap())
-        try row.insert(key: "id", v: chatId)
-        try row.insert(key: "deviceId", v: space.deviceId)
-        try row.insert(key: "archived", v: false)
-        try row.insert(key: "cwd", v: cwd)
-        try row.insert(key: "spaceId", v: space.id)
-        let createdAt = row.get(key: "createdAt")?.asValue()?.i64Value ?? nowMs()
-        try row.insert(key: "createdAt", v: createdAt)
-        if let branch { try row.insert(key: "branch", v: branch) }
-        if let value = LoroValue.fromEncodable(chatConfig) {
-            try row.insert(key: "config", v: value)
+        try mutateRecord(root: "chats", key: chatId) { row in
+            try row.insert(key: "id", v: chatId)
+            try row.insert(key: "deviceId", v: space.deviceId)
+            try row.insert(key: "archived", v: false)
+            try row.insert(key: "cwd", v: cwd)
+            try row.insert(key: "spaceId", v: space.id)
+            let createdAt = row.get(key: "createdAt")?.asValue()?.i64Value ?? nowMs()
+            try row.insert(key: "createdAt", v: createdAt)
+            if let branch { try row.insert(key: "branch", v: branch) }
+            if let value = LoroValue.fromEncodable(chatConfig) {
+                try row.insert(key: "config", v: value)
+            }
         }
-        doc.commit()
         guard addSessionRef(chatId: chatId) != nil else {
             throw MobileSessionError.unavailable("Couldn’t save this session’s membership")
         }
@@ -991,16 +1164,15 @@ final class WorkspaceStore {
         ]
         let viaHost: OkReply? = try? await relay(for: deviceId).call(method: "Mutate", params: params)
         if viaHost == nil {
-            let map = doc.getMap(id: "spaces")
             do {
-                let row = try map.getOrCreateContainer(key: spaceId, child: LoroMap())
-                try row.insert(key: "id", v: spaceId)
-                try row.insert(key: "deviceId", v: deviceId)
-                try row.insert(key: "path", v: path)
-                try row.insert(key: "gitDetected", v: gitDetected)
-                try row.insert(key: "createdAt", v: nowMs())
-                doc.commit()
-            } catch {}
+                try mutateRecord(root: "spaces", key: spaceId) { row in
+                    try row.insert(key: "id", v: spaceId)
+                    try row.insert(key: "deviceId", v: deviceId)
+                    try row.insert(key: "path", v: path)
+                    try row.insert(key: "gitDetected", v: gitDetected)
+                    try row.insert(key: "createdAt", v: nowMs())
+                }
+            } catch { blockRecordRecovery(error) }
         }
         project()
         return spaceId
@@ -1009,9 +1181,10 @@ final class WorkspaceStore {
     func setArchived(chatId: String, archived: Bool) {
         updateChat(chatId) { row in
             try row.insert(key: "archived", v: archived)
-            if !archived {
-                try doc.getMap(id: "worktreeDeletions").delete(key: chatId)
-            }
+        }
+        if !archived {
+            do { try writeRecord(root: "worktreeDeletions", key: chatId, after: nil) }
+            catch { blockRecordRecovery(error) }
         }
     }
 
@@ -1038,13 +1211,9 @@ final class WorkspaceStore {
     }
 
     private func updateChat(_ chatId: String, _ mutate: (LoroMap) throws -> Void) {
-        let map = doc.getMap(id: "chats")
-        guard let row = map.get(key: chatId)?.asLoroMap() else { return }
-        do {
-            try mutate(row)
-            doc.commit()
-            project()
-        } catch {}
+        guard (try? DocDisk.recordValue(in: doc, root: "chats", key: chatId)) != nil else { return }
+        do { try mutateRecord(root: "chats", key: chatId, mutate) }
+        catch { blockRecordRecovery(error) }
     }
 }
 
@@ -1083,3 +1252,82 @@ struct WorkspaceLists: Equatable {
         occupiedSpaces = spaces.filter { activeBySpace[$0.id] != nil }
     }
 }
+
+#if DEBUG
+extension WorkspaceStore {
+    static func runRecordIntentRegression() -> Bool {
+        let config = AppConfig(edgeURL: URL(string: "http://127.0.0.1:1")!, mode: .dev,
+            userId: "workspace-intents-\(UUID().uuidString)", projectScope: "workspace-intents",
+            deviceId: "viewer", deviceName: "Crew regression")
+        let cacheId = config.documentCacheId(roomId: "ws4/\(config.projectScope)")
+        var stores: [WorkspaceStore] = []
+        defer {
+            stores.forEach { $0.stop() }
+            if let files = try? FileManager.default.contentsOfDirectory(at: DocDisk.directory, includingPropertiesForKeys: nil) {
+                for file in files where file.lastPathComponent.hasPrefix(cacheId) { try? FileManager.default.removeItem(at: file) }
+            }
+        }
+        do {
+            let existing = UUID().uuidString.lowercased()
+            let created = UUID().uuidString.lowercased()
+            let source = LoroDoc()
+            let row = try source.getMap(id: "chats").getOrCreateContainer(key: existing, child: LoroMap())
+            try row.insert(key: "id", v: existing); try row.insert(key: "deviceId", v: "host")
+            try row.insert(key: "title", v: "Original")
+            source.commit()
+            DocDisk.save(doc: source, id: cacheId)
+            let offline = WorkspaceStore(config: config)
+            stores.append(offline)
+            _ = try offline.doc.importWith(bytes: source.export(mode: .snapshot), origin: "workspace-intent-regression")
+            offline.rename(chatId: existing, title: "Intermediate offline title")
+            offline.rename(chatId: existing, title: "Final offline title")
+            try offline.mutateRecord(root: "chats", key: created) { row in
+                try row.insert(key: "id", v: created); try row.insert(key: "deviceId", v: "host")
+                try row.insert(key: "title", v: "Created offline")
+                try row.insert(key: "config", v: LoroValue.fromJSON(["nested": ["sandbox": "workspace-write"]]))
+            }
+            guard offline.addSessionRef(chatId: created) != nil,
+                  offline.recoveryFailure == nil else { return false }
+            // Restart before the debounced snapshot ever ran. The only cache
+            // still has the original title; accepted goals are independent.
+            let restarted = WorkspaceStore(config: config)
+            stores.append(restarted)
+            guard restarted.recordIntents.count == 3,
+                  let cached = DocDisk.loadReplica(id: cacheId),
+                  try DocDisk.recordValue(in: cached, root: "chats", key: existing)?.mapValue?["title"]?.stringValue == "Original" else { return false }
+            restarted.doc = cached
+            restarted.room = RoomClient(roomId: "ws4/\(config.projectScope)", doc: cached,
+                recoverApplicationIntents: true, urlProvider: { nil }, events: { _ in }, adoptSnapshot: { _, _ in false })
+            restarted.saver = DocSaver(docId: cacheId, doc: cached)
+            // An earlier edit was admitted under another operation identity.
+            // Its successor must rebase, not overwrite a remote disjoint field.
+            try row.insert(key: "title", v: "Intermediate offline title")
+            try row.insert(key: "archived", v: true)
+            source.commit()
+            let floor = source.stateFrontiers()
+            try source.getMap(id: "meta").insert(key: "current", v: true); source.commit()
+            guard let replacement = DocDisk.replacementSnapshot(bytes: try source.export(mode: .shallowSnapshot(frontiers: floor))),
+                  restarted.adoptSnapshot(previous: cached, replacement: replacement),
+                  let records = replacement.getDeepValue().mapValue?["chats"]?.mapValue,
+                  records[existing]?.mapValue?["title"]?.stringValue == "Final offline title",
+                  records[existing]?.mapValue?["archived"]?.boolValue == true,
+                  records[created]?.mapValue?["config"]?.mapValue?["nested"]?.mapValue?["sandbox"]?.stringValue == "workspace-write",
+                  try DocDisk.recordValue(in: replacement, root: "sessionRefs", key: restarted.sessionRefKey(chatId: created))?.mapValue?["userId"]?.stringValue == config.userId else { return false }
+            restarted.acknowledgeRecordIntents(replacement.oplogVv().encode())
+            let afterAck = WorkspaceStore(config: config)
+            stores.append(afterAck)
+            guard afterAck.recordIntents.isEmpty,
+                  try DocDisk.recordValue(in: DocDisk.loadReplica(id: cacheId)!, root: "chats", key: existing)?.mapValue?["title"]?.stringValue == "Final offline title" else { return false }
+            restarted.rename(chatId: existing, title: "Retained conflicting title")
+            try row.insert(key: "title", v: "Authoritative conflicting title"); source.commit()
+            guard let conflict = DocDisk.replacementSnapshot(bytes: try source.export(mode: .shallowSnapshot(frontiers: source.stateFrontiers()))),
+                  !restarted.adoptSnapshot(previous: replacement, replacement: conflict),
+                  restarted.doc === replacement, restarted.recoveryFailure != nil,
+                  let retained = try DocDisk.loadIntents([DocDisk.RecordIntent].self, id: cacheId),
+                  retained.contains(where: { (try? DocDisk.recordValue($0.after))?.mapValue?["title"]?.stringValue == "Retained conflicting title" }) else { return false }
+            E2ERunner.log("OK Crew workspace intents: immediate restart, intermediate admission, nested create edit membership, shallow recovery, durable ACK, conflict originals retained")
+            return true
+        } catch { E2ERunner.log("FAIL Crew workspace intents: \(error)"); return false }
+    }
+}
+#endif

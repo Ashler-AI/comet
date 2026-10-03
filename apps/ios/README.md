@@ -22,7 +22,7 @@ automatically): [loro-swift 1.13.x](https://github.com/loro-dev/loro-swift)
 (cmark-gfm: tables/strikethrough/tasklists — the same feature set as the
 desktop's pulldown-cmark config).
 
-Mobile staging **1.0 (27)** and production **1.0 (20)** are available
+Mobile staging **1.0 (28)** and production **1.0 (20)** are available
 through their existing **Ashler Internal** TestFlight groups. Both are internal-only
 releases, not public App Store submissions. Upload and verification evidence is
 recorded below.
@@ -35,7 +35,7 @@ bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
 xcodebuild -project Comet.xcodeproj -scheme Comet \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 
-# Staging candidate: Crew Staging, ai.ashler.crew.staging, version 1.0 build 28
+# Staging candidate: Crew Staging, ai.ashler.crew.staging, version 1.0 build 29
 xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 ```
@@ -65,7 +65,7 @@ The artifact `crew-mobile-<environment>-<source SHA>` contains:
 
 | Environment | Device archive | Simulator app package |
 | --- | --- | --- |
-| staging | `Crew-Staging-1.0-28-unsigned.xcarchive.tar.gz` | `Crew-Staging-1.0-28-simulator-arm64.tar.gz` |
+| staging | `Crew-Staging-1.0-29-unsigned.xcarchive.tar.gz` | `Crew-Staging-1.0-29-simulator-arm64.tar.gz` |
 | production | `Crew-1.0-21-unsigned.xcarchive.tar.gz` | `Crew-1.0-21-simulator-arm64.tar.gz` |
 
 Both also include `SHA256SUMS`, `source-sha.txt`, `provenance.json`, `e2e.log`,
@@ -91,6 +91,26 @@ produce these build candidates.
 `native-verification.yml` is a separate Rust/desktop verification workflow. It
 has no dispatch inputs and runs only on pushes to `verify/native-lifecycle-*`
 or `verify/native-startup-*`; it neither creates nor signs mobile archives.
+
+### Crew Staging 1.0 (29): durable recovery candidate
+
+The staging-only update retains scoped drafts, instructions and workspace edits
+outside replaceable CRDT caches. Recovery preserves original command identities
+and payloads; conflicting, revoked or expired work stays visibly blocked. Owner
+publications, current-generation relay fencing, authoritative metadata clears and
+canonical fragmented backfill are covered by the existing simulator gate.
+
+Source `1df831eb0ffb0a8dca9e5751919fbccafac1f9da` passed all 21 required markers
+and produced the device archive in [CI 37132956763](https://github.com/Ashler-AI/comet/actions/runs/37132956763).
+Downloaded checksums and provenance matched. The blocked-recovery screenshot
+showed retained originals and manual retry; native accessibility and a fresh
+screenshot of the downloaded simulator app verified the Unreachable strip.
+CI surface capture now allows its navigation transition to finish before capture.
+
+The archive is still ad-hoc signed and is **not yet published to TestFlight**.
+Production build 21, tester memberships and account permissions are unchanged.
+No local compilation or typechecks were run for this mobile update; physical-phone
+installation and notification receipt remain unverified.
 
 ### Crew 0.1.132 mobile release evidence
 
