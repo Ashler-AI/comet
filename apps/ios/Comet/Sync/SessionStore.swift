@@ -792,7 +792,8 @@ final class SessionStore {
         }
         let chosen = awaiting ?? working ?? stale ?? terminal
         var environment: SessionEnvironment?
-        if let value = owner["environment"], let bytes = try? JSONSerialization.data(withJSONObject: value.jsonObject) {
+        if let value = owner["environment"], value.mapValue != nil,
+           let bytes = try? JSONSerialization.data(withJSONObject: value.jsonObject) {
             environment = try? JSONDecoder().decode(SessionEnvironment.self, from: bytes)
         }
         return Projection(entries: [], session: chosen, activity: nil, environment: environment, previewTitle: nil,
