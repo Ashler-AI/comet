@@ -6,6 +6,7 @@ import Foundation
 import Observation
 import SwiftUI
 import Network
+import Loro
 
 enum MobileSessionError: LocalizedError {
     case unavailable(String)

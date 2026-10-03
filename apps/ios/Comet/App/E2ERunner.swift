@@ -821,7 +821,7 @@ extension E2ERunner {
             let restored = LoroDoc()
             _ = try restored.importWith(bytes: source.export(mode: .snapshot), origin: "nested-tool-regression")
             let version = source.oplogVv()
-            try command.insert(pos: original.count, s: " suffix")
+            try command.insert(pos: UInt32(original.count), s: " suffix")
             try nested.insert(key: "isError", v: false)
             source.commit()
             _ = try restored.importWith(bytes: source.export(mode: .updates(from: version)), origin: "nested-tool-regression")
