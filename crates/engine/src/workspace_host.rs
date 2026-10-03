@@ -921,43 +921,22 @@ impl WorkspaceHost {
             return Ok(());
         };
         if crate::session_activity::room_projection(&reference, self.project_scope())
-            .as_ref()
-            .map(Option::as_ref)
-            != Some(projection)
+            .as_ref().map(Option::as_ref) != Some(projection)
             || owner_subject != self.owner_subject()
-            || reference
-                .environment
-                .as_ref()
-                .is_some_and(|environment| environment.owner_principal != owner_subject)
+            || reference.environment.as_ref().is_some_and(|environment| environment.owner_principal != owner_subject)
         {
             return Ok(());
         }
-        match reference
-            .environment
-            .as_ref()
-            .map(|environment| &environment.source)
-        {
-            Some(comet_proto::SessionEnvironmentSource::Scaffold {
-                sandbox_id,
-                lifecycle_epoch,
-                ..
-            }) => {
-                if !comet_proto::parse_scaffold_device_id(&session.device_id).is_some_and(
-                    |(sandbox, epoch)| {
-                        sandbox == sandbox_id
-                            && lifecycle_epoch.is_none_or(|expected| expected == epoch)
-                    },
-                ) {
+        match reference.environment.as_ref().map(|environment| &environment.source) {
+            Some(comet_proto::SessionEnvironmentSource::Scaffold { sandbox_id, lifecycle_epoch, .. }) => {
+                if !comet_proto::parse_scaffold_device_id(&session.device_id).is_some_and(|(sandbox, epoch)| {
+                    sandbox == sandbox_id && lifecycle_epoch.is_none_or(|expected| expected == epoch)
+                }) {
                     return Ok(());
                 }
             }
             _ => {
-                if self
-                    .inner
-                    .doc
-                    .chat(&session.chat_id)?
-                    .is_none_or(|chat| chat.device_id != session.device_id)
-                {
+                if self.inner.doc.chat(&session.chat_id)?.is_none_or(|chat| chat.device_id != session.device_id) {
                     return Ok(());
                 }
             }
@@ -965,10 +944,7 @@ impl WorkspaceHost {
         // Consumers read this watch directly; a workspace import may remain pending
         // forever when peers have incompatible shallow frontiers.
         self.inner.room_sessions_tx.send_if_modified(|rows| {
-            if let Some(row) = rows
-                .iter_mut()
-                .find(|(_, row)| row.chat_id == session.chat_id)
-            {
+            if let Some(row) = rows.iter_mut().find(|(_, row)| row.chat_id == session.chat_id) {
                 if row.0.environment == reference.environment && row.1 == *session {
                     return false;
                 }
@@ -1480,22 +1456,12 @@ impl WorkspaceHostInner {
             retain_visible_sessions(&mut state.chats, &mut state.sessions, &state.session_refs);
             self.room_sessions_tx.send_if_modified(|rows| {
                 let before = rows.len();
-                rows.retain(|(observed, session)| {
-                    state.session_refs.iter().any(|reference| {
-                        reference.chat_id == session.chat_id
-                            && reference.added_at == observed.added_at
-                            && reference.environment == observed.environment
-                            && (crate::session_activity::projection(
-                                reference,
-                                &self.config.project_scope,
-                            )
-                            .is_some()
-                                || state.chats.iter().any(|chat| {
-                                    chat.id == session.chat_id
-                                        && chat.device_id == session.device_id
-                                }))
-                    })
-                });
+                rows.retain(|(observed, session)| state.session_refs.iter().any(|reference| {
+                    reference.chat_id == session.chat_id && reference.added_at == observed.added_at
+                        && reference.environment == observed.environment
+                        && (crate::session_activity::projection(reference, &self.config.project_scope).is_some()
+                            || state.chats.iter().any(|chat| chat.id == session.chat_id && chat.device_id == session.device_id))
+                }));
                 before != rows.len()
             });
             Ok(state)
@@ -1678,33 +1644,19 @@ fn merge_sessions(
     refs: &[SessionRef],
     room_rows: &[(SessionRef, Session)],
 ) -> Vec<Session> {
-    let projected = room_rows
-        .iter()
-        .filter(|(observed, session)| {
-            refs.iter().any(|reference| {
-                reference.chat_id == session.chat_id
-                    && reference.added_at == observed.added_at
-                    && reference.environment == observed.environment
-            })
-        })
-        .map(|(_, session)| session);
-    let remote: std::collections::HashSet<&str> = projected
-        .clone()
+    let projected = room_rows.iter().filter(|(observed, session)| {
+        refs.iter().any(|reference| reference.chat_id == session.chat_id
+            && reference.added_at == observed.added_at && reference.environment == observed.environment)
+    }).map(|(_, session)| session);
+    let remote: std::collections::HashSet<&str> = projected.clone()
         .filter(|session| session.device_id != device_id)
         .map(|session| session.chat_id.as_str())
-        .chain(
-            refs.iter()
-                .filter(|reference| {
-                    comet_proto::parse_scaffold_device_id(device_id).is_none()
-                        && reference.environment.as_ref().is_some_and(|environment| {
-                            matches!(
-                                environment.source,
-                                comet_proto::SessionEnvironmentSource::Scaffold { .. }
-                            )
-                        })
+        .chain(refs.iter().filter(|reference| {
+            comet_proto::parse_scaffold_device_id(device_id).is_none()
+                && reference.environment.as_ref().is_some_and(|environment| {
+                    matches!(environment.source, comet_proto::SessionEnvironmentSource::Scaffold { .. })
                 })
-                .map(|reference| reference.chat_id.as_str()),
-        )
+        }).map(|reference| reference.chat_id.as_str()))
         .collect();
     let mut merged: std::collections::HashMap<String, Session> = rows
         .iter()
@@ -2199,9 +2151,7 @@ mod tests {
         seed.upsert_chat(&chat("session-a", "device-a")).unwrap();
         let baseline = seed.export_snapshot().unwrap();
         for store in [&store_a, &store_b] {
-            store
-                .save_snapshot(super::WORKSPACE_DOC_ID, &baseline)
-                .unwrap();
+            store.save_snapshot(super::WORKSPACE_DOC_ID, &baseline).unwrap();
         }
 
         let a = open(store_a.clone(), "device-a");

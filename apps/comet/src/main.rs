@@ -914,27 +914,17 @@ mod session_parser_tests {
     fn session_search_requires_a_filter_and_bounded_page_size() {
         assert!(Cli::try_parse_from(["comet", "session", "search"]).is_err());
         for limit in ["0", "51"] {
-            assert!(
-                Cli::try_parse_from([
-                    "comet", "session", "search", "--query", "bridge", "--limit", limit,
-                ])
-                .is_err()
-            );
+            assert!(Cli::try_parse_from([
+                "comet", "session", "search", "--query", "bridge", "--limit", limit,
+            ]).is_err());
         }
         for filter in ["--query", "--source-url"] {
             let parsed = Cli::try_parse_from([
                 "comet", "session", "search", filter, "bridge", "--limit", "50",
-            ])
-            .unwrap();
-            assert!(matches!(
-                parsed.command,
-                Some(Command::Session {
-                    command: super::session_cli::SessionCommand::Search {
-                        limit: Some(50),
-                        ..
-                    },
-                })
-            ));
+            ]).unwrap();
+            assert!(matches!(parsed.command, Some(Command::Session {
+                command: super::session_cli::SessionCommand::Search { limit: Some(50), .. },
+            })));
         }
     }
 
