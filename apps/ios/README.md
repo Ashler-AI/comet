@@ -22,7 +22,7 @@ automatically): [loro-swift 1.13.x](https://github.com/loro-dev/loro-swift)
 (cmark-gfm: tables/strikethrough/tasklists — the same feature set as the
 desktop's pulldown-cmark config).
 
-Mobile staging **1.0 (28)** and production **1.0 (20)** are available
+Mobile staging **1.0 (29)** and production **1.0 (20)** are available
 through their existing **Ashler Internal** TestFlight groups. Both are internal-only
 releases, not public App Store submissions. Upload and verification evidence is
 recorded below.
@@ -92,32 +92,33 @@ produce these build candidates.
 has no dispatch inputs and runs only on pushes to `verify/native-lifecycle-*`
 or `verify/native-startup-*`; it neither creates nor signs mobile archives.
 
-### Crew Staging 1.0 (29): durable recovery candidate
+### Crew Staging 1.0 (29): durable recovery release evidence
 
-The staging-only update retains scoped drafts, instructions and workspace edits
-outside replaceable CRDT caches. Recovery preserves original command identities
-and payloads; conflicting, revoked or expired work stays visibly blocked. Owner
-publications, current-generation relay fencing, authoritative metadata clears and
-canonical fragmented backfill are covered by the existing simulator gate.
+Merged source `a074ebdbf28111504ec211a9c61ee5bd805d036a`, including
+[PR #68](https://github.com/Ashler-AI/comet/pull/68) and
+[PR #72](https://github.com/Ashler-AI/comet/pull/72), passed all 21 required markers
+and the device archive in [main CI 37140082063](https://github.com/Ashler-AI/comet/actions/runs/37140082063).
+Downloaded checksums and provenance matched. Fresh settled screenshots show the
+persistent blocked-recovery banner and explicit retry, plus the Unreachable strip.
+Fragmented backfill is self-seeded coverage, not a claim of live remote convergence.
 
-Source `1df831eb0ffb0a8dca9e5751919fbccafac1f9da` passed all 21 required markers
-and produced the device archive in [CI 37132956763](https://github.com/Ashler-AI/comet/actions/runs/37132956763).
-Downloaded checksums and provenance matched. The blocked-recovery screenshot
-showed retained originals and manual retry; native accessibility and a fresh
-screenshot of the downloaded simulator app verified the Unreachable strip.
-CI surface capture now allows its navigation transition to finish before capture.
+Scoped drafts, original instructions and workspace edits survive replaceable CRDT
+caches. Recovery retains original identities/payloads and visibly blocks conflicts,
+revocation and expiry. Current-generation relay fencing, owner publication
+aggregation, authoritative metadata clears and nested tool calls share that gate.
 
-The settled screenshot exposed a navigation-dismissed recovery modal. The follow-up
-in [PR #72](https://github.com/Ashler-AI/comet/pull/72) replaces it with persistent
-inline recovery feedback and explicit retry, without changing retained records or
-retry authority. [CI 37137327017](https://github.com/Ashler-AI/comet/actions/runs/37137327017)
-passed all 21 markers and archived source `3b873c801f26a78146ff6210296871c2d0158500`;
-its settled screenshots show both the blocked banner/retry and Unreachable strip.
+Apple accepted the staging-only upload at **17:38 UTC on October 3**. Authenticated
+App Store Connect readback confirmed **Testing**, **Internal**, the existing
+**Ashler Internal** group and one existing invitation. The exact uploaded IPA
+passed strict deep signature verification with bundle `ai.ashler.crew.staging`,
+build 29, team `825LYXGJR6`, and matching production APNs signature/profile.
+Uploaded IPA SHA-256: `b4c0062c526953d662ff3e3d1342dc093940070a2d991f6e57956908f2baaf8e`.
+Apple delivery: `b8f6987c-c3ae-4ec6-a041-c73c45fcea1c`.
 
-The archive is still ad-hoc signed and is **not yet published to TestFlight**.
-Production build 21, tester memberships and account permissions are unchanged.
-No local compilation or typechecks were run for this mobile update; physical-phone
-installation and notification receipt remain unverified.
+Export/upload performed no local compilation or typechecks. Production build 21,
+tester memberships and account permissions were not changed; no public App Store
+submission occurred. Physical-phone installation and notification receipt remain
+unverified.
 
 ### Crew 0.1.132 mobile release evidence
 

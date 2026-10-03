@@ -2,6 +2,19 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Crew Staging mobile 1.0 (29)
+
+Crew Staging **1.0 (29)** is available in the existing **Ashler Internal** TestFlight
+group from merged source `a074ebdbf28111504ec211a9c61ee5bd805d036a`.
+[Main CI 37140082063](https://github.com/Ashler-AI/comet/actions/runs/37140082063)
+passed all 21 recovery markers and archived the device build; settled screenshots
+verify persistent blocked-recovery feedback/manual retry and the Unreachable strip.
+The exact uploaded IPA passed strict distribution-signature and APNs checks, and
+authenticated Apple readback showed Testing. See
+[mobile release evidence](apps/ios/README.md#crew-staging-10-29-durable-recovery-release-evidence).
+No production upload, tester/account changes or public App Store submission occurred.
+Physical-phone acceptance remains manual; export/upload did not compile locally.
+
 ## Crew 0.1.136 release candidate: canonical recovered rooms
 
 Recovered execution journals keep their private execution keys, but resolve to
