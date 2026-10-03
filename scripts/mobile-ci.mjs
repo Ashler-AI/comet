@@ -20,7 +20,7 @@ const work = path.join(process.env.RUNNER_TEMP, "crew-mobile");
 for (const directory of [logs, release, work]) mkdirSync(directory, { recursive: true });
 const environment = process.env.CREW_MOBILE_ENVIRONMENT ?? "staging";
 const profiles = {
-  staging: { scheme: "Crew Staging", bundleId: "ai.ashler.crew.staging", build: "28", suffix: "-Staging", name: "Crew-Staging" },
+  staging: { scheme: "Crew Staging", bundleId: "ai.ashler.crew.staging", build: "29", suffix: "-Staging", name: "Crew-Staging" },
   production: { scheme: "Comet", bundleId: "ai.ashler.crew", build: "21", suffix: "", name: "Crew" },
 };
 if (!Object.hasOwn(profiles, environment)) throw new Error(`Unsupported mobile environment: ${environment}`);
@@ -39,6 +39,17 @@ const markers = [
   "OK Crew peer message visibility",
   "OK Crew live list projection",
   "OK Crew room convergence",
+  "OK Crew workspace intents",
+  "OK Crew saved record recovery",
+  "OK Crew durable intents",
+  "OK Crew transcript freshness",
+  "OK Crew foreground and blocked recovery",
+  "OK Crew owner publication register",
+  "OK Crew mixed nested tool calls",
+  "OK Crew deployment retarget",
+  "OK Crew metadata clear",
+  "OK Crew relay lifecycle",
+  "OK Crew fragmented backfill",
 ];
 const project = "apps/ios/Comet.xcodeproj";
 const lockfile = path.join(project, "project.xcworkspace/xcshareddata/swiftpm/Package.resolved");
@@ -126,7 +137,30 @@ async function verifySimulator(app) {
     if (/\bFAIL\b/.test(text)) throw new Error(`Mobile regression failed:\n${text}`);
     if (markers.every((marker) => text.split("\n").some((line) => new RegExp(`^\\[\\d+\\] ${marker}(?=[:\\s]|$)`).test(line)))) {
       console.log(text);
-      return { identifier: runtime.identifier, version: runtime.version, deviceType, markers };
+      run("xcrun", ["simctl", "io", simulator, "screenshot", path.join(logs, "convergence-surface.png")]);
+      writeFileSync(path.join(logs, "visibility-e2e.log"), text);
+      for (const [argument, marker, prefix] of [
+        ["-recoveryblocked-e2e", "OK Crew blocked recovery surface fixture", "blocked-recovery"],
+        ["-unreachable-e2e", "OK Crew unreachable surface fixture", "unreachable"],
+      ]) {
+        run("xcrun", ["simctl", "launch", "--terminate-running-process", simulator, bundleId,
+          argument], { timeout: 300_000, log: `${prefix}-simulator.log` });
+        const surfaceDeadline = Date.now() + 30_000;
+        for (;;) {
+          const surface = snapshotE2ELog();
+          if (/\bFAIL\b/.test(surface)) throw new Error(`${prefix} surface failed:\n${surface}`);
+          if (surface.includes(marker)) {
+            run("xcrun", ["simctl", "io", simulator, "screenshot", path.join(logs, `${prefix}-surface.png`)]);
+            writeFileSync(path.join(logs, `${prefix}-e2e.log`), surface);
+            break;
+          }
+          if (Date.now() >= surfaceDeadline) throw new Error(`${prefix} surface did not appear`);
+          await sleep(250);
+        }
+      }
+      return { identifier: runtime.identifier, version: runtime.version, deviceType, markers,
+        recoverySurface: "OK Crew blocked recovery surface fixture",
+        unreachableSurface: "OK Crew unreachable surface fixture" };
     }
     await sleep(1_000);
   }

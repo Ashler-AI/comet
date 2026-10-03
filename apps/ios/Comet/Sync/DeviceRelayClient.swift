@@ -34,6 +34,7 @@ actor DeviceRelayClient {
     private let deviceId: String
     private let config: AppConfig
     private let controlSessionId: String?
+    private let controlDeploymentId: String?
 
     private var socket: URLSessionWebSocketTask?
     private var receiveTask: Task<Void, Never>?
@@ -41,18 +42,39 @@ actor DeviceRelayClient {
     private var nextId: UInt64 = 1
     private var pending: [UInt64: CheckedContinuation<Result<Data, RelayError>, Never>] = [:]
     private var connected = false
+    private var generation: UInt64 = 0
+    #if DEBUG
+    private var beforeToken: (() async -> Void)?
+    private var regressionNoNetwork = false
+    private var regressionPing: ((URLSessionWebSocketTask) -> Void)?
+    #endif
 
-    init(deviceId: String, config: AppConfig, controlSessionId: String? = nil) {
+    init(deviceId: String, config: AppConfig, controlSessionId: String? = nil,
+         controlDeploymentId: String? = nil) {
         self.deviceId = deviceId
         self.config = config
         self.controlSessionId = controlSessionId
+        self.controlDeploymentId = controlDeploymentId
     }
 
     // MARK: Lifecycle
 
-    private func connect() async throws {
-        if connected, socket != nil { return }
+    private func connect() async throws -> URLSessionWebSocketTask {
+        if connected, let socket { return socket }
+        if let controlSessionId, AppConfig.canonicalSessionId(controlSessionId) != controlSessionId {
+            throw RelayError.rpc("Crew control requires a canonical public session identity.")
+        }
+        if controlDeploymentId != nil, controlSessionId == nil {
+            throw RelayError.rpc("Crew control requires an exact session scope for this deployment.")
+        }
+        let startingGeneration = generation
+        #if DEBUG
+        await beforeToken?()
+        #endif
         guard let token = await config.currentToken() else { throw RelayError.notConnected }
+        try Task.checkCancellation()
+        if connected, let socket { return socket }
+        guard generation == startingGeneration else { throw RelayError.notConnected }
         var components = URLComponents(url: config.edgeURL.appending(path: "device/\(deviceId)/ws"),
                                        resolvingAgainstBaseURL: false)!
         components.scheme = components.scheme == "http" ? "ws" : "wss"
@@ -68,23 +90,30 @@ actor DeviceRelayClient {
                 URLQueryItem(name: "purpose", value: "control"),
                 URLQueryItem(name: "controlSessionId", value: controlSessionId),
             ]
+            if let controlDeploymentId {
+                queryItems.append(URLQueryItem(name: "controlDeploymentId", value: controlDeploymentId))
+            }
         }
         queryItems.append(URLQueryItem(name: "token", value: token))
         components.queryItems = queryItems
         let task = URLSession.shared.webSocketTask(with: components.url!)
         socket = task
+        generation &+= 1
+        let gen = generation
+        #if DEBUG
+        if regressionNoNetwork { connected = true; return task }
+        #endif
         task.resume()
         connected = true
 
         receiveTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
-                guard let sock = await self.socket else { return }
                 do {
-                    let message = try await sock.receive()
-                    await self.handleInbound(message)
+                    let message = try await task.receive()
+                    await self.handleInbound(message, generation: gen)
                 } catch {
-                    await self.teardown(error: .hostOffline)
+                    await self.teardown(error: .hostOffline, generation: gen)
                     return
                 }
             }
@@ -92,19 +121,24 @@ actor DeviceRelayClient {
         pingTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 30_000_000_000)
-                guard let self else { return }
-                await self.sendPing()
+                guard !Task.isCancelled, let self else { return }
+                await self.sendPing(socket: task, generation: gen)
             }
         }
+        return task
     }
 
     func close() {
         teardown(error: .notConnected)
     }
 
-    private func teardown(error: RelayError) {
+    private func teardown(error: RelayError, generation expected: UInt64? = nil) {
+        guard expected == nil || expected == generation else { return }
+        generation &+= 1
         receiveTask?.cancel()
         pingTask?.cancel()
+        receiveTask = nil
+        pingTask = nil
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
         connected = false
@@ -115,8 +149,12 @@ actor DeviceRelayClient {
         }
     }
 
-    private func sendPing() async {
-        try? await socket?.send(.string("ping"))
+    private func sendPing(socket: URLSessionWebSocketTask, generation gen: UInt64) async {
+        guard gen == generation, self.socket === socket else { return }
+        #if DEBUG
+        if let regressionPing { regressionPing(socket); return }
+        #endif
+        try? await socket.send(.string("ping"))
     }
 
     // MARK: RPC
@@ -126,10 +164,6 @@ actor DeviceRelayClient {
     func call<Response: Decodable>(method: String, params: [String: Any],
                                    timeoutNanoseconds: UInt64? = 10_000_000_000,
                                    preserveSuccessfulResponseOnCancellation: Bool = false) async throws -> Response {
-        defer {
-            // Command authority is bound to this fresh socket and consumed once.
-            if controlSessionId != nil { teardown(error: .notConnected) }
-        }
         for attempt in 0..<3 {
             try Task.checkCancellation()
             do {
@@ -140,7 +174,6 @@ actor DeviceRelayClient {
                 guard attempt < 2 else { throw error }
                 switch error {
                 case .hostOffline, .notConnected:
-                    teardown(error: error)
                     try await Task.sleep(nanoseconds: UInt64(attempt + 1) * 250_000_000)
                 case .rpc, .timeout:
                     throw error
@@ -156,7 +189,13 @@ actor DeviceRelayClient {
         timeoutNanoseconds: UInt64?,
         preserveSuccessfulResponseOnCancellation: Bool
     ) async throws -> Response {
-        try await connect()
+        let socket = try await connect()
+        guard connected, self.socket === socket else { throw RelayError.notConnected }
+        let gen = generation
+        defer {
+            // One-shot command authority belongs only to this connection.
+            if controlSessionId != nil { teardown(error: .notConnected, generation: gen) }
+        }
         let id = nextId
         nextId += 1
         // Always send a params object — the engine's serde rejects a missing
@@ -173,7 +212,7 @@ actor DeviceRelayClient {
                 pending[id] = continuation
                 Task {
                     guard self.pending[id] != nil else { return }
-                    await self.send(data, for: id)
+                    await self.send(data, for: id, socket: socket, generation: gen)
                 }
                 if let timeoutNanoseconds {
                     Task {
@@ -198,8 +237,8 @@ actor DeviceRelayClient {
         }
     }
 
-    private func send(_ data: Data, for id: UInt64) async {
-        guard let socket else {
+    private func send(_ data: Data, for id: UInt64, socket: URLSessionWebSocketTask, generation gen: UInt64) async {
+        guard gen == generation, self.socket === socket else {
             failCall(id: id, error: .notConnected)
             return
         }
@@ -207,7 +246,7 @@ actor DeviceRelayClient {
             try await socket.send(.data(data))
         } catch {
             failCall(id: id, error: .notConnected)
-            teardown(error: .notConnected)
+            teardown(error: .notConnected, generation: gen)
         }
     }
 
@@ -227,12 +266,14 @@ actor DeviceRelayClient {
         let frame: [String: Any] = ["id": id, "cancel": true, "params": [:]]
         guard let payload = try? JSONSerialization.data(withJSONObject: frame) else { return }
         let data = Self.encodeFrame(header: #"{"s":"rpc","k":"rpc"}"#, payload: payload)
+        let socket = self.socket
         Task { try? await socket?.send(.data(data)) }
     }
 
     // MARK: Inbound
 
-    private func handleInbound(_ message: URLSessionWebSocketTask.Message) {
+    private func handleInbound(_ message: URLSessionWebSocketTask.Message, generation gen: UInt64) {
+        guard gen == generation else { return }
         switch message {
         case .string:
             return  // "pong"
@@ -243,7 +284,7 @@ actor DeviceRelayClient {
                 handleRpcPayload(payload)
             case Self.relayKind:
                 // {"error":"host_offline"|"host_closed"|...} — link down.
-                teardown(error: .hostOffline)
+                teardown(error: .hostOffline, generation: gen)
             default:
                 return
             }
@@ -315,3 +356,89 @@ actor DeviceRelayClient {
         return (header, payload)
     }
 }
+
+#if DEBUG
+extension DeviceRelayClient {
+    static func runConnectionGenerationRegression() async -> Bool {
+        let config = AppConfig(edgeURL: URL(string: "http://127.0.0.1:1")!, mode: .dev,
+                               userId: "relay-regression", projectScope: "relay-regression",
+                               deviceId: "phone", deviceName: "Crew regression", devBearer: "fixture-only")
+        let client = DeviceRelayClient(deviceId: "host", config: config)
+        let passed = await client.exerciseConnectionGenerations()
+        await E2ERunner.log(passed
+            ? "OK Crew relay lifecycle: concurrent cold connect, stale receive/ping/error isolation, close during token wait"
+            : "FAIL Crew relay connection generation isolation")
+        return passed
+    }
+
+    private func exerciseConnectionGenerations() async -> Bool {
+        regressionNoNetwork = true
+        defer { beforeToken = nil; regressionPing = nil; close() }
+        var waiters: [CheckedContinuation<Void, Never>] = []
+        var first: Task<URLSessionWebSocketTask, Error>?
+        var second: Task<URLSessionWebSocketTask, Error>?
+        await withCheckedContinuation { ready in
+            beforeToken = {
+                await withCheckedContinuation { waiter in
+                    waiters.append(waiter)
+                    if waiters.count == 2 { ready.resume() }
+                }
+            }
+            first = Task { try await self.connect() }
+            second = Task { try await self.connect() }
+        }
+        waiters.forEach { $0.resume() }
+        do {
+            let original = try await first!.value
+            let shared = try await second!.value
+            guard original === shared, socket === original, generation == 1 else { return false }
+            beforeToken = nil
+            let oldGeneration = generation
+            close()
+            let replacement = try await connect()
+            let newGeneration = generation
+            var stalePreservedWaiter = false
+            let result: Result<Data, RelayError> = await withCheckedContinuation { continuation in
+                pending[42] = continuation
+                teardown(error: .hostOffline, generation: oldGeneration)
+                let relayError = Self.encodeFrame(header: #"{"s":"rpc","k":" relay"}"#, payload: Data())
+                handleInbound(.data(relayError), generation: oldGeneration)
+                let staleReply = Self.encodeFrame(header: #"{"s":"rpc","k":"rpc"}"#, payload: Data(#"{"id":42,"err":"stale peer"}"#.utf8))
+                handleInbound(.data(staleReply), generation: oldGeneration)
+                stalePreservedWaiter = pending[42] != nil && socket === replacement && generation == newGeneration
+                close()
+            }
+            guard stalePreservedWaiter, case .failure(.notConnected) = result else { return false }
+            // A late ping from the old socket must not send on the replacement.
+            let current = try await connect()
+            let currentGeneration = generation
+            var pings: [URLSessionWebSocketTask] = []
+            regressionPing = { pings.append($0) }
+            await sendPing(socket: original, generation: oldGeneration)
+            guard pings.isEmpty, socket === current, generation == currentGeneration else { return false }
+            await sendPing(socket: current, generation: currentGeneration)
+            guard pings.count == 1, pings[0] === current else { return false }
+            close()
+            var blocked: Task<URLSessionWebSocketTask, Error>?
+            var releaseToken: CheckedContinuation<Void, Never>?
+            await withCheckedContinuation { ready in
+                beforeToken = {
+                    await withCheckedContinuation { waiter in
+                        releaseToken = waiter
+                        ready.resume()
+                    }
+                }
+                blocked = Task { try await self.connect() }
+            }
+            close()
+            releaseToken?.resume()
+            do {
+                _ = try await blocked!.value
+                return false
+            } catch RelayError.notConnected {
+                return socket == nil && !connected
+            }
+        } catch { return false }
+    }
+}
+#endif

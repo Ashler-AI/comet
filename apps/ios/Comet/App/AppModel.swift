@@ -5,6 +5,7 @@
 import Foundation
 import Observation
 import SwiftUI
+import Network
 
 enum MobileSessionError: LocalizedError {
     case unavailable(String)
@@ -22,6 +23,7 @@ final class AppModel {
         case ready
     }
     private var scaffoldRoutes: [String: ScaffoldControlRoute] = [:]
+    private var scaffoldBrowseTargets: [String: (sandboxId: String, scope: CollaborationScope)] = [:]
     private var scaffoldPreparations: [String: ScaffoldPreparationReceipt] = [:]
 
     var phase: Phase = .signedOut
@@ -40,9 +42,11 @@ final class AppModel {
         var environment: SessionEnvironment?
         var previewTitle: String?
         var session: SessionRow?
+        var hasActiveChildren = false
     }
     private var listMetadata: [String: ListMetadata] = [:]
     private var config: AppConfig?
+    @ObservationIgnored private var networkMonitor: NWPathMonitor?
     let notifications = SessionNotifications.shared
 
     // Persisted connection settings.
@@ -80,7 +84,6 @@ final class AppModel {
 
     func restore() {
         if demo != nil || workspace != nil { return }
-        DocDisk.prune(keep: 80)
         let args = ProcessInfo.processInfo.arguments
         // Debug-rig config overrides (cfprefsd caching defeats external
         // defaults writes; the app applying them itself always sticks).
@@ -93,6 +96,29 @@ final class AppModel {
         override("-setmode") { authModeRaw = $0 }
         override("-setuser") { storedUserId = $0 }
         override("-setproject") { storedProjectScope = $0 }
+        #if DEBUG
+        if args.contains("-recoveryblocked-e2e") {
+            enterDemoMode()
+            if let chat = demo?.chats.first, let store = demo?.sessionStore(for: chat.id) {
+                store.presentRecoveryFixture()
+                launchRoute = .chat(chat.id)
+                E2ERunner.log("OK Crew blocked recovery surface fixture")
+            }
+            return
+        }
+        if args.contains("-unreachable-e2e") {
+            enterDemoMode()
+            if let chat = demo?.chats.first, let store = demo?.sessionStore(for: chat.id) {
+                store.setEntries([])
+                let stale = nowMs() - sessionStaleMs - 1
+                demo?.sessions[chat.id] = SessionRow(chatId: chat.id, deviceId: chat.deviceId,
+                    status: .working, startedAt: stale, updatedAt: stale)
+                launchRoute = .chat(chat.id)
+                E2ERunner.log("OK Crew unreachable surface fixture")
+            }
+            return
+        }
+        #endif
         if args.contains("-visibility-e2e") {
             E2ERunner.runSessionVisibility()
             E2ERunner.runAttentionTransitions()
@@ -220,6 +246,8 @@ final class AppModel {
 
     func signOut() {
         notifications.signOut()
+        networkMonitor?.cancel(); networkMonitor = nil
+        scaffoldBrowseTargets.removeAll()
         workspace?.stop()
         workspace = nil
         sessionStores.values.forEach { $0.stop() }
@@ -270,6 +298,14 @@ final class AppModel {
         }
         workspace = store
         store.start()
+        DocDisk.prune(keep: 80)
+        let monitor = NWPathMonitor()
+        networkMonitor = monitor
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard path.status == .satisfied else { return }
+            Task { @MainActor [weak self] in await self?.refreshSync() }
+        }
+        monitor.start(queue: DispatchQueue(label: "crew.sync.network"))
         phase = .ready
         drainPendingInvite()
     }
@@ -384,22 +420,18 @@ final class AppModel {
         guard phase == .ready, let workspace, workspace.connected,
               let link = pendingScaffoldLink else { return }
         pendingScaffoldLink = nil
-        guard let controller = scaffoldControllerDeviceId(chatId: link.scope.sessionId!) else {
-            openSessionError = "Connect a desktop Crew controller for this project, then open the link again. Execution stays in the remote session."
+        // Browse published state only; attach/resume belongs to a deliberate send.
+        guard let sessionId = link.scope.sessionId, let config,
+              link.scope.projectId == config.projectScope,
+              let deploymentId = link.scope.deploymentId else {
+            openSessionError = "Open this Crew session in its authenticated project and deployment."
             return
         }
-        Task { [weak self] in
-            do {
-                let route = try await workspace.openScaffoldSession(controllerDeviceId: controller,
-                                                                    sandboxId: link.sandboxId, scope: link.scope)
-                guard let self, self.workspace === workspace else { return }
-                self.scaffoldRoutes[route.projection.sessionId] = route
-                self.launchRoute = .chat(route.projection.sessionId)
-            } catch {
-                guard let self, self.workspace === workspace else { return }
-                self.openSessionError = error.localizedDescription
-            }
-        }
+        directoryRoomProjections[sessionId] = SessionRoomProjection(projectId: link.scope.projectId,
+            deploymentId: deploymentId, sessionId: sessionId)
+        scaffoldBrowseTargets[sessionId] = (link.sandboxId, link.scope)
+        _ = workspace.addSessionRef(chatId: sessionId)
+        launchRoute = .chat(sessionId)
     }
 
     /// Mirrors `comet_proto::CometInvitation::parse_deep_link`: exactly three
@@ -467,16 +499,22 @@ final class AppModel {
     }
 
     func activity(chatId: String, now: Int64) -> SessionActivity {
-        let store = sessionStores[chatId]
+        let store = sessionStores[AppConfig.canonicalSessionId(chatId) ?? chatId]
+        let cached = cachedListMetadata(chatId: chatId)
+        let environment = store?.publishedEnvironment ?? cached?.environment
+        let hasActiveChildren = store?.hasAuthoritativeProjection == true
+            ? store?.publishedHasActiveChildren ?? false
+            : (store?.publishedHasActiveChildren ?? false) || (cached?.hasActiveChildren ?? false)
+        let ownerGroup = hasActiveChildren || environment?.source.kind == "scaffold"
         return sessionActivity(
-            workspace: demo?.sessions[chatId] ?? workspace?.sessions[chatId],
-            published: store?.publishedSession ?? cachedListMetadata(chatId: chatId)?.session,
+            workspace: ownerGroup ? nil : (demo?.sessions[chatId] ?? workspace?.sessions[chatId]),
+            published: store?.publishedSession ?? cached?.session,
             transcript: store?.transcriptActivity, now: now
         )
     }
 
     func hasPendingSend(chatId: String) -> Bool {
-        !(sessionStores[chatId]?.pendingSends.isEmpty ?? true)
+        !(sessionStores[AppConfig.canonicalSessionId(chatId) ?? chatId]?.pendingSends.isEmpty ?? true)
     }
 
     func indicator(for chat: Chat) -> ChatIndicator {
@@ -877,6 +915,8 @@ final class AppModel {
 
     private func sessionStore(chatId: String, deploymentId: String?,
                               environment: SessionEnvironment?, metadataOnly: Bool = false) -> SessionStore? {
+        let originalChatId = chatId
+        let chatId = AppConfig.canonicalSessionId(chatId) ?? chatId
         if let demo {
             let store = demo.sessionStore(for: chatId)
             store.attachmentUploader = { [weak self] images in
@@ -899,7 +939,7 @@ final class AppModel {
                 existing.activateTranscript()
             }
         } else {
-            store = SessionStore(chatId: chatId, config: config, deploymentId: deploymentId,
+            store = SessionStore(chatId: originalChatId, config: config, deploymentId: deploymentId,
                                  metadataOnly: metadataOnly)
             sessionStores[chatId] = store
             if metadataOnly { metadataOnlyStores.insert(chatId) }
@@ -913,12 +953,19 @@ final class AppModel {
     private func retainTranscriptBuilder(chatId: String) {
         recentTranscriptIds.removeAll { $0 == chatId }
         recentTranscriptIds.append(chatId)
+        let visibleChatId = notifications.visibleChatId.map { AppConfig.canonicalSessionId($0) ?? $0 }
         while recentTranscriptIds.count > 3 {
             guard let index = recentTranscriptIds.firstIndex(where: {
-                $0 != chatId && $0 != notifications.visibleChatId
+                $0 != chatId && $0 != visibleChatId
             }) else { break }
             let oldest = recentTranscriptIds.remove(at: index)
             sessionStores[oldest]?.transcriptBuilder.reset()
+            if metadataReaders[oldest] == nil, oldest != visibleChatId,
+               let store = sessionStores[oldest], !store.sending {
+                store.flushToDisk()
+                sessionStores.removeValue(forKey: oldest)?.stop()
+                scaffoldRoutes.removeValue(forKey: oldest)
+            }
         }
     }
 
@@ -941,6 +988,29 @@ final class AppModel {
                                            environment: SessionEnvironment?) {
         let chatId = store.chatId
         let preparation = scaffoldPreparations[chatId]
+        store.commandHostDeviceId = workspace?.chat(id: chatId)?.deviceId ?? workspace?.sessions[chatId]?.deviceId
+        store.commandScaffoldRoute = scaffoldRoutes[chatId]
+        store.commandHostProvider = { [weak self, weak store] in
+            self?.workspace?.chat(id: chatId)?.deviceId ?? self?.workspace?.sessions[chatId]?.deviceId ?? store?.publishedSession?.deviceId
+        }
+        store.commandRouteProvider = { [weak self, weak store] in
+            guard let self, let workspace = self.workspace else { throw MobileSessionError.unavailable("Not connected") }
+            let environment = self.scaffoldEnvironment(chatId: chatId) ?? store?.publishedEnvironment ?? environment
+            let target = self.scaffoldBrowseTargets[chatId]
+            guard environment?.source.kind == "scaffold" || target != nil else { return nil }
+            guard let controller = self.scaffoldControllerDeviceId(chatId: chatId) else {
+                throw MobileSessionError.unavailable("Connect a desktop Crew controller to send this instruction.")
+            }
+            let route: ScaffoldControlRoute
+            if let environment {
+                route = try await workspace.scaffoldRoute(controllerDeviceId: controller, environment: environment)
+            } else if let target {
+                route = try await workspace.openScaffoldSession(controllerDeviceId: controller,
+                    sandboxId: target.sandboxId, scope: target.scope)
+            } else { return nil }
+            self.scaffoldRoutes[chatId] = route
+            return route
+        }
         store.attachmentUploader = { [weak self] images in
             do {
                 guard let self else { throw MobileSessionError.unavailable("Not connected") }
@@ -950,7 +1020,7 @@ final class AppModel {
                 throw error
             }
         }
-        store.commandSender = { [weak self] payload in
+        store.commandSender = { [weak self, weak store] payload, admission in
             var queued = false
             defer { if !queued { preparation?.reportFailure() } }
             guard let self, let workspace = self.workspace else {
@@ -958,15 +1028,10 @@ final class AppModel {
             }
             // Resolve from current workspace state, not the route captured when
             // a cached transcript was first opened.
-            let environment = self.scaffoldEnvironment(chatId: chatId) ?? environment
+            let environment = self.scaffoldEnvironment(chatId: chatId) ?? store?.publishedEnvironment ?? environment
             if let environment, environment.source.kind == "scaffold" {
-                guard let controllerDeviceId = self.scaffoldControllerDeviceId(chatId: chatId) else {
-                    throw MobileSessionError.unavailable("This session has no Scaffold controller")
-                }
                 try await workspace.sendScaffoldCommand(
-                    controllerDeviceId: controllerDeviceId,
-                    environment: environment, payload: payload,
-                    preparationGeneration: preparation.flatMap { $0.admitted ? nil : $0.generation }
+                    environment: environment, payload: payload, admission: admission
                 )
                 if case .run = payload {
                     preparation?.markAdmitted()
@@ -976,7 +1041,11 @@ final class AppModel {
                     }
                 }
             } else {
-                try await workspace.sendSessionCommand(chatId: chatId, payload: payload)
+                if let currentOwner = store?.publishedSession?.deviceId,
+                   let originalOwner = admission.hostDeviceId, currentOwner != originalOwner {
+                    throw MobileSessionError.unavailable("The Crew session owner changed. The original retained instruction was not sent.")
+                }
+                try await workspace.sendSessionCommand(chatId: chatId, payload: payload, admission: admission)
             }
             queued = true
         }
@@ -987,7 +1056,7 @@ final class AppModel {
     /// ordinary workspace titles remain authoritative for local renames.
     /// An explicit fallback bypasses transcript-derived previews for notifications.
     func sessionTitle(for chat: Chat, fallbackTitle: String? = nil) -> String {
-        let store = demo?.sessionStore(for: chat.id) ?? sessionStores[chat.id]
+        let store = demo?.sessionStore(for: chat.id) ?? sessionStores[AppConfig.canonicalSessionId(chat.id) ?? chat.id]
         return normalizedSessionTitle(workspace?.sessionRef(id: chat.id)?.environment?.name)
             ?? normalizedSessionTitle(scaffoldRoutes[chat.id]?.environment.name)
             ?? normalizedSessionTitle(store?.publishedEnvironment?.name)
@@ -1000,7 +1069,7 @@ final class AppModel {
     }
 
     func sessionTitle(for sessionRef: SessionRef) -> String {
-        let store = demo?.sessionStore(for: sessionRef.chatId) ?? sessionStores[sessionRef.chatId]
+        let store = demo?.sessionStore(for: sessionRef.chatId) ?? sessionStores[AppConfig.canonicalSessionId(sessionRef.chatId) ?? sessionRef.chatId]
         return normalizedSessionTitle(sessionRef.environment?.name)
             ?? normalizedSessionTitle(scaffoldRoutes[sessionRef.chatId]?.environment.name)
             ?? normalizedSessionTitle(store?.publishedEnvironment?.name)
@@ -1011,19 +1080,26 @@ final class AppModel {
     }
 
     func releaseSessionStore(chatId: String) {
-        // Opened transcript stores stay warm; row metadata has a separate lease.
+        let chatId = AppConfig.canonicalSessionId(chatId) ?? chatId
+        // Durable intents no longer require a live doc/socket while off screen.
+        guard metadataReaders[chatId] == nil, !recentTranscriptIds.contains(chatId),
+              let store = sessionStores[chatId], !store.sending else { return }
+        store.flushToDisk()
+        sessionStores.removeValue(forKey: chatId)?.stop()
+        scaffoldRoutes.removeValue(forKey: chatId)
     }
 
     /// Sweep removed memberships and refresh only rows actually on screen.
     /// Empty bootstrap projections and stores serving a send/navigation stay safe.
     func preloadSessionMetadata() {
-        let visible = workspace?.lists.memberIds ?? []
+        let visible = Set((workspace?.lists.memberIds ?? []).map { AppConfig.canonicalSessionId($0) ?? $0 })
+        let visibleChatId = notifications.visibleChatId.map { AppConfig.canonicalSessionId($0) ?? $0 }
         // An empty projection can be bootstrap/recovery, not a membership
         // revocation. Never invalidate a store still used by an open view or
         // an in-flight launch/send; authoritative room access stays server-side.
         if !visible.isEmpty {
             for id in Array(sessionStores.keys) where !visible.contains(id) {
-                guard id != notifications.visibleChatId,
+                guard id != visibleChatId,
                       scaffoldRoutes[id] == nil,
                       let store = sessionStores[id], !store.sending,
                       store.pendingSends.isEmpty else { continue }
@@ -1044,6 +1120,7 @@ final class AppModel {
     }
 
     func retainListMetadata(chatId: String) {
+        let chatId = AppConfig.canonicalSessionId(chatId) ?? chatId
         guard demo == nil else { return }
         metadataReaders[chatId, default: 0] += 1
         pendingMetadataReleases.remove(chatId)
@@ -1058,12 +1135,15 @@ final class AppModel {
     }
 
     private func cachedListMetadata(chatId: String) -> ListMetadata? {
+        let chatId = AppConfig.canonicalSessionId(chatId) ?? chatId
+        guard sessionStores[chatId]?.hasAuthoritativeProjection != true else { return nil }
         guard let cached = listMetadata[chatId],
               cached.deploymentId == scaffoldEnvironment(chatId: chatId)?.scope.deploymentId else { return nil }
         return cached
     }
 
     func releaseListMetadata(chatId: String) {
+        let chatId = AppConfig.canonicalSessionId(chatId) ?? chatId
         guard let readers = metadataReaders[chatId] else { return }
         if readers > 1 {
             metadataReaders[chatId] = readers - 1
@@ -1115,11 +1195,13 @@ final class AppModel {
               store.pendingSends.isEmpty else { return }
         // Retain labels and timestamped activity, not a document/socket per row.
         // sessionActivity still expires stale publications while off screen.
-        let previous = cachedListMetadata(chatId: chatId)
-        listMetadata[chatId] = ListMetadata(deploymentId: store.deploymentId,
-                                            environment: store.publishedEnvironment ?? previous?.environment,
-                                            previewTitle: store.previewTitle ?? previous?.previewTitle,
-                                            session: store.publishedSession ?? previous?.session)
+        if store.hasAuthoritativeProjection {
+            listMetadata[chatId] = ListMetadata(deploymentId: store.deploymentId,
+                                                environment: store.publishedEnvironment,
+                                                previewTitle: store.previewTitle,
+                                                session: store.publishedSession,
+                                                hasActiveChildren: store.publishedHasActiveChildren)
+        }
         metadataOnlyStores.remove(chatId)
         sessionStores.removeValue(forKey: chatId)
         store.stop()
@@ -1242,3 +1324,72 @@ extension AppModel {
         return true
     }
 }
+
+#if DEBUG
+extension AppModel {
+    static func runMetadataClearRegression() async -> Bool {
+        let probe = AppModel()
+        let config = AppConfig(edgeURL: URL(string: "http://127.0.0.1:1")!, mode: .dev,
+                               userId: "metadata-clear", projectScope: "metadata-clear",
+                               deviceId: "phone", deviceName: "Crew regression")
+        let chatId = UUID().uuidString.lowercased()
+        let chat = Chat(id: chatId, deviceId: "host", archived: false, createdAt: 0)
+        let initial = SessionStore(chatId: chatId, config: config, offline: true, metadataOnly: true)
+        let reopened = SessionStore(chatId: chatId, config: config, offline: true, metadataOnly: true)
+        defer { initial.stop(); reopened.stop() }
+        do {
+            let source = LoroDoc()
+            let timestamp = nowMs()
+            let value: [String: Any] = ["chatId": chatId, "sessionId": chatId,
+                "ownerSubject": config.userId, "ownerDeviceId": "host", "source": "native",
+                "createdAt": timestamp, "updatedAt": timestamp, "status": "errored",
+                "environment": ["name": "Previous owner", "source": ["kind": "native"],
+                    "ownerPrincipal": config.userId, "scope": ["projectId": config.projectScope, "sessionId": chatId]]]
+            let anchor = try source.getList(id: "publications").pushContainer(child: LoroMap())
+            try anchor.insert(key: "record", v: LoroValue.fromJSON([
+                "id": UUID().uuidString.lowercased(), "schemaVersion": 1, "kind": "agentSession",
+                "publishedBy": config.userId, "publishedAt": timestamp, "value": value]))
+            let message = try source.getList(id: "messages").pushContainer(child: LoroMap())
+            try message.insert(key: "id", v: "title")
+            try message.insert(key: "role", v: "user")
+            try message.insert(key: "parts", v: LoroValue.fromJSON([["id": "text", "kind": "text", "text": "Previous preview"]]))
+            source.commit()
+            probe.sessionStores[chatId] = initial
+            probe.metadataOnlyStores.insert(chatId)
+            try initial.receiveAuthoritativeFixture(source)
+            guard await E2ERunner.poll(timeout: 5, label: "authoritative metadata fixture", {
+                initial.hasAuthoritativeProjection ? true : nil
+            }) != nil, initial.previewTitle == "Previous preview",
+                  probe.activity(chatId: chatId, now: timestamp).status == .errored,
+                  probe.sessionTitle(for: chat) == "Previous owner" else { return false }
+            probe.releaseInactiveMetadata(chatId: chatId)
+            guard probe.sessionStores[chatId] == nil,
+                  probe.sessionTitle(for: chat) == "Previous owner" else { return false }
+            probe.sessionStores[chatId] = reopened
+            probe.metadataOnlyStores.insert(chatId)
+            guard probe.sessionTitle(for: chat) == "Previous owner",
+                  probe.activity(chatId: chatId, now: timestamp).status == .errored else { return false }
+            // An unfinished reopen/eviction must not drop the retained labels.
+            probe.releaseInactiveMetadata(chatId: chatId)
+            guard probe.sessionTitle(for: chat) == "Previous owner" else { return false }
+            probe.sessionStores[chatId] = reopened
+            probe.metadataOnlyStores.insert(chatId)
+            try reopened.receiveAuthoritativeFixture(LoroDoc())
+            guard await E2ERunner.poll(timeout: 5, label: "authoritative metadata clear", {
+                reopened.hasAuthoritativeProjection ? true : nil
+            }) != nil, reopened.previewTitle == nil, reopened.publishedEnvironment == nil,
+                  reopened.publishedSession == nil,
+                  probe.sessionTitle(for: chat) == chat.displayTitle,
+                  probe.activity(chatId: chatId, now: timestamp).status == nil else { return false }
+            probe.releaseInactiveMetadata(chatId: chatId)
+            guard probe.sessionTitle(for: chat) == chat.displayTitle,
+                  probe.activity(chatId: chatId, now: timestamp).status == nil,
+                  probe.listMetadata[chatId]?.environment == nil,
+                  probe.listMetadata[chatId]?.previewTitle == nil,
+                  probe.listMetadata[chatId]?.session == nil else { return false }
+            E2ERunner.log("OK Crew metadata clear: cached fallback survives unfinished reopen; authoritative nil clears owner title and status before and after eviction")
+            return true
+        } catch { E2ERunner.log("FAIL Crew metadata clear: \(error)"); return false }
+    }
+}
+#endif

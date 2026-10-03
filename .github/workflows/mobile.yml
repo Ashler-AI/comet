@@ -11,12 +11,17 @@ on:
         default: staging
         type: choice
         options: [staging, production]
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        default: staging
 
 permissions:
   contents: read
 
 concurrency:
-  group: mobile-${{ github.ref }}-${{ inputs.environment || 'staging' }}
+  group: ${{ github.workflow }}-mobile-${{ github.ref }}-${{ inputs.environment || 'staging' }}
   cancel-in-progress: true
 
 env:

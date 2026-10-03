@@ -68,7 +68,8 @@ final class AppConfig: @unchecked Sendable {
         let identity = [edgeURL.absoluteString, mode.rawValue, userId, projectScope,
                         roomId, deploymentId ?? ""]
         let bytes = Data(identity.map { "\($0.utf8.count):\($0)" }.joined().utf8)
-        return "scoped-" + SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        let scoped = "scoped-" + SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        return roomId.hasPrefix("ws4/") ? "workspace-" + scoped : scoped
     }
 
     /// Current revocable Scaffold bearer. The control plane validates it on
@@ -93,9 +94,14 @@ final class AppConfig: @unchecked Sendable {
         return url
     }
 
+    static func canonicalSessionId(_ id: String) -> String? {
+        guard let uuid = UUID(uuidString: id) else { return nil }
+        return uuid.uuidString.lowercased()
+    }
+
     func sessionSocketURL(chatId: String, deploymentId: String? = nil) async -> URL? {
-        guard let token = await currentToken() else { return nil }
-        var url = wsBase.appending(path: "session/\(chatId)/ws")
+        guard let sessionId = Self.canonicalSessionId(chatId), let token = await currentToken() else { return nil }
+        var url = wsBase.appending(path: "session/\(sessionId)/ws")
         url.append(queryItems: [URLQueryItem(name: "token", value: token)])
         // Local-controller sessions use the project/session room. A deployment
         // selects a different physical room and must come from the session's

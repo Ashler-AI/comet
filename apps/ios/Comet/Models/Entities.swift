@@ -303,10 +303,10 @@ func sessionActivity(
     }
     var status = effectiveStatus(transcript, now: now)
     if transcript.status == .working, status != .working {
-        // Match desktop agent_indicator_with_transcript for remote owners:
-        // the current streaming turn outlives a one-shot working publication.
-        // Local fallback still expires when neither room delivers activity.
-        guard usesPublication, row?.status == .working else { return base }
+        // An owner heartbeat can keep a quiet stream working. Neither stale
+        // content nor a stale publication is proof that its owner is alive.
+        guard usesPublication, let row, row.status == .working,
+              effectiveStatus(row, now: now) == .working else { return base }
         status = .working
     }
     if let row, row.status == .working || row.status == .awaitingInput {
