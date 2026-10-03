@@ -645,6 +645,37 @@ impl ScaffoldClient {
         response.sandbox.into_environment(scope.clone())
     }
 
+    pub(crate) async fn inspect_agent_route(
+        &self,
+        sandbox_id: &str,
+        scope: &CollaborationScope,
+        cancellation: &CancellationToken,
+    ) -> Result<(SessionEnvironment, AgentRoute), ScaffoldError> {
+        self.validate_scope(scope)?;
+        let bearer = self.bearer.token().await.filter(|token| !token.trim().is_empty())
+            .ok_or(ScaffoldError::AuthUnavailable)?;
+        let request = self.http.get(self.sandbox_url(sandbox_id, None)?)
+            .bearer_auth(&bearer).header(reqwest::header::ACCEPT, "application/json");
+        let read = async {
+            let response = request.send().await.map_err(ScaffoldError::from)?;
+            drop(bearer);
+            let mut response: SandboxEnvelope = serde_json::from_value(Self::bounded_json(response).await?)
+                .map_err(|error| ScaffoldError::InvalidResponse(error.to_string()))?;
+            if response.sandbox.id != sandbox_id {
+                return Err(ScaffoldError::InvalidResponse("preserved route returned a different sandbox".into()));
+            }
+            let route = response.sandbox.agent_route.take()
+                .ok_or_else(|| ScaffoldError::InvalidResponse("preserved sandbox has no pinned agent route".into()))?;
+            route.validate().map_err(|error| ScaffoldError::InvalidResponse(error.into()))?;
+            Ok((response.sandbox.into_environment(scope.clone())?, route))
+        };
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(ScaffoldError::Cancelled),
+            result = read => result,
+        }
+    }
+
     pub(crate) async fn create(
         &self,
         scope: &CollaborationScope,
@@ -1501,6 +1532,7 @@ struct ScaffoldSandbox {
     #[serde(default)]
     links: ScaffoldEnvironmentLinks,
     comet_runtime_profile: Option<ScaffoldCometRuntimeProfile>,
+    agent_route: Option<AgentRoute>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -130,13 +130,7 @@ async fn respond_to_route_receipt(connection: tokio::net::TcpStream, model: &str
     let mut reader = BufReader::new(connection);
     let mut line = String::new();
     reader.read_line(&mut line).await.unwrap();
-    assert_eq!(
-        line,
-        format!(
-            "GET /api/agent-auth/routes/{} HTTP/1.1\r\n",
-            recovery_request().recover_chat_id
-        )
-    );
+    let supported = line.trim() == "GET /api/code-sandboxes/sandbox-a HTTP/1.1";
     loop {
         line.clear();
         reader.read_line(&mut line).await.unwrap();
@@ -144,16 +138,16 @@ async fn respond_to_route_receipt(connection: tokio::net::TcpStream, model: &str
             break;
         }
     }
-    let body = serde_json::json!({
-            "logicalSessionId": recovery_request().recover_chat_id, "routingMode": "automatic",
-            "route": { "provider": "openai", "model": model, "backend": "oauth",
-                "createdAt": "2026-08-10T00:00:00Z", "updatedAt": "2026-08-10T00:00:00Z", "expiresAt": "2026-08-10T01:00:00Z" },
-            "grant": { "id": "grant-a", "provider": "openai", "model": model,
-                "harness": "codex", "source": "comet-local", "lifecycleEpoch": 1,
-                "environment": "local", "routingMode": "automatic", "backend": "oauth",
-                "createdAt": "2026-08-10T00:00:00Z", "expiresAt": "2026-08-10T01:00:00Z" }
-        }).to_string();
-    reader.get_mut().write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+    let body = serde_json::json!({ "ok": true, "sandbox": {
+        "id": "sandbox-a", "kind": "remote_code", "runtimeProfile": "comet_remote",
+        "status": "ready", "lifecycleEpoch": 1, "ownerEmail": "owner@example.com",
+        "databaseEnvironment": "local", "createdAt": "2026-08-10T00:00:00Z", "updatedAt": "2026-08-10T00:00:00Z",
+        "cometRuntimeProfile": { "version": "scaffold.comet-runtime.v1", "projectId": "project-a",
+            "deploymentId": "deployment-a", "sessionId": recovery_request().recover_chat_id, "sandboxId": "sandbox-a" },
+        "agentRoute": { "provider": "openai", "model": model, "fallback": "disabled", "routingMode": "automatic" }
+    }}).to_string();
+    let status = if supported { "200 OK" } else { "404 Not Found" };
+    reader.get_mut().write_all(format!("HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
 }
 
 #[tokio::test]

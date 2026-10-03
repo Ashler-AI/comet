@@ -178,8 +178,8 @@ impl EngineRpc {
         }
         let cancellation = CancellationToken::new();
         let _cancel_on_drop = cancellation.clone().drop_guard();
-        if recovery_sandbox.is_some() {
-            self.validate_recovery_route(&params.scope, &params.agent_route, &cancellation)
+        if let Some(sandbox_id) = recovery_sandbox {
+            self.validate_recovery_route(sandbox_id, &params.scope, &params.agent_route, &cancellation)
                 .await?;
         }
         let mut startup = PreparationOutcome::begin(self.workspace.clone(), session_id)?;
@@ -203,7 +203,7 @@ impl EngineRpc {
                     }
                     self.require_unadmitted_handoff(expected_scope.session_id.as_deref().unwrap())?;
                     if matches!(&control, ScaffoldEnvironmentControl::HandoffOmpSession { .. }) {
-                        self.validate_recovery_route(expected_scope, expected_route, cancellation).await?;
+                        self.validate_recovery_route(sandbox_id, expected_scope, expected_route, cancellation).await?;
                     }
                     // Check the persisted owner reference again before each external control.
                     let current = self.workspace.doc().session_ref(&actor.id, expected_scope.session_id.as_deref().unwrap())
@@ -518,27 +518,20 @@ impl EngineRpc {
 
     async fn validate_recovery_route(
         &self,
+        sandbox_id: &str,
         scope: &CollaborationScope,
         expected: &AgentRoute,
         cancellation: &CancellationToken,
     ) -> Result<(), RpcError> {
-        let session_id = scope
-            .session_id
-            .as_deref()
-            .expect("validated session identity");
-        let receipt = self
-            .scaffold()?
-            .client()
-            .get_agent_route_receipt(session_id, cancellation)
-            .await
-            .map_err(|error| {
-                recovery_error(&format!("cannot verify the preserved agent route: {error}"))
-            })?;
-        if receipt.logical_session_id != session_id
-            || receipt.route.provider != expected.provider
-            || receipt.route.model != expected.model
-            || receipt.routing_mode != expected.routing_mode
-            || receipt.requested_account_id != expected.account_id
+        let (environment, route) = self.scaffold()?.client()
+            .inspect_agent_route(sandbox_id, scope, cancellation).await
+            .map_err(|error| recovery_error(&format!("cannot verify the preserved agent route: {error}")))?;
+        let state = self.auth()?.state();
+        let actor = state.user().ok_or_else(|| recovery_error("authenticated owner is unavailable"))?;
+        if environment.owner_principal != actor.id && environment.owner_principal != actor.email {
+            return Err(recovery_error("preserved agent route belongs to a different owner"));
+        }
+        if route != *expected
         {
             return Err(recovery_error(
                 "preserved target's agent route differs from the source model; restore the original source model, do not create a replacement",
