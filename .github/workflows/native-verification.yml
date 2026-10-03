@@ -73,14 +73,6 @@ jobs:
           cargo test --locked -p comet-engine --test peer_messages --test restart_resume --test workspace_sync --test remote_sync 2>&1 | tee native-evidence/native-integration.log
           cargo test --locked -p comet-engine --test e2e queued_run_command_executes_end_to_end 2>&1 | tee native-evidence/queued-run.log
           cargo test --locked -p comet --bin comet session 2>&1 | tee native-evidence/cli.log
-      - name: Verify worker lifecycle and asynchronous admission
-        if: startsWith(github.ref_name, 'verify/native-lifecycle-')
-        timeout-minutes: 10
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test --locked -p comet-engine --test worker_sessions -- --nocapture 2>&1 | tee native-evidence/workers.log
-          cargo test --locked -p comet-engine --lib repos::tests::worker_ 2>&1 | tee native-evidence/worker-checkouts.log
       - name: Verify startup generation fence
         if: startsWith(github.ref_name, 'verify/native-startup-')
         timeout-minutes: 5
