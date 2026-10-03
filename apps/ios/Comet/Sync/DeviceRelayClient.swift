@@ -44,7 +44,8 @@ actor DeviceRelayClient {
     private var connected = false
     private var generation: UInt64 = 0
     #if DEBUG
-    private var beforeToken: (() async -> Void)?
+    private var regressionTokenGate: (expected: Int, ready: CheckedContinuation<Void, Never>,
+                                      waiters: [CheckedContinuation<Void, Never>])?
     private var regressionNoNetwork = false
     private var regressionPing: ((URLSessionWebSocketTask) -> Void)?
     #endif
@@ -69,7 +70,14 @@ actor DeviceRelayClient {
         }
         let startingGeneration = generation
         #if DEBUG
-        await beforeToken?()
+        if regressionTokenGate != nil {
+            await withCheckedContinuation { waiter in
+                regressionTokenGate?.waiters.append(waiter)
+                if let gate = regressionTokenGate, gate.waiters.count == gate.expected {
+                    gate.ready.resume()
+                }
+            }
+        }
         #endif
         guard let token = await config.currentToken() else { throw RelayError.notConnected }
         try Task.checkCancellation()
@@ -371,28 +379,27 @@ extension DeviceRelayClient {
         return passed
     }
 
+    private func releaseRegressionTokenGate() {
+        guard let gate = regressionTokenGate else { return }
+        regressionTokenGate = nil
+        gate.waiters.forEach { $0.resume() }
+    }
+
     private func exerciseConnectionGenerations() async -> Bool {
         regressionNoNetwork = true
-        defer { beforeToken = nil; regressionPing = nil; close() }
-        var waiters: [CheckedContinuation<Void, Never>] = []
+        defer { releaseRegressionTokenGate(); regressionPing = nil; close() }
         var first: Task<URLSessionWebSocketTask, Error>?
         var second: Task<URLSessionWebSocketTask, Error>?
         await withCheckedContinuation { ready in
-            beforeToken = {
-                await withCheckedContinuation { waiter in
-                    waiters.append(waiter)
-                    if waiters.count == 2 { ready.resume() }
-                }
-            }
+            regressionTokenGate = (2, ready, [])
             first = Task { try await self.connect() }
             second = Task { try await self.connect() }
         }
-        waiters.forEach { $0.resume() }
+        releaseRegressionTokenGate()
         do {
             let original = try await first!.value
             let shared = try await second!.value
             guard original === shared, socket === original, generation == 1 else { return false }
-            beforeToken = nil
             let oldGeneration = generation
             close()
             let replacement = try await connect()
@@ -420,18 +427,12 @@ extension DeviceRelayClient {
             guard pings.count == 1, pings[0] === current else { return false }
             close()
             var blocked: Task<URLSessionWebSocketTask, Error>?
-            var releaseToken: CheckedContinuation<Void, Never>?
             await withCheckedContinuation { ready in
-                beforeToken = {
-                    await withCheckedContinuation { waiter in
-                        releaseToken = waiter
-                        ready.resume()
-                    }
-                }
+                regressionTokenGate = (1, ready, [])
                 blocked = Task { try await self.connect() }
             }
             close()
-            releaseToken?.resume()
+            releaseRegressionTokenGate()
             do {
                 _ = try await blocked!.value
                 return false
