@@ -618,6 +618,17 @@ impl WorkspaceHost {
             .and_then(|reference| reference.startup))
     }
 
+    pub(crate) fn session_environment(
+        &self,
+        chat_id: &str,
+    ) -> Result<Option<SessionEnvironment>, EngineError> {
+        Ok(self
+            .inner
+            .doc
+            .session_ref(&self.inner.config.user_id, chat_id)?
+            .and_then(|reference| reference.environment))
+    }
+
     pub(crate) fn report_scaffold_preparation_failure(
         &self,
         chat_id: &str,

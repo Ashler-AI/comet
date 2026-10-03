@@ -601,6 +601,23 @@ distinct Crew chat. The receipt contains `chatId`, `sandboxId`, `commandId`, and
 `environment`; it confirms command admission, not remote task completion.
 Monitor the returned chat in Crew, not standalone `handoff.*` lifecycle tools.
 
+Starting with **0.1.137**, recover a failed import into its preserved target:
+
+```bash
+"$COMET_EXECUTABLE" session handoff "$COMET_SESSION_ID" \
+  --prompt-file "$PROMPT_FILE" --database-environment local \
+  --recover-chat-id "$TARGET_CHAT_ID" --recover-sandbox-id "$TARGET_SANDBOX_ID"
+```
+
+Both target flags are required. Recovery uses a separate RPC so older engines
+refuse rather than silently creating another sandbox. The accepted owner,
+project/deployment/session, sandbox, database and agent route must still match.
+Imported native context, admitted commands and active runs refuse recovery;
+read-only peer diagnostics do not. A bounded native-ID probe checks the active
+profile before any worktree replacement, including renamed journals and lost
+import responses. Incomplete inspection fails closed. Preparation and initial
+command admission share the same scope gate, including ordinary Start/Run RPCs.
+
 Handoff chats publish running, waiting, and terminal status under their chat ID,
 including follow-up turns. Mobile follow-ups use a desktop controller, not the
 ephemeral sandbox host: attachment resumes a paused sandbox and confirms its
@@ -617,10 +634,14 @@ the Git delta after that commit; matching HEADs transfer no Git objects. Dirty a
 a separate verified overlay. The 256 MiB archive limit is unchanged.
 Archive uploads have a five-minute total request deadline, separate from the
 30-second control-request deadline. Cancellation still stops an in-flight upload.
-The worktree verifier runs from a temporary sandbox file rather than exceeding
-the runtime's 16 KiB exec-argument limit with inline program text.
+The worktree and native-context verifiers run from temporary sandbox files rather
+than exceeding the runtime's 16 KiB exec-argument limit with inline program text.
 The reconstructed checkout has a separate 1 GiB byte budget; compressed Git
 objects and archive bytes are checked independently before checkout publication.
+Files and symlinks have a 25,000-item budget; real directories have a separate
+25,000-item budget. Paths, symlinks, object expansion and history remain bounded.
+Recovery's read-only journal scan checks at most 4,096 entries, 64 KiB per header
+and 16 MiB aggregate header bytes within a 10-second exec deadline.
 
 Scaffold reconstructs the exact source HEAD at `/workspace/crew-handoff`, preserving
 a nested source cwd. Delta checkouts borrow the provisioned platform repository's
