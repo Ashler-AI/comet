@@ -1382,11 +1382,9 @@ export class SessionRoom implements DurableObject {
     // Workspace/unknown rooms must preserve accepted history even after repeated
     // resource failures: no assumption that another device retains every op.
     let attempts = Number(this.getMeta("replayAttempts") ?? "0");
-    if (attempts >= REPLAY_CRASH_LIMIT) {
-      if (this.retainsWorkspaceHistory()) {
-        this.closeSocketsForRoomReset();
-        throw new Error("workspace replay failed repeatedly; retained history requires recovery");
-      }
+    // Replay failures must not permanently lock a workspace, even after a
+    // transient resource failure or a deployment that fixes replay itself.
+    if (attempts >= REPLAY_CRASH_LIMIT && !this.retainsWorkspaceHistory()) {
       this.dropLog();
       // Boot every attached socket, exactly like POST /reset-log. The
       // automated wedge break used to swap the doc out from UNDER live
@@ -1414,35 +1412,34 @@ export class SessionRoom implements DurableObject {
     const doc = new LoroDoc();
     const snapshot = this.blobs.get("snapshot");
     let pendingEnds: Map<PeerID, number> | undefined;
-    const replay = (bytes: Uint8Array): void => {
-      const imported = doc.import(bytes);
+    const replay = (bytes: Uint8Array | Uint8Array[]): void => {
+      const imported = Array.isArray(bytes) ? doc.importBatch(bytes) : doc.import(bytes);
       for (const [peer, span] of imported.pending ?? []) {
         pendingEnds ??= new Map();
         pendingEnds.set(peer, Math.max(pendingEnds.get(peer) ?? 0, span.end));
       }
     };
-    if (snapshot && snapshot.length > 0) {
+    // Bootstrap the snapshot separately: batching it with dependent deltas
+    // can leave shallow snapshots unresolved in Loro 1.13.9.
+    if (snapshot?.length) {
       try {
         replay(snapshot);
       } catch (error) {
         return await this.rejectPersistedLoroState(doc, "snapshot", error);
       }
     }
+    const updates: Uint8Array[] = [];
     let rows = 0;
     for (const row of this.ctx.storage.sql.exec("SELECT bytes FROM updates ORDER BY seq")) {
       rows++;
-      try {
-        replay(new Uint8Array(row.bytes as ArrayBuffer));
-      } catch (error) {
-        return await this.rejectPersistedLoroState(doc, `update row ${rows}`, error);
-      }
+      updates.push(new Uint8Array(row.bytes as ArrayBuffer));
     }
-    for (const update of this.pending) {
-      try {
-        replay(update);
-      } catch (error) {
-        return await this.rejectPersistedLoroState(doc, "buffered update", error);
-      }
+    for (const update of this.pending) updates.push(update);
+    try {
+      // Materialize all deltas once, not once per small persisted update.
+      replay(updates);
+    } catch (error) {
+      return await this.rejectPersistedLoroState(doc, "update log", error);
     }
     this.setMeta("replayAttempts", "0");
     // Scope the crash budget to the replay ALONE: without this second sync, a

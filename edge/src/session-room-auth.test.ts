@@ -1486,6 +1486,38 @@ describe("SessionRoom chat authorization", () => {
     }
   });
 
+  it("recovers workspace discovery after repeated replay failures without resetting history", async () => {
+    const source = new LoroDoc();
+    const mirror = new LoroDoc();
+    const sql = new MemorySql();
+    let version: VersionVector | undefined;
+    try {
+      source.getMap("devices").set("host", { id: "host", name: "Desktop", platform: "macos" });
+      source.getMap("chats").set("chat", { id: "chat", deviceId: "host", title: "Existing session" });
+      source.commit();
+      sql.putBlob("snapshot", source.export({ mode: "snapshot" }));
+      version = source.oplogVersion();
+      source.getMap("sessionRefs").set("6:user-a:chat", { chatId: "chat", userId: "user-a", addedAt: 1 });
+      source.commit();
+      sql.appendUpdate(source.export({ mode: "update", from: version }));
+      sql.meta.set("chatId", "ws4/project-a");
+      sql.meta.set("roomKind", "workspace");
+      sql.meta.set("replayAttempts", "3");
+
+      const socket = await join(makeRoom(sql).room, "user-a", "ws4/project-a");
+      for (const bytes of socket.sent) {
+        const message = decode(bytes);
+        if (message.type === MessageType.DocUpdate) mirror.importBatch(message.updates);
+      }
+      expect(mirror.toJSON()).toEqual(source.toJSON());
+      expect(sql.meta.get("replayAttempts")).toBe("0");
+      expect(sql.hasBlob("snapshot")).toBe(true);
+      expect(sql.updateCount()).toBe(1);
+    } finally {
+      version?.free(); mirror.free(); source.free();
+    }
+  });
+
   it("preserves rejected workspace history through replay failures and cold restart", async () => {
     const corruptSnapshot = new Uint8Array(
       readFileSync(
