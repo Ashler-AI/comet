@@ -9,6 +9,15 @@ import Loro
 import os
 
 enum DocDisk {
+    /// Identity-local navigation metadata, never execution or lifecycle authority.
+    struct BrowsePointer: Codable, Hashable {
+        var projection: SessionRoomProjection
+        var sandboxId: String?
+        var scope: CollaborationScope {
+            CollaborationScope(projectId: projection.projectId,
+                deploymentId: projection.deploymentId, sessionId: projection.sessionId)
+        }
+    }
     struct RecordIntent: Codable {
         var id = UUID().uuidString.lowercased()
         var root: String
@@ -153,6 +162,7 @@ enum DocDisk {
         let url = intentURL(for: id).appendingPathExtension("\(commandId).outcome")
         try JSONEncoder().encode(value).write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
     }
+
     /// Retain legacy/blocked records before adopting an unrelated ancestry.
     static func retainRecoveryOriginal(doc: LoroDoc, id: String) throws {
         let url = self.url(for: id).appendingPathExtension("recovery")

@@ -72,6 +72,14 @@ final class SessionStore {
     @ObservationIgnored var attachmentUploader: (([MobileImageAttachment]) async throws -> [String])?
     @ObservationIgnored private var uploadedImages: [UUID: String] = [:]
     @ObservationIgnored private var submittedDrafts: [String: SubmittedDraft] = [:]
+    @ObservationIgnored private var terminalControlOutcomes: [String: ControlOutcome] = [:]
+    private struct ControlOutcome: Decodable {
+        var messageId: String
+        var prompt: String
+        var terminal: Bool
+        var failure: String?
+        var control: SubmittedDraft.Control?
+    }
     @ObservationIgnored private var retryDraft: SubmittedDraft?
 
     private struct SubmittedDraft: Codable {
@@ -134,7 +142,12 @@ final class SessionStore {
             admission = try c.decodeIfPresent(MobileCommandAdmission.self, forKey: .admission)
             steerPrompt = try c.decodeIfPresent(String.self, forKey: .steerPrompt)
             control = try c.decodeIfPresent(Control.self, forKey: .control)
-            images = try c.decode([Image].self, forKey: .images).map {
+            let retainedImages = try c.decode([Image].self, forKey: .images)
+            guard retainedImages.count <= MobileImageAttachment.maximumCount,
+                  retainedImages.allSatisfy({ $0.bytes.count <= MobileImageAttachment.maximumImageBytes }) else {
+                throw MobileSessionError.unavailable("The retained Crew images exceed their safe limits.")
+            }
+            images = try retainedImages.map {
                 guard let preview = UIImage(data: $0.bytes) else {
                     throw MobileSessionError.unavailable("A retained Crew image cannot be decoded; its original is still on disk.")
                 }
@@ -183,7 +196,9 @@ final class SessionStore {
 
     var retainedControls: [(id: String, prompt: String, terminal: Bool)] {
         _ = revision
-        return submittedDrafts.values.filter { $0.control != nil }.sorted { $0.createdAt < $1.createdAt }.map { ($0.messageId, $0.prompt, $0.terminal) }
+        let pending = submittedDrafts.values.filter { $0.control != nil }.sorted { $0.createdAt < $1.createdAt }.map { ($0.messageId, $0.prompt, $0.terminal) }
+        let terminal = terminalControlOutcomes.values.sorted { $0.messageId < $1.messageId }.map { ($0.messageId, $0.prompt, true) }
+        return pending + terminal
     }
 
     func retryControl(_ id: String) {
@@ -199,16 +214,60 @@ final class SessionStore {
         revision &+= 1
     }
 
+    // Count immutable attachments once across retained sends and the composer.
+    // Reusing an identity for different bytes or metadata is never a retry.
+    private static func validateAttachments(_ groups: [[MobileImageAttachment]]) throws {
+        var unique: [UUID: MobileImageAttachment] = [:]
+        var total = 0
+        for images in groups {
+            guard images.count <= MobileImageAttachment.maximumCount,
+                  Set(images.map(\.id)).count == images.count else {
+                throw MobileSessionError.unavailable("Crew retained too many or duplicate images in one instruction.")
+            }
+            for image in images {
+                guard image.bytes.count <= MobileImageAttachment.maximumImageBytes else {
+                    throw MobileSessionError.unavailable("Crew retained an image larger than 24 MB.")
+                }
+                if let original = unique[image.id] {
+                    guard original.filename == image.filename, original.bytes == image.bytes else {
+                        throw MobileSessionError.unavailable("Crew retained conflicting payloads for one attachment identity.")
+                    }
+                } else {
+                    guard image.bytes.count <= MobileImageAttachment.maximumTotalBytes - total else {
+                        throw MobileSessionError.unavailable("Crew retains too many unacknowledged images. Resolve those sends before attaching more.")
+                    }
+                    total += image.bytes.count
+                    unique[image.id] = image
+                }
+            }
+        }
+    }
+
+    private func validateDrafts(_ drafts: [SubmittedDraft]) throws {
+        guard drafts.count <= 17,
+              Set(drafts.map(\.messageId)).count == drafts.count,
+              drafts.allSatisfy({ $0.admission?.scope == nil || ($0.admission?.scope?.projectId == config.projectScope && $0.admission?.scope?.deploymentId == deploymentId && $0.admission?.scope?.sessionId == chatId) }),
+              drafts.allSatisfy({ $0.messageId == "composer" || UUID(uuidString: $0.messageId) != nil }),
+              drafts.allSatisfy({ $0.admission == nil || ($0.admission?.commandId == $0.messageId && $0.admission?.issuedAt == $0.createdAt && $0.admission?.expiresAt == $0.expiresAt) }),
+              drafts.allSatisfy({ let lifetime = $0.expiresAt.subtractingReportingOverflow($0.createdAt); return !lifetime.overflow && lifetime.partialValue > 0 && lifetime.partialValue <= 86_400_000 }) else {
+            throw MobileSessionError.unavailable("The retained Crew journal has conflicting or oversized records.")
+        }
+        try Self.validateAttachments(drafts.map(\.images))
+    }
+
     private func persistDrafts() throws {
         guard !offline, !metadataOnly, AppConfig.canonicalSessionId(chatId) != nil else { return }
         guard !intentLoadBlocked else { throw MobileSessionError.unavailable("Crew draft recovery is blocked; the original journal is retained.") }
         var drafts = submittedDrafts
         if let retryDraft, !(retryDraft.admitted && retryDraft.terminal) { drafts[retryDraft.messageId] = retryDraft }
+        try Self.validateAttachments(drafts.values.map(\.images) + [composerImages])
         let representedComposer = drafts.values.contains { $0.control == nil && $0.prompt == composerText.trimmingCharacters(in: .whitespacesAndNewlines) && $0.images.map(\.id) == composerImages.map(\.id) }
         if (!composerText.isEmpty || !composerImages.isEmpty), !representedComposer {
             drafts["composer"] = SubmittedDraft(messageId: "composer", prompt: composerText, images: composerImages, steer: false)
         }
-        try DocDisk.saveIntents(Array(drafts.values), id: intentCacheId)
+        let retained = Array(drafts.values)
+        try validateDrafts(retained)
+        try DocDisk.saveIntents(retained, id: intentCacheId)
     }
 
     private func restoreDrafts() {
@@ -217,23 +276,34 @@ final class SessionStore {
             var loaded = try DocDisk.loadIntents([SubmittedDraft].self, id: intentCacheId)
             if loaded == nil, let legacyCacheId {
                 loaded = try DocDisk.loadIntents([SubmittedDraft].self, id: legacyCacheId)
-                if let loaded { try DocDisk.saveIntents(loaded, id: intentCacheId) }
+                if let loaded { try validateDrafts(loaded); try DocDisk.saveIntents(loaded, id: intentCacheId) }
             }
             let drafts = loaded ?? []
-            guard drafts.count <= 17,
-                  Set(drafts.map(\.messageId)).count == drafts.count,
-                  drafts.allSatisfy({ $0.admission?.scope == nil || ($0.admission?.scope?.projectId == config.projectScope && $0.admission?.scope?.deploymentId == deploymentId && $0.admission?.scope?.sessionId == chatId) }),
-                  drafts.allSatisfy({ $0.messageId == "composer" || UUID(uuidString: $0.messageId) != nil }),
-                  drafts.allSatisfy({ $0.admission == nil || ($0.admission?.commandId == $0.messageId && $0.admission?.issuedAt == $0.createdAt && $0.admission?.expiresAt == $0.expiresAt) }),
-                  drafts.allSatisfy({ $0.expiresAt > $0.createdAt && $0.expiresAt - $0.createdAt <= 86_400_000 }),
-                  drafts.reduce(0, { $0 + $1.images.reduce(0, { $0 + $1.bytes.count }) }) <= MobileImageAttachment.maximumTotalBytes else {
-                throw MobileSessionError.unavailable("The retained Crew journal has conflicting or oversized records.")
+            try validateDrafts(drafts)
+            terminalControlOutcomes.removeAll()
+            let prefix = DocDisk.intentURL(for: intentCacheId).lastPathComponent + "."
+            for url in try FileManager.default.contentsOfDirectory(at: DocDisk.directory, includingPropertiesForKeys: nil)
+                where url.lastPathComponent.hasPrefix(prefix) && url.pathExtension == "outcome" {
+                let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+                guard let size = attributes[.size] as? NSNumber, size.int64Value <= 64 * 1024 * 1024 else {
+                    throw MobileSessionError.unavailable("A retained Crew outcome exceeds its safe size limit.")
+                }
+                let outcome = try JSONDecoder().decode(ControlOutcome.self, from: Data(contentsOf: url))
+                if outcome.terminal, outcome.control != nil, outcome.failure != nil { terminalControlOutcomes[outcome.messageId] = outcome }
             }
             if let composer = drafts.first(where: { $0.messageId == "composer" }) {
                 composerText = composer.prompt; composerImages = composer.images
             }
-            let sends = drafts.filter { $0.messageId != "composer" }
+            // Migrate terminal controls only after retaining their durable outcome.
+            for draft in drafts where draft.terminal && draft.control != nil {
+                try DocDisk.retainOutcome(draft, id: intentCacheId, commandId: draft.messageId)
+                if draft.failure != nil {
+                    terminalControlOutcomes[draft.messageId] = ControlOutcome(messageId: draft.messageId, prompt: draft.prompt, terminal: true, failure: draft.failure, control: draft.control)
+                }
+            }
+            let sends = drafts.filter { $0.messageId != "composer" && !($0.terminal && $0.control != nil) }
             submittedDrafts = Dictionary(uniqueKeysWithValues: sends.map { ($0.messageId, $0) })
+            if sends.count != drafts.filter({ $0.messageId != "composer" }).count { try persistDrafts() }
             // A reply may have been lost; don't lock the composer behind an
             // uncertain echo. Deliberate retry still uses the original ID.
             pendingSends = []
@@ -727,6 +797,52 @@ final class SessionStore {
                 environment?["source"]?.mapValue?["sandbox_id"] == original?["source"]?.mapValue?["sandbox_id"] &&
                 environment?["source"]?.mapValue?["lifecycle_epoch"] == original?["source"]?.mapValue?["lifecycle_epoch"]
         }
+        func newerAnchor(_ current: [String: LoroValue], _ next: [String: LoroValue]) -> Bool {
+            guard current["sessionId"] == next["sessionId"], current["chatId"] == next["chatId"],
+                  current["ownerSubject"] == next["ownerSubject"] else { return false }
+            if current["ownerDeviceId"] == next["ownerDeviceId"], current["source"] == next["source"],
+               current["environment"] == next["environment"] {
+                let currentAt = current["updatedAt"]?.i64Value ?? current["createdAt"]?.i64Value ?? 0
+                let nextAt = next["updatedAt"]?.i64Value ?? next["createdAt"]?.i64Value ?? 0
+                func rank(_ value: [String: LoroValue]) -> Int {
+                    switch value["status"]?.stringValue {
+                    case "errored": return 2
+                    case "idle": return 1
+                    case "working", "awaitingInput": return 0
+                    default: return -1
+                    }
+                }
+                return nextAt > currentAt || (nextAt == currentAt && rank(next) >= rank(current))
+            }
+            func scaffoldIdentity(_ value: [String: LoroValue]) -> (sandbox: String, epoch: UInt64)? {
+                guard value["source"]?.stringValue == "scaffold",
+                      let device = value["ownerDeviceId"]?.stringValue, device.hasPrefix("comet-scaffold-"),
+                      let separator = device.range(of: "-e", options: .backwards),
+                      let epoch = UInt64(device[separator.upperBound...]), epoch > 0 else { return nil }
+                let start = device.index(device.startIndex, offsetBy: "comet-scaffold-".count)
+                guard separator.lowerBound >= start else { return nil }
+                let sandbox = String(device[start..<separator.lowerBound])
+                return sandbox.isEmpty ? nil : (sandbox, epoch)
+            }
+            guard let old = scaffoldIdentity(current), let new = scaffoldIdentity(next),
+                  old.sandbox == new.sandbox, new.epoch > old.epoch else { return false }
+            func validEnvironment(_ value: [String: LoroValue], epoch: UInt64) -> Bool {
+                guard let environment = value["environment"]?.mapValue else { return true }
+                let source = environment["source"]?.mapValue
+                let advertisedEpoch = source?["lifecycle_epoch"]
+                return environment["ownerPrincipal"] == value["ownerSubject"] && source?["kind"]?.stringValue == "scaffold" &&
+                    source?["sandbox_id"]?.stringValue == old.sandbox &&
+                    (advertisedEpoch == nil || advertisedEpoch == .null || advertisedEpoch?.i64Value.flatMap({ UInt64(exactly: $0) }) == epoch)
+            }
+            guard validEnvironment(current, epoch: old.epoch), validEnvironment(next, epoch: new.epoch) else { return false }
+            guard let a = current["environment"]?.mapValue else { return true }
+            guard let b = next["environment"]?.mapValue else { return false }
+            return a["scope"] == b["scope"] && a["databaseEnvironment"] == b["databaseEnvironment"]
+        }
+        func collect(_ value: [String: LoroValue], writer: String, into cache: inout PublicationCache) {
+            if let current = cache.anchors[writer], !newerAnchor(current, value) { return }
+            cache.anchors[writer] = value
+        }
         let publications = doc.getList(id: "publications")
         var cache = publicationCache ?? PublicationCache()
         if cache.count > publications.len() { cache = PublicationCache() }
@@ -735,7 +851,7 @@ final class SessionStore {
                   let record = (item.asValue() ?? item.asLoroMap()?.getDeepValue())?.mapValue?["record"]?.mapValue,
                   let value = payload(record),
                   let writer = AppConfig.canonicalSessionId(value["sessionId"]?.stringValue ?? chatId) else { continue }
-            cache.anchors[writer] = value
+            collect(value, writer: writer, into: &cache)
         }
         cache.count = publications.len()
         let registers = doc.getMap(id: "agentSessions").getDeepValue().mapValue ?? [:]
@@ -747,13 +863,12 @@ final class SessionStore {
             // A register can arrive just after its immutable creation record.
             // Recover only missing anchors, not the entire audit on each pulse.
             for writer in needed where cache.anchors[writer] == nil {
-                for index in (0..<publications.len()).reversed() {
+                for index in 0..<publications.len() {
                     guard let item = publications.get(index: index),
                           let record = (item.asValue() ?? item.asLoroMap()?.getDeepValue())?.mapValue?["record"]?.mapValue,
                           let value = payload(record),
                           AppConfig.canonicalSessionId(value["sessionId"]?.stringValue ?? chatId) == writer else { continue }
-                    cache.anchors[writer] = value
-                    break
+                    collect(value, writer: writer, into: &cache)
                 }
             }
         }
@@ -978,11 +1093,8 @@ final class SessionStore {
             sendFailure = "Crew retains 16 unresolved sends. Review them before submitting another instruction."
             return false
         }
-        let retainedImageBytes = submittedDrafts.values.filter { $0.prompt != prompt }.reduce(0) { $0 + $1.images.reduce(0) { $0 + $1.bytes.count } }
-        guard retainedImageBytes + images.reduce(0, { $0 + $1.bytes.count }) <= MobileImageAttachment.maximumTotalBytes else {
-            sendFailure = "Crew retains too many unacknowledged images. Resolve those sends before attaching more."
-            return false
-        }
+        do { try Self.validateAttachments(submittedDrafts.values.map(\.images) + [images]) }
+        catch { sendFailure = error.localizedDescription; return false }
         sending = true
         defer { sending = false }
         clearSendFailure()
@@ -1118,11 +1230,16 @@ final class SessionStore {
             guard !draft.terminal || terminal else { return }
             draft.failure = message
             draft.terminal = terminal
-            if terminal {
-                do { try DocDisk.retainOutcome(draft, id: intentCacheId, commandId: messageId) }
-                catch { recoveryFailure = "Crew could not retain the terminal outcome: \(error.localizedDescription)" }
-            }
             submittedDrafts[messageId] = draft
+            if terminal {
+                do {
+                    try DocDisk.retainOutcome(draft, id: intentCacheId, commandId: messageId)
+                    if draft.control != nil {
+                        terminalControlOutcomes[messageId] = ControlOutcome(messageId: messageId, prompt: draft.prompt, terminal: true, failure: draft.failure, control: draft.control)
+                        submittedDrafts.removeValue(forKey: messageId)
+                    }
+                } catch { recoveryFailure = "Crew could not retain the terminal outcome: \(error.localizedDescription)" }
+            }
             revision &+= 1
             if draft.control == nil {
                 retryDraft = draft
@@ -1208,6 +1325,164 @@ final class SessionStore {
 
 #if DEBUG
 extension SessionStore {
+    static func runAttachmentJournalRegression() async -> Bool {
+        let config = AppConfig(edgeURL: URL(string: "http://127.0.0.1:1")!, mode: .dev,
+            userId: "attachment-\(UUID().uuidString)", projectScope: "attachments", deviceId: "phone", deviceName: "Crew regression")
+        let preview = UIGraphicsImageRenderer(size: CGSize(width: 1, height: 1)).image { context in
+            UIColor.red.setFill(); context.fill(CGRect(x: 0, y: 0, width: 1, height: 1))
+        }
+        guard var bytes = preview.pngData() else { return false }
+        // Real decodable PNG bytes, padded to exercise the actual 20 MiB limit.
+        bytes.append(Data(repeating: 0, count: 20 * 1024 * 1024 - bytes.count))
+        guard UIImage(data: bytes) != nil else { return false }
+        let image = MobileImageAttachment(id: UUID(), filename: "retained.png", bytes: bytes, preview: preview)
+        var stores: [SessionStore] = []
+        var cacheIds: [String] = []
+        defer {
+            stores.forEach { $0.stop() }
+            if let files = try? FileManager.default.contentsOfDirectory(at: DocDisk.directory, includingPropertiesForKeys: nil) {
+                for file in files where cacheIds.contains(where: { file.lastPathComponent.hasPrefix($0) }) { try? FileManager.default.removeItem(at: file) }
+            }
+        }
+        do {
+            for terminal in [false, true] {
+                let chatId = UUID().uuidString.lowercased()
+                let initial = SessionStore(chatId: chatId, config: config)
+                stores.append(initial); cacheIds.append(initial.intentCacheId)
+                var admission: MobileCommandAdmission?
+                initial.attachmentUploader = { _ in ["/fixture/retained.png"] }
+                initial.commandSender = { _, value in admission = value; throw RelayError.timeout }
+                guard !(await initial.sendSteer(prompt: "original text", images: [image])), let admission else { return false }
+                if terminal { initial.reportSendFailure("rejected", messageId: admission.commandId, terminal: true) }
+                initial.retainComposer(text: "edited text only", images: [image])
+                try initial.persistDrafts()
+                let restarted = SessionStore(chatId: chatId, config: config)
+                stores.append(restarted)
+                guard !restarted.intentLoadBlocked, restarted.composerText == "edited text only",
+                      restarted.composerImages.first?.bytes == bytes,
+                      restarted.submittedDrafts[admission.commandId]?.images.first?.bytes == bytes,
+                      restarted.submittedDrafts[admission.commandId]?.terminal == terminal else { return false }
+                let journal = try Data(contentsOf: DocDisk.intentURL(for: initial.intentCacheId))
+                var changed = bytes; changed[changed.count - 1] = 1
+                let conflicting = MobileImageAttachment(id: image.id, filename: image.filename, bytes: changed, preview: preview)
+                restarted.retainComposer(text: "edited text only", images: [conflicting])
+                do { try restarted.persistDrafts(); return false } catch {}
+                guard try Data(contentsOf: DocDisk.intentURL(for: initial.intentCacheId)) == journal else { return false }
+                let distinct = MobileImageAttachment(id: UUID(), filename: image.filename, bytes: bytes, preview: preview)
+                restarted.retainComposer(text: "edited text only", images: [distinct])
+                do { try restarted.persistDrafts(); return false } catch {}
+                guard try Data(contentsOf: DocDisk.intentURL(for: initial.intentCacheId)) == journal else { return false }
+                let original = restarted.submittedDrafts[admission.commandId]!
+                let forged = SubmittedDraft(messageId: "composer", prompt: "conflict", images: [conflicting], steer: false)
+                try DocDisk.saveIntents([original, forged], id: initial.intentCacheId)
+                let forgedJournal = try Data(contentsOf: DocDisk.intentURL(for: initial.intentCacheId))
+                let blocked = SessionStore(chatId: chatId, config: config)
+                stores.append(blocked)
+                guard blocked.intentLoadBlocked, blocked.submittedDrafts.isEmpty,
+                      try Data(contentsOf: DocDisk.intentURL(for: initial.intentCacheId)) == forgedJournal else { return false }
+            }
+            E2ERunner.log("OK Crew attachment journal: failed and uncertain 20 MiB send, text-only composer edit, exact-identity dedupe, conflict and distinct-byte-limit rejection before replacement")
+            return true
+        } catch { E2ERunner.log("FAIL Crew attachment journal: \(error)"); return false }
+    }
+
+    static func runTerminalControlRegression() async -> Bool {
+        let config = AppConfig(edgeURL: URL(string: "http://127.0.0.1:1")!, mode: .dev,
+            userId: "controls-\(UUID().uuidString)", projectScope: "controls", deviceId: "phone", deviceName: "Crew regression")
+        let chatId = UUID().uuidString.lowercased()
+        let store = SessionStore(chatId: chatId, config: config)
+        var stores = [store]
+        defer {
+            stores.forEach { $0.stop() }
+            if let files = try? FileManager.default.contentsOfDirectory(at: DocDisk.directory, includingPropertiesForKeys: nil) {
+                for file in files where file.lastPathComponent.hasPrefix(store.intentCacheId) { try? FileManager.default.removeItem(at: file) }
+            }
+        }
+        do {
+            var rejectedIds: [String] = []
+            store.commandSender = { _, admission in
+                rejectedIds.append(admission.commandId)
+                store.reportSendFailure("Crew rejected this control", messageId: admission.commandId, terminal: true)
+            }
+            for index in 0..<20 {
+                var control = SubmittedDraft(messageId: UUID().uuidString.lowercased(), prompt: "control \(index)", images: [], steer: false)
+                control.payload = index.isMultiple(of: 2) ? .interrupt : .respondInput(requestId: "question", answers: [])
+                control.createdAt = nowMs() - (index.isMultiple(of: 2) ? 300_001 : 0)
+                control.expiresAt = control.createdAt + 300_000
+                control.admission = MobileCommandAdmission(commandId: control.messageId, issuedAt: control.createdAt,
+                    expiresAt: control.expiresAt, hostDeviceId: "host", scaffold: nil)
+                await store.submitControl(control)
+                guard store.submittedDrafts.isEmpty, store.retainedControls.count == index + 1,
+                      store.retainedControls.allSatisfy({ $0.terminal }), store.sendFailure != nil else { return false }
+                let url = DocDisk.intentURL(for: store.intentCacheId).appendingPathExtension("\(control.messageId).outcome")
+                let outcome = try JSONDecoder().decode(SubmittedDraft.self, from: Data(contentsOf: url))
+                guard outcome.terminal, outcome.failure != nil else { return false }
+            }
+            guard rejectedIds.count == 10 else { return false }
+            var uncertain = SubmittedDraft(messageId: UUID().uuidString.lowercased(), prompt: "uncertain Stop", images: [], steer: false)
+            uncertain.payload = .interrupt
+            uncertain.admission = MobileCommandAdmission(commandId: uncertain.messageId, issuedAt: uncertain.createdAt,
+                expiresAt: uncertain.expiresAt, hostDeviceId: "host", scaffold: nil)
+            store.commandSender = { _, _ in throw RelayError.timeout }
+            await store.submitControl(uncertain)
+            let restarted = SessionStore(chatId: chatId, config: config)
+            stores.append(restarted)
+            guard !restarted.intentLoadBlocked, restarted.submittedDrafts.count == 1,
+                  restarted.submittedDrafts[uncertain.messageId]?.terminal == false,
+                  restarted.retainedControls.filter({ $0.terminal }).count == 20 else { return false }
+            var admitted: [String] = []
+            restarted.commandSender = { _, admission in admitted.append(admission.commandId) }
+            await restarted.submitControl(restarted.submittedDrafts[uncertain.messageId]!)
+            guard admitted == [uncertain.messageId], await restarted.sendSteer(prompt: "fresh instruction after terminal controls"),
+                  admitted.count == 2, admitted[1] != uncertain.messageId else { return false }
+            E2ERunner.log("OK Crew terminal controls: 20 expired/rejected outcomes remain visible after restart, pending slots freed, uncertain control identity retry, fresh send admitted")
+            return true
+        } catch { E2ERunner.log("FAIL Crew terminal controls: \(error)"); return false }
+    }
+
+    static func runOwnerAnchorReplayRegression() -> Bool {
+        do {
+            let doc = LoroDoc()
+            let chatId = UUID().uuidString.lowercased()
+            func value(epoch: Int64, at: Int64, status: String) -> [String: Any] {
+                ["chatId": chatId, "sessionId": chatId, "ownerSubject": "owner",
+                 "ownerDeviceId": "comet-scaffold-sandbox-e\(epoch)", "source": "scaffold",
+                 "createdAt": Int64(1), "updatedAt": at, "status": status,
+                 "environment": ["ownerPrincipal": "owner", "source": ["kind": "scaffold", "sandbox_id": "sandbox", "lifecycle_epoch": epoch],
+                                 "scope": ["projectId": "project", "deploymentId": "deployment", "sessionId": chatId], "databaseEnvironment": "local"]]
+            }
+            func record(_ value: [String: Any]) -> LoroValue {
+                LoroValue.fromJSON(["kind": "agentSession", "publishedBy": "owner", "value": value])
+            }
+            func append(_ value: [String: Any]) throws {
+                let row = try doc.getList(id: "publications").pushContainer(child: LoroMap())
+                try row.insert(key: "record", v: record(value)); doc.commit()
+            }
+            try append(value(epoch: 1, at: 100, status: "working"))
+            try append(value(epoch: 2, at: 10, status: "working"))
+            let current = decodeProjection(from: doc, chatId: chatId, observedAt: nil)
+            try append(value(epoch: 1, at: 999, status: "errored"))
+            try doc.getMap(id: "agentSessions").insert(key: chatId, v: record(value(epoch: 2, at: 20, status: "idle"))); doc.commit()
+            let replayed = decodeProjection(from: doc, chatId: chatId, observedAt: nil, publicationCache: current.publicationCache)
+            guard replayed.session?.deviceId == "comet-scaffold-sandbox-e2", replayed.session?.updatedAt == 20,
+                  replayed.session?.status == .idle, replayed.environment?.source.lifecycleEpoch == 2 else { return false }
+            // Simulate a register arriving after its anchor was evicted.
+            let missing = PublicationCache(count: doc.getList(id: "publications").len(), anchors: [:])
+            let recovered = decodeProjection(from: doc, chatId: chatId, observedAt: nil, publicationCache: missing)
+            guard recovered.session?.updatedAt == 20, recovered.environment?.source.lifecycleEpoch == 2 else { return false }
+            try doc.getMap(id: "agentSessions").insert(key: chatId, v: record(value(epoch: 2, at: 30, status: "idle"))); doc.commit()
+            let pulse = decodeProjection(from: doc, chatId: chatId, observedAt: nil, publicationCache: recovered.publicationCache)
+            guard pulse.session?.updatedAt == 30, pulse.publicationCache?.count == recovered.publicationCache?.count else { return false }
+            // Older phases and equal-time active phases cannot mask terminal state.
+            try append(value(epoch: 2, at: 40, status: "errored"))
+            try append(value(epoch: 2, at: 40, status: "working"))
+            try append(value(epoch: 2, at: 39, status: "idle"))
+            let terminal = decodeProjection(from: doc, chatId: chatId, observedAt: nil, publicationCache: pulse.publicationCache)
+            guard terminal.session?.status == .errored, terminal.session?.updatedAt == 40 else { return false }
+            E2ERunner.log("OK Crew owner anchors: e1 replay after e2, missing-anchor scan, heartbeat-only refresh, timestamp and terminal tie ordering")
+            return true
+        } catch { E2ERunner.log("FAIL Crew owner anchor replay: \(error)"); return false }
+    }
     func presentRecoveryFixture() {
         handle(.recoveryBlocked("Crew recovery is blocked by conflicting local records. Your original records and unsent drafts are retained on this device; no instruction was resubmitted."))
     }

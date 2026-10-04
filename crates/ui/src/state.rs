@@ -29,7 +29,7 @@ use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
 use comet_doc::{
-    MessagePart, MessageRole, MessageStatus, SessionEntryWindow, SessionMessageEntry,
+    MessagePart, MessageRole, SessionEntryWindow, SessionMessageEntry,
     TranscriptDesync, TranscriptFrame,
 };
 use comet_engine::{Engine, EngineConfig, EngineRuntime, rpc::AuthRpc};
@@ -5411,7 +5411,7 @@ mod tests {
 
     #[test]
     fn display_status_derivation() {
-        let now = Utc::now();
+        let now = DateTime::from_timestamp_millis(1_000_000).unwrap();
         let mut c = chat("c", 0, Some(10));
         // Live states win regardless of seen.
         let working = session("c", SessionStatus::Working, 5, now);
@@ -5432,15 +5432,18 @@ mod tests {
             display_status(&c, Some(&idle), now),
             ChatIndicator::Completed
         );
-        // Stale working session falls back to the seen check.
+        // Stale activity is unreachable, regardless of unseen/seen state.
         let stale = session("c", SessionStatus::Working, 300, now);
         assert_eq!(
             display_status(&c, Some(&stale), now),
-            ChatIndicator::Completed
+            ChatIndicator::Unreachable
         );
         // Seen after the last message = Idle.
         c.last_seen_at = c.last_message_at.map(|t| t + TimeDelta::minutes(1));
         assert_eq!(display_status(&c, Some(&idle), now), ChatIndicator::Idle);
+        assert_eq!(display_status(&c, Some(&stale), now), ChatIndicator::Unreachable);
+        let stale_input = session("c", SessionStatus::AwaitingInput, 300, now);
+        assert_eq!(display_status(&c, Some(&stale_input), now), ChatIndicator::Unreachable);
         // Errored + unseen = Errored; seen clears it to Idle.
         let errored = session("c", SessionStatus::Errored, 600, now);
         assert_eq!(display_status(&c, Some(&errored), now), ChatIndicator::Idle);

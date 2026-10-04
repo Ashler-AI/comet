@@ -253,14 +253,13 @@ const HOST_LIVENESS_MS = 75_000;
 // with ===; a mismatch makes host_offline/host_closed invisible to them.
 const RELAY_KIND = " relay";
 
-/** Nudge frames (§7 cold-chat command delivery): payload `{chatId}` tells the
- * host "this chat's doc has pending commands — open it and drain". Durable:
- * queued in the DO while the host is offline, replayed on its next join, so a
- * command sent to a chat the host hasn't warm-opened is never stranded. */
+/** Wakeups remain durable until the current host acknowledges consumption of
+ * `{chatId,nudgeId}`. Older hosts still receive chatId, but cannot clear rows. */
 export const NUDGE_KIND = "nudge";
+export const NUDGE_ACK_KIND = "nudge-ack";
 export const GRANT_KIND = "grant";
 const NUDGE_MAX_PENDING = 256;
-const CHAT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const CHAT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export class DeviceRoom implements DurableObject {
   private readonly ctx: DurableObjectState;
@@ -277,6 +276,13 @@ export class DeviceRoom implements DurableObject {
     ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS pending_nudges (chat_id TEXT PRIMARY KEY, queued_at INTEGER NOT NULL)"
     );
+    const columns = [...ctx.storage.sql.exec("PRAGMA table_info(pending_nudges)")];
+    if (!columns.some((column) => column.name === "nudge_id")) {
+      ctx.storage.sql.exec("ALTER TABLE pending_nudges ADD COLUMN nudge_id TEXT");
+    }
+    for (const row of ctx.storage.sql.exec("SELECT chat_id FROM pending_nudges WHERE nudge_id IS NULL")) {
+      ctx.storage.sql.exec("UPDATE pending_nudges SET nudge_id = ? WHERE chat_id = ?", crypto.randomUUID(), row.chat_id);
+    }
     this.blobs = createBlobStore(ctx.storage.sql);
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
@@ -303,7 +309,9 @@ export class DeviceRoom implements DurableObject {
    * suppress the very `host_closed` that close is supposed to announce. */
   private liveHost(exclude?: WebSocket): WebSocket | undefined {
     return pickLiveHost(
-      this.ctx.getWebSockets(HOST_TAG).map((ws) => ({
+      this.ctx.getWebSockets(HOST_TAG)
+        .filter((ws) => !(ws.deserializeAttachment() as SocketState | null)?.superseded)
+        .map((ws) => ({
         ws,
         // Auto-pongs are stamped even while hibernating; `joinedAt` covers the
         // window before a fresh socket's first ping. Sockets attached by an
@@ -485,6 +493,10 @@ export class DeviceRoom implements DurableObject {
       }
       const connId = url.searchParams.get("connId") ?? crypto.randomUUID();
       const controlSessionId = url.searchParams.get("controlSessionId") ?? undefined;
+      if ((controlSessionId || url.searchParams.get("purpose") === "control") &&
+          (url.searchParams.has("controlDeploymentId") || url.searchParams.has("deploymentId"))) {
+        return new Response("scoped_control_not_supported", { status: 403 });
+      }
       if (controlSessionId && (role !== "client" || grant || peerSessionId ||
         !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(controlSessionId))) {
         return new Response("forbidden", { status: 403 });
@@ -530,13 +542,15 @@ export class DeviceRoom implements DurableObject {
         // Only an authorized successor may evict the previous host.
         for (const stale of this.ctx.getWebSockets(HOST_TAG)) {
           if (stale === pair[1]) continue;
+          const staleState = stale.deserializeAttachment() as SocketState | null;
+          if (staleState) stale.serializeAttachment({ ...staleState, superseded: true });
           try {
             stale.close(4409, "superseded by new host connection");
           } catch {
             /* already gone */
           }
         }
-        this.deliverHostStartup(pair[1], grant);
+        await this.deliverHostStartup(pair[1], grant);
       }
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
@@ -587,24 +601,30 @@ export class DeviceRoom implements DurableObject {
       }
       const body = (await request.json().catch(() => null)) as { chatId?: string } | null;
       const chatId = body?.chatId;
-      if (!chatId || !CHAT_ID_RE.test(chatId)) return json({ error: "bad_chat_id" }, 400);
-      const host = this.liveHost();
-      if (host && (await this.authorizeHost(host))) {
-        this.deliver(host, { s: chatId, k: NUDGE_KIND }, new TextEncoder().encode(JSON.stringify({ chatId })));
-        return json({ delivered: true });
+      if (typeof chatId !== "string" || !CHAT_ID_RE.test(chatId)) return json({ error: "bad_chat_id" }, 400);
+      if (grant && grant.scope.sessionId !== chatId) return json({ error: "forbidden" }, 403);
+      const existing = [...this.ctx.storage.sql.exec("SELECT chat_id FROM pending_nudges WHERE chat_id = ?", chatId)];
+      const count = [...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM pending_nudges")][0]?.n as number;
+      if (existing.length === 0 && count >= NUDGE_MAX_PENDING) {
+        return json({ error: "nudge_capacity", delivered: false, queued: false }, 503);
       }
-      // Host offline: queue durably (dedup by chat — one open covers any
-      // number of pending commands), bounded so a runaway sender can't grow
-      // the DO forever. Overflow drops the OLDEST: recency wins.
+      // A new wakeup supersedes the receipt token, never the original queue time.
+      // An in-flight ACK for an older drain cannot consume this acceptance.
+      const nudgeId = crypto.randomUUID();
       this.ctx.storage.sql.exec(
-        "INSERT INTO pending_nudges (chat_id, queued_at) VALUES (?, ?) ON CONFLICT(chat_id) DO UPDATE SET queued_at = excluded.queued_at",
-        chatId,
-        Date.now()
+        "INSERT INTO pending_nudges (chat_id, queued_at, nudge_id) VALUES (?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET nudge_id = excluded.nudge_id",
+        chatId, Date.now(), nudgeId
       );
-      this.ctx.storage.sql.exec(
-        "DELETE FROM pending_nudges WHERE chat_id NOT IN (SELECT chat_id FROM pending_nudges ORDER BY queued_at DESC LIMIT ?)",
-        NUDGE_MAX_PENDING
-      );
+      await this.ctx.storage.sync();
+      const host = this.liveHost();
+      if (host && (await this.authorizeHost(host)) && this.liveHost() === host) {
+        const hostState = host.deserializeAttachment() as SocketState | null;
+        if (!hostState?.grant || hostState.grant.scope.sessionId === chatId) {
+          const delivered = this.deliver(host, { s: chatId, k: NUDGE_KIND },
+            new TextEncoder().encode(JSON.stringify({ chatId, nudgeId })));
+          return json({ delivered, queued: true });
+        }
+      }
       return json({ delivered: false, queued: true });
     }
 
@@ -613,20 +633,23 @@ export class DeviceRoom implements DurableObject {
 
   private replayNudges(host: WebSocket): void {
     const rows = [
-      ...this.ctx.storage.sql.exec("SELECT chat_id FROM pending_nudges ORDER BY queued_at ASC")
-    ] as Array<{ chat_id: string }>;
+      ...this.ctx.storage.sql.exec("SELECT chat_id, nudge_id FROM pending_nudges ORDER BY queued_at ASC")
+    ] as Array<{ chat_id: string; nudge_id: string }>;
     if (rows.length === 0) return;
     for (const row of rows) {
+      const state = host.deserializeAttachment() as SocketState | null;
+      if (state?.grant && state.grant.scope.sessionId !== row.chat_id) continue;
       this.deliver(
         host,
         { s: row.chat_id, k: NUDGE_KIND },
-        new TextEncoder().encode(JSON.stringify({ chatId: row.chat_id }))
+        new TextEncoder().encode(JSON.stringify({ chatId: row.chat_id, nudgeId: row.nudge_id }))
       );
     }
-    this.ctx.storage.sql.exec("DELETE FROM pending_nudges");
   }
 
-  deliverHostStartup(host: WebSocket, grant?: TrustedDeviceGrant): void {
+  async deliverHostStartup(host: WebSocket, grant?: TrustedDeviceGrant): Promise<void> {
+    await this.ctx.storage.sync();
+    if (this.liveHost() !== host || (host.deserializeAttachment() as SocketState | null)?.superseded) return;
     if (grant) {
       this.deliver(
         host,
@@ -737,6 +760,19 @@ export class DeviceRoom implements DurableObject {
       this.deliver(host, { s: frame.header.s, k: frame.header.k, from: state.connId }, frame.payload);
       return;
     }
+    if (frame.header.k === NUDGE_ACK_KIND) {
+      // Check after asynchronous authorization: superseded hosts cannot consume.
+      const current = ws.deserializeAttachment() as SocketState | null;
+      if (this.liveHost() !== ws || current?.superseded) return;
+      let receipt: { chatId?: unknown; nudgeId?: unknown };
+      try { receipt = JSON.parse(new TextDecoder().decode(frame.payload)); } catch { return; }
+      if (!receipt || typeof receipt.chatId !== "string" || !CHAT_ID_RE.test(receipt.chatId) ||
+          typeof receipt.nudgeId !== "string" || frame.header.s !== receipt.chatId ||
+          (current?.grant && current.grant.scope.sessionId !== receipt.chatId)) return;
+      this.ctx.storage.sql.exec("DELETE FROM pending_nudges WHERE chat_id = ? AND nudge_id = ?", receipt.chatId, receipt.nudgeId);
+      await this.ctx.storage.sync();
+      return;
+    }
     // Host frame: route by `to`.
     const to = frame.header.to;
     if (!to) return;
@@ -802,11 +838,12 @@ export class DeviceRoom implements DurableObject {
     this.deliver(ws, { s: frame.header.s, k: RELAY_KIND }, encodeRelayError(code));
   }
 
-  private deliver(ws: WebSocket, header: DeviceFrameHeader, payload: Uint8Array): void {
+  private deliver(ws: WebSocket, header: DeviceFrameHeader, payload: Uint8Array): boolean {
     try {
       ws.send(encodeDeviceFrame(header, payload));
+      return true;
     } catch {
-      /* stale socket */
+      return false;
     }
   }
 }
@@ -1014,6 +1051,9 @@ export const peerCommandAdmission = (
     if (request.method !== "AdmitPeerCommand" || !Number.isSafeInteger(request.id) || request.id < 0 ||
       request.cancel || request.params?.chatId !== client.controlSessionId ||
       typeof request.params.commandId !== "string" || !request.params.commandId.trim()) return undefined;
+    // Legacy ordinary authority cannot attest a deployment, even if the caller
+    // puts one in the DTO instead of the websocket query.
+    if (request.params.deploymentId != null || request.params.controlDeploymentId != null) return undefined;
     const command = request.params.command;
     if (command?.kind === "control") {
       if (command.source !== "local" || command.ownerDeviceId !== host.targetDeviceId ||

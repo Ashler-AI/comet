@@ -595,3 +595,106 @@ Source-visible costs still needing workload attribution include whole-live-
 reply display-tree construction, very large individual code blocks, Mermaid
 layout, and collaboration/command-ledger projection. No arbitrary eviction or
 notification-cadence change was introduced to hide those costs.
+
+### Paced large-tool journal and Loro allocation corrections (2026-10-03)
+
+The actual-EngineCore probe completes 24 turns with 300 KiB progressive exec
+arguments, 4 KiB increments and `COMET_MOCK_DELAY_MS=150`; the acceptance bound
+remains 128 MiB RSS growth after warmup. Reverse-tail journal lookup alone did
+not resolve the reported 659,520 KiB growth. A diagnostic run also failed at
+939,488 KiB growth while Loro container/oplog and pending-record bytes grew
+linearly to about 7 MiB each, with no dropped containers. Those serialized
+sizes do not prove that native live allocations are bounded.
+
+`RunJournal::append` previously cloned each event, serialized the whole event
+into a string, then copied that string into another whole-line buffer. It now
+serializes a borrowed event through one reusable 8 KiB `BufWriter`, flushes every
+line, and preserves terminal-event `sync_all`. The escaped-large-event boundary
+regression checks bounded buffering, immediate replay visibility and sequence
+continuity across reopen. History, semantic intents and recovery backups are
+unchanged. The probe additionally distinguishes macOS live malloc bytes from
+reserved allocator memory; it never trims the allocator. The source correction
+is **not claimed to satisfy the RSS bound until the unchanged paced probe passes**.
+
+Parent probe command (retain the normal toolchain/target-directory environment):
+`ASHLER_INCREMENTAL_TSC_CHECKS=false COMET_MOCK_DELAY_MS=150 cargo run -p comet-engine --example crew_tool_soak`.
+
+The pinned `loro-internal` 1.13.9 snapshot exporter discarded parsed operation
+blocks when it serialized them. The next append reparsed those same encoded
+blocks into the same append-only string arena, retaining decoded prefixes again
+even though logical operation history stayed linear. The dependency-root patch
+keeps `ChangesBlockContent::Both` during ordinary snapshot flush and preserves
+the explicit `compact_change_store` cache-discard contract. No semantic intents,
+document scope, nudge protocol, valid operation history or backups are removed.
+
+The consumer boundary regression performs three 4 KiB text appends with a full
+snapshot between each and requires the native arena to contain exactly the
+visible 12 KiB. It also round-trips each snapshot and its version vector.
+Explicit compaction retains its value/history contract; cache-layout assertions
+are not a public contract because the SDK barrier renews its auto-commit transaction.
+The shipped SDK's concrete pre-fix arena count has not been observed.
+
+`vendor/loro-internal` contains only the required packaged source, grammar,
+manifests, version and provenance files, plus license notices; package example,
+external-test and benchmark targets/assets are not vendored. The original
+1.13.9 crate archive SHA-256 is
+`6fec47acf8db115b7146da5e1d5b18d0cf58032e6012c0c1ee3ec3442d1e936f`.
+The original manifest and `.cargo_vcs_info.json` retain upstream commit
+`1e529a6841b35572b05c3cb1258c0862b3aaef40`; the MIT notice is retained from that
+immutable commit, as is the packaged diff module's license. Cargo's existing
+path-patch convention selects the local 1.13.9 package; the lock entry therefore
+has no registry source/checksum, while the original archive checksum remains in
+the vendored manifest and here. All other Loro version pins are unchanged.
+
+The throwaway probe now performs no `analyze`, snapshot/all-updates export or
+pending-record JSON materialization merely to measure memory. It samples RSS
+and malloc statistics and obtains one read-only native `vmmap -summary` after
+all turns and RSS samples. The example uses Rust's System allocator; the real
+macOS Comet binary installs mimalloc, so example measurements are not exact
+real-binary allocator acceptance. Neither allocator selection nor trimming was
+changed to make the probe pass.
+
+Full disk snapshots had also been throttled, not debounced: progressive local
+edits kept the first one-second deadline. They now reset that deadline only when
+their semantic records are already durable per commit. Imports, nonsemantic edits
+and root-list deletions retain periodic checkpoints; completion, eviction and
+shutdown retain forced saves. A successfully saved change epoch avoids redundant
+background export after an immediate completion checkpoint.
+
+The unchanged paced probe still **fails** after this correction: turn 4 RSS was
+93,120 KiB, peak RSS was 596,688 KiB, and growth was 503,568 KiB. Turn 24 live
+malloc was 66,663,952 bytes; native region inspection found substantial freed large
+and small allocation regions. This narrows the allocation churn but does not meet
+the 128 MiB bound. Native all-event allocation-stack profiling is diagnostic-only;
+its instrumented RSS is not an acceptance result.
+
+Streaming native allocation-stack analysis found 32,029,803,393 cumulative
+allocated bytes, of which 21,600,331,213 bytes (67.4%) came from provider-session
+discovery replaying all prior tool events. Journals without a provider ID repeated
+that replay on each dispatch. Existing capped journal writers now cache the small
+binding, including absence, after successful append; cold reads reuse one line
+buffer, project event kinds and fully validate only binding-bearing records.
+Full replay, accepted events, CWD/ID precedence and torn-record handling are unchanged.
+
+The binding/reopen regression passed. The next unchanged paced run still failed:
+68,880 KiB warmup RSS, 236,240 KiB peak, and 167,360 KiB growth. This is not a
+passing 128 MiB result; remaining full-snapshot allocation traffic is under review.
+
+The retained follow-on corrections reuse the full-snapshot envelope and semantic
+record serialization buffers, preserve encoded blocks after a known compression
+fallback, and preallocate richtext materialization from its cached UTF-8 length.
+The unchanged local probe on 2026-10-04 **passed**: 24 complete turns, all final
+300 KiB exec arguments preserved, 75,328 KiB warmup RSS, 136,992 KiB peak, and
+61,664 KiB (60.2 MiB) growth against the original 128 MiB bound. All 429 doc,
+sync and engine library tests passed. This is a System-allocator EngineCore
+result, not an eight-hour desktop or released-binary measurement.
+
+The native-verification workflow now runs this paced probe on both supported
+runner platforms and retains `large-tool-memory.log` with the other evidence.
+A separate SQLite-counter probe did not support blaming `RETURNING rowid` for
+full-blob allocation in isolation; that SQL was left unchanged and the temporary
+probe removed. No allocator trimming, threshold relaxation, history deletion,
+production release or active devbox restart was used to obtain the passing run.
+
+
+

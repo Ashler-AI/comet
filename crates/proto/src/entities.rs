@@ -240,8 +240,7 @@ impl Chat {
     }
 }
 
-/// Display status for a chat row/tab: the four user-facing states plus a
-/// distinct Errored. Derived — never stored.
+/// Derived presentation status for a chat row/tab; never stored as owner state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ChatIndicator {

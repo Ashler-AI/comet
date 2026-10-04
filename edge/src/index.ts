@@ -351,8 +351,7 @@ export default {
       ) {
         return json({ error: "forbidden" }, 403);
       }
-      const deviceId = await peerSessionOwnerDevice(env, identity, sessionId, deploymentId)
-        ?? (deploymentId ? await peerSessionOwnerDevice(env, identity, sessionId) : undefined);
+      const deviceId = await peerSessionOwnerDevice(env, identity, sessionId, deploymentId);
       if (!deviceId) return json({ error: "target_session_not_found" }, 404);
       const connId = url.searchParams.get("connId") ?? crypto.randomUUID();
       return forward(
@@ -374,6 +373,12 @@ export default {
       const controlSessionId = peerPurpose === "control"
         ? canonicalSessionId(url.searchParams.get("controlSessionId") ?? undefined)
         : undefined;
+      // Ordinary hosts have no authenticated deployment-aware admission contract.
+      // Never erase explicit scope and downgrade it to the legacy UUID route.
+      if (peerPurpose === "control" &&
+          (url.searchParams.has("controlDeploymentId") || url.searchParams.has("deploymentId"))) {
+        return json({ error: "scoped_control_not_supported" }, 403);
+      }
       if (peerPurpose === "control" && (
         deviceCredential || !controlSessionId || requestedRole !== "client" ||
         deviceId.startsWith(SANDBOX_DEVICE_PREFIX) || !hasCapability(identity, "session.control")

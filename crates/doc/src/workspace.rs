@@ -583,6 +583,20 @@ impl WorkspaceDoc {
         Ok(true)
     }
 
+    /// Activity publishers own timestamps, never concurrent user metadata.
+    pub fn set_chat_activity(&self, chat_id: &str, last_message_at: Option<i64>, created_at: Option<i64>) -> Result<bool, DocError> {
+        let _operation = self.doc.operation();
+        let Some(row) = self.existing_row("chats",chat_id) else { return Ok(false) };
+        if let Some(ms) = last_message_at {
+            set_opt_ms(&row,"lastMessageAt",DateTime::<Utc>::from_timestamp_millis(ms))?;
+        }
+        if let Some(ms) = created_at && let Some(at) = DateTime::<Utc>::from_timestamp_millis(ms) {
+            row.insert("createdAt",at.timestamp_millis())?;
+        }
+        self.doc.commit()?;
+        Ok(true)
+    }
+
     /// Host-side resume continuity: the harness-native session id of the chat's
     /// latest run and the cwd it was created under (comet stored the same pair
     /// on the chats table). An empty
@@ -879,7 +893,7 @@ impl WorkspaceDoc {
                                 _ => None,
                             });
                     for (field, value) in fields {
-                        if target.get(&field).is_none() || newer_status {
+                        if newer_status || (target.get(&field).is_none() && target.get_last_editor(&field).is_none()) {
                             target.insert(&field, LoroValue::from(value))?;
                         }
                     }
@@ -914,7 +928,15 @@ impl WorkspaceDoc {
             return None;
         }
         match self.doc.get_map(container).get(key) {
-            Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) => Some(map),
+            Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) => {
+                let identity = if container == "chats" { "id" } else { "chatId" };
+                if matches!(container, "chats" | "sessions" | "worktreeDeletions")
+                    && matches!(map.get(identity), Some(loro::ValueOrContainer::Value(LoroValue::String(id))) if id.contains("::session::"))
+                {
+                    return None;
+                }
+                Some(map)
+            }
             _ => None,
         }
     }
@@ -933,7 +955,7 @@ impl WorkspaceDoc {
         for (key, row) in rows {
             // Imported legacy execution rows remain private until safely migrated.
             if matches!(container, "chats" | "sessions" | "sessionRefs" | "worktreeDeletions")
-                && (key.contains("::session::")
+                && ((container != "sessionRefs" && key.contains("::session::"))
                     || row.get("id").and_then(|id| id.as_str()).is_some_and(|id| id.contains("::session::"))
                     || row.get("chatId").and_then(|id| id.as_str()).is_some_and(|id| id.contains("::session::")))
             {
@@ -953,7 +975,8 @@ impl WorkspaceDoc {
 fn set_opt_str(row: &LoroMap, key: &str, value: Option<&str>) -> Result<(), DocError> {
     match value {
         Some(v) => row.insert(key, v)?,
-        None => row.delete(key)?,
+        None if row.get(key).is_some() => row.delete(key)?,
+        None => {},
     }
     Ok(())
 }
@@ -961,7 +984,8 @@ fn set_opt_str(row: &LoroMap, key: &str, value: Option<&str>) -> Result<(), DocE
 fn set_opt_ms(row: &LoroMap, key: &str, value: Option<DateTime<Utc>>) -> Result<(), DocError> {
     match value {
         Some(at) => row.insert(key, at.timestamp_millis())?,
-        None => row.delete(key)?,
+        None if row.get(key).is_some() => row.delete(key)?,
+        None => {},
     }
     Ok(())
 }
@@ -1202,6 +1226,9 @@ mod tests {
         assert_eq!(execution_chat_id(&format!("{PUBLIC_CHAT}::session::other")), None);
         assert_eq!(execution_chat_id("chat-a::session::chat-a"), None);
         assert_eq!(execution_chat_id(&format!("{private}::session::{PUBLIC_CHAT}")), None);
+        let owner = "owner::session::member";
+        ws.upsert_session_ref(owner, &session_ref(PUBLIC_CHAT, 1)).unwrap();
+        assert_eq!(ws.read_session_refs_for(owner).unwrap()[0].chat_id, PUBLIC_CHAT);
     }
 
     #[test]
@@ -1217,6 +1244,9 @@ mod tests {
         fields["harnessSessionId"] = "native-session".into();
         fields["generatedTitle"] = "Generated title".into();
         insert_legacy_row(&ws, "chats", &private, fields);
+        let mut public = ws.chat(PUBLIC_CHAT).unwrap().unwrap();
+        public.cwd = None;
+        ws.upsert_chat(&public).unwrap();
         insert_legacy_row(&ws, "sessions", &private, serde_json::json!({
             "chatId": private, "deviceId": "dev-a", "status": "working", "updatedAt": 4_000,
         }));
@@ -1240,6 +1270,7 @@ mod tests {
         assert_eq!(ws.read_all().unwrap(), b.read_all().unwrap());
         let public = b.chat(PUBLIC_CHAT).unwrap().unwrap();
         assert_eq!(public.title.as_deref(), Some("Public title"));
+        assert_eq!(public.cwd, None);
         assert_eq!(public.harness_session_id.as_deref(), Some("native-session"));
         assert_eq!(b.generated_chat_title(PUBLIC_CHAT).as_deref(), Some("Generated title"));
         assert_eq!(b.read_sessions().unwrap()[0].status, SessionStatus::Working);

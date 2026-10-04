@@ -1,3 +1,4 @@
+import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
 import {
   DeviceRoom,
@@ -14,7 +15,8 @@ import {
   rpcAllowedForScopedHost,
   requiredCapabilityForRpc,
 } from "./device-room";
-import { DEVICE_HOST_AUTH_HEADER, stripTrustedAuthHeaders } from "./env";
+import type { Env } from "./env";
+import { AUTH_CAPABILITIES_HEADER, AUTH_PROJECT_HEADER, AUTH_USER_HEADER, DEVICE_HOST_AUTH_HEADER, stripTrustedAuthHeaders } from "./env";
 
 const now = 1_800_000_000_000;
 const rawGrant = {
@@ -62,6 +64,36 @@ describe("ordinary device command admission", () => {
     }
     expect(peerCommandAdmission(client, { ...host, hostAuthorization: "sandbox" }, encode(request), now)).toBeUndefined();
     expect(peerCommandAdmission(client, host, encode({ ...request, method: "QueueCommand" }), now)).toBeUndefined();
+  });
+
+  it.each(["deploymentId", "controlDeploymentId"] as const)("does not erase an ordinary admission's explicit %s", (field) => {
+    for (const value of ["deployment-a", ""]) {
+      expect(peerCommandAdmission(client, host, encode({ ...request, params: {
+        ...request.params, [field]: value
+      } }), now)).toBeUndefined();
+    }
+    expect(peerCommandAdmission(client, host, encode({ ...request, params: {
+      ...request.params, [field]: null
+    } }), now)?.authority).toEqual({
+      subject: client.userId, projectId: client.projectScope, deviceId: "devbox-a",
+      chatId: "chat-a", expiresAt: client.joinedAt + 30_000
+    });
+  });
+
+  it.each(["deploymentId", "controlDeploymentId"] as const)("rejects direct ordinary socket %s before creating a relay", async (field) => {
+    const room = {
+      getMeta: (key: string) => key === "projectScope" || key === "owner" ? "project-a" : undefined
+    } as unknown as DeviceRoom;
+    const response = await DeviceRoom.prototype.fetch.call(room, new Request(
+      `https://device.internal/ws?role=client&controlSessionId=11111111-1111-4111-8111-111111111111&${field}=deployment-a`,
+      { headers: {
+        [AUTH_USER_HEADER]: client.userId,
+        [AUTH_PROJECT_HEADER]: "project-a",
+        [AUTH_CAPABILITIES_HEADER]: "session.read session.control"
+      } }
+    ));
+    expect(response.status).toBe(403);
+    expect(await response.text()).toBe("scoped_control_not_supported");
   });
 
   it("allows typed Local controls without trusting caller grant ids or Scaffold identities", () => {
@@ -187,25 +219,109 @@ describe("device host authentication", () => {
   });
 });
 
-describe("device host startup", () => {
-  it("delivers verified authority before replaying queued work", () => {
-    const grant = parseTrustedDeviceGrant(
-      JSON.stringify(rawGrant),
-      rawGrant.subject,
-      rawGrant.scope.projectId,
-      now
-    )!;
-    const delivered: string[] = [];
-    const room = {
-      deliver: vi.fn(() => delivered.push("grant")),
-      replayNudges: vi.fn(() => delivered.push("nudge"))
-    } as unknown as DeviceRoom;
-    DeviceRoom.prototype.deliverHostStartup.call(
-      room,
-      {} as WebSocket,
-      grant
-    );
-    expect(delivered).toEqual(["grant", "nudge"]);
+describe("durable cold-chat wakeups", () => {
+  it("retains SQL wakeups across overflow, failed sends and restarts until exact current-host consumption", async () => {
+    const db = new DatabaseSync(":memory:");
+    const legacyChatId = "11111111-1111-4111-8111-111111111111";
+    const frames: Uint8Array[] = [];
+    let failSend = false;
+    let attachment = {
+      userId: "owner", projectScope: "project-a", capabilities: ["session.read", "session.control"],
+      role: "host", connId: "engine", hostAuthorization: "local", joinedAt: Date.now(), superseded: false
+    };
+    const host = {
+      deserializeAttachment: () => attachment,
+      serializeAttachment: (value: typeof attachment) => { attachment = value; },
+      send: (bytes: Uint8Array) => { if (failSend) throw new Error("closed"); frames.push(bytes); },
+      close: () => {}
+    } as unknown as WebSocket;
+    let sockets: WebSocket[] = [];
+    const ctx = {
+      storage: {
+        sql: { exec: (query: string, ...values: (string | number)[]) => db.prepare(query).all(...values) },
+        sync: async () => {}
+      },
+      getWebSockets: () => sockets,
+      getWebSocketAutoResponseTimestamp: () => null,
+      setWebSocketAutoResponse: () => {}
+    } as unknown as DurableObjectState;
+    vi.stubGlobal("WebSocketRequestResponsePair", class {});
+    try {
+      db.exec("CREATE TABLE pending_nudges (chat_id TEXT PRIMARY KEY, queued_at INTEGER NOT NULL)");
+      db.prepare("INSERT INTO pending_nudges VALUES (?, ?)").run(legacyChatId, 1);
+      let room = new DeviceRoom(ctx, {} as Env);
+      db.prepare("INSERT INTO meta (key, value) VALUES (?, ?)").run("projectScope", "project-a");
+      db.prepare("INSERT INTO meta (key, value) VALUES (?, ?)").run("owner", "project-a");
+      const legacy = db.prepare("SELECT * FROM pending_nudges WHERE chat_id = ?").get(legacyChatId);
+      expect(legacy?.queued_at).toBe(1);
+      expect(typeof legacy?.nudge_id).toBe("string");
+      const invalid = await room.fetch(new Request("https://device.internal/nudge", {
+        method: "POST", body: JSON.stringify({ chatId: "not-a-uuid" }), headers: {
+          [AUTH_USER_HEADER]: "owner", [AUTH_PROJECT_HEADER]: "project-a",
+          [AUTH_CAPABILITIES_HEADER]: "session.read session.control"
+        }
+      }));
+      expect(invalid.status).toBe(400);
+      expect(db.prepare("SELECT * FROM pending_nudges").all()).toEqual([legacy]);
+      for (let index = 0; index < 255; index++) {
+        const response = await room.fetch(new Request("https://device.internal/nudge", {
+          method: "POST", body: JSON.stringify({ chatId: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}` }), headers: {
+            [AUTH_USER_HEADER]: "owner", [AUTH_PROJECT_HEADER]: "project-a",
+            [AUTH_CAPABILITIES_HEADER]: "session.read session.control"
+          }
+        }));
+        expect(response.status).toBe(200);
+      }
+      const before = db.prepare("SELECT * FROM pending_nudges ORDER BY chat_id").all();
+      const overflow = await room.fetch(new Request("https://device.internal/nudge", {
+        method: "POST", body: JSON.stringify({ chatId: "99999999-9999-4999-8999-999999999999" }), headers: {
+          [AUTH_USER_HEADER]: "owner", [AUTH_PROJECT_HEADER]: "project-a",
+          [AUTH_CAPABILITIES_HEADER]: "session.read session.control"
+        }
+      }));
+      expect(overflow.status).toBe(503);
+      expect(await overflow.json()).toMatchObject({ delivered: false, queued: false });
+      expect(db.prepare("SELECT * FROM pending_nudges ORDER BY chat_id").all()).toEqual(before);
+      sockets = [host];
+      failSend = true;
+      const failed = await room.fetch(new Request("https://device.internal/nudge", {
+        method: "POST", body: JSON.stringify({ chatId: legacyChatId }), headers: {
+          [AUTH_USER_HEADER]: "owner", [AUTH_PROJECT_HEADER]: "project-a",
+          [AUTH_CAPABILITIES_HEADER]: "session.read session.control"
+        }
+      }));
+      expect(await failed.json()).toEqual({ delivered: false, queued: true });
+      const pending = db.prepare("SELECT * FROM pending_nudges ORDER BY chat_id").all();
+      expect(pending.find((row) => row.chat_id === legacyChatId)?.queued_at).toBe(1);
+      room = new DeviceRoom(ctx, {} as Env);
+      await room.deliverHostStartup(host);
+      expect(frames).toEqual([]);
+      expect(db.prepare("SELECT * FROM pending_nudges ORDER BY chat_id").all()).toEqual(pending);
+      failSend = false;
+      await room.deliverHostStartup(host);
+      expect(db.prepare("SELECT * FROM pending_nudges ORDER BY chat_id").all()).toEqual(pending);
+      const frame = frames.map(decodeDeviceFrame).find((value) => value.header.s === legacyChatId)!;
+      const receipt = JSON.parse(new TextDecoder().decode(frame.payload));
+      expect(receipt.chatId).toBe(legacyChatId);
+      const ack = encodeDeviceFrame({ s: receipt.chatId, k: "nudge-ack" },
+        new TextEncoder().encode(JSON.stringify(receipt))).buffer as ArrayBuffer;
+      const supersededAck = room.webSocketMessage(host, ack);
+      attachment = { ...attachment, superseded: true };
+      await supersededAck;
+      expect(db.prepare("SELECT * FROM pending_nudges ORDER BY chat_id").all()).toEqual(pending);
+      attachment = { ...attachment, superseded: false };
+      const staleAck = encodeDeviceFrame({ s: receipt.chatId, k: "nudge-ack" },
+        new TextEncoder().encode(JSON.stringify({ ...receipt, nudgeId: legacy?.nudge_id }))).buffer as ArrayBuffer;
+      await room.webSocketMessage(host, staleAck);
+      expect(db.prepare("SELECT * FROM pending_nudges ORDER BY chat_id").all()).toEqual(pending);
+      const wrongStream = encodeDeviceFrame({ s: "other-chat", k: "nudge-ack" },
+        new TextEncoder().encode(JSON.stringify(receipt))).buffer as ArrayBuffer;
+      await room.webSocketMessage(host, wrongStream);
+      expect(db.prepare("SELECT * FROM pending_nudges ORDER BY chat_id").all()).toEqual(pending);
+      await room.webSocketMessage(host, ack);
+      expect(db.prepare("SELECT * FROM pending_nudges WHERE chat_id = ?").get(legacyChatId)).toBeUndefined();
+      expect(db.prepare("SELECT * FROM pending_nudges ORDER BY chat_id").all()).toEqual(pending.filter((row) => row.chat_id !== legacyChatId));
+    } finally { db.close(); vi.unstubAllGlobals(); }
   });
 });
 

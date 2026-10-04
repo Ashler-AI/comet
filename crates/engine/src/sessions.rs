@@ -367,7 +367,7 @@ struct Inner {
     shutting_down: CancellationToken,
     admission: RwLock<()>,
     run_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
-    recovery_states: Mutex<HashMap<String, serde_json::Value>>,
+    recovery_states: Mutex<HashMap<String, (std::time::Instant, serde_json::Value)>>,
     recovery_tx: broadcast::Sender<(String, serde_json::Value)>,
     /// One local live waiter per `(source chat, thread)`. Intentionally process-local:
     /// the command ledger remains the only durable outbox.
@@ -389,7 +389,13 @@ pub struct SessionsEngine {
     inner: Arc<Inner>,
 }
 
+pub(crate) struct WeakSessionsEngine(Weak<Inner>);
+impl WeakSessionsEngine {
+    pub(crate) fn upgrade(&self) -> Option<SessionsEngine> { self.0.upgrade().map(|inner| SessionsEngine { inner }) }
+}
+
 impl SessionsEngine {
+    pub(crate) fn downgrade(&self) -> WeakSessionsEngine { WeakSessionsEngine(Arc::downgrade(&self.inner)) }
     pub fn new(
         device_id: String,
         journal: Arc<RunJournal>,
@@ -659,6 +665,7 @@ impl SessionsEngine {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn recovered_context(&self, execution_key: &str) -> Result<RunRequest, EngineError> {
         self.recovered_context_if_present(execution_key)?
             .ok_or_else(|| EngineError::Other("session_context_recovery_missing".into()))
@@ -670,12 +677,11 @@ impl SessionsEngine {
     ) -> Result<Option<RunRequest>, EngineError> {
         let context: Option<(RunAuthIdentity, String, HarnessId, RunRequest)> =
             self.inner.journal.read_context(execution_key)?;
-        let Some((identity, device_id, harness, request)) = context else {
+        let Some((identity, device_id, _, request)) = context else {
             return Ok(None);
         };
         if identity != self.auth_identity()
             || device_id != self.inner.device_id
-            || harness != HarnessId::Omp
             || request.cwd.is_empty()
         {
             return Err(EngineError::Other(
@@ -820,7 +826,7 @@ impl SessionsEngine {
     }
 
     pub fn omp_recovery_state(&self, chat_id: &str) -> serde_json::Value {
-        if let Some(state) = lock(&self.inner.recovery_states).get(chat_id) {
+        if let Some((_, state)) = lock(&self.inner.recovery_states).get(chat_id) {
             return state.clone();
         }
         match self.pending_run(chat_id) {
@@ -1610,6 +1616,14 @@ impl SessionsEngine {
     /// the remembered harness session (comet: "not just eulogized";
     /// `MAX_AUTO_RESUME` = 3 consecutive revivals, fresh = crashed < 12h ago).
     pub fn recover_stale(&self) -> Result<usize, EngineError> {
+        self.recover_stale_matching(None)
+    }
+
+    pub(crate) fn recover_stale_in_room(&self, chat_id: &str) -> Result<usize, EngineError> {
+        self.recover_stale_matching(Some(chat_id))
+    }
+
+    fn recover_stale_matching(&self, room: Option<&str>) -> Result<usize, EngineError> {
         self.require_running()?;
         const MAX_AUTO_RESUME: u32 = 3;
         const RESUME_FRESH_MS: i64 = 12 * 60 * 60 * 1000;
@@ -1619,16 +1633,16 @@ impl SessionsEngine {
         chats.extend(self.inner.journal.recovery_sessions()?);
         chats.sort();
         chats.dedup();
+        if let Some(room) = room {
+            chats.retain(|id| id == room || id.strip_prefix(room).is_some_and(|suffix| suffix.starts_with("::session::")));
+        }
         let mut recovered = 0;
         for chat_id in chats {
             if lock(&self.inner.runs).contains_key(&chat_id) {
                 continue;
             }
             let result = (|| -> Result<(), EngineError> {
-                let retired = self.inner.journal.recovery_retired(&chat_id)?;
-                if retired && !chat_id.contains("::session::") {
-                    return Ok(());
-                }
+
                 let context: Option<(RunAuthIdentity, String, HarnessId, RunRequest)> =
                     self.inner.journal.read_context(&chat_id)?;
                 // Do not open or mutate this chat until its durable identity can be
@@ -1658,6 +1672,24 @@ impl SessionsEngine {
                         "session_recovery_binding_mismatch".into(),
                     ));
                 }
+                let retired = self.inner.journal.recovery_retired(&chat_id)?;
+                // A crash can retain Done while losing its room/workspace mirror.
+                // Reproject only this runtime's proven terminal state, never rerun it.
+                if context.is_some()
+                    && let Some((_, AgentEvent::Done { status, .. })) = self.inner.journal.last_event(&chat_id)?
+                    && (retired || status == DoneStatus::Completed)
+                    && !lock(&self.inner.statuses).contains_key(&chat_id)
+                {
+                    let handle = self.doc_handle(&chat_id)?;
+                    if !self.inner.doc_host.get().expect("doc handle requires host").recovery_baseline_ready(&handle) {
+                        return Ok(());
+                    }
+                    self.set_status(&chat_id, if status == DoneStatus::Errored {
+                        SessionStatus::Errored
+                    } else {
+                        SessionStatus::Idle
+                    }, false);
+                }
                 let pending = self.pending_run(&chat_id)?;
                 // Completed private journals still contain output stranded before
                 // canonical aliases were restored. Repair the document binding after
@@ -1666,18 +1698,14 @@ impl SessionsEngine {
                     self.doc_handle(&chat_id)?;
                 }
                 if retired || (pending.is_none() && !stale.contains(&chat_id)) {
-                    if self.inner.workspace_continuation_id(&chat_id) != chat_id
-                        && let Some((_, AgentEvent::Done { status, .. })) = self.inner.journal.last_event(&chat_id)?
-                    {
-                        self.set_status(&chat_id, if status == DoneStatus::Errored {
-                            SessionStatus::Errored
-                        } else {
-                            SessionStatus::Idle
-                        }, false);
-                    }
                     return Ok(());
                 }
                 let handle = self.doc_handle(&chat_id)?;
+                // The checkpoint can lag acknowledged stream content. Do not
+                // terminalize its prefix before the room's authoritative backfill.
+                if !self.inner.doc_host.get().expect("doc handle requires host").recovery_baseline_ready(&handle) {
+                    return Ok(());
+                }
                 // Externally owned writers never become an automatic stop on reboot.
                 if pending
                     .as_ref()
@@ -2038,6 +2066,45 @@ impl SessionsEngine {
 }
 
 impl Inner {
+    /// Bound process-local history; journals and workspace rows remain durable.
+    fn prune_inactive_state(&self) {
+        const RETAIN_INACTIVE: usize = 256;
+        let runs = lock(&self.runs);
+        let preparations = lock(&self.preparations);
+        let mut statuses = lock(&self.statuses);
+        let mut inactive: Vec<_> = statuses.values()
+            .filter(|session| !runs.contains_key(&session.chat_id)
+                && !preparations.contains_key(&session.chat_id)
+                && !matches!(session.status, SessionStatus::Working | SessionStatus::AwaitingInput))
+            .map(|session| (session.updated_at, session.chat_id.clone()))
+            .collect();
+        inactive.sort_unstable();
+        let evict = inactive.len().saturating_sub(RETAIN_INACTIVE);
+        for (_, chat_id) in inactive.into_iter().take(evict) {
+            statuses.remove(&chat_id);
+            lock(&self.route_restarts).remove(&chat_id);
+            lock(&self.recovery_states).remove(&chat_id);
+            // Bare engines have no durable rejected-resume tombstone fallback.
+            if self.workspace().is_some() {
+                lock(&self.harness_sessions).remove(&chat_id);
+            }
+        }
+        if evict > 0 {
+            self.publish_sessions(&statuses);
+        }
+        let mut recovery = lock(&self.recovery_states);
+        if recovery.len() > RETAIN_INACTIVE {
+            let mut inactive: Vec<_> = recovery.iter()
+                .filter(|(id, _)| !runs.contains_key(*id) && !preparations.contains_key(*id))
+                .map(|(id, (at, _))| (*at, id.clone())).collect();
+            inactive.sort_unstable();
+            let evict = inactive.len().saturating_sub(RETAIN_INACTIVE);
+            for (_, id) in inactive.into_iter().take(evict) { recovery.remove(&id); }
+        }
+        lock(&self.hubs).retain(|_, hub| hub.receiver_count() > 0);
+        lock(&self.run_tasks).retain(|task| !task.is_finished());
+    }
+
     fn start_turn(&self, chat_id: &str, run_id: &str) -> Result<(), EngineError> {
         self.namespace_tasks.start_turn(chat_id, run_id).map_err(|error| {
             tracing::error!(chat = %chat_id, %error, "could not create Crew Namespace task marker");
@@ -2085,7 +2152,7 @@ impl Inner {
     }
     fn set_recovery(&self, chat_id: &str, phase: &str, error: Option<String>) {
         let state = serde_json::json!({ "phase": phase, "error": error });
-        lock(&self.recovery_states).insert(chat_id.to_string(), state.clone());
+        lock(&self.recovery_states).insert(chat_id.to_string(), (std::time::Instant::now(), state.clone()));
         let _ = self.recovery_tx.send((chat_id.to_string(), state));
     }
 
@@ -2103,11 +2170,13 @@ impl Inner {
                 0
             }
         };
-        if let Some(hub) = lock(&self.hubs).get(chat_id) {
-            let _ = hub.send(JournaledEvent {
-                seq,
-                event: event.clone(),
-            });
+        let mut hubs = lock(&self.hubs);
+        if let Some(hub) = hubs.get(chat_id) {
+            if hub.receiver_count() == 0 {
+                hubs.remove(chat_id);
+            } else {
+                let _ = hub.send(JournaledEvent { seq, event: event.clone() });
+            }
         }
         seq
     }
@@ -2180,8 +2249,9 @@ impl Inner {
         self.mirror_session(session);
         // A tool-only turn also becomes unread on completion. Repeated idle
         // teardown and freshness heartbeats must not manufacture new activity.
-        if finished && let Some(workspace) = self.workspace() {
-            let chat_id = self.workspace_continuation_id(chat_id);
+        if finished && let Some(workspace) = self.workspace()
+            && let Some(chat_id) = self.doc_host.get().and_then(|host| host.workspace_activity_id(chat_id))
+        {
             if let Err(error) =
                 workspace.set_chat_activity(&chat_id, Some(now.timestamp_millis()), None)
             {
@@ -2191,13 +2261,20 @@ impl Inner {
     }
 
     fn publish_sessions(&self, statuses: &HashMap<String, Session>) {
-        let mut list: Vec<Session> = statuses.values().cloned().collect();
+        let mut list = Vec::with_capacity(statuses.len());
         for session in statuses.values() {
-            let canonical_id = self.workspace_continuation_id(&session.chat_id);
-            if canonical_id != session.chat_id {
-                let mut canonical = session.clone();
-                canonical.chat_id = canonical_id;
-                list.push(canonical);
+            let aggregate = self.doc_host.get().and_then(|host| host.owner_thread_session(session));
+            if session.chat_id.contains("::session::") {
+                list.push(session.clone()); // Private monitor and turn identity stays exact.
+            }
+            if let Some(aggregate) = aggregate {
+                list.push(aggregate);
+            } else {
+                let mut public = session.clone();
+                public.chat_id = self.workspace_continuation_id(&session.chat_id);
+                if public.chat_id != session.chat_id || !session.chat_id.contains("::session::") {
+                    list.push(public);
+                }
             }
         }
         list.sort_by(|a, b| {
@@ -2213,6 +2290,10 @@ impl Inner {
 
     fn mirror_session(&self, mut session: Session) {
         if let Some(ws) = self.workspace() {
+            if let Some(aggregate) = self.doc_host.get().and_then(|host| host.owner_thread_session(&session)) {
+                ws.record_session(&aggregate);
+                return;
+            }
             session.chat_id = self.workspace_continuation_id(&session.chat_id);
             ws.record_session(&session);
         }
@@ -2234,8 +2315,10 @@ impl Inner {
         if text.is_empty() {
             return;
         }
-        if let Some(ws) = self.workspace() {
-            ws.note_message(&self.workspace_continuation_id(chat_id), text);
+        if let Some(ws) = self.workspace()
+            && let Some(public_id) = self.doc_host.get().and_then(|host| host.workspace_activity_id(chat_id))
+        {
+            ws.note_message(&public_id, text);
         }
     }
 
@@ -2369,35 +2452,13 @@ impl Inner {
     /// the cwd of the `SessionStarted` that governs it. `Done.session_id`
     /// inherits the cwd of the most recent `SessionStarted` (same run).
     fn journal_harness_session(&self, chat_id: &str) -> Option<(String, String)> {
-        let events = match self.journal.replay(chat_id, 0) {
-            Ok(events) => events,
+        match self.journal.last_harness_session(chat_id) {
+            Ok(session) => session,
             Err(err) => {
                 tracing::warn!(chat = %chat_id, error = %err, "journal scan for harness session failed");
-                return None;
-            }
-        };
-        let mut current_cwd = String::new();
-        let mut found: Option<(String, String)> = None;
-        for (_, event) in events {
-            match event {
-                AgentEvent::SessionStarted {
-                    session_id, cwd, ..
-                } => {
-                    current_cwd = cwd;
-                    if !session_id.is_empty() {
-                        found = Some((session_id, current_cwd.clone()));
-                    }
-                }
-                AgentEvent::Done {
-                    session_id: Some(session_id),
-                    ..
-                } if !session_id.is_empty() => {
-                    found = Some((session_id, current_cwd.clone()));
-                }
-                _ => {}
+                None
             }
         }
-        found
     }
 
     fn mark_run_tearing_down(&self, chat_id: &str, run_id: &str) {
@@ -3115,6 +3176,7 @@ async fn drive_run(
             runs.remove(&chat_id);
         }
     }
+    inner.prune_inactive_state();
 
     if interrupted {
         for followup in deferred_followups {
@@ -3274,6 +3336,44 @@ mod tests {
             Arc::new(HarnessRegistry::new()),
             27654,
         )
+    }
+
+    #[test]
+    fn inactive_retention_preserves_live_events_and_durable_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = bare_sessions(dir.path());
+        let request = test_request("resume retained request", None);
+        sessions.save_pending("old-000", HarnessId::Mock, &request, "user", None).unwrap();
+        let (_, mut live) = sessions.subscribe("old-000", 0).unwrap();
+        for i in 0..300 {
+            let id = format!("old-{i:03}");
+            lock(&sessions.inner.statuses).insert(id.clone(), Session {
+                chat_id: id.clone(), device_id: "test-device".into(), status: SessionStatus::Idle,
+                started_at: None, updated_at: chrono::DateTime::from_timestamp_millis(i).unwrap(),
+            });
+            lock(&sessions.inner.recovery_states).insert(id.clone(), (std::time::Instant::now(), serde_json::json!({"phase": "completed"})));
+            let (_, receiver) = sessions.subscribe(&id, 0).unwrap();
+            drop(receiver);
+            drop(sessions.dispatch_lock(&id));
+        }
+        sessions.set_status("active", SessionStatus::AwaitingInput, true);
+        sessions.inner.prune_inactive_state();
+        assert_eq!(lock(&sessions.inner.statuses).len(), 257);
+        assert!(sessions.session_status("old-000").is_none());
+        assert_eq!(sessions.session_status("active").unwrap().status, SessionStatus::AwaitingInput);
+        assert_eq!(lock(&sessions.inner.hubs).len(), 1);
+        assert!(lock(&sessions.inner.dispatch_locks).len() <= 1);
+        assert!(lock(&sessions.inner.recovery_states).len() <= 256);
+        assert_eq!(sessions.last_request("old-000").unwrap().prompt, request.prompt);
+        let event = AgentEvent::Done { status: DoneStatus::Completed, result: None, error: None, session_id: None };
+        let seq = sessions.inner.publish("old-000", &event);
+        assert_eq!(live.try_recv().unwrap().seq, seq);
+        drop(live);
+        sessions.inner.prune_inactive_state();
+        assert!(lock(&sessions.inner.hubs).is_empty());
+        let (replay, _) = sessions.subscribe("old-000", 0).unwrap();
+        assert_eq!(replay.last().unwrap().seq, seq);
+        assert!(matches!(replay.last().unwrap().event, AgentEvent::Done { status: DoneStatus::Completed, .. }));
     }
 
     #[tokio::test]
@@ -3446,7 +3546,6 @@ mod tests {
             .unwrap();
         drop(sessions);
         let restarted = bare_sessions(dir.path());
-        assert!(restarted.last_request(key).is_none());
         let recovered = restarted.recovered_context(key).unwrap();
         assert_eq!(
             serde_json::to_value(&recovered).unwrap(),
@@ -3461,7 +3560,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_context_rejects_wrong_tenant_device_harness_and_missing_evidence() {
+    fn durable_context_enforces_tenant_device_and_accepts_supported_harnesses() {
         let dir = tempfile::tempdir().unwrap();
         let sessions = bare_sessions(dir.path());
         let key = "chat::session::chat";
@@ -3487,11 +3586,6 @@ mod tests {
                 "other-device".into(),
                 HarnessId::Omp,
             ),
-            (
-                sessions.auth_identity(),
-                sessions.inner.device_id.clone(),
-                HarnessId::Codex,
-            ),
         ] {
             sessions
                 .inner
@@ -3501,6 +3595,13 @@ mod tests {
             assert!(sessions.recovered_context(key).is_err());
             assert!(sessions.recovered_context_if_present(key).is_err());
         }
+        for harness in [HarnessId::Omp,HarnessId::Codex,HarnessId::ClaudeCode] {
+            sessions.inner.journal.save_context(key,&(sessions.auth_identity(),&sessions.inner.device_id,harness,&request)).unwrap();
+            assert_eq!(serde_json::to_value(sessions.recovered_context_if_present(key).unwrap().unwrap()).unwrap(),serde_json::to_value(&request).unwrap());
+        }
+        let mut invalid = request.clone(); invalid.cwd.clear();
+        sessions.inner.journal.save_context(key,&(sessions.auth_identity(),&sessions.inner.device_id,HarnessId::Codex,&invalid)).unwrap();
+        assert!(sessions.recovered_context_if_present(key).is_err());
     }
 
     #[test]
@@ -3786,6 +3887,7 @@ mod tests {
         });
         host.set_workspace(workspace);
         sessions.set_doc_host(host.clone());
+        host.set_sessions(&sessions);
         sessions.inner.journal.save_context(&execution, &(
             sessions.auth_identity(), "test-device", HarnessId::Mock,
             test_request("Do not repeat the completed report task", None),
@@ -3799,6 +3901,200 @@ mod tests {
         assert!(sessions.pending_run(&execution).unwrap().is_none());
         assert!(matches!(sessions.inner.journal.last_event(&execution).unwrap(),
             Some((_, AgentEvent::Done { status: DoneStatus::Completed, .. }))));
+    }
+
+    #[tokio::test]
+    async fn crash_recovery_waits_for_acknowledged_stream_backfill() {
+        use futures::{SinkExt, StreamExt};
+        use loro_protocol::{BatchId, CrdtType, Permission, ProtocolMessage, UpdateStatusCode, decode, encode};
+        use tokio_tungstenite::tungstenite::Message;
+        const CHAT: &str = "00000000-0000-4000-8000-000000000252";
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path().join("docs")).unwrap());
+        let cached = SessionDoc::init(CHAT).unwrap();
+        let text = |value: &str| vec![MessagePart::Text { id: "text".into(), text: value.into() }];
+        let mut writer = SegmentWriter::begin(&cached, "active", "test-device", 1).unwrap();
+        writer.sync(&text("cached")).unwrap();
+        drop(writer);
+        store.save_snapshot(CHAT, &cached.export_snapshot().unwrap()).unwrap();
+        let remote_raw = loro::LoroDoc::new();
+        remote_raw.import(&cached.export_snapshot().unwrap()).unwrap();
+        let remote = SessionDoc::from_doc(remote_raw);
+        let mut ahead = remote.read_entry("active").unwrap().unwrap();
+        ahead.parts = text("cached acknowledged suffix");
+        remote.reconcile_message(&ahead).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut release = Some(release_rx);
+            while let Some(Ok(Message::Binary(bytes))) = socket.next().await {
+                match decode(&bytes).unwrap() {
+                    ProtocolMessage::JoinRequest { crdt: CrdtType::Loro, room_id, .. } => {
+                        if let Some(release) = release.take() { release.await.unwrap(); }
+                        socket.send(Message::Binary(encode(&ProtocolMessage::JoinResponseOk {
+                            crdt: CrdtType::Loro, room_id: room_id.clone(), permission: Permission::Write,
+                            version: remote.doc().oplog_vv().encode(), extra: None,
+                        }).unwrap())).await.unwrap();
+                        socket.send(Message::Binary(encode(&ProtocolMessage::DocUpdate {
+                            crdt: CrdtType::Loro, room_id, batch_id: BatchId([1; 8]),
+                            updates: vec![remote.export_snapshot().unwrap()],
+                        }).unwrap())).await.unwrap();
+                    }
+                    ProtocolMessage::DocUpdate { crdt: CrdtType::Loro, room_id, batch_id, updates } => {
+                        for update in updates { remote.binding().import(&update).unwrap(); }
+                        socket.send(Message::Binary(encode(&ProtocolMessage::Ack {
+                            crdt: CrdtType::Loro, room_id, ref_id: batch_id, status: UpdateStatusCode::Ok,
+                        }).unwrap())).await.unwrap();
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let workspace = WorkspaceHost::open(store.clone(), WorkspaceHostConfig {
+            device_id: "test-device".into(), device_name: "Test".into(), platform: "test".into(),
+            project_scope: "project".into(), user_id: "owner".into(), edge: None,
+        }).unwrap();
+        workspace.claim_chat(CHAT, Some("/tmp")).unwrap();
+        let host = DocHost::new(store, DocHostConfig {
+            device_id: "test-device".into(), default_harness: HarnessId::Mock,
+            edge: Some(crate::doc_host::EdgeConfig::with_static_token(format!("http://{address}"), "test")),
+        });
+        host.set_workspace(workspace);
+        let sessions = bare_sessions(&dir.path().join("journal"));
+        sessions.set_doc_host(host.clone());
+        host.set_sessions(&sessions);
+        sessions.save_pending(CHAT, HarnessId::Mock, &test_request("accepted", None), "original", None).unwrap();
+        sessions.inner.journal.append(CHAT, &AgentEvent::TextDelta { text: "cached".into() }).unwrap();
+        // Exhaust the existing revival budget: this check observes settlement, not a new run.
+        for _ in 0..3 { sessions.inner.journal.note_resume_attempt(CHAT); }
+        assert_eq!(sessions.recover_stale().unwrap(), 0);
+        let handle = host.open(CHAT).unwrap();
+        assert_eq!(handle.doc().read_entry("active").unwrap().unwrap().status, Some(MessageStatus::Streaming));
+        assert!(matches!(sessions.inner.journal.last_event(CHAT).unwrap(), Some((_, AgentEvent::TextDelta { .. }))));
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let entry = handle.doc().read_entry("active").unwrap().unwrap();
+                if entry.status == Some(MessageStatus::Aborted) && entry.parts.len() == 2
+                    && sessions.session_status(CHAT).is_some_and(|row| row.status == SessionStatus::Idle) {
+                    assert_eq!(entry.parts[0], text("cached acknowledged suffix")[0]);
+                    assert!(matches!(entry.parts[1], MessagePart::Error { .. }));
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        assert!(handle.recovery_error().is_none());
+        assert_eq!(handle.doc().read_entries().unwrap().len(), 1);
+        assert!(lock(&sessions.inner.runs).is_empty());
+        sessions.shutdown().await;
+        host.purge_chat(CHAT);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn child_tool_only_completion_updates_public_activity_once() {
+        const CHAT: &str = "00000000-0000-4000-8000-000000000253";
+        const CHILD: &str = "00000000-0000-4000-8000-000000000254";
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path().join("docs")).unwrap());
+        let workspace = WorkspaceHost::open(store.clone(), WorkspaceHostConfig {
+            device_id: "test-device".into(), device_name: "Test".into(), platform: "test".into(),
+            project_scope: "project".into(), user_id: "owner".into(), edge: None,
+        }).unwrap();
+        workspace.claim_chat(CHAT, Some("/tmp")).unwrap();
+        workspace.set_chat_activity(CHAT, Some(1_000), None).unwrap();
+        workspace.set_chat_harness_session(CHAT, "parent-native", "/tmp");
+        let host = DocHost::new(store, DocHostConfig { device_id: "test-device".into(), default_harness: HarnessId::Mock, edge: None });
+        host.set_workspace(workspace.clone());
+        let handle = host.open(CHAT).unwrap();
+        handle.doc().append_publication(&comet_proto::PublicationRecord {
+            id: "child-start".into(), schema_version: comet_proto::COLLABORATION_SCHEMA_VERSION,
+            published_at: 1, published_by: "owner".into(),
+            value: comet_proto::PublicationValue::AgentSession(Box::new(comet_proto::AgentSessionRecord {
+                session_id: CHILD.into(), chat_id: CHAT.into(), owner_subject: "owner".into(),
+                owner_device_id: "test-device".into(), source: comet_proto::AgentSessionSource::Local,
+                environment: None, harness: Some(HarnessId::Mock), model: None, harness_session_id: None,
+                status: Some(SessionStatus::Idle), updated_at: Some(1), created_at: 1, unknown: Default::default(),
+            })), unknown: Default::default(),
+        }).unwrap();
+        let registry = Arc::new(HarnessRegistry::for_profile(comet_proto::RuntimeProfile::Mock));
+        registry.register(Arc::new(RouteRestartHarness { requests: Arc::new(Mutex::new(Vec::new())) }));
+        let sessions = SessionsEngine::new("test-device".into(), Arc::new(RunJournal::open(dir.path().join("journal")).unwrap()), registry, 27654);
+        sessions.set_doc_host(host.clone()); host.set_sessions(&sessions);
+        let key = format!("{CHAT}::session::{CHILD}");
+        let request = test_request("", None); // No message preview can stand in for completion activity.
+        sessions.save_pending(&key, HarnessId::Mock, &request, "original", None).unwrap();
+        sessions.dispatch(&key, HarnessId::Mock, request, Some("original".into())).await.unwrap();
+        assert_eq!(workspace.doc().chat(CHAT).unwrap().unwrap().last_message_at.unwrap().timestamp_millis(), 1_000);
+        sessions.interrupt(&key).await.unwrap();
+        let completed_at = workspace.doc().chat(CHAT).unwrap().unwrap().last_message_at.unwrap();
+        assert!(completed_at.timestamp_millis() > 1_000);
+        assert_eq!(sessions.watch_sessions().borrow().iter().find(|row| row.chat_id == CHAT).unwrap().status, SessionStatus::Idle);
+        assert_eq!(workspace.chat_harness_session(CHAT).unwrap().0, "parent-native");
+        assert_eq!(workspace.doc().read_chats().unwrap().len(), 1);
+        assert!(!sessions.interrupt(&key).await.unwrap());
+        assert_eq!(workspace.doc().chat(CHAT).unwrap().unwrap().last_message_at, Some(completed_at));
+        sessions.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn settled_journal_restores_owner_completion_without_replaying() {
+        const CHAT: &str = "00000000-0000-4000-8000-000000000251";
+        for (private, done, expected) in [
+            (false, DoneStatus::Completed, SessionStatus::Idle),
+            (true, DoneStatus::Interrupted, SessionStatus::Idle),
+            (true, DoneStatus::Errored, SessionStatus::Errored),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(DocsStore::open(dir.path().join("docs")).unwrap());
+            let workspace = crate::WorkspaceHost::open(store.clone(), crate::WorkspaceHostConfig {
+                device_id: "test-device".into(), device_name: "Test".into(), platform: "test".into(),
+                project_scope: "project".into(), user_id: "owner".into(), edge: None,
+            }).unwrap();
+            workspace.claim_chat(CHAT, Some("/tmp")).unwrap();
+            let config = DocHostConfig { device_id: "test-device".into(), default_harness: HarnessId::Mock, edge: None };
+            let host = DocHost::new(store.clone(), config.clone());
+            host.set_workspace(workspace.clone());
+            let handle = host.open(CHAT).unwrap();
+            let key = if private { format!("{CHAT}::session::{CHAT}") } else { CHAT.into() };
+            let journal_path = dir.path().join("journal");
+            let sessions = bare_sessions(&journal_path);
+            sessions.save_pending(&key, HarnessId::Mock, &test_request("accepted once", None), "accepted", None).unwrap();
+            handle.write_user_message("accepted", "accepted once", 1).unwrap();
+            host.record_agent_session(&Session {
+                chat_id: CHAT.into(), device_id: "test-device".into(), status: SessionStatus::Working,
+                started_at: None, updated_at: Utc::now(),
+            }).unwrap();
+            // Done and retirement are durable, but the public mirror still says Working.
+            sessions.inner.journal.retire_recovery(&key).unwrap();
+            sessions.inner.journal.append(&key, &AgentEvent::Done {
+                status: done, result: None, error: None, session_id: None,
+            }).unwrap();
+            host.flush_all();
+            drop(handle);
+            drop(host);
+            drop(sessions);
+            let host = DocHost::new(store, config);
+            host.set_workspace(workspace.clone());
+            let sessions = bare_sessions(&journal_path); // No registered harness can execute.
+            sessions.set_doc_host(host.clone());
+            host.set_sessions(&sessions);
+            assert_eq!(sessions.recover_stale().unwrap(), 0);
+            assert_eq!(sessions.watch_sessions().borrow().iter().find(|row| row.chat_id == CHAT).unwrap().status, expected);
+            assert_eq!(workspace.doc().read_sessions().unwrap().iter().find(|row| row.chat_id == CHAT).unwrap().status, expected);
+            let handle = host.open(CHAT).unwrap();
+            assert_eq!(handle.doc().collaboration_snapshot().unwrap().sessions.iter().find(|row| row.session_id == CHAT).unwrap().status, Some(expected));
+            assert_eq!(handle.doc().read_entries().unwrap().iter().filter(|row| row.id == "accepted").count(), 1);
+            assert!(lock(&sessions.inner.runs).is_empty());
+            let published = handle.doc().read_publications().unwrap();
+            sessions.recover_stale().unwrap();
+            assert_eq!(handle.doc().read_publications().unwrap(), published, "repeat recovery must not manufacture freshness");
+            sessions.shutdown().await;
+        }
     }
 
     #[tokio::test]
@@ -4209,14 +4505,14 @@ mod tests {
     async fn dispatched_context_and_completed_native_session_survive_restart() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DocsStore::open(dir.path().join("store")).unwrap());
-        let host = DocHost::new(
-            store.clone(),
-            DocHostConfig {
-                device_id: "test-device".into(),
-                default_harness: HarnessId::Omp,
-                edge: None,
-            },
-        );
+        let chat = "44444444-4444-4444-8444-444444444444";
+        let key = "44444444-4444-4444-8444-444444444444::session::44444444-4444-4444-8444-444444444444";
+        let workspace = crate::WorkspaceHost::open(store.clone(),crate::WorkspaceHostConfig {
+            device_id:"test-device".into(),device_name:"Test".into(),platform:"test".into(),
+            project_scope:"ashler-local".into(),user_id:"test-owner".into(),edge:None,
+        }).unwrap();
+        workspace.create_space("owned-space","test-device","/workspace/transferred",None,false).unwrap();
+        workspace.create_chat(chat,"owned-space",None,None).unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let registry = Arc::new(HarnessRegistry::new());
         registry.register(Arc::new(TakeoverHarness {
@@ -4226,27 +4522,28 @@ mod tests {
             fail_cleanup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }));
         let open = || {
+            let host = DocHost::new(store.clone(),DocHostConfig {
+                device_id:"test-device".into(),default_harness:HarnessId::Omp,edge:None,
+            });
+            host.set_workspace(workspace.clone());
             let sessions = SessionsEngine::new(
                 "test-device".into(),
                 Arc::new(RunJournal::open(dir.path().join("journal")).unwrap()),
                 registry.clone(),
                 27654,
             );
+            host.set_sessions(&sessions);
             sessions.set_doc_host(host.clone());
             sessions
         };
-        let public = uuid::Uuid::new_v4().to_string();
-        let execution = format!("{public}::session::{public}");
-        let key = execution.as_str();
-        let workspace = crate::WorkspaceHost::open(store, crate::workspace_host::WorkspaceHostConfig {
-            device_id: "test-device".into(), device_name: "test".into(), platform: "test".into(),
-            project_scope: "project-a".into(), user_id: "owner-a".into(), edge: None,
-        }).unwrap();
-        workspace.claim_chat(&public, Some("/workspace/transferred")).unwrap();
-        host.set_workspace(workspace);
+
         let sessions = open();
         let mut request = test_request("transferred turn", Some("native-takeover-session"));
         request.cwd = "/workspace/transferred".into();
+        // The transfer is authenticated before dispatch; dispatch must replace
+        // this bootstrap context with its actual admitted request.
+        let mut bootstrap = request.clone(); bootstrap.prompt="awaiting transferred dispatch".into();
+        sessions.inner.journal.save_context(key,&(sessions.auth_identity(),&sessions.inner.device_id,HarnessId::Omp,&bootstrap)).unwrap();
         sessions
             .dispatch(key, HarnessId::Omp, request.clone(), None)
             .await
@@ -4273,7 +4570,6 @@ mod tests {
         sessions.interrupt(key).await.unwrap();
         drop(sessions);
         let restarted = open();
-        assert!(restarted.last_request(key).is_none());
         let recovered = restarted.recovered_context(key).unwrap();
         assert_eq!(
             serde_json::to_value(&recovered).unwrap(),

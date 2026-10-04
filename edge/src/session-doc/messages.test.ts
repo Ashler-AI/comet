@@ -1,4 +1,4 @@
-import { LoroDoc, LoroList, LoroMap } from "loro-crdt";
+import { LoroDoc, LoroList, LoroMap, LoroText } from "loro-crdt";
 import { describe, expect, it } from "vitest";
 import {
   isPeerMessageEntry,
@@ -43,6 +43,50 @@ const textOf = (value: SessionMessageEntry): string =>
 // Runtime values can precede this client's wire schema.
 const withMetadata = (metadata: unknown): SessionMessageEntry =>
   ({ ...entry, peerMessage: metadata }) as SessionMessageEntry;
+
+describe("mixed-version tool call projection", () => {
+  it("renders legacy scalar calls and progressive nested text calls after snapshot and delta reconnect", () => {
+    const source = new LoroDoc();
+    const restored = new LoroDoc();
+    const fresh = new LoroDoc();
+    const legacy: SessionMessageEntry = {
+      id: "legacy-tool", role: "assistant", createdAt: 123, deviceId: "host", status: "complete",
+      parts: [{ kind: "tool", id: "legacy-part", call: { _tag: "Exec", command: "echo legacy", background: false } }]
+    };
+    const current: SessionMessageEntry = {
+      id: "container-tool", role: "assistant", createdAt: 124, deviceId: "host", status: "complete", parts: []
+    };
+    appendEntry(source, legacy).free();
+    const message = appendEntry(source, current);
+    const parts = message.get("parts") as LoroList;
+    const part = parts.insertContainer(0, new LoroMap());
+    const call = part.setContainer("call", new LoroMap());
+    const command = call.setContainer("command", new LoroText());
+    try {
+      part.set("id", "container-part"); part.set("kind", "tool");
+      call.set("_tag", "Exec"); call.set("background", false);
+      command.insert(0, "echo first"); source.commit();
+      restored.import(source.export({ mode: "snapshot" }));
+      const before = source.oplogVersion();
+      try {
+        command.insert(command.length, "; echo second"); source.commit();
+        restored.import(source.export({ mode: "update", from: before }));
+      } finally { before.free(); }
+      const expected = [legacy, { ...current, parts: [{
+        kind: "tool", id: "container-part", call: {
+          _tag: "Exec", command: "echo first; echo second", background: false
+        }
+      }] }];
+      expect(readMessageEntries(restored)).toEqual(expected);
+      expect(materializeTail(restored, 456).messages).toEqual(expected);
+      fresh.import(source.export({ mode: "snapshot" }));
+      expect(materializeTail(fresh, 456).messages).toEqual(expected);
+    } finally {
+      command.free(); call.free(); part.free(); parts.free(); message.free();
+      fresh.free(); restored.free(); source.free();
+    }
+  });
+});
 
 describe("peer message provenance", () => {
   it("hides only valid native user identity, never legacy text or unsupported metadata", () => {

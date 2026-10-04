@@ -20,8 +20,7 @@
  * - Ephemeral presence (%EPH room) is memory-only by construction.
  *
  * Hibernation discipline: timers only release idle caches and fragment batches;
- * scheduled work
- * (checkpoints, history trim, R2 backup §3.3) rides the durable alarm.
+ * checkpoints, history trim and R2 backups ride the durable alarm.
  */
 import { LoroDoc, EphemeralStore, VersionVector, decodeImportBlobMeta } from "loro-crdt";
 import type { PeerID } from "loro-crdt";
@@ -93,13 +92,10 @@ export const canonicalSessionId = (value: string | undefined): string | undefine
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RETAIN_MS = RETAIN_DAYS * DAY_MS;
-/** Session-only replay reset policy. Workspace history is never reset or gated. */
-const REPLAY_CRASH_LIMIT = 3;
 const FRAGMENT_TTL_MS = 30_000;
 /** Payload bytes per outbound fragment (leaves room for the envelope). */
 const FRAGMENT_BYTES = 200_000;
-/** Match the sync client's healthy-snapshot limits, shared across each
- * socket's in-flight batches so incomplete headers cannot accumulate forever. */
+/** Match healthy-snapshot limits; reservations are shared by the whole room. */
 const MAX_REASSEMBLED_BYTES = 64 * 1024 * 1024;
 const MAX_FRAGMENT_COUNT = 1024;
 const MAX_PRESENCE_UPDATE_BYTES = 16 * 1024;
@@ -309,6 +305,8 @@ export class SessionRoom implements DurableObject {
    * FragmentTimeout ack for the unknown batch and resends — self-healing. */
   private readonly fragments = new Map<WebSocket, Map<string, FragmentBatch>>();
   private fragmentTimer: number | undefined;
+  private applyingFragmentBytes = 0;
+  private applyingFragmentParts = 0;
   /** Revocations delivered while this instance is live close the TOCTOU gap
    * between an authority response and a handler's final mutation/send. */
   private readonly revokedGrants = new Set<string>();
@@ -393,16 +391,24 @@ export class SessionRoom implements DurableObject {
         this.getMeta("projectScope") === candidateProjectScope &&
         this.getMeta("ownerUserId") === candidateUserId;
       if (!ownsSession) return json({ ownsSession: false });
-      let deviceId = this.getMeta("hostDeviceId");
+      // Old attribution-only metadata has no proof of owner authority.
+      let deviceId = this.getMeta("hostDeviceOwnerUserId") === candidateUserId
+        ? this.getMeta("hostDeviceId") : undefined;
       if (!deviceId) {
         const liveDevices = new Set(
           this.ctx.getWebSockets()
-            .map((socket) => (socket.deserializeAttachment() as SocketState | null)?.deviceId)
+            .map((socket) => socket.deserializeAttachment() as SocketState | null)
+            .filter((state) => state?.userId === candidateUserId && state.projectScope === candidateProjectScope &&
+              !state.grantId && !state.workspace && canPublish(state.capabilities))
+            .map((state) => state?.deviceId)
             .filter((value): value is string => typeof value === "string" && GRANT_ID_RE.test(value))
         );
         if (liveDevices.size === 1) {
           deviceId = liveDevices.values().next().value;
-          if (deviceId) this.setMeta("hostDeviceId", deviceId);
+          if (deviceId) {
+            this.setMeta("hostDeviceId", deviceId);
+            this.setMeta("hostDeviceOwnerUserId", candidateUserId);
+          }
         }
       }
       return json({ ownsSession: true, ...(deviceId ? { deviceId } : {}) });
@@ -462,8 +468,11 @@ export class SessionRoom implements DurableObject {
       if (!currentOwnerUserId && ownerUserId) this.setMeta("ownerUserId", ownerUserId);
       if (chatId && !this.getMeta("chatId")) this.setMeta("chatId", chatId);
       const deviceId = url.searchParams.get("device") ?? undefined;
-      if (!workspace && ownerUserId && deviceId && GRANT_ID_RE.test(deviceId) && !this.getMeta("hostDeviceId")) {
+      if (!workspace && !grant && userId === ownerUserId && canPublish(capabilities) &&
+          deviceId && GRANT_ID_RE.test(deviceId) &&
+          (!this.getMeta("hostDeviceId") || this.getMeta("hostDeviceOwnerUserId") !== ownerUserId)) {
         this.setMeta("hostDeviceId", deviceId);
+        this.setMeta("hostDeviceOwnerUserId", userId);
       }
       const pair = new WebSocketPair();
       this.ctx.acceptWebSocket(pair[1]);
@@ -521,8 +530,7 @@ export class SessionRoom implements DurableObject {
         checkpoints: (JSON.parse(this.getMeta("checkpoints") ?? "[]") as unknown[]).length,
         lastTrimAt: this.getMeta("lastTrimAt") ?? null,
         backupDirty: this.getMeta("backupDirty") === "1",
-        // Non-zero while a cold replay is in flight or has been dying — the
-        // wedge signature ensureDoc's automated reset watches for.
+        // Non-zero while replay is in flight or failing; never an erase gate.
         replayAttempts: Number(this.getMeta("replayAttempts") ?? "0")
       });
     }
@@ -577,7 +585,8 @@ export class SessionRoom implements DurableObject {
         if (!owner) return json({ error: "not_found" }, 404);
         if (owner !== projectScope) return json({ error: "forbidden" }, 403);
       }
-      const body = new Uint8Array(await request.arrayBuffer());
+      const body = await readBoundedBody(request, MAX_REASSEMBLED_BYTES);
+      if (body === null) return json({ error: "too_large" }, 413);
       let doc = await this.ensureDoc();
       if (workspace) this.notifyWorkspace(doc, projectScope, true);
       try {
@@ -617,7 +626,7 @@ export class SessionRoom implements DurableObject {
         if (!workspace) return json({ error: "workspace_seed_required" }, 400);
         let validationStage = "decode";
         try {
-          const metadata = decodeImportBlobMeta(seed, false);
+          const metadata = decodeImportBlobMeta(seed, true);
           validationStage = "mode";
           try {
             if (metadata.mode !== "snapshot" && metadata.mode !== "shallow-snapshot" && metadata.mode !== "outdated-snapshot") {
@@ -629,6 +638,19 @@ export class SessionRoom implements DurableObject {
             validationStage = "free-end";
             metadata.partialEndVersionVector.free();
           }
+          validationStage = "construct";
+          const candidate = new LoroDoc();
+          try {
+            validationStage = "import";
+            const imported = candidate.import(seed);
+            const pendingEnds = new Map<PeerID, number>();
+            for (const [peer, span] of imported.pending ?? []) pendingEnds.set(peer, span.end);
+            validationStage = "materialize";
+            this.assertLoroMaterialized(candidate, pendingEnds);
+            // Force lazy snapshot containers to decode before replacing accepted bytes.
+            validationStage = "decode-state";
+            candidate.toJSON();
+          } finally { candidate.free(); }
         } catch (error) {
           this.escalateWasmPoisoning(error);
           if (this.env.ENVIRONMENT === "staging") {
@@ -911,7 +933,7 @@ export class SessionRoom implements DurableObject {
       if (backfill) {
         if (backfill.length > 0) this.sendUpdates(ws, message.crdt, message.roomId, [backfill]);
       } else {
-        // No await: snapshot, SQL rows, and buffered writes describe exactly
+        // No await: persisted snapshot and SQL rows describe exactly
         // the advertised version. Send the lazy baseline FIRST, avoiding a
         // full-history WASM export merely to bootstrap a fresh mobile reader.
         const baseline = this.blobs.get("snapshot");
@@ -1092,13 +1114,10 @@ export class SessionRoom implements DurableObject {
       const retainedPending = this.docPendingEnds;
       let pendingEnds = retainedPending ? new Map(retainedPending) : undefined;
       try {
-        for (const update of updates) {
-          if (update.length === 0) continue;
-          const imported = doc.import(update);
-          for (const [peer, span] of imported.pending ?? []) {
-            pendingEnds ??= new Map();
-            pendingEnds.set(peer, Math.max(pendingEnds.get(peer) ?? 0, span.end));
-          }
+        const imported = doc.importBatch(updates.filter((update) => update.length > 0));
+        for (const [peer, span] of imported.pending ?? []) {
+          pendingEnds ??= new Map();
+          pendingEnds.set(peer, Math.max(pendingEnds.get(peer) ?? 0, span.end));
         }
         this.assertLoroMaterialized(doc, pendingEnds);
         const after = doc.oplogFrontiers();
@@ -1158,23 +1177,28 @@ export class SessionRoom implements DurableObject {
             ownsCandidate = false;
             return this.importLoroUpdates(doc, updates.filter((_, i) => i !== snapshotIndex));
           }
-          let preserveRetainedHistory = false;
-          if (this.retainsWorkspaceHistory() && previousVersion.length() > 0) {
-            const retainedSince = doc.shallowSinceVV();
-            const incomingSince = candidate.shallowSinceVV();
+          // A genuinely empty server has no accepted ancestry to discard. Legacy
+          // pending spans are accepted history even when applied VV is empty.
+          if (this.retainsWorkspaceHistory() && (previousVersion.length() > 0 || this.docPendingEnds?.size)) {
+            const incomingFloor = candidate.shallowSinceVV();
+            const retainedFloor = doc.shallowSinceVV();
             try {
-              const historyCoverage = incomingSince.compare(retainedSince);
-              preserveRetainedHistory = historyCoverage === undefined || historyCoverage > 0;
-            } finally { incomingSince.free(); retainedSince.free(); }
+              const floorCoverage = incomingFloor.compare(retainedFloor);
+              if (floorCoverage === undefined || floorCoverage > 0) {
+                // A newer-looking shallow snapshot can omit retained causal
+                // history. Merge only its available delta into the old replica.
+                const available = previousVersion.compare(incomingFloor);
+                if (available === undefined || available < 0) {
+                  throw new Error("snapshot advances beyond retained-history boundary");
+                }
+                const delta = candidate.export({ mode: "update", from: previousVersion });
+                candidate.free();
+                ownsCandidate = false;
+                return this.importLoroUpdates(doc, [delta, ...updates.filter((_, i) => i !== snapshotIndex)]);
+              }
+            } finally { retainedFloor.free(); incomingFloor.free(); }
           }
-          if (preserveRetainedHistory) {
-            // A client's shallow snapshot must not trim the workspace history
-            // that disconnected writers still need, even when its VV is newer.
-            const incoming = candidate;
-            candidate = doc.fork();
-            incoming.free();
-            replay(baseline);
-          } else if (coverage === undefined) {
+          if (coverage === undefined) {
             const retainedSince = doc.shallowSinceVV();
             try {
               const retainedCoverage = candidateVersion.compare(retainedSince);
@@ -1331,8 +1355,8 @@ export class SessionRoom implements DurableObject {
       this.ack(ws, message, UpdateStatusCode.PayloadTooLarge, message.batchId);
       return;
     }
-    let reservedBytes = message.totalSizeBytes;
-    let reservedParts = message.fragmentCount;
+    let reservedBytes = message.totalSizeBytes + this.applyingFragmentBytes;
+    let reservedParts = message.fragmentCount + this.applyingFragmentParts;
     // The WASM heap is isolate-shared: a per-socket budget still admits N*64MiB.
     for (const [socket, inFlight] of this.fragments) {
       for (const [id, batch] of inFlight) {
@@ -1365,9 +1389,9 @@ export class SessionRoom implements DurableObject {
     state: SocketState,
     message: { crdt: CrdtType; roomId: string; batchId: `0x${string}`; index: number; fragment: Uint8Array }
   ): Promise<void> {
-    this.pruneFragments(Date.now());
     const batch = this.fragments.get(ws)?.get(message.batchId);
-    if (!batch) {
+    if (!batch || batch.expiresAt <= Date.now()) {
+      this.fragments.get(ws)?.delete(message.batchId);
       // Unknown batch (e.g. header lost to hibernation) — tell the sender to
       // retry the whole batch.
       this.ack(ws, message, UpdateStatusCode.FragmentTimeout, message.batchId);
@@ -1401,16 +1425,26 @@ export class SessionRoom implements DurableObject {
       this.ack(ws, message, UpdateStatusCode.InvalidUpdate, message.batchId);
       return;
     }
-    const total = new Uint8Array(batch.totalSize);
-    let off = 0;
-    for (let i = 0; i < batch.parts.length; i++) {
-      const part = batch.parts[i];
-      if (part === undefined) throw new Error("incomplete fragment batch");
-      total.set(part, off);
-      off += part.length;
-      batch.parts[i] = undefined;
+    // Completing a batch must not release its reservation while grant lookup
+    // or storage.sync retains the assembled payload across an await.
+    this.applyingFragmentBytes += batch.totalSize;
+    this.applyingFragmentParts += batch.parts.length;
+    this.pruneFragments(Date.now());
+    try {
+      const total = new Uint8Array(batch.totalSize);
+      let off = 0;
+      for (let i = 0; i < batch.parts.length; i++) {
+        const part = batch.parts[i];
+        if (part === undefined) throw new Error("incomplete fragment batch");
+        total.set(part, off);
+        off += part.length;
+        batch.parts[i] = undefined;
+      }
+      await this.applyUpdates(ws, state, message.crdt, message.roomId, message.batchId, [total]);
+    } finally {
+      this.applyingFragmentBytes -= batch.totalSize;
+      this.applyingFragmentParts -= batch.parts.length;
     }
-    await this.applyUpdates(ws, state, message.crdt, message.roomId, message.batchId, [total]);
   }
 
   // ── doc/ephemeral materialization ────────────────────────────────────────
@@ -1443,30 +1477,15 @@ export class SessionRoom implements DurableObject {
   }
 
   private async materializeDoc(): Promise<LoroDoc> {
-    // A crash counter is telemetry, not evidence that accepted workspace bytes
-    // are disposable or that a subsequent complete replay cannot heal the room.
-    let attempts = Number(this.getMeta("replayAttempts") ?? "0");
-    // Replay failures must not permanently lock a workspace, even after a
-    // transient resource failure or a deployment that fixes replay itself.
-    if (attempts >= REPLAY_CRASH_LIMIT && !this.retainsWorkspaceHistory()) {
-      this.dropLog();
-      // Boot every attached socket, exactly like POST /reset-log. The
-      // automated wedge break used to swap the doc out from UNDER live
-      // sessions: their next writes carried deps the emptied doc lacks,
-      // imports failed, clients burned their capped invalid-rejoin resyncs
-      // and then sat LATCHED — rows frozen on a healthy-looking socket
-      // (2026-08-04: work-metal's workspace status never updated again
-      // after the 20:16Z wedge-break while its chat rooms streamed fine).
-      // A close → redial → empty-VV join re-uploads full state instead.
-      this.closeSocketsForRoomReset();
-      attempts = 0;
-    }
+    const started = Date.now();
+    // A crash counter is telemetry, never evidence that accepted bytes are
+    // disposable or that a subsequent complete replay cannot heal the room.
+    const attempts = Number(this.getMeta("replayAttempts") ?? "0");
     this.setMeta("replayAttempts", String(attempts + 1));
     // Persist telemetry before crossing WASM so resource deaths remain visible.
     await this.ctx.storage.sync();
-    const started = Date.now();
-    const doc = new LoroDoc();
     const snapshot = this.blobs.get("snapshot");
+    const doc = new LoroDoc();
     let pendingEnds: Map<PeerID, number> | undefined;
     const replay = (bytes: Uint8Array | Uint8Array[]): void => {
       const imported = Array.isArray(bytes) ? doc.importBatch(bytes) : doc.import(bytes);
@@ -1497,9 +1516,19 @@ export class SessionRoom implements DurableObject {
     } catch (error) {
       return await this.rejectPersistedLoroState(doc, "update journal", error);
     }
+    this.doc = doc;
+    if (pendingEnds?.size) {
+      const version = doc.oplogVersion();
+      try {
+        for (const [peer, end] of pendingEnds) {
+          if ((version.get(peer) ?? 0) >= end) pendingEnds.delete(peer);
+        }
+      } finally { version.free(); }
+    }
+    this.docPendingEnds = pendingEnds?.size ? pendingEnds : undefined;
     this.setMeta("replayAttempts", "0");
-    // Reset only after a successful replay; later export failures never reset
-    // accepted workspace state. Both old and current clients keep their history.
+    // Reset telemetry only after successful replay; export failures never erase
+    // accepted state. Both old and current clients keep their history.
     await this.ctx.storage.sync();
     // Cold-start telemetry (Workers Logs + /stats): the replay cost is the
     // wedge risk — watch lastReplayMs trend toward the CPU limit to catch the
@@ -1512,16 +1541,6 @@ export class SessionRoom implements DurableObject {
       `cold replay: ${replayMs}ms, ${rows} rows, snapshot ${snapshot?.length ?? 0}B, attempt ${attempts + 1}`,
       `room=${this.getMeta("chatId") ?? "?"}`
     );
-    this.doc = doc;
-    if (pendingEnds?.size) {
-      const version = doc.oplogVersion();
-      try {
-        for (const [peer, end] of pendingEnds) {
-          if ((version.get(peer) ?? 0) >= end) pendingEnds.delete(peer);
-        }
-      } finally { version.free(); }
-    }
-    this.docPendingEnds = pendingEnds?.size ? pendingEnds : undefined;
     // Migrate long legacy journals once. Never fold unresolved accepted history:
     // only a peer carrying its missing dependencies can complete that baseline.
     if (rows >= COMPACT_LOG_ROWS && !this.docPendingEnds) {
@@ -1579,7 +1598,7 @@ export class SessionRoom implements DurableObject {
     }
     this.doc?.free();
     this.doc = undefined;
-    this.eph?.free();
+    this.eph?.destroy();
     this.eph = undefined;
     this.workspacePresence.clear();
   }
@@ -1594,8 +1613,7 @@ export class SessionRoom implements DurableObject {
     }
   }
 
-  /** Never erase workspace/unknown history on a failed replay. Session rooms
-   * retain their existing reset policy; explicit administrator resets remain
+  /** Failed replay retains accepted bytes; explicit administrator resets are
    * separate from automatic recovery. */
   private async rejectPersistedLoroState(
     doc: LoroDoc,
@@ -1614,7 +1632,6 @@ export class SessionRoom implements DurableObject {
       /* a wasm panic may already have invalidated the handle */
     }
     this.doc = undefined;
-    if (!this.retainsWorkspaceHistory()) this.dropLog();
     await this.ctx.storage.sync();
     this.closeSocketsForRoomReset();
     throw error;
@@ -1884,7 +1901,7 @@ export class SessionRoom implements DurableObject {
         const vv = current.oplogVersion();
         try {
           const encodedVersion = btoa(String.fromCharCode(...vv.encode()));
-          await this.env.BLOBS.put(`backup/${chatId}/latest.loro`, snapshot);
+          await this.env.BLOBS.put(`backup/rooms/${this.ctx.id.toString()}/latest.loro`, snapshot);
           // The original doc may have been freed, or advanced in place, while
           // R2 persisted this snapshot. Its metadata must describe these bytes.
           this.setMeta("backupVV", encodedVersion);

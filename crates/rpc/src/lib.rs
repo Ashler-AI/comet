@@ -25,7 +25,8 @@ mod server;
 pub use client::{RpcClient, connect_ws};
 pub use device_room::{
     DeviceFrameHeader, DeviceLink, GRANT_KIND, GrantHandler, GrantResetHandler, HostRelay,
-    HostRelayConfig, LinkCache, LinkCacheConfig, NudgeHandler, StaticToken, TokenSource,
+    HostRelayConfig, LinkCache, LinkCacheConfig, NUDGE_ACK_KIND, Nudge, NudgeHandler, StaticToken,
+    TokenSource,
     decode_device_frame, device_room_ws_url, encode_device_frame,
 };
 pub use server::{serve_connection, serve_ws_listener};

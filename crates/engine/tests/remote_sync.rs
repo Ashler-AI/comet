@@ -675,15 +675,15 @@ async fn two_authenticated_engines_sync_workspace_streams_and_reconnect_backfill
         .create_space("space-a", "device-a", "/tmp", None, false)
         .expect("create shared space");
     a.workspace
-        .create_chat("chat-shared", "space-a", None, None)
+        .create_chat("00000000-0000-4000-8000-000000000101", "space-a", None, None)
         .expect("create shared chat");
     a.workspace
-        .set_chat_harness_session("chat-shared", "native-session", "/tmp");
+        .set_chat_harness_session("00000000-0000-4000-8000-000000000101", "native-session", "/tmp");
     wait_for(
         || {
             b.workspace
                 .doc()
-                .chat("chat-shared")
+                .chat("00000000-0000-4000-8000-000000000101")
                 .ok()
                 .flatten()
                 .is_some_and(|chat| {
@@ -695,8 +695,8 @@ async fn two_authenticated_engines_sync_workspace_streams_and_reconnect_backfill
     )
     .await;
 
-    let handle_a = a.doc_host.open("chat-shared").expect("open A chat");
-    let handle_b = b.doc_host.open("chat-shared").expect("open B chat");
+    let handle_a = a.doc_host.open("00000000-0000-4000-8000-000000000101").expect("open A chat");
+    let handle_b = b.doc_host.open("00000000-0000-4000-8000-000000000101").expect("open B chat");
     let mut messages_b = handle_b.watch_messages();
     wait_for(
         || handle_a.connected() && handle_b.connected(),
@@ -706,7 +706,7 @@ async fn two_authenticated_engines_sync_workspace_streams_and_reconnect_backfill
 
     a.doc_host
         .queue_command(
-            "chat-shared",
+            "00000000-0000-4000-8000-000000000101",
             SessionCommandPayload::Run {
                 request: run_request("prompt from A"),
                 message_id: "user-1".into(),
@@ -748,13 +748,13 @@ async fn two_authenticated_engines_sync_workspace_streams_and_reconnect_backfill
     );
 
     b.workspace
-        .rename_chat("chat-shared", "renamed by device B")
+        .rename_chat("00000000-0000-4000-8000-000000000101", "renamed by device B")
         .expect("B renames shared chat");
     wait_for(
         || {
             a.workspace
                 .doc()
-                .chat("chat-shared")
+                .chat("00000000-0000-4000-8000-000000000101")
                 .ok()
                 .flatten()
                 .and_then(|chat| chat.title)
@@ -778,13 +778,13 @@ async fn two_authenticated_engines_sync_workspace_streams_and_reconnect_backfill
         .write_user_message("user-during-reconnect", "missed live broadcast", 2_000)
         .expect("write while B disconnected");
     a.workspace
-        .set_chat_archived("chat-shared", true)
+        .set_chat_archived("00000000-0000-4000-8000-000000000101", true)
         .expect("archive while B disconnected");
     let session_version = handle_a.doc().doc().oplog_vv();
     let workspace_version = a.workspace.doc().doc().oplog_vv();
     wait_for(
         || {
-            relay.room_includes("chat-shared", &session_version)
+            relay.room_includes("00000000-0000-4000-8000-000000000101", &session_version)
                 && relay.room_includes(&format!("ws4/{PROJECT}"), &workspace_version)
         },
         "relay to persist A's disconnected-window updates",
@@ -825,7 +825,7 @@ async fn two_authenticated_engines_sync_workspace_streams_and_reconnect_backfill
         || {
             b.workspace
                 .doc()
-                .chat("chat-shared")
+                .chat("00000000-0000-4000-8000-000000000101")
                 .ok()
                 .flatten()
                 .is_some_and(|chat| chat.archived)

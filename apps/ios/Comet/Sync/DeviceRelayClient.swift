@@ -400,6 +400,7 @@ extension DeviceRelayClient {
             let original = try await first!.value
             let shared = try await second!.value
             guard original === shared, socket === original, generation == 1 else { return false }
+
             let oldGeneration = generation
             close()
             let replacement = try await connect()

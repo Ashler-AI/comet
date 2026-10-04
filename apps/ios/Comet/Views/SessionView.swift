@@ -158,6 +158,12 @@ struct SessionView: View {
         } message: {
             Text(store?.sendFailure ?? "Unknown error")
         }
+        .alert("Crew recovery blocked", isPresented: Binding(
+            get: { store?.recoveryFailure != nil },
+            set: { _ in }
+        )) {
+            Button("Retry recovery") { Task { await store?.retryRecovery() } }
+        } message: { Text(store?.recoveryFailure ?? "") }
         .sheet(isPresented: $showConfig) {
             if let chat {
                 let harness = chat.config?.harness ?? "claude-code"

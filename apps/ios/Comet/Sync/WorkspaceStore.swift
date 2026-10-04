@@ -168,6 +168,26 @@ final class WorkspaceStore {
                 }
             }
         }
+        // Project accepted goals even when the debounced cache predates them.
+        // Replay in isolation before subscribing/joining; original journal IDs
+        // and versions remain untouched for authoritative reconciliation.
+        if !recordIntents.isEmpty {
+            do {
+                let local = doc.fork()
+                for intent in recordIntents.values {
+                    try DocDisk.applyRecordChange(root: intent.root, key: intent.key,
+                        before: try DocDisk.recordValue(intent.before), after: try DocDisk.recordValue(intent.after), in: local,
+                        alternatives: try intent.intermediates.map { try DocDisk.recordValue($0) })
+                }
+                local.commit()
+                doc = local
+            } catch {
+                recordJournalBlocked = true
+                blockRecordRecovery(error)
+                project()
+                return
+            }
+        }
         saver = DocSaver(docId: cacheId, doc: doc)
         let client = RoomClient(roomId: roomId, doc: doc, recoverApplicationIntents: !recordIntents.isEmpty) { [config] in
             await config.workspaceSocketURL()
@@ -185,7 +205,7 @@ final class WorkspaceStore {
         subscribeLocalUpdates(client: client)
 
         Task { await client.start() }
-        scheduleProjection()
+        project()
     }
 
     private func subscribeLocalUpdates(client: RoomClient) {
@@ -1274,6 +1294,15 @@ extension WorkspaceStore {
             let row = try source.getMap(id: "chats").getOrCreateContainer(key: existing, child: LoroMap())
             try row.insert(key: "id", v: existing); try row.insert(key: "deviceId", v: "host")
             try row.insert(key: "title", v: "Original")
+            let membership = try source.getMap(id: "sessionRefs").getOrCreateContainer(
+                key: "\(config.userId.utf8.count):\(config.userId):\(existing)", child: LoroMap())
+            try membership.insert(key: "userId", v: config.userId)
+            try membership.insert(key: "chatId", v: existing)
+            try membership.insert(key: "addedAt", v: Int64(1))
+            let removedSpace = try source.getMap(id: "spaces").getOrCreateContainer(key: "removed", child: LoroMap())
+            try removedSpace.insert(key: "id", v: "removed")
+            try removedSpace.insert(key: "deviceId", v: "host")
+            try removedSpace.insert(key: "path", v: "/removed")
             source.commit()
             DocDisk.save(doc: source, id: cacheId)
             let offline = WorkspaceStore(config: config)
@@ -1286,19 +1315,32 @@ extension WorkspaceStore {
                 try row.insert(key: "title", v: "Created offline")
                 try row.insert(key: "config", v: LoroValue.fromJSON(["nested": ["sandbox": "workspace-write"]]))
             }
+            try offline.mutateRecord(root: "spaces", key: "created-space") { row in
+                try row.insert(key: "id", v: "created-space")
+                try row.insert(key: "deviceId", v: "host")
+                try row.insert(key: "path", v: "/accepted")
+                try row.insert(key: "name", v: "Accepted offline space")
+            }
+            try offline.writeRecord(root: "spaces", key: "removed", after: nil)
             guard offline.addSessionRef(chatId: created) != nil,
                   offline.recoveryFailure == nil else { return false }
             // Restart before the debounced snapshot ever ran. The only cache
             // still has the original title; accepted goals are independent.
             let restarted = WorkspaceStore(config: config)
             stores.append(restarted)
-            guard restarted.recordIntents.count == 3,
+            guard restarted.recordIntents.count == 5,
                   let cached = DocDisk.loadReplica(id: cacheId),
                   try DocDisk.recordValue(in: cached, root: "chats", key: existing)?.mapValue?["title"]?.stringValue == "Original" else { return false }
-            restarted.doc = cached
-            restarted.room = RoomClient(roomId: "ws4/\(config.projectScope)", doc: cached,
-                recoverApplicationIntents: true, urlProvider: { nil }, events: { _ in }, adoptSnapshot: { _, _ in false })
-            restarted.saver = DocSaver(docId: cacheId, doc: cached)
+            let journal = try Data(contentsOf: DocDisk.intentURL(for: cacheId))
+            restarted.start()
+            let local = restarted.doc
+            guard !restarted.connected, restarted.recoveryFailure == nil,
+                  restarted.chat(id: existing)?.title == "Final offline title",
+                  restarted.chat(id: created)?.title == "Created offline",
+                  restarted.sessionRef(id: created) != nil,
+                  restarted.space(id: "created-space")?.name == "Accepted offline space",
+                  restarted.space(id: "removed") == nil,
+                  try Data(contentsOf: DocDisk.intentURL(for: cacheId)) == journal else { return false }
             // An earlier edit was admitted under another operation identity.
             // Its successor must rebase, not overwrite a remote disjoint field.
             try row.insert(key: "title", v: "Intermediate offline title")
@@ -1307,7 +1349,7 @@ extension WorkspaceStore {
             let floor = source.stateFrontiers()
             try source.getMap(id: "meta").insert(key: "current", v: true); source.commit()
             guard let replacement = DocDisk.replacementSnapshot(bytes: try source.export(mode: .shallowSnapshot(frontiers: floor))),
-                  restarted.adoptSnapshot(previous: cached, replacement: replacement),
+                  restarted.adoptSnapshot(previous: local, replacement: replacement),
                   let records = replacement.getDeepValue().mapValue?["chats"]?.mapValue,
                   records[existing]?.mapValue?["title"]?.stringValue == "Final offline title",
                   records[existing]?.mapValue?["archived"]?.boolValue == true,
@@ -1325,7 +1367,7 @@ extension WorkspaceStore {
                   restarted.doc === replacement, restarted.recoveryFailure != nil,
                   let retained = try DocDisk.loadIntents([DocDisk.RecordIntent].self, id: cacheId),
                   retained.contains(where: { (try? DocDisk.recordValue($0.after))?.mapValue?["title"]?.stringValue == "Retained conflicting title" }) else { return false }
-            E2ERunner.log("OK Crew workspace intents: immediate restart, intermediate admission, nested create edit membership, shallow recovery, durable ACK, conflict originals retained")
+            E2ERunner.log("OK Crew workspace intents: offline start projects stale-cache rename, space creation, membership and deletion without rewriting the journal; shallow recovery, durable ACK, conflict originals retained")
             return true
         } catch { E2ERunner.log("FAIL Crew workspace intents: \(error)"); return false }
     }

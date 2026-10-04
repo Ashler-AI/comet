@@ -58,7 +58,8 @@ describe("session owner authority", () => {
       roomWithMeta({
         projectScope: "project-a",
         ownerUserId: "owner@example.com",
-        hostDeviceId: "owner-device"
+        hostDeviceId: "owner-device",
+        hostDeviceOwnerUserId: "owner@example.com"
       }),
       "owner@example.com"
     );

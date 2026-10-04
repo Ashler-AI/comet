@@ -434,7 +434,12 @@ impl EngineRpc {
                 Some(&source),
             )
             .await?;
-        self.admit_scaffold_handoff(source, params.prompt, remote_model, actor_subject, attached)
+        let admitted = self.admit_scaffold_handoff(source, params.prompt, remote_model, actor_subject, attached)?;
+        // Admission is durable even if its wakeup cannot be enqueued. Do not
+        // re-arm preparation rollback or mint another command on a retry.
+        self.doc_host.wake_queued_command(&admitted.chat_id,&admitted.command_id).await
+            .map_err(|error| RpcError::Failed(format!("{error}; session {}; durable command {} remains admitted",admitted.chat_id,admitted.command_id)))?;
+        Ok(admitted)
     }
 
     fn require_unadmitted_handoff(&self, session_id: &str) -> Result<(), RpcError> {

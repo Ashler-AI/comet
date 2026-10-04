@@ -70,6 +70,36 @@ one authenticated paid-provider test remains intentionally ignored. The actual
 native CLI smoke verified immutable retries, correlated replies, and restart
 recovery with an offline Edge endpoint.
 No installed engine was replaced; local typechecks were intentionally skipped.
+## Unreleased: durable scoped recovery
+
+Application edits and command outcomes are journaled before acknowledgement,
+independently of replaceable Loro caches. Causal checkpoint restoration does not
+replay edits already present in newer history; genuinely conflicting fields keep
+their original records. Cold native journals reconcile with authoritative room
+identities before uploading reconstructed list entries.
+
+Public room identities are canonical UUIDs. Principal, project and deployment
+boundaries remain exact; private execution keys never become discovery rows.
+Legacy output migration checks provenance before publishing recovered messages.
+Cold execution aliases accept authenticated OMP, Codex and Claude Code contexts.
+
+Mobile browse links retain their exact scope without attaching or resuming a
+sandbox. Conflicting links fail before navigation or sends. Shared attachment
+identities use consistent outbox accounting; terminal controls retain durable
+outcomes without consuming pending-command capacity. Offline workspace goals
+project before a network join. A trusted room reset retires only the previous
+frontier, not the pending journal.
+
+The release gates cover paced large-tool memory, failure recovery, both supported
+mixed-native directions and a real simulator/native/Edge transport path. Native
+publication heartbeats remain while the pre-register baseline is supported;
+that compatibility history can be removed when the baseline retires.
+
+Local checks: 433 native library tests and 194 Edge tests passed. The unchanged
+24-turn, 300 KiB progressive-tool probe passed at 60.2 MiB RSS growth against
+128 MiB. The full native convergence scenario and new mobile source still await
+their final integrated gates; this source is not a staging or production release.
+Local typechecks are intentionally skipped to preserve workstation resources.
 
 ## Crew 0.1.135 release candidate: network catch-up
 

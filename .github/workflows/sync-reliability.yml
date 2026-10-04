@@ -1,0 +1,42 @@
+name: sync-reliability
+
+on:
+  pull_request:
+    paths:
+      - apps/**
+      - crates/**
+      - edge/**
+      - scripts/**
+      - vendor/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/**
+  workflow_dispatch:
+    inputs:
+      baseline_ref:
+        description: "Supported pre-fix native source for mixed-version convergence"
+        type: string
+        default: aa3c9e7dbb97dbfb68a4f53a1af20b3a029dee02
+  workflow_call:
+    inputs:
+      baseline_ref:
+        type: string
+        default: aa3c9e7dbb97dbfb68a4f53a1af20b3a029dee02
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-sync-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  native:
+    uses: ./.github/workflows/native-verification.yml
+    with:
+      baseline_ref: ${{ inputs.baseline_ref || 'aa3c9e7dbb97dbfb68a4f53a1af20b3a029dee02' }}
+  mobile:
+    uses: ./.github/workflows/mobile.yml
+    with:
+      environment: staging

@@ -40,11 +40,6 @@ export const SOFT_CEILING_BYTES = 25 * 1024 * 1024;
  * cadence while a run is streaming (single-peer appends RLE-merge in Loro). */
 export const STREAM_COMMIT_MS = 120;
 
-/** DO durability batching during active streams: buffered updates are flushed
- * to SQLite on this cadence. A crash losing the buffer is healed by normal
- * CRDT resync from the host on reconnect. */
-export const DO_FLUSH_MS = 5_000;
-
 /** Mobile doc LRU budget — bytes of resident doc *state*, not doc count.
  * Eviction drops the Mirror + doc; state stays on disk. */
 export const DOC_LRU_BYTE_BUDGET = 80 * 1024 * 1024;

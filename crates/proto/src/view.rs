@@ -37,9 +37,8 @@ pub enum Indicator {
     Unreachable,
 }
 
-/// A `Working`/`AwaitingInput` session older than this is treated as dead — a
-/// crashed backend must never show an eternal "Working" (feature-inventory
-/// §1.12). Engines heartbeat sessions well inside this window.
+/// Active owner state older than this is unreachable, never evidence of idle
+/// or successful completion. Engines heartbeat well inside this window.
 pub const SESSION_STALE_MS: i64 = 45_000;
 
 /// Staleness-checked indicator for a session row. Pure.
@@ -92,9 +91,9 @@ pub fn effective_agent_indicator(
     }
 }
 
-/// The full display status for a chat row / tab dot: live states win, then the
-/// synced seen marker decides completed-vs-idle. Staleness gating rides on
-/// [`effective_indicator`]; the derivation itself is [`crate::chat_indicator`].
+/// Fresh active state wins; expired active state stays visibly unreachable
+/// instead of manufacturing completion. Terminal/history rows use the synced
+/// seen marker via [`crate::chat_indicator`].
 pub fn display_status(chat: &Chat, session: Option<&Session>, now: DateTime<Utc>) -> ChatIndicator {
     match effective_indicator(session, now) {
         Indicator::Unreachable => ChatIndicator::Unreachable,

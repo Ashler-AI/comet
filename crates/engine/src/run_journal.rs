@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -29,17 +29,42 @@ pub enum JournalError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct JournalLine {
+struct JournalLine<E = AgentEvent> {
     seq: u64,
-    event: AgentEvent,
+    event: E,
 }
 
 struct ChatJournal {
-    file: File,
+    file: BufWriter<File>,
     next_seq: u64,
     /// True when the file ends without a newline (torn write) — the next append
     /// starts with one so the torn line stays isolated.
     needs_newline: bool,
+    harness_session: HarnessSessionMetadata,
+}
+
+#[derive(Default)]
+struct HarnessSessionMetadata {
+    cwd: String,
+    last: Option<(String, String)>,
+}
+
+impl HarnessSessionMetadata {
+    fn observe(&mut self, event: &AgentEvent) {
+        let session_id = match event {
+            AgentEvent::SessionStarted { session_id, cwd, .. } => {
+                self.cwd.clone_from(cwd);
+                session_id
+            }
+            AgentEvent::Done { session_id: Some(session_id), .. } => session_id,
+            _ => return,
+        };
+        if !session_id.is_empty() {
+            let last = self.last.get_or_insert_with(|| (String::new(), String::new()));
+            last.0.clone_from(session_id);
+            last.1.clone_from(&self.cwd);
+        }
+    }
 }
 
 /// Append-only JSONL journal store, one file per chat.
@@ -227,13 +252,15 @@ impl RunJournal {
             }
             let path = self.path_for(chat_id);
             let (next_seq, needs_newline) = scan_tail(&path)?;
+            let harness_session = read_harness_session(&path)?;
             let file = OpenOptions::new().create(true).append(true).open(&path)?;
             files.insert(
                 chat_id.to_string(),
                 ChatJournal {
-                    file,
+                    file: BufWriter::with_capacity(8 * 1024, file),
                     next_seq,
                     needs_newline,
+                    harness_session,
                 },
             );
         }
@@ -244,23 +271,21 @@ impl RunJournal {
             )));
         };
         let seq = journal.next_seq;
-        let line = serde_json::to_string(&JournalLine {
-            seq,
-            event: event.clone(),
-        })?;
-        let mut buf = Vec::with_capacity(line.len() + 2);
+        // Serialize the borrowed event through one bounded buffer. A progressive
+        // tool call must not clone the payload, materialize a full JSON string,
+        // then copy that string into a second whole-line allocation.
         if journal.needs_newline {
-            buf.push(b'\n');
+            journal.file.write_all(b"\n")?;
         }
-        buf.extend_from_slice(line.as_bytes());
-        buf.push(b'\n');
-        journal.file.write_all(&buf)?;
+        serde_json::to_writer(&mut journal.file, &JournalLine { seq, event })?;
+        journal.file.write_all(b"\n")?;
         journal.file.flush()?;
         if matches!(event, AgentEvent::Done { .. }) {
-            journal.file.sync_all()?;
+            journal.file.get_ref().sync_all()?;
         }
         journal.needs_newline = false;
         journal.next_seq = seq + 1;
+        journal.harness_session.observe(event);
         Ok(seq)
     }
 
@@ -283,11 +308,17 @@ impl RunJournal {
 
     /// The last event in a chat's journal, if any (ignores a torn tail line).
     pub fn last_event(&self, chat_id: &str) -> Result<Option<(u64, AgentEvent)>, JournalError> {
-        let path = self.path_for(chat_id);
-        if !path.exists() {
-            return Ok(None);
+        let (last, _) = read_tail(&self.path_for(chat_id))?;
+        Ok(last.map(|line| (line.seq,line.event)))
+    }
+
+    /// Latest provider binding, without replaying tool payloads. The capped
+    /// writer cache includes absence and is updated only after durable append.
+    pub fn last_harness_session(&self, chat_id: &str) -> Result<Option<(String, String)>, JournalError> {
+        if let Some(journal) = self.lock().get(chat_id) {
+            return Ok(journal.harness_session.last.clone());
         }
-        Ok(read_lines(&path)?.into_iter().next_back())
+        Ok(read_harness_session(&self.path_for(chat_id))?.last)
     }
 
     fn chat_id_for(&self, path: &Path) -> Result<Option<String>, JournalError> {
@@ -332,8 +363,8 @@ impl RunJournal {
                     continue;
                 }
             };
-            let last = match read_lines(&path) {
-                Ok(events) => events.into_iter().next_back(),
+            let last = match read_tail(&path) {
+                Ok((event,_)) => event.map(|line| (line.seq,line.event)),
                 Err(error) => {
                     tracing::error!(path = %path.display(), %error, "skipping unreadable Crew journal");
                     continue;
@@ -411,19 +442,80 @@ fn read_lines(path: &Path) -> Result<Vec<(u64, AgentEvent)>, JournalError> {
     Ok(out)
 }
 
-/// Next seq (last valid seq + 1, starting at 1) and whether the file ends mid-line.
-fn scan_tail(path: &Path) -> Result<(u64, bool), JournalError> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((1, false)),
-        Err(e) => return Err(e.into()),
+/// Cold/reopened metadata lookup reuses one line buffer and ignores unrelated
+/// JSON values. Only real SessionStarted/Done records undergo event decoding;
+/// malformed metadata and torn lines follow replay's existing skip contract.
+fn read_harness_session(path: &Path) -> Result<HarnessSessionMetadata, JournalError> {
+    #[derive(Deserialize)]
+    struct EventKind {
+        #[serde(rename = "type")]
+        kind: String,
+    }
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HarnessSessionMetadata::default()),
+        Err(error) => return Err(error.into()),
     };
-    let needs_newline = bytes.last().is_some_and(|b| *b != b'\n');
-    let next_seq = read_lines(path)?
-        .last()
-        .map(|(seq, _)| seq + 1)
-        .unwrap_or(1);
-    Ok((next_seq, needs_newline))
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let mut metadata = HarnessSessionMetadata::default();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 { break; }
+        if line.trim().is_empty() { continue; }
+        let parsed = serde_json::from_str::<JournalLine<EventKind>>(&line);
+        match parsed {
+            Ok(parsed) if matches!(parsed.event.kind.as_str(), "sessionStarted" | "done") => {
+                match serde_json::from_str::<JournalLine>(&line) {
+                    Ok(parsed) => metadata.observe(&parsed.event),
+                    Err(error) => tracing::warn!(path = %path.display(), %error, "journal: skipping malformed metadata"),
+                }
+            }
+            Ok(_) => {},
+            Err(error) => tracing::warn!(path = %path.display(), %error, "journal: skipping malformed line"),
+        }
+    }
+    Ok(metadata)
+}
+
+/// Read backwards in fixed blocks. Tail queries must not materialize all prior
+/// tool argument prefixes merely to locate one event or its sequence number.
+fn read_tail(path: &Path) -> Result<(Option<JournalLine>, bool), JournalError> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((None,false)),
+        Err(error) => return Err(error.into()),
+    };
+    let mut position = file.metadata()?.len();
+    if position == 0 { return Ok((None,false)); }
+    file.seek(SeekFrom::Start(position-1))?;
+    let mut final_byte=[0u8;1]; file.read_exact(&mut final_byte)?;
+    let needs_newline=final_byte[0] != b'\n';
+    let mut block=[0u8;8192];
+    let mut line=Vec::new();
+    while position > 0 {
+        let count=position.min(block.len() as u64) as usize;
+        position -= count as u64;
+        file.seek(SeekFrom::Start(position))?;
+        file.read_exact(&mut block[..count])?;
+        for byte in block[..count].iter().rev() {
+            if *byte == b'\n' {
+                if !line.is_empty() {
+                    line.reverse();
+                    if let Ok(event) = serde_json::from_slice::<JournalLine>(&line) { return Ok((Some(event),needs_newline)); }
+                    line.clear();
+                }
+            } else { line.push(*byte); }
+        }
+    }
+    line.reverse();
+    Ok((serde_json::from_slice::<JournalLine>(&line).ok(),needs_newline))
+}
+
+/// Next seq and torn-write isolation use the same bounded tail reader.
+fn scan_tail(path: &Path) -> Result<(u64, bool), JournalError> {
+    let (last,needs_newline)=read_tail(path)?;
+    Ok((last.map_or(1,|line| line.seq+1),needs_newline))
 }
 
 /// Chat ids become file names; anything outside a conservative set is replaced so a
@@ -448,6 +540,87 @@ mod tests {
 
     fn text(s: &str) -> AgentEvent {
         AgentEvent::TextDelta { text: s.into() }
+    }
+
+    #[test]
+    fn resume_metadata_preserves_bindings_without_replaying_tool_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = RunJournal::open(dir.path()).unwrap();
+        let started = |id: &str, cwd: &str| AgentEvent::SessionStarted {
+            harness: comet_proto::HarnessId::Mock, model: "test".into(), tools: Vec::new(),
+            cwd: cwd.into(), session_id: id.into(), assistant_message_id: "assistant".into(),
+        };
+        let finished = |id: &str| AgentEvent::Done {
+            status: DoneStatus::Completed, result: None, error: None, session_id: Some(id.into()),
+        };
+        let tool = AgentEvent::ToolCall { id: "large".into(), call: comet_proto::ToolCall::Exec {
+            command: "{\"type\":\"sessionStarted\",\"sessionId\":\"spoof\",\"cwd\":\"/wrong\"}\nα".repeat(6000),
+        } };
+        assert_eq!(journal.last_harness_session("chat").unwrap(), None);
+        journal.append("chat", &tool).unwrap();
+        assert_eq!(journal.last_harness_session("chat").unwrap(), None);
+        journal = RunJournal::open(dir.path()).unwrap();
+        assert_eq!(journal.last_harness_session("chat").unwrap(), None, "cold no-ID history must ignore embedded metadata");
+        let mut expected = vec![(1, tool.clone())];
+        for (event, binding) in [
+            (finished("done-only"), ("done-only", "")),
+            (started("early", "/early"), ("early", "/early")),
+            (tool, ("early", "/early")),
+            (finished("promoted"), ("promoted", "/early")),
+            (started("", "/empty"), ("promoted", "/early")),
+            (finished(""), ("promoted", "/early")),
+            (finished("switched"), ("switched", "/empty")),
+            (started("late", "/late"), ("late", "/late")),
+            (done(), ("late", "/late")),
+        ] {
+            let seq = journal.append("chat", &event).unwrap();
+            expected.push((seq, event));
+            assert_eq!(journal.last_harness_session("chat").unwrap(), Some((binding.0.into(), binding.1.into())));
+        }
+        assert_eq!(journal.replay("chat", 0).unwrap(), expected);
+        drop(journal);
+        let mut file = OpenOptions::new().append(true).open(dir.path().join("chat.jsonl")).unwrap();
+        file.write_all(b"{\"seq\":998,\"event\":{\"type\":\"sessionStarted\",\"cwd\":\"/bad\",\"sessionId\":\"invalid\"}}\n").unwrap();
+        file.write_all(b"{\"seq\":999,\"event\":{\"type\":\"done\",\"status\":\"invalid\",\"sessionId\":\"invalid\"}}\n").unwrap();
+        file.write_all(b"{\"seq\":1000,\"event\":{\"type\":\"sessionStarted\",\"sessionId\":\"torn\"").unwrap();
+        drop(file);
+        let journal = RunJournal::open(dir.path()).unwrap();
+        assert_eq!(journal.last_harness_session("chat").unwrap(), Some(("late".into(), "/late".into())));
+        assert_eq!(journal.replay("chat", 0).unwrap(), expected, "invalid metadata must not alter replay or routing");
+        let event = finished("after-reopen");
+        let seq = journal.append("chat", &event).unwrap();
+        expected.push((seq, event));
+        assert_eq!(journal.last_harness_session("chat").unwrap(), Some(("after-reopen".into(), "/late".into())));
+        for index in 0..20 { journal.append(&format!("other-{index}"), &done()).unwrap(); }
+        assert_eq!(journal.last_harness_session("chat").unwrap(), Some(("after-reopen".into(), "/late".into())));
+        let event = started("after-eviction", "/evicted");
+        let seq = journal.append("chat", &event).unwrap();
+        expected.push((seq, event));
+        assert_eq!(journal.last_harness_session("chat").unwrap(), Some(("after-eviction".into(), "/evicted".into())));
+        assert_eq!(journal.replay("chat", 0).unwrap(), expected);
+        journal.discard("chat").unwrap();
+        assert_eq!(journal.last_harness_session("chat").unwrap(), None);
+    }
+
+    #[test]
+    fn tail_lookup_handles_large_records_and_multiblock_torn_writes() {
+        let dir=tempfile::tempdir().unwrap();
+        let journal=RunJournal::open(dir.path()).unwrap();
+        for prefix in 1..32 { journal.append("large",&text(&"history".repeat(prefix*1024))).unwrap(); }
+        let command="αβγ tool arguments ".repeat(20_000);
+        let last=AgentEvent::ToolCall { id:"last-tool".into(),call:comet_proto::ToolCall::Exec { command:command.clone() } };
+        let seq=journal.append("large",&last).unwrap();
+        assert_eq!(journal.last_event("large").unwrap(),Some((seq,last.clone())));
+        drop(journal);
+        let path=dir.path().join("large.jsonl");
+        let mut file=OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"{\"seq\":999,\"event\":\"").unwrap();
+        file.write_all(&vec![b'x';24*1024]).unwrap(); drop(file);
+        let reopened=RunJournal::open(dir.path()).unwrap();
+        assert_eq!(reopened.last_event("large").unwrap(),Some((seq,last)));
+        assert_eq!(reopened.append("large",&done()).unwrap(),seq+1);
+        assert!(matches!(reopened.last_event("large").unwrap(),Some((n,AgentEvent::Done {..})) if n==seq+1));
+        assert!(reopened.stale_sessions().unwrap().is_empty());
     }
 
     #[test]
@@ -525,6 +698,29 @@ mod tests {
             error: None,
             session_id: None,
         }
+    }
+
+    #[test]
+    fn large_escaped_events_flush_from_bounded_journal_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        let command = "α\"quoted\"\\path\n\t".repeat(24 * 1024);
+        assert!(command.len() > 300 * 1024);
+        let event = AgentEvent::ToolCall {
+            id: "large-tool".into(),
+            call: comet_proto::ToolCall::Exec { command },
+        };
+        assert_eq!(journal.append("large", &event).unwrap(), 1);
+        assert!(journal.lock().get("large").unwrap().file.capacity() <= 8 * 1024);
+        // Separate readers must see the complete event before the writer is
+        // dropped, including escapes and UTF-8 spanning buffer boundaries.
+        assert_eq!(journal.last_event("large").unwrap(), Some((1, event.clone())));
+        assert_eq!(journal.replay("large", 0).unwrap(), vec![(1, event)]);
+        assert_eq!(journal.append("large", &done()).unwrap(), 2);
+        drop(journal);
+        let reopened = RunJournal::open(dir.path()).unwrap();
+        assert_eq!(reopened.append("large", &text("next")).unwrap(), 3);
+        assert_eq!(reopened.last_event("large").unwrap(), Some((3, text("next"))));
     }
 
     #[test]

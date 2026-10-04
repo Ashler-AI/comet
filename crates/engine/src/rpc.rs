@@ -351,6 +351,30 @@ struct QueueCommandParams {
     expires_at: Option<i64>,
     #[serde(default)]
     bootstrap: Option<PeerCommandBootstrap>,
+    #[serde(default)]
+    deployment_id: Option<String>,
+    #[serde(default)]
+    control_deployment_id: Option<String>,
+    #[serde(default)]
+    room_projection: Option<SessionRoomProjection>,
+    #[serde(default)]
+    target_device_id: Option<String>,
+}
+
+impl QueueCommandParams {
+    fn explicit_deployment(&self) -> Result<Option<&str>, RpcError> {
+        let mut deployment = None;
+        for claim in [self.deployment_id.as_deref(), self.control_deployment_id.as_deref(),
+            self.room_projection.as_ref().map(|projection| projection.deployment_id.as_str())]
+            .into_iter().flatten()
+        {
+            if claim.trim().is_empty() || deployment.is_some_and(|current| current != claim) {
+                return Err(RpcError::Failed("command_deployment_scope_denied".into()));
+            }
+            deployment = Some(claim);
+        }
+        Ok(deployment)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -923,6 +947,44 @@ impl EngineRpc {
         }
     }
 
+    /// Ordinary relay authority never selects a physical deployment. Explicit
+    /// selection requires an already verified exact room and owner grant.
+    fn validate_command_deployment(&self, params: &QueueCommandParams) -> Result<(), RpcError> {
+        let Some(deployment) = params.explicit_deployment()? else { return Ok(()) };
+        let SessionCommandPayload::Control {
+            source, session_id, owner_device_id, actor_device_id, actor_subject, ..
+        } = &params.command else {
+            return Err(RpcError::Failed("command_deployment_scope_denied".into()));
+        };
+        if params.target_device_id.as_deref().is_some_and(|device| device != owner_device_id)
+            || params.room_projection.as_ref().is_some_and(|projection|
+                projection.project_id != self.workspace.project_scope() || projection.session_id != params.chat_id)
+            || !self.doc_host.has_exact_projection(&params.chat_id, deployment)
+        {
+            return Err(RpcError::Failed("command_deployment_scope_denied".into()));
+        }
+        if *source == comet_proto::AgentSessionSource::Scaffold {
+            if self.doc_host.control_projection_authorized(&params.chat_id, deployment, &params.command) {
+                return Ok(());
+            }
+        } else if *source == comet_proto::AgentSessionSource::Local
+            && session_id == &params.chat_id
+            && owner_device_id == self.doc_host.device_id()
+            && actor_device_id == self.doc_host.device_id()
+            && self.doc_host.is_locally_hosted(&params.chat_id)
+        {
+            let auth = self.auth()?;
+            let state = auth.state();
+            if state.user().is_some_and(|user| &user.id == actor_subject)
+                && state.project_scope() == Some(self.workspace.project_scope())
+                && self.doc_host.control_projection_authorized(&params.chat_id, deployment, &params.command)
+            {
+                return Ok(());
+            }
+        }
+        Err(RpcError::Failed("command_deployment_scope_denied".into()))
+    }
+
     /// Local owner authority is derived from the attached authenticated identity.
     /// The UI supplies no capability list; the one required capability is selected
     /// from the typed action and persisted as a short-lived verified grant.
@@ -1256,19 +1318,23 @@ impl EngineRpc {
             self.doc_host
                 .open_projection(target_chat_id, projection)
                 .map_err(|error| RpcError::Failed(error.to_string()))?;
-            return self
-                .doc_host
+            let entry = self.doc_host
                 .queue_command_with_id(target_chat_id, command_id, payload)
-                .map_err(|error| RpcError::Failed(error.to_string()));
+                .map_err(|error| RpcError::Failed(error.to_string()))?;
+            self.doc_host.wake_queued_command(target_chat_id, &entry.id).await
+                .map_err(|error| RpcError::Failed(error.to_string()))?;
+            return Ok(entry);
         }
         if self.links.is_none() {
             self.doc_host
                 .open_projection(target_chat_id, projection)
                 .map_err(|error| RpcError::Failed(error.to_string()))?;
-            return self
-                .doc_host
+            let entry = self.doc_host
                 .queue_command_with_id(target_chat_id, command_id, payload)
-                .map_err(|error| RpcError::Failed(error.to_string()));
+                .map_err(|error| RpcError::Failed(error.to_string()))?;
+            self.doc_host.wake_queued_command(target_chat_id, &entry.id).await
+                .map_err(|error| RpcError::Failed(error.to_string()))?;
+            return Ok(entry);
         }
         let links = self
             .links
@@ -1874,6 +1940,9 @@ impl RpcService for EngineRpc {
         validate_public_chat_routes(&params)?;
         let mut p: QueueCommandParams = parse_params(params)?;
         validate_command_lifetime(p.issued_at, p.expires_at, crate::now_ms())?;
+        if p.explicit_deployment()?.is_some() || self.doc_host.has_scoped_route(&p.chat_id) {
+            return Err(RpcError::Failed("peer_command_scope_denied".into()));
+        }
         let auth = self.auth()?.state();
         if self.runtime_profile == RuntimeProfile::ScaffoldHost
             || auth.user().map(|user| user.id.as_str()) != Some(authority.subject.as_str())
@@ -1982,6 +2051,8 @@ impl RpcService for EngineRpc {
         self.workspace
             .set_chat_archived(&p.chat_id, false)
             .map_err(|error| RpcError::Failed(error.to_string()))?;
+        self.doc_host.wake_queued_command(&p.chat_id, &entry.id).await
+            .map_err(|error| RpcError::Failed(format!("{error}; durable commandId={}", entry.id)))?;
         Ok(serde_json::json!({ "commandId": entry.id }))
     }
 
@@ -2382,11 +2453,14 @@ impl RpcService for EngineRpc {
                 if existing.payload != p.command {
                     return Err(RpcError::Failed("command_id_conflict".into()));
                 }
+                self.doc_host.wake_queued_command(&chat_id, &existing.id).await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "commandId": existing.id }))
             }
             methods::QUEUE_COMMAND => {
                 let p: QueueCommandParams = parse_params(params)?;
                 validate_command_lifetime(p.issued_at, p.expires_at, crate::now_ms())?;
+                self.validate_command_deployment(&p)?;
                 if ordinary_peer_command(&p.command)
                     && let Some(chat) = self
                         .workspace
@@ -2500,6 +2574,8 @@ impl RpcService for EngineRpc {
                         .set_chat_archived(&p.chat_id, false)
                         .map_err(|e| RpcError::Failed(e.to_string()))?;
                 }
+                self.doc_host.wake_queued_command(&p.chat_id, &command_id).await
+                    .map_err(|error| RpcError::Failed(format!("{error}; durable commandId={command_id}")))?;
                 RpcReply::value(&serde_json::json!({ "commandId": command_id }))
             }
             methods::WATCH_OMP_RECOVERY => {
@@ -2859,6 +2935,7 @@ impl RpcService for EngineRpc {
                         "probes": s.probes,
                         "fullResyncs": s.full_resyncs,
                         "disconnects": s.disconnects,
+                        "recoveryError": s.recovery_error,
                     })
                 }
                 let workspace = self.workspace.sync_status();
@@ -2870,6 +2947,7 @@ impl RpcService for EngineRpc {
                         serde_json::json!({
                             "chatId": chat_id,
                             "room": room.as_ref().map(room_json),
+                            "recoveryError": self.doc_host.recovery_error(chat_id),
                         })
                     })
                     .collect();
@@ -2877,6 +2955,7 @@ impl RpcService for EngineRpc {
                     "deviceId": self.doc_host.device_id(),
                     "nowMs": crate::now_ms(),
                     "workspace": workspace.as_ref().map(room_json),
+                    "workspaceRecoveryError": self.workspace.recovery_error(),
                     "chats": chats,
                 }))
             }
@@ -3419,6 +3498,127 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn queue_capacity_failure_retains_durable_instruction_and_exact_retry() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut posts = 0;
+            while posts < 2 {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                let nudge = line.starts_with("POST /device/comet-scaffold-capacity-e1/nudge ");
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    socket.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" || line.is_empty() { break; }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).await.unwrap();
+                let status = if nudge {
+                    posts += 1;
+                    assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["chatId"], "00000000-0000-4000-8000-000000000231");
+                    if posts == 1 { "503 Service Unavailable" } else { "202 Accepted" }
+                } else { "404 Not Found" };
+                socket.get_mut().write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let core = crate::EngineCore::assemble_with_identity(dir.path(),
+            std::sync::Arc::new(crate::default_registry(RuntimeProfile::Mock)),
+            HarnessId::Mock, None, "project-a", "owner-a", RuntimeProfile::Mock).unwrap();
+        let chat = "00000000-0000-4000-8000-000000000231";
+        core.workspace.create_space("capacity-space", &core.device_id, "/tmp", None, false).unwrap();
+        core.workspace.create_chat(chat, "capacity-space", None, None).unwrap();
+        core.workspace.set_chat_host(chat, "comet-scaffold-capacity-e1").unwrap();
+        let store = std::sync::Arc::new(comet_sync::DocsStore::open(dir.path().join("capacity-docs")).unwrap());
+        let host = DocHost::new(store.clone(), crate::DocHostConfig {
+            device_id: core.device_id.clone(), default_harness: HarnessId::Mock,
+            edge: Some(crate::EdgeConfig::new(&origin, std::sync::Arc::new(comet_rpc::StaticToken("test".into())))),
+        });
+        host.set_workspace(core.workspace.clone());
+        let mut rpc = core.build_rpc_service();
+        rpc.doc_host = host;
+        let issued = crate::now_ms() - 1_000;
+        let expires = issued + 60_000;
+        let params = serde_json::json!({ "chatId": chat, "commandId": "capacity-command",
+            "issuedAt": issued, "expiresAt": expires, "command": { "kind": "interrupt" } });
+        let error = rpc.handle(methods::QUEUE_COMMAND, params.clone()).await.err().expect("queue capacity failure must be visible");
+        assert!(error.to_string().contains("HTTP 503"));
+        let accepted = rpc.doc_host.command_entry(chat, "capacity-command").unwrap().unwrap();
+        assert_eq!(accepted.status, comet_doc::SessionCommandStatus::Pending);
+        assert_eq!(accepted.issued_at, issued);
+        assert_eq!(accepted.expires_at, Some(expires));
+        // The accepted semantic instruction, not a renewed append, backs retry
+        // after both cache replacement and a new host instance.
+        let handle = rpc.doc_host.open(chat).unwrap();
+        let empty = comet_doc::SessionDoc::init(chat).unwrap();
+        handle.doc().binding().adopt_snapshot(&empty.export_snapshot().unwrap(), Some(chat)).unwrap();
+        let restarted = DocHost::new(store, crate::DocHostConfig {
+            device_id: core.device_id.clone(), default_harness: HarnessId::Mock,
+            edge: Some(crate::EdgeConfig::new(&origin, std::sync::Arc::new(comet_rpc::StaticToken("test".into())))),
+        });
+        restarted.set_workspace(core.workspace.clone());
+        rpc.doc_host = restarted;
+        rpc.handle(methods::QUEUE_COMMAND, params).await.unwrap();
+        let retried = rpc.doc_host.command_entry(chat, "capacity-command").unwrap().unwrap();
+        assert_eq!(retried, accepted);
+        assert_eq!(rpc.doc_host.open(chat).unwrap().doc().read_commands().unwrap(), vec![accepted]);
+        server.await.unwrap();
+        core.shutdown().await;
+    }
+
+    #[test]
+    fn command_lifetime_rejects_partial_future_expired_and_extended_envelopes() {
+        let now = 100_000_000;
+        let day = 24 * 60 * 60 * 1_000;
+        assert!(validate_command_lifetime(None, None, now).is_ok());
+        assert!(validate_command_lifetime(Some(now), Some(now + day), now).is_ok());
+        assert!(validate_command_lifetime(Some(now - day + 1), Some(now + 1), now).is_ok());
+        for (issued, expires) in [
+            (Some(now), None),
+            (None, Some(now + 1)),
+            (Some(now + 1), Some(now + 2)),
+            (Some(now - 1), Some(now)),
+            (Some(now), Some(now)),
+            (Some(now), Some(now + day + 1)),
+            (Some(i64::MIN), Some(i64::MAX)),
+        ] {
+            assert!(validate_command_lifetime(issued, expires, now).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn public_routes_reject_private_execution_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = crate::EngineCore::assemble_with_identity(
+            dir.path(),
+            std::sync::Arc::new(crate::default_registry(RuntimeProfile::Mock)),
+            HarnessId::Mock,
+            None,
+            "project-a",
+            "owner-a",
+            RuntimeProfile::Mock,
+        ).unwrap();
+        let rpc = core.rpc_service();
+        let private = "018eeb58-6508-78e8-a544-44682ab94c50::session::018eeb58-6508-78e8-a544-44682ab94c50";
+        for (method, params) in [
+            (methods::TOOL_CALL_DETAIL, serde_json::json!({ "chatId": private, "toolId": "tool-a" })),
+            (methods::QUEUE_COMMAND, serde_json::json!({ "chatId": private, "commandId": "command-a", "command": { "kind": "interrupt" } })),
+        ] {
+            assert!(matches!(rpc.handle(method, params).await, Err(RpcError::BadParams(_))));
+        }
+        assert!(core.sessions.session_status(private).is_none());
+        assert!(core.workspace.doc().doc().get_map("chats").get(private).is_none());
+    }
+
+    #[tokio::test]
     async fn ordinary_peer_commands_require_exact_relay_authority() {
         let dir = tempfile::tempdir().unwrap();
         let core = crate::EngineCore::assemble_with_identity(
@@ -3465,8 +3665,11 @@ mod tests {
             last_seen_at: None,
         };
         let rpc = core.rpc_service();
+        let issued_at = crate::now_ms() - 60_000;
+        let expires_at = issued_at + 300_000;
         let params = serde_json::json!({ "chatId": "chat-a", "commandId": "command-a",
             "bootstrap": { "chat": chat, "space": space },
+            "issuedAt": issued_at, "expiresAt": expires_at,
             "command": { "kind": "control", "source": "local", "sessionId": "agent-a",
                 "ownerDeviceId": core.device_id, "actorDeviceId": "desktop-a",
                 "actorSubject": "owner-a", "grantId": "untrusted-caller-grant",
@@ -3479,6 +3682,33 @@ mod tests {
             serde_json::json!({ "subject": "owner-a", "projectId": "project-a",
             "deviceId": core.device_id, "chatId": "chat-a", "expiresAt": crate::now_ms() + 30_000 })
         };
+        // Omitting deployment fields cannot select an already scoped cache claim.
+        let scoped_id = "00000000-0000-4000-8000-000000000099";
+        core.doc_host.open_projection(scoped_id, Some(&SessionRoomProjection {
+            project_id: "project-a".into(), deployment_id: "deployment-a".into(),
+            session_id: scoped_id.into(),
+        })).unwrap();
+        let mut scoped_params = params.clone();
+        scoped_params["chatId"] = serde_json::json!(scoped_id);
+        scoped_params["bootstrap"]["chat"]["id"] = serde_json::json!(scoped_id);
+        scoped_params["command"]["sessionId"] = serde_json::json!(scoped_id);
+        let mut scoped_authority = authority();
+        scoped_authority["chatId"] = serde_json::json!(scoped_id);
+        assert!(rpc.admit_peer_command(serde_json::from_value(scoped_authority).unwrap(), scoped_params).await.is_err());
+        assert!(core.workspace.doc().chat(scoped_id).unwrap().is_none());
+        assert!(core.doc_host.command_entry(scoped_id, "command-a").unwrap().is_none());
+        // A valid ordinary authority/bootstrap cannot turn an explicit deployment
+        // claim into a bare-room admission, even when the claim names this project.
+        for field in ["deploymentId", "controlDeploymentId"] {
+            for deployment in ["deployment-foreign", "project-a"] {
+                let mut scoped = params.clone();
+                scoped[field] = serde_json::json!(deployment);
+                assert!(rpc.admit_peer_command(serde_json::from_value(authority()).unwrap(), scoped.clone()).await.is_err());
+                assert!(rpc.handle(methods::QUEUE_COMMAND, scoped).await.is_err());
+                assert!(core.workspace.doc().chat("chat-a").unwrap().is_none());
+                assert!(!core.doc_host.chat_has_commands("chat-a").unwrap());
+            }
+        }
         for (field, value) in [
             ("subject", serde_json::json!("attacker")),
             ("projectId", serde_json::json!("foreign")),
@@ -3528,6 +3758,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(admitted["commandId"], "command-a");
+        let entry = core.doc_host.command_entry("chat-a", "command-a").unwrap().unwrap();
+        assert_eq!(entry.issued_at, issued_at);
+        assert_eq!(entry.expires_at, Some(expires_at));
         let handle = core.doc_host.open("chat-a").unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -3556,6 +3789,9 @@ mod tests {
                 .unwrap(),
             admitted
         );
+        let mut changed_lifetime = params.clone();
+        changed_lifetime["expiresAt"] = serde_json::json!(expires_at + 1);
+        assert!(rpc.admit_peer_command(serde_json::from_value(authority()).unwrap(), changed_lifetime).await.is_err());
         let mut conflict = params;
         conflict["command"]["action"]["request"]["prompt"] = serde_json::json!("changed payload");
         assert!(

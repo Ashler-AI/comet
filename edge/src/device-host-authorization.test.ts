@@ -59,6 +59,21 @@ afterEach(() => {
 });
 
 describe("trusted device host forwarding", () => {
+  it.each([
+    "controlDeploymentId=deployment-a", "deploymentId=deployment-a",
+    "controlDeploymentId=", "deploymentId="
+  ])("rejects ordinary control scope %s instead of forwarding a legacy command", async (scopeQuery) => {
+    const env = edgeEnv("dev", "local");
+    env.SCAFFOLD_REQUIRED_CAPABILITIES = "session.read session.chat session.control session.environment";
+    const response = await worker.fetch(new Request(
+      `http://127.0.0.1/device/local-engine/ws?role=client&purpose=control&controlSessionId=11111111-1111-4111-8111-111111111111&${scopeQuery}`,
+      { headers: { authorization: "Bearer engine@ashler-local", upgrade: "websocket" } }
+    ), env);
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ error: "scoped_control_not_supported" });
+    expect(forwardedRequests).toEqual([]);
+  });
+
   it("lets an ordinary local dev engine host and replaces spoofed authority", async () => {
     const env = edgeEnv("dev", "local");
     const response = await worker.fetch(
@@ -137,6 +152,7 @@ describe("trusted device host forwarding", () => {
       revokedAt: null
     };
     let ownsSession = true;
+    let scopedAvailable = false;
     const env = {
       ...edgeEnv("scaffold", "staging"),
       SCAFFOLD_REQUIRED_CAPABILITIES: "session.read session.chat",
@@ -147,13 +163,13 @@ describe("trusted device host forwarding", () => {
       SESSION_ROOMS: {
         idFromName: (id: string) => id,
         get: (room: string) => ({ fetch: async () => Response.json({
-          ownsSession: ownsSession && !room.includes(grant.deploymentId),
+          ownsSession: ownsSession && (!room.includes(grant.deploymentId) || scopedAvailable),
           deviceId: "local-engine"
         }) })
       }
     } as unknown as Env;
     const targetSession = "22222222-2222-4222-8222-222222222222";
-    const fallbackResolvedRequest = () => worker.fetch(new Request(
+    const scopedRequest = () => worker.fetch(new Request(
       `https://comet.example/peer/${targetSession}/ws?deploymentId=${grant.deploymentId}`,
       { headers: { authorization: `Bearer cs1.${grant.grantId}.${"b".repeat(64)}`, upgrade: "websocket" } }
     ), env);
@@ -169,11 +185,14 @@ describe("trusted device host forwarding", () => {
     expect((await directRequest()).status).toBe(204);
     expect((await resolvedRequest()).status).toBe(204);
     expect(new URL(forwardedRequests[1]!.url).searchParams.get("targetDeviceId")).toBe("local-engine");
-    expect((await fallbackResolvedRequest()).status).toBe(204);
-    expect(new URL(forwardedRequests[2]!.url).searchParams.get("targetDeviceId")).toBe("local-engine");
+    expect((await scopedRequest()).status).toBe(404);
+    expect(forwardedRequests).toHaveLength(2);
+    scopedAvailable = true;
+    expect((await scopedRequest()).status).toBe(204);
     ownsSession = false;
     expect((await directRequest()).status).toBe(403);
     expect((await resolvedRequest()).status).toBe(404);
+    expect((await scopedRequest()).status).toBe(404);
     expect(forwardedRequests).toHaveLength(3);
   });
 });
