@@ -153,6 +153,8 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
    retained history for correct offline merges; transcript-room retention is separate. Fresh
    readers receive the persisted baseline followed by ordered accepted deltas, avoiding a
    whole-history export for every sign-in.
+   Cold replay imports the baseline snapshot separately, then batches retained deltas
+   so each persisted update does not rematerialize the workspace's intermediate state.
 
    Authorized workspace recovery may atomically replace a wedged room with one bounded complete
    snapshot. The edge validates the snapshot envelope and enforces an 8 MiB observed-byte limit
@@ -168,8 +170,10 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
    pending history reports `JoinError(AppError, "incomplete_history")` without advertising a
    partial version. An authorized writer may supply a complete snapshot on that recovery-only
    socket, then rejoin after its ACK. Fresh empty readers cannot manufacture missing history.
-   Workspace replay failures preserve stored bytes; irreversibly trimmed gaps still require a
-   replica or backup covering their dependencies, never automatic resets or silent loss.
+   Workspace replay failures preserve stored bytes and keep cold replay retryable after
+   transient resource failures; the transcript crash budget must not permanently lock
+   workspace discovery. Irreversibly trimmed gaps still require a replica or backup
+   covering their dependencies, never automatic resets or silent loss.
 
    Rollout: deploy the edge changes before publishing desktop and mobile builds. Older clients
    cannot perform the new incomplete-history handshake, so both native updates are needed for
