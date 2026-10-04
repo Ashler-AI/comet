@@ -646,27 +646,6 @@ impl WorkspaceDoc {
         Ok(true)
     }
 
-    /// Update only activity timestamps; never rewrite concurrent user metadata.
-    pub fn set_chat_activity(
-        &self,
-        chat_id: &str,
-        last_message_at: Option<i64>,
-        created_at: Option<i64>,
-    ) -> Result<bool, DocError> {
-        let Some(row) = self.existing_row("chats", chat_id) else {
-            return Ok(false);
-        };
-        if let Some(ms) = last_message_at {
-            set_opt_ms(&row, "lastMessageAt", DateTime::<Utc>::from_timestamp_millis(ms))?;
-        }
-        if let Some(ms) = created_at
-            && let Some(at) = DateTime::<Utc>::from_timestamp_millis(ms)
-        {
-            row.insert("createdAt", at.timestamp_millis())?;
-        }
-        self.doc.commit();
-        Ok(true)
-    }
 
     /// Tombstone: delete the chat row (and its session-status row). The per-chat
     /// session doc remains — DeleteChat removes the index entry, not the transcript.

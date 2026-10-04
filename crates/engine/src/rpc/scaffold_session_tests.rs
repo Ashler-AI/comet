@@ -580,28 +580,19 @@ async fn recovery_peer_diagnostic_does_not_duplicate_admission() {
     core.workspace
         .upsert_session_ref(scope.session_id.as_deref().unwrap(), Some(accepted.clone()))
         .unwrap();
+    // This is an already accepted diagnostic in the scoped replica, not a new
+    // bare control admission inheriting deployment authority from its cache.
     core.doc_host
-        .open_projection(
-            scope.session_id.as_deref().unwrap(),
-            response(&scope, ScaffoldLifecycle::Ready)
-                .room_projection
-                .as_ref(),
-        )
-        .unwrap();
-    core.doc_host
-        .queue_command(
-            &recovery_request().recover_chat_id,
-            SessionCommandPayload::PeerMessage {
-                text: "Read-only diagnostic".into(),
-                source_chat_id: recovery_request().handoff.source_chat_id,
-                source_deployment_id: None,
-                source_device_id: None,
-                thread_id: "diagnostic".into(),
-                reply_to: None,
-                hop_count: 0,
+        .open_projection(scope.session_id.as_deref().unwrap(), response(&scope, ScaffoldLifecycle::Ready).room_projection.as_ref())
+        .unwrap().doc().queue_command(&comet_doc::SessionCommandEntry {
+            id:"diagnostic".into(), issued_by:core.device_id.clone(), issued_at:1,
+            based_on:None, expires_at:None, status:comet_doc::SessionCommandStatus::Applied, resolution:None,
+            payload:SessionCommandPayload::PeerMessage {
+                text:"Read-only diagnostic".into(), source_chat_id:recovery_request().handoff.source_chat_id,
+                source_deployment_id:None, source_device_id:None, thread_id:"diagnostic".into(),
+                reply_to:None, hop_count:0,
             },
-        )
-        .unwrap();
+        }).unwrap();
     core.rpc_service()
         .require_unadmitted_handoff(&recovery_request().recover_chat_id)
         .unwrap();

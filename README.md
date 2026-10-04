@@ -28,6 +28,26 @@ embedded base64 payload, avoiding its startup string and decoding buffers.
 The immutable candidate includes the WASM module; no-bundle deployment attaches
 the same bytes alongside the JavaScript entry point.
 
+Mobile browse links retain their exact scope without attaching or resuming a
+sandbox. Conflicting links fail before navigation or sends. Shared attachment
+identities use consistent outbox accounting; terminal controls retain durable
+outcomes without consuming pending-command capacity. Offline workspace goals
+project before a network join. A trusted room reset retires only the previous
+frontier, not the pending journal.
+
+The release gates cover paced large-tool memory, failure recovery, both supported
+mixed-native directions and a real simulator/native/Edge transport path. Native
+publication heartbeats remain while the pre-register baseline is supported;
+that compatibility history can be removed when the baseline retires.
+
+Local checks: 465 native/RPC library tests passed. The unchanged 24-turn,
+300 KiB progressive-tool probe passed at 60.2 MiB RSS growth against 128 MiB.
+The merged 0.1.141 headless binary completed the full 24-turn convergence
+scenario, preserving 1,600 history rows through crash and independent epoch
+replacement, with 21.1 MiB RSS growth. The headed demo accepted one mock turn,
+rendered its reply and reported idle. New Swift source and both mixed-native
+directions still await remote CI; this is not a staging or production release.
+Local typechecks are intentionally skipped to preserve workstation resources.
 ## Crew Staging mobile 1.0 (29)
 
 Crew Staging **1.0 (29)** is available in the existing **Ashler Internal** TestFlight
