@@ -435,7 +435,7 @@ fn rejected(status: u16, reason: &str) -> ErrorResponse {
         .expect("error response")
 }
 
-async fn start_relay() -> (String, Arc<LocalRoomRelay>, tokio::task::JoinHandle<()>) {
+async fn start_relay(deployment: Option<&'static str>) -> (String, Arc<LocalRoomRelay>, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind relay");
     let url = format!("http://{}", listener.local_addr().expect("relay address"));
     let relay = LocalRoomRelay::new();
@@ -457,7 +457,7 @@ async fn start_relay() -> (String, Arc<LocalRoomRelay>, tokio::task::JoinHandle<
                         if query_parameter(&uri, "token") != Some(TEST_BEARER) {
                             return Err(rejected(401, "unauthenticated"));
                         }
-                        if query_parameter(&uri, "deploymentId") != Some(DEPLOYMENT) {
+                        if query_parameter(&uri, "deploymentId") != deployment {
                             return Err(rejected(403, "deployment mismatch"));
                         }
                         let Some(device_id) = query_parameter(&uri, "device").map(str::to_string)
@@ -591,12 +591,11 @@ fn registry() -> Arc<HarnessRegistry> {
     Arc::new(registry)
 }
 
-fn assemble_remote(dir: &std::path::Path, device_id: &str, edge_url: &str) -> EngineCore {
+fn assemble_remote(dir: &std::path::Path, device_id: &str, edge_url: &str, deployment: Option<&str>) -> EngineCore {
     std::fs::create_dir_all(dir).expect("create engine directory");
     std::fs::write(dir.join("device-id"), device_id).expect("write device id");
-    let edge = EdgeConfig::with_static_token(edge_url, TEST_BEARER)
-        .with_device(device_id)
-        .with_deployment(DEPLOYMENT);
+    let mut edge = EdgeConfig::with_static_token(edge_url, TEST_BEARER).with_device(device_id);
+    if let Some(deployment) = deployment { edge = edge.with_deployment(deployment); }
     EngineCore::assemble_with_identity(
         dir,
         registry(),
@@ -643,10 +642,10 @@ fn entry_contains(entry: &comet_doc::SessionMessageEntry, text: &str) -> bool {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_authenticated_engines_sync_workspace_streams_and_reconnect_backfill() {
-    let (edge_url, relay, relay_task) = start_relay().await;
+    let (edge_url, relay, relay_task) = start_relay(None).await;
     let dirs = tempfile::tempdir().expect("tempdir");
-    let a = assemble_remote(&dirs.path().join("a"), "device-a", &edge_url);
-    let b = assemble_remote(&dirs.path().join("b"), "device-b", &edge_url);
+    let a = assemble_remote(&dirs.path().join("a"), "device-a", &edge_url, None);
+    let b = assemble_remote(&dirs.path().join("b"), "device-b", &edge_url, None);
 
     wait_for(
         || a.workspace.connected() && b.workspace.connected(),
@@ -841,9 +840,9 @@ async fn two_authenticated_engines_sync_workspace_streams_and_reconnect_backfill
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scaffold_host_joins_project_workspace_and_publishes_status() {
-    let (edge_url, _, relay_task) = start_relay().await;
+    let (edge_url, _, relay_task) = start_relay(Some(DEPLOYMENT)).await;
     let dirs = tempfile::tempdir().unwrap();
-    let controller = assemble_remote(&dirs.path().join("controller"), "controller", &edge_url);
+    let controller = assemble_remote(&dirs.path().join("controller"), "controller", &edge_url, Some(DEPLOYMENT));
     std::fs::create_dir_all(dirs.path().join("sandbox")).unwrap();
     std::fs::write(dirs.path().join("sandbox/device-id"), "sandbox").unwrap();
     let sandbox = EngineCore::assemble_with_identity(

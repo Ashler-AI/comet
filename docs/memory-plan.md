@@ -727,6 +727,15 @@ owner completion, scoped upload/actor rejection, reconnect and revocation.
 Inference and Scaffold authority were local deterministic fixtures; no active
 devbox restart, paid-provider run or production deployment was performed.
 
+The first exact-source remote gate rejected the old `remote_sync` fixture on
+both platforms: ordinary local devices advertised a sandbox deployment without
+its live grant. The fixture now tests ordinary unscoped devices separately from
+the deployment-scoped Scaffold host, and each relay enforces its exact expected
+deployment. Production admission guards are unchanged. All four local native
+integration suites then passed (26 tests; two existing ignored tests), and the
+queued-run end-to-end regression passed. Remote native gates must rerun before
+staging publication.
+
 
 
 
