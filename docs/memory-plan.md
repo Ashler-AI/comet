@@ -864,3 +864,13 @@ The existing FAIL gate, exact markers and archive checks remain. No permanent
 wording/mock-wiring test, local typecheck or mobile compilation override added;
 archive/source/signature acceptance still requires the full remote rerun.
 
+The corrected marker reader's run `37371030005` compiled source `9024c659`,
+but a preceding foreign-principal WebSocket open failed with an empty builtin
+Node error before the mobile hook. The rig now uses its already-installed `ws`
+transport, which exposes HTTP handshake rejection status instead of that opaque
+event; no retry, authentication bypass or acceptance fallback is added. Its
+full local 24-turn/1,600-row scenario passed again with 1,923 ms catch-up,
+foreign-principal denial, reconnect and revocation. That does not claim the
+intermittent hosted-runner handshake cause is confirmed; final full remote
+transport, surface and archive gates still must pass.
+

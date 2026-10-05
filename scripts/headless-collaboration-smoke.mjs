@@ -24,6 +24,7 @@ const SOAK_TURNS = Number(process.env.COMET_SYNC_SOAK_TURNS ?? 24);
 assert.ok(Number.isSafeInteger(SOAK_TURNS) && SOAK_TURNS > 0 && SOAK_TURNS <= 2_000,
   "COMET_SYNC_SOAK_TURNS must be an integer between 1 and 2000");
 const edgeRequire = createRequire(path.join(EDGE_DIR, "package.json"));
+const { WebSocket } = edgeRequire("ws");
 const OWNER_TOKEN = "sc_rc_comet_integration_owner";
 const CLIENT_A_TOKEN = "sc_rc_comet_integration_client_a";
 const CLIENT_B_TOKEN = "sc_rc_comet_integration_client_b";
