@@ -568,6 +568,7 @@ const liveMobileSmoke = async (edgeOrigin, deviceId, workspacePath) => {
   await rm(log, { force: true });
   await exec("xcrun", ["simctl", "launch", "--terminate-running-process", MOBILE_SIMULATOR, MOBILE_BUNDLE, "-e2e"], {
     env: { ...process.env, SIMCTL_CHILD_CREW_E2E_EDGE_URL: edgeOrigin,
+      SIMCTL_CHILD_CREW_E2E_ACCESS_TOKEN: OWNER_TOKEN,
       SIMCTL_CHILD_CREW_E2E_USER_ID: OWNER_SUBJECT, SIMCTL_CHILD_CREW_E2E_PROJECT_SCOPE: PROJECT_ID,
       SIMCTL_CHILD_CREW_E2E_DEVICE_ID: deviceId, SIMCTL_CHILD_CREW_E2E_WORKSPACE_PATH: workspacePath },
   });

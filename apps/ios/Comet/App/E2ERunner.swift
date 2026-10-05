@@ -1,8 +1,7 @@
-// Headless e2e rig — launch with `-e2e` (plus a local wrangler dev edge and a
-// `comet headless` engine in dev mode) and the app exercises the full live
-// stack with no taps: workspace room backfill, device-relay RPCs, space/chat
-// creation, the command plane, and session-room streaming. Results append to
-// Documents/e2e.log for the harness to read via simctl.
+// Headless e2e rig: `-e2e` plus the isolated loopback Edge, scoped fixture
+// credential and `comet headless` mock engine supplied by the CI harness.
+// Exercises workspace backfill, relay RPCs, commands and session streaming;
+// results append to Documents/e2e.log for simctl to read.
 
 import Foundation
 import Loro
@@ -27,24 +26,30 @@ enum E2ERunner {
         }
     }
 
-    static func run(model: AppModel) async {
-        try? FileManager.default.removeItem(at: logURL)
-        log("start")
+    private static func liveFixture() -> (edgeURL: URL, accessToken: String, userId: String, projectScope: String, deviceId: String, workspacePath: String)? {
         let fixture = ProcessInfo.processInfo.environment
         guard let edge = fixture["CREW_E2E_EDGE_URL"], let edgeURL = URL(string: edge),
               edgeURL.scheme == "http", ["localhost", "127.0.0.1"].contains(edgeURL.host ?? ""),
               edgeURL.port != nil, edgeURL.user == nil, edgeURL.password == nil,
               edgeURL.query == nil, edgeURL.fragment == nil, ["", "/"].contains(edgeURL.path),
+              let accessToken = fixture["CREW_E2E_ACCESS_TOKEN"], !accessToken.isEmpty,
               let userId = fixture["CREW_E2E_USER_ID"], !userId.isEmpty,
               let projectScope = fixture["CREW_E2E_PROJECT_SCOPE"], !projectScope.isEmpty,
               let deviceId = fixture["CREW_E2E_DEVICE_ID"], !deviceId.isEmpty,
               let workspacePath = fixture["CREW_E2E_WORKSPACE_PATH"], workspacePath.hasPrefix("/"),
               URL(fileURLWithPath: workspacePath).lastPathComponent.hasPrefix("comet-integration-smoke-") else {
-            log("FAIL live fixture requires an isolated loopback edge, principal, device and temporary workspace")
-            return
+            log("FAIL Crew live fixture requires an isolated loopback edge, scoped credential, principal, device and temporary workspace")
+            return nil
         }
+        return (edgeURL, accessToken, userId, projectScope, deviceId, workspacePath)
+    }
+
+    static func run(model: AppModel) async {
+        try? FileManager.default.removeItem(at: logURL)
+        log("start")
+        guard let (edgeURL, accessToken, userId, projectScope, deviceId, workspacePath) = liveFixture() else { return }
         guard runSessionVisibility() else { return }
-        model.signInDev(edgeURL: edgeURL, userId: userId, projectScope: projectScope)
+        model.signInFixture(edgeURL: edgeURL, userId: userId, projectScope: projectScope, accessToken: accessToken)
 
         // 1. Workspace room: wait for connection + the engine's device row.
         guard let workspace = model.workspace else {

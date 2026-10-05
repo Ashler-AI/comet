@@ -230,14 +230,14 @@ final class AppModel {
                 projectScope: projectScope, tokens: tokens, devBearer: nil)
     }
 
-    /// Local development edge: bearer = "userId@projectScope".
-    func signInDev(edgeURL: URL, userId: String, projectScope: String) {
+    /// Isolated live rig using the harness's revocable scoped bearer.
+    func signInFixture(edgeURL: URL, userId: String, projectScope: String, accessToken: String) {
         edgeURLString = edgeURL.absoluteString
-        authModeRaw = AppConfig.Mode.dev.rawValue
+        authModeRaw = AppConfig.Mode.scaffold.rawValue
         storedUserId = userId
         storedProjectScope = projectScope
-        connect(url: edgeURL, mode: .dev, userId: userId, projectScope: projectScope,
-                tokens: nil, devBearer: devBearer(userId: userId, projectScope: projectScope))
+        connect(url: edgeURL, mode: .scaffold, userId: userId, projectScope: projectScope,
+                tokens: AuthTokens(accessToken: accessToken), devBearer: nil)
     }
 
     func enterDemoMode() {
