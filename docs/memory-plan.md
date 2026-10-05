@@ -696,5 +696,37 @@ full-blob allocation in isolation; that SQL was left unchanged and the temporary
 probe removed. No allocator trimming, threshold relaxation, history deletion,
 production release or active devbox restart was used to obtain the passing run.
 
+The follow-on 2026-10-05 verification exposed two remaining allocation sources.
+SQLite expands a zeroblob when a later record column contains `saved_at`; v9
+moves `bytes` to the record tail while preserving snapshot rowids, clocks,
+original recovery bytes and the processed-command ledger. The existing
+incremental-blob write and `RETURNING rowid` statement remain unchanged.
+Native allocation stacks after that migration contain no SQLite allocations
+of 1 MiB or more; they still attribute 201.6 MiB of cumulative large allocations
+to 48 LZ4 frame-buffer growth calls. LZ4's automatic selection skips its 1 MiB
+frame size, so values between 256 KiB and 1 MiB were reserving 4 MiB buffers.
+The shared compressor now selects the smallest supported frame size, retaining
+standard LZ4 frames and the existing 4 MiB maximum for larger values.
+
+The unchanged, uninstrumented System-allocator probe then passed: 24 completed
+turns, every final 300 KiB argument retained, 61,840 KiB warmup RSS, 91,808 KiB
+peak sampled RSS and 29,968 KiB (29.3 MiB) growth. Native-region inspection also
+reported 37.4 MiB swapped, so this is the observed RSS gate result, not a claim
+that every allocation remained resident. Remote Linux/macOS gates remain
+required. The 466 native/RPC library tests, 33 vendored KV tests, eight native
+peer-message tests and 196 Edge tests passed, including lossless legacy SQLite
+migration and standard LZ4 decoding at all frame-size boundaries.
+
+Current upstream workspace-discovery recovery is integrated without a crash
+counter erase gate or permanent lockout. A reversed 600-row journal converged
+across bounded replay batches, full/shallow discovery survived cold restart,
+and corrupt accepted bytes remained intact. The rebuilt real Edge/native smoke
+completed 24 turns with 1,600 history rows and 22.4 MiB headless RSS growth,
+including independent epoch reset, lost-ACK retry/dedup, owner and Edge crashes,
+owner completion, scoped upload/actor rejection, reconnect and revocation.
+Inference and Scaffold authority were local deterministic fixtures; no active
+devbox restart, paid-provider run or production deployment was performed.
+
+
 
 

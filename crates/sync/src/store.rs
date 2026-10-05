@@ -72,6 +72,17 @@ const MIGRATIONS: &[&str] = &[
         nudge_id TEXT NOT NULL,
         accepted_at INTEGER NOT NULL
      ) STRICT;",
+    // v9 — zeroblob stays compact only at the record tail, after saved_at.
+    // Keep rowids and every cache/backup byte; all callers name their columns.
+    "CREATE TABLE snapshots_blob_tail (
+        doc_id TEXT PRIMARY KEY,
+        saved_at INTEGER NOT NULL,
+        bytes BLOB NOT NULL
+     ) STRICT;
+     INSERT INTO snapshots_blob_tail (rowid, doc_id, saved_at, bytes)
+        SELECT rowid, doc_id, saved_at, bytes FROM snapshots;
+     DROP TABLE snapshots;
+     ALTER TABLE snapshots_blob_tail RENAME TO snapshots;",
 ];
 
 /// SQLite-backed store under a data directory (`{data_dir}/docs.sqlite3`).
@@ -956,5 +967,35 @@ mod tests {
         );
         assert!(store.is_processed("cmd-1").unwrap());
         assert!(!store.mark_processed("cmd-1").unwrap());
+    }
+
+    #[test]
+    fn legacy_snapshot_migration_preserves_bytes_clocks_rowids_and_command_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload: Vec<u8> = (0..11 * 4096 + 3).map(|index| index as u8).collect();
+        {
+            let conn = Connection::open(dir.path().join("docs.sqlite3")).unwrap();
+            conn.execute_batch(MIGRATIONS[0]).unwrap();
+            conn.execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL) STRICT;
+                INSERT INTO schema_migrations VALUES (1, 1);
+                INSERT INTO processed_commands VALUES ('accepted-command', 17);").unwrap();
+            conn.execute("INSERT INTO snapshots (rowid,doc_id,bytes,saved_at) VALUES (?1,?2,?3,?4)",
+                params![41,"public-room",payload.as_slice(),1234567890_i64]).unwrap();
+            conn.execute("INSERT INTO snapshots (rowid,doc_id,bytes,saved_at) VALUES (?1,?2,?3,?4)",
+                params![97,"recovery-original/room",&[] as &[u8],0]).unwrap();
+        }
+        for _ in 0..2 {
+            let store = DocsStore::open(dir.path()).unwrap();
+            assert_eq!(store.load_snapshot("public-room").unwrap(),Some(payload.clone()));
+            assert_eq!(store.load_snapshot("recovery-original/room").unwrap(),Some(Vec::new()));
+            let metadata: Vec<(String,i64,i64)> = store.conn().prepare("SELECT doc_id,rowid,saved_at FROM snapshots ORDER BY rowid")
+                .unwrap().query_map([],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap().map(Result::unwrap).collect();
+            assert_eq!(metadata,[("public-room".into(),41,1234567890),("recovery-original/room".into(),97,0)]);
+            assert!(store.is_processed("accepted-command").unwrap());
+        }
+        let store = DocsStore::open(dir.path()).unwrap();
+        store.save_snapshot("public-room",b"new checkpoint").unwrap();
+        assert_eq!(store.load_snapshot("public-room").unwrap().as_deref(),Some(&b"new checkpoint"[..]));
+        assert_eq!(store.load_snapshot("recovery-original/room").unwrap(),Some(Vec::new()));
     }
 }
