@@ -1120,7 +1120,7 @@ export class SessionRoom implements DurableObject {
     }
     // Snapshot bootstraps need an isolated candidate: import state before any
     // retained deltas to keep the lazy snapshot path and preserve both branches.
-    const candidate = new LoroDoc();
+    let candidate = new LoroDoc();
     let ownsCandidate = true;
     let previousVersion: VersionVector | undefined;
     let mergedBaseline = false;
@@ -1148,7 +1148,24 @@ export class SessionRoom implements DurableObject {
             ownsCandidate = false;
             return this.importLoroUpdates(doc, updates.filter((_, i) => i !== snapshotIndex));
           }
-          if (coverage === undefined) {
+          let preserveRetainedHistory = false;
+          if (this.retainsWorkspaceHistory() && previousVersion.length() > 0) {
+            const retainedSince = doc.shallowSinceVV();
+            const incomingSince = candidate.shallowSinceVV();
+            try {
+              const historyCoverage = incomingSince.compare(retainedSince);
+              preserveRetainedHistory = historyCoverage === undefined || historyCoverage > 0;
+            } finally { incomingSince.free(); retainedSince.free(); }
+          }
+          if (preserveRetainedHistory) {
+            // A client's shallow snapshot must not trim the workspace history
+            // that disconnected writers still need, even when its VV is newer.
+            const incoming = candidate;
+            candidate = doc.fork();
+            incoming.free();
+            replay(baseline);
+            mergedBaseline = true;
+          } else if (coverage === undefined) {
             const retainedSince = doc.shallowSinceVV();
             try {
               const retainedCoverage = candidateVersion.compare(retainedSince);

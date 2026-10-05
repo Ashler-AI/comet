@@ -682,6 +682,60 @@ describe("SessionRoom chat authorization", () => {
     }
   });
 
+  it("preserves offline session discovery after a client uploads a newer shallow snapshot", async () => {
+    const source = new LoroDoc();
+    const offline = new LoroDoc();
+    const catchup = new LoroDoc();
+    const reader = new LoroDoc();
+    let offlineBase: VersionVector | undefined;
+    try {
+      source.setPeerId("10");
+      source.getMap("devices").set("desktop", { id: "desktop", platform: "macos" });
+      source.getMap("chats").set("base", { id: "base", deviceId: "desktop" });
+      source.commit();
+      offline.import(source.export({ mode: "snapshot" }));
+      offline.setPeerId("20");
+      offlineBase = offline.oplogVersion();
+      offline.getMap("chats").set("offline", { id: "offline", deviceId: "desktop" });
+      offline.getMap("sessionRefs").set("6:user-a:offline", { chatId: "offline", userId: "user-a", addedAt: 1 });
+      offline.commit();
+      source.getMap("chats").set("server", { id: "server", deviceId: "desktop" });
+      source.commit();
+      catchup.import(source.export({ mode: "snapshot" }));
+      catchup.setPeerId("30");
+      catchup.getMap("sessionRefs").set("6:user-a:server", { chatId: "server", userId: "user-a", addedAt: 2 });
+      catchup.commit();
+
+      const sql = new MemorySql();
+      sql.meta.set("roomKind", "workspace");
+      sql.meta.set("chatId", "ws4/project-a");
+      sql.putBlob("snapshot", source.export({ mode: "snapshot" }));
+      const headers = { [ROOM_KIND_HEADER]: "workspace" };
+      expect((await makeRoom(sql).room.fetch(authedRequest("/append", "user-a", {
+        method: "POST", headers,
+        body: catchup.export({ mode: "shallow-snapshot", frontiers: catchup.frontiers() })
+      }))).status).toBe(200);
+      const restarted = makeRoom(sql).room;
+      expect((await restarted.fetch(authedRequest("/append", "user-a", {
+        method: "POST", headers, body: offline.export({ mode: "update", from: offlineBase })
+      }))).status).toBe(200);
+      source.import(catchup.export({ mode: "snapshot" }));
+      source.import(offline.export({ mode: "update", from: offlineBase }));
+      await restarted.fetch(authedRequest("/stats", "user-a", { headers }));
+      const socket = await join(makeRoom(sql).room, "user-a", "ws4/project-a");
+      for (const bytes of socket.sent) {
+        const message = decode(bytes);
+        if (message.type === MessageType.DocUpdate) {
+          for (const update of message.updates) expect(reader.import(update).pending?.size ?? 0).toBe(0);
+        }
+      }
+      expect(reader.toJSON()).toEqual(source.toJSON());
+      expect(reader.getMap("sessionRefs").get("6:user-a:offline")).toEqual({ chatId: "offline", userId: "user-a", addedAt: 1 });
+    } finally {
+      offlineBase?.free(); reader.free(); catchup.free(); offline.free(); source.free();
+    }
+  });
+
   it.each([
     ["workspace", "age"], ["workspace", "size"],
     ["legacy", "age"], ["legacy", "size"]
