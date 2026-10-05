@@ -171,6 +171,8 @@ async function verifySimulator(app) {
           await sleep(250);
         }
       }
+      // The live transport hook relaunches this app; retire completed UI fixture timers first.
+      run("xcrun", ["simctl", "terminate", simulator, bundleId], { log: "simulator.log" });
       run("node", ["scripts/headless-collaboration-smoke.mjs"], {
         timeout: 600_000, log: "live-convergence.log",
         env: { ...process.env, COMET_BIN: path.join(root, "target/debug/comet"), COMET_SYNC_SOAK_TURNS: "4",

@@ -797,3 +797,19 @@ recover operations never persisted or sent by that immutable binary. Retiring
 that writable baseline or changing the acceptance contract requires explicit
 user approval; no gate was relaxed and no compatibility success is claimed.
 
+Mobile run `37338615608` built source `5f1c314b` and again passed the 27
+simulator fixtures and both recovery surfaces. Its ordinary native recovery
+scenario reached a later real Worker process restart, whose Wrangler child
+produced no output before the unchanged readiness bound; full mobile live
+transport and archive did not execute. The completed UI fixture is now explicitly
+terminated before starting the native failure-recovery rig; the live hook still
+relaunches that exact simulator app for real transport. This removes unnecessary
+fixture timer/render work, but is not yet a claim that CI startup is resolved.
+
+An attempted prebuilt-Worker optimization preserved full 24-turn recovery but
+introduced a repeatable Miniflare proxy HTTP 500 on relay reconnect. It was
+removed, as were temporary WebSocket/body diagnostics and unproven socket guards.
+The established Worker mode then passed the complete same-version scenario,
+including reconnect and active revocation. No fallback, scenario removal,
+acceptance relocation or deadline relaxation was kept.
+
