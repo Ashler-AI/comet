@@ -29,6 +29,8 @@ enum ReleaseConfig {
 }
 
 final class AppConfig: @unchecked Sendable {
+    static let durableSyncProtocol = "durable-records-v1"
+
     enum Mode: String {
         case scaffold
         case dev
@@ -90,7 +92,8 @@ final class AppConfig: @unchecked Sendable {
     func workspaceSocketURL() async -> URL? {
         guard let token = await currentToken() else { return nil }
         var url = wsBase.appending(path: "workspace/\(projectScope)/ws")
-        url.append(queryItems: [URLQueryItem(name: "token", value: token)])
+        url.append(queryItems: [URLQueryItem(name: "token", value: token),
+                                URLQueryItem(name: "syncProtocol", value: Self.durableSyncProtocol)])
         return url
     }
 
@@ -102,7 +105,8 @@ final class AppConfig: @unchecked Sendable {
     func sessionSocketURL(chatId: String, deploymentId: String? = nil) async -> URL? {
         guard let sessionId = Self.canonicalSessionId(chatId), let token = await currentToken() else { return nil }
         var url = wsBase.appending(path: "session/\(sessionId)/ws")
-        url.append(queryItems: [URLQueryItem(name: "token", value: token)])
+        url.append(queryItems: [URLQueryItem(name: "token", value: token),
+                                URLQueryItem(name: "syncProtocol", value: Self.durableSyncProtocol)])
         // Local-controller sessions use the project/session room. A deployment
         // selects a different physical room and must come from the session's
         // Scaffold environment, never from the workspace project scope.

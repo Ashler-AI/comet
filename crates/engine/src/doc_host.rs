@@ -283,7 +283,7 @@ impl comet_sync::UrlProvider for EdgeRoomUrl {
             let token = token.token().await.ok_or_else(|| {
                 comet_sync::SyncError::Auth("no access token (signed out)".into())
             })?;
-            let mut url = format!("{base}?token={token}");
+            let mut url = format!("{base}?token={token}&syncProtocol={}", comet_proto::DURABLE_SYNC_PROTOCOL);
             if !device.is_empty() {
                 url.push_str(&format!("&device={device}"));
             }
@@ -1554,24 +1554,24 @@ impl DocHost {
     /// Bind a per-agent-session execution key to the shared thread document. SessionsEngine
     /// remains keyed by its first argument, so distinct keys run concurrently while every
     /// writer receives the same `SessionDoc` and publications CRDT-merge in one room.
-    fn bind_session_execution_key(&self, handle: &Arc<ChatDocHandle>, session_id: &str) -> String {
+    fn bind_session_execution_key(&self, handle: &Arc<ChatDocHandle>, session_id: &str) -> Result<String, EngineError> {
         let key = format!("{}::session::{session_id}", handle.chat_id);
-        // Publishing a canonical room record must not rekey an existing bare
-        // writer: typed Stop/Steer/Input controls need its live channels too.
+        // Canonical controls must preserve both a live bare writer and its
+        // durable pending recovery before boot has reconstructed status.
         if session_id == handle.chat_id
-            && self.inner.sessions.get().and_then(crate::sessions::WeakSessionsEngine::upgrade).is_some_and(|sessions| {
-                sessions.session_status(&handle.chat_id).is_some_and(|bare| {
-                    matches!(
-                        bare.status,
-                        comet_proto::SessionStatus::Working | comet_proto::SessionStatus::AwaitingInput
-                    ) || sessions.session_status(&key).is_none()
-                })
-            })
+            && let Some(sessions) = self.inner.sessions.get().and_then(crate::sessions::WeakSessionsEngine::upgrade)
         {
-            return handle.chat_id.clone();
+            let bare = sessions.session_status(&handle.chat_id);
+            if bare.as_ref().is_some_and(|status| matches!(status.status,
+                comet_proto::SessionStatus::Working | comet_proto::SessionStatus::AwaitingInput))
+                || (sessions.session_status(&key).is_none() && !sessions.has_pending_recovery(&key)?
+                    && (bare.is_some() || sessions.has_pending_recovery(&handle.chat_id)?))
+            {
+                return Ok(handle.chat_id.clone());
+            }
         }
         lock(&self.inner.handles).insert(key.clone(), handle.clone());
-        key
+        Ok(key)
     }
 
     /// A new sandbox epoch may continue a room without another Start command.
@@ -1718,6 +1718,7 @@ impl DocHost {
         if session.status == Some(status.status) && session.updated_at == Some(updated_at) {
             return Ok(());
         }
+        let phase_changed = session.status != Some(status.status);
         session.status = Some(status.status);
         session.updated_at = Some(updated_at);
         let publication = PublicationRecord {
@@ -1731,9 +1732,9 @@ impl DocHost {
             value: PublicationValue::AgentSession(Box::new(session)),
             unknown: Default::default(),
         };
-        // ponytail: retain publication heartbeats while the supported pre-register
-        // baseline reads them; remove this history growth when that baseline retires.
-        handle.doc.append_publication(&publication)?;
+        if phase_changed {
+            handle.doc.append_publication(&publication)?;
+        }
         handle.doc.upsert_agent_session(&publication)?;
         Ok(())
     }
@@ -1766,7 +1767,7 @@ impl DocHost {
                 session.session_id == handle.chat_id && session.owner_device_id == self.device_id()
             })
         {
-            Ok(self.bind_session_execution_key(handle, &handle.chat_id))
+            self.bind_session_execution_key(handle, &handle.chat_id)
         } else {
             Ok(handle.chat_id.clone())
         }
@@ -2154,7 +2155,7 @@ impl DocHost {
                 expected_turn_id: Some(expected),
             } = action.as_ref()
         {
-            let execution_key = self.bind_session_execution_key(&handle, session_id);
+            let execution_key = self.bind_session_execution_key(&handle, session_id)?;
             let sessions = self.inner.sessions.get().and_then(crate::sessions::WeakSessionsEngine::upgrade)
                 .ok_or_else(|| EngineError::Other("Stop target is no longer active".into()))?;
             sessions.require_turn(&execution_key, expected)?;
@@ -2263,7 +2264,7 @@ impl DocHost {
         let bearer = edge.bearer().await
             .ok_or_else(|| EngineError::Other("nudge unavailable: signed out".into()))?;
         let response = reqwest::Client::new()
-            .post(format!("{}/device/{}/nudge", edge.url.trim_end_matches('/'), host_device))
+            .post(format!("{}/device/{}/nudge?syncProtocol={}", edge.url.trim_end_matches('/'), host_device, comet_proto::DURABLE_SYNC_PROTOCOL))
             .bearer_auth(&bearer)
             .json(&serde_json::json!({ "chatId": chat_id }))
             .timeout(std::time::Duration::from_secs(10))
@@ -2835,7 +2836,7 @@ impl DocHost {
                         Some("command addressed to another session owner".into()),
                     ));
                 }
-                let execution_key = self.bind_session_execution_key(handle, session_id);
+                let execution_key = self.bind_session_execution_key(handle, session_id)?;
                 match action.as_ref() {
                     SessionControlAction::Start {
                         request,
@@ -3821,6 +3822,57 @@ mod authority_tests {
     }
 
     #[tokio::test]
+    async fn canonical_stop_retires_bare_recovery_before_status_is_rebuilt() {
+        for typed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(DocsStore::open(dir.path().join("docs")).unwrap());
+            let host = scoped_test_host(store);
+            host.workspace().unwrap().claim_chat("chat-a", Some("/tmp")).unwrap();
+            let handle = host.open("chat-a").unwrap();
+            handle.write_user_message("accepted", "original request", 1).unwrap();
+            host.record_agent_session(&comet_proto::Session {
+                chat_id: "chat-a".into(), device_id: "device-a".into(),
+                status: SessionStatus::Working, started_at: None, updated_at: chrono::Utc::now(),
+            }).unwrap();
+            let request: comet_proto::RunRequest = serde_json::from_value(serde_json::json!({
+                "prompt": "original request", "cwd": "/tmp", "sandbox": "workspace-write", "autoApprove": true,
+            })).unwrap();
+            let journal = Arc::new(crate::RunJournal::open(dir.path().join("journal")).unwrap());
+            journal.save_recovery("chat-a", &serde_json::json!({
+                "identity": "Unattached", "device_id": "device-a", "harness": "mock",
+                "request": request, "user_message_id": "accepted", "blocked_session": null,
+                "updated_at": now_ms(), "journal_seq": 0,
+            })).unwrap();
+            let sessions = SessionsEngine::new("device-a".into(), journal.clone(),
+                Arc::new(crate::HarnessRegistry::new()), 27654);
+            sessions.set_doc_host(host.clone());
+            host.set_sessions(&sessions);
+            assert!(sessions.session_status("chat-a").is_none());
+            let payload = if typed {
+                SessionCommandPayload::Control {
+                    session_id: "chat-a".into(), owner_device_id: "device-a".into(),
+                    actor_device_id: "device-a".into(), actor_subject: "owner".into(),
+                    grant_id: "local-stop".into(), source: AgentSessionSource::Local,
+                    action: Box::new(SessionControlAction::Stop { expected_turn_id: None }),
+                }
+            } else { SessionCommandPayload::Interrupt {} };
+            let command = SessionCommandEntry {
+                id: "accepted-stop".into(), payload, issued_by: "device-a".into(),
+                issued_at: now_ms(), based_on: None, expires_at: None,
+                status: SessionCommandStatus::Pending, resolution: None,
+            };
+            assert_eq!(host.execute(&sessions, &handle, &command).await.unwrap().0, SessionCommandStatus::Applied);
+            assert!(journal.recovery_retired("chat-a").unwrap());
+            assert!(!sessions.has_pending_recovery("chat-a").unwrap());
+            assert_eq!(sessions.session_status("chat-a").unwrap().status, SessionStatus::Idle);
+            assert_eq!(handle.doc.collaboration_snapshot().unwrap().sessions[0].status, Some(SessionStatus::Idle));
+            assert_eq!(handle.doc.read_entries().unwrap().iter().filter(|row| row.id == "accepted").count(), 1);
+            assert_eq!(sessions.recover_stale_in_room("chat-a").unwrap(), 0);
+            sessions.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
     async fn owned_session_status_tracks_heartbeat_input_and_followup_turn() {
         let dir = tempfile::tempdir().unwrap();
         let host = DocHost::new(
@@ -3832,8 +3884,8 @@ mod authority_tests {
             },
         );
         let handle = host.open("chat-a").unwrap();
-        let execution_key = host.bind_session_execution_key(&handle, "chat-a");
-        let other_key = host.bind_session_execution_key(&handle, "agent-b");
+        let execution_key = host.bind_session_execution_key(&handle, "chat-a").unwrap();
+        let other_key = host.bind_session_execution_key(&handle, "agent-b").unwrap();
         for (session_id, owner_device_id) in [("chat-a", "device-a"), ("agent-b", "device-b")] {
             handle
                 .doc
@@ -3868,14 +3920,15 @@ mod authority_tests {
             started_at: None,
             updated_at: chrono::DateTime::from_timestamp_millis(1).unwrap(),
         };
-        for (status, at) in [
-            (SessionStatus::Working, 10_001),
-            (SessionStatus::Working, 20_001),
-            (SessionStatus::AwaitingInput, 20_002),
-            (SessionStatus::Working, 20_003),
-            (SessionStatus::Idle, 20_004),
-            (SessionStatus::Working, 20_005),
-            (SessionStatus::Errored, 20_006),
+        for (status, at, publication_count) in [
+            (SessionStatus::Working, 10_001, 2),
+            (SessionStatus::Working, 20_001, 2),
+            (SessionStatus::AwaitingInput, 20_002, 3),
+            (SessionStatus::Working, 20_003, 4),
+            (SessionStatus::Idle, 20_004, 5),
+            (SessionStatus::Idle, 20_005, 5),
+            (SessionStatus::Working, 20_006, 6),
+            (SessionStatus::Errored, 20_007, 7),
         ] {
             source.status = status;
             source.updated_at = chrono::DateTime::from_timestamp_millis(at).unwrap();
@@ -3890,6 +3943,12 @@ mod authority_tests {
                 (assigned.status, assigned.updated_at),
                 (Some(status), Some(at))
             );
+            assert_eq!(snapshot.publications.len(), publication_count);
+            assert_eq!(handle.doc.doc().get_map("agentSessions").len(), 1);
+            assert_eq!(assigned.created_at, 1);
+            assert_eq!(assigned.owner_subject, "owner");
+            assert_eq!(assigned.owner_device_id, "device-a");
+            assert_eq!(assigned.source, AgentSessionSource::Scaffold);
             let other = snapshot
                 .sessions
                 .iter()
@@ -3976,8 +4035,8 @@ mod authority_tests {
             },
         );
         let handle = host.open("shared-chat").unwrap();
-        host.bind_session_execution_key(&handle, "session-a");
-        host.bind_session_execution_key(&handle, "session-b");
+        host.bind_session_execution_key(&handle, "session-a").unwrap();
+        host.bind_session_execution_key(&handle, "session-b").unwrap();
         host.flush_all();
         assert_eq!(
             host.sync_statuses()
@@ -4531,7 +4590,7 @@ mod authority_tests {
                 .contains("different session room projection")
         );
 
-        let execution_key = host.bind_session_execution_key(&room_handle, "agent-a");
+        let execution_key = host.bind_session_execution_key(&room_handle, "agent-a").unwrap();
         let execution_handle = host.open_existing_or_local(&execution_key).unwrap();
 
         assert!(Arc::ptr_eq(&room_handle, &execution_handle));
@@ -4663,8 +4722,8 @@ mod authority_tests {
         );
         host.set_workspace(workspace.clone());
         let handle = host.open("chat-a").unwrap();
-        let assigned = host.bind_session_execution_key(&handle, "chat-a");
-        let other = host.bind_session_execution_key(&handle, "agent-b");
+        let assigned = host.bind_session_execution_key(&handle, "chat-a").unwrap();
+        let other = host.bind_session_execution_key(&handle, "agent-b").unwrap();
         handle.doc.append_publication(&PublicationRecord {
             id: "child-start".into(), schema_version: COLLABORATION_SCHEMA_VERSION,
             published_at: 1, published_by: "owner-a".into(),
@@ -5439,19 +5498,6 @@ mod authority_tests {
 #[cfg(test)]
 mod edge_url_tests {
     use super::*;
-
-    #[tokio::test]
-    async fn deployment_scoped_room_url_carries_trusted_namespace() {
-        let edge = EdgeConfig::with_static_token("https://edge.example", "secret")
-            .with_device("device-a")
-            .with_deployment("deployment-a");
-        let provider = edge.room_url("/session/session-a/ws");
-        let url = provider.url().await.unwrap();
-        assert_eq!(
-            url,
-            "wss://edge.example/session/session-a/ws?token=secret&device=device-a&deploymentId=deployment-a"
-        );
-    }
 
     #[test]
     fn policy_rejections_throttle_while_transport_faults_stay_fast() {

@@ -12,6 +12,8 @@ import {
   AUTH_USER_HEADER,
   GRANT_EVENT_HEADER,
   ROOM_KIND_HEADER,
+  DURABLE_SYNC_PROTOCOL,
+  SYNC_PROTOCOL_HEADER,
   type Env
 } from "./env";
 import { canonicalSessionId, SessionRoom } from "./session-room";
@@ -148,6 +150,7 @@ interface JoinState {
   userId: string;
   projectScope: string;
   capabilities: string[];
+  durableSync?: boolean;
   rooms: string[];
   deviceId?: string;
   workspace?: boolean;
@@ -225,6 +228,7 @@ const authedRequest = (path: string, userId: string, init: RequestInit = {}): Re
   headers.set(AUTH_USER_HEADER, userId);
   headers.set(AUTH_PROJECT_HEADER, PROJECT_SCOPE);
   headers.set(AUTH_CAPABILITIES_HEADER, CAPABILITIES.join(" "));
+  if (!headers.has(SYNC_PROTOCOL_HEADER)) headers.set(SYNC_PROTOCOL_HEADER, DURABLE_SYNC_PROTOCOL);
   return new Request(`https://room.test${path}`, { ...init, headers });
 };
 
@@ -247,6 +251,7 @@ const join = async (
     userId,
     projectScope: PROJECT_SCOPE,
     capabilities: CAPABILITIES,
+    durableSync: true,
     rooms: []
   };
   socket.serializeAttachment(state);
@@ -318,6 +323,77 @@ describe("SessionRoom chat authorization", () => {
     vi.unstubAllGlobals();
     vi.useRealTimers();
   });
+
+  it.each(["", "?syncProtocol=unknown", "?syncProtocol=durable-records-v1&syncProtocol=unknown"])(
+    "keeps authenticated legacy rooms read-only despite spoofed headers (%s)", async (query) => {
+      const NativeResponse = Response;
+      vi.stubGlobal("Response", class extends NativeResponse {
+        constructor(body?: BodyInit | null, init?: ResponseInit) {
+          super(body, init?.status === 101 ? { ...init, status: 200 } : init);
+          if (init?.status === 101) Object.defineProperty(this, "status", { value: 101 });
+        }
+      });
+      vi.stubGlobal("WebSocketPair", class { 0 = new CapturingSocket(); 1 = new CapturingSocket(); });
+      const { room, sql, sockets } = makeRoom();
+      const source = new LoroDoc(); const reader = new LoroDoc();
+      const sessionId = "11111111-1111-4111-8111-111111111111";
+      const scope = "ashler-local";
+      const env = {
+        AUTH_MODE: "dev", ENVIRONMENT: "local", SCAFFOLD_PROJECT_SCOPE: scope,
+        SCAFFOLD_CONTROL_PLANE_URL: "http://127.0.0.1:8788",
+        SCAFFOLD_REQUIRED_CAPABILITIES: CAPABILITIES.join(" "),
+        SESSION_ROOMS: { idFromName: (name: string) => name, get: () => ({ fetch: (request: Request) => room.fetch(request) }) }
+      } as unknown as Env;
+      const request = (path: string, init: RequestInit = {}) => worker.fetch(new Request(`http://127.0.0.1${path}`, {
+        ...init, headers: { authorization: `Bearer alice@${scope}`, upgrade: "websocket",
+          [SYNC_PROTOCOL_HEADER]: DURABLE_SYNC_PROTOCOL }
+      }), env);
+      const send = (socket: CapturingSocket, message: ProtocolMessage) => room.webSocketMessage(
+        socket as unknown as WebSocket, Uint8Array.from(encode(message)).buffer);
+      try {
+        source.getMap("metadata").set("accepted", true); source.commit();
+        sql.putBlob("snapshot", source.export({ mode: "snapshot" }));
+        expect((await request(`/session/${sessionId}/ws${query}`)).status).toBe(101);
+        const legacy = sockets[0] as unknown as CapturingSocket;
+        await send(legacy, joinRequest(sessionId));
+        expect(legacy.sent.map((bytes) => decode(bytes))).toContainEqual(expect.objectContaining({ type: MessageType.JoinResponseOk, permission: "read" }));
+        for (const bytes of legacy.sent) {
+          const message = decode(bytes);
+          if (message.type === MessageType.DocUpdate) for (const update of message.updates) reader.import(update);
+        }
+        expect(reader.toJSON()).toEqual(source.toJSON());
+        const accepted = source.toJSON();
+        source.getMap("metadata").set("writer", true); source.commit();
+        const update = source.export({ mode: "snapshot" });
+        const envelope = { crdt: CrdtType.Loro, roomId: sessionId, batchId: "0x0000000000000001" as const };
+        legacy.sent.length = 0;
+        await send(legacy, { type: MessageType.DocUpdate, ...envelope, updates: [update] });
+        await send(legacy, { type: MessageType.DocUpdateFragmentHeader, ...envelope, fragmentCount: 1, totalSizeBytes: update.length });
+        await send(legacy, { type: MessageType.DocUpdateFragment, ...envelope, index: 0, fragment: update });
+        expect(legacy.sent.map((bytes) => decode(bytes))).toEqual(Array.from({ length: 3 }, () => expect.objectContaining({ type: MessageType.Ack, status: UpdateStatusCode.PermissionDenied })));
+        for (const path of [`/append/${sessionId}`, `/diff/${sessionId}`, `/workspace/${scope}/reset-log`]) {
+          expect((await request(path + query, { method: "POST", body: update })).status).toBe(426);
+        }
+        expect(sql.updateCount()).toBe(0);
+        expect((await (makeRoom(sql).room as unknown as SessionRoomInternals).ensureDoc()).toJSON()).toEqual(accepted);
+        expect((await request(`/session/${sessionId}/ws?syncProtocol=${DURABLE_SYNC_PROTOCOL}`)).status).toBe(101);
+        const writer = sockets[1] as unknown as CapturingSocket;
+        await send(writer, joinRequest(sessionId));
+        expect(writer.sent.map((bytes) => decode(bytes))).toContainEqual(expect.objectContaining({ type: MessageType.JoinResponseOk, permission: "write" }));
+        writer.sent.length = 0;
+        await send(writer, { type: MessageType.DocUpdate, ...envelope, updates: [update] });
+        expect(writer.sent.map((bytes) => decode(bytes))).toContainEqual(expect.objectContaining({ type: MessageType.Ack, status: UpdateStatusCode.Ok }));
+        expect((await (makeRoom(sql).room as unknown as SessionRoomInternals).ensureDoc()).toJSON()).toEqual(source.toJSON());
+        // Pre-rollout attachments retain capabilities/membership, not write permission.
+        const state = writer.deserializeAttachment() as JoinState;
+        delete state.durableSync; writer.serializeAttachment(state); writer.sent.length = 0;
+        source.getMap("metadata").set("staleSocket", true); source.commit();
+        await send(writer, { type: MessageType.DocUpdate, ...envelope, updates: [source.export({ mode: "snapshot" })] });
+        expect(writer.sent.map((bytes) => decode(bytes))).toContainEqual(expect.objectContaining({ type: MessageType.Ack, status: UpdateStatusCode.PermissionDenied }));
+        expect((await (room as unknown as SessionRoomInternals).ensureDoc()).toJSON()).not.toEqual(source.toJSON());
+      } finally { source.free(); reader.free(); }
+    }
+  );
 
   it.each(["delta", "snapshot"] as const)("reconciles legacy re-appended accepted messages on the raw %s receiver boundary", async (mode) => {
     const source = new LoroDoc(); const publisher = new LoroDoc(); const observer = new LoroDoc();
@@ -817,7 +893,7 @@ describe("SessionRoom chat authorization", () => {
         routed.push(id); return new Response(null, { status: 204 });
       } }) }
     } as unknown as Env;
-    const request = () => worker.fetch(new Request(`https://edge.test/peer/${sessionId}/ws`, {
+    const request = () => worker.fetch(new Request(`https://edge.test/peer/${sessionId}/ws?syncProtocol=${DURABLE_SYNC_PROTOCOL}`, {
       headers: { authorization: `Bearer cs1.${grant.grantId}.${"a".repeat(64)}`, upgrade: "websocket" }
     }), env);
     expect((await request()).status).toBe(404);
@@ -861,7 +937,7 @@ describe("SessionRoom chat authorization", () => {
         get: () => ({ fetch: (request: Request) => workspaceRoom.room.fetch(request) })
       }
     } as unknown as Env;
-    const request = (path: string, method = "GET") => worker.fetch(new Request(`https://edge.test${path}`, {
+    const request = (path: string, method = "GET") => worker.fetch(new Request(`https://edge.test${path}${path.includes("?") ? "&" : "?"}syncProtocol=${DURABLE_SYNC_PROTOCOL}`, {
       method,
       headers: { authorization: `Bearer cs1.${grant.grantId}.${"a".repeat(64)}`, upgrade: "websocket" }
     }), env);
@@ -1499,7 +1575,7 @@ describe("SessionRoom chat authorization", () => {
       sql.appendUpdate(delta);
       const { room } = makeRoom(sql);
       const socket = new CapturingSocket();
-      const state: JoinState = { userId: "user-a", projectScope: PROJECT_SCOPE, capabilities: CAPABILITIES, rooms: [] };
+      const state: JoinState = { userId: "user-a", projectScope: PROJECT_SCOPE, capabilities: CAPABILITIES, durableSync: true, rooms: [] };
       socket.serializeAttachment(state);
       const internals = room as unknown as SessionRoomInternals;
       await internals.handleJoin(socket as unknown as WebSocket, state, joinRequest("bootstrap-chat"));
@@ -1672,6 +1748,7 @@ describe("SessionRoom chat authorization", () => {
       userId: "user-a",
       projectScope: PROJECT_SCOPE,
       capabilities: CAPABILITIES,
+      durableSync: true,
       rooms: [CrdtType.Loro],
       workspace: true,
       deviceId
@@ -1947,6 +2024,7 @@ describe("SessionRoom chat authorization", () => {
         userId: "user-a",
         projectScope: PROJECT_SCOPE,
         capabilities: CAPABILITIES,
+        durableSync: true,
         rooms: [],
         grantId: "grant-1",
         grantExpiresAt: Date.now() + 600_000

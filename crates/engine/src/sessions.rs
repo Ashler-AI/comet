@@ -855,6 +855,18 @@ impl SessionsEngine {
         Ok(())
     }
 
+    pub(crate) fn has_pending_recovery(&self, chat_id: &str) -> Result<bool, EngineError> {
+        if self.inner.journal.recovery_retired(chat_id)? { return Ok(false); }
+        let Some(pending) = self.inner.journal.read_recovery::<PendingRun>(chat_id)? else { return Ok(false); };
+        if self.inner.auth.get().is_none() && pending.identity != RunAuthIdentity::Unattached {
+            return Ok(false);
+        }
+        if pending.identity != self.auth_identity() || pending.device_id != self.inner.device_id || pending.request.cwd.is_empty() {
+            return Err(EngineError::Other("session_recovery_binding_mismatch".into()));
+        }
+        Ok(true)
+    }
+
     fn pending_run(&self, chat_id: &str) -> Result<Option<PendingRun>, EngineError> {
         if self.inner.journal.recovery_retired(chat_id)? {
             return Ok(None);
@@ -1090,7 +1102,7 @@ impl SessionsEngine {
             ExistingRunDecision::Replace { run_id } => {
                 // Mailbox closed, non-steering harness, or route mismatch:
                 // settle the old run before issuing any replacement.
-                self.interrupt(chat_id).await?;
+                self.interrupt_live_turn(chat_id, None).await?;
                 // `interrupt` is intentionally bounded for ordinary callers;
                 // route replacement must also await local relay removal, which
                 // happens before the handle disappears.
@@ -1485,6 +1497,48 @@ impl SessionsEngine {
         chat_id: &str,
         expected: Option<&str>,
     ) -> Result<bool, EngineError> {
+        let dispatch_lock = self.dispatch_lock(chat_id);
+        let _dispatch_guard = dispatch_lock.lock().await;
+        let pending = {
+            let runs = lock(&self.inner.runs);
+            if let Some(expected) = expected {
+                self.require_turn(chat_id, expected)?;
+                if !runs.contains_key(chat_id) {
+                    return Err(EngineError::Other("Stop target is no longer active".into()));
+                }
+            }
+            // Validate the durable owner binding before retiring its request.
+            // The runs lock also fences SessionStarted recovery-record updates.
+            let pending = self.pending_run(chat_id)?.is_some();
+            if pending {
+                self.inner.journal.retire_recovery(chat_id)?;
+            }
+            pending
+        };
+        let interrupted = self.interrupt_live_turn(chat_id, expected).await?;
+        if pending && !interrupted {
+            // A queued recovery has no live cancellation channel yet. Keep the
+            // stop durable even if the process dies before its room mirror.
+            self.inner.publish(chat_id, &AgentEvent::Done {
+                status: DoneStatus::Interrupted, result: None,
+                error: Some("Run interrupted before Crew recovery resumed".into()),
+                session_id: None,
+            });
+            self.set_status(chat_id, SessionStatus::Idle, false);
+        }
+        if pending {
+            self.inner.set_recovery(chat_id, "idle", None);
+        }
+        Ok(interrupted || pending)
+    }
+
+    /// Cancel only an existing run. Internal replacement/shutdown callers may
+    /// already own dispatch admission and must not retire the next request.
+    async fn interrupt_live_turn(
+        &self,
+        chat_id: &str,
+        expected: Option<&str>,
+    ) -> Result<bool, EngineError> {
         let target = {
             let runs = lock(&self.inner.runs);
             let statuses = lock(&self.inner.statuses);
@@ -1566,7 +1620,7 @@ impl SessionsEngine {
             .map(|(chat_id, handle)| (chat_id.clone(), handle.run_id.clone()))
             .collect::<Vec<_>>();
         let interrupted =
-            futures::future::join_all(runs.iter().map(|(chat_id, _)| self.interrupt(chat_id)))
+            futures::future::join_all(runs.iter().map(|(chat_id, _)| self.interrupt_live_turn(chat_id, None)))
                 .await;
         for ((chat_id, _), result) in runs.iter().zip(interrupted) {
             if let Err(error) = result {
@@ -1638,6 +1692,8 @@ impl SessionsEngine {
         }
         let mut recovered = 0;
         for chat_id in chats {
+            let dispatch_lock = self.dispatch_lock(&chat_id);
+            let Ok(_dispatch_guard) = dispatch_lock.try_lock() else { continue; };
             if lock(&self.inner.runs).contains_key(&chat_id) {
                 continue;
             }
@@ -1978,7 +2034,7 @@ impl SessionsEngine {
                     "replacement inference route expired before making progress"
                 );
                 self.inner.mark_run_tearing_down(chat_id, &run_id);
-                if let Err(error) = self.interrupt(chat_id).await {
+                if let Err(error) = self.interrupt_live_turn(chat_id, None).await {
                     tracing::error!(chat = %chat_id, %error, "failed replacement run teardown failed");
                 }
                 return;
@@ -1997,7 +2053,7 @@ impl SessionsEngine {
             "restarting run after local inference route expired"
         );
         self.inner.mark_run_tearing_down(chat_id, &run_id);
-        if let Err(error) = self.interrupt(chat_id).await {
+        if let Err(error) = self.interrupt_live_turn(chat_id, None).await {
             tracing::error!(chat = %chat_id, %error, "expired-route run teardown failed");
             return;
         }
@@ -2038,7 +2094,7 @@ impl SessionsEngine {
         }
         let _admission = self.inner.admission.write().await;
         let chats: Vec<String> = lock(&self.inner.runs).keys().cloned().collect();
-        futures::future::join_all(chats.iter().map(|chat_id| self.interrupt(chat_id))).await;
+        futures::future::join_all(chats.iter().map(|chat_id| self.interrupt_live_turn(chat_id, None))).await;
         drop(_admission);
         loop {
             let tasks = std::mem::take(&mut *lock(&self.inner.run_tasks));
@@ -3432,12 +3488,15 @@ mod tests {
             .unwrap()
         };
         let old = identity();
+        sessions.save_pending("chat", HarnessId::Mock, &test_request("newer turn", None), "newer-user", None).unwrap();
         sessions.require_turn("chat", &old).unwrap();
         sessions.set_status("chat", SessionStatus::Working, true);
         assert!(sessions.require_turn("chat", &old).is_err());
         assert!(sessions.interrupt_turn("chat", Some(&old)).await.is_err());
         assert!(!token.is_cancelled());
         assert!(!*cancel_rx.borrow());
+        assert!(!sessions.inner.journal.recovery_retired("chat").unwrap(),
+            "a stale turn stop must not retire the newer request");
         let current = identity();
         sessions.set_status("chat", SessionStatus::AwaitingInput, false);
         sessions.require_turn("chat", &current).unwrap();
@@ -3455,11 +3514,60 @@ mod tests {
         );
         assert!(token.is_cancelled());
         assert!(*cancel_rx.borrow());
+        assert!(sessions.inner.journal.recovery_retired("chat").unwrap());
         sessions.set_status("chat", SessionStatus::Idle, false);
         assert!(sessions.require_turn("chat", &current).is_err());
         assert!(sessions.require_turn("chat", "invalid").is_err());
         assert!(!sessions.interrupt("chat").await.unwrap());
     }
+
+    #[tokio::test]
+    async fn stop_retires_pending_recovery_before_queued_resume_can_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let registry = Arc::new(HarnessRegistry::new());
+        registry.register(Arc::new(TakeoverHarness {
+            runs: runs.clone(), requests: requests.clone(),
+            stops: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            fail_cleanup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }));
+        let sessions = SessionsEngine::new("test-device".into(),
+            Arc::new(RunJournal::open(dir.path().join("journal")).unwrap()), registry, 27654);
+        let host = DocHost::new(Arc::new(DocsStore::open(dir.path().join("docs")).unwrap()),
+            DocHostConfig { device_id: "test-device".into(), default_harness: HarnessId::Omp, edge: None });
+        let handle = host.open("recovering-chat").unwrap();
+        handle.write_user_message("original-user", "original request", 1).unwrap();
+        sessions.set_doc_host(host);
+        sessions.save_pending("recovering-chat", HarnessId::Omp,
+            &test_request("original request", None), "original-user", None).unwrap();
+        sessions.inner.journal.append("recovering-chat", &AgentEvent::TextDelta { text: "saved output".into() }).unwrap();
+        // Current-thread scheduling makes the real recovery task wait until the
+        // external stop has acquired admission; no timing delay or fake resume.
+        assert_eq!(sessions.recover_stale_in_room("recovering-chat").unwrap(), 1);
+        sessions.save_pending("unrelated-chat", HarnessId::Omp,
+            &test_request("unrelated request", None), "unrelated-user", None).unwrap();
+        let unrelated = serde_json::to_value(sessions.pending_run("unrelated-chat").unwrap()).unwrap();
+        assert!(sessions.interrupt("recovering-chat").await.unwrap());
+        assert!(sessions.inner.journal.recovery_retired("recovering-chat").unwrap());
+        assert!(sessions.pending_run("recovering-chat").unwrap().is_none());
+        let tasks = std::mem::take(&mut *lock(&sessions.inner.run_tasks));
+        for task in tasks { task.await.unwrap(); }
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1,
+            "the retired original request must never reach the harness");
+        assert!(lock(&requests).is_empty());
+        assert_eq!(sessions.session_status("recovering-chat").unwrap().status, SessionStatus::Idle);
+        assert_eq!(serde_json::to_value(sessions.pending_run("unrelated-chat").unwrap()).unwrap(), unrelated);
+        assert_eq!(handle.doc().read_entries().unwrap().iter().filter(|row| row.id == "original-user").count(), 1);
+        assert!(sessions.inner.journal.replay("recovering-chat", 0).unwrap().iter().any(|(_, event)|
+            matches!(event, AgentEvent::TextDelta { text } if text == "saved output")));
+        let terminal = sessions.session_status("recovering-chat").unwrap();
+        assert!(!sessions.interrupt("recovering-chat").await.unwrap());
+        assert_eq!(sessions.session_status("recovering-chat").unwrap().updated_at, terminal.updated_at);
+        assert_eq!(sessions.recover_stale_in_room("recovering-chat").unwrap(), 0);
+        sessions.shutdown().await;
+    }
+
 
     fn test_request(prompt: &str, resume: Option<&str>) -> RunRequest {
         RunRequest {

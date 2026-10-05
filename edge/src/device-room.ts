@@ -23,6 +23,9 @@ import {
   AUTH_USER_HEADER,
   DEVICE_HOST_AUTH_HEADER,
   GRANT_EVENT_HEADER,
+  DURABLE_SYNC_PROTOCOL,
+  SYNC_PROTOCOL_HEADER,
+  CREW_UPDATE_REQUIRED,
   type Env
 } from "./env";
 
@@ -153,6 +156,7 @@ interface SocketState {
   userId: string;
   projectScope: string;
   capabilities: string[];
+  durableSync?: boolean;
   role: "host" | "client";
   connId: string;
   grant?: TrustedDeviceGrant;
@@ -310,7 +314,10 @@ export class DeviceRoom implements DurableObject {
   private liveHost(exclude?: WebSocket): WebSocket | undefined {
     return pickLiveHost(
       this.ctx.getWebSockets(HOST_TAG)
-        .filter((ws) => !(ws.deserializeAttachment() as SocketState | null)?.superseded)
+        .filter((ws) => {
+          const state = ws.deserializeAttachment() as SocketState | null;
+          return state?.durableSync === true && !state.superseded;
+        })
         .map((ws) => ({
         ws,
         // Auto-pongs are stamped even while hibernating; `joinedAt` covers the
@@ -333,7 +340,7 @@ export class DeviceRoom implements DurableObject {
     let latest: { ws: WebSocket; joinedAt: number } | undefined;
     for (const ws of this.ctx.getWebSockets(clientTag(connId))) {
       const state = ws.deserializeAttachment() as SocketState | null;
-      if (state?.role !== "client" || state.superseded) continue;
+      if (state?.role !== "client" || state.durableSync !== true || state.superseded) continue;
       const joinedAt = state.joinedAt ?? 0;
       if (!latest || joinedAt > latest.joinedAt) latest = { ws, joinedAt };
     }
@@ -355,6 +362,10 @@ export class DeviceRoom implements DurableObject {
 
   private async authorizeHost(ws: WebSocket): Promise<boolean> {
     const state = ws.deserializeAttachment() as SocketState | null;
+    if (state?.durableSync !== true) {
+      ws.close(4406, CREW_UPDATE_REQUIRED);
+      return false;
+    }
     return enforceDeviceHostGrantAuthority(ws, state, Date.now(), async (grantId) => {
       if (this.revokedGrants.has(grantId)) return false;
       const stub = this.env.AUTH_GRANTS.get(this.env.AUTH_GRANTS.idFromName(grantId));
@@ -426,8 +437,7 @@ export class DeviceRoom implements DurableObject {
       return new Response("forbidden", { status: 403 });
     }
     const boundScope = this.getMeta("projectScope");
-    if (!boundScope) this.setMeta("projectScope", projectScope);
-    else if (boundScope !== projectScope) return new Response("forbidden", { status: 403 });
+    if (boundScope && boundScope !== projectScope) return new Response("forbidden", { status: 403 });
     const encodedGrant = request.headers.get(AUTH_GRANT_HEADER);
     const grant = parseTrustedDeviceGrant(encodedGrant, userId, projectScope, Date.now());
     if (encodedGrant && !grant) return new Response("invalid grant", { status: 403 });
@@ -445,6 +455,7 @@ export class DeviceRoom implements DurableObject {
       }
     }
     const owner = this.getMeta("owner");
+    const durableSync = request.headers.get(SYNC_PROTOCOL_HEADER) === DURABLE_SYNC_PROTOCOL;
 
     if (url.pathname === "/ws") {
       const requestedPeerSessionId = url.searchParams.get("peerSessionId");
@@ -468,8 +479,7 @@ export class DeviceRoom implements DurableObject {
           return new Response("forbidden", { status: 403 });
         }
         const boundDevice = this.getMeta("targetDeviceId");
-        if (!boundDevice) this.setMeta("targetDeviceId", grant.targetDeviceId);
-        else if (boundDevice !== grant.targetDeviceId) {
+        if (boundDevice && boundDevice !== grant.targetDeviceId) {
           return new Response("forbidden", { status: 403 });
         }
       }
@@ -484,10 +494,8 @@ export class DeviceRoom implements DurableObject {
           const current = this.liveHost()?.deserializeAttachment() as SocketState | null | undefined;
           const principal = this.getMeta("localOwnerUserId") ?? current?.userId;
           if (principal && principal !== userId) return new Response("forbidden", { status: 403 });
-          this.setMeta("localOwnerUserId", userId);
         }
-        if (!owner) this.setMeta("owner", projectScope);
-        else if (owner !== projectScope) return new Response("forbidden", { status: 403 });
+        if (owner && owner !== projectScope) return new Response("forbidden", { status: 403 });
       } else if (!owner || owner !== projectScope) {
         return new Response("forbidden", { status: 403 });
       }
@@ -501,6 +509,15 @@ export class DeviceRoom implements DurableObject {
         !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(controlSessionId))) {
         return new Response("forbidden", { status: 403 });
       }
+      if (!durableSync) {
+        return json({ error: "crew_update_required", message: CREW_UPDATE_REQUIRED }, 426);
+      }
+      if (!boundScope) this.setMeta("projectScope", projectScope);
+      if (role === "host") {
+        if (grant && !this.getMeta("targetDeviceId")) this.setMeta("targetDeviceId", grant.targetDeviceId);
+        if (hostAuthorization === "local") this.setMeta("localOwnerUserId", userId);
+        if (!owner) this.setMeta("owner", projectScope);
+      }
       const staleClients =
         role === "client" ? this.ctx.getWebSockets(clientTag(connId)) : [];
       const pair = new WebSocketPair();
@@ -513,6 +530,7 @@ export class DeviceRoom implements DurableObject {
         userId,
         projectScope,
         capabilities,
+        durableSync: true,
         role,
         connId,
         joinedAt: Date.now(),
@@ -571,6 +589,7 @@ export class DeviceRoom implements DurableObject {
         ) {
           return json({ error: "forbidden" }, 403);
         }
+        if (!durableSync) return json({ error: "crew_update_required", message: CREW_UPDATE_REQUIRED }, 426);
         putJsonBlob(this.blobs, `sidecar:${name}`, await request.json());
         return json({ ok: true });
       }
@@ -599,6 +618,7 @@ export class DeviceRoom implements DurableObject {
       ) {
         return json({ error: "forbidden" }, owner ? 403 : 404);
       }
+      if (!durableSync) return json({ error: "crew_update_required", message: CREW_UPDATE_REQUIRED }, 426);
       const body = (await request.json().catch(() => null)) as { chatId?: string } | null;
       const chatId = body?.chatId;
       if (typeof chatId !== "string" || !CHAT_ID_RE.test(chatId)) return json({ error: "bad_chat_id" }, 400);
@@ -664,6 +684,10 @@ export class DeviceRoom implements DurableObject {
     const state = ws.deserializeAttachment() as SocketState | null;
     if (!state) {
       ws.close(1008, "Missing socket authority");
+      return;
+    }
+    if (state.durableSync !== true) {
+      ws.close(4406, CREW_UPDATE_REQUIRED);
       return;
     }
     if (state.role === "client" && !(await this.authorizePeerClient(ws, state))) return;
@@ -786,7 +810,7 @@ export class DeviceRoom implements DurableObject {
 
   async webSocketClose(ws: WebSocket): Promise<void> {
     const state = ws.deserializeAttachment() as SocketState | null;
-    if (!state) return;
+    if (!state || state.durableSync !== true) return;
     if (state.superseded) return;
     if (state.role === "client") {
       // Tell the host so it can tear down any per-client streams (ptys etc.).

@@ -35,25 +35,31 @@ outcomes without consuming pending-command capacity. Offline workspace goals
 project before a network join. A trusted room reset retires only the previous
 frontier, not the pending journal.
 
-The release gates cover paced large-tool memory, failure recovery, both supported
-mixed-native directions and a real simulator/native/Edge transport path. Native
-publication heartbeats remain while the pre-register baseline is supported;
-that compatibility history can be removed when the baseline retires.
+Writable sync and relay clients must declare `syncProtocol=durable-records-v1`.
+Crew 0.1.135 is retired for writes: legacy room clients retain authenticated
+read-only backfill, while host/control registration and durable writes require
+an update. The declaration negotiates compatibility, never authentication.
+Owner heartbeats use the bounded `agentSessions` register; immutable phase
+anchors remain. Release gates cover real legacy-write rejection, current-client
+crash recovery, quiet-owner freshness and simulator/native/Edge transport.
 
-Local checks: 468 native/RPC library tests, 33 vendored KV tests, eight native
-peer-message tests and 199 Edge tests passed. The unchanged 24-turn, 300 KiB
-progressive-tool probe passed at 29.3 MiB RSS growth against 128 MiB. The lossless
+Current cutover checks: 468 native/RPC library tests, 26 native integration tests
+and eight relay integration tests passed, with existing external/paid-provider
+tests explicitly ignored. All 206 Edge tests passed. The unchanged 24-turn,
+300 KiB progressive-tool probe passed at 52.7 MiB RSS growth against 128 MiB.
 SQLite layout migration avoids full-blob temporaries; standard LZ4 frame sizing
-bounds compression scratch. The merged 0.1.141 headless binary completed the
+bounds compression scratch. The rebuilt 0.1.141 headless binary completed the
 full 24-turn convergence scenario, preserving 1,600 history rows through crash
-and independent epoch replacement, with 22.4 MiB RSS growth. The rebuilt headed
-demo accepted a new mock turn and rendered its complete reply. Remote memory
+and independent epoch replacement, with 9.6 MiB RSS growth. Accepted Stop also
+retires queued recovery so no resumed run can start after its acknowledgment.
+The rebuilt headed demo accepted a new mock turn and rendered its complete reply. Remote memory
 gates passed on Linux and macOS; the simulator passed all 27 recovery fixtures.
 Real simulator/native/Edge transport and the complete staging simulator/archive
 gate passed in [mobile run 37373585650](https://github.com/Ashler-AI/comet/actions/runs/37373585650)
 from `70e90dc1`. Archive signing is ad-hoc, not Apple distribution; no new
-TestFlight upload or staging/production release is claimed. Supported 0.1.135
-mixed-version crash recovery still blocks release.
+TestFlight upload or staging/production release is claimed for that earlier
+candidate. The owner has authorized the updated-client cutover and staging
+rollout; final release gates and a safe devbox checkpoint precede activation.
 Local typechecks are intentionally skipped to preserve workstation resources.
 ## Crew Staging mobile 1.0 (29)
 

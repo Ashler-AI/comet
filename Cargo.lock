@@ -1292,6 +1292,7 @@ name = "comet-sync"
 version = "0.1.140"
 dependencies = [
  "comet-doc",
+ "comet-proto",
  "futures",
  "loro",
  "loro-protocol",

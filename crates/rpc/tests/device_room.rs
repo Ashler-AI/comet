@@ -142,6 +142,7 @@ async fn handle_socket(stream: tokio::net::TcpStream, state: Arc<Mutex<RelayStat
         .filter_map(|kv| kv.split_once('='))
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
+    assert_eq!(query.get("syncProtocol").map(String::as_str), Some(comet_proto::DURABLE_SYNC_PROTOCOL));
     let is_host = query.get("role").map(String::as_str) == Some("host");
     let conn_id = query
         .get("connId")

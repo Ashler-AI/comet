@@ -54,6 +54,9 @@ import {
   ROOM_KIND_HEADER,
   SESSION_OWNER_AUTH_HEADER,
   NOTIFICATION_BEARER_HEADER,
+  DURABLE_SYNC_PROTOCOL,
+  SYNC_PROTOCOL_HEADER,
+  CREW_UPDATE_REQUIRED,
   type Env
 } from "./env";
 import { parseTrustedDeviceGrant } from "./device-room";
@@ -259,6 +262,8 @@ interface SocketState extends SocketGrantState {
   userId: string;
   projectScope: string;
   capabilities: string[];
+  /** Missing on pre-rollout attachments: those sockets are durable-read-only. */
+  durableSync?: boolean;
   /** Joined sub-rooms by crdt magic ("%LOR", "%EPH"). */
   rooms: string[];
   /** True for sockets on a project-workspace document. */
@@ -394,14 +399,15 @@ export class SessionRoom implements DurableObject {
         this.getMeta("ownerUserId") === candidateUserId;
       if (!ownsSession) return json({ ownsSession: false });
       // Old attribution-only metadata has no proof of owner authority.
-      let deviceId = this.getMeta("hostDeviceOwnerUserId") === candidateUserId
+      let deviceId = this.getMeta("hostDeviceOwnerUserId") === candidateUserId &&
+        this.getMeta("hostDeviceSyncProtocol") === DURABLE_SYNC_PROTOCOL
         ? this.getMeta("hostDeviceId") : undefined;
       if (!deviceId) {
         const liveDevices = new Set(
           this.ctx.getWebSockets()
             .map((socket) => socket.deserializeAttachment() as SocketState | null)
             .filter((state) => state?.userId === candidateUserId && state.projectScope === candidateProjectScope &&
-              !state.grantId && !state.workspace && canPublish(state.capabilities))
+              !state.grantId && !state.workspace && state.durableSync === true && canPublish(state.capabilities))
             .map((state) => state?.deviceId)
             .filter((value): value is string => typeof value === "string" && GRANT_ID_RE.test(value))
         );
@@ -410,6 +416,7 @@ export class SessionRoom implements DurableObject {
           if (deviceId) {
             this.setMeta("hostDeviceId", deviceId);
             this.setMeta("hostDeviceOwnerUserId", candidateUserId);
+            this.setMeta("hostDeviceSyncProtocol", DURABLE_SYNC_PROTOCOL);
           }
         }
       }
@@ -423,8 +430,16 @@ export class SessionRoom implements DurableObject {
       return new Response("forbidden", { status: 403 });
     }
     const boundScope = this.getMeta("projectScope");
+    if (boundScope && boundScope !== projectScope) return new Response("forbidden", { status: 403 });
+    const durableSync = request.headers.get(SYNC_PROTOCOL_HEADER) === DURABLE_SYNC_PROTOCOL;
+    const writeCapability = request.method === "POST"
+      ? url.pathname === "/append" ? "session.chat"
+        : url.pathname === "/reset-log" ? "session.control"
+        : url.pathname === "/diff" ? "session.files" : undefined
+      : undefined;
+    if (writeCapability && !capabilities.includes(writeCapability)) return json({ error: "forbidden" }, 403);
+    if (writeCapability && !durableSync) return json({ error: "crew_update_required", message: CREW_UPDATE_REQUIRED }, 426);
     if (!boundScope) this.setMeta("projectScope", projectScope);
-    else if (boundScope !== projectScope) return new Response("forbidden", { status: 403 });
     // Workspace routing was scope-checked by the Worker; this DO independently
     // binds the same verified project scope above.
     const workspace = request.headers.get(ROOM_KIND_HEADER) === "workspace";
@@ -470,11 +485,13 @@ export class SessionRoom implements DurableObject {
       if (!currentOwnerUserId && ownerUserId) this.setMeta("ownerUserId", ownerUserId);
       if (chatId && !this.getMeta("chatId")) this.setMeta("chatId", chatId);
       const deviceId = url.searchParams.get("device") ?? undefined;
-      if (!workspace && !grant && userId === ownerUserId && canPublish(capabilities) &&
+      if (durableSync && !workspace && !grant && userId === ownerUserId && canPublish(capabilities) &&
           deviceId && GRANT_ID_RE.test(deviceId) &&
-          (!this.getMeta("hostDeviceId") || this.getMeta("hostDeviceOwnerUserId") !== ownerUserId)) {
+          (!this.getMeta("hostDeviceId") || this.getMeta("hostDeviceOwnerUserId") !== ownerUserId ||
+            this.getMeta("hostDeviceSyncProtocol") !== DURABLE_SYNC_PROTOCOL)) {
         this.setMeta("hostDeviceId", deviceId);
         this.setMeta("hostDeviceOwnerUserId", userId);
+        this.setMeta("hostDeviceSyncProtocol", DURABLE_SYNC_PROTOCOL);
       }
       const pair = new WebSocketPair();
       this.ctx.acceptWebSocket(pair[1]);
@@ -482,6 +499,7 @@ export class SessionRoom implements DurableObject {
         userId,
         projectScope,
         capabilities,
+        durableSync,
         rooms: [],
         ...(workspace ? { workspace } : {}),
         ...(deviceId ? { deviceId } : {}),
@@ -881,7 +899,7 @@ export class SessionRoom implements DurableObject {
         this.assertLoroMaterialized(doc, this.docPendingEnds);
       } catch {
         state.rooms = state.rooms.filter((room) => room !== CrdtType.Loro);
-        state.loroRecoveryRoomId = canPublish(state.capabilities) ? message.roomId : undefined;
+        state.loroRecoveryRoomId = state.durableSync === true && canPublish(state.capabilities) ? message.roomId : undefined;
         ws.serializeAttachment(state);
         this.send(ws, {
           type: MessageType.JoinError,
@@ -906,7 +924,7 @@ export class SessionRoom implements DurableObject {
           type: MessageType.JoinResponseOk,
           crdt: message.crdt,
           roomId: message.roomId,
-          permission: canPublish(state.capabilities) ? "write" : "read",
+          permission: state.durableSync === true && canPublish(state.capabilities) ? "write" : "read",
           version: vv.encode()
         });
       } finally {
@@ -1021,7 +1039,7 @@ export class SessionRoom implements DurableObject {
   ): Promise<void> {
     if (
       crdt === CrdtType.Loro &&
-      !canPublish(state.capabilities)
+      (state.durableSync !== true || !canPublish(state.capabilities))
     ) {
       this.ack(ws, { crdt, roomId }, UpdateStatusCode.PermissionDenied, batchId);
       return;
@@ -1530,6 +1548,10 @@ export class SessionRoom implements DurableObject {
     state: SocketState,
     message: DocUpdateFragmentHeader
   ): void {
+    if (message.crdt === CrdtType.Loro && (state.durableSync !== true || !canPublish(state.capabilities))) {
+      this.ack(ws, message, UpdateStatusCode.PermissionDenied, message.batchId);
+      return;
+    }
     if (!state.rooms.includes(message.crdt) && !(message.crdt === CrdtType.Loro && state.loroRecoveryRoomId === message.roomId)) {
       this.ack(ws, message, UpdateStatusCode.PermissionDenied, message.batchId);
       return;
@@ -1581,6 +1603,11 @@ export class SessionRoom implements DurableObject {
     state: SocketState,
     message: { crdt: CrdtType; roomId: string; batchId: `0x${string}`; index: number; fragment: Uint8Array }
   ): Promise<void> {
+    if (message.crdt === CrdtType.Loro && (state.durableSync !== true || !canPublish(state.capabilities))) {
+      this.fragments.get(ws)?.delete(message.batchId);
+      this.ack(ws, message, UpdateStatusCode.PermissionDenied, message.batchId);
+      return;
+    }
     const batch = this.fragments.get(ws)?.get(message.batchId);
     if (!batch || batch.expiresAt <= Date.now()) {
       this.fragments.get(ws)?.delete(message.batchId);

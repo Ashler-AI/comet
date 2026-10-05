@@ -132,37 +132,14 @@ jobs:
           COMET_BIN: ${{ github.workspace }}/target/debug/comet
           COMET_SYNC_SOAK_TURNS: "24"
         run: node scripts/headless-collaboration-smoke.mjs 2>&1 | tee native-evidence/sync-reliability.log
-      - name: Check out supported native baseline
-        if: runner.os == 'Linux'
-        uses: actions/checkout@v4
-        with:
-          ref: aa3c9e7dbb97dbfb68a4f53a1af20b3a029dee02
-          path: native-baseline
-          persist-credentials: false
-      - name: Build supported native baseline
-        if: runner.os == 'Linux'
-        working-directory: native-baseline
-        env:
-          CARGO_TARGET_DIR: ${{ github.workspace }}/target-baseline
-        run: |
-          git rev-parse HEAD | tee ../native-evidence/baseline-source-sha.txt
-          cargo build --locked -p comet --bin comet
-      - name: Exercise supported mixed-native convergence
-        if: runner.os == 'Linux'
-        env:
-          COMET_BIN: ${{ github.workspace }}/target/debug/comet
-          COMET_BASELINE_BIN: ${{ github.workspace }}/target-baseline/debug/comet
-          COMET_SYNC_SOAK_TURNS: "4"
-        run: node scripts/headless-collaboration-smoke.mjs 2>&1 | tee native-evidence/mixed-version-sync.log
-      - name: Exercise supported old observer with a quiet new owner
+      - name: Exercise durable owner register freshness
         if: runner.os == 'Linux'
         timeout-minutes: 10
         env:
           COMET_BIN: ${{ github.workspace }}/target/debug/comet
-          COMET_BASELINE_BIN: ${{ github.workspace }}/target-baseline/debug/comet
-          COMET_BASELINE_OBSERVER: "1"
+          COMET_SYNC_QUIET_OWNER: "1"
           COMET_SYNC_SOAK_TURNS: "4"
-        run: node scripts/headless-collaboration-smoke.mjs 2>&1 | tee native-evidence/mixed-owner-freshness.log
+        run: node scripts/headless-collaboration-smoke.mjs 2>&1 | tee native-evidence/owner-register-freshness.log
       - name: Exercise native CLI against isolated headless engine
         timeout-minutes: 3
         shell: bash

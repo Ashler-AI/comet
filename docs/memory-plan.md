@@ -893,3 +893,52 @@ require the user's explicit supported-baseline decision before merge/staging.
 Installed Crew, active bb6 writer, production and Scaffold pins remain unchanged;
 local typechecks were intentionally skipped to preserve workstation resources.
 
+### Authorized staging writable-client cutover (2026-10-05)
+
+The owner authorized retirement of unsafe writable 0.1.135 compatibility and
+staging rollout to Scaffold, the existing Namespace devbox and mobile. New
+native/Swift clients declare query-only `syncProtocol=durable-records-v1` on
+every room and device/peer relay socket, and native HTTP diff/nudge writes.
+The Worker strips spoofable internal protocol headers before deriving that
+compatibility declaration; principal, scope and capabilities remain independent.
+Legacy/unknown/duplicate declarations retain authenticated room backfill but
+cannot publish whole/fragment/recovery writes, register/control a host, or use
+HTTP append/reset/diff/nudge/sidecar bypasses. Pre-rollout sockets are fenced too.
+Owner heartbeats update the bounded register; real phase anchors remain durable.
+The retired mixed-writable gates were replaced with actual read-only/rejection
+proof and current-owner freshness beyond the unchanged 45-second lease.
+
+The initial full smoke exposed a real Stop/boot-recovery race: terminal Idle was
+published, Stop applied, then queued automatic recovery started a new Working
+run. External Stop now serializes with dispatch/recovery, validates the exact
+owner/turn, retires pending recovery durably before acknowledgment, and preserves
+the bare pending execution route during early boot. Internal replacement/auth
+teardown/shutdown cancellation remains live-only to avoid already-locked deadlock.
+Deterministic queued-resume and legacy/typed boot-stop regressions passed, as did
+the stale-turn rejection boundary. Originals, unrelated requests and child
+identities are retained; no timing workaround or completion-bound relaxation.
+
+After review: 468 native/RPC library tests, 26 native integration tests, eight
+relay integration tests, queued-run e2e and 14 CLI session tests passed; existing
+external/paid-provider cases remain explicitly ignored. All 206 Edge tests passed.
+The actual full smoke completed 24 turns, preserved 1,600 rows, caught up in
+3,923 ms and sampled 9.6 MiB owner RSS growth. The quiet-owner variant verified
+genuine register heartbeats after 50 seconds, four crash/recovery turns, legacy
+read/no-publish/no-host control, epoch reset, scoped uploads/actor rejection,
+reconnect and revocation. The unchanged paced 24-turn/300 KiB System-allocator
+probe passed with 53,920 KiB (52.7 MiB) RSS growth; its native region report also
+contained 37.9 MiB swapped, so it is not an all-resident or eight-hour claim.
+The real isolated headed app rendered a fresh complete mock reply and returned
+idle. A final-source long mock turn also streamed through that viewport; its
+actual Stop control halted output, restored the send button and returned native
+WatchSessions to Idle. Only the owned fixture window/engine was closed. Staging
+mobile source build 30 is prepared; production build 21 unchanged.
+
+Deployment activation still requires the verified immutable candidate and a
+fresh safe devbox writer checkpoint. The installed devbox OMP 18.4.10 matched its
+official upstream digest and will be preserved rather than downgraded during
+the Crew-only update. No production channel, production image pin, account/tester
+permission or live writer has been changed by this cutover implementation.
+Local typechecks were intentionally skipped to preserve workstation resources;
+authorized remote CI remains the release validation path.
+

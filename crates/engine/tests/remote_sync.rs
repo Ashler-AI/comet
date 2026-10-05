@@ -460,6 +460,9 @@ async fn start_relay(deployment: Option<&'static str>) -> (String, Arc<LocalRoom
                         if query_parameter(&uri, "deploymentId") != deployment {
                             return Err(rejected(403, "deployment mismatch"));
                         }
+                        if query_parameter(&uri, "syncProtocol") != Some(comet_proto::DURABLE_SYNC_PROTOCOL) {
+                            return Err(rejected(426, "Crew update required for durable sync"));
+                        }
                         let Some(device_id) = query_parameter(&uri, "device").map(str::to_string)
                         else {
                             return Err(rejected(400, "device missing"));

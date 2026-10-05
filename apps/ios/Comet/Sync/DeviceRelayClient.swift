@@ -88,6 +88,7 @@ actor DeviceRelayClient {
         components.scheme = components.scheme == "http" ? "ws" : "wss"
         var queryItems = [
             URLQueryItem(name: "role", value: "client"),
+            URLQueryItem(name: "syncProtocol", value: AppConfig.durableSyncProtocol),
             // A reconnect is a new relay peer. Reusing a connId can briefly
             // leave two tagged sockets in the hibernating DO and route the
             // host's response to the stale predecessor.

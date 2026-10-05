@@ -12,6 +12,11 @@ export const GRANT_EVENT_HEADER = "x-comet-internal-grant-event";
 export const DEVICE_HOST_AUTH_HEADER = "x-comet-internal-device-host-auth";
 export const SESSION_OWNER_AUTH_HEADER = "x-comet-internal-session-owner-auth";
 export const NOTIFICATION_BEARER_HEADER = "x-comet-notification-bearer";
+/** Compatibility declaration, never authentication or capability authority. */
+export const SYNC_PROTOCOL_QUERY = "syncProtocol";
+export const DURABLE_SYNC_PROTOCOL = "durable-records-v1";
+export const SYNC_PROTOCOL_HEADER = "x-comet-sync-protocol";
+export const CREW_UPDATE_REQUIRED = "Crew update required for durable sync";
 
 export const stripTrustedAuthHeaders = (headers: Headers): void => {
   headers.delete(AUTH_USER_HEADER);
@@ -23,4 +28,5 @@ export const stripTrustedAuthHeaders = (headers: Headers): void => {
   headers.delete(GRANT_EVENT_HEADER);
   headers.delete(ROOM_KIND_HEADER);
   headers.delete(NOTIFICATION_BEARER_HEADER);
+  headers.delete(SYNC_PROTOCOL_HEADER);
 };

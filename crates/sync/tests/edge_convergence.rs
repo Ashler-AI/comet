@@ -54,9 +54,9 @@ async fn two_session_docs_converge_through_a_real_room() {
         std::env::var("COMET_EDGE_TOKEN_A").unwrap_or_else(|_| "alice@sync-it-org".to_string());
     let token_b =
         std::env::var("COMET_EDGE_TOKEN_B").unwrap_or_else(|_| "bob@sync-it-org".to_string());
-    let chat_id = format!("it-{}", uuid::Uuid::new_v4().simple());
-    let host_url = format!("{base}/session/{chat_id}/ws?token={token_a}");
-    let peer_url = format!("{base}/session/{chat_id}/ws?token={token_b}");
+    let chat_id = uuid::Uuid::new_v4().to_string();
+    let host_url = format!("{base}/session/{chat_id}/ws?token={token_a}&syncProtocol={}", comet_proto::DURABLE_SYNC_PROTOCOL);
+    let peer_url = format!("{base}/session/{chat_id}/ws?token={token_b}&syncProtocol={}", comet_proto::DURABLE_SYNC_PROTOCOL);
 
     // Alice initializes the doc; room access is authentication-only.
     let host = SessionDoc::init(&chat_id).expect("init session doc");

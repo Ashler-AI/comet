@@ -3509,7 +3509,14 @@ mod tests {
                 let mut socket = BufReader::new(socket);
                 let mut line = String::new();
                 socket.read_line(&mut line).await.unwrap();
-                let nudge = line.starts_with("POST /device/comet-scaffold-capacity-e1/nudge ");
+                let mut request = line.split_whitespace();
+                let method = request.next().unwrap();
+                let url = reqwest::Url::parse(&format!("http://localhost{}", request.next().unwrap())).unwrap();
+                let nudge = method == "POST" && url.path() == "/device/comet-scaffold-capacity-e1/nudge";
+                if nudge {
+                    assert_eq!(url.query_pairs().find(|(key, _)| key == "syncProtocol").map(|(_, value)| value.into_owned()).as_deref(),
+                        Some(comet_proto::DURABLE_SYNC_PROTOCOL));
+                }
                 let mut length = 0;
                 loop {
                     line.clear();

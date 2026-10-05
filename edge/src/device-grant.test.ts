@@ -1,5 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
+import worker from "./index";
 import {
   DeviceRoom,
   authorizedDeviceSocketRole,
@@ -16,7 +17,7 @@ import {
   requiredCapabilityForRpc,
 } from "./device-room";
 import type { Env } from "./env";
-import { AUTH_CAPABILITIES_HEADER, AUTH_PROJECT_HEADER, AUTH_USER_HEADER, DEVICE_HOST_AUTH_HEADER, stripTrustedAuthHeaders } from "./env";
+import { AUTH_CAPABILITIES_HEADER, AUTH_PROJECT_HEADER, AUTH_USER_HEADER, DEVICE_HOST_AUTH_HEADER, DURABLE_SYNC_PROTOCOL, SYNC_PROTOCOL_HEADER, stripTrustedAuthHeaders } from "./env";
 
 const now = 1_800_000_000_000;
 const rawGrant = {
@@ -41,7 +42,8 @@ describe("ordinary device command admission", () => {
   const client = {
     userId: "owner@example.test", projectScope: "project-a",
     targetDeviceId: "devbox-a", controlSessionId: "chat-a",
-    capabilities: ["session.control", "session.chat"], joinedAt: now - 1
+    capabilities: ["session.control", "session.chat"], joinedAt: now - 1,
+    durableSync: true,
   };
   const host = { ...client, hostAuthorization: "local" as const };
   const request = {
@@ -89,7 +91,8 @@ describe("ordinary device command admission", () => {
       { headers: {
         [AUTH_USER_HEADER]: client.userId,
         [AUTH_PROJECT_HEADER]: "project-a",
-        [AUTH_CAPABILITIES_HEADER]: "session.read session.control"
+        [AUTH_CAPABILITIES_HEADER]: "session.read session.control",
+        [SYNC_PROTOCOL_HEADER]: DURABLE_SYNC_PROTOCOL
       } }
     ));
     expect(response.status).toBe(403);
@@ -227,6 +230,7 @@ describe("durable cold-chat wakeups", () => {
     let failSend = false;
     let attachment = {
       userId: "owner", projectScope: "project-a", capabilities: ["session.read", "session.control"],
+      durableSync: true,
       role: "host", connId: "engine", hostAuthorization: "local", joinedAt: Date.now(), superseded: false
     };
     const host = {
@@ -258,7 +262,8 @@ describe("durable cold-chat wakeups", () => {
       const invalid = await room.fetch(new Request("https://device.internal/nudge", {
         method: "POST", body: JSON.stringify({ chatId: "not-a-uuid" }), headers: {
           [AUTH_USER_HEADER]: "owner", [AUTH_PROJECT_HEADER]: "project-a",
-          [AUTH_CAPABILITIES_HEADER]: "session.read session.control"
+          [AUTH_CAPABILITIES_HEADER]: "session.read session.control",
+          [SYNC_PROTOCOL_HEADER]: DURABLE_SYNC_PROTOCOL
         }
       }));
       expect(invalid.status).toBe(400);
@@ -267,7 +272,8 @@ describe("durable cold-chat wakeups", () => {
         const response = await room.fetch(new Request("https://device.internal/nudge", {
           method: "POST", body: JSON.stringify({ chatId: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}` }), headers: {
             [AUTH_USER_HEADER]: "owner", [AUTH_PROJECT_HEADER]: "project-a",
-            [AUTH_CAPABILITIES_HEADER]: "session.read session.control"
+            [AUTH_CAPABILITIES_HEADER]: "session.read session.control",
+            [SYNC_PROTOCOL_HEADER]: DURABLE_SYNC_PROTOCOL
           }
         }));
         expect(response.status).toBe(200);
@@ -276,7 +282,8 @@ describe("durable cold-chat wakeups", () => {
       const overflow = await room.fetch(new Request("https://device.internal/nudge", {
         method: "POST", body: JSON.stringify({ chatId: "99999999-9999-4999-8999-999999999999" }), headers: {
           [AUTH_USER_HEADER]: "owner", [AUTH_PROJECT_HEADER]: "project-a",
-          [AUTH_CAPABILITIES_HEADER]: "session.read session.control"
+          [AUTH_CAPABILITIES_HEADER]: "session.read session.control",
+          [SYNC_PROTOCOL_HEADER]: DURABLE_SYNC_PROTOCOL
         }
       }));
       expect(overflow.status).toBe(503);
@@ -287,7 +294,8 @@ describe("durable cold-chat wakeups", () => {
       const failed = await room.fetch(new Request("https://device.internal/nudge", {
         method: "POST", body: JSON.stringify({ chatId: legacyChatId }), headers: {
           [AUTH_USER_HEADER]: "owner", [AUTH_PROJECT_HEADER]: "project-a",
-          [AUTH_CAPABILITIES_HEADER]: "session.read session.control"
+          [AUTH_CAPABILITIES_HEADER]: "session.read session.control",
+          [SYNC_PROTOCOL_HEADER]: DURABLE_SYNC_PROTOCOL
         }
       }));
       expect(await failed.json()).toEqual({ delivered: false, queued: true });
@@ -521,11 +529,12 @@ describe("session-scoped host RPC", () => {
       role: "client",
       connId: "client-1",
       userId: rawGrant.subject,
-      capabilities: ["session.read", "session.control", "session.chat"]
+      capabilities: ["session.read", "session.control", "session.chat"],
+      durableSync: true,
     };
     const client = { deserializeAttachment: () => clientState, send: vi.fn(), close: vi.fn() };
     const host = {
-      deserializeAttachment: () => ({ role: "host", grant }),
+      deserializeAttachment: () => ({ role: "host", durableSync: true, grant }),
       send: vi.fn(),
       close: vi.fn()
     };
@@ -569,5 +578,82 @@ describe("session-scoped host RPC", () => {
     expect(reply(4)).toEqual({ header: rpc, value: { id: 6, ok: { accepted: true } } });
     expect(client.close).not.toHaveBeenCalled();
     expect(host.close).not.toHaveBeenCalled();
+  });
+});
+
+describe("durable relay ingress", () => {
+  it("rejects legacy registration and commands without superseding a declared host", async () => {
+    const db = new DatabaseSync(":memory:");
+    const sockets: Array<{ socket: WebSocket; tags: string[] }> = [];
+    class Socket {
+      attachment: unknown;
+      send = vi.fn(); close = vi.fn();
+      serializeAttachment(value: unknown) { this.attachment = value; }
+      deserializeAttachment() { return this.attachment; }
+    }
+    const NativeResponse = Response;
+    vi.stubGlobal("Response", class extends NativeResponse {
+      constructor(body?: BodyInit | null, init?: ResponseInit) {
+        super(body, init?.status === 101 ? { ...init, status: 200 } : init);
+        if (init?.status === 101) Object.defineProperty(this, "status", { value: 101 });
+      }
+    });
+    vi.stubGlobal("WebSocketPair", class { 0 = new Socket(); 1 = new Socket(); });
+    vi.stubGlobal("WebSocketRequestResponsePair", class {});
+    const ctx = {
+      storage: { sql: { exec: (query: string, ...values: (string | number)[]) => db.prepare(query).all(...values) }, sync: async () => {} },
+      acceptWebSocket: (socket: WebSocket, tags: string[] = []) => { sockets.push({ socket, tags }); },
+      getWebSockets: (tag?: string) => sockets.filter((entry) => !tag || entry.tags.includes(tag)).map((entry) => entry.socket),
+      getWebSocketAutoResponseTimestamp: () => null, setWebSocketAutoResponse: () => {}
+    } as unknown as DurableObjectState;
+    try {
+      const room = new DeviceRoom(ctx, {} as Env);
+      const env = {
+        AUTH_MODE: "dev", ENVIRONMENT: "local", SCAFFOLD_PROJECT_SCOPE: "ashler-local",
+        SCAFFOLD_CONTROL_PLANE_URL: "http://127.0.0.1:8788",
+        SCAFFOLD_REQUIRED_CAPABILITIES: "session.read session.control session.environment",
+        DEVICE_ROOMS: { idFromName: (name: string) => name, get: () => ({ fetch: (request: Request) => room.fetch(request) }) }
+      } as unknown as Env;
+      const connect = (role: string, declaration = "") => worker.fetch(new Request(
+        `http://127.0.0.1/device/engine/ws?role=${role}&connId=connection${declaration}`, {
+          headers: { authorization: "Bearer owner@ashler-local", upgrade: "websocket", [SYNC_PROTOCOL_HEADER]: DURABLE_SYNC_PROTOCOL }
+        }), env);
+      for (const declaration of ["", "&syncProtocol=unknown", "&syncProtocol=durable-records-v1&syncProtocol=unknown"]) {
+        const rejected = await connect("host", declaration);
+        expect(rejected.status).toBe(426);
+        expect(await rejected.json()).toMatchObject({ error: "crew_update_required", message: expect.stringContaining("Crew") });
+        expect(sockets).toHaveLength(0);
+        expect(db.prepare("SELECT * FROM meta").all()).toEqual([]);
+      }
+      expect((await connect("host", `&syncProtocol=${DURABLE_SYNC_PROTOCOL}`)).status).toBe(101);
+      const host = sockets[0].socket as unknown as Socket;
+      expect((await connect("client")).status).toBe(426);
+      expect((await connect("host")).status).toBe(426);
+      expect(host.close).not.toHaveBeenCalled();
+      expect(sockets).toHaveLength(1);
+      for (const path of ["nudge", "sidecar/repos"]) {
+        expect((await worker.fetch(new Request(`http://127.0.0.1/device/engine/${path}`, {
+          method: "POST", body: "unread malformed body",
+          headers: { authorization: "Bearer owner@ashler-local", [SYNC_PROTOCOL_HEADER]: DURABLE_SYNC_PROTOCOL }
+        }), env)).status).toBe(426);
+      }
+      expect(db.prepare("SELECT * FROM pending_nudges").all()).toEqual([]);
+      expect(db.prepare("SELECT * FROM blobs").all()).toEqual([]);
+      expect((await connect("client", `&syncProtocol=${DURABLE_SYNC_PROTOCOL}`)).status).toBe(101);
+      const client = sockets[1].socket as unknown as Socket;
+      const frame = encodeDeviceFrame({ s: "rpc", k: "rpc" }, new TextEncoder().encode(JSON.stringify({ id: 1, method: "LocalDevice", params: {} }))).buffer as ArrayBuffer;
+      await room.webSocketMessage(client as unknown as WebSocket, frame);
+      expect(host.send).toHaveBeenCalledOnce();
+      host.send.mockClear();
+      const legacy = new Socket();
+      legacy.serializeAttachment({ ...(client.attachment as object), durableSync: undefined });
+      await room.webSocketMessage(legacy as unknown as WebSocket, frame);
+      expect(legacy.close).toHaveBeenCalledWith(4406, expect.stringContaining("Crew"));
+      expect(host.send).not.toHaveBeenCalled();
+      host.serializeAttachment({ ...(host.attachment as object), durableSync: undefined });
+      await room.webSocketMessage(host as unknown as WebSocket, encodeDeviceFrame({ s: "rpc", k: "rpc", to: "connection" }, new Uint8Array()).buffer as ArrayBuffer);
+      expect(host.close).toHaveBeenCalledWith(4406, expect.stringContaining("Crew"));
+      expect(client.send).not.toHaveBeenCalled();
+    } finally { db.close(); vi.unstubAllGlobals(); }
   });
 });

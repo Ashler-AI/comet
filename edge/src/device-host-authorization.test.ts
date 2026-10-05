@@ -48,7 +48,7 @@ const hostRequest = (
   if (spoofedAuthorization) {
     headers.set(DEVICE_HOST_AUTH_HEADER, spoofedAuthorization);
   }
-  return new Request(`${origin}/device/${deviceId}/ws?role=host&connId=engine`, {
+  return new Request(`${origin}/device/${deviceId}/ws?role=host&connId=engine&syncProtocol=durable-records-v1`, {
     headers
   });
 };
@@ -170,15 +170,15 @@ describe("trusted device host forwarding", () => {
     } as unknown as Env;
     const targetSession = "22222222-2222-4222-8222-222222222222";
     const scopedRequest = () => worker.fetch(new Request(
-      `https://comet.example/peer/${targetSession}/ws?deploymentId=${grant.deploymentId}`,
+      `https://comet.example/peer/${targetSession}/ws?deploymentId=${grant.deploymentId}&syncProtocol=durable-records-v1`,
       { headers: { authorization: `Bearer cs1.${grant.grantId}.${"b".repeat(64)}`, upgrade: "websocket" } }
     ), env);
     const directRequest = () => worker.fetch(new Request(
-      `https://comet.example/device/local-engine/ws?role=client&purpose=peer&peerSessionId=${targetSession}`,
+      `https://comet.example/device/local-engine/ws?role=client&purpose=peer&peerSessionId=${targetSession}&syncProtocol=durable-records-v1`,
       { headers: { authorization: `Bearer cs1.${grant.grantId}.${"b".repeat(64)}`, upgrade: "websocket" } }
     ), env);
     const resolvedRequest = () => worker.fetch(new Request(
-      `https://comet.example/peer/${targetSession}/ws`,
+      `https://comet.example/peer/${targetSession}/ws?syncProtocol=durable-records-v1`,
       { headers: { authorization: `Bearer cs1.${grant.grantId}.${"b".repeat(64)}`, upgrade: "websocket" } }
     ), env);
 

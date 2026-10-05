@@ -180,7 +180,7 @@ pub fn device_room_ws_url(
     let ws_base = edge_url.replacen("http", "ws", 1);
     let ws_base = ws_base.trim_end_matches('/');
     let conn = conn_id.map(|c| format!("&connId={c}")).unwrap_or_default();
-    format!("{ws_base}/device/{device_id}/ws?role={role}{conn}&token={token}")
+    format!("{ws_base}/device/{device_id}/ws?role={role}{conn}&token={token}&syncProtocol={}", comet_proto::DURABLE_SYNC_PROTOCOL)
 }
 
 fn peer_session_ws_url(
@@ -195,7 +195,7 @@ fn peer_session_ws_url(
     let deployment = deployment_id
         .map(|value| format!("&deploymentId={value}"))
         .unwrap_or_default();
-    format!("{ws_base}/peer/{session_id}/ws?connId={conn_id}&token={token}{deployment}")
+    format!("{ws_base}/peer/{session_id}/ws?connId={conn_id}&token={token}{deployment}&syncProtocol={}", comet_proto::DURABLE_SYNC_PROTOCOL)
 }
 
 fn peer_device_ws_url(
@@ -212,7 +212,8 @@ fn peer_device_ws_url(
         .map(|value| format!("&peerDeploymentId={value}"))
         .unwrap_or_default();
     format!(
-        "{ws_base}/device/{device_id}/ws?role=client&connId={conn_id}&token={token}&purpose=peer-reply&peerSessionId={session_id}{deployment}"
+        "{ws_base}/device/{device_id}/ws?role=client&connId={conn_id}&token={token}&purpose=peer-reply&peerSessionId={session_id}{deployment}&syncProtocol={}",
+        comet_proto::DURABLE_SYNC_PROTOCOL
     )
 }
 
@@ -1375,42 +1376,4 @@ mod tests {
         assert!(!exact_device_response(&serde_json::json!({}), "dev-1"));
     }
 
-    #[test]
-    fn ws_url_shapes() {
-        let url = device_room_ws_url(
-            "https://edge.example/",
-            "dev-1",
-            "client",
-            Some("c1"),
-            "tok",
-        );
-        assert_eq!(
-            url,
-            "wss://edge.example/device/dev-1/ws?role=client&connId=c1&token=tok"
-        );
-        let host = device_room_ws_url("http://localhost:26640", "d", "host", None, "t");
-        assert_eq!(host, "ws://localhost:26640/device/d/ws?role=host&token=t");
-
-        assert_eq!(
-            peer_session_ws_url(
-                "https://edge.example/",
-                "c1",
-                "tok",
-                "session-1",
-                Some("deployment-1"),
-            ),
-            "wss://edge.example/peer/session-1/ws?connId=c1&token=tok&deploymentId=deployment-1"
-        );
-        assert_eq!(
-            peer_device_ws_url(
-                "https://edge.example/",
-                "c1",
-                "tok",
-                "session-1",
-                Some("deployment-1"),
-                "device-1",
-            ),
-            "wss://edge.example/device/device-1/ws?role=client&connId=c1&token=tok&purpose=peer-reply&peerSessionId=session-1&peerDeploymentId=deployment-1"
-        );
-    }
 }

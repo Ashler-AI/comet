@@ -22,7 +22,7 @@ const stats = async () => {
   return res.json();
 };
 
-const client = new LoroWebsocketClient({ url: `${wsBase}/workspace/${projectScope}/ws?token=${token}` });
+const client = new LoroWebsocketClient({ url: `${wsBase}/workspace/${projectScope}/ws?token=${token}&syncProtocol=durable-records-v1` });
 await client.waitConnected();
 const adaptor = new LoroAdaptor();
 await client.join({ roomId: room, crdtAdaptor: adaptor });
@@ -35,7 +35,7 @@ for (let i = 0; i < N; i++) {
   map.set(`d${i % 8}`, `beat-${i}`); // tiny presence-adjacent writes
   doc.commit();
 }
-const reader = new LoroWebsocketClient({ url: `${wsBase}/workspace/${projectScope}/ws?token=${token}` });
+const reader = new LoroWebsocketClient({ url: `${wsBase}/workspace/${projectScope}/ws?token=${token}&syncProtocol=durable-records-v1` });
 try {
   await reader.waitConnected();
   const mirror = new LoroAdaptor();
