@@ -874,3 +874,22 @@ foreign-principal denial, reconnect and revocation. That does not claim the
 intermittent hosted-runner handshake cause is confirmed; final full remote
 transport, surface and archive gates still must pass.
 
+[Mobile run `37373585650`](https://github.com/Ashler-AI/comet/actions/runs/37373585650)
+completed the full gate successfully on immutable source `70e90dc1`: all 27
+fixture markers, real authenticated simulator/native/Edge workspace and relay
+traffic, command admission/transcript/fragmented backfill, four recovery turns
+with 1,600 preserved rows and 4,066 ms catch-up, scoped actor/upload rejection,
+reconnect, revocation and the device archive. Inspected screenshots show populated
+live session rows/Running, retained-original blocked recovery with manual retry,
+and the stale-owner Unreachable strip. The archive verifies bundle identity,
+arm64, source build 29, expanded/signed production APNs entitlement, locked SPM
+packages and ad-hoc signature. Provenance names that exact source/run/toolchain;
+all nine downloaded artifact checksums verified locally.
+
+This is CI simulator/archive acceptance, not Apple distribution signing,
+physical-phone acceptance, a new TestFlight upload or a release deployment.
+The immutable 0.1.135 mixed-version durability/identity blockers above still
+require the user's explicit supported-baseline decision before merge/staging.
+Installed Crew, active bb6 writer, production and Scaffold pins remain unchanged;
+local typechecks were intentionally skipped to preserve workstation resources.
+
