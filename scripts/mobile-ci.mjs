@@ -129,7 +129,7 @@ async function verifySimulator(app) {
   const deviceType = template?.deviceTypeIdentifier ?? types.find((item) => item.name === template?.name)?.identifier;
   if (!deviceType) throw new Error(`No compatible installed iPhone template for ${runtime.identifier}`);
   run("cargo", ["build", "--locked", "-p", "comet", "--bin", "comet"], {
-    timeout: 1_200_000, log: "native-build.log", env: { ...process.env, CARGO_BUILD_JOBS: "2" },
+    timeout: 2_400_000, log: "native-build.log", env: { ...process.env, CARGO_BUILD_JOBS: "2" },
   });
   run("npm", ["ci", "--prefix", "edge"], { timeout: 300_000, log: "edge-install.log" });
   simulator = run("xcrun", ["simctl", "create", `Crew CI ${process.env.GITHUB_RUN_ID}`, deviceType, runtime.identifier]);

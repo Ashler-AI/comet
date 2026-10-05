@@ -736,6 +736,15 @@ integration suites then passed (26 tests; two existing ignored tests), and the
 queued-run end-to-end regression passed. Remote native gates must rerun before
 staging publication.
 
+The initial mobile gate built its simulator app but killed the cold native
+dependency build at its 20-minute subprocess deadline, before simulator checks
+started. Uploaded `native-build.log` still ended in native crate compilation
+without compiler-error diagnostics. That prerequisite now has 40 minutes within
+the existing 65-minute verification step and 75-minute job; its locked build,
+source checks, all simulator/transport markers and archive checks are unchanged.
+Only remote CI can execute this entrypoint; no local compilation override was
+used. A successful rerun remains required.
+
 
 
 
