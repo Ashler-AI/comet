@@ -248,8 +248,8 @@ export const deviceGrantTargetsRoom = (
  *
  * Hosts ping every 15s (crates/rpc/src/device_room.rs PING_INTERVAL) and the
  * DO's auto-response stamps a timestamp without waking us, so liveness is free
- * to read. The window is sized for the 30s of older builds still in the fleet
- * — 2.5 of their intervals — so upgrading engines is never a prerequisite. */
+ * to read. The 75s lease tolerates transport jitter independently of the
+ * durable-sync protocol required for host registration. */
 const HOST_LIVENESS_MS = 75_000;
 
 /** Control frames the relay itself emits (kind " relay"). */

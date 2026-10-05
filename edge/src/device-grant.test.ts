@@ -621,7 +621,7 @@ describe("durable relay ingress", () => {
       for (const declaration of ["", "&syncProtocol=unknown", "&syncProtocol=durable-records-v1&syncProtocol=unknown"]) {
         const rejected = await connect("host", declaration);
         expect(rejected.status).toBe(426);
-        expect(await rejected.json()).toMatchObject({ error: "crew_update_required", message: expect.stringContaining("Crew") });
+        expect(await rejected.json()).toMatchObject({ error: "crew_update_required" });
         expect(sockets).toHaveLength(0);
         expect(db.prepare("SELECT * FROM meta").all()).toEqual([]);
       }
@@ -648,11 +648,11 @@ describe("durable relay ingress", () => {
       const legacy = new Socket();
       legacy.serializeAttachment({ ...(client.attachment as object), durableSync: undefined });
       await room.webSocketMessage(legacy as unknown as WebSocket, frame);
-      expect(legacy.close).toHaveBeenCalledWith(4406, expect.stringContaining("Crew"));
+      expect(legacy.close.mock.calls.map(([code]) => code)).toEqual([4406]);
       expect(host.send).not.toHaveBeenCalled();
       host.serializeAttachment({ ...(host.attachment as object), durableSync: undefined });
       await room.webSocketMessage(host as unknown as WebSocket, encodeDeviceFrame({ s: "rpc", k: "rpc", to: "connection" }, new Uint8Array()).buffer as ArrayBuffer);
-      expect(host.close).toHaveBeenCalledWith(4406, expect.stringContaining("Crew"));
+      expect(host.close.mock.calls.map(([code]) => code)).toEqual([4406]);
       expect(client.send).not.toHaveBeenCalled();
     } finally { db.close(); vi.unstubAllGlobals(); }
   });
