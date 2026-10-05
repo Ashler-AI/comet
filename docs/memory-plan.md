@@ -847,3 +847,20 @@ all 24 turns with 1,600 rows, 1,951 ms catch-up, foreign-principal denial,
 immutable retries, reconnect and active revocation. Full remote mobile transport
 and archive verification still must complete.
 
+Mobile run `37366068192` attempt 1 never acquired a hosted runner and executed
+zero steps. Attempt 2 reused the exact `2dd21e09` source and completed the real
+authenticated simulator/native/Edge scenario: workspace sync, native relay
+folder/model RPCs, run admission, streamed transcript and distinctive fragmented
+backfill all emitted their required success markers and `done`. The actual rig
+then passed reconnect, scoped upload/actor rejection and active revocation.
+
+The remaining failure was the CI reader, not auth or transport: its marker
+lookahead allowed only colon/space/end, rejecting the actual `workspace synced;`
+and `ListFolders[...]` detail formats. Standard non-word boundaries now accept
+those structured details without accepting appended marker-name suffixes.
+A throwaway check against the captured real log showed exactly those two old
+misses, all seven corrected live markers accepted, and false suffixes rejected.
+The existing FAIL gate, exact markers and archive checks remain. No permanent
+wording/mock-wiring test, local typecheck or mobile compilation override added;
+archive/source/signature acceptance still requires the full remote rerun.
+

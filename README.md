@@ -49,8 +49,8 @@ full 24-turn convergence scenario, preserving 1,600 history rows through crash
 and independent epoch replacement, with 22.4 MiB RSS growth. The rebuilt headed
 demo accepted a new mock turn and rendered its complete reply. Remote memory
 gates passed on Linux and macOS; the simulator passed all 27 recovery fixtures.
-Full mobile transport/archive verification and supported 0.1.135 mixed-version
-crash recovery still gate release. Neither staging nor production is claimed.
+Real simulator/native/Edge transport passed. Archive verification and supported
+0.1.135 mixed-version crash recovery still gate release; no staging or production claim.
 Local typechecks are intentionally skipped to preserve workstation resources.
 ## Crew Staging mobile 1.0 (29)
 

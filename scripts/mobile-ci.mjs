@@ -146,7 +146,7 @@ async function verifySimulator(app) {
   while (Date.now() < deadline) {
     const text = snapshotE2ELog();
     if (/\bFAIL\b/.test(text)) throw new Error(`Mobile regression failed:\n${text}`);
-    if (markers.every((marker) => text.split("\n").some((line) => new RegExp(`^\\[\\d+\\] ${marker}(?=[:\\s]|$)`).test(line)))) {
+    if (markers.every((marker) => text.split("\n").some((line) => new RegExp(`^\\[\\d+\\] ${marker}(?=\\W|$)`).test(line)))) {
       console.log(text);
       run("xcrun", ["simctl", "io", simulator, "screenshot", path.join(logs, "convergence-surface.png")]);
       writeFileSync(path.join(logs, "visibility-e2e.log"), text);
@@ -180,7 +180,7 @@ async function verifySimulator(app) {
       });
       const liveText = snapshotE2ELog();
       if (/\bFAIL\b/.test(liveText) || !liveMarkers.every((marker) => liveText.split("\n")
-        .some((line) => new RegExp(`^\\[\\d+\\] ${marker}(?=[:\\s]|$)`).test(line)))) {
+        .some((line) => new RegExp(`^\\[\\d+\\] ${marker}(?=\\W|$)`).test(line)))) {
         throw new Error(`Live mobile convergence did not finish all checks:\n${liveText}`);
       }
       const transportLog = readFileSync(path.join(logs, "live-convergence.log"), "utf8");
