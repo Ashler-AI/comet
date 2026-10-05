@@ -837,3 +837,13 @@ uploads, actor rejection, reconnect and active revocation also passed. Full
 authenticated simulator transport and archive remain remote verification gates;
 neither a local typecheck nor a local mobile compilation override was used.
 
+Run `37361935203` compiled source `e35d4995` and passed all simulator fixtures,
+but stopped before the mobile hook on a foreign-principal WebSocket-open timeout
+at 15 seconds. Its stall cause was not confirmed; no authentication assertion
+was suppressed. The shared fixture handshake budget is now 30 seconds, separate
+from unchanged RPC, 30-second end-to-end recovery, 45-second owner-freshness and
+128 MiB memory acceptance. The full actual same-version scenario then passed
+all 24 turns with 1,600 rows, 1,951 ms catch-up, foreign-principal denial,
+immutable retries, reconnect and active revocation. Full remote mobile transport
+and archive verification still must complete.
+

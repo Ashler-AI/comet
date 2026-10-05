@@ -319,7 +319,7 @@ const openWebSocket = (url, label) =>
       socket.addEventListener("error", onError);
       socket.addEventListener("close", onClose);
     }),
-    label
+    label, 30_000
   );
 
 const closeWebSocket = (socket, label) => {
