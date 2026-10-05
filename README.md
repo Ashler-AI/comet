@@ -2,6 +2,13 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Unreleased: workspace snapshot admission
+
+Newer client snapshots cannot discard the workspace's retained causal history.
+Returning offline edits and session memberships remain mergeable after a cold
+restart; transcript-room retention is unchanged. Previously discarded dependencies
+still require an explicit, backed-up recovery rather than an automatic reset.
+
 ## Crew Staging mobile 1.0 (29)
 
 Crew Staging **1.0 (29)** is available in the existing **Ashler Internal** TestFlight

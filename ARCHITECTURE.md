@@ -153,6 +153,8 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
    retained history for correct offline merges; transcript-room retention is separate. Fresh
    readers receive the persisted baseline followed by ordered accepted deltas, avoiding a
    whole-history export for every sign-in.
+   Client snapshot admission also preserves the room's retained causal history:
+   a newer version vector does not authorize advancing its shallow-history boundary.
    Cold replay imports the baseline snapshot separately, then batches retained deltas
    so each persisted update does not rematerialize the workspace's intermediate state.
 
