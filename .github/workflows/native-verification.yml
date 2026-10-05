@@ -4,16 +4,7 @@ on:
   push:
     branches: ["verify/native-lifecycle-*", "verify/native-startup-*", "verify/native-recovery-*"]
   workflow_dispatch:
-    inputs:
-      baseline_ref:
-        description: "Supported pre-fix native source for mixed-version convergence"
-        type: string
-        default: aa3c9e7dbb97dbfb68a4f53a1af20b3a029dee02
   workflow_call:
-    inputs:
-      baseline_ref:
-        type: string
-        default: aa3c9e7dbb97dbfb68a4f53a1af20b3a029dee02
 defaults:
   run:
     shell: bash
@@ -145,7 +136,7 @@ jobs:
         if: runner.os == 'Linux'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.baseline_ref || 'aa3c9e7dbb97dbfb68a4f53a1af20b3a029dee02' }}
+          ref: aa3c9e7dbb97dbfb68a4f53a1af20b3a029dee02
           path: native-baseline
           persist-credentials: false
       - name: Build supported native baseline

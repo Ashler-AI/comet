@@ -128,6 +128,10 @@ async function verifySimulator(app) {
   const types = JSON.parse(run("xcrun", ["simctl", "list", "devicetypes", "--json"])).devicetypes;
   const deviceType = template?.deviceTypeIdentifier ?? types.find((item) => item.name === template?.name)?.identifier;
   if (!deviceType) throw new Error(`No compatible installed iPhone template for ${runtime.identifier}`);
+  run("cargo", ["build", "--locked", "-p", "comet", "--bin", "comet"], {
+    timeout: 1_200_000, log: "native-build.log", env: { ...process.env, CARGO_BUILD_JOBS: "2" },
+  });
+  run("npm", ["ci", "--prefix", "edge"], { timeout: 300_000, log: "edge-install.log" });
   simulator = run("xcrun", ["simctl", "create", `Crew CI ${process.env.GITHUB_RUN_ID}`, deviceType, runtime.identifier]);
   run("xcrun", ["simctl", "boot", simulator]);
   run("xcrun", ["simctl", "bootstatus", simulator, "-b"], { timeout: 300_000, log: "simulator.log" });
@@ -167,10 +171,6 @@ async function verifySimulator(app) {
           await sleep(250);
         }
       }
-      run("cargo", ["build", "--locked", "-p", "comet", "--bin", "comet"], {
-        timeout: 1_200_000, log: "native-build.log", env: { ...process.env, CARGO_BUILD_JOBS: "2" },
-      });
-      run("npm", ["ci", "--prefix", "edge"], { timeout: 300_000, log: "edge-install.log" });
       run("node", ["scripts/headless-collaboration-smoke.mjs"], {
         timeout: 600_000, log: "live-convergence.log",
         env: { ...process.env, COMET_BIN: path.join(root, "target/debug/comet"), COMET_SYNC_SOAK_TURNS: "4",

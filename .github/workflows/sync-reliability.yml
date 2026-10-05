@@ -13,16 +13,7 @@ on:
       - rust-toolchain.toml
       - .github/workflows/**
   workflow_dispatch:
-    inputs:
-      baseline_ref:
-        description: "Supported pre-fix native source for mixed-version convergence"
-        type: string
-        default: aa3c9e7dbb97dbfb68a4f53a1af20b3a029dee02
   workflow_call:
-    inputs:
-      baseline_ref:
-        type: string
-        default: aa3c9e7dbb97dbfb68a4f53a1af20b3a029dee02
 
 permissions:
   contents: read
@@ -34,8 +25,6 @@ concurrency:
 jobs:
   native:
     uses: ./.github/workflows/native-verification.yml
-    with:
-      baseline_ref: ${{ inputs.baseline_ref || 'aa3c9e7dbb97dbfb68a4f53a1af20b3a029dee02' }}
   mobile:
     uses: ./.github/workflows/mobile.yml
     with:

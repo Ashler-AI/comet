@@ -41,6 +41,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
+      - name: Select checked-in Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: native
+          cache-on-failure: true
       - name: Verify simulator and archive Crew without Apple credentials
         timeout-minutes: 65
         run: node scripts/mobile-ci.mjs
