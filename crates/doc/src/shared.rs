@@ -336,7 +336,25 @@ fn reconcile(doc: &LoroDoc, pending: &[PendingRecord], cached: &LoroDoc) -> Resu
                 session.upsert_agent_session(&publication)?;
             }
             name if MAPS.contains(&name) => {
-                let local_follows_remote = local_version.as_ref().is_some_and(|version| version.includes_vv(&candidate_version));
+                let local_follows_remote = local_version.as_ref().is_some_and(|version| {
+                    if version.includes_vv(&candidate_version) { return true }
+                    // ponytail: peer coverage is conservative; expose per-field op IDs if same-peer unrelated edits block recovery.
+                    // Creation coalesces later accepted edits. Other-row writers must
+                    // not make an already-observed creation look concurrent.
+                    if record.before.is_some() { return false }
+                    let (Some(local), Some(remote)) = (record.value.as_ref().and_then(serde_json::Value::as_object), remote.as_ref().and_then(serde_json::Value::as_object)) else { return false };
+                    // Full-row replay cannot erase fields absent from the original creation intent.
+                    if remote.keys().any(|field| !local.contains_key(field)) { return false }
+                    let root = doc.get_map(name);
+                    let covers_editor = |peer| candidate_version.get(&peer).is_some_and(|counter|
+                        *counter > 0 && version.get(&peer).is_some_and(|accepted| *accepted >= *counter));
+                    if !root.get_last_editor(&record.key).is_some_and(covers_editor) { return false }
+                    let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) = root.get(&record.key) else { return false };
+                    local.keys().all(|field| match row.get_last_editor(field) {
+                        Some(peer) => covers_editor(peer),
+                        None => !remote.contains_key(field),
+                    })
+                });
                 let cached_session = if name == "sessions" { row_value(cached, name, &record.key) } else { None };
                 let owner_publication = if name == "sessions" && remote.is_some() && record.value.is_some() {
                     let local = record.value.as_ref().and_then(serde_json::Value::as_object).ok_or_else(conflict)?;
@@ -523,6 +541,39 @@ mod tests {
         assert_eq!(chats["chat"]["title"],"renamed offline");
         assert_eq!(chats["offline"]["title"],"created offline");
         assert_eq!(chats.as_object().unwrap().len(),2);
+    }
+
+    #[test]
+    fn unrelated_remote_edits_preserve_causally_accepted_chat_creation() {
+        let local = WorkspaceDoc::new();
+        let binding = local.binding(); journal(&binding);
+        let row = binding.get_map("chats").insert_container("chat", LoroMap::new()).unwrap();
+        row.insert("id", "chat").unwrap(); row.insert("deviceId", "owner-device").unwrap();
+        row.insert("title", "created").unwrap(); binding.commit().unwrap();
+        let raw = LoroDoc::new(); raw.import(&local.export_snapshot().unwrap()).unwrap();
+        let remote = WorkspaceDoc::from_doc(raw);
+        local.rename_chat("chat", "accepted offline rename").unwrap();
+        let original = binding.pending_records()[0].clone();
+        let device = remote.doc().get_map("devices").insert_container("peer", LoroMap::new()).unwrap();
+        device.insert("id", "peer").unwrap(); device.insert("name", "unrelated heartbeat").unwrap();
+        remote.doc().commit();
+        let snapshot = remote.export_snapshot().unwrap();
+        binding.adopt_snapshot(&snapshot, None).unwrap();
+        assert_eq!(local.chat("chat").unwrap().unwrap().title.as_deref(), Some("accepted offline rename"));
+        assert_eq!(binding.get_map("devices").get("peer").unwrap().get_deep_value().to_json_value()["name"], "unrelated heartbeat");
+        assert_eq!(binding.pending_records()[0].before, original.before);
+        assert_eq!(binding.pending_records()[0].value, original.value);
+        let preserved = local.export_snapshot().unwrap();
+        let intents = serde_json::to_vec(&binding.pending_records()).unwrap();
+        for (field, value) in [("title", "conflicting rename"), ("deviceId", "foreign-owner")] {
+            let raw = LoroDoc::new(); raw.import(&snapshot).unwrap();
+            let changed = WorkspaceDoc::from_doc(raw);
+            let loro::ValueOrContainer::Container(loro::Container::Map(row)) = changed.doc().get_map("chats").get("chat").unwrap() else { panic!("chat row missing"); };
+            row.insert(field, value).unwrap(); changed.doc().commit();
+            assert!(binding.adopt_snapshot(&changed.export_snapshot().unwrap(), None).is_err());
+            assert_eq!(local.export_snapshot().unwrap(), preserved);
+            assert_eq!(serde_json::to_vec(&binding.pending_records()).unwrap(), intents);
+        }
     }
 
     #[test]

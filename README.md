@@ -40,7 +40,7 @@ mixed-native directions and a real simulator/native/Edge transport path. Native
 publication heartbeats remain while the pre-register baseline is supported;
 that compatibility history can be removed when the baseline retires.
 
-Local checks: 467 native/RPC library tests, 33 vendored KV tests, eight native
+Local checks: 468 native/RPC library tests, 33 vendored KV tests, eight native
 peer-message tests and 199 Edge tests passed. The unchanged 24-turn, 300 KiB
 progressive-tool probe passed at 29.3 MiB RSS growth against 128 MiB. The lossless
 SQLite layout migration avoids full-blob temporaries; standard LZ4 frame sizing

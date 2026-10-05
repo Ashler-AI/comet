@@ -813,3 +813,27 @@ The established Worker mode then passed the complete same-version scenario,
 including reconnect and active revocation. No fallback, scenario removal,
 acceptance relocation or deadline relaxation was kept.
 
+The next mobile run `37349899168` reached live simulator traffic after actual
+native crash/recovery, but the workspace join returned HTTP 401: the harness
+uses a scoped fixture bearer while the old iOS hook constructed a dev bearer.
+The hook now requires the harness credential alongside the existing validated
+loopback/principal/project/device/temp-workspace settings and uses the existing
+Scaffold `AuthTokens` transport. No Edge authentication or permissions changed.
+
+Run `37354793566` compiled that scoped-auth cutover and passed the simulator
+fixtures, but stopped earlier in native recovery with a retained chat-creation
+conflict. A deterministic consumer regression reproduced the cause: whole-doc
+version comparison let unrelated editor updates make an already-observed,
+coalesced creation look concurrent. Creation recovery now accepts only covered
+row/editor peers and refuses a full-row replay that could erase incoming fields.
+Genuine divergent fields/ownership still retain cache and original intents;
+peer-level conservatism is documented in code rather than guessed away.
+The regression failed before the repair; all 468 native/RPC library tests then
+passed, including the existing clock/concurrent-field protection cases.
+
+The rebuilt real same-version scenario again completed all 24 turns and retained
+1,600 rows, with 8,035 ms catch-up under the unchanged 30-second bound. Scoped
+uploads, actor rejection, reconnect and active revocation also passed. Full
+authenticated simulator transport and archive remain remote verification gates;
+neither a local typecheck nor a local mobile compilation override was used.
+
