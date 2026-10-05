@@ -748,3 +748,52 @@ used. A successful rerun remains required.
 
 
 
+Remote native run `37324038360` on `940832b0` passed the unchanged paced memory
+gate on both platforms: Linux growth 72,352 KiB (70.7 MiB), macOS growth
+105,648 KiB (103.2 MiB), both below 128 MiB. The macOS region report showed no
+swapped malloc memory. All 564 desktop tests and the actual native CLI smoke
+passed on macOS. Linux's full same-version real Edge/native scenario preserved
+1,600 rows across 24 turns and caught up in 2,125 ms; its mixed 0.1.135 publisher
+case then exposed duplicate accepted message IDs after publisher/Edge crash.
+This is not a passing mixed-native release gate.
+
+Mobile run `37325961918` on `31be5e3b` completed the native prerequisite in
+7m19s, emitted all 27 simulator fixture markers and captured both blocked
+recovery/manual retry and stale-owner Unreachable surfaces. Its full transport
+scenario stopped before the mobile live path: a cold Worker restart returned
+health HTTP 200 after 22.158s, exceeding the inherited 15s readiness deadline.
+Readiness now uses the existing 30s end-to-end recovery bound; the catch-up
+assertion and all recovery/authorization scenarios remain unchanged. The next
+local full smoke exposed a separate same-owner `sessions.updatedAt` journal
+reconciliation conflict. Neither the full mobile transport nor its archive is
+claimed verified until those runtime paths complete.
+
+The subsequent same-owner repair selects status, run start and update time as one
+validated clocked publication; unchanged three-way baselines also preserve real
+same-millisecond local transitions. Cached authority prevents reordered stale
+snapshots from resurrecting losing offline status. Foreign identity, malformed
+clocks and genuinely divergent fields retain cache and original intents. All
+467 native/RPC library tests passed, including the new restart/clock regression.
+
+Edge validates duplicate application IDs against the pre-import accepted
+container and immutable applied-command evidence. Genuine writer/session
+quiescence gates physical CRDT deletion so the positional 0.1.135 writer does
+not lose later output. Compact identity/fingerprint proof persists atomically
+with accepted bytes across deferred repair and restart; prompts and attachments
+are not copied into that metadata. All 199 Edge tests passed, including complete
+old-index stream/result preservation and raw publisher/observer repair. Parallel
+smokes initially collided on Wrangler's default inspector port 9229; the native
+ephemeral-port option now isolates those fixtures without changing any scenario.
+
+The rebuilt same-version full scenario passed again: 24 turns, 1,600 retained
+rows, 3,914 ms catch-up and all existing crash, ACK, owner, epoch and authorization
+checks. Actual immutable 0.1.135 mixed runs remain blocked with their original
+workload, ordering and deadlines. The old publisher failed singleton-ID recovery
+before interrupt within 30s; its positional writer makes early deletion unsafe
+while the repeated stream is active. The old observer passed the genuine quiet
+owner heartbeat check beyond 45s, then lost an acknowledged offline creation and
+rename when immediately crashed before its debounced snapshot. No receiver can
+recover operations never persisted or sent by that immutable binary. Retiring
+that writable baseline or changing the acceptance contract requires explicit
+user approval; no gate was relaxed and no compatibility success is claimed.
+

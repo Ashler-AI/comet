@@ -40,16 +40,17 @@ mixed-native directions and a real simulator/native/Edge transport path. Native
 publication heartbeats remain while the pre-register baseline is supported;
 that compatibility history can be removed when the baseline retires.
 
-Local checks: 466 native/RPC library tests, 33 vendored KV tests, eight native
-peer-message tests and 196 Edge tests passed. The unchanged 24-turn, 300 KiB
+Local checks: 467 native/RPC library tests, 33 vendored KV tests, eight native
+peer-message tests and 199 Edge tests passed. The unchanged 24-turn, 300 KiB
 progressive-tool probe passed at 29.3 MiB RSS growth against 128 MiB. The lossless
 SQLite layout migration avoids full-blob temporaries; standard LZ4 frame sizing
 bounds compression scratch. The merged 0.1.141 headless binary completed the
 full 24-turn convergence scenario, preserving 1,600 history rows through crash
 and independent epoch replacement, with 22.4 MiB RSS growth. The rebuilt headed
-demo accepted a new mock turn and rendered its complete reply. New Swift source
-and both mixed-native directions still await remote CI; this is not a staging
-or production release.
+demo accepted a new mock turn and rendered its complete reply. Remote memory
+gates passed on Linux and macOS; the simulator passed all 27 recovery fixtures.
+Full mobile transport/archive verification and supported 0.1.135 mixed-version
+crash recovery still gate release. Neither staging nor production is claimed.
 Local typechecks are intentionally skipped to preserve workstation resources.
 ## Crew Staging mobile 1.0 (29)
 

@@ -154,7 +154,7 @@ impl SharedDocument {
             }
         }
         let mut pending = self.pending_records();
-        reconcile(&candidate, &pending)?;
+        reconcile(&candidate, &pending, &self.raw())?;
         let version = candidate.oplog_vv().encode();
         for record in &mut pending {
             record.version = version.clone();
@@ -277,7 +277,7 @@ fn row_value(doc: &LoroDoc, container: &str, key: &str) -> Option<serde_json::Va
     } }
     None
 }
-fn reconcile(doc: &LoroDoc, pending: &[PendingRecord]) -> Result<(),DocError> {
+fn reconcile(doc: &LoroDoc, pending: &[PendingRecord], cached: &LoroDoc) -> Result<(),DocError> {
     let session = SessionDoc::from_doc(doc.clone());
     let candidate_version = doc.oplog_vv();
     for record in pending.iter().filter(|record| record.container != "agentSessions" && record.container != "meta")
@@ -336,7 +336,42 @@ fn reconcile(doc: &LoroDoc, pending: &[PendingRecord]) -> Result<(),DocError> {
                 session.upsert_agent_session(&publication)?;
             }
             name if MAPS.contains(&name) => {
-                let merged = if local_version.as_ref().is_some_and(|version| version.includes_vv(&candidate_version)) {
+                let local_follows_remote = local_version.as_ref().is_some_and(|version| version.includes_vv(&candidate_version));
+                let cached_session = if name == "sessions" { row_value(cached, name, &record.key) } else { None };
+                let owner_publication = if name == "sessions" && remote.is_some() && record.value.is_some() {
+                    let local = record.value.as_ref().and_then(serde_json::Value::as_object).ok_or_else(conflict)?;
+                    let remote = remote.as_ref().and_then(serde_json::Value::as_object).ok_or_else(conflict)?;
+                    let before = match &record.before { Some(value) => Some(value.as_object().ok_or_else(conflict)?), None => None };
+                    let cached = match &cached_session { Some(value) => Some(value.as_object().ok_or_else(conflict)?), None => None };
+                    let owner = local.get("deviceId").and_then(serde_json::Value::as_str).filter(|owner| !owner.is_empty()).ok_or_else(conflict)?;
+                    for row in before.into_iter().chain([local, remote]).chain(cached) {
+                        if row.get("chatId").and_then(serde_json::Value::as_str) != Some(record.key.as_str())
+                            || row.get("deviceId").and_then(serde_json::Value::as_str) != Some(owner)
+                            || !matches!(row.get("status").and_then(serde_json::Value::as_str), Some("idle" | "working" | "awaitingInput" | "errored"))
+                            || row.get("updatedAt").and_then(serde_json::Value::as_i64).and_then(chrono::DateTime::from_timestamp_millis).is_none()
+                            || row.get("startedAt").is_some_and(|value| value.as_i64().and_then(chrono::DateTime::from_timestamp_millis).is_none())
+                        { return Err(conflict()) }
+                    }
+                    let local_at = local["updatedAt"].as_i64().expect("validated owner clock");
+                    let remote_at = remote["updatedAt"].as_i64().expect("validated owner clock");
+                    // An unchanged incoming publication is the three-way baseline,
+                    // even when millisecond encoding ties a genuine local transition.
+                    let local_publication_wins_tie = local_follows_remote || before.is_some_and(|row|
+                        ["status", "startedAt", "updatedAt"].iter().all(|field| row.get(*field) == remote.get(*field)));
+                    if before.is_some_and(|row| row["updatedAt"].as_i64().is_some_and(|at| local_at < at || remote_at < at))
+                        || (!local_publication_wins_tie && local_at == remote_at && ["status", "startedAt"].iter().any(|field| local.get(*field) != remote.get(*field)))
+                    { return Err(conflict()) }
+                    // Status and run identity belong to the clocked publication, never to separate field winners.
+                    let mut publication = if local_at > remote_at || (local_at == remote_at && local_publication_wins_tie) { local } else { remote };
+                    if let Some(cached) = cached {
+                        let cached_at = cached["updatedAt"].as_i64().expect("validated owner clock");
+                        let at = publication["updatedAt"].as_i64().expect("validated owner clock");
+                        if cached_at == at && ["status", "startedAt"].iter().any(|field| cached.get(*field) != publication.get(*field)) { return Err(conflict()) }
+                        if cached_at > at { publication = cached; }
+                    }
+                    Some(publication)
+                } else { None };
+                let mut merged = if local_follows_remote {
                     record.value.clone()
                 } else { match (&record.before,&record.value,&remote) {
                     (_,None,None) => continue,
@@ -357,23 +392,25 @@ fn reconcile(doc: &LoroDoc, pending: &[PendingRecord]) -> Result<(),DocError> {
                         }
                         Some(serde_json::Value::Object(merged))
                     }
-                    (Some(before),Some(local),Some(remote)) => {
-                        let (Some(before),Some(local),Some(remote)) = (before.as_object(),local.as_object(),remote.as_object()) else { return Err(conflict()) };
+                    (before,Some(local),Some(remote)) if before.is_some() || owner_publication.is_some() => {
+                        let before = match before { Some(value) => Some(value.as_object().ok_or_else(conflict)?), None => None };
+                        let (Some(local),Some(remote)) = (local.as_object(),remote.as_object()) else { return Err(conflict()) };
                         let mut merged = remote.clone();
-                        for field in before.keys().chain(local.keys()).collect::<BTreeSet<_>>() {
-                            if before.get(field) == local.get(field) { continue }
+                        for field in before.into_iter().flat_map(|row| row.keys()).chain(local.keys()).collect::<BTreeSet<_>>() {
+                            if owner_publication.is_some() && matches!(field.as_str(), "status" | "startedAt" | "updatedAt") { continue }
+                            if before.and_then(|row| row.get(field)) == local.get(field) { continue }
                             if name == "chats" && field == "lastMessageAt"
                                 && local.get("id").and_then(serde_json::Value::as_str) == Some(record.key.as_str())
-                                && remote.get("id") == local.get("id") && before.get("deviceId") == local.get("deviceId")
+                                && remote.get("id") == local.get("id") && before.and_then(|row| row.get("deviceId")) == local.get("deviceId")
                                 && local.get("deviceId").and_then(serde_json::Value::as_str).is_some_and(|owner| remote.get("deviceId").and_then(serde_json::Value::as_str) == Some(owner))
                                 && let (Some(local_at), Some(remote_at)) = (local.get(field).and_then(serde_json::Value::as_i64), remote.get(field).and_then(serde_json::Value::as_i64))
-                                && before.get(field).and_then(serde_json::Value::as_i64).is_none_or(|at| local_at >= at && remote_at >= at)
+                                && before.and_then(|row| row.get(field)).and_then(serde_json::Value::as_i64).is_none_or(|at| local_at >= at && remote_at >= at)
                             {
                                 // Activity is a monotonic owner clock, not conflicting user intent.
                                 merged.insert(field.clone(), serde_json::json!(local_at.max(remote_at)));
                                 continue;
                             }
-                            if remote.get(field) != before.get(field) && remote.get(field) != local.get(field) {
+                            if remote.get(field) != before.and_then(|row| row.get(field)) && remote.get(field) != local.get(field) {
                                 return Err(DocError::Schema(format!("Crew recovery conflict in {}/{} field={field}; original intent retained", record.container, record.key)));
                             }
                             if let Some(value) = local.get(field) { merged.insert(field.clone(),value.clone()); } else { merged.remove(field); }
@@ -383,6 +420,11 @@ fn reconcile(doc: &LoroDoc, pending: &[PendingRecord]) -> Result<(),DocError> {
                     (_,Some(local),Some(remote)) if local == remote => continue,
                     _ => return Err(conflict()),
                 } };
+                if let (Some(publication), Some(serde_json::Value::Object(fields))) = (owner_publication, &mut merged) {
+                    for field in ["status", "startedAt", "updatedAt"] {
+                        if let Some(value) = publication.get(field) { fields.insert(field.into(), value.clone()); } else { fields.remove(field); }
+                    }
+                }
                 let root = doc.get_map(name);
                 if let Some(serde_json::Value::Object(fields)) = merged {
                     let row = match root.get(&record.key) { Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) => row, _ => root.insert_container(&record.key,LoroMap::new())? };
@@ -512,6 +554,84 @@ mod tests {
             assert!(binding.adopt_snapshot(&changed_owner, None).is_err());
             assert_eq!(binding.get_map("chats").get("chat").unwrap().get_deep_value().to_json_value(), row);
         }
+    }
+
+    #[test]
+    fn restarted_session_publications_keep_latest_owner_status_and_retain_conflicting_originals() {
+        use comet_proto::{Session, SessionStatus};
+        let publication = |at, status| Session {
+            chat_id: "chat".into(), device_id: "owner-device".into(), status,
+            started_at: chrono::DateTime::from_timestamp_millis(at - 100),
+            updated_at: chrono::DateTime::from_timestamp_millis(at).unwrap(),
+        };
+        for existing in [false, true] {
+            for (local_at, remote_at) in [(3_000, 2_000), (2_000, 3_000)] {
+                let remote = WorkspaceDoc::new();
+                if existing { remote.upsert_session(&publication(1_000, SessionStatus::Working)).unwrap(); }
+                let raw = LoroDoc::new(); raw.import(&remote.export_snapshot().unwrap()).unwrap();
+                let local = WorkspaceDoc::from_doc(raw);
+                let original = local.binding(); journal(&original);
+                let local_session = publication(local_at, SessionStatus::Idle);
+                let remote_session = publication(remote_at, SessionStatus::Working);
+                local.upsert_session(&local_session).unwrap();
+                let loro::ValueOrContainer::Container(loro::Container::Map(row)) = original.get_map("sessions").get("chat").unwrap() else { panic!("session row missing"); };
+                row.insert("label", "offline intent").unwrap(); original.commit().unwrap();
+                let records = serde_json::to_vec(&original.pending_records()).unwrap();
+                let raw = LoroDoc::new(); raw.import(&local.export_snapshot().unwrap()).unwrap();
+                let restarted = WorkspaceDoc::from_doc(raw);
+                let binding = restarted.binding();
+                binding.install_journal(serde_json::from_slice(&records).unwrap(), Arc::new(|_,_| Ok(())));
+                remote.upsert_session(&remote_session).unwrap();
+                let loro::ValueOrContainer::Container(loro::Container::Map(row)) = remote.doc().get_map("sessions").get("chat").unwrap() else { panic!("session row missing"); };
+                row.insert("remoteNote", "concurrent field").unwrap(); remote.doc().commit();
+                let snapshot = remote.doc().export(ExportMode::shallow_snapshot(&remote.doc().state_frontiers())).unwrap();
+                for _ in 0..2 {
+                    binding.adopt_snapshot(&snapshot, None).unwrap();
+                    assert_eq!(restarted.read_sessions().unwrap(), vec![if local_at > remote_at { local_session.clone() } else { remote_session.clone() }]);
+                    let row = binding.get_map("sessions").get("chat").unwrap().get_deep_value().to_json_value();
+                    assert_eq!(row["label"], "offline intent");
+                    assert_eq!(row["remoteNote"], "concurrent field");
+                    let pending: Vec<PendingRecord> = serde_json::from_slice(&records).unwrap();
+                    assert_eq!(binding.pending_records()[0].before, pending[0].before);
+                    assert_eq!(binding.pending_records()[0].value, pending[0].value);
+                }
+                // An older owner snapshot must not resurrect a losing offline status after recovery.
+                let stale = LoroDoc::new(); stale.import(&snapshot).unwrap();
+                let loro::ValueOrContainer::Container(loro::Container::Map(row)) = stale.get_map("sessions").get("chat").unwrap() else { panic!("session row missing"); };
+                row.insert("updatedAt", 1_500i64).unwrap(); row.insert("status", "errored").unwrap(); stale.commit();
+                binding.adopt_snapshot(&stale.export(ExportMode::shallow_snapshot(&stale.state_frontiers())).unwrap(), None).unwrap();
+                assert_eq!(restarted.read_sessions().unwrap(), vec![if local_at > remote_at { local_session.clone() } else { remote_session.clone() }]);
+                let original_cache = restarted.export_snapshot().unwrap();
+                let original_records = serde_json::to_vec(&binding.pending_records()).unwrap();
+                for (field, value) in [
+                    ("deviceId", serde_json::json!("foreign-owner")),
+                    ("chatId", serde_json::json!("foreign-chat")),
+                    ("updatedAt", serde_json::json!("corrupt-clock")),
+                    ("updatedAt", serde_json::json!(999)),
+                    ("updatedAt", serde_json::json!(local_at)),
+                    ("status", serde_json::json!("corrupt-status")),
+                    ("label", serde_json::json!("divergent intent")),
+                ] {
+                    if field == "updatedAt" && value == serde_json::json!(999) && !existing { continue }
+                    // Start every boundary case from the same accepted owner publication.
+                    let candidate = LoroDoc::new(); candidate.import(&snapshot).unwrap();
+                    let loro::ValueOrContainer::Container(loro::Container::Map(row)) = candidate.get_map("sessions").get("chat").unwrap() else { panic!("session row missing"); };
+                    row.insert(field, LoroValue::from(value)).unwrap(); candidate.commit();
+                    assert!(binding.adopt_snapshot(&candidate.export(ExportMode::shallow_snapshot(&candidate.state_frontiers())).unwrap(), None).is_err(), "must retain {field} conflict");
+                    assert_eq!(restarted.export_snapshot().unwrap(), original_cache);
+                    assert_eq!(serde_json::to_vec(&binding.pending_records()).unwrap(), original_records);
+                }
+            }
+        }
+        // Millisecond encoding may tie a causal status transition; its ancestry still orders it.
+        let remote = WorkspaceDoc::new();
+        remote.upsert_session(&publication(1_000, SessionStatus::Working)).unwrap();
+        let raw = LoroDoc::new(); raw.import(&remote.export_snapshot().unwrap()).unwrap();
+        let local = WorkspaceDoc::from_doc(raw); let binding = local.binding(); journal(&binding);
+        let settled = publication(1_000, SessionStatus::Idle);
+        local.upsert_session(&settled).unwrap();
+        binding.adopt_snapshot(&remote.export_snapshot().unwrap(), None).unwrap();
+        assert_eq!(local.read_sessions().unwrap(), vec![settled]);
     }
 
     #[test]

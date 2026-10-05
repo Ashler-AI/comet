@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath, URL as NodeUrl } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CrdtType, JoinErrorCode, MessageType, UpdateStatusCode, decode, encode, type JoinRequest, type ProtocolMessage } from "loro-protocol";
-import { LoroDoc, decodeImportBlobMeta } from "loro-crdt";
+import { LoroDoc, LoroMap, LoroList, LoroText, decodeImportBlobMeta } from "loro-crdt";
 import type { VersionVector } from "loro-crdt";
 import {
   AUTH_CAPABILITIES_HEADER,
@@ -317,6 +317,172 @@ describe("SessionRoom chat authorization", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.useRealTimers();
+  });
+
+  it.each(["delta", "snapshot"] as const)("reconciles legacy re-appended accepted messages on the raw %s receiver boundary", async (mode) => {
+    const source = new LoroDoc(); const publisher = new LoroDoc(); const observer = new LoroDoc();
+    const sql = new MemorySql(); sql.meta.set("owner", PROJECT_SCOPE); sql.meta.set("chatId", "room-a");
+    const appendMessage = (doc: LoroDoc, createdAt: number, text = "accepted original", deviceId = "owner-device") => {
+      const messages = doc.getList("messages");
+      const row = messages.insertContainer(0, new LoroMap());
+      const parts = row.setContainer("parts", new LoroList());
+      const part = parts.pushContainer(new LoroMap());
+      const body = part.setContainer("text", new LoroText());
+      try {
+        for (const [key, value] of Object.entries({ id: "message-1", role: "user", createdAt, deviceId, status: "complete" })) row.set(key, value);
+        part.set("id", "t0"); part.set("kind", "text"); body.insert(0, text); doc.commit();
+      } finally { body.free(); part.free(); parts.free(); row.free(); messages.free(); }
+    };
+    try {
+      appendMessage(source, 10);
+      const commands = source.getList("commands"); const command = commands.pushContainer(new LoroMap());
+      try {
+        command.set("id", "command-1"); command.set("status", "applied"); command.set("issuedBy", "controller-device");
+        command.set("kind", "run");
+        command.set("payload", { kind: "run", messageId: "message-1", request: { prompt: "accepted original" } }); source.commit();
+      } finally { command.free(); commands.free(); }
+      const accepted = source.toJSON(); const baseline = source.export({ mode: "snapshot" });
+      sql.putBlob("snapshot", baseline); publisher.import(baseline); observer.import(baseline);
+      // Both processes cold-start. The old publisher appends the same immutable
+      // message under new CRDT ancestry before its recovered observer rejoins.
+      const { room, sockets } = makeRoom(sql);
+      const sender = await join(room, "user-a", "room-a");
+      const receiver = await join(room, "user-b", "room-a");
+      sockets.push(sender as unknown as WebSocket, receiver as unknown as WebSocket);
+      sender.sent.length = 0; receiver.sent.length = 0;
+      const before = publisher.oplogVersion();
+      let update: Uint8Array;
+      let duplicateSnapshot: Uint8Array;
+      try {
+        appendMessage(publisher, 20); // Sorted before the originally accepted row.
+        update = publisher.export(mode === "delta" ? { mode: "update", from: before } : { mode: "snapshot" });
+        duplicateSnapshot = publisher.export({ mode: "snapshot" });
+      } finally { before.free(); }
+      const internals = room as unknown as SessionRoomInternals;
+      await internals.applyUpdates(sender as unknown as WebSocket, sender.deserializeAttachment() as JoinState,
+        CrdtType.Loro, "room-a", "0x0000000000000001", [update]);
+      expect(sender.sent.map((bytes) => decode(bytes))).toContainEqual(expect.objectContaining({ type: MessageType.Ack, status: UpdateStatusCode.Ok }));
+      for (const [socket, client] of [[sender, publisher], [receiver, observer]] as const) {
+        for (const bytes of socket.sent) {
+          const message = decode(bytes);
+          if (message.type === MessageType.DocUpdate) client.importBatch(message.updates);
+        }
+        // This is the raw doc handed to either old or native WatchDocMessages,
+        // not a deduplicated tail/UI projection. Command identity/outcome stays.
+        expect(client.toJSON()).toEqual(accepted);
+      }
+      expect((await internals.ensureDoc()).toJSON()).toEqual(accepted);
+      expect((await (makeRoom(sql).room as unknown as SessionRoomInternals).ensureDoc()).toJSON()).toEqual(accepted);
+      const rows = sql.updateCount();
+      // Repeating the unconsumed batch cannot create another accepted row.
+      await internals.applyUpdates(sender as unknown as WebSocket, sender.deserializeAttachment() as JoinState,
+        CrdtType.Loro, "room-a", "0x0000000000000001", [update]);
+      expect(sql.updateCount()).toBe(rows);
+      for (const [text, device] of [["conflicting accepted content", "owner-device"], ["accepted original", "foreign-device"]]) {
+        const conflict = new LoroDoc();
+        try {
+          conflict.import(publisher.export({ mode: "snapshot" })); appendMessage(conflict, 30, text, device);
+          expect((await room.fetch(authedRequest("/append", "user-a", { method: "POST", body: conflict.export({ mode: "snapshot" }) }))).status).toBe(400);
+          expect((await internals.ensureDoc()).toJSON()).toEqual(accepted);
+          expect(sql.updateCount()).toBe(rows); expect(sql.hasBlob("snapshot")).toBe(true);
+        } finally { conflict.free(); }
+      }
+      // Cold legacy log replay retains its baseline's authoritative metadata.
+      const legacy = new MemorySql(); legacy.putBlob("snapshot", baseline); legacy.appendUpdate(update);
+      expect((await (makeRoom(legacy).room as unknown as SessionRoomInternals).ensureDoc()).toJSON()).toEqual(accepted);
+      // An already-ambiguous snapshot cannot self-authorize choosing a timestamp.
+      const ambiguous = new MemorySql(); ambiguous.putBlob("snapshot", duplicateSnapshot);
+      await expect((makeRoom(ambiguous).room as unknown as SessionRoomInternals).ensureDoc()).rejects.toThrow();
+      expect(ambiguous.hasBlob("snapshot")).toBe(true); expect(ambiguous.updateCount()).toBe(0);
+      // An imported applied outcome is not an acceptance anchor either.
+      const asserted = new LoroDoc();
+      try {
+        asserted.import(baseline);
+        const ledger = asserted.getList("commands"); const pending = ledger.get(0) as LoroMap;
+        try { pending.set("status", "pending"); asserted.commit(); } finally { pending.free(); ledger.free(); }
+        const untrusted = new MemorySql(); untrusted.meta.set("owner", PROJECT_SCOPE);
+        untrusted.putBlob("snapshot", asserted.export({ mode: "snapshot" }));
+        const beforeAssertion = asserted.toJSON();
+        const untrustedRoom = makeRoom(untrusted).room;
+        const forgedLedger = asserted.getList("commands"); const forged = forgedLedger.get(0) as LoroMap;
+        try { forged.set("status", "applied"); appendMessage(asserted, 20); } finally { forged.free(); forgedLedger.free(); }
+        expect((await untrustedRoom.fetch(authedRequest("/append", "user-a", { method: "POST", body: asserted.export({ mode: "snapshot" }) }))).status).toBe(400);
+        expect((await (untrustedRoom as unknown as SessionRoomInternals).ensureDoc()).toJSON()).toEqual(beforeAssertion);
+        expect(untrusted.updateCount()).toBe(0); expect(untrusted.hasBlob("snapshot")).toBe(true);
+      } finally { asserted.free(); }
+    } finally { observer.free(); publisher.free(); source.free(); }
+  });
+
+  it("preserves a legacy positional writer's complete result across deferred repair and Edge restart", async () => {
+    const publisher = new LoroDoc(); const sql = new MemorySql();
+    sql.meta.set("owner", PROJECT_SCOPE); sql.meta.set("chatId", "room-a");
+    const appendEntry = (id: string, role: string, status: string, createdAt: number, text: string) => {
+      const messages = publisher.getList("messages"); const index = messages.length;
+      const row = messages.pushContainer(new LoroMap()); const parts = row.setContainer("parts", new LoroList());
+      const part = parts.pushContainer(new LoroMap()); const body = part.setContainer("text", new LoroText());
+      try {
+        for (const [key, value] of Object.entries({ id, role, status, createdAt, deviceId: "owner-device" })) row.set(key, value);
+        part.set("id", "t0"); part.set("kind", "text"); body.insert(0, text); publisher.commit();
+        return index;
+      } finally { body.free(); part.free(); parts.free(); row.free(); messages.free(); }
+    };
+    const publishOwner = (status: string, at: number) => {
+      const publications = publisher.getList("publications"); const row = publications.pushContainer(new LoroMap());
+      try {
+        row.set("id", `owner-${at}`);
+        row.set("record", { publishedBy: "user-a", value: { kind: "agentSession", value: {
+          sessionId: "room-a", ownerSubject: "user-a", ownerDeviceId: "owner-device", status, createdAt: 10, updatedAt: at
+        } } }); publisher.commit();
+      } finally { row.free(); publications.free(); }
+    };
+    try {
+      appendEntry("message-1", "user", "complete", 10, "accepted original");
+      const commands = publisher.getList("commands"); const command = commands.pushContainer(new LoroMap());
+      try {
+        command.set("id", "command-1"); command.set("kind", "run"); command.set("status", "applied");
+        command.set("payload", { kind: "run", messageId: "message-1", request: { prompt: "accepted original" } }); publisher.commit();
+      } finally { command.free(); commands.free(); }
+      publishOwner("working", 10); sql.putBlob("snapshot", publisher.export({ mode: "snapshot" }));
+      let room = makeRoom(sql).room; let sender = await join(room, "user-a", "room-a");
+      let internals = room as unknown as SessionRoomInternals;
+      const publish = async (mutate: () => void) => {
+        const before = publisher.oplogVersion();
+        try {
+          mutate(); sender.sent.length = 0;
+          await internals.applyUpdates(sender as unknown as WebSocket, sender.deserializeAttachment() as JoinState,
+            CrdtType.Loro, "room-a", "0x0000000000000001", [publisher.export({ mode: "update", from: before })]);
+          expect(sender.sent.map((bytes) => decode(bytes))).toContainEqual(expect.objectContaining({ type: MessageType.Ack, status: UpdateStatusCode.Ok }));
+          for (const bytes of sender.sent) { const message = decode(bytes); if (message.type === MessageType.DocUpdate) publisher.importBatch(message.updates); }
+        } finally { before.free(); }
+      };
+      // Working precedes the first stream row: deleting the duplicate now could
+      // race a positional writer that has already begun locally but not synced.
+      await publish(() => { appendEntry("message-1", "user", "complete", 20, "accepted original"); });
+      expect(publisher.toJSON().messages.filter((row: { id: string }) => row.id === "message-1")).toHaveLength(2);
+      room = makeRoom(sql).room; internals = room as unknown as SessionRoomInternals;
+      sender = await join(room, "user-a", "room-a");
+      let writerIndex = -1;
+      await publish(() => { writerIndex = appendEntry("answer-1", "assistant", "streaming", 21, "first"); });
+      const writeAtOldIndex = (suffix: string, status: string) => {
+        const messages = publisher.getList("messages"); const row = messages.get(writerIndex) as LoroMap;
+        const parts = row.get("parts") as LoroList; const part = parts.get(0) as LoroMap; const body = part.get("text") as LoroText;
+        try {
+          expect(row.get("id")).toBe("answer-1"); body.insert(body.length, suffix); row.set("status", status); publisher.commit();
+        } finally { body.free(); part.free(); parts.free(); row.free(); messages.free(); }
+      };
+      await publish(() => { writeAtOldIndex(" + middle", "streaming"); });
+      await publish(() => { writeAtOldIndex(" + final result", "complete"); });
+      expect(publisher.toJSON().messages.filter((row: { id: string }) => row.id === "message-1")).toHaveLength(2);
+      // Genuine terminal owner state, not an elapsed deadline, retires the
+      // position only after the old writer finished every suffix and its status.
+      await publish(() => { publishOwner("idle", 30); });
+      const expected = publisher.toJSON();
+      expect(expected.messages.filter((row: { id: string }) => row.id === "message-1")).toHaveLength(1);
+      expect(expected.messages.find((row: { id: string }) => row.id === "message-1").createdAt).toBe(10);
+      expect(expected.messages.find((row: { id: string }) => row.id === "answer-1")).toMatchObject({ status: "complete", parts: [{ kind: "text", text: "first + middle + final result" }] });
+      expect((await internals.ensureDoc()).toJSON()).toEqual(expected);
+      expect((await (makeRoom(sql).room as unknown as SessionRoomInternals).ensureDoc()).toJSON()).toEqual(expected);
+    } finally { publisher.free(); }
   });
 
   it.each(["delta", "snapshot"] as const)("durably acknowledges a %s before publisher and edge restart, without duplicate admission", async (mode) => {

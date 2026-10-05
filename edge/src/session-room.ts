@@ -22,8 +22,10 @@
  * Hibernation discipline: timers only release idle caches and fragment batches;
  * checkpoints, history trim and R2 backups ride the durable alarm.
  */
-import { LoroDoc, EphemeralStore, VersionVector, decodeImportBlobMeta } from "loro-crdt";
-import type { PeerID } from "loro-crdt";
+import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
+import { LoroDoc, LoroMap, isContainer, EphemeralStore, VersionVector, decodeImportBlobMeta } from "loro-crdt";
+import type { PeerID, ContainerID } from "loro-crdt";
 import {
   CrdtType,
   JoinErrorCode,
@@ -589,8 +591,9 @@ export class SessionRoom implements DurableObject {
       if (body === null) return json({ error: "too_large" }, 413);
       let doc = await this.ensureDoc();
       if (workspace) this.notifyWorkspace(doc, projectScope, true);
+      let repair: Uint8Array | undefined;
       try {
-        doc = this.importLoroUpdates(doc, [body]);
+        ({ doc, repair } = this.importLoroUpdates(doc, [body]));
       } catch (error) {
         this.escalateWasmPoisoning(error);
         return json({ error: "invalid_update" }, 400);
@@ -603,7 +606,7 @@ export class SessionRoom implements DurableObject {
         const state = ws.deserializeAttachment() as SocketState | null;
         if (!state?.rooms.includes(CrdtType.Loro)) continue;
         if (!(await this.authorizeSocket(ws, state))) continue;
-        this.sendUpdates(ws, CrdtType.Loro, roomId, [body]);
+        this.sendUpdates(ws, CrdtType.Loro, roomId, repair ? [body, repair] : [body]);
       }
       return json({ ok: true });
     }
@@ -1037,6 +1040,7 @@ export class SessionRoom implements DurableObject {
         return;
       }
       if (state.workspace) this.notifyWorkspace(doc, state.projectScope, true);
+      let repair: Uint8Array | undefined;
       try {
         if (state.loroRecoveryRoomId !== undefined) {
           if (state.loroRecoveryRoomId !== roomId || updates.length !== 1 || updates[0].length === 0) {
@@ -1052,7 +1056,7 @@ export class SessionRoom implements DurableObject {
             metadata.partialEndVersionVector.free();
           }
         }
-        doc = this.importLoroUpdates(doc, updates);
+        ({ doc, repair } = this.importLoroUpdates(doc, updates));
       } catch (error) {
         this.escalateWasmPoisoning(error);
         // Missing dependencies or an irreversible shallow-history gap require
@@ -1065,7 +1069,9 @@ export class SessionRoom implements DurableObject {
       // The grant may expire or be revoked while durable persistence yields.
       if (!(await this.authorizeSocket(ws, state)) || ws.readyState !== WebSocket.OPEN) return;
       this.ack(ws, { crdt, roomId }, UpdateStatusCode.Ok, batchId);
-      await this.relay(ws, crdt, roomId, updates);
+      // The sender already has its own writes, but not Edge's identity repair.
+      if (repair) this.sendUpdates(ws, crdt, roomId, [repair]);
+      await this.relay(ws, crdt, roomId, repair ? [...updates, repair] : updates);
       return;
     }
     if (crdt === CrdtType.LoroEphemeralStore) {
@@ -1092,10 +1098,190 @@ export class SessionRoom implements DurableObject {
     this.ack(ws, { crdt, roomId }, UpdateStatusCode.Unknown, batchId);
   }
 
-  private importLoroUpdates(doc: LoroDoc, updates: Uint8Array[]): LoroDoc {
+  /** Legacy publishers can re-append an accepted id with fresh CRDT ancestry.
+   * Validate immediately, but do not shift a positional 0.1.135 writer until
+   * its real stream/session state is terminal. No timer or placeholder rows. */
+  private reconcileMessageIdentities(doc: LoroDoc, retained = new Set<unknown>(), acceptedRuns = new Set<ContainerID>()): { repair?: Uint8Array; deferred?: string } {
+    if (this.getMeta("roomKind") === "workspace" || !doc.getShallowValue().messages) return {};
+    const pending = new Map<string, { containerId: ContainerID; fingerprint: string; timestampEcho: boolean }>(JSON.parse(this.getMeta("messageIdentityRepairs") ?? "[]"));
+    const next = new Map<string, { containerId: ContainerID; fingerprint: string; timestampEcho: boolean }>();
+    const messages = doc.getList("messages");
+    // ponytail: scan raw IDs per import; index them if room throughput warrants it.
+    const seen = new Map<string, { index: number; containerId: ContainerID }[]>();
+    const remove: number[] = [];
+    let lastStreaming = -1;
+    const rowAt = (index: number) => {
+      const row = messages.get(index);
+      try { return row instanceof LoroMap ? row.toJSON() : undefined; }
+      finally { if (isContainer(row)) row.free(); }
+    };
+    try {
+      for (let index = 0; index < messages.length; index++) {
+        const row = messages.get(index);
+        let id: unknown;
+        try {
+          if (row instanceof LoroMap) {
+            id = row.get("id");
+            if (typeof id === "string" && id) {
+              const indices = seen.get(id) ?? [];
+              indices.push({ index, containerId: row.id }); seen.set(id, indices);
+            }
+            const status = row.get("status");
+            if (status === "streaming" || isContainer(status)) lastStreaming = index;
+            if (isContainer(status)) status.free();
+          }
+        } finally { if (isContainer(row)) row.free(); }
+        if (isContainer(id)) id.free();
+      }
+      for (const [id, indices] of seen) {
+        if (indices.length < 2) continue;
+        const anchor = pending.get(id);
+        const originalRow = anchor ? indices.find((row) => row.containerId === anchor.containerId)
+          : indices.find((row) => retained.has(row.containerId)) ?? indices[0];
+        if (!originalRow) throw new Error(`message ${id} lost its accepted identity; originals retained`);
+        const original = rowAt(originalRow.index);
+        const { createdAt: originalAt, ...originalIdentity } = original;
+        const fingerprint = createHash("sha256").update(JSON.stringify(original, (_key, value) =>
+          value && typeof value === "object" && !Array.isArray(value)
+            ? Object.fromEntries(Object.entries(value).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)) : value)).digest("hex");
+        let timestampEcho = anchor?.timestampEcho === true;
+        for (const row of indices) {
+          if (row === originalRow) continue;
+          const { createdAt: retryAt, ...retryIdentity } = rowAt(row.index);
+          const anchored = anchor !== undefined || (retained.has(originalRow.containerId) && !retained.has(row.containerId));
+          if (!Array.isArray(original.parts) || typeof original.deviceId !== "string" ||
+              !Number.isSafeInteger(originalAt) || !Number.isSafeInteger(retryAt) ||
+              !isDeepStrictEqual(originalIdentity, retryIdentity) || (anchor && anchor.fingerprint !== fingerprint)) {
+            throw new Error(`message ${id} names conflicting accepted content; originals retained`);
+          }
+          if (originalAt !== retryAt) {
+            if (!(anchored && original.role === "user" && original.continuationOf == null && original.peerMessage == null &&
+                (timestampEcho || this.attestRetainedUserEcho(originalRow.containerId, original, acceptedRuns)))) {
+              throw new Error(`message ${id} names conflicting accepted content; originals retained`);
+            }
+            timestampEcho = true;
+          }
+          remove.push(row.index);
+        }
+        next.set(id, { containerId: originalRow.containerId, fingerprint, timestampEcho });
+      }
+      if (!remove.length) return pending.size ? { deferred: "[]" } : {};
+      // The publication may announce Working before the old writer's first
+      // assistant row reaches Edge; streaming rows alone cannot close that race.
+      if (lastStreaming >= remove.reduce((first, index) => Math.min(first, index), messages.length) || !this.sessionWritersQuiescent(doc)) {
+        return { deferred: JSON.stringify([...next]) };
+      }
+      const before = doc.oplogVersion();
+      try {
+        for (const index of remove.sort((a, b) => b - a)) messages.delete(index, 1);
+        doc.commit();
+        return { repair: doc.export({ mode: "update", from: before }), deferred: "[]" };
+      } finally { before.free(); }
+    } finally { messages.free(); }
+  }
+
+  /** Both legacy append-only owner status and native agentSessions registers
+   * must be terminal before retiring raw list positions used by old writers. */
+  private sessionWritersQuiescent(doc: LoroDoc): boolean {
+    const sessions = new Map<string, { ownerSubject: string; ownerDeviceId: string; status?: string; at: number }>();
+    const observe = (record: unknown) => {
+      if (!record || typeof record !== "object") return;
+      const publication = record as { publishedBy?: string; value?: { kind?: string; value?: { sessionId?: string; ownerSubject?: string; ownerDeviceId?: string; status?: string; updatedAt?: number; createdAt?: number } } };
+      const value = publication.value?.value;
+      if (publication.value?.kind !== "agentSession" || !value || typeof value.sessionId !== "string" ||
+          typeof value.ownerSubject !== "string" || typeof value.ownerDeviceId !== "string" || publication.publishedBy !== value.ownerSubject) return;
+      const at = value.updatedAt ?? value.createdAt;
+      if (typeof at !== "number" || !Number.isSafeInteger(at)) return;
+      const previous = sessions.get(value.sessionId);
+      if (previous && (previous.ownerSubject !== value.ownerSubject || previous.ownerDeviceId !== value.ownerDeviceId || previous.at > at)) return;
+      sessions.set(value.sessionId, { ownerSubject: value.ownerSubject, ownerDeviceId: value.ownerDeviceId, status: value.status, at });
+    };
+    const roots = doc.getShallowValue();
+    if (roots.publications) {
+      const publications = doc.getList("publications");
+      try {
+        for (let index = 0; index < publications.length; index++) {
+          const row = publications.get(index);
+          try {
+            if (row instanceof LoroMap) {
+              const record = row.get("record");
+              try { observe(record); } finally { if (isContainer(record)) record.free(); }
+            }
+          }
+          finally { if (isContainer(row)) row.free(); }
+        }
+      } finally { publications.free(); }
+    }
+    if (roots.agentSessions) {
+      const register = doc.getMap("agentSessions");
+      try { for (const record of Object.values(register.toJSON())) observe(record); }
+      finally { register.free(); }
+    }
+    return [...sessions.values()].every(({ status }) => status === "idle" || status === "errored");
+  }
+
+  /** Capture only compact command/container identity before import. In particular,
+   * never materialize RunRequest attachments on every streaming/metadata tick. */
+  private acceptedRunContainers(doc: LoroDoc): Set<ContainerID> {
+    const accepted = new Set<ContainerID>();
+    if (!doc.getShallowValue().commands) return accepted;
+    const commands = doc.getList("commands");
+    try {
+      for (let index = 0; index < commands.length; index++) {
+        const row = commands.get(index);
+        try {
+          if (row instanceof LoroMap) {
+            const status = row.get("status"); const kind = row.get("kind");
+            try { if (status === "applied" && kind === "run") accepted.add(row.id); }
+            finally { if (isContainer(status)) status.free(); if (isContainer(kind)) kind.free(); }
+          }
+        }
+        finally { if (isContainer(row)) row.free(); }
+      }
+      return accepted;
+    } finally { commands.free(); }
+  }
+
+  /** Only a newly encountered timestamp echo needs this read. Reconstruct the
+   * already-durable pre-import state, never the sender's rewritten command.
+   * The persisted fingerprint/proof makes subsequent ticks and restarts cheap. */
+  private attestRetainedUserEcho(containerId: ContainerID, original: Record<string, unknown>, acceptedRuns: Set<ContainerID>): boolean {
+    if (!acceptedRuns.size) return false;
+    const accepted = new LoroDoc();
+    try {
+      const baseline = this.blobs.get("snapshot");
+      if (baseline?.length) accepted.import(baseline);
+      this.replayLog(accepted);
+      this.assertLoroMaterialized(accepted);
+      const message = accepted.getContainerById(containerId);
+      try { if (!(message instanceof LoroMap) || !isDeepStrictEqual(message.toJSON(), original)) return false; }
+      finally { if (isContainer(message)) message.free(); }
+      for (const id of acceptedRuns) {
+        const row = accepted.getContainerById(id);
+        try {
+          if (!(row instanceof LoroMap) || row.get("status") !== "applied") continue;
+          const payload = row.get("payload");
+          if (!payload || typeof payload !== "object" || isContainer(payload)) { if (isContainer(payload)) payload.free(); continue; }
+          const command = payload as { kind?: string; messageId?: string; request?: { prompt?: string } };
+          if (command.kind === "run" && command.messageId === original.id && typeof command.request?.prompt === "string" &&
+              isDeepStrictEqual(original.parts, [{ id: "t0", kind: "text", text: command.request.prompt }])) return true;
+        } finally { if (isContainer(row)) row.free(); }
+      }
+      return false;
+    } finally { accepted.free(); }
+  }
+
+  private acceptedMessageContainers(doc: LoroDoc): Set<unknown> {
+    if (this.getMeta("roomKind") === "workspace" || !doc.getShallowValue().messages) return new Set();
+    const messages = doc.getList("messages");
+    try { return new Set(messages.getShallowValue()); }
+    finally { messages.free(); }
+  }
+
+  private importLoroUpdates(doc: LoroDoc, updates: Uint8Array[]): { doc: LoroDoc; repair?: Uint8Array } {
     if (updates.every((update) => update.length === 0)) {
       this.assertLoroMaterialized(doc, this.docPendingEnds);
-      return doc;
+      return { doc };
     }
     const snapshotIndex = updates.findIndex((update) => {
       if (update.length === 0) return false;
@@ -1107,6 +1293,9 @@ export class SessionRoom implements DurableObject {
         metadata.partialEndVersionVector.free();
       }
     });
+    const retained = this.acceptedMessageContainers(doc);
+    const session = this.getMeta("roomKind") !== "workspace";
+    const acceptedRuns = session ? this.acceptedRunContainers(doc) : new Set<ContainerID>();
     if (snapshotIndex < 0) {
       // Reject a whole batch atomically. Only fully materialized deltas enter SQL.
       // Reconstruct accepted state from its durable baseline only on failure.
@@ -1120,14 +1309,15 @@ export class SessionRoom implements DurableObject {
           pendingEnds.set(peer, Math.max(pendingEnds.get(peer) ?? 0, span.end));
         }
         this.assertLoroMaterialized(doc, pendingEnds);
+        const { repair, deferred } = this.reconcileMessageIdentities(doc, retained, acceptedRuns);
         const after = doc.oplogFrontiers();
         const changed = before.length !== after.length ||
           !before.every((head) => after.some((other) => head.peer === other.peer && head.counter === other.counter));
         if (changed || retainedPending?.size) {
-          this.recordLoroUpdates(doc, updates, Boolean(pendingEnds?.size));
+          this.recordLoroUpdates(doc, repair ? [...updates, repair] : updates, Boolean(pendingEnds?.size), deferred);
         }
         this.docPendingEnds = undefined;
-        return doc;
+        return { doc, repair };
       } catch (error) {
         this.doc = undefined;
         doc.free();
@@ -1232,15 +1422,16 @@ export class SessionRoom implements DurableObject {
         const coverage = mergedVersion.compare(previousVersion);
         if (coverage === undefined || coverage < 0) throw new Error("import lost retained operations");
       } finally { mergedVersion.free(); }
+      const { repair, deferred } = this.reconcileMessageIdentities(candidate, retained, acceptedRuns);
       // Persist the validated union, never the publisher's partial baseline.
       // Replacement and log deletion share a synchronous transaction, so writes
       // accepted while storage.sync yields stay in the new log.
-      this.recordLoroUpdates(candidate, updates, true);
+      this.recordLoroUpdates(candidate, repair ? [...updates, repair] : updates, true, deferred);
       this.doc = candidate;
       this.docPendingEnds = undefined;
       ownsCandidate = false;
       doc.free();
-      return candidate;
+      return { doc: candidate, repair };
     } finally {
       previousVersion?.free();
       if (ownsCandidate) candidate.free();
@@ -1289,9 +1480,9 @@ export class SessionRoom implements DurableObject {
 
   /** Commit accepted bytes and fold status churn without discarding CRDT history.
    * No accepted payload remains in a volatile JS buffer after this returns. */
-  private recordLoroUpdates(doc: LoroDoc, updates: Uint8Array[], forceSnapshot = false): void {
+  private recordLoroUpdates(doc: LoroDoc, updates: Uint8Array[], forceSnapshot = false, deferred?: string): void {
     const bytes = updates.reduce((total, update) => total + update.byteLength, 0);
-    if (!bytes) return;
+    if (!bytes && deferred === undefined) return;
     const logBytes = Number(this.getMeta("updateBytes") ?? "0") + bytes;
     const rows = Number([...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM updates")][0]?.n ?? 0);
     const fold = forceSnapshot || logBytes >= COMPACT_LOG_BYTES ||
@@ -1313,6 +1504,7 @@ export class SessionRoom implements DurableObject {
         }
         this.setMeta("updateBytes", String(logBytes));
       }
+      if (deferred !== undefined && this.getMeta("messageIdentityRepairs") !== deferred) this.setMeta("messageIdentityRepairs", deferred);
       this.setMeta("tailDirty", "1");
       this.setMeta("backupDirty", "1");
       this.setMeta("postReset", "0");
@@ -1505,7 +1697,11 @@ export class SessionRoom implements DurableObject {
     }
     let rows = 0;
     let batches = 0;
+    let retained = new Set<unknown>();
+    let acceptedRuns = new Set<ContainerID>();
     try {
+      retained = this.acceptedMessageContainers(doc);
+      if (this.getMeta("roomKind") !== "workspace") acceptedRuns = this.acceptedRunContainers(doc);
       const replayed = this.replayLog(doc);
       rows = replayed.rows;
       batches = replayed.batches;
@@ -1526,6 +1722,15 @@ export class SessionRoom implements DurableObject {
       } finally { version.free(); }
     }
     this.docPendingEnds = pendingEnds?.size ? pendingEnds : undefined;
+    if (!this.docPendingEnds) {
+      try {
+        const { repair, deferred } = this.reconcileMessageIdentities(doc, retained, acceptedRuns);
+        if (repair || deferred !== undefined) this.recordLoroUpdates(doc, repair ? [repair] : [], false, deferred);
+      } catch (error) {
+        this.doc = undefined;
+        return await this.rejectPersistedLoroState(doc, "message identities", error);
+      }
+    }
     this.setMeta("replayAttempts", "0");
     // Reset telemetry only after successful replay; export failures never erase
     // accepted state. Both old and current clients keep their history.
@@ -1644,6 +1849,7 @@ export class SessionRoom implements DurableObject {
     this.ctx.storage.sql.exec("DELETE FROM updates");
     this.blobs.delete("snapshot");
     this.setMeta("updateBytes", "0");
+    this.setMeta("messageIdentityRepairs", "[]");
     this.setMeta("checkpoints", "[]");
     this.setMeta("lastTrimAt", "");
     this.docPendingEnds = undefined;

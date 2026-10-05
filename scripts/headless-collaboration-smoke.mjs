@@ -791,6 +791,8 @@ const main = async () => {
       "127.0.0.1",
       "--port",
       String(edgePort),
+      "--inspector-port",
+      "0",
       "--persist-to",
       path.join(tempDir, "worker-state"),
       "--var",
@@ -811,7 +813,7 @@ const main = async () => {
       if (worker.exitCode !== null) throw new Error(worker.outputSummary());
       const result = await fetchJson(`${edgeOrigin}/health`);
       return result.response.ok ? result.body : undefined;
-    });
+    }, 30_000);
     assert.deepEqual(health, { ok: true, auth: "scaffold", environment: "local" });
   };
   const restartEdge = async (duringOutage) => {
