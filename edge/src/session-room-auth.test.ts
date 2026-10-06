@@ -173,7 +173,8 @@ const makeRoom = (
   sql = new MemorySql(),
   sync: () => Promise<void> = async () => {},
   grantStatus: () => Promise<Response> = async () => new Response(null, { status: 200 }),
-  putBackup?: (key: string, bytes: Uint8Array) => Promise<void>
+  putBackup?: (key: string, bytes: Uint8Array) => Promise<void>,
+  environment: Env["ENVIRONMENT"] = "local"
 ): { room: SessionRoom; sql: MemorySql; sockets: WebSocket[] } => {
   const sockets: WebSocket[] = [];
   const storage = {
@@ -193,6 +194,7 @@ const makeRoom = (
     }
   } as unknown as DurableObjectState;
   const env = {
+    ENVIRONMENT: environment,
     BLOBS: { put: putBackup },
     AUTH_GRANTS: {
       idFromName: (id: string) => id,
@@ -814,6 +816,39 @@ describe("SessionRoom chat authorization", () => {
       } });
     } finally {
       writerBase?.free(); reader.free(); writer.free(); source.free();
+    }
+  });
+
+  it.each(["staging", "production"] as const)("rejects invalid recovery seeds without replacing %s history", async (environment) => {
+    const source = new LoroDoc();
+    const recovered = new LoroDoc();
+    try {
+      source.getMap("metadata").set("retained", "accepted state");
+      source.commit();
+      const sql = new MemorySql();
+      sql.meta.set("roomKind", "workspace");
+      sql.putBlob("snapshot", source.export({ mode: "snapshot" }));
+      const { room } = makeRoom(sql, undefined, undefined, undefined, environment);
+      const invalid = new Uint8Array([1, 2, 3]);
+      const headers = { [ROOM_KIND_HEADER]: "workspace" };
+      const response = await room.fetch(authedRequest("/reset-log", "user-a", {
+        method: "POST", headers, body: invalid
+      }));
+      expect(response.status).toBe(400);
+      const diagnostic = await response.json() as { sha256?: string; seedBytes?: number; validationStage?: string };
+      if (environment === "staging") {
+        const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", invalid));
+        expect(diagnostic.sha256).toBe(Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join(""));
+        expect(diagnostic.seedBytes).toBe(invalid.byteLength);
+      } else {
+        expect(diagnostic.sha256).toBeUndefined();
+        expect(diagnostic.validationStage).toBeUndefined();
+      }
+      const snapshot = await makeRoom(sql).room.fetch(authedRequest("/snapshot", "user-a", { headers }));
+      recovered.import(new Uint8Array(await snapshot.arrayBuffer()));
+      expect(recovered.toJSON()).toEqual({ metadata: { retained: "accepted state" } });
+    } finally {
+      recovered.free(); source.free();
     }
   });
 
