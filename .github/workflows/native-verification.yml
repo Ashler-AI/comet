@@ -122,6 +122,17 @@ jobs:
         if: runner.os == 'Linux'
         working-directory: edge
         run: npm ci
+      - name: Generate Worker binding types
+        if: runner.os == 'Linux'
+        working-directory: edge
+        run: npm run types
+      - name: Require current Worker binding declarations
+        if: runner.os == 'Linux'
+        run: git diff --exit-code -- edge/worker-configuration.d.ts
+      - name: Typecheck Worker
+        if: runner.os == 'Linux'
+        working-directory: edge
+        run: npm run typecheck
       - name: Verify edge recovery and durable acknowledgements
         if: runner.os == 'Linux'
         working-directory: edge

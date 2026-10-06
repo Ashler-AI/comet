@@ -34,6 +34,8 @@ pending notice after authoritative applied readback without re-admission.
 Local typechecks are intentionally skipped. Exact-source remote mobile gates,
 live writer-gate cutover, staging publication and physical-device acceptance
 remain with the integration owner.
+The required native verification workflow checks generated Worker declarations
+and TypeScript remotely before running the Edge/native convergence probes.
 
 ## Unreleased: workspace snapshot admission
 
