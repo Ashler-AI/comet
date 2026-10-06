@@ -474,7 +474,7 @@ const localRpc = async (port, method, params = {}) => {
         else if (Object.hasOwn(reply, "item")) resolve(reply.item);
       });
       socket.send(JSON.stringify({ id: 1, method, params }));
-    }), `${method} local RPC`);
+    }), `${method} local RPC (${params.command?.kind ?? "read"})`);
   } finally { await closeWebSocket(socket, "local IPC"); }
 };
 

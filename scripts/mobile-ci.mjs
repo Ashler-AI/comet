@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   closeSync, copyFileSync, createReadStream, existsSync, mkdirSync, openSync,
@@ -173,11 +173,15 @@ async function verifySimulator(app) {
       }
       // The live transport hook relaunches this app; retire completed UI fixture timers first.
       run("xcrun", ["simctl", "terminate", simulator, bundleId], { log: "simulator.log" });
-      run("node", ["scripts/headless-collaboration-smoke.mjs"], {
-        timeout: 600_000, log: "live-convergence.log",
-        env: { ...process.env, COMET_BIN: path.join(root, "target/debug/comet"), COMET_SYNC_SOAK_TURNS: "4",
-          COMET_MOBILE_SIMULATOR_ID: simulator, COMET_MOBILE_BUNDLE_ID: bundleId },
-      });
+      const loadLog = openSync(path.join(logs, "live-system-load.log"), "w");
+      const loadSampler = spawn("top", ["-l", "0", "-s", "2", "-o", "cpu", "-n", "20", "-stats", "pid,command,cpu,mem"], { stdio: ["ignore", loadLog, loadLog] });
+      try {
+        run("node", ["scripts/headless-collaboration-smoke.mjs"], {
+          timeout: 600_000, log: "live-convergence.log",
+          env: { ...process.env, COMET_BIN: path.join(root, "target/debug/comet"), COMET_SYNC_SOAK_TURNS: "4",
+            COMET_MOBILE_SIMULATOR_ID: simulator, COMET_MOBILE_BUNDLE_ID: bundleId },
+        });
+      } finally { loadSampler.kill(); closeSync(loadLog); }
       const liveText = snapshotE2ELog();
       if (/\bFAIL\b/.test(liveText) || !liveMarkers.every((marker) => liveText.split("\n")
         .some((line) => new RegExp(`^\\[\\d+\\] ${marker}(?=\\W|$)`).test(line)))) {
