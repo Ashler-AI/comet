@@ -291,7 +291,8 @@ fn reconcile(doc: &LoroDoc, pending: &[PendingRecord], cached: &LoroDoc, session
         if covered && !MAPS.contains(&record.container.as_str()) { continue }
         let remote = row_value(doc,&record.container,&record.key);
         let conflict = || DocError::Schema(format!("Crew recovery conflict in {}/{}; original intent retained",record.container,record.key));
-        if MAPS.contains(&record.container.as_str()) {
+        // Owner-register publication IDs change; they are not logical map row identities.
+        if MAPS.contains(&record.container.as_str()) && record.container != "agentSessions" {
             if let (Some(base), Some(remote)) = (record.before.as_ref().or(record.value.as_ref()).and_then(serde_json::Value::as_object), remote.as_ref().and_then(serde_json::Value::as_object)) {
                 let local = record.value.as_ref().and_then(serde_json::Value::as_object).unwrap_or(base);
                 for field in ["id", "chatId", "userId", "deviceId"] {
@@ -347,7 +348,27 @@ fn reconcile(doc: &LoroDoc, pending: &[PendingRecord], cached: &LoroDoc, session
                 session.upsert_agent_session(&publication)?;
             }
             name if MAPS.contains(&name) => {
-                let creation_merge = local_version.as_ref().and_then(|version| {
+                let activity_merge = if name == "chats" && record.before.is_none() {
+                    record.value.as_ref().and_then(serde_json::Value::as_object).and_then(|local| {
+                        let remote = remote.as_ref().and_then(serde_json::Value::as_object)?;
+                        if local.get("id").and_then(serde_json::Value::as_str) != Some(record.key.as_str())
+                            || !local.get("deviceId").and_then(serde_json::Value::as_str).is_some_and(|owner| !owner.is_empty() && remote.get("deviceId").and_then(serde_json::Value::as_str) == Some(owner)) { return None }
+                        let same_payload = |row: &serde_json::Map<String, serde_json::Value>|
+                            local.iter().all(|(field, value)| matches!(field.as_str(), "lastMessageAt" | "lastMessagePreview") || row.get(field) == Some(value))
+                            && row.keys().all(|field| matches!(field.as_str(), "lastMessageAt" | "lastMessagePreview") || local.contains_key(field));
+                        if !same_payload(remote) { return None }
+                        let clock = |row: &serde_json::Map<String, serde_json::Value>| row.get("lastMessageAt").and_then(serde_json::Value::as_i64)
+                            .filter(|at| chrono::DateTime::from_timestamp_millis(*at).is_some());
+                        let local_at = clock(local)?; let remote_at = clock(remote)?;
+                        let mut winner = if local_at > remote_at { local } else { remote };
+                        let cached_value = row_value(cached, name, &record.key);
+                        if let Some(row) = cached_value.as_ref().and_then(serde_json::Value::as_object)
+                            && same_payload(row) && clock(row).is_some_and(|at| at > local_at.max(remote_at)) { winner = row; }
+                        // Timestamp and preview belong to one owner publication.
+                        Some(serde_json::Value::Object(winner.clone()))
+                    })
+                } else { None };
+                let creation_merge = if activity_merge.is_some() { None } else { local_version.as_ref().and_then(|version| {
                     if record.before.is_some() { return None }
                     let (Some(local), Some(remote)) = (record.value.as_ref().and_then(serde_json::Value::as_object), remote.as_ref().and_then(serde_json::Value::as_object)) else { return None };
                     let root = doc.get_map(name);
@@ -409,7 +430,7 @@ fn reconcile(doc: &LoroDoc, pending: &[PendingRecord], cached: &LoroDoc, session
                     let publication_follows = name == "sessions" && ["status", "startedAt", "updatedAt"].iter().all(|field|
                         handler.get_last_edit_idlp(field).map(|edit| covers_incoming(field, edit)).unwrap_or(!remote.contains_key(*field)));
                     Some((serde_json::Value::Object(merged), publication_follows))
-                });
+                }) };
                 let local_follows_remote = creation_merge.as_ref().is_some_and(|(_, follows)| *follows)
                     || local_version.as_ref().is_some_and(|version| version.includes_vv(&candidate_version));
                 let cached_session = if name == "sessions" { row_value(cached, name, &record.key) } else { None };
@@ -446,7 +467,9 @@ fn reconcile(doc: &LoroDoc, pending: &[PendingRecord], cached: &LoroDoc, session
                     }
                     Some(publication)
                 } else { None };
-                let mut merged = if let Some((value, _)) = creation_merge {
+                let mut merged = if let Some(value) = activity_merge {
+                    Some(value)
+                } else if let Some((value, _)) = creation_merge {
                     Some(value)
                 } else if local_follows_remote && (record.before.is_none() || record.value.is_none() || remote.is_none()) {
                     record.value.clone()
@@ -729,6 +752,34 @@ mod tests {
             assert!(binding.adopt_snapshot(&resurrection, None).is_err());
             assert_eq!(restarted.export_snapshot().unwrap(), cached_import);
             assert_eq!(serde_json::to_vec(&binding.pending_records()).unwrap(), intents);
+        }
+    }
+
+    #[test]
+    fn coalesced_creation_activity_keeps_clock_and_preview_across_independent_seed() {
+        for (local_at, remote_at) in [(3_000, 2_000), (2_000, 3_000)] {
+            let local = WorkspaceDoc::new();
+            let binding = local.binding(); journal(&binding);
+            let row = binding.get_map("chats").insert_container("chat", LoroMap::new()).unwrap();
+            row.insert("id", "chat").unwrap(); row.insert("deviceId", "owner-device").unwrap();
+            row.insert("title", "retained creation").unwrap(); binding.commit().unwrap();
+            local.set_chat_last_message("chat", "local preview", chrono::DateTime::from_timestamp_millis(local_at).unwrap()).unwrap();
+            let original = binding.pending_records()[0].clone();
+            assert!(original.before.is_none());
+            let remote = WorkspaceDoc::new();
+            let row = remote.doc().get_map("chats").insert_container("chat", LoroMap::new()).unwrap();
+            row.insert("id", "chat").unwrap(); row.insert("deviceId", "owner-device").unwrap();
+            row.insert("title", "retained creation").unwrap(); remote.doc().commit();
+            remote.set_chat_last_message("chat", "remote preview", chrono::DateTime::from_timestamp_millis(remote_at).unwrap()).unwrap();
+            let snapshot = remote.export_snapshot().unwrap();
+            for _ in 0..2 {
+                binding.adopt_snapshot(&snapshot, None).unwrap();
+                let row = binding.get_map("chats").get("chat").unwrap().get_deep_value().to_json_value();
+                assert_eq!(row["lastMessageAt"], 3_000);
+                assert_eq!(row["lastMessagePreview"], if local_at > remote_at { "local preview" } else { "remote preview" });
+                assert_eq!(binding.pending_records()[0].before, original.before);
+                assert_eq!(binding.pending_records()[0].value, original.value);
+            }
         }
     }
 

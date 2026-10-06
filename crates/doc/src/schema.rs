@@ -1887,15 +1887,27 @@ mod tests {
             })),
         };
         doc.append_publication(&record).unwrap();
+        let mut heartbeat_base = Vec::new();
         for at in 2..=1_000 {
+            if at == 3 { doc.binding().install_journal(Vec::new(), std::sync::Arc::new(|_, _| Ok(()))); }
+            record.id = format!("heartbeat-{at}");
             record.published_at = at;
             let PublicationValue::AgentSession(session) = &mut record.value else { unreachable!() };
             session.updated_at = Some(at);
             doc.upsert_agent_session(&record).unwrap();
+            if at == 2 { heartbeat_base = doc.export_snapshot().unwrap(); }
         }
         assert_eq!(doc.doc().get_map("agentSessions").len(), 1);
         assert_eq!(doc.read_publications().unwrap().len(), 1);
         assert_eq!(doc.collaboration_snapshot().unwrap().sessions[0].updated_at, Some(1_000));
+        let current = doc.export_snapshot().unwrap();
+        let raw = LoroDoc::new(); raw.import(&current).unwrap();
+        let restored = SessionDoc::from_doc(raw);
+        restored.binding().install_journal(doc.binding().pending_records(), std::sync::Arc::new(|_, _| Ok(())));
+        restored.binding().adopt_snapshot(&heartbeat_base, Some("chat-1")).unwrap();
+        restored.binding().adopt_snapshot(&current, Some("chat-1")).unwrap();
+        assert_eq!(restored.collaboration_snapshot().unwrap().sessions[0].updated_at, Some(1_000));
+        assert_eq!(restored.doc().get_map("agentSessions").len(), 1);
         record.id = "idle".into();
         record.published_at = 1_000;
         let PublicationValue::AgentSession(session) = &mut record.value else { unreachable!() };

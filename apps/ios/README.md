@@ -60,6 +60,9 @@ also runs on pushes to `release/mobile-*` (staging only). It uses Apple-silicon
 `macos-26`, Node 24, the newest installed stable Xcode 26 and iOS 26 SDK/runtime.
 `node scripts/mobile-ci.mjs` is CI-only and refuses developer-workstation builds.
 It verifies the simulator, then archives the same source without Apple credentials.
+The unused simulator OS is shut down during native preflight and boots on demand
+at the live mobile transport phase. RPC, catch-up, freshness and RSS limits remain
+unchanged; the same owned simulator retains its installed app and fixture data.
 
 The artifact `crew-mobile-<environment>-<source SHA>` contains:
 

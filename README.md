@@ -23,7 +23,11 @@ identity and owner checks precede causal shortcuts. Authority clocks are capture
 before session-only schema migration, never by stamping a workspace as a session.
 Unprovable provenance remains blocked with original intents retained.
 
-Latest native follow-up passed 151 document/sync tests and the rebuilt 24-turn
+Bounded owner registers validate immutable anchors, not changing heartbeat event
+IDs. Coalesced creation activity retains one timestamp/preview publication across
+independent seeds when all user-owned fields and row ownership match.
+
+Latest native follow-up passed 152 document/sync tests and the rebuilt 24-turn
 real collaboration smoke with all 1,600 history rows. Three awake quiet-owner
 runs passed lease freshness and cold recovery; the headed demo admitted a new
 mock turn and rendered its completed reply. Remote release gates remain required.
@@ -73,9 +77,11 @@ Real simulator/native/Edge transport and the complete staging simulator/archive
 gate passed in [mobile run 37373585650](https://github.com/Ashler-AI/comet/actions/runs/37373585650)
 from `70e90dc1`. Archive signing is ad-hoc, not Apple distribution; no new
 TestFlight upload or staging/production release is claimed for that earlier
-candidate. The owner has authorized the updated-client cutover and staging
-rollout; final release gates and a safe devbox checkpoint precede activation.
+candidate. Updated-client rollout is authorized, but existing-engine work has
+resumed; merging, writer-gate activation and restarts wait for a fresh coordinated
+checkpoint. Candidate verification proceeds independently without an execution hold.
 Local typechecks are intentionally skipped to preserve workstation resources.
+
 ## Crew Staging mobile 1.0 (29)
 
 Crew Staging **1.0 (29)** is available in the existing **Ashler Internal** TestFlight
