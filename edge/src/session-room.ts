@@ -584,7 +584,8 @@ export class SessionRoom implements DurableObject {
       if (workspace) this.notifyWorkspace(doc, projectScope, true);
       try {
         doc = this.importLoroUpdates(doc, [body]);
-      } catch {
+      } catch (error) {
+        this.escalateWasmPoisoning(error);
         return json({ error: "invalid_update" }, 400);
       }
       if (workspace) this.notifyWorkspace(doc, projectScope);
@@ -789,6 +790,10 @@ export class SessionRoom implements DurableObject {
    * within seconds instead of hot-looping against a deaf room until
    * Cloudflare's memory-limit reset finally fires. */
   private escalateWasmPoisoning(e: unknown): void {
+    if (this.env.ENVIRONMENT === "staging") {
+      console.error("Loro operation failed", `room=${this.getMeta("chatId") ?? "?"}`,
+        (e instanceof Error ? e.stack ?? `${e.name}: ${e.message}` : String(e)).slice(0, 512));
+    }
     if (!(e instanceof RangeError || e instanceof WebAssembly.RuntimeError)) return;
     wasmPoisonStrikes++;
     if (wasmPoisonStrikes < WASM_POISON_ABORT_AFTER) return;
@@ -1030,7 +1035,8 @@ export class SessionRoom implements DurableObject {
           }
         }
         doc = this.importLoroUpdates(doc, updates);
-      } catch {
+      } catch (error) {
+        this.escalateWasmPoisoning(error);
         // Missing dependencies or an irreversible shallow-history gap require
         // peer recovery; never acknowledge a merely pending import as applied.
         this.ack(ws, { crdt, roomId }, UpdateStatusCode.InvalidUpdate, batchId);

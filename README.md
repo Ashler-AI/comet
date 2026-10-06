@@ -15,6 +15,8 @@ Invalid seeds still leave retained state unchanged; production responses remain
 generic and neither environment returns seed contents or credentials.
 Recovery-seed decoding uses the existing WASM exhaustion/recycle policy; rejected
 requests never replace retained workspace history.
+HTTP and WebSocket imports use that same policy instead of masking exhausted
+WASM as an ordinary invalid update; staging logs retain a bounded error stack.
 
 The edge pins Loro 1.16.4 for lower-memory concurrent workspace imports; no
 history boundary is advanced. A returning native writer's edit over the recovered
