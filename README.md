@@ -30,7 +30,12 @@ independent seeds when all user-owned fields and row ownership match.
 Latest native follow-up passed 152 document/sync tests and the rebuilt 24-turn
 real collaboration smoke with all 1,600 history rows. Three awake quiet-owner
 runs passed lease freshness and cold recovery; the headed demo admitted a new
-mock turn and rendered its completed reply. Remote release gates remain required.
+mock turn and rendered its completed reply. Candidate `de43e527` passed Linux,
+macOS and complete mobile gates in [run 37420927501](https://github.com/Ashler-AI/comet/actions/runs/37420927501),
+including real simulator/native/Edge transport and the staging 1.0 (30) archive.
+All nine downloaded checksums, exact bundle/build and production APNs entitlement
+verified. The archive is ad-hoc, not Apple distribution or TestFlight availability;
+no merge, channel publication or live-engine cutover occurred.
 
 Public room identities are canonical UUIDs. Principal, project and deployment
 boundaries remain exact; private execution keys never become discovery rows.
