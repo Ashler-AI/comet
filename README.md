@@ -16,6 +16,12 @@ generic and neither environment returns seed contents or credentials.
 Recovery-seed decoding uses the existing WASM exhaustion/recycle policy; rejected
 requests never replace retained workspace history.
 
+The edge pins Loro 1.16.4 for lower-memory concurrent workspace imports; no
+history boundary is advanced. A returning native writer's edit over the recovered
+workspace used 104 MiB of WASM linear memory versus 143 MiB on 1.13.9.
+Replay the same budget check in a fresh process with private corpus files:
+`node edge/scripts/workspace-replay-memory-smoke.mjs BASELINE.loro DELTA.loro`.
+
 ## Crew Staging mobile 1.0 (29)
 
 Crew Staging **1.0 (29)** is available in the existing **Ashler Internal** TestFlight
