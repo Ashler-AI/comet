@@ -650,6 +650,7 @@ enum E2ERunner {
               await SessionStore.runTerminalControlRegression(),
               await RoomClient.runResetEpochRegression(),
               await SessionStore.runDurableIntentRegression(),
+              await SessionStore.runAdmissionReadbackRegression(),
               await SessionStore.runTranscriptActivityRegression(),
               await AppModel.runMetadataClearRegression(),
               await DeviceRelayClient.runConnectionGenerationRegression(),

@@ -702,15 +702,35 @@ const ordinaryDeviceSmoke = async (edgeOrigin, scaffoldOrigin, restartEdge) => {
   const sessionId = crypto.randomUUID();
   const typed = (action) => ({ kind: "control", source: "local", sessionId,
     ownerDeviceId: deviceId, actorDeviceId: "desktop", actorSubject: OWNER_SUBJECT, grantId: "", action });
-  await send(typed({ action: "start", message_id: crypto.randomUUID(), request }));
-  await waitFor("ordinary Local session publication", async () =>
-    (await localRpc(desktop, "WatchCollaboration", { chatId })).sessions.some((session) =>
-      session.sessionId === sessionId && session.ownerDeviceId === deviceId && session.source === "local"));
+  const typedStart = await send(typed({ action: "start", message_id: crypto.randomUUID(), request }));
+  try {
+    await waitFor("ordinary Local session publication", async () =>
+      (await localRpc(desktop, "WatchCollaboration", { chatId })).sessions.some((session) =>
+        session.sessionId === sessionId && session.ownerDeviceId === deviceId && session.source === "local"));
+  } catch (error) {
+    const outcome = await localRpc(devbox, "ReadSessionCommand", { chatId, commandId: typedStart.commandId });
+    throw new Error(`${error.message}; owner command status=${outcome.command?.status ?? "missing"}, resolution=${String(outcome.command?.resolution ?? "none").slice(0, 500)}`);
+  }
   await send(typed({ action: "steer", prompt: "continue", message_id: crypto.randomUUID() }));
   await send(typed({ action: "stop" }));
   await waitFor("typed remote stop", async () =>
     (await localRpc(devbox, "WatchCollaboration", { chatId })).sessions.some((session) =>
       session.sessionId === sessionId && session.status === "idle"));
+  const readParams = { chatId, commandId: typedStart.commandId, targetDeviceId: deviceId, roomProjection: null };
+  const outcome = await localRpc(desktop, "ReadSessionCommand", readParams);
+  assert.equal(outcome.command?.status, "applied", "the observing device reads the original owner's durable outcome");
+  assert.equal(outcome.command?.payload.sessionId, sessionId);
+  for (const token of [OWNER_TOKEN, CLIENT_A_TOKEN]) {
+    const unscoped = await openWebSocket(
+      `${edgeOrigin.replace("http:", "ws:")}/device/${deviceId}/ws?role=client&token=${token}`,
+      "unscoped outcome reader"
+    );
+    try {
+      await assert.rejects(rpcCall(unscoped, 1, "ReadSessionCommand", {
+        chatId, commandId: typedStart.commandId
+      }), { message: "peer_command_scope_denied" });
+    } finally { await closeWebSocket(unscoped, "unscoped outcome reader"); }
+  }
   const attacker = await openWebSocket(
     `${edgeOrigin.replace("http:", "ws:")}/device/${deviceId}/ws?role=client&purpose=control&controlSessionId=${chatId}&token=${CLIENT_A_TOKEN}`,
     "foreign principal control"

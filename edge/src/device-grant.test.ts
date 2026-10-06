@@ -68,6 +68,21 @@ describe("ordinary device command admission", () => {
     expect(peerCommandAdmission(client, host, encode({ ...request, method: "QueueCommand" }), now)).toBeUndefined();
   });
 
+  it("reads an accepted command only through the same authenticated host/session authority", () => {
+    const reader = { ...client, capabilities: ["session.read"] };
+    const read = { id: 2, method: "ReadSessionCommand", params: { chatId: "chat-a", commandId: "command-a", targetDeviceId: "devbox-a" } };
+    expect(peerCommandAdmission(reader, host, encode(read), now)).toBeDefined();
+    for (const changed of [{ userId: "attacker" }, { projectScope: "foreign" }, { targetDeviceId: "other" },
+      { controlSessionId: "other-chat" }, { capabilities: [] }, { controlConsumed: true }, { joinedAt: now - 30_000 }]) {
+      expect(peerCommandAdmission({ ...reader, ...changed }, host, encode(read), now)).toBeUndefined();
+    }
+    for (const changed of [{ targetDeviceId: "other" }, { chatId: "other-chat" },
+      { roomProjection: { projectId: "project-a", deploymentId: "deployment-a", sessionId: "chat-a" } }]) {
+      expect(peerCommandAdmission(reader, host, encode({ ...read, params: { ...read.params, ...changed } }), now)).toBeUndefined();
+    }
+    expect(peerCommandAdmission(reader, host, encode(request), now)).toBeUndefined();
+  });
+
   it.each(["deploymentId", "controlDeploymentId"] as const)("does not erase an ordinary admission's explicit %s", (field) => {
     for (const value of ["deployment-a", ""]) {
       expect(peerCommandAdmission(client, host, encode({ ...request, params: {
@@ -135,6 +150,23 @@ describe("ordinary device command admission", () => {
     expect(deliver).toHaveBeenCalledOnce();
     expect(rejectRequest).toHaveBeenCalledWith(socket, expect.anything(), "peer_command_scope_denied");
     expect(deliver.mock.calls[0][1].k).toBe("peer-command");
+  });
+
+  it("denies ordinary raw outcome reads instead of borrowing the host identity", async () => {
+    const rejectRequest = vi.fn();
+    const deliver = vi.fn();
+    const room = {
+      authorizePeerClient: async () => true, authorizeHost: async () => true,
+      liveHost: () => ({ deserializeAttachment: () => host }), deliver, rejectRequest
+    } as unknown as DeviceRoom;
+    for (const userId of [client.userId, "foreign-owner"]) {
+      const socket = { deserializeAttachment: () => ({ ...client, userId,
+        role: "client", capabilities: [...client.capabilities, "session.read"], controlSessionId: undefined }) } as unknown as WebSocket;
+      await DeviceRoom.prototype.webSocketMessage.call(room, socket, encodeDeviceFrame({ s: "rpc", k: "rpc" },
+        encode({ id: 1, method: "ReadSessionCommand", params: { chatId: "chat-a", commandId: "command-a" } })).buffer as ArrayBuffer);
+      expect(rejectRequest).toHaveBeenLastCalledWith(socket, expect.anything(), "peer_command_scope_denied");
+    }
+    expect(deliver).not.toHaveBeenCalled();
   });
 
   it("never relays client-forged authority frames", async () => {
@@ -502,6 +534,18 @@ describe("session-scoped host RPC", () => {
   it("allows only the non-mutating exact-device readiness probe", () => {
     expect(rpcAllowedForScopedHost(rpc, payload({ method: "LocalDevice", params: {} }), grant)).toBe(true);
     expect(rpcAllowedForScopedHost(rpc, payload({ method: "LocalDevice", params: { targetDeviceId: "other" } }), grant)).toBe(false);
+  });
+
+  it("fences scoped command readback by session, deployment and device", () => {
+    const read = { method: "ReadSessionCommand", params: { chatId: rawGrant.scope.sessionId,
+      commandId: "accepted-command", targetDeviceId: rawGrant.targetDeviceId,
+      roomProjection: { projectId: rawGrant.scope.projectId, deploymentId: rawGrant.scope.deploymentId, sessionId: rawGrant.scope.sessionId } } };
+    expect(rpcAllowedForScopedHost(rpc, payload(read), grant)).toBe(true);
+    for (const changed of [{ chatId: "other" }, { targetDeviceId: "other" },
+      { roomProjection: { ...read.params.roomProjection, deploymentId: "other" } }]) {
+      expect(rpcAllowedForScopedHost(rpc, payload({ ...read, params: { ...read.params, ...changed } }), grant)).toBe(false);
+    }
+    expect(rpcAllowedForScopedHost(rpc, payload(read), { ...grant, capabilities: [] })).toBe(false);
   });
 
   it("requires file authority and the exact session for attachment uploads", () => {

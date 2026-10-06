@@ -74,6 +74,22 @@ describe("trusted device host forwarding", () => {
     expect(forwardedRequests).toEqual([]);
   });
 
+  it("admits read-only outcome authority only on an exact one-shot session socket", async () => {
+    const env = edgeEnv("dev", "local");
+    env.SCAFFOLD_REQUIRED_CAPABILITIES = "session.read";
+    for (const [query, status] of [
+      ["role=client&purpose=control&controlSessionId=11111111-1111-4111-8111-111111111111", 204],
+      ["role=client", 403], ["role=host", 403],
+      ["role=client&purpose=control&controlSessionId=invalid", 403]
+    ] as const) {
+      const response = await worker.fetch(new Request(
+        `http://127.0.0.1/device/local-engine/ws?${query}`,
+        { headers: { authorization: "Bearer reader@ashler-local", upgrade: "websocket" } }
+      ), env);
+      expect(response.status).toBe(status);
+    }
+  });
+
   it("lets an ordinary local dev engine host and replaces spoofed authority", async () => {
     const env = edgeEnv("dev", "local");
     const response = await worker.fetch(

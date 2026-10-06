@@ -44,6 +44,132 @@ enum DocDisk {
         }
     }
 
+    static let workspaceIdentityFields = ["id", "chatId", "userId", "deviceId", "ownerSubject", "ownerDeviceId", "ownerPrincipal", "projectId", "deploymentId"]
+
+    private static func selfSessionId(_ id: String) -> Substring? {
+        let bytes = id.utf8
+        let first = bytes.prefix(36)
+        guard first.count == 36, bytes.count > 36,
+              first.enumerated().allSatisfy({ index, byte in
+                  (index == 8 || index == 13 || index == 18 || index == 23) ? byte == 45 : (48...57).contains(byte) || (97...102).contains(byte)
+              }) else { return nil }
+        var rest = bytes.dropFirst(36)
+        while !rest.isEmpty {
+            guard rest.starts(with: "::session::".utf8) else { return nil }
+            rest = rest.dropFirst(11)
+            guard rest.starts(with: first) else { return nil }
+            rest = rest.dropFirst(36)
+        }
+        return id[..<id.index(id.startIndex, offsetBy: 36)]
+    }
+
+    static func normalizeWorkspaceIntent(_ original: RecordIntent) throws -> RecordIntent {
+        guard ["chats", "sessions", "sessionRefs", "worktreeDeletions"].contains(original.root) else { return original }
+        let identity = original.root == "chats" ? "id" : "chatId"
+        let values = try ([original.before, original.after] + original.intermediates).map { try recordValue($0) }
+        guard let base = values.compactMap({ $0?.mapValue }).first, base[identity]?.stringValue != nil else { return original }
+        let user = base["userId"]?.stringValue
+        var keyId = original.key
+        if original.root == "sessionRefs" {
+            guard let user, keyId.hasPrefix("\(user.utf8.count):\(user):") else {
+                throw MobileSessionError.unavailable("Crew cannot recover membership for a different principal.")
+            }
+            keyId = String(keyId.dropFirst("\(user.utf8.count):\(user):".count))
+        }
+        guard let publicId = selfSessionId(keyId) ?? values.compactMap({ $0?.mapValue?[identity]?.stringValue }).compactMap({ selfSessionId($0) }).first else { return original }
+        guard keyId == publicId || selfSessionId(keyId) == publicId else { throw MobileSessionError.unavailable("Crew retained a conflicting session identity.") }
+        let owners = original.root == "sessionRefs" ? ["userId"] : original.root == "worktreeDeletions" ? ["ownerSubject", "ownerDeviceId"] : ["deviceId"]
+        guard owners.allSatisfy({ !(base[$0]?.stringValue ?? "").isEmpty }) else { throw MobileSessionError.unavailable("Crew retained an unowned session alias.") }
+        for value in values.compactMap({ $0 }) {
+            guard let row = value.mapValue, let id = row[identity]?.stringValue, id == publicId || selfSessionId(id) == publicId,
+                  workspaceIdentityFields.filter({ $0 != identity }).allSatisfy({ row[$0] == base[$0] }),
+                  row["environment"]?.mapValue?["scope"] == base["environment"]?.mapValue?["scope"] else {
+                throw MobileSessionError.unavailable("Crew cannot migrate a foreign session identity; original edits are retained.")
+            }
+        }
+        let canonicalId = String(publicId)
+        func normalize(_ bytes: Data?) throws -> Data? {
+            guard var row = try recordValue(bytes)?.mapValue else { return bytes }
+            row[identity] = .string(canonicalId)
+            return try recordData(.map(row))
+        }
+        var intent = original
+        intent.key = original.root == "sessionRefs" ? "\(user!.utf8.count):\(user!):\(canonicalId)" : canonicalId
+        intent.before = try normalize(original.before); intent.after = try normalize(original.after)
+        intent.intermediates = try original.intermediates.map { try normalize($0) }
+        return intent
+    }
+
+    static func canonicalCreationCoversAlias(_ alias: RecordIntent, canonical: RecordIntent, cached: LoroDoc) throws -> Bool {
+        guard alias.root == canonical.root, alias.key != canonical.key, alias.before == nil, canonical.before == nil,
+              alias.intermediates.isEmpty, canonical.intermediates.isEmpty,
+              let aliasBytes = alias.version, let canonicalBytes = canonical.version,
+              let aliasVersion = try? VersionVector.decode(bytes: aliasBytes),
+              let canonicalVersion = try? VersionVector.decode(bytes: canonicalBytes),
+              canonicalVersion.includesVv(other: aliasVersion),
+              canonicalVersion.includesVv(other: cached.oplogVv()), cached.oplogVv().includesVv(other: canonicalVersion) else { return false }
+        let local = try normalizeWorkspaceIntent(alias), target = try normalizeWorkspaceIntent(canonical)
+        guard local.key == target.key, target.key == canonical.key else { return false }
+        for (original, normalized) in [(alias, local), (canonical, target)] {
+            var evidence = RecordIntent(root: original.root, key: original.key, before: nil)
+            evidence.after = try recordData(recordValue(in: cached, root: original.root, key: original.key))
+            guard try recordValue(normalizeWorkspaceIntent(evidence).after) == recordValue(normalized.after),
+                  cached.getMap(id: original.root).getLastEditor(key: original.key) != nil else { return false }
+        }
+        if target.after == nil { return true }
+        guard let local = try recordValue(local.after)?.mapValue, let target = try recordValue(target.after)?.mapValue else { return false }
+        let observations: Set<String>
+        switch alias.root {
+        case "chats": observations = ["createdAt", "harnessSessionId", "harnessSessionCwd", "lastSeenAt", "lastMessageAt", "lastMessagePreview"]
+        case "sessions": observations = ["status", "startedAt", "updatedAt"]
+        case "sessionRefs": observations = ["addedAt"]
+        default: return false
+        }
+        guard Set(local.keys).union(target.keys).allSatisfy({ local[$0] == target[$0] || observations.contains($0) }) else { return false }
+        for clock in alias.root == "sessions" ? ["updatedAt"] : ["lastSeenAt", "lastMessageAt"] {
+            if let localClock = local[clock]?.i64Value, target[clock]?.i64Value.map({ $0 >= localClock }) != true { return false }
+        }
+        if alias.root == "sessions", local["updatedAt"] == target["updatedAt"], ["status", "startedAt"].contains(where: { local[$0] != target[$0] }) { return false }
+        if alias.root == "chats", local["lastMessageAt"] == target["lastMessageAt"], local["lastMessagePreview"] != target["lastMessagePreview"] { return false }
+        return true
+    }
+
+    /// Work on a fork before binding it: failures leave the cache and its evidence intact.
+    static func migrateWorkspaceRows(in doc: LoroDoc) throws -> Bool {
+        var changed = false
+        for root in ["chats", "sessions", "sessionRefs", "worktreeDeletions"] {
+            let map = doc.getMap(id: root)
+            for (key, value) in map.getDeepValue().mapValue ?? [:] {
+                var original = RecordIntent(root: root, key: key, before: nil)
+                original.after = try recordData(value)
+                let normalized = try normalizeWorkspaceIntent(original)
+                guard normalized.key != key || normalized.after != original.after else { continue }
+                guard isRecoveryValue(value), let fields = try recordValue(normalized.after)?.mapValue else { continue }
+                var targetIntent = RecordIntent(root: root, key: normalized.key, before: nil)
+                targetIntent.after = try recordData(recordValue(in: doc, root: root, key: normalized.key))
+                let remote = try recordValue(normalizeWorkspaceIntent(targetIntent).after)?.mapValue
+                if normalized.key != key, let remote {
+                    guard workspaceIdentityFields.allSatisfy({ remote[$0] == fields[$0] }),
+                          remote["environment"]?.mapValue?["scope"] == fields["environment"]?.mapValue?["scope"] else {
+                        throw MobileSessionError.unavailable("Crew cannot merge a foreign canonical workspace record.")
+                    }
+                }
+                let deleted = map.get(key: normalized.key) == nil && map.getLastEditor(key: normalized.key) != nil
+                if !deleted {
+                    let row = try map.getOrCreateContainer(key: normalized.key, child: LoroMap())
+                    let newerStatus = root == "sessions" && (fields["updatedAt"]?.i64Value ?? Int64.min) > (remote?["updatedAt"]?.i64Value ?? Int64.min)
+                    for (field, value) in fields where (key == normalized.key && field == (root == "chats" ? "id" : "chatId")) || (newerStatus && ["status", "startedAt", "updatedAt"].contains(field)) || (row.get(key: field) == nil && row.getLastEditor(key: field) == nil) {
+                        try row.insert(key: field, v: value)
+                    }
+                }
+                if key != normalized.key { try map.delete(key: key) }
+                changed = true
+            }
+        }
+        if changed { doc.commit() }
+        return changed
+    }
+
     static func recordValue(in doc: LoroDoc, root: String, key: String) throws -> LoroValue? {
         guard let item = doc.getMap(id: root).get(key: key) else { return nil }
         guard let value = item.asValue() ?? item.asLoroMap()?.getDeepValue() else {
@@ -66,6 +192,14 @@ enum DocDisk {
     static func applyRecordChange(root: String, key: String, before: LoroValue?, after: LoroValue?, in doc: LoroDoc,
                                   alternatives: [LoroValue?] = []) throws {
         let server = try recordValue(in: doc, root: root, key: key)
+        if let identity = after?.mapValue ?? before?.mapValue {
+            for row in ([before, after, server] + alternatives).compactMap({ $0?.mapValue }) {
+                guard workspaceIdentityFields.allSatisfy({ row[$0] == identity[$0] }),
+                      row["environment"]?.mapValue?["scope"] == identity["environment"]?.mapValue?["scope"] else {
+                    throw MobileSessionError.unavailable("Crew recovery cannot change retained record ownership or project/deployment identity.")
+                }
+            }
+        }
         if server == after { return }
         var before = before
         if let desired = after?.mapValue, let remote = server?.mapValue, !alternatives.isEmpty {
@@ -88,10 +222,8 @@ enum DocDisk {
                   before == nil || server != nil else {
                 throw MobileSessionError.unavailable("Crew recovery conflicts with the authoritative \(root) record \(key), including a remote deletion. The original intent is retained.")
             }
-            for field in ["id", "chatId", "userId", "deviceId"] where base[field] != nil {
-                guard desired[field] == base[field], remote[field] == base[field] else {
-                    throw MobileSessionError.unavailable("Crew recovery cannot replace record ownership or identity (\(field)).")
-                }
+            guard server != nil || map.getLastEditor(key: key) == nil else {
+                throw MobileSessionError.unavailable("Crew recovery cannot revive a deleted record.")
             }
             let row = try map.getOrCreateContainer(key: key, child: LoroMap())
             // Legacy scalar records may become containers. Preserve every
@@ -434,6 +566,41 @@ extension DocDisk {
             try? FileManager.default.removeItem(at: intentURL(for: cacheId))
         }
         do {
+            let publicId = "018eeb58-6508-78e8-a544-44682ab94c50"
+            let alias = publicId + "::session::" + publicId + "::session::" + publicId
+            guard selfSessionId(alias).map({ $0 == publicId }) == true,
+                  selfSessionId(alias + "::session::018eeb58-6508-78e8-a544-44682ab94c51") == nil,
+                  selfSessionId(publicId + "::session::018eeb58-6508-78e8-a544-44682ab94c51::session::" + publicId) == nil,
+                  selfSessionId(alias + "::session::") == nil else { return false }
+            let aliasDoc = LoroDoc()
+            let aliasRow = try aliasDoc.getMap(id: "chats").getOrCreateContainer(key: alias, child: LoroMap())
+            try aliasRow.insert(key: "id", v: publicId); try aliasRow.insert(key: "deviceId", v: "owner")
+            try aliasRow.insert(key: "title", v: "Retained")
+            aliasDoc.commit()
+            guard try migrateWorkspaceRows(in: aliasDoc), !(try migrateWorkspaceRows(in: aliasDoc)),
+                  try recordValue(in: aliasDoc, root: "chats", key: publicId)?.mapValue?["title"]?.stringValue == "Retained" else { return false }
+            var aliasIntent = RecordIntent(root: "chats", key: alias, before: try recordData(.map(["id": .string(alias), "deviceId": .string("owner"), "title": .string("Before")])))
+            aliasIntent.after = try recordData(.map(["id": .string(publicId), "deviceId": .string("owner"), "title": .string("After")]))
+            aliasIntent.intermediates = [aliasIntent.before, aliasIntent.after]
+            let normalized = try normalizeWorkspaceIntent(aliasIntent)
+            guard normalized.key == publicId, normalized.id == aliasIntent.id,
+                  try recordValue(normalized.before)?.mapValue?["id"]?.stringValue == publicId,
+                  try normalized.intermediates.allSatisfy({ try recordValue($0)?.mapValue?["id"]?.stringValue == publicId }) else { return false }
+            var mixed = aliasIntent
+            mixed.key = publicId; mixed.before = aliasIntent.after; mixed.after = aliasIntent.before
+            guard try recordValue(normalizeWorkspaceIntent(mixed).after)?.mapValue?["id"]?.stringValue == publicId else { return false }
+            mixed.intermediates = [try recordData(.map(["id": .string(alias), "deviceId": .string("foreign")]))]
+            do { _ = try normalizeWorkspaceIntent(mixed); return false } catch MobileSessionError.unavailable(_) {}
+            let foreign = aliasDoc.fork()
+            let foreignAlias = try foreign.getMap(id: "chats").getOrCreateContainer(key: alias, child: LoroMap())
+            try foreignAlias.insert(key: "id", v: alias); try foreignAlias.insert(key: "deviceId", v: "foreign")
+            foreign.commit()
+            do { _ = try migrateWorkspaceRows(in: foreign); return false } catch MobileSessionError.unavailable(_) {}
+            try aliasDoc.getMap(id: "chats").delete(key: publicId)
+            let lateAlias = try aliasDoc.getMap(id: "chats").getOrCreateContainer(key: alias, child: LoroMap())
+            try lateAlias.insert(key: "id", v: alias); try lateAlias.insert(key: "deviceId", v: "owner")
+            aliasDoc.commit()
+            guard try migrateWorkspaceRows(in: aliasDoc), aliasDoc.getMap(id: "chats").get(key: publicId) == nil else { return false }
             let source = LoroDoc()
             let row = try source.getMap(id: "chats").getOrCreateContainer(key: "existing", child: LoroMap())
             try row.insert(key: "id", v: "existing")

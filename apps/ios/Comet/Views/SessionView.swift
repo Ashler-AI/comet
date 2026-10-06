@@ -150,7 +150,7 @@ struct SessionView: View {
         } message: {
             Text(forkError ?? "Unknown error")
         }
-        .alert("Couldn’t send", isPresented: Binding(
+        .alert("Crew instruction status", isPresented: Binding(
             get: { store?.sendFailure != nil },
             set: { if !$0 { store?.clearSendFailure() } }
         )) {
@@ -348,9 +348,9 @@ struct SessionView: View {
     /// transitions so status feedback never moves the composer.
     private func statusStrip(store: SessionStore, activity: SessionActivity, now: Int64) -> some View {
         HStack(spacing: 6) {
-            if !store.pendingSends.isEmpty {
+            if let delivery = store.deliveryStatus {
                 WorkingSpinner()
-                Text("Sending\u{2026}")
+                Text(delivery)
                     .font(Theme.sans(12))
                     .foregroundStyle(Theme.textMuted)
             } else {

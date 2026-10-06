@@ -53,8 +53,9 @@
 //! forward can never loop. Streaming methods are proxied by re-subscribing remotely and
 //! piping items. To make another method device-addressable, nothing per-method is needed
 //! beyond listing it in [`forwardable`] (and [`is_stream_method`] if it streams);
-//! handlers stay transport-agnostic. `QueueCommand` stays non-forwardable; ordinary
-//! remote hosts use a separate, one-shot authenticated relay admission before append.
+//! handlers stay transport-agnostic. `QueueCommand` and `ReadSessionCommand` stay
+//! non-forwardable; ordinary remote hosts use fresh one-shot authenticated sockets
+//! for admission and outcome readback.
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -1307,34 +1308,23 @@ impl EngineRpc {
         payload: SessionCommandPayload,
         target_device_id: Option<&str>,
         projection: Option<&SessionRoomProjection>,
-    ) -> Result<comet_doc::SessionCommandEntry, RpcError> {
+    ) -> Result<(comet_doc::SessionCommandEntry, Option<String>), RpcError> {
         let deployment_id = projection.map(|scope| scope.deployment_id.as_str());
         let local_device =
             comet_proto::parse_scaffold_device_id(self.doc_host.device_id()).is_none();
-        if local_device && (target_device_id.is_none()
-            || (projection.is_none()
-                && target_device_id == Some(self.doc_host.device_id())
-                && self.doc_host.is_locally_hosted(target_chat_id))) {
-            self.doc_host
-                .open_projection(target_chat_id, projection)
-                .map_err(|error| RpcError::Failed(error.to_string()))?;
-            let entry = self.doc_host
-                .queue_command_with_id(target_chat_id, command_id, payload)
-                .map_err(|error| RpcError::Failed(error.to_string()))?;
-            self.doc_host.wake_queued_command(target_chat_id, &entry.id).await
-                .map_err(|error| RpcError::Failed(error.to_string()))?;
-            return Ok(entry);
-        }
-        if self.links.is_none() {
-            self.doc_host
-                .open_projection(target_chat_id, projection)
-                .map_err(|error| RpcError::Failed(error.to_string()))?;
-            let entry = self.doc_host
-                .queue_command_with_id(target_chat_id, command_id, payload)
-                .map_err(|error| RpcError::Failed(error.to_string()))?;
-            self.doc_host.wake_queued_command(target_chat_id, &entry.id).await
-                .map_err(|error| RpcError::Failed(error.to_string()))?;
-            return Ok(entry);
+        if (local_device && (target_device_id.is_none()
+            || (projection.is_none() && target_device_id == Some(self.doc_host.device_id())
+                && self.doc_host.is_locally_hosted(target_chat_id)))) || self.links.is_none() {
+            let entry = if let Some(existing) = self.doc_host.command_entry_projection(target_chat_id, command_id, projection)
+                .map_err(|error| RpcError::Failed(error.to_string()))? {
+                if existing.payload != payload { return Err(RpcError::Failed("command_id_conflict".into())); }
+                existing
+            } else {
+                self.doc_host.open_projection(target_chat_id, projection).map_err(|error| RpcError::Failed(error.to_string()))?;
+                self.doc_host.queue_command_with_id(target_chat_id, command_id, payload).map_err(|error| RpcError::Failed(error.to_string()))?
+            };
+            let delivery_error = self.doc_host.wake_queued_command(target_chat_id, &entry.id).await.err().map(|error| error.to_string());
+            return Ok((entry, delivery_error));
         }
         let links = self
             .links
@@ -1345,7 +1335,7 @@ impl EngineRpc {
             "commandId": command_id,
             "command": payload,
         });
-        if let Some(target_device_id) = target_device_id {
+        let receipt = if let Some(target_device_id) = target_device_id {
             links
                 .peer_device_call(
                     target_device_id,
@@ -1354,7 +1344,7 @@ impl EngineRpc {
                     methods::DELIVER_PEER_MESSAGE,
                     params,
                 )
-                .await?;
+                .await?
         } else {
             links
                 .peer_call(
@@ -1363,9 +1353,11 @@ impl EngineRpc {
                     methods::DELIVER_PEER_MESSAGE,
                     params,
                 )
-                .await?;
-        }
-        Ok(comet_doc::SessionCommandEntry {
+                .await?
+        };
+        if receipt["commandId"].as_str() != Some(command_id) { return Err(RpcError::Failed("peer admission response has unknown outcome; retry original commandId".into())); }
+        let delivery_error = receipt["deliveryError"].as_str().map(str::to_owned);
+        Ok((comet_doc::SessionCommandEntry {
             id: command_id.to_string(),
             payload,
             issued_by: self.doc_host.device_id().to_string(),
@@ -1374,7 +1366,7 @@ impl EngineRpc {
             expires_at: None,
             status: comet_doc::SessionCommandStatus::Pending,
             resolution: None,
-        })
+        }, delivery_error))
     }
 
     fn worktree_deletion_stage(&self, chat_id: &str) -> Option<WorktreeDeletionStage> {
@@ -1570,9 +1562,8 @@ fn owner_may_stage_worktree_deletion(
 }
 
 /// ControlRpc methods that operate on device-local resources and therefore
-/// honor `targetDeviceId`. Durable session commands are deliberately excluded:
-/// the authenticated caller's engine must append them to its local shared
-/// document first, then the document host drains them after sync.
+/// honor `targetDeviceId` through cached links. Durable session admission and
+/// outcome readback have their own authenticated routing in the method handlers.
 fn forwardable(method: &str) -> bool {
     matches!(
         method,
@@ -1932,14 +1923,45 @@ impl RpcService for AuthRpc {
 
 #[async_trait]
 impl RpcService for EngineRpc {
-    async fn admit_peer_command(
+    async fn peer_command(
         &self,
+        method: &str,
         authority: comet_rpc::PeerCommandAuthority,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, RpcError> {
         validate_public_chat_routes(&params)?;
+        if method == "ReadSessionCommand" {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase", deny_unknown_fields)]
+            struct ReadParams {
+                chat_id: String,
+                command_id: String,
+                #[serde(default)] target_device_id: Option<String>,
+                #[serde(default)] room_projection: Option<SessionRoomProjection>,
+            }
+            let p: ReadParams = parse_params(params)?;
+            let auth = self.auth()?.state();
+            if self.runtime_profile == RuntimeProfile::ScaffoldHost
+                || auth.user().map(|user| user.id.as_str()) != Some(authority.subject.as_str())
+                || auth.project_scope() != Some(authority.project_id.as_str())
+                || authority.subject != self.workspace.owner_subject()
+                || authority.project_id != self.workspace.project_scope()
+                || authority.device_id != self.doc_host.device_id()
+                || authority.chat_id != p.chat_id || authority.expires_at <= crate::now_ms()
+                || p.room_projection.is_some() || self.doc_host.has_scoped_route(&p.chat_id)
+                || p.target_device_id.as_deref().is_some_and(|device| device != authority.device_id)
+                || p.command_id.trim().is_empty() {
+                return Err(RpcError::Failed("peer_command_scope_denied".into()));
+            }
+            let command = self.doc_host.command_entry_projection(&p.chat_id, &p.command_id, None)
+                .map_err(|error| RpcError::Failed(error.to_string()))?
+                .map(|entry| serde_json::json!({ "commandId": entry.id, "status": entry.status,
+                    "resolution": entry.resolution, "payload": entry.payload, "issuedAt": entry.issued_at,
+                    "expiresAt": entry.expires_at, "issuedBy": entry.issued_by }));
+            return Ok(serde_json::json!({ "command": command }));
+        }
+        if method != "AdmitPeerCommand" { return Err(RpcError::UnknownMethod(method.into())); }
         let mut p: QueueCommandParams = parse_params(params)?;
-        validate_command_lifetime(p.issued_at, p.expires_at, crate::now_ms())?;
         if p.explicit_deployment()?.is_some() || self.doc_host.has_scoped_route(&p.chat_id) {
             return Err(RpcError::Failed("peer_command_scope_denied".into()));
         }
@@ -1947,15 +1969,44 @@ impl RpcService for EngineRpc {
         if self.runtime_profile == RuntimeProfile::ScaffoldHost
             || auth.user().map(|user| user.id.as_str()) != Some(authority.subject.as_str())
             || auth.project_scope() != Some(authority.project_id.as_str())
+            || authority.subject != self.workspace.owner_subject()
             || authority.project_id != self.workspace.project_scope()
             || authority.device_id != self.doc_host.device_id()
             || authority.chat_id != p.chat_id
+            || p.target_device_id.as_deref().is_some_and(|device| device != authority.device_id)
             || authority.expires_at <= crate::now_ms()
             || !ordinary_peer_command(&p.command)
         {
             return Err(RpcError::Failed("peer_command_scope_denied".into()));
         }
-        if !self.doc_host.is_locally_hosted(&p.chat_id) {
+        let command_id = p
+            .command_id
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| RpcError::BadParams("commandId required".into()))?;
+        if let SessionCommandPayload::Control {
+            owner_device_id,
+            actor_device_id,
+            actor_subject,
+            grant_id,
+            ..
+        } = &mut p.command
+        {
+            if owner_device_id != self.doc_host.device_id() || actor_subject != &authority.subject {
+                return Err(RpcError::Failed("peer_command_scope_denied".into()));
+            }
+            // The host admits on behalf of its authenticated owner, rather than
+            // trusting command-carried grant identifiers from the shared doc.
+            *actor_device_id = self.doc_host.device_id().to_string();
+            *grant_id = format!("peer-command:{command_id}");
+        }
+        let retained = self.doc_host.command_entry_projection(&p.chat_id, &command_id, None)
+            .map_err(|error| RpcError::Failed(error.to_string()))?;
+        if retained.is_none() { validate_command_lifetime(p.issued_at, p.expires_at, crate::now_ms())?; }
+        if self.workspace.doc().chat(&p.chat_id).map_err(|error| RpcError::Failed(error.to_string()))?
+            .is_some_and(|chat| chat.device_id != authority.device_id) {
+            return Err(RpcError::Failed("peer_command_scope_denied".into()));
+        }
+        if retained.is_none() && !self.doc_host.is_locally_hosted(&p.chat_id) {
             let Some(bootstrap) = p.bootstrap.take() else {
                 return Err(RpcError::Failed("peer_command_scope_denied".into()));
             };
@@ -2006,34 +2057,10 @@ impl RpcService for EngineRpc {
                 .upsert_session_ref(&p.chat_id, None)
                 .map_err(|error| RpcError::Failed(error.to_string()))?;
         }
-        if !self.doc_host.is_locally_hosted(&p.chat_id) {
+        if retained.is_none() && !self.doc_host.is_locally_hosted(&p.chat_id) {
             return Err(RpcError::Failed("peer_command_scope_denied".into()));
         }
-        let command_id = p
-            .command_id
-            .filter(|id| !id.trim().is_empty())
-            .ok_or_else(|| RpcError::BadParams("commandId required".into()))?;
-        if let SessionCommandPayload::Control {
-            owner_device_id,
-            actor_device_id,
-            actor_subject,
-            grant_id,
-            ..
-        } = &mut p.command
-        {
-            if owner_device_id != self.doc_host.device_id() || actor_subject != &authority.subject {
-                return Err(RpcError::Failed("peer_command_scope_denied".into()));
-            }
-            // The host admits on behalf of its authenticated owner, rather than
-            // trusting command-carried grant identifiers from the shared doc.
-            *actor_device_id = self.doc_host.device_id().to_string();
-            *grant_id = format!("peer-command:{command_id}");
-        }
-        let entry = match self
-            .doc_host
-            .command_entry(&p.chat_id, &command_id)
-            .map_err(|error| RpcError::Failed(error.to_string()))?
-        {
+        let entry = match retained {
             Some(entry) => entry,
             None => {
                 self.install_local_owner_grant(&p.command)?;
@@ -2048,12 +2075,11 @@ impl RpcService for EngineRpc {
         {
             return Err(RpcError::Failed("command_id_conflict".into()));
         }
-        self.workspace
-            .set_chat_archived(&p.chat_id, false)
-            .map_err(|error| RpcError::Failed(error.to_string()))?;
-        self.doc_host.wake_queued_command(&p.chat_id, &entry.id).await
-            .map_err(|error| RpcError::Failed(format!("{error}; durable commandId={}", entry.id)))?;
-        Ok(serde_json::json!({ "commandId": entry.id }))
+        let metadata_error = self.workspace.set_chat_archived(&p.chat_id, false).err().map(|error| error.to_string());
+        let delivery_error = self.doc_host.wake_queued_command(&p.chat_id, &entry.id).await.err().map(|error| error.to_string());
+        Ok(serde_json::json!({ "commandId": entry.id, "admission": "accepted",
+            "delivery": if delivery_error.is_some() { "pending" } else { "notified" },
+            "metadataError": metadata_error, "deliveryError": delivery_error }))
     }
 
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
@@ -2250,18 +2276,63 @@ impl RpcService for EngineRpc {
                 struct Params {
                     chat_id: String,
                     command_id: String,
+                    #[serde(default)]
+                    target_device_id: Option<String>,
+                    #[serde(default)]
+                    room_projection: Option<SessionRoomProjection>,
                 }
                 let p: Params = parse_params(params)?;
-                session_viewport_authority(self, &p.chat_id)?;
+                if self.runtime_profile == RuntimeProfile::ScaffoldHost {
+                    let authority = session_viewport_authority(self, &p.chat_id)?;
+                    if p.target_device_id.as_deref().is_some_and(|device| device != self.doc_host.device_id()) {
+                        return Err(RpcError::Failed("command_read_scope_denied".into()));
+                    }
+                    if p.room_projection.as_ref().is_some_and(|scope| scope.project_id != authority.scope.project_id
+                        || Some(scope.deployment_id.as_str()) != authority.scope.deployment_id.as_deref()
+                        || scope.session_id != p.chat_id) {
+                        return Err(RpcError::Failed("command_read_scope_denied".into()));
+                    }
+                } else {
+                    let auth = self.auth()?.state();
+                    if auth.user().map(|user| user.id.as_str()) != Some(self.workspace.owner_subject())
+                        || auth.project_scope() != Some(self.workspace.project_scope()) {
+                        return Err(RpcError::Failed("command_read_scope_denied".into()));
+                    }
+                    if let Some(device) = p.target_device_id.as_deref().filter(|device| *device != self.doc_host.device_id()) {
+                        if p.room_projection.is_none() && (self.doc_host.has_scoped_route(&p.chat_id)
+                            || comet_proto::parse_scaffold_device_id(device).is_some()) {
+                            return Err(RpcError::Failed("command_read_scope_denied".into()));
+                        }
+                        let links = self.links.as_ref().ok_or_else(|| RpcError::Failed("peer relay unavailable".into()))?;
+                        return links.command_call(device, &p.chat_id, "ReadSessionCommand", serde_json::json!({
+                            "chatId": p.chat_id, "commandId": p.command_id,
+                            "targetDeviceId": device, "roomProjection": p.room_projection,
+                        })).await.map(RpcReply::Value);
+                    }
+                    if let Some(scope) = &p.room_projection {
+                        let granted = self.doc_host.collaboration_grants(self.workspace.owner_subject(), &[p.chat_id.clone()]).into_iter().any(|grant|
+                            grant.scope.project_id == scope.project_id
+                                && grant.scope.deployment_id.as_deref() == Some(scope.deployment_id.as_str())
+                                && grant.scope.session_id.as_deref() == Some(p.chat_id.as_str())
+                                && scope.session_id == p.chat_id
+                                && grant.device_id.as_deref() == Some(self.doc_host.device_id())
+                                && grant.capabilities.iter().any(|capability| capability == comet_proto::CAPABILITY_SESSION_READ));
+                        if !granted { return Err(RpcError::Failed("command_read_scope_denied".into())); }
+                    }
+                }
                 let command = self
                     .doc_host
-                    .command_entry(&p.chat_id, &p.command_id)
+                    .command_entry_projection(&p.chat_id, &p.command_id, p.room_projection.as_ref())
                     .map_err(|error| RpcError::Failed(error.to_string()))?
                     .map(|entry| {
                         serde_json::json!({
                             "commandId": entry.id,
                             "status": entry.status,
                             "resolution": entry.resolution,
+                            "payload": entry.payload,
+                            "issuedAt": entry.issued_at,
+                            "expiresAt": entry.expires_at,
+                            "issuedBy": entry.issued_by,
                         })
                     });
                 RpcReply::value(&serde_json::json!({ "command": command }))
@@ -2453,13 +2524,12 @@ impl RpcService for EngineRpc {
                 if existing.payload != p.command {
                     return Err(RpcError::Failed("command_id_conflict".into()));
                 }
-                self.doc_host.wake_queued_command(&chat_id, &existing.id).await
-                    .map_err(|error| RpcError::Failed(error.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "commandId": existing.id }))
+                let delivery_error = self.doc_host.wake_queued_command(&chat_id, &existing.id).await.err().map(|error| error.to_string());
+                RpcReply::value(&serde_json::json!({ "commandId": existing.id, "admission": "accepted",
+                    "delivery": if delivery_error.is_some() { "pending" } else { "notified" }, "deliveryError": delivery_error }))
             }
             methods::QUEUE_COMMAND => {
                 let p: QueueCommandParams = parse_params(params)?;
-                validate_command_lifetime(p.issued_at, p.expires_at, crate::now_ms())?;
                 self.validate_command_deployment(&p)?;
                 if ordinary_peer_command(&p.command)
                     && let Some(chat) = self
@@ -2470,6 +2540,9 @@ impl RpcService for EngineRpc {
                     && chat.device_id != self.doc_host.device_id()
                     && !chat.device_id.starts_with("comet-scaffold-")
                 {
+                    if p.target_device_id.as_deref().is_some_and(|device| device != chat.device_id) {
+                        return Err(RpcError::Failed("command_destination_changed".into()));
+                    }
                     // QueueCommand itself remains non-forwardable. The relay
                     // authenticates this exact admission on a fresh connection.
                     let chat_id = canonical_session_id(&p.chat_id)
@@ -2488,6 +2561,7 @@ impl RpcService for EngineRpc {
                         .command_call(
                             &chat.device_id,
                             &chat_id,
+                            "AdmitPeerCommand",
                             serde_json::json!({
                                 "chatId": chat_id,
                                 "commandId": command_id,
@@ -2495,11 +2569,41 @@ impl RpcService for EngineRpc {
                                 "bootstrap": bootstrap,
                                 "issuedAt": p.issued_at,
                                 "expiresAt": p.expires_at,
+                                "targetDeviceId": p.target_device_id,
                             }),
                         )
                         .await
                         .map(RpcReply::Value);
                 }
+                if ordinary_peer_command(&p.command)
+                    && p.target_device_id.as_deref().is_some_and(|device| device != self.doc_host.device_id()) {
+                    return Err(RpcError::Failed("command_destination_changed".into()));
+                }
+                let activates_chat = match &p.command {
+                    SessionCommandPayload::Run { .. }
+                    | SessionCommandPayload::Steer { .. }
+                    | SessionCommandPayload::Queue { .. } => true,
+                    SessionCommandPayload::Control { action, .. } => matches!(
+                        action.as_ref(),
+                        comet_doc::SessionControlAction::Start { .. }
+                            | comet_doc::SessionControlAction::Steer { .. }
+                            | comet_doc::SessionControlAction::Queue { .. }
+                    ),
+                    _ => false,
+                };
+                if let Some(command_id) = p.command_id.as_deref()
+                    && let Some(entry) = self.doc_host.command_entry_projection(&p.chat_id, command_id, p.room_projection.as_ref())
+                        .map_err(|error| RpcError::Failed(error.to_string()))? {
+                    if entry.payload != p.command || p.issued_at.is_some_and(|issued| entry.issued_at != issued)
+                        || p.expires_at.is_some_and(|expires| entry.expires_at != Some(expires)) {
+                        return Err(RpcError::Failed("command_id_conflict".into()));
+                    }
+                    let metadata_error = if activates_chat { self.workspace.set_chat_archived(&p.chat_id, false).err().map(|error| error.to_string()) } else { None };
+                    let delivery_error = self.doc_host.wake_queued_command(&p.chat_id, &entry.id).await.err().map(|error| error.to_string());
+                    return RpcReply::value(&serde_json::json!({ "commandId": entry.id, "admission": "accepted",
+                        "delivery": if delivery_error.is_some() { "pending" } else { "notified" }, "metadataError": metadata_error, "deliveryError": delivery_error }));
+                }
+                validate_command_lifetime(p.issued_at, p.expires_at, crate::now_ms())?;
                 let starts_session = matches!(&p.command, SessionCommandPayload::Run { .. })
                     || matches!(&p.command, SessionCommandPayload::Control { action, .. }
                         if matches!(action.as_ref(), comet_doc::SessionControlAction::Start { .. }));
@@ -2545,18 +2649,6 @@ impl RpcService for EngineRpc {
                 } else {
                     None
                 };
-                let activates_chat = match &p.command {
-                    SessionCommandPayload::Run { .. }
-                    | SessionCommandPayload::Steer { .. }
-                    | SessionCommandPayload::Queue { .. } => true,
-                    SessionCommandPayload::Control { action, .. } => matches!(
-                        action.as_ref(),
-                        comet_doc::SessionControlAction::Start { .. }
-                            | comet_doc::SessionControlAction::Steer { .. }
-                            | comet_doc::SessionControlAction::Queue { .. }
-                    ),
-                    _ => false,
-                };
                 self.install_local_owner_grant(&p.command)?;
                 let command_id = if let Some(command_id) = p.command_id {
                     self.doc_host
@@ -2566,17 +2658,14 @@ impl RpcService for EngineRpc {
                     self.doc_host.queue_command_at(&p.chat_id, p.command, p.issued_at, p.expires_at)
                 }
                 .map_err(|e| RpcError::Failed(e.to_string()))?;
-                if let Some(startup) = startup.as_mut() {
-                    startup.admitted(&command_id)?;
-                }
-                if activates_chat {
-                    self.workspace
-                        .set_chat_archived(&p.chat_id, false)
-                        .map_err(|e| RpcError::Failed(e.to_string()))?;
-                }
-                self.doc_host.wake_queued_command(&p.chat_id, &command_id).await
-                    .map_err(|error| RpcError::Failed(format!("{error}; durable commandId={command_id}")))?;
-                RpcReply::value(&serde_json::json!({ "commandId": command_id }))
+                let preparation_error = startup.as_mut().and_then(|startup| startup.admitted(&command_id).err()).map(|error| error.to_string());
+                let metadata_error = if activates_chat {
+                    self.workspace.set_chat_archived(&p.chat_id, false).err().map(|error| error.to_string())
+                } else { None };
+                let delivery_error = self.doc_host.wake_queued_command(&p.chat_id, &command_id).await.err().map(|error| error.to_string());
+                RpcReply::value(&serde_json::json!({ "commandId": command_id, "admission": "accepted",
+                    "delivery": if delivery_error.is_some() { "pending" } else { "notified" },
+                    "metadataError": metadata_error, "preparationError": preparation_error, "deliveryError": delivery_error }))
             }
             methods::WATCH_OMP_RECOVERY => {
                 let p: ChatParams = parse_params(params)?;
@@ -2652,16 +2741,10 @@ impl RpcService for EngineRpc {
                 } else {
                     None
                 };
-                // Membership MUST precede opening or routing the target room.
-                let target_ref = self
-                    .workspace
-                    .upsert_session_ref(&target_chat_id, None)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                let target_projection = crate::session_activity::projection(
-                    &target_ref,
-                    self.workspace.project_scope(),
-                );
-                let existing = self
+                let target_ref = self.workspace.doc().session_ref(self.workspace.owner_subject(), &target_chat_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let target_projection = target_ref.as_ref().and_then(|reference| crate::session_activity::projection(reference, self.workspace.project_scope()));
+                let (existing, delivery_error) = self
                     .queue_peer_message(
                         &target_chat_id,
                         &command_id,
@@ -2678,6 +2761,7 @@ impl RpcService for EngineRpc {
                         target_projection.as_ref(),
                     )
                     .await?;
+                let metadata_error = self.workspace.upsert_session_ref(&target_chat_id, None).err().map(|error| error.to_string());
                 let thread_id = match &existing.payload {
                     SessionCommandPayload::PeerMessage {
                         source_chat_id: stored_source_chat_id,
@@ -2698,11 +2782,8 @@ impl RpcService for EngineRpc {
                         .map(peer_reply_result),
                     None => None,
                 };
-                RpcReply::value(&PeerMessageResult {
-                    command_id,
-                    thread_id,
-                    reply,
-                })
+                RpcReply::value(&PeerMessageResult { command_id, thread_id, reply,
+                    delivery: if delivery_error.is_some() { "pending" } else { "notified" }.into(), delivery_error, metadata_error })
             }
             methods::REPLY_PEER_MESSAGE => {
                 let p: ReplyPeerMessageParams = parse_params(params)?;
@@ -2762,14 +2843,9 @@ impl RpcService for EngineRpc {
                 } else {
                     None
                 };
-                let target_ref = self
-                    .workspace
-                    .upsert_session_ref(&target_chat_id, None)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                let mut target_projection = crate::session_activity::projection(
-                    &target_ref,
-                    self.workspace.project_scope(),
-                );
+                let target_ref = self.workspace.doc().session_ref(self.workspace.owner_subject(), &target_chat_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let mut target_projection = target_ref.as_ref().and_then(|reference| crate::session_activity::projection(reference, self.workspace.project_scope()));
                 if target_projection.is_none() {
                     target_projection =
                         target_deployment_id.map(|deployment_id| SessionRoomProjection {
@@ -2784,7 +2860,7 @@ impl RpcService for EngineRpc {
                 let reply_command_id = format!("reply:{}", p.command_id);
                 let source_session_id = session_id;
                 let original_command_id = p.command_id.clone();
-                let queued = self
+                let (queued, delivery_error) = self
                     .queue_peer_message(
                         &target_chat_id,
                         &reply_command_id,
@@ -2801,6 +2877,7 @@ impl RpcService for EngineRpc {
                         target_projection.as_ref(),
                     )
                     .await?;
+                let metadata_error = self.workspace.upsert_session_ref(&target_chat_id, None).err().map(|error| error.to_string());
                 match &queued.payload {
                     SessionCommandPayload::PeerMessage {
                         source_chat_id,
@@ -2822,11 +2899,8 @@ impl RpcService for EngineRpc {
                         .map(peer_reply_result),
                     None => None,
                 };
-                RpcReply::value(&PeerMessageResult {
-                    command_id: reply_command_id,
-                    thread_id,
-                    reply,
-                })
+                RpcReply::value(&PeerMessageResult { command_id: reply_command_id, thread_id, reply,
+                    delivery: if delivery_error.is_some() { "pending" } else { "notified" }.into(), delivery_error, metadata_error })
             }
             methods::WAIT_PEER_REPLY => {
                 let p: WaitPeerReplyParams = parse_params(params)?;
@@ -3556,8 +3630,10 @@ mod tests {
         let expires = issued + 60_000;
         let params = serde_json::json!({ "chatId": chat, "commandId": "capacity-command",
             "issuedAt": issued, "expiresAt": expires, "command": { "kind": "interrupt" } });
-        let error = rpc.handle(methods::QUEUE_COMMAND, params.clone()).await.err().expect("queue capacity failure must be visible");
-        assert!(error.to_string().contains("HTTP 503"));
+        let comet_rpc::RpcReply::Value(receipt) = rpc.handle(methods::QUEUE_COMMAND, params.clone()).await.unwrap() else { panic!("admission receipt") };
+        assert_eq!(receipt["admission"], "accepted");
+        assert_eq!(receipt["delivery"], "pending");
+        assert!(receipt["deliveryError"].as_str().unwrap().contains("HTTP 503"));
         let accepted = rpc.doc_host.command_entry(chat, "capacity-command").unwrap().unwrap();
         assert_eq!(accepted.status, comet_doc::SessionCommandStatus::Pending);
         assert_eq!(accepted.issued_at, issued);
@@ -3701,7 +3777,7 @@ mod tests {
         scoped_params["command"]["sessionId"] = serde_json::json!(scoped_id);
         let mut scoped_authority = authority();
         scoped_authority["chatId"] = serde_json::json!(scoped_id);
-        assert!(rpc.admit_peer_command(serde_json::from_value(scoped_authority).unwrap(), scoped_params).await.is_err());
+        assert!(rpc.peer_command("AdmitPeerCommand", serde_json::from_value(scoped_authority).unwrap(), scoped_params).await.is_err());
         assert!(core.workspace.doc().chat(scoped_id).unwrap().is_none());
         assert!(core.doc_host.command_entry(scoped_id, "command-a").unwrap().is_none());
         // A valid ordinary authority/bootstrap cannot turn an explicit deployment
@@ -3710,7 +3786,7 @@ mod tests {
             for deployment in ["deployment-foreign", "project-a"] {
                 let mut scoped = params.clone();
                 scoped[field] = serde_json::json!(deployment);
-                assert!(rpc.admit_peer_command(serde_json::from_value(authority()).unwrap(), scoped.clone()).await.is_err());
+                assert!(rpc.peer_command("AdmitPeerCommand", serde_json::from_value(authority()).unwrap(), scoped.clone()).await.is_err());
                 assert!(rpc.handle(methods::QUEUE_COMMAND, scoped).await.is_err());
                 assert!(core.workspace.doc().chat("chat-a").unwrap().is_none());
                 assert!(!core.doc_host.chat_has_commands("chat-a").unwrap());
@@ -3725,8 +3801,10 @@ mod tests {
         ] {
             let mut denied = authority();
             denied[field] = value;
+            assert!(rpc.peer_command("ReadSessionCommand", serde_json::from_value(denied.clone()).unwrap(),
+                serde_json::json!({"chatId":"chat-a", "commandId":"command-a"})).await.is_err());
             assert!(
-                rpc.admit_peer_command(serde_json::from_value(denied).unwrap(), params.clone())
+                rpc.peer_command("AdmitPeerCommand", serde_json::from_value(denied).unwrap(), params.clone())
                     .await
                     .is_err()
             );
@@ -3738,7 +3816,8 @@ mod tests {
             .unwrap()
             .remove("bootstrap");
         assert!(
-            rpc.admit_peer_command(
+            rpc.peer_command(
+                "AdmitPeerCommand",
                 serde_json::from_value(authority()).unwrap(),
                 missing_bootstrap,
             )
@@ -3748,7 +3827,7 @@ mod tests {
         let mut bad_bootstrap = params.clone();
         bad_bootstrap["bootstrap"]["chat"]["deviceId"] = serde_json::json!("other-device");
         assert!(
-            rpc.admit_peer_command(serde_json::from_value(authority()).unwrap(), bad_bootstrap,)
+            rpc.peer_command("AdmitPeerCommand", serde_json::from_value(authority()).unwrap(), bad_bootstrap,)
                 .await
                 .is_err()
         );
@@ -3761,13 +3840,34 @@ mod tests {
         );
         assert!(!core.doc_host.chat_has_commands("chat-a").unwrap());
         let admitted = rpc
-            .admit_peer_command(serde_json::from_value(authority()).unwrap(), params.clone())
+            .peer_command("AdmitPeerCommand", serde_json::from_value(authority()).unwrap(), params.clone())
             .await
             .unwrap();
         assert_eq!(admitted["commandId"], "command-a");
         let entry = core.doc_host.command_entry("chat-a", "command-a").unwrap().unwrap();
         assert_eq!(entry.issued_at, issued_at);
         assert_eq!(entry.expires_at, Some(expires_at));
+        let read_params = serde_json::json!({"chatId":"chat-a", "commandId":"command-a",
+            "targetDeviceId": core.device_id, "roomProjection": null});
+        let readback = rpc.peer_command("ReadSessionCommand", serde_json::from_value(authority()).unwrap(),
+            read_params.clone()).await.unwrap();
+        assert_eq!(readback["command"]["commandId"], entry.id);
+        assert_eq!(readback["command"]["payload"], serde_json::to_value(&entry.payload).unwrap());
+        assert_eq!(readback["command"]["issuedAt"], issued_at);
+        assert_eq!(readback["command"]["expiresAt"], expires_at);
+        for (field, value) in [
+            ("targetDeviceId", serde_json::json!("other-device")),
+            ("roomProjection", serde_json::json!({"projectId":"project-a",
+                "deploymentId":"deployment-a", "sessionId":"chat-a"})),
+        ] {
+            let mut mismatched_read = read_params.clone();
+            mismatched_read[field] = value;
+            assert!(matches!(rpc.peer_command("ReadSessionCommand",
+                serde_json::from_value(authority()).unwrap(), mismatched_read).await,
+                Err(RpcError::Failed(error)) if error == "peer_command_scope_denied"));
+        }
+        assert!(matches!(rpc.peer_command("UnknownPeerCommand", serde_json::from_value(authority()).unwrap(),
+            serde_json::json!({"chatId":"chat-a", "commandId":"command-a"})).await, Err(RpcError::UnknownMethod(_))));
         let handle = core.doc_host.open("chat-a").unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -3791,21 +3891,36 @@ mod tests {
         .await
         .expect("authenticated remote Start executes as a Local session");
         assert_eq!(
-            rpc.admit_peer_command(serde_json::from_value(authority()).unwrap(), params.clone())
+            rpc.peer_command("AdmitPeerCommand", serde_json::from_value(authority()).unwrap(), params.clone())
                 .await
                 .unwrap(),
             admitted
         );
         let mut changed_lifetime = params.clone();
         changed_lifetime["expiresAt"] = serde_json::json!(expires_at + 1);
-        assert!(rpc.admit_peer_command(serde_json::from_value(authority()).unwrap(), changed_lifetime).await.is_err());
+        assert!(rpc.peer_command("AdmitPeerCommand", serde_json::from_value(authority()).unwrap(), changed_lifetime).await.is_err());
         let mut conflict = params;
         conflict["command"]["action"]["request"]["prompt"] = serde_json::json!("changed payload");
         assert!(
-            rpc.admit_peer_command(serde_json::from_value(authority()).unwrap(), conflict)
+            rpc.peer_command("AdmitPeerCommand", serde_json::from_value(authority()).unwrap(), conflict)
                 .await
                 .is_err()
         );
+        let mut moved = core.workspace.doc().chat("chat-a").unwrap().unwrap();
+        moved.device_id = "new-owner".into();
+        core.workspace.doc().upsert_chat(&moved).unwrap();
+        let old_target = serde_json::json!({ "chatId": "chat-a", "commandId": "must-not-retarget",
+            "targetDeviceId": core.device_id, "command": { "kind": "interrupt" } });
+        assert!(matches!(rpc.handle(methods::QUEUE_COMMAND, old_target.clone()).await,
+            Err(RpcError::Failed(message)) if message == "command_destination_changed"));
+        assert!(core.doc_host.command_entry("chat-a", "must-not-retarget").unwrap().is_none());
+        moved.device_id = core.device_id.clone();
+        core.workspace.doc().upsert_chat(&moved).unwrap();
+        let mut wrong_local_target = old_target;
+        wrong_local_target["targetDeviceId"] = serde_json::json!("former-owner");
+        assert!(matches!(rpc.handle(methods::QUEUE_COMMAND, wrong_local_target).await,
+            Err(RpcError::Failed(message)) if message == "command_destination_changed"));
+        assert!(core.doc_host.command_entry("chat-a", "must-not-retarget").unwrap().is_none());
     }
 
     #[tokio::test]

@@ -1123,6 +1123,37 @@ final class AppModel {
             self.scaffoldRoutes[chatId] = route
             return route
         }
+        store.commandReader = { [weak self, weak store] admission in
+            guard let self, let store, let config = self.config, self.workspace != nil,
+                  let scope = admission.scope,
+                  scope.projectId == config.projectScope, scope.sessionId == chatId,
+                  scope.deploymentId == store.deploymentId else {
+                throw MobileSessionError.unavailable("Crew cannot confirm this instruction from a different retained scope.")
+            }
+            var params: [String: Any] = ["chatId": chatId, "commandId": admission.commandId]
+            let reader: DeviceRelayClient
+            if let authority = admission.scaffold {
+                guard scope == authority.environment.scope,
+                      authority.actorSubject == config.userId,
+                      authority.environment.ownerPrincipal == config.userId,
+                      authority.projection.projectId == scope.projectId,
+                      authority.projection.deploymentId == scope.deploymentId,
+                      authority.projection.sessionId == chatId else {
+                    throw MobileSessionError.unavailable("Crew cannot confirm this instruction under different authority.")
+                }
+                let projectionData = try JSONEncoder().encode(authority.projection)
+                params["roomProjection"] = try JSONSerialization.jsonObject(with: projectionData)
+                params["targetDeviceId"] = authority.ownerDeviceId
+                reader = DeviceRelayClient(deviceId: authority.controllerDeviceId, config: config)
+            } else {
+                guard scope.deploymentId == nil, let host = admission.hostDeviceId, !host.isEmpty else {
+                    throw MobileSessionError.unavailable("Crew retained this instruction without a verifiable original host.")
+                }
+                params["targetDeviceId"] = host
+                reader = DeviceRelayClient(deviceId: host, config: config, controlSessionId: chatId)
+            }
+            return try await reader.callJSON(method: "ReadSessionCommand", params: params)
+        }
         store.attachmentUploader = { [weak self] images in
             do {
                 guard let self else { throw MobileSessionError.unavailable("Not connected") }
@@ -1150,9 +1181,10 @@ final class AppModel {
                 }
             }
             if let environment, environment.source.kind == "scaffold" {
-                try await workspace.sendScaffoldCommand(
+                let receipt = try await workspace.sendScaffoldCommand(
                     environment: environment, payload: payload, admission: admission
                 )
+                try store?.recordAdmissionReceipt(receipt, admission: admission)
                 if case .run = payload {
                     preparation?.markAdmitted()
                     if self.scaffoldPreparations[chatId] === preparation {
@@ -1165,7 +1197,8 @@ final class AppModel {
                    let originalOwner = admission.hostDeviceId, currentOwner != originalOwner {
                     throw MobileSessionError.unavailable("The Crew session owner changed. The original retained instruction was not sent.")
                 }
-                try await workspace.sendSessionCommand(chatId: chatId, payload: payload, admission: admission)
+                let receipt = try await workspace.sendSessionCommand(chatId: chatId, payload: payload, admission: admission)
+                try store?.recordAdmissionReceipt(receipt, admission: admission)
             }
             queued = true
         }

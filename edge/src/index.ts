@@ -388,7 +388,8 @@ export default {
       }
       if (peerPurpose === "control" && (
         deviceCredential || !controlSessionId || requestedRole !== "client" ||
-        deviceId.startsWith(SANDBOX_DEVICE_PREFIX) || !hasCapability(identity, "session.control")
+        deviceId.startsWith(SANDBOX_DEVICE_PREFIX) ||
+          (!hasCapability(identity, "session.control") && !hasCapability(identity, "session.read"))
       )) return json({ error: "forbidden" }, 403);
       const directPeerReply = peerPurpose === "peer-reply";
       const peerClient =
@@ -424,6 +425,8 @@ export default {
             ? !hasCapability(identity, "session.environment")
             : peerClient
               ? !hasCapability(identity, "session.chat")
+              : controlSessionId
+                ? !hasCapability(identity, "session.read") && !hasCapability(identity, "session.control")
               : !hasCapability(identity, "session.control") &&
                 !hasCapability(identity, "session.environment")
         ) {

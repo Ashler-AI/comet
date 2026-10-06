@@ -2,6 +2,39 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Unreleased: cross-device workspace recovery
+
+Legacy workspace rows and retained journals normalize repeated self-session
+aliases together, preserving canonical ownership, tombstones and completed
+outcomes. Covered bootstrap observations can coalesce; conflicting user edits
+or unknown ancestry retain their original evidence and remain blocked.
+
+Durable command admission is independent of metadata and notification failures.
+Desktop and mobile retain the original command identity across retries and
+restart, read the owner's outcome, and distinguish accepted-pending delivery
+from unknown admission or authoritative rejection. Completed sends are not queued
+again; peer outcome reads retain the same exact authenticated scope as admission.
+AppState events refresh unresolved outcomes without re-admission. Authoritative
+terminal proof retires the original journal record and its associated delivery
+notice; metadata-recovery and unrelated warnings are not cleared by that proof.
+
+Composer submissions claim their draft and snapshot the authorized target and
+configuration before asynchronous recovery. Later choices cannot retarget them.
+Stop and input retries match their execution target and request; terminal controls retire
+from the hot journal without blocking genuinely new controls.
+
+Local cold recovery of the preserved Mac workspace retained 1,662 public chats
+and 4,540 pending records through two opens, with no private aliases or recovery
+error. The 24-turn real two-device smoke preserved 1,600 history rows through
+offline edits, crashes and lost acknowledgements, including original-host outcome
+readback, raw/foreign read denial and bounded RSS. Quiet-owner freshness beyond
+45 seconds, all 212 Edge tests and 574 desktop tests passed. The actual headed
+demo admitted duplicate Enter once, rendered its mock reply, and retired the
+pending notice after authoritative applied readback without re-admission.
+Local typechecks are intentionally skipped. Exact-source remote mobile gates,
+live writer-gate cutover, staging publication and physical-device acceptance
+remain with the integration owner.
+
 ## Unreleased: workspace snapshot admission
 
 Newer client snapshots cannot discard the workspace's retained causal history.

@@ -581,11 +581,11 @@ async fn handle_host_frame(
             let Ok(admission) = serde_json::from_slice::<Admission>(&payload) else {
                 return;
             };
-            if admission.request.method.as_deref() != Some("AdmitPeerCommand") {
-                return;
-            }
+            let Some(method) = admission.request.method.as_deref().filter(|method| {
+                matches!(*method, "AdmitPeerCommand" | "ReadSessionCommand")
+            }) else { return };
             let result = service
-                .admit_peer_command(admission.authority, admission.request.params)
+                .peer_command(method, admission.authority, admission.request.params)
                 .await;
             let mut response = crate::ServerFrame {
                 id: admission.request.id,
@@ -879,12 +879,13 @@ impl LinkCache {
         Err(last_err.unwrap_or(RpcError::Closed))
     }
 
-    /// Fresh authentication for each ordinary remote command; no cached socket
-    /// may extend a revoked sign-in's control authority.
+    /// Fresh authentication for each remote command or outcome read; no cached
+    /// socket may extend a revoked sign-in's authority.
     pub async fn command_call(
         &self,
         device_id: &str,
         chat_id: &str,
+        method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, RpcError> {
         let token = self
@@ -900,15 +901,17 @@ impl LinkCache {
             Some(&uuid::Uuid::new_v4().to_string()),
             &token,
         );
-        url.push_str("&purpose=control&controlSessionId=");
-        url.push_str(chat_id);
+        if params.get("roomProjection").is_none_or(serde_json::Value::is_null) {
+            url.push_str("&purpose=control&controlSessionId=");
+            url.push_str(chat_id);
+        }
         let link = DeviceLink::connect(&url).await?;
         tokio::time::timeout(
             self.config.probe_timeout,
-            link.client().call("AdmitPeerCommand", params),
+            link.client().call(method, params),
         )
         .await
-        .map_err(|_| RpcError::Transport("peer command admission timed out".into()))?
+        .map_err(|_| RpcError::Transport("peer command timed out".into()))?
     }
 
     /// Drop a cached link after a failed RPC so the next call re-dials.

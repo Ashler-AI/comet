@@ -8,6 +8,12 @@ import Loro
 import Observation
 import UIKit
 
+struct MobileCommandReceipt: Decodable {
+    var commandId: String
+    var metadataError: String?
+    var preparationError: String?
+}
+
 struct MobileCommandAdmission: Codable {
     var commandId: String
     var issuedAt: Int64
@@ -94,6 +100,7 @@ final class SessionStore {
         var failure: String?
         var terminal = false
         var admitted = false
+        var admissionAttempted = false
         var admission: MobileCommandAdmission?
         var steerPrompt: String?
         enum Control: Codable {
@@ -121,7 +128,7 @@ final class SessionStore {
         }
         private struct Image: Codable { var id: UUID; var filename: String; var bytes: Data }
         private enum CodingKeys: String, CodingKey {
-            case messageId, prompt, images, steer, request, prepared, createdAt, expiresAt, failure, terminal, admitted, admission, steerPrompt, control
+            case messageId, prompt, images, steer, request, prepared, createdAt, expiresAt, failure, terminal, admitted, admissionAttempted, admission, steerPrompt, control
         }
         init(messageId: String, prompt: String, images: [MobileImageAttachment], steer: Bool) {
             self.messageId = messageId; self.prompt = prompt; self.images = images; self.steer = steer
@@ -139,6 +146,7 @@ final class SessionStore {
             failure = try c.decodeIfPresent(String.self, forKey: .failure)
             terminal = try c.decode(Bool.self, forKey: .terminal)
             admitted = try c.decode(Bool.self, forKey: .admitted)
+            admissionAttempted = try c.decodeIfPresent(Bool.self, forKey: .admissionAttempted) ?? prepared
             admission = try c.decodeIfPresent(MobileCommandAdmission.self, forKey: .admission)
             steerPrompt = try c.decodeIfPresent(String.self, forKey: .steerPrompt)
             control = try c.decodeIfPresent(Control.self, forKey: .control)
@@ -161,6 +169,7 @@ final class SessionStore {
             try c.encode(prepared, forKey: .prepared); try c.encode(createdAt, forKey: .createdAt)
             try c.encode(expiresAt, forKey: .expiresAt); try c.encodeIfPresent(failure, forKey: .failure)
             try c.encode(terminal, forKey: .terminal); try c.encode(admitted, forKey: .admitted)
+            try c.encode(admissionAttempted, forKey: .admissionAttempted)
             try c.encodeIfPresent(admission, forKey: .admission)
             try c.encodeIfPresent(steerPrompt, forKey: .steerPrompt)
             try c.encodeIfPresent(control, forKey: .control)
@@ -178,7 +187,7 @@ final class SessionStore {
 
     func retainComposer(text: String, images: [MobileImageAttachment]) {
         composerText = text; composerImages = images
-        if let retryDraft, retryDraft.admitted, retryDraft.terminal,
+        if let retryDraft, retryDraft.admitted, retryDraft.terminal, retryDraft.failure == nil,
            text.trimmingCharacters(in: .whitespacesAndNewlines) != retryDraft.prompt { self.retryDraft = nil }
         composerSaveTask?.cancel()
         composerSaveTask = Task { @MainActor [weak self] in
@@ -189,9 +198,17 @@ final class SessionStore {
         }
     }
 
+    var deliveryStatus: String? {
+        _ = revision
+        if submittedDrafts.values.contains(where: { $0.admitted && !$0.terminal }) { return "Accepted · delivery pending" }
+        if sending || !pendingSends.isEmpty { return "Awaiting Crew admission…" }
+        if submittedDrafts.values.contains(where: { $0.admissionAttempted && !$0.terminal }) { return "Admission unknown · retry original instruction" }
+        return nil
+    }
+
     var retainedDrafts: [(id: String, prompt: String)] {
         _ = revision
-        return submittedDrafts.values.filter { $0.failure != nil && $0.control == nil }.sorted { $0.createdAt < $1.createdAt }.map { ($0.messageId, $0.prompt) }
+        return submittedDrafts.values.filter { $0.control == nil && (!$0.terminal || $0.failure != nil) }.sorted { $0.createdAt < $1.createdAt }.map { ($0.messageId, $0.prompt) }
     }
 
     var retainedControls: [(id: String, prompt: String, terminal: Bool)] {
@@ -210,7 +227,7 @@ final class SessionStore {
         guard let draft = submittedDrafts[id] else { return }
         retryDraft = draft
         failedPrompt = draft.prompt; failedImages = draft.images
-        sendFailure = draft.failure ?? "Crew retained this instruction. Review before retrying."
+        sendFailure = draft.failure ?? (draft.admitted ? "Crew accepted this instruction. Retry checks its original identity and pending delivery." : "Crew retained this instruction. Review before retrying.")
         revision &+= 1
     }
 
@@ -259,7 +276,7 @@ final class SessionStore {
         guard !offline, !metadataOnly, AppConfig.canonicalSessionId(chatId) != nil else { return }
         guard !intentLoadBlocked else { throw MobileSessionError.unavailable("Crew draft recovery is blocked; the original journal is retained.") }
         var drafts = submittedDrafts
-        if let retryDraft, !(retryDraft.admitted && retryDraft.terminal) { drafts[retryDraft.messageId] = retryDraft }
+        if let retryDraft, !(retryDraft.admitted && retryDraft.terminal && retryDraft.failure == nil) { drafts[retryDraft.messageId] = retryDraft }
         try Self.validateAttachments(drafts.values.map(\.images) + [composerImages])
         let representedComposer = drafts.values.contains { $0.control == nil && $0.prompt == composerText.trimmingCharacters(in: .whitespacesAndNewlines) && $0.images.map(\.id) == composerImages.map(\.id) }
         if (!composerText.isEmpty || !composerImages.isEmpty), !representedComposer {
@@ -282,6 +299,7 @@ final class SessionStore {
             try validateDrafts(drafts)
             terminalControlOutcomes.removeAll()
             let prefix = DocDisk.intentURL(for: intentCacheId).lastPathComponent + "."
+            var completedIds: Set<String> = []
             for url in try FileManager.default.contentsOfDirectory(at: DocDisk.directory, includingPropertiesForKeys: nil)
                 where url.lastPathComponent.hasPrefix(prefix) && url.pathExtension == "outcome" {
                 let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
@@ -290,6 +308,7 @@ final class SessionStore {
                 }
                 let outcome = try JSONDecoder().decode(ControlOutcome.self, from: Data(contentsOf: url))
                 if outcome.terminal, outcome.control != nil, outcome.failure != nil { terminalControlOutcomes[outcome.messageId] = outcome }
+                if outcome.terminal, outcome.failure == nil { completedIds.insert(outcome.messageId) }
             }
             if let composer = drafts.first(where: { $0.messageId == "composer" }) {
                 composerText = composer.prompt; composerImages = composer.images
@@ -301,13 +320,17 @@ final class SessionStore {
                     terminalControlOutcomes[draft.messageId] = ControlOutcome(messageId: draft.messageId, prompt: draft.prompt, terminal: true, failure: draft.failure, control: draft.control)
                 }
             }
-            let sends = drafts.filter { $0.messageId != "composer" && !($0.terminal && $0.control != nil) }
+            let sends = drafts.filter { $0.messageId != "composer" && !($0.terminal && $0.control != nil) && !completedIds.contains($0.messageId) }
             submittedDrafts = Dictionary(uniqueKeysWithValues: sends.map { ($0.messageId, $0) })
+            if let composer = drafts.first(where: { $0.messageId == "composer" }),
+               drafts.contains(where: { completedIds.contains($0.messageId) && $0.prompt == composer.prompt && $0.images.map(\.id) == composer.images.map(\.id) }) {
+                composerText = ""; composerImages = []
+            }
             if sends.count != drafts.filter({ $0.messageId != "composer" }).count { try persistDrafts() }
             // A reply may have been lost; don't lock the composer behind an
             // uncertain echo. Deliberate retry still uses the original ID.
             pendingSends = []
-            if let draft = sends.filter({ $0.control == nil }).sorted(by: { $0.createdAt < $1.createdAt }).last {
+            if let draft = sends.filter({ $0.control == nil && !$0.admitted }).sorted(by: { $0.createdAt < $1.createdAt }).last {
                 retryDraft = draft
                 failedPrompt = draft.prompt; failedImages = draft.images
                 sendFailure = draft.failure ?? "Crew retained this send. Retry checks its original identity; it is not automatically sent."
@@ -334,6 +357,7 @@ final class SessionStore {
     /// The trusted desktop host/controller admits every command. Transport and
     /// admission errors are handled here alongside the matching optimistic echo.
     @ObservationIgnored var commandSender: ((SessionCommandPayload, MobileCommandAdmission) async throws -> Void)?
+    @ObservationIgnored var commandReader: ((MobileCommandAdmission) async throws -> [String: Any])?
     @ObservationIgnored var commandHostDeviceId: String?
     @ObservationIgnored var commandHostProvider: (() -> String?)?
     @ObservationIgnored var commandRouteProvider: (() async throws -> ScaffoldControlRoute?)?
@@ -650,16 +674,16 @@ final class SessionStore {
                 return
             }
             self.lastProjectionKey = result.key
+            for (messageId, failure) in result.failures
+                where self.submittedDrafts[messageId] != nil || self.pendingSends.contains(where: { $0.messageId == messageId }) {
+                self.reportSendFailure(failure, messageId: messageId, terminal: true)
+            }
             if let decoded = result.decoded {
                 self.projectionCount &+= 1
                 self.apply(decoded, metadataOnly: metadataOnly, entriesChanged: result.entriesChanged)
             }
             if self.connected, !doc.isDetached(), doc.stateVv() == doc.oplogVv() {
                 self.hasAuthoritativeProjection = true
-            }
-            for (messageId, failure) in result.failures
-                where self.submittedDrafts[messageId] != nil || self.pendingSends.contains(where: { $0.messageId == messageId }) {
-                self.reportSendFailure(failure, messageId: messageId, terminal: true)
             }
             for id in result.completions { self.resolveAcceptedDraft(id) }
             if !result.completions.isEmpty {
@@ -698,7 +722,7 @@ final class SessionStore {
                 resolveAcceptedDraft(id)
             }
         }
-        if let retryDraft, entries.contains(where: { $0.id == retryDraft.messageId }) {
+        if let retryDraft, retryDraft.failure == nil, entries.contains(where: { $0.id == retryDraft.messageId }) {
             self.retryDraft?.admitted = true
             self.retryDraft?.terminal = true
             clearSendFailure()
@@ -708,7 +732,7 @@ final class SessionStore {
     }
 
     private func resolveAcceptedDraft(_ id: String) {
-        guard var draft = submittedDrafts[id] else { return }
+        guard var draft = submittedDrafts[id], !(draft.terminal && draft.failure != nil) else { return }
         draft.admitted = true; draft.terminal = true; draft.failure = nil
         do {
             try DocDisk.retainOutcome(draft, id: intentCacheId, commandId: id)
@@ -1073,6 +1097,26 @@ final class SessionStore {
 
     // MARK: Command plane (authenticated desktop admission)
 
+    func recordAdmissionReceipt(_ receipt: MobileCommandReceipt, admission: MobileCommandAdmission) throws {
+        guard receipt.commandId == admission.commandId else {
+            throw MobileSessionError.unavailable("Crew admission response did not identify the original command; its outcome is unknown.")
+        }
+        if var draft = submittedDrafts[receipt.commandId], !draft.terminal {
+            guard let original = draft.admission,
+                  NSDictionary(dictionary: encodableDictionary(original)).isEqual(to: encodableDictionary(admission)) else {
+                throw MobileSessionError.unavailable("Crew admission receipt belongs to different retained authority; the original instruction is retained.")
+            }
+            draft.admitted = true; draft.failure = nil
+            submittedDrafts[receipt.commandId] = draft
+            do { try persistDrafts() }
+            catch { recoveryFailure = "Crew accepted this instruction, but could not checkpoint its receipt: \(error.localizedDescription)" }
+        }
+        if let failure = receipt.metadataError ?? receipt.preparationError {
+            recoveryFailure = "Crew accepted the instruction; metadata recovery needs attention: \(failure)"
+        }
+        revision &+= 1
+    }
+
     @discardableResult
     func sendRun(prompt: String, chat: Chat?, images: [MobileImageAttachment] = []) async -> Bool {
         await sendMessage(prompt: prompt, chat: chat, images: images, steer: false)
@@ -1101,7 +1145,7 @@ final class SessionStore {
         let retry = retryDraft.flatMap {
             $0.prompt == prompt && $0.images.map(\.id) == images.map(\.id) ? $0 : nil
         } ?? submittedDrafts.values.first(where: { $0.control == nil && $0.prompt == prompt && $0.images.map(\.id) == images.map(\.id) })
-        if let retry, entries.contains(where: { $0.id == retry.messageId }) {
+        if let retry, retry.failure == nil, (retry.admitted && retry.terminal || entries.contains(where: { $0.id == retry.messageId })) {
             retryDraft = nil
             return true
         }
@@ -1112,7 +1156,7 @@ final class SessionStore {
             draft.payload = nil
             draft.steer = steer
             draft.createdAt = nowMs(); draft.expiresAt = draft.createdAt + 86_400_000
-            draft.failure = nil; draft.terminal = false; draft.admitted = false; draft.admission = nil
+            draft.failure = nil; draft.terminal = false; draft.admitted = false; draft.admissionAttempted = false; draft.admission = nil
             submittedDrafts.removeValue(forKey: retry.messageId)
         }
         draft.failure = nil
@@ -1130,14 +1174,15 @@ final class SessionStore {
         let attachmentUploader = attachmentUploader
         let commandSender = commandSender
         do {
+            if retry != nil, let accepted = await readAdmission(&draft, retryPending: true) { return accepted }
             guard draft.expiresAt > nowMs() else {
-                reportSendFailure("This retained Crew send has expired. Review it before sending a new instruction.", messageId: draft.messageId, terminal: true)
+                reportSendFailure(draft.admissionAttempted ? "This original Crew instruction's retry window expired; its admission outcome is still unknown. Check the original host before sending a new instruction." : "This retained Crew send expired before admission. Review it before sending a new instruction.", messageId: draft.messageId, terminal: !draft.admissionAttempted)
                 return false
             }
             // Write before uploads or admission: a process death cannot erase a
             // user send or change its ID on an uncertain-response retry.
             try persistDrafts()
-            if draft.admission?.scaffold == nil, let route = try await commandRouteProvider?() {
+            if !draft.admissionAttempted, draft.admission?.scaffold == nil, let route = try await commandRouteProvider?() {
                 draft.admission?.scaffold = MobileCommandAdmission.ScaffoldAuthority(route)
                 submittedDrafts[draft.messageId] = draft
                 try persistDrafts()
@@ -1188,6 +1233,9 @@ final class SessionStore {
             guard let admission = draft.admission, admission.expiresAt > nowMs() else {
                 throw MobileSessionError.unavailable("This Crew instruction has expired.")
             }
+            draft.admissionAttempted = true
+            submittedDrafts[draft.messageId] = draft
+            try persistDrafts()
             try await commandSender(payload, admission)
             // Projection may report a rejection while admission is suspended.
             guard retryDraft?.messageId != draft.messageId || sendFailure == nil else { return false }
@@ -1201,12 +1249,21 @@ final class SessionStore {
         } catch {
             // A lost RPC response must not turn an already materialized send
             // into a second user message on deliberate retry.
-            if entries.contains(where: { $0.id == draft.messageId }) { return true }
+            if entries.contains(where: { $0.id == draft.messageId }), submittedDrafts[draft.messageId]?.terminal != true { return true }
             if submittedDrafts[draft.messageId] == nil, retryDraft?.messageId == draft.messageId,
                retryDraft?.admitted == true { return true }
             if retryDraft?.messageId == draft.messageId, sendFailure != nil { return false }
-            reportSendFailure(error is CancellationError ? "Send cancelled. Your draft is still here." : error.localizedDescription,
-                              messageId: draft.messageId)
+            if let accepted = await readAdmission(&draft) { return accepted }
+            if submittedDrafts[draft.messageId]?.admitted == true { return true }
+            if let relay = error as? RelayError, case .rpc(let detail) = relay,
+               ["command_id_conflict", "peer_command_scope_denied"].contains(where: { detail.contains($0) }) {
+                reportSendFailure("Crew rejected this admission attempt: \(detail). The original instruction and identity are retained.", messageId: draft.messageId)
+                return false
+            }
+            let message = draft.admissionAttempted
+                ? "Crew admission outcome is unknown. Retry checks the original instruction: \(error.localizedDescription)"
+                : error is CancellationError ? "Send cancelled before admission. Your draft is still here." : "Crew did not send this instruction: \(error.localizedDescription)"
+            reportSendFailure(message, messageId: draft.messageId)
             return false
         }
     }
@@ -1282,6 +1339,79 @@ final class SessionStore {
         Task { await submitControl(draft) }
     }
 
+    // Read only the original host/scope. Absence or an unavailable response is
+    // not rejection; a retry keeps its durable identity and immutable request.
+    private func matchesAdmissionPayload(_ command: [String: Any], draft: SubmittedDraft) -> Bool {
+        guard let original = draft.payload, let admission = draft.admission,
+              var payload = command["payload"] as? [String: Any] else { return false }
+        let scoped = admission.scaffold != nil
+        if let authority = admission.scaffold {
+            guard payload["kind"] as? String == "control",
+                  payload["sessionId"] as? String == authority.projection.sessionId,
+                  payload["ownerDeviceId"] as? String == authority.ownerDeviceId,
+                  payload["actorDeviceId"] as? String == authority.controllerDeviceId,
+                  payload["actorSubject"] as? String == authority.actorSubject,
+                  payload["grantId"] as? String == authority.grantId,
+                  payload["source"] as? String == "scaffold",
+                  let action = payload["action"] as? [String: Any] else { return false }
+            payload = action
+        }
+        func decode<T: Decodable>(_ value: Any?, as type: T.Type) -> T? {
+            guard let value, let data = try? JSONSerialization.data(withJSONObject: value) else { return nil }
+            return try? JSONDecoder().decode(type, from: data)
+        }
+        let kind = payload[scoped ? "action" : "kind"] as? String
+        switch original {
+        case .run(let request, let id):
+            guard kind == (scoped ? "start" : "run"), payload[scoped ? "message_id" : "messageId"] as? String == id,
+                  let retained = decode(payload["request"], as: RunRequest.self) else { return false }
+            return NSDictionary(dictionary: encodableDictionary(retained)).isEqual(to: encodableDictionary(request))
+        case .steer(let prompt, let id):
+            return kind == "steer" && payload["prompt"] as? String == prompt && payload[scoped ? "message_id" : "messageId"] as? String == id
+        case .interrupt: return kind == (scoped ? "stop" : "interrupt")
+        case .respondInput(let id, let answers):
+            return kind == "respondInput" && payload[scoped ? "request_id" : "requestId"] as? String == id && decode(payload["answers"], as: [UserInputAnswer].self) == answers
+        }
+    }
+
+    private func readAdmission(_ draft: inout SubmittedDraft, retryPending: Bool = false) async -> Bool? {
+        // Readback can upgrade the durable receipt before returning nil to wake
+        // a pending retry. Both send paths must resume with that upgraded copy.
+        defer { if let retained = submittedDrafts[draft.messageId] { draft = retained } }
+        guard let admission = draft.admission, let commandReader else { return nil }
+        do {
+            let response = try await commandReader(admission)
+            guard let command = response["command"] as? [String: Any] else { return nil }
+            guard command["commandId"] as? String == admission.commandId,
+                  (command["issuedAt"] as? NSNumber)?.int64Value == admission.issuedAt,
+                  (command["expiresAt"] as? NSNumber)?.int64Value == admission.expiresAt,
+                  let status = command["status"] as? String else { return nil }
+            guard matchesAdmissionPayload(command, draft: draft) else {
+                reportSendFailure("Crew received a conflicting command receipt; the admission outcome is unknown. Its original payload and identity are retained; no retry was sent.", messageId: draft.messageId)
+                return false
+            }
+            if ["rejected", "expired", "superseded", "cancelled"].contains(status) {
+                reportSendFailure(command["resolution"] as? String ?? "Crew marked this instruction \(status).", messageId: draft.messageId, terminal: true)
+                return false
+            }
+            guard ["pending", "applied"].contains(status) else { return nil }
+            if status == "applied" { resolveAcceptedDraft(draft.messageId) }
+            else if var retained = submittedDrafts[draft.messageId] {
+                retained.admitted = true; retained.failure = nil
+                submittedDrafts[draft.messageId] = retained
+                retryDraft = nil
+                clearSendFailure()
+            }
+            do { try persistDrafts() }
+            catch {
+                recoveryFailure = "Crew accepted this instruction, but could not checkpoint its receipt: \(error.localizedDescription). The original identity is retained."
+                return true
+            }
+            if retryPending, status == "pending", admission.expiresAt > nowMs() { return nil }
+            return true
+        } catch { return nil }
+    }
+
     private func submitControl(_ retained: SubmittedDraft) async {
         guard AppConfig.canonicalSessionId(chatId) != nil else {
             sendFailure = "Crew control requires a canonical public session identity. The instruction was not sent."
@@ -1297,18 +1427,22 @@ final class SessionStore {
         var draft = retained
         submittedDrafts[draft.messageId] = draft
         do {
+            if let accepted = await readAdmission(&draft, retryPending: true) { if accepted { clearSendFailure() }; return }
             guard draft.expiresAt > nowMs() else {
-                reportSendFailure("This retained Crew instruction has expired; it was not sent.", messageId: draft.messageId, terminal: true)
+                reportSendFailure(draft.admissionAttempted ? "This original Crew control's retry window expired; its admission outcome is unknown. Its identity is retained for readback." : "This retained Crew instruction expired before admission; it was not sent.", messageId: draft.messageId, terminal: !draft.admissionAttempted)
                 return
             }
             try persistDrafts()
-            if draft.admission?.scaffold == nil, let route = try await commandRouteProvider?() {
+            if !draft.admissionAttempted, draft.admission?.scaffold == nil, let route = try await commandRouteProvider?() {
                 draft.admission?.scaffold = MobileCommandAdmission.ScaffoldAuthority(route)
                 submittedDrafts[draft.messageId] = draft
                 try persistDrafts()
             }
             guard let commandSender, let payload = draft.payload, let admission = draft.admission,
                   admission.expiresAt > nowMs() else { throw MobileSessionError.unavailable("This Crew instruction has no valid command route or has expired.") }
+            draft.admissionAttempted = true
+            submittedDrafts[draft.messageId] = draft
+            try persistDrafts()
             try await commandSender(payload, admission)
             if var accepted = submittedDrafts[draft.messageId], !accepted.terminal {
                 accepted.admitted = true; accepted.failure = nil
@@ -1316,8 +1450,14 @@ final class SessionStore {
                 try persistDrafts()
             }
         } catch {
-            if submittedDrafts[draft.messageId] != nil {
-                reportSendFailure(error.localizedDescription, messageId: draft.messageId)
+            if let accepted = await readAdmission(&draft), accepted { return }
+            if submittedDrafts[draft.messageId] != nil, submittedDrafts[draft.messageId]?.admitted != true {
+                if let relay = error as? RelayError, case .rpc(let detail) = relay,
+                   ["command_id_conflict", "peer_command_scope_denied"].contains(where: { detail.contains($0) }) {
+                    reportSendFailure("Crew rejected this control admission attempt: \(detail). Its original identity is retained.", messageId: draft.messageId)
+                } else {
+                    reportSendFailure(draft.admissionAttempted ? "Crew control admission outcome is unknown. Retry checks its original identity: \(error.localizedDescription)" : "Crew did not send this control: \(error.localizedDescription)", messageId: draft.messageId)
+                }
             }
         }
     }
@@ -1325,6 +1465,66 @@ final class SessionStore {
 
 #if DEBUG
 extension SessionStore {
+    static func runAdmissionReadbackRegression() async -> Bool {
+        let config = AppConfig(edgeURL: URL(string: "http://127.0.0.1:1")!, mode: .dev,
+            userId: "admission-\(UUID().uuidString)", projectScope: "admission-regression", deviceId: "phone", deviceName: "Crew regression")
+        let chatId = UUID().uuidString.lowercased()
+        let initial = SessionStore(chatId: chatId, config: config)
+        let cacheId = initial.intentCacheId
+        var restarted: SessionStore?
+        defer {
+            initial.stop(); restarted?.stop()
+            let prefix = DocDisk.intentURL(for: cacheId).lastPathComponent
+            if let files = try? FileManager.default.contentsOfDirectory(at: DocDisk.directory, includingPropertiesForKeys: nil) {
+                for file in files where file.lastPathComponent.hasPrefix(prefix) { try? FileManager.default.removeItem(at: file) }
+            }
+        }
+        var admissions = 0
+        var status = "pending"
+        var original: MobileCommandAdmission?
+        initial.commandHostDeviceId = "owner"
+        initial.commandSender = { _, admission in
+            admissions += 1; original = admission
+            throw MobileSessionError.unavailable("metadata failed after durable admission")
+        }
+        initial.commandReader = { admission in
+            guard let original, admission.commandId == original.commandId else { return ["command": NSNull()] }
+            return ["command": ["commandId": original.commandId, "issuedAt": original.issuedAt, "expiresAt": original.expiresAt,
+                "status": status, "payload": ["kind": "steer", "prompt": "original instruction", "messageId": original.commandId]]]
+        }
+        guard await initial.sendSteer(prompt: "original instruction"), admissions == 1,
+              initial.sendFailure == nil, let original,
+              let retained = initial.submittedDrafts[original.commandId], retained.admitted else { return false }
+        do {
+            try initial.recordAdmissionReceipt(MobileCommandReceipt(commandId: original.commandId,
+                metadataError: "metadata conflict", preparationError: nil), admission: original)
+        } catch { return false }
+        guard initial.recoveryFailure?.contains("Crew accepted") == true,
+              initial.recoveryFailure?.contains("metadata conflict") == true, initial.sendFailure == nil else { return false }
+        let validReader = initial.commandReader
+        initial.commandReader = { _ in
+            ["command": ["commandId": original.commandId, "issuedAt": original.issuedAt, "expiresAt": original.expiresAt,
+                "status": "applied", "payload": ["kind": "steer", "prompt": "changed payload", "messageId": original.commandId]]]
+        }
+        guard !(await initial.sendSteer(prompt: "original instruction")), admissions == 1,
+              initial.submittedDrafts[original.commandId]?.terminal == false else { return false }
+        initial.commandReader = validReader
+        initial.flushToDisk()
+        let restored = SessionStore(chatId: chatId, config: config)
+        restarted = restored
+        restored.commandSender = { _, _ in admissions += 1; throw RelayError.timeout }
+        restored.commandReader = initial.commandReader
+        status = "applied"
+        guard await restored.sendSteer(prompt: "original instruction"), admissions == 1,
+              restored.submittedDrafts.isEmpty else { return false }
+        // A crash between the outcome tombstone and hot-outbox checkpoint must
+        // not restore a completed instruction as a new composer draft.
+        do { try DocDisk.saveIntents([retained], id: cacheId) } catch { return false }
+        let completed = SessionStore(chatId: chatId, config: config)
+        defer { completed.stop() }
+        return completed.submittedDrafts.isEmpty && completed.failedPrompt == nil && completed.composerText.isEmpty
+    }
+
     static func runAttachmentJournalRegression() async -> Bool {
         let config = AppConfig(edgeURL: URL(string: "http://127.0.0.1:1")!, mode: .dev,
             userId: "attachment-\(UUID().uuidString)", projectScope: "attachments", deviceId: "phone", deviceName: "Crew regression")
@@ -1585,6 +1785,44 @@ extension SessionStore {
                   let original = admissions.first,
                   restarted.submittedDrafts[original.commandId]?.request?.cwd == "/original",
                   let cached = DocDisk.loadReplica(id: cacheId) else { return false }
+            func command(_ payload: [String: Any], admission: MobileCommandAdmission, status: String = "pending") -> [String: Any] {
+                ["commandId": admission.commandId, "issuedAt": admission.issuedAt,
+                 "expiresAt": admission.expiresAt, "status": status, "payload": payload]
+            }
+            guard let retainedRun = restarted.submittedDrafts[original.commandId],
+                  let originalRequest = retainedRun.request else { return false }
+            var nativeRequest = encodableDictionary(originalRequest)
+            nativeRequest.removeValue(forKey: "attachments")
+            let runPayload: [String: Any] = ["kind": "run", "messageId": original.commandId, "request": nativeRequest]
+            let pendingRun = command(runPayload, admission: original)
+            guard restarted.matchesAdmissionPayload(pendingRun, draft: retainedRun) else { return false }
+            for changed in [NSNull(), "/not-an-array", ["/changed-image"]] as [Any] {
+                var request = nativeRequest; request["attachments"] = changed
+                guard !restarted.matchesAdmissionPayload(command(["kind": "run", "messageId": original.commandId, "request": request], admission: original), draft: retainedRun) else { return false }
+            }
+            var changedRequest = nativeRequest; changedRequest["cwd"] = "/changed"
+            guard !restarted.matchesAdmissionPayload(command(["kind": "run", "messageId": original.commandId, "request": changedRequest], admission: original), draft: retainedRun) else { return false }
+            var scopedRun = retainedRun
+            let route = ScaffoldControlRoute(controllerDeviceId: "controller", ownerDeviceId: "owner",
+                actorSubject: config.userId, grantId: "original-grant",
+                projection: SessionRoomProjection(projectId: config.projectScope, deploymentId: "scaffold", sessionId: chatId),
+                environment: SessionEnvironment(source: SessionEnvironmentSource(kind: "scaffold"), ownerPrincipal: config.userId,
+                    scope: CollaborationScope(projectId: config.projectScope, deploymentId: "scaffold", sessionId: chatId)))
+            scopedRun.admission?.scaffold = MobileCommandAdmission.ScaffoldAuthority(route)
+            func scaffoldPayload(_ request: [String: Any]) -> [String: Any] {
+                ["kind": "control", "sessionId": chatId, "ownerDeviceId": route.ownerDeviceId,
+                 "actorDeviceId": route.controllerDeviceId, "actorSubject": route.actorSubject,
+                 "grantId": route.grantId, "source": "scaffold",
+                 "action": ["action": "start", "message_id": original.commandId, "request": request]]
+            }
+            guard restarted.matchesAdmissionPayload(command(scaffoldPayload(nativeRequest), admission: original), draft: scopedRun),
+                  !restarted.matchesAdmissionPayload(command(scaffoldPayload(changedRequest), admission: original), draft: scopedRun) else { return false }
+            var runReadbacks = 0
+            restarted.commandReader = { _ in
+                runReadbacks += 1
+                guard runReadbacks == 1 else { throw RelayError.timeout }
+                return ["command": pendingRun]
+            }
             restarted.doc = cached
             restarted.commandSender = { payload, admission in
                 guard case .run(let request, let id) = payload, id == original.commandId, request.cwd == "/original" else {
@@ -1593,10 +1831,18 @@ extension SessionStore {
                 admissions.append(admission)
                 throw RelayError.timeout
             }
-            guard !(await restarted.sendSteer(prompt: "accepted but ACK lost")), admissions.count == 2,
+            guard await restarted.sendSteer(prompt: "accepted but ACK lost"), admissions.count == 2,
                   admissions[1].commandId == original.commandId,
                   admissions[1].issuedAt == original.issuedAt,
                   admissions[1].expiresAt == original.expiresAt else { return false }
+            let pendingRestart = SessionStore(chatId: chatId, config: config)
+            stores.append(pendingRestart)
+            guard runReadbacks == 2, let pendingDraft = pendingRestart.submittedDrafts[original.commandId],
+                  pendingDraft.admitted, !pendingDraft.terminal, pendingDraft.failure == nil,
+                  let pendingRequest = pendingDraft.request, let pendingAdmission = pendingDraft.admission,
+                  NSDictionary(dictionary: encodableDictionary(pendingRequest)).isEqual(to: encodableDictionary(originalRequest)),
+                  NSDictionary(dictionary: encodableDictionary(pendingAdmission)).isEqual(to: encodableDictionary(original)),
+                  pendingRestart.composerText == "unsent composer draft" else { return false }
             let server = old.fork()
             try append([
                 "id": original.commandId, "role": "user", "createdAt": original.issuedAt, "deviceId": "owner",
@@ -1661,19 +1907,52 @@ extension SessionStore {
             let controlRestart = SessionStore(chatId: chatId, config: config)
             stores.append(controlRestart)
             controlRestart.commandSender = afterRecovery.commandSender
+            let pendingControl = command(["kind": "respondInput", "requestId": "original-request",
+                "answers": answers.map(encodableDictionary)], admission: controlAdmission)
+            var controlReadbacks = 0
+            controlRestart.commandReader = { _ in
+                controlReadbacks += 1
+                guard controlReadbacks == 1 else { throw RelayError.timeout }
+                return ["command": pendingControl]
+            }
             controlRestart.retryControl(controlAdmission.commandId)
             guard await E2ERunner.poll(timeout: 5, label: "durable control retry", {
-                controlAdmissions.count == 2 ? true : nil
+                controlAdmissions.count == 2 && !controlRestart.sending ? true : nil
             }) != nil,
                   controlAdmissions[1].commandId == controlAdmission.commandId,
                   controlAdmissions[1].issuedAt == controlAdmission.issuedAt,
                   controlAdmissions[1].expiresAt == controlAdmission.expiresAt else { return false }
+            let pendingControlRestart = SessionStore(chatId: chatId, config: config)
+            stores.append(pendingControlRestart)
+            guard controlReadbacks == 2, let pendingControlDraft = pendingControlRestart.submittedDrafts[controlAdmission.commandId],
+                  pendingControlDraft.admitted, !pendingControlDraft.terminal, pendingControlDraft.failure == nil,
+                  let retainedControlAdmission = pendingControlDraft.admission,
+                  NSDictionary(dictionary: encodableDictionary(retainedControlAdmission)).isEqual(to: encodableDictionary(controlAdmission)) else { return false }
             try append(["id": controlAdmission.commandId, "status": "applied", "payload": ["kind": "respondInput"]],
                        to: controlRestart.doc, list: "commands")
             controlRestart.doc.commit(); controlRestart.project()
             guard await E2ERunner.poll(timeout: 5, label: "durable control outcome", {
                 controlRestart.submittedDrafts[controlAdmission.commandId] == nil ? true : nil
             }) != nil else { return false }
+            let terminalRestart = SessionStore(chatId: chatId, config: config)
+            stores.append(terminalRestart)
+            guard terminalRestart.submittedDrafts[controlAdmission.commandId] == nil else { return false }
+            var cancelled = pendingControlDraft
+            cancelled.messageId = UUID().uuidString.lowercased()
+            cancelled.admission?.commandId = cancelled.messageId
+            guard let cancelledAdmission = cancelled.admission else { return false }
+            terminalRestart.submittedDrafts[cancelled.messageId] = cancelled
+            let cancelledCommand = command(["kind": "respondInput", "requestId": "original-request",
+                "answers": answers.map(encodableDictionary)], admission: cancelledAdmission, status: "cancelled")
+            terminalRestart.commandReader = { _ in ["command": cancelledCommand] }
+            await terminalRestart.submitControl(cancelled)
+            let cancelledRestart = SessionStore(chatId: chatId, config: config)
+            stores.append(cancelledRestart)
+            cancelledRestart.commandSender = afterRecovery.commandSender
+            cancelledRestart.retryControl(cancelled.messageId)
+            guard cancelledRestart.submittedDrafts[cancelled.messageId] == nil,
+                  cancelledRestart.terminalControlOutcomes[cancelled.messageId]?.terminal == true,
+                  controlAdmissions.count == 2 else { return false }
             let wrongScope = SessionStore(chatId: chatId, config: config, deploymentId: "another-deployment")
             stores.append(wrongScope)
             guard wrongScope.submittedDrafts.isEmpty, wrongScope.composerText.isEmpty else { return false }
@@ -1689,7 +1968,7 @@ extension SessionStore {
             } catch {
                 guard error.localizedDescription.contains("explicit deployment") else { return false }
             }
-            E2ERunner.log("OK Crew durable intents: restart draft, original ID payload expiry, lost ACK dedupe, shallow adoption, revoked and expired blocked, scope isolation, durable control answers and outcomes")
+            E2ERunner.log("OK Crew durable intents: restart draft, original ID payload expiry, lost ACK dedupe, shallow adoption, revoked and expired blocked, scope isolation, durable control answers and outcomes, native omitted-empty attachments, pending receipt survives lost retry and restart, cancelled outcomes monotonic")
             return true
         } catch { E2ERunner.log("FAIL Crew durable intents: \(error)"); return false }
     }

@@ -77,6 +77,14 @@ pub(crate) fn install_document_journal(
         store.save_snapshot(&format!("recovery-original/{doc_id}"), &original)?;
         store.migrate_pending_records(doc_id, &records)?;
     }
+    if expected_chat.is_none() {
+        let evidence_id = format!("recovery-original/{doc_id}");
+        if store.load_snapshot(&evidence_id)?.is_none() {
+            let original = binding.export(loro::ExportMode::Snapshot).map_err(|error| EngineError::Other(error.to_string()))?;
+            store.save_snapshot(&evidence_id, &original)?;
+        }
+        store.normalize_workspace_records(doc_id, &binding.raw())?;
+    }
     let pending = store.load_pending_records(doc_id)?;
     let has_pending = !pending.is_empty();
     let journal_store = store.clone();
@@ -85,7 +93,7 @@ pub(crate) fn install_document_journal(
     binding.install_journal(pending, Arc::new(move |records, snapshot| {
         journal_store.save_pending_records_for_snapshot(&journal_id, &snapshot_id, records.iter().map(Arc::as_ref), snapshot).map_err(|error| error.to_string())
     }));
-    if has_pending {
+    if has_pending || expected_chat.is_none() {
         let snapshot = binding.export(loro::ExportMode::Snapshot).map_err(|error| EngineError::Other(error.to_string()))?;
         binding.adopt_snapshot(&snapshot, expected_chat)?;
     }
@@ -122,7 +130,8 @@ pub(crate) fn install_workspace_journal(store: &Arc<DocsStore>, doc: &comet_doc:
     let key = CacheScope { project:project.into(),principal:user.into(),deployment:None,session:format!("ws4/{project}") }.key()?;
     store.claim_document_scope(crate::workspace_host::WORKSPACE_DOC_ID,&key,None)?;
     install_document_journal(store, crate::workspace_host::WORKSPACE_DOC_ID, &key, &doc.binding(), || {
-        let raw = doc.doc();
+        let raw = doc.doc().fork();
+        comet_doc::WorkspaceDoc::from_doc(raw.clone()).migrate_execution_rows()?;
         let mut records = Vec::new();
         let refs_prefix = format!("{}:{user}:", user.len());
         for container in ["devices", "spaces", "chats", "sessions", "sessionRefs", "worktreeDeletions"] {
@@ -2100,6 +2109,14 @@ impl DocHost {
         &self, chat_id: &str, command_id: &str, payload: SessionCommandPayload,
         issued_at: Option<i64>, expires_at: Option<i64>,
     ) -> Result<SessionCommandEntry, EngineError> {
+        if let Some(existing) = self.command_entry(chat_id, command_id)? {
+            if existing.payload != payload || issued_at.is_some_and(|value| value != existing.issued_at)
+                || expires_at.is_some_and(|value| Some(value) != existing.expires_at)
+            {
+                return Err(EngineError::Other("command id already names a different immutable intent".into()));
+            }
+            return Ok(existing);
+        }
         let existing = { lock(&self.inner.handles).get(chat_id).cloned() };
         let handle = match existing {
             Some(handle) => {
@@ -2222,13 +2239,54 @@ impl DocHost {
         chat_id: &str,
         command_id: &str,
     ) -> Result<Option<SessionCommandEntry>, EngineError> {
-        let handle = self.open(chat_id)?;
+        self.command_entry_projection(chat_id, command_id, None)
+    }
+
+    /// Read durable admission evidence without opening or repairing its cache.
+    pub fn command_entry_projection(
+        &self,
+        chat_id: &str,
+        command_id: &str,
+        projection: Option<&SessionRoomProjection>,
+    ) -> Result<Option<SessionCommandEntry>, EngineError> {
+        if chat_id.contains("::session::") {
+            return Err(EngineError::Other("private execution keys cannot read public command outcomes".into()));
+        }
+        let mut scope = self.cache_scope(chat_id, projection);
+        if projection.is_some_and(|projection| projection.project_id != scope.project
+            || projection.session_id != chat_id || projection.deployment_id.trim().is_empty())
+        {
+            return Err(EngineError::Other("command outcome projection does not match local project/chat".into()));
+        }
+        let handle = lock(&self.inner.handles).get(chat_id).cloned();
+        if let Some(persisted) = self.inner.store.document_scope(chat_id)? {
+            let persisted: CacheScope = serde_json::from_str(&persisted)
+                .map_err(|error| EngineError::Other(format!("invalid command outcome scope: {error}")))?;
+            if projection.is_none() && scope.deployment.is_none() {
+                scope.deployment = persisted.deployment.clone();
+            }
+            if scope != persisted {
+                return Err(EngineError::Other("command outcome belongs to a different authenticated room scope".into()));
+            }
+        }
+        if let Some(handle) = &handle {
+            let cached = lock(&handle.cache_scope);
+            if projection.is_none() && scope.deployment.is_none() {
+                scope.deployment = cached.deployment.clone();
+            }
+            if scope != *cached {
+                return Err(EngineError::Other("live command outcome belongs to a different authenticated room scope".into()));
+            }
+        }
+        if let Some(entry) = self.inner.store.load_command_outcome(&scope.key()?, command_id)? {
+            if entry.id != command_id {
+                return Err(EngineError::Other("durable command outcome has a different identity".into()));
+            }
+            return Ok(Some(entry));
+        }
+        let Some(handle) = handle else { return Ok(None) };
         let _guard = lock(&handle.command_lock);
-        Ok(handle
-            .doc
-            .read_commands()?
-            .into_iter()
-            .find(|entry| entry.id == command_id))
+        Ok(handle.doc.read_commands()?.into_iter().find(|entry| entry.id == command_id))
     }
 
     pub fn chat_has_commands(&self, chat_id: &str) -> Result<bool, EngineError> {
@@ -3592,6 +3650,34 @@ mod authority_tests {
         assert_eq!(outcome.issued_at,entry.issued_at); assert_eq!(outcome.expires_at,entry.expires_at);
         assert!(restarted.queue_command_with_id_at(chat,"command",SessionCommandPayload::Interrupt {},Some(entry.issued_at),Some(entry.expires_at.unwrap()+1)).is_err());
         assert_eq!(restarted.open(chat).unwrap().doc.read_commands().unwrap().len(),1);
+    }
+
+    #[tokio::test]
+    async fn durable_admission_readback_survives_unreadable_cache_without_reopening() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let config = DocHostConfig { device_id: "device-a".into(), default_harness: HarnessId::Mock, edge: None };
+        let host = DocHost::new(store.clone(), config.clone());
+        let chat = "00000000-0000-4000-8000-000000000215";
+        let now = now_ms();
+        let accepted = host.queue_command_with_id_at(chat, "retained-send", SessionCommandPayload::Interrupt {},
+            Some(now - 1), Some(now + 30_000)).unwrap();
+        drop(host);
+        let damaged = b"retained unreadable cache";
+        store.save_snapshot(chat, damaged).unwrap();
+        let restarted = DocHost::new(store.clone(), config);
+        assert_eq!(restarted.command_entry(chat, "retained-send").unwrap(), Some(accepted.clone()));
+        assert!(restarted.command_entry(chat, "absent-send").unwrap().is_none());
+        assert_eq!(restarted.queue_command_with_id_at(chat, "retained-send", accepted.payload.clone(),
+            Some(accepted.issued_at), accepted.expires_at).unwrap(), accepted);
+        assert!(restarted.queue_command_with_id_at(chat, "retained-send", SessionCommandPayload::Interrupt {},
+            Some(accepted.issued_at + 1), accepted.expires_at).is_err());
+        let foreign = SessionRoomProjection { project_id: "other-project".into(), deployment_id: "other-deployment".into(), session_id: chat.into() };
+        assert!(restarted.command_entry_projection(chat, "retained-send", Some(&foreign)).is_err());
+        assert_eq!(store.load_snapshot(chat).unwrap().as_deref(), Some(damaged.as_slice()));
+        let absent_chat = "00000000-0000-4000-8000-000000000216";
+        assert!(restarted.command_entry(absent_chat, "absent-send").unwrap().is_none());
+        assert!(store.load_snapshot(absent_chat).unwrap().is_none());
     }
 
     #[tokio::test]

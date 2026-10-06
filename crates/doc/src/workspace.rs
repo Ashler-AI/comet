@@ -27,7 +27,7 @@
 //! `chrono::DateTime<Utc>` through the `comet_proto` entity types.
 
 use chrono::{DateTime, Utc};
-use loro::{ExportMode, LoroDoc, LoroMap, LoroValue, ToJson};
+use loro::{ContainerTrait, ExportMode, LoroDoc, LoroMap, LoroValue, ToJson};
 use serde::{Deserialize, Serialize};
 
 use comet_proto::{
@@ -47,12 +47,15 @@ pub fn presence_key(device_id: &str) -> String {
     format!("presence/{device_id}")
 }
 
-/// Only the native self-session execution key can be projected to a public UUID.
+/// A UUID followed by identical self-session components projects to that public UUID, never a child.
 /// This is deliberately independent of warm doc handles and never renames journals.
 pub fn execution_chat_id(key: &str) -> Option<&str> {
-    let (chat_id, session_id) = key.split_once("::session::")?;
+    let mut parts = key.split("::session::");
+    let chat_id = parts.next()?;
+    let session_id = parts.next()?;
     let bytes = chat_id.as_bytes();
     (chat_id == session_id
+        && parts.all(|part| part == chat_id)
         && bytes.len() == 36
         && bytes.iter().enumerate().all(|(index, byte)| {
             if matches!(index, 8 | 13 | 18 | 23) {
@@ -73,6 +76,104 @@ fn require_public_chat_id(chat_id: &str) -> Result<(), DocError> {
 
 fn session_ref_key(user_id: &str, chat_id: &str) -> String {
     format!("{}:{user_id}:{chat_id}", user_id.len())
+}
+
+pub(crate) const WORKSPACE_IDENTITY_FIELDS: &[&str] = &[
+    "id", "chatId", "userId", "deviceId", "ownerSubject", "ownerDeviceId",
+    "ownerPrincipal", "projectId", "deploymentId",
+];
+
+/// A public row alias is recoverable only when key, every retained identity,
+/// and ownership all describe the same UUID self-session, never a child session.
+pub fn normalize_workspace_record(record: &crate::PendingRecord) -> Result<crate::PendingRecord, DocError> {
+    let identity = match record.container.as_str() {
+        "chats" => "id",
+        "sessions" | "sessionRefs" | "worktreeDeletions" => "chatId",
+        _ => return Ok(record.clone()),
+    };
+    let conflict = || DocError::Schema(format!("Crew recovery conflict in {}/{}; original intent retained", record.container, record.key));
+    let Some(row) = record.before.as_ref().or(record.value.as_ref()).and_then(|value| value.as_object()) else { return Ok(record.clone()) };
+    if row.get(identity).and_then(|value| value.as_str()).is_none() { return Ok(record.clone()) }
+    let user = row.get("userId").and_then(|value| value.as_str());
+    let key_id = if record.container == "sessionRefs" {
+        let Some(user) = user else { return Ok(record.clone()) };
+        let prefix = format!("{}:{user}:", user.len());
+        record.key.strip_prefix(&prefix).ok_or_else(conflict)?
+    } else { record.key.as_str() };
+    let Some(public) = execution_chat_id(key_id).or_else(|| record.before.iter().chain(record.value.iter())
+        .find_map(|value| value.get(identity).and_then(|id| id.as_str()).and_then(execution_chat_id))) else { return Ok(record.clone()) };
+    if key_id != public && execution_chat_id(key_id) != Some(public) { return Err(conflict()) }
+    let owner_fields: &[&str] = match record.container.as_str() {
+        "sessionRefs" => &["userId"],
+        "worktreeDeletions" => &["ownerSubject", "ownerDeviceId"],
+        _ => &["deviceId"],
+    };
+    if owner_fields.iter().any(|field| !row.get(*field).and_then(|value| value.as_str()).is_some_and(|value| !value.is_empty())) { return Err(conflict()) }
+    for value in record.before.iter().chain(record.value.iter()) {
+        let fields = value.as_object().ok_or_else(conflict)?;
+        if !fields.get(identity).and_then(|value| value.as_str()).is_some_and(|id| id == public || execution_chat_id(id) == Some(public)) { return Err(conflict()) }
+        for field in WORKSPACE_IDENTITY_FIELDS.iter().copied().filter(|field| *field != identity) {
+            if fields.get(field) != row.get(field) { return Err(conflict()) }
+        }
+        if fields.get("environment").and_then(|value| value.get("scope")) != row.get("environment").and_then(|value| value.get("scope")) { return Err(conflict()) }
+    }
+    let mut normalized = record.clone();
+    normalized.key = if let Some(user) = user.filter(|_| record.container == "sessionRefs") { session_ref_key(user, public) } else { public.into() };
+    for value in normalized.before.iter_mut().chain(normalized.value.iter_mut()) {
+        value.as_object_mut().ok_or_else(conflict)?.insert(identity.into(), public.into());
+    }
+    Ok(normalized)
+}
+
+/// Coexisting bootstrap creations may retain stale owner observations under an
+/// alias. Only a covered cached canonical creation supersedes those observations;
+/// edits to user-controlled fields and unknown ancestry still conflict.
+pub fn canonical_creation_covers_alias(alias: &crate::PendingRecord, canonical: &crate::PendingRecord, cached: &LoroDoc) -> bool {
+    if alias.container != canonical.container || alias.key == canonical.key || alias.before.is_some() || canonical.before.is_some()
+        || alias.version.is_empty() || canonical.version.is_empty() { return false }
+    let (Ok(alias_version), Ok(canonical_version)) = (loro::VersionVector::decode(&alias.version), loro::VersionVector::decode(&canonical.version)) else { return false };
+    let cached_version = cached.oplog_vv();
+    if !canonical_version.includes_vv(&alias_version) || !cached_version.includes_vv(&canonical_version) { return false }
+    let (Ok(local), Ok(public)) = (normalize_workspace_record(alias), normalize_workspace_record(canonical)) else { return false };
+    if local.key != public.key || public.key != canonical.key { return false }
+    let covered_row = |record: &crate::PendingRecord, normalized: &crate::PendingRecord, version: &loro::VersionVector| {
+        let root = cached.get_map(record.container.as_str());
+        let covers = |edit| cached.with_oplog(|oplog| oplog.idlp_to_id(edit))
+            .map(|id| version.includes_id(id)).unwrap_or_else(|| version.includes_vv(&cached_version));
+        if !root.to_handler().get_last_edit_idlp(&record.key).is_some_and(covers) { return false }
+        let value = root.get(&record.key).map(|row| row.get_deep_value().to_json_value());
+        let cached_record = crate::PendingRecord { container: record.container.clone(), key: record.key.clone(), value, before: None, version: Vec::new(), acknowledged: false };
+        let Ok(cached_record) = normalize_workspace_record(&cached_record) else { return false };
+        if cached_record.value != normalized.value { return false }
+        match root.get(&record.key) {
+            None => normalized.value.is_none(),
+            Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) => {
+                let Some(fields) = normalized.value.as_ref().and_then(|value| value.as_object()) else { return false };
+                fields.keys().all(|field| !matches!(row.get(field), Some(loro::ValueOrContainer::Container(_)))
+                    && row.to_handler().get_last_edit_idlp(field).is_some_and(covers))
+            }
+            _ => false,
+        }
+    };
+    if !covered_row(alias, &local, &alias_version) || !covered_row(canonical, &public, &canonical_version) { return false }
+    if public.value.is_none() { return true } // A proved canonical tombstone is never revived.
+    let (Some(local), Some(public)) = (local.value.as_ref().and_then(|value| value.as_object()), public.value.as_ref().and_then(|value| value.as_object())) else { return false };
+    let observations: &[&str] = match alias.container.as_str() {
+        "chats" => &["createdAt", "harnessSessionId", "harnessSessionCwd", "lastSeenAt", "lastMessageAt", "lastMessagePreview"],
+        "sessions" => &["status", "startedAt", "updatedAt"],
+        "sessionRefs" => &["addedAt"],
+        _ => return false,
+    };
+    if local.keys().chain(public.keys()).any(|field| local.get(field) != public.get(field) && !observations.contains(&field.as_str())) { return false }
+    for clock in if alias.container == "sessions" { &["updatedAt"][..] } else { &["lastSeenAt", "lastMessageAt"][..] } {
+        if let Some(local) = local.get(*clock).and_then(|value| value.as_i64())
+            && !public.get(*clock).and_then(|value| value.as_i64()).is_some_and(|public| public >= local) { return false }
+    }
+    if alias.container == "sessions" && local.get("updatedAt") == public.get("updatedAt")
+        && ["status", "startedAt"].iter().any(|field| local.get(*field) != public.get(*field)) { return false }
+    if alias.container == "chats" && local.get("lastMessageAt") == public.get("lastMessageAt")
+        && local.get("lastMessagePreview") != public.get("lastMessagePreview") { return false }
+    true
 }
 
 /// Everything in the workspace doc, materialized (`read_all`).
@@ -830,56 +931,51 @@ impl WorkspaceDoc {
     /// journals are not part of this doc and are never renamed or discarded.
     pub fn migrate_execution_rows(&self) -> Result<usize, DocError> {
         let _operation = self.doc.operation();
-        let mut migrated = 0;
+        let mut plans = Vec::new();
         for container in ["chats", "sessions", "sessionRefs", "worktreeDeletions"] {
             let parent = self.doc.get_map(container);
-            let serde_json::Value::Object(rows) = parent.get_deep_value().to_json_value() else {
-                continue;
-            };
-            let id_field = if container == "chats" { "id" } else { "chatId" };
+            let serde_json::Value::Object(rows) = parent.get_deep_value().to_json_value() else { continue };
             for (old_key, value) in rows {
-                let serde_json::Value::Object(mut fields) = value else { continue };
-                let Some(old_id) = fields.get(id_field).and_then(|id| id.as_str()) else { continue };
-                let Some(chat_id) = execution_chat_id(old_id) else { continue };
-                let new_key = if container == "sessionRefs" {
-                    let Some(user_id) = fields.get("userId").and_then(|id| id.as_str()) else { continue };
-                    if old_key != session_ref_key(user_id, old_id) { continue; }
-                    session_ref_key(user_id, chat_id)
-                } else {
-                    if old_key != old_id { continue; }
-                    chat_id.to_string()
-                };
+                let original = crate::PendingRecord { container: container.into(), key: old_key.clone(), before: None, value: Some(value), version: Vec::new(), acknowledged: false };
+                let normalized = normalize_workspace_record(&original)?;
+                if normalized.key == old_key && normalized.value == original.value { continue }
                 let Some(loro::ValueOrContainer::Container(loro::Container::Map(source))) = parent.get(&old_key) else { continue };
-                // Unknown nested CRDT containers cannot be safely flattened into
-                // values. Leave such legacy rows private rather than losing data.
-                if fields.keys().any(|field| matches!(source.get(field), Some(loro::ValueOrContainer::Container(_)))) {
-                    continue;
-                }
-                fields.insert(id_field.into(), serde_json::Value::String(chat_id.to_string()));
-                let deleted = parent.get(&new_key).is_none() && parent.get_last_editor(&new_key).is_some();
-                if !deleted {
-                    let target = self.row(container, &new_key)?;
-                    // Canonical metadata is authoritative; fill only absent fields.
-                    // Session status is a single observation, so copy a newer one
-                    // only when it belongs to the same device.
-                    let newer_status = container == "sessions"
-                        && matches!((target.get("deviceId"), source.get("deviceId")),
-                            (Some(loro::ValueOrContainer::Value(LoroValue::String(a))),
-                             Some(loro::ValueOrContainer::Value(LoroValue::String(b)))) if a == b)
-                        && fields.get("updatedAt").and_then(|at| at.as_i64())
-                            > target.get("updatedAt").and_then(|at| match at {
-                                loro::ValueOrContainer::Value(LoroValue::I64(ms)) => Some(ms),
-                                _ => None,
-                            });
-                    for (field, value) in fields {
-                        if newer_status || (target.get(&field).is_none() && target.get_last_editor(&field).is_none()) {
-                            target.insert(&field, LoroValue::from(value))?;
-                        }
+                let Some(serde_json::Value::Object(fields)) = normalized.value else { continue };
+                if fields.keys().any(|field| matches!(source.get(field), Some(loro::ValueOrContainer::Container(_)))) { continue }
+                if normalized.key != old_key && let Some(target) = parent.get(&normalized.key) {
+                    let target = normalize_workspace_record(&crate::PendingRecord {
+                        container: container.into(), key: normalized.key.clone(), before: None,
+                        value: Some(target.get_deep_value().to_json_value()), version: Vec::new(), acknowledged: false,
+                    })?;
+                    let target = target.value.as_ref().and_then(|value| value.as_object()).ok_or_else(|| DocError::Schema("Crew alias target is not a workspace record".into()))?;
+                    if WORKSPACE_IDENTITY_FIELDS.iter().any(|field| target.get(*field) != fields.get(*field))
+                        || target.get("environment").and_then(|value| value.get("scope")) != fields.get("environment").and_then(|value| value.get("scope")) {
+                        return Err(DocError::Schema(format!("Crew recovery conflict in {container}/{old_key}; foreign identity retained")));
                     }
                 }
-                parent.delete(&old_key)?;
-                migrated += 1;
+                plans.push((container, old_key, normalized.key, fields));
             }
+        }
+        let migrated = plans.len();
+        for (container, old_key, new_key, fields) in plans {
+            let parent = self.doc.get_map(container);
+            let deleted = parent.get(&new_key).is_none() && parent.get_last_editor(&new_key).is_some();
+            if !deleted {
+                let target = self.row(container, &new_key)?;
+                let newer_status = container == "sessions"
+                    && fields.get("updatedAt").and_then(|at| at.as_i64())
+                        > target.get("updatedAt").and_then(|at| match at {
+                            loro::ValueOrContainer::Value(LoroValue::I64(ms)) => Some(ms), _ => None,
+                        });
+                for (field, value) in fields {
+                    if (old_key == new_key && field == if container == "chats" { "id" } else { "chatId" })
+                        || (newer_status && matches!(field.as_str(), "status" | "startedAt" | "updatedAt"))
+                        || (target.get(&field).is_none() && target.get_last_editor(&field).is_none()) {
+                        target.insert(&field, LoroValue::from(value))?;
+                    }
+                }
+            }
+            if old_key != new_key { parent.delete(&old_key)?; }
         }
         if migrated != 0 { self.doc.commit()?; }
         Ok(migrated)
@@ -1204,7 +1300,10 @@ mod tests {
         assert_eq!(execution_chat_id(&private), Some(PUBLIC_CHAT));
         assert_eq!(execution_chat_id(&format!("{PUBLIC_CHAT}::session::other")), None);
         assert_eq!(execution_chat_id("chat-a::session::chat-a"), None);
-        assert_eq!(execution_chat_id(&format!("{private}::session::{PUBLIC_CHAT}")), None);
+        assert_eq!(execution_chat_id(&format!("{private}::session::{PUBLIC_CHAT}")), Some(PUBLIC_CHAT));
+        assert_eq!(execution_chat_id(&format!("{private}::session::018eeb58-6508-78e8-a544-44682ab94c51")), None);
+        assert_eq!(execution_chat_id(&format!("{PUBLIC_CHAT}::session::018eeb58-6508-78e8-a544-44682ab94c51::session::{PUBLIC_CHAT}")), None);
+        assert_eq!(execution_chat_id(&format!("{private}::session::")), None);
         let owner = "owner::session::member";
         ws.upsert_session_ref(owner, &session_ref(PUBLIC_CHAT, 1)).unwrap();
         assert_eq!(ws.read_session_refs_for(owner).unwrap()[0].chat_id, PUBLIC_CHAT);
@@ -1274,6 +1373,27 @@ mod tests {
         assert_eq!(ws.migrate_execution_rows().unwrap(), 1);
         assert!(ws.chat(PUBLIC_CHAT).unwrap().is_none());
         assert!(ws.doc().get_map("privateExecutionState").get(&private).is_some());
+    }
+
+    #[test]
+    fn mixed_alias_rows_migrate_but_foreign_targets_remain_untouched() {
+        let ws = WorkspaceDoc::new();
+        let alias = format!("{PUBLIC_CHAT}::session::{PUBLIC_CHAT}::session::{PUBLIC_CHAT}");
+        insert_legacy_row(&ws, "chats", &alias, serde_json::json!({"id": PUBLIC_CHAT, "deviceId": "owner", "title": "kept"}));
+        assert_eq!(ws.migrate_execution_rows().unwrap(), 1);
+        assert_eq!(ws.doc().get_map("chats").get_deep_value().to_json_value()[PUBLIC_CHAT]["title"], "kept");
+        insert_legacy_row(&ws, "chats", &alias, serde_json::json!({"id": alias, "deviceId": "foreign", "title": "blocked"}));
+        let before = ws.export_snapshot().unwrap();
+        assert!(ws.migrate_execution_rows().is_err());
+        assert_eq!(ws.export_snapshot().unwrap(), before);
+        let mixed = crate::PendingRecord { container: "chats".into(), key: PUBLIC_CHAT.into(),
+            before: Some(serde_json::json!({"id": PUBLIC_CHAT, "deviceId": "owner"})),
+            value: Some(serde_json::json!({"id": alias, "deviceId": "owner"})), version: Vec::new(), acknowledged: false };
+        assert_eq!(normalize_workspace_record(&mixed).unwrap().value.unwrap()["id"], PUBLIC_CHAT);
+        let member = crate::PendingRecord { container: "sessionRefs".into(), key: session_ref_key("owner", &alias),
+            before: Some(serde_json::json!({"chatId": alias, "userId": "owner"})),
+            value: Some(serde_json::json!({"chatId": PUBLIC_CHAT, "userId": "foreign"})), version: Vec::new(), acknowledged: false };
+        assert!(normalize_workspace_record(&member).is_err());
     }
 
     fn ts(ms: i64) -> DateTime<Utc> {

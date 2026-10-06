@@ -312,7 +312,6 @@ impl WorkspaceHost {
             None => WorkspaceDoc::new(),
         };
         let doc = Arc::new(doc);
-        doc.migrate_execution_rows()?;
         crate::doc_host::install_workspace_journal(&store, &doc, &config.device_id, &config.project_scope, &config.user_id)?;
         // Destructive-break hygiene: drop the unreachable legacy snapshot row and
         // stamp the in-band schema version for the NEXT break to detect.
@@ -1680,8 +1679,7 @@ fn merge_sessions(
         .filter(|s| !remote.contains(s.chat_id.as_str()))
     {
         // Native handoffs retain their private execution row for turn identity.
-        if let Some((chat_id, session_id)) = session.chat_id.split_once("::session::")
-            && chat_id == session_id
+        if let Some(chat_id) = comet_doc::workspace::execution_chat_id(&session.chat_id)
             && !remote.contains(chat_id)
             && !local.iter().any(|row| row.chat_id == chat_id)
             && merged.get(chat_id).is_none_or(|row| row.device_id == device_id)
@@ -1869,15 +1867,16 @@ mod tests {
 
     #[test]
     fn merged_statuses_include_native_handoff_without_collapsing_child_sessions() {
-        let mut live = session("chat-a::session::chat-a", "device-a");
+        let id = "00000000-0000-4000-8000-000000000217";
+        let mut live = session(&format!("{id}::session::{id}"), "device-a");
         live.status = SessionStatus::Working;
-        let child = session("chat-a::session::child", "device-a");
+        let child = session(&format!("{id}::session::00000000-0000-4000-8000-000000000218"), "device-a");
         let merged = merge_sessions("device-a", &[], &[live.clone(), child.clone()], &[], &[]);
         assert_eq!(merged.len(), 3);
         assert_eq!(
             merged
                 .iter()
-                .find(|row| row.chat_id == "chat-a")
+                .find(|row| row.chat_id == id)
                 .unwrap()
                 .status,
             SessionStatus::Working
@@ -2009,6 +2008,38 @@ mod tests {
         drop(host);
         let restarted = WorkspaceHost::open(store,config).unwrap();
         assert_eq!(restarted.doc().chat(id).unwrap().unwrap().last_message_at.unwrap().timestamp_millis(),3);
+    }
+
+    #[tokio::test]
+    async fn mixed_alias_workspace_and_existing_journal_recover_together_on_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(comet_sync::DocsStore::open(temp.path()).unwrap());
+        let config = WorkspaceHostConfig { device_id: "device-a".into(), device_name: "Test".into(), platform: "test".into(),
+            project_scope: "project-a".into(), user_id: "user-a".into(), edge: None };
+        let host = WorkspaceHost::open(store.clone(), config.clone()).unwrap();
+        let id = "00000000-0000-4000-8000-000000000219";
+        let alias = format!("{id}::session::{id}");
+        let mut original = chat(id, "device-a");
+        original.title = Some("Retained offline title".into());
+        let mut fields = serde_json::to_value(&original).unwrap();
+        fields["createdAt"] = original.created_at.timestamp_millis().into();
+        let row = host.doc().doc().get_map("chats").insert_container(&alias, loro::LoroMap::new()).unwrap();
+        for (field, value) in fields.as_object().unwrap() { row.insert(field, loro::LoroValue::from(value.clone())).unwrap(); }
+        host.doc().binding().commit().unwrap();
+        let scope = store.document_scope(super::WORKSPACE_DOC_ID).unwrap().unwrap();
+        assert!(store.load_pending_records(&scope).unwrap().iter().any(|record| record.key == alias));
+        store.save_snapshot(super::WORKSPACE_DOC_ID, &host.doc().export_snapshot().unwrap()).unwrap();
+        drop(host);
+        for _ in 0..2 {
+            let reopened = WorkspaceHost::open(store.clone(), config.clone()).unwrap();
+            assert_eq!(reopened.doc().chat(id).unwrap().map(|row| row.title), Some(original.title.clone()));
+            assert!(reopened.doc().doc().get_map("chats").get(&alias).is_none());
+            let pending = store.load_pending_records(&scope).unwrap();
+            assert!(pending.iter().all(|record| record.key != alias));
+            assert!(pending.iter().any(|record| record.key == id && record.value.as_ref().is_some_and(|value| value["id"] == id)));
+            assert!(store.load_snapshot(&format!("recovery-original/{scope}")).unwrap().is_some());
+            store.save_snapshot(super::WORKSPACE_DOC_ID, &reopened.doc().export_snapshot().unwrap()).unwrap();
+        }
     }
 
     #[test]

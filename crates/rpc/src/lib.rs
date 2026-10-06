@@ -378,6 +378,11 @@ pub struct PeerReplyResult {
 pub struct PeerMessageResult {
     pub command_id: String,
     pub thread_id: String,
+    pub delivery: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply: Option<PeerReplyResult>,
 }
@@ -468,8 +473,9 @@ pub trait RpcService: Send + Sync + 'static {
 
     /// Only the authenticated host relay invokes this seam. Ordinary JSON RPC
     /// dispatch cannot manufacture a verified principal by claiming its fields.
-    async fn admit_peer_command(
+    async fn peer_command(
         &self,
+        _method: &str,
         _authority: PeerCommandAuthority,
         _params: serde_json::Value,
     ) -> Result<serde_json::Value, RpcError> {

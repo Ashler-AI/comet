@@ -757,7 +757,7 @@ export class DeviceRoom implements DurableObject {
       const hostGrant = hostState?.grant;
       let method: string | undefined;
       try { method = JSON.parse(new TextDecoder().decode(frame.payload)).method; } catch { /* denied below */ }
-      if (method === "AdmitPeerCommand" || state.controlSessionId) {
+      if (method === "AdmitPeerCommand" || (method === "ReadSessionCommand" && !hostGrant) || state.controlSessionId) {
         // Re-read after the authority awaits: another message may have consumed it.
         const current = ws.deserializeAttachment() as SocketState | null;
         const admission = current && frame.header.k === "rpc"
@@ -775,6 +775,11 @@ export class DeviceRoom implements DurableObject {
       }
       if (method === "QueueCommand" && !hostGrant) {
         this.rejectRequest(ws, frame, "peer_command_authority_required");
+        return;
+      }
+      if (method === "ReadSessionCommand" &&
+          (state.userId !== hostState?.userId || state.projectScope !== hostState?.projectScope)) {
+        this.rejectRequest(ws, frame, "session_scope_denied");
         return;
       }
       if (hostGrant && !rpcAllowedForScopedHost(frame.header, frame.payload, hostGrant)) {
@@ -933,6 +938,14 @@ export const rpcAllowedForScopedHost = (
           value.params.targetDeviceId === grant.targetDeviceId)
       );
     }
+    if (value.method === "ReadSessionCommand") {
+      const projection = value.params?.roomProjection as Record<string, unknown> | undefined;
+      return grant.capabilities.includes(SESSION_READ) && value.params?.chatId === grant.scope.sessionId &&
+        typeof value.params.commandId === "string" && value.params.commandId.trim().length > 0 &&
+        (value.params.targetDeviceId === undefined || value.params.targetDeviceId === grant.targetDeviceId) &&
+        (projection === undefined || (projection !== null && projection.projectId === grant.scope.projectId &&
+          projection.deploymentId === grant.scope.deploymentId && projection.sessionId === grant.scope.sessionId));
+    }
     if (value.method === "DeliverPeerMessage") {
       return (
         grant.capabilities.includes("session.chat") &&
@@ -1068,22 +1081,26 @@ export const peerCommandAdmission = (
     host.userId !== client.userId || host.projectScope !== client.projectScope ||
     !host.targetDeviceId || host.targetDeviceId !== client.targetDeviceId ||
     !client.controlSessionId || client.controlConsumed ||
-    !client.capabilities.includes("session.control") ||
     !client.joinedAt || client.joinedAt > now || now >= client.joinedAt + 30_000) return undefined;
   try {
     const request = JSON.parse(new TextDecoder().decode(payload));
-    if (request.method !== "AdmitPeerCommand" || !Number.isSafeInteger(request.id) || request.id < 0 ||
+    if (!["AdmitPeerCommand", "ReadSessionCommand"].includes(request.method) || !Number.isSafeInteger(request.id) || request.id < 0 ||
       request.cancel || request.params?.chatId !== client.controlSessionId ||
       typeof request.params.commandId !== "string" || !request.params.commandId.trim()) return undefined;
     // Legacy ordinary authority cannot attest a deployment, even if the caller
     // puts one in the DTO instead of the websocket query.
     if (request.params.deploymentId != null || request.params.controlDeploymentId != null) return undefined;
+    if (request.params.roomProjection != null ||
+      (request.params.targetDeviceId != null && request.params.targetDeviceId !== host.targetDeviceId)) return undefined;
     const command = request.params.command;
-    if (command?.kind === "control") {
-      if (command.source !== "local" || command.ownerDeviceId !== host.targetDeviceId ||
-        command.actorSubject !== client.userId || typeof command.sessionId !== "string" ||
-        !command.sessionId.trim()) return undefined;
-    } else if (!["run", "steer", "queue", "interrupt", "respondInput"].includes(command?.kind)) return undefined;
+    if (request.method === "AdmitPeerCommand") {
+      if (!client.capabilities.includes("session.control")) return undefined;
+      if (command?.kind === "control") {
+        if (command.source !== "local" || command.ownerDeviceId !== host.targetDeviceId ||
+          command.actorSubject !== client.userId || typeof command.sessionId !== "string" ||
+          !command.sessionId.trim()) return undefined;
+      } else if (!["run", "steer", "queue", "interrupt", "respondInput"].includes(command?.kind)) return undefined;
+    }
     if (!client.capabilities.includes(requiredCapabilityForRpc({ s: "rpc", k: "rpc" }, payload))) return undefined;
     return { request, authority: {
       subject: client.userId,
@@ -1111,6 +1128,7 @@ export const requiredCapabilityForRpc = (
   }
   if (value.method === "DeliverPeerMessage") return "session.chat";
   if (value.method === "LocalDevice") return SESSION_READ;
+  if (value.method === "ReadSessionCommand") return SESSION_READ;
   if (value.method === "QueueCommand" || value.method === "AdmitPeerCommand") {
     const command = value.params?.command;
     if (command?.kind !== "control") return "session.control";

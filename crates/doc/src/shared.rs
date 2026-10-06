@@ -154,7 +154,33 @@ impl SharedDocument {
             }
         }
         let mut pending = self.pending_records();
-        reconcile(&candidate, &pending, &self.raw(), expected_chat.is_some())?;
+        let mut retired = Vec::new();
+        let cached = if expected_chat.is_none() {
+            crate::WorkspaceDoc::from_doc(candidate.clone()).migrate_execution_rows()?;
+            let cached = self.raw().fork();
+            crate::WorkspaceDoc::from_doc(cached.clone()).migrate_execution_rows()?;
+            let originals = std::mem::take(&mut pending);
+            let original_cache = self.raw();
+            for record in &originals {
+                let normalized = crate::workspace::normalize_workspace_record(record)?;
+                if normalized.key != record.key {
+                    let mut original = record.clone(); original.acknowledged = true;
+                    retired.push(Arc::new(original));
+                    if let Some(canonical) = originals.iter().find(|canonical| canonical.container == record.container && canonical.key == normalized.key) {
+                        let target = crate::workspace::normalize_workspace_record(canonical)?;
+                        if (target.before == normalized.before && target.value == normalized.value)
+                            || crate::workspace::canonical_creation_covers_alias(record, canonical, &original_cache) { continue }
+                    }
+                }
+                pending.push(normalized);
+            }
+            let mut keys = BTreeSet::new();
+            if pending.iter().any(|record| !keys.insert((record.container.clone(), record.key.clone()))) {
+                return Err(DocError::Schema("Crew recovery has competing canonical workspace intents; originals retained".into()));
+            }
+            cached
+        } else { self.raw() };
+        reconcile(&candidate, &pending, &cached, expected_chat.is_some())?;
         let version = candidate.oplog_vv().encode();
         for record in &mut pending {
             record.version = version.clone();
@@ -164,7 +190,10 @@ impl SharedDocument {
         }
         let pending: Vec<_> = pending.into_iter().map(Arc::new).collect();
         let snapshot = candidate.export(ExportMode::Snapshot).map_err(|e| DocError::Schema(e.to_string()))?;
-        if let Some(persist) = lock(&self.0.persist).as_ref() { persist(&pending, Some(&snapshot)).map_err(DocError::Schema)?; }
+        if let Some(persist) = lock(&self.0.persist).as_ref() {
+            retired.extend(pending.iter().cloned());
+            persist(&retired, Some(&snapshot)).map_err(DocError::Schema)?;
+        }
         let journal = journal_subscription(&self.0, &candidate);
         let baseline = map_rows(&candidate);
         let mut state = lock(&self.0.state);
@@ -293,10 +322,11 @@ fn reconcile(doc: &LoroDoc, pending: &[PendingRecord], cached: &LoroDoc, session
         let conflict = || DocError::Schema(format!("Crew recovery conflict in {}/{}; original intent retained",record.container,record.key));
         // Owner-register publication IDs change; they are not logical map row identities.
         if MAPS.contains(&record.container.as_str()) && record.container != "agentSessions" {
-            if let (Some(base), Some(remote)) = (record.before.as_ref().or(record.value.as_ref()).and_then(serde_json::Value::as_object), remote.as_ref().and_then(serde_json::Value::as_object)) {
-                let local = record.value.as_ref().and_then(serde_json::Value::as_object).unwrap_or(base);
-                for field in ["id", "chatId", "userId", "deviceId"] {
-                    if base.contains_key(field) && (local.get(field) != base.get(field) || remote.get(field) != base.get(field)) { return Err(conflict()) }
+            if let Some(base) = record.before.as_ref().or(record.value.as_ref()).and_then(serde_json::Value::as_object) {
+                for row in record.value.as_ref().and_then(serde_json::Value::as_object).into_iter()
+                    .chain(remote.as_ref().and_then(serde_json::Value::as_object)) {
+                    if crate::workspace::WORKSPACE_IDENTITY_FIELDS.iter().any(|field| row.get(*field) != base.get(*field))
+                        || row.get("environment").and_then(|value| value.get("scope")) != base.get("environment").and_then(|value| value.get("scope")) { return Err(conflict()) }
                 }
             }
         }
@@ -551,6 +581,70 @@ mod tests {
             parts: vec![MessagePart::Text { id: "text".into(), text: "accepted offline".into() }],
             created_at: 100, device_id: "device".into(), status: Some(MessageStatus::Complete),
             continuation_of: None, peer_message: None }
+    }
+
+    #[test]
+    fn self_alias_journal_recovery_survives_restart_and_keeps_identity_fences() {
+        let public = "018eeb58-6508-78e8-a544-44682ab94c50";
+        let alias = format!("{public}::session::{public}::session::{public}");
+        let remote = LoroDoc::new();
+        let row = remote.get_map("chats").insert_container(public, LoroMap::new()).unwrap();
+        row.insert("id", public).unwrap(); row.insert("deviceId", "owner").unwrap(); row.insert("title", "before").unwrap(); remote.commit();
+        let before = serde_json::json!({"id": alias, "deviceId": "owner", "title": "before"});
+        let after = serde_json::json!({"id": public, "deviceId": "owner", "title": "offline"});
+        let binding = SharedDocument::new(LoroDoc::new());
+        binding.install_journal(vec![PendingRecord { container: "chats".into(), key: alias.clone(), before: Some(before), value: Some(after), version: Vec::new(), acknowledged: false }], Arc::new(|_,_| Ok(())));
+        binding.adopt_snapshot(&remote.export(ExportMode::Snapshot).unwrap(), None).unwrap();
+        assert_eq!(binding.get_map("chats").get_deep_value().to_json_value()[public]["title"], "offline");
+        assert!(binding.get_map("chats").get(&alias).is_none());
+        let records = binding.pending_records();
+        assert_eq!(records[0].key, public);
+        assert_eq!(records[0].before.as_ref().unwrap()["id"], public);
+        let restarted = SharedDocument::new(LoroDoc::new());
+        restarted.install_journal(records.clone(), Arc::new(|_,_| Ok(())));
+        restarted.adopt_snapshot(&binding.export(ExportMode::Snapshot).unwrap(), None).unwrap();
+        assert_eq!(restarted.get_deep_value(), binding.get_deep_value());
+        for (field, value) in [("deviceId", "foreign"), ("projectId", "foreign-project"), ("deploymentId", "foreign-deployment")] {
+            let foreign = remote.fork();
+            let row = foreign.get_map("chats").get(public).unwrap().get_deep_value().to_json_value();
+            let mut row = row.as_object().unwrap().clone(); row.insert(field.into(), value.into());
+            foreign.get_map("chats").insert(public, LoroValue::from(serde_json::Value::Object(row))).unwrap(); foreign.commit();
+            assert!(binding.adopt_snapshot(&foreign.export(ExportMode::Snapshot).unwrap(), None).is_err());
+        }
+        let deletion = LoroDoc::new(); deletion.import(&binding.export(ExportMode::Snapshot).unwrap()).unwrap();
+        deletion.get_map("chats").delete(public).unwrap(); deletion.commit();
+        binding.adopt_snapshot(&deletion.export(ExportMode::Snapshot).unwrap(), None).unwrap();
+        assert!(binding.get_map("chats").get(public).is_none());
+    }
+
+    #[test]
+    fn covered_nested_alias_bootstrap_adopts_canonical_observations_and_restarts() {
+        let public = "018eeb58-6508-78e8-a544-44682ab94c50";
+        let alias = format!("{public}::session::{public}::session::{public}");
+        let cached = LoroDoc::new();
+        for (key, clock) in [(public, 200_i64), (alias.as_str(), 100_i64)] {
+            let row = cached.get_map("chats").insert_container(key, LoroMap::new()).unwrap();
+            row.insert("id", key).unwrap(); row.insert("deviceId", "owner").unwrap(); row.insert("title", "retained user title").unwrap();
+            row.insert("lastSeenAt", clock).unwrap(); row.insert("lastMessageAt", clock).unwrap();
+        }
+        cached.commit();
+        let records: Vec<_> = [public, alias.as_str()].into_iter().map(|key| PendingRecord { container: "chats".into(), key: key.into(), before: None,
+            value: row_value(&cached, "chats", key), version: cached.oplog_vv().encode(), acknowledged: false }).collect();
+        let binding = SharedDocument::new(cached.fork());
+        binding.install_journal(records.clone(), Arc::new(|_,_| Ok(())));
+        binding.adopt_snapshot(&cached.export(ExportMode::Snapshot).unwrap(), None).unwrap();
+        assert_eq!(binding.pending_records().len(), 1);
+        assert_eq!(binding.get_map("chats").get_deep_value().to_json_value()[public]["lastSeenAt"], 200);
+        assert!(binding.get_map("chats").get(&alias).is_none());
+        let restored = SharedDocument::new(binding.raw().fork());
+        restored.install_journal(binding.pending_records(), Arc::new(|_,_| Ok(())));
+        restored.adopt_snapshot(&binding.export(ExportMode::Snapshot).unwrap(), None).unwrap();
+        assert_eq!(restored.get_deep_value(), binding.get_deep_value());
+        let mut unknown = records; unknown[1].version.clear();
+        let blocked = SharedDocument::new(cached.fork());
+        blocked.install_journal(unknown, Arc::new(|_,_| Ok(())));
+        assert!(blocked.adopt_snapshot(&cached.export(ExportMode::Snapshot).unwrap(), None).is_err());
+        assert!(blocked.get_map("chats").get(&alias).is_some());
     }
 
     #[test]
