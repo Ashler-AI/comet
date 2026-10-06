@@ -21,6 +21,10 @@ history boundary is advanced. A returning native writer's edit over the recovere
 workspace used 104 MiB of WASM linear memory versus 143 MiB on 1.13.9.
 Replay the same budget check in a fresh process with private corpus files:
 `node edge/scripts/workspace-replay-memory-smoke.mjs BASELINE.loro DELTA.loro`.
+The Worker loads Loro as a native compiled WebAssembly module rather than an
+embedded base64 payload, avoiding its startup string and decoding buffers.
+The immutable candidate includes the WASM module; no-bundle deployment attaches
+the same bytes alongside the JavaScript entry point.
 
 ## Crew Staging mobile 1.0 (29)
 
