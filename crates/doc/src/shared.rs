@@ -1,7 +1,7 @@
 //! Replaceable Loro cache binding. Durable semantic intents do not depend on Loro ancestry.
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
-use loro::{EventTriggerKind, ExportMode, Index, LoroDoc, LoroList, LoroMap, LoroValue, ToJson};
+use loro::{ContainerTrait, EventTriggerKind, ExportMode, Index, LoroDoc, LoroList, LoroMap, LoroValue, ToJson};
 use loro::event::{Diff, DiffEvent, ListDiffItem};
 use comet_proto::PublicationRecord;
 use serde::{Deserialize, Serialize};
@@ -154,7 +154,7 @@ impl SharedDocument {
             }
         }
         let mut pending = self.pending_records();
-        reconcile(&candidate, &pending, &self.raw())?;
+        reconcile(&candidate, &pending, &self.raw(), expected_chat.is_some())?;
         let version = candidate.oplog_vv().encode();
         for record in &mut pending {
             record.version = version.clone();
@@ -277,18 +277,29 @@ fn row_value(doc: &LoroDoc, container: &str, key: &str) -> Option<serde_json::Va
     } }
     None
 }
-fn reconcile(doc: &LoroDoc, pending: &[PendingRecord], cached: &LoroDoc) -> Result<(),DocError> {
-    let session = SessionDoc::from_doc(doc.clone());
+fn reconcile(doc: &LoroDoc, pending: &[PendingRecord], cached: &LoroDoc, session_context: bool) -> Result<(),DocError> {
+    let session = std::cell::LazyCell::new(|| SessionDoc::from_doc(doc.clone()));
     let candidate_version = doc.oplog_vv();
+    let cached_version = cached.oplog_vv();
+    if session_context { std::cell::LazyCell::force(&session); }
     for record in pending.iter().filter(|record| record.container != "agentSessions" && record.container != "meta")
         .chain(pending.iter().filter(|record| record.container == "agentSessions" || record.container == "meta")) {
         let local_version = if record.version.is_empty() { None } else { loro::VersionVector::decode(&record.version).ok() };
         // A retained intent can already be superseded in the cached history.
         // An older causal checkpoint, conversely, cannot contain a competing edit.
-        if local_version.as_ref().is_some_and(|version| candidate_version.includes_vv(version)) { continue }
+        let covered = local_version.as_ref().is_some_and(|version| candidate_version.includes_vv(version));
+        if covered && !MAPS.contains(&record.container.as_str()) { continue }
         let remote = row_value(doc,&record.container,&record.key);
-        if remote == record.value { continue }
         let conflict = || DocError::Schema(format!("Crew recovery conflict in {}/{}; original intent retained",record.container,record.key));
+        if MAPS.contains(&record.container.as_str()) {
+            if let (Some(base), Some(remote)) = (record.before.as_ref().or(record.value.as_ref()).and_then(serde_json::Value::as_object), remote.as_ref().and_then(serde_json::Value::as_object)) {
+                let local = record.value.as_ref().and_then(serde_json::Value::as_object).unwrap_or(base);
+                for field in ["id", "chatId", "userId", "deviceId"] {
+                    if base.contains_key(field) && (local.get(field) != base.get(field) || remote.get(field) != base.get(field)) { return Err(conflict()) }
+                }
+            }
+        }
+        if covered || remote == record.value { continue }
         match record.container.as_str() {
             "meta" if record.key == "directoryCompletedTurn" => {
                 let Some(local) = record.value.as_ref().and_then(|value| value.as_str()) else { return Err(conflict()) };
@@ -336,25 +347,71 @@ fn reconcile(doc: &LoroDoc, pending: &[PendingRecord], cached: &LoroDoc) -> Resu
                 session.upsert_agent_session(&publication)?;
             }
             name if MAPS.contains(&name) => {
-                let local_follows_remote = local_version.as_ref().is_some_and(|version| {
-                    if version.includes_vv(&candidate_version) { return true }
-                    // ponytail: peer coverage is conservative; expose per-field op IDs if same-peer unrelated edits block recovery.
-                    // Creation coalesces later accepted edits. Other-row writers must
-                    // not make an already-observed creation look concurrent.
-                    if record.before.is_some() { return false }
-                    let (Some(local), Some(remote)) = (record.value.as_ref().and_then(serde_json::Value::as_object), remote.as_ref().and_then(serde_json::Value::as_object)) else { return false };
-                    // Full-row replay cannot erase fields absent from the original creation intent.
-                    if remote.keys().any(|field| !local.contains_key(field)) { return false }
+                let creation_merge = local_version.as_ref().and_then(|version| {
+                    if record.before.is_some() { return None }
+                    let (Some(local), Some(remote)) = (record.value.as_ref().and_then(serde_json::Value::as_object), remote.as_ref().and_then(serde_json::Value::as_object)) else { return None };
                     let root = doc.get_map(name);
-                    let covers_editor = |peer| candidate_version.get(&peer).is_some_and(|counter|
-                        *counter > 0 && version.get(&peer).is_some_and(|accepted| *accepted >= *counter));
-                    if !root.get_last_editor(&record.key).is_some_and(covers_editor) { return false }
-                    let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) = root.get(&record.key) else { return false };
-                    local.keys().all(|field| match row.get_last_editor(field) {
-                        Some(peer) => covers_editor(peer),
-                        None => !remote.contains_key(field),
-                    })
+                    let covers_edit = |source: &LoroDoc, other: &LoroDoc, edit: loro::IdLp, state_proof: bool| {
+                        // Lamport bounds the peer counter, even after history compaction.
+                        if version.get(&edit.peer).is_some_and(|&next| i64::from(next) > i64::from(edit.lamport)) { return true }
+                        // A known uncovered source ID cannot be hidden by a counter alias.
+                        source.with_oplog(|oplog| oplog.idlp_to_id(edit))
+                            .map(|id| version.includes_id(id))
+                            .unwrap_or_else(|| state_proof || other.with_oplog(|oplog| oplog.idlp_to_id(edit))
+                                .is_some_and(|id| version.includes_id(id)))
+                    };
+                    // A covered document also covers state edits whose changes
+                    // have been compacted out of both shallow histories.
+                    let incoming_covered = version.includes_vv(&candidate_version);
+                    let cached_covered = version.includes_vv(&cached_version);
+                    let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) = root.get(&record.key) else { return None };
+                    let cached_root = cached.get_map(name);
+                    let Some(loro::ValueOrContainer::Container(loro::Container::Map(cached_row))) = cached_root.get(&record.key) else { return None };
+                    if cached_row.id() != row.id() { return None }
+                    if !root.to_handler().get_last_edit_idlp(&record.key).is_some_and(|edit|
+                        covers_edit(doc, cached, edit, incoming_covered || (cached_covered && cached_root.to_handler().get_last_edit_idlp(&record.key) == Some(edit)))) { return None }
+                    let cached_handler = cached_row.to_handler();
+                    let handler = row.to_handler();
+                    let covers_incoming = |field: &str, edit| covers_edit(doc, cached, edit,
+                        incoming_covered || (cached_covered && cached_handler.get_last_edit_idlp(field) == Some(edit)));
+                    let covers_cached = |field: &str, edit| covers_edit(cached, doc, edit,
+                        cached_covered || (incoming_covered && handler.get_last_edit_idlp(field) == Some(edit)));
+                    // Workspace fields are atomic values; a nested container's
+                    // attachment alone cannot prove coverage of its child edits.
+                    if remote.keys().any(|field| matches!(row.get(field), Some(loro::ValueOrContainer::Container(_)))) { return None }
+                    if remote.keys().chain(local.keys()).any(|field| matches!(cached_row.get(field), Some(loro::ValueOrContainer::Container(_)))) { return None }
+                    let mut merged = remote.clone();
+                    for (field, value) in local {
+                        if remote.get(field) == Some(value) { continue }
+                        match handler.get_last_edit_idlp(field) {
+                            Some(edit) if !covers_incoming(field, edit) => return None,
+                            None if remote.contains_key(field) => return None,
+                            _ => {},
+                        }
+                        merged.insert(field.clone(), value.clone());
+                    }
+                    for field in remote.keys().filter(|field| !local.contains_key(*field)) {
+                        match cached_handler.get_last_edit_idlp(field) {
+                            None if cached_row.get(field).is_none() => {}, // Independent incoming addition.
+                            Some(edit) if covers_cached(field, edit) => {
+                                if cached_row.get(field).is_none() {
+                                    // An explicit local tombstone wins only over an
+                                    // observed field, never an unseen resurrection.
+                                    if !handler.get_last_edit_idlp(field).is_some_and(|edit| covers_incoming(field, edit)) { return None }
+                                    merged.remove(field);
+                                }
+                                // A present cached field can be a previously merged
+                                // remote addition, absent from the retained intent.
+                            }
+                            _ => return None, // Cached imports erased the intent's field provenance.
+                        }
+                    }
+                    let publication_follows = name == "sessions" && ["status", "startedAt", "updatedAt"].iter().all(|field|
+                        handler.get_last_edit_idlp(field).map(|edit| covers_incoming(field, edit)).unwrap_or(!remote.contains_key(*field)));
+                    Some((serde_json::Value::Object(merged), publication_follows))
                 });
+                let local_follows_remote = creation_merge.as_ref().is_some_and(|(_, follows)| *follows)
+                    || local_version.as_ref().is_some_and(|version| version.includes_vv(&candidate_version));
                 let cached_session = if name == "sessions" { row_value(cached, name, &record.key) } else { None };
                 let owner_publication = if name == "sessions" && remote.is_some() && record.value.is_some() {
                     let local = record.value.as_ref().and_then(serde_json::Value::as_object).ok_or_else(conflict)?;
@@ -389,7 +446,9 @@ fn reconcile(doc: &LoroDoc, pending: &[PendingRecord], cached: &LoroDoc) -> Resu
                     }
                     Some(publication)
                 } else { None };
-                let mut merged = if local_follows_remote {
+                let mut merged = if let Some((value, _)) = creation_merge {
+                    Some(value)
+                } else if local_follows_remote && (record.before.is_none() || record.value.is_none() || remote.is_none()) {
                     record.value.clone()
                 } else { match (&record.before,&record.value,&remote) {
                     (_,None,None) => continue,
@@ -428,7 +487,7 @@ fn reconcile(doc: &LoroDoc, pending: &[PendingRecord], cached: &LoroDoc) -> Resu
                                 merged.insert(field.clone(), serde_json::json!(local_at.max(remote_at)));
                                 continue;
                             }
-                            if remote.get(field) != before.and_then(|row| row.get(field)) && remote.get(field) != local.get(field) {
+                            if !local_follows_remote && remote.get(field) != before.and_then(|row| row.get(field)) && remote.get(field) != local.get(field) {
                                 return Err(DocError::Schema(format!("Crew recovery conflict in {}/{} field={field}; original intent retained", record.container, record.key)));
                             }
                             if let Some(value) = local.get(field) { merged.insert(field.clone(),value.clone()); } else { merged.remove(field); }
@@ -572,6 +631,103 @@ mod tests {
             row.insert(field, value).unwrap(); changed.doc().commit();
             assert!(binding.adopt_snapshot(&changed.export_snapshot().unwrap(), None).is_err());
             assert_eq!(local.export_snapshot().unwrap(), preserved);
+            assert_eq!(serde_json::to_vec(&binding.pending_records()).unwrap(), intents);
+        }
+    }
+
+    #[test]
+    fn same_peer_unrelated_edits_preserve_cold_creation_and_row_provenance() {
+        for (shallow, warmup) in [(false, 0), (true, 0), (false, 64), (true, 64)] {
+            let local = WorkspaceDoc::new();
+            local.doc().set_peer_id(3).unwrap();
+            if warmup > 0 {
+                let clock = local.doc().get_map("devices").insert_container("clock", LoroMap::new()).unwrap();
+                clock.insert("id", "clock").unwrap(); clock.insert("name", "clock").unwrap();
+                for tick in 0..warmup { clock.insert("tick", tick).unwrap(); local.doc().commit(); }
+            }
+            local.doc().set_peer_id(1).unwrap();
+            let original_binding = local.binding(); journal(&original_binding);
+            let row = original_binding.get_map("chats").insert_container("chat", LoroMap::new()).unwrap();
+            row.insert("id", "chat").unwrap(); row.insert("deviceId", "owner-device").unwrap();
+            row.insert("title", "created").unwrap(); row.insert("removeMe", "observed field").unwrap(); original_binding.commit().unwrap();
+            let raw = LoroDoc::new(); raw.import(&local.export_snapshot().unwrap()).unwrap();
+            raw.set_peer_id(1).unwrap();
+            let remote = WorkspaceDoc::from_doc(raw);
+            // A restarted owner keeps the coalesced creation intent, but uses a
+            // fresh Loro peer for its accepted rename (no same-peer history fork).
+            local.doc().set_peer_id(2).unwrap();
+            local.rename_chat("chat", "accepted offline rename").unwrap();
+            row.delete("removeMe").unwrap(); original_binding.commit().unwrap();
+            let original = original_binding.pending_records();
+            assert_eq!(original.len(), 1); assert!(original[0].before.is_none());
+            let raw = LoroDoc::new(); raw.import(&local.export_snapshot().unwrap()).unwrap();
+            let mut restarted = WorkspaceDoc::from_doc(raw);
+            let mut binding = restarted.binding();
+            binding.install_journal(original.clone(), Arc::new(|_,_| Ok(())));
+            let device = remote.doc().get_map("devices").insert_container("peer", LoroMap::new()).unwrap();
+            device.insert("id", "peer").unwrap(); device.insert("name", "unrelated heartbeat").unwrap();
+            let loro::ValueOrContainer::Container(loro::Container::Map(remote_row)) = remote.doc().get_map("chats").get("chat").unwrap() else { panic!("chat row missing"); };
+            remote_row.insert("remoteNote", "independent field must survive").unwrap();
+            remote.doc().commit();
+            let accepted = loro::VersionVector::decode(&original[0].version).unwrap();
+            assert!(remote.doc().oplog_vv().get(&1) > accepted.get(&1));
+            let snapshot = if shallow {
+                remote.doc().export(ExportMode::shallow_snapshot(&remote.doc().state_frontiers())).unwrap()
+            } else { remote.export_snapshot().unwrap() };
+            for recovery in 0..3 {
+                binding.adopt_snapshot(&snapshot, None).unwrap_or_else(|error| panic!("shallow={shallow} recovery={recovery}: {error}"));
+                assert_eq!(restarted.chat("chat").unwrap().unwrap().title.as_deref(), Some("accepted offline rename"));
+                assert_eq!(binding.get_map("devices").get("peer").unwrap().get_deep_value().to_json_value()["name"], "unrelated heartbeat");
+                let row = binding.get_map("chats").get("chat").unwrap().get_deep_value().to_json_value();
+                assert_eq!(row["remoteNote"], "independent field must survive");
+                assert!(row.get("removeMe").is_none());
+                assert_eq!(binding.pending_records()[0].before, original[0].before);
+                assert_eq!(binding.pending_records()[0].value, original[0].value);
+                if recovery == 1 {
+                    let records = binding.pending_records();
+                    let raw = LoroDoc::new(); raw.import(&restarted.export_snapshot().unwrap()).unwrap();
+                    restarted = WorkspaceDoc::from_doc(raw);
+                    binding = restarted.binding();
+                    binding.install_journal(records, Arc::new(|_,_| Ok(())));
+                }
+            }
+            let preserved = restarted.export_snapshot().unwrap();
+            let intents = serde_json::to_vec(&binding.pending_records()).unwrap();
+            for change in ["title", "deviceId", "field deletion", "row deletion", "row replacement", "resurrection", "nested container"] {
+                let raw = LoroDoc::new(); raw.import(&remote.export_snapshot().unwrap()).unwrap();
+                raw.set_peer_id(1).unwrap();
+                let changed = WorkspaceDoc::from_doc(raw);
+                let root = changed.doc().get_map("chats");
+                let loro::ValueOrContainer::Container(loro::Container::Map(row)) = root.get("chat").unwrap() else { panic!("chat row missing"); };
+                match change {
+                    "title" => row.insert("title", "conflicting rename").unwrap(),
+                    "deviceId" => row.insert("deviceId", "foreign-owner").unwrap(),
+                    "field deletion" => row.delete("title").unwrap(),
+                    "row deletion" => root.delete("chat").unwrap(),
+                    "row replacement" => {
+                        root.delete("chat").unwrap();
+                        let row = root.insert_container("chat", LoroMap::new()).unwrap();
+                        row.insert("id", "chat").unwrap(); row.insert("deviceId", "owner-device").unwrap();
+                        row.insert("title", "created").unwrap();
+                    }
+                    "resurrection" => row.insert("removeMe", "unseen resurrection").unwrap(),
+                    _ => { row.insert_container("nested", LoroMap::new()).unwrap(); }
+                }
+                changed.doc().commit();
+                assert!(binding.adopt_snapshot(&changed.export_snapshot().unwrap(), None).is_err(), "{change}");
+                assert_eq!(restarted.export_snapshot().unwrap(), preserved, "{change}");
+                assert_eq!(serde_json::to_vec(&binding.pending_records()).unwrap(), intents, "{change}");
+            }
+            // A later cache import can overwrite the deletion's winning metadata.
+            // Its uncovered present field is ambiguous, not an independent addition.
+            for update in 0..8 { device.insert("name", format!("later heartbeat {update}")).unwrap(); }
+            remote_row.insert("removeMe", "unseen resurrection").unwrap(); remote.doc().commit();
+            let resurrection = remote.export_snapshot().unwrap();
+            binding.raw().import(&resurrection).unwrap();
+            assert_eq!(binding.get_map("chats").get("chat").unwrap().get_deep_value().to_json_value()["removeMe"], "unseen resurrection");
+            let cached_import = restarted.export_snapshot().unwrap();
+            assert!(binding.adopt_snapshot(&resurrection, None).is_err());
+            assert_eq!(restarted.export_snapshot().unwrap(), cached_import);
             assert_eq!(serde_json::to_vec(&binding.pending_records()).unwrap(), intents);
         }
     }

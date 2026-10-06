@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { createRequire } from "node:module";
@@ -195,6 +195,7 @@ const captureOutput = (child, label) => {
     child.spawnError = error;
     capture(error.stack ?? error.message);
   });
+  child.once("exit", (code, signal) => capture(`${new Date().toISOString()} ${label} exited code=${code} signal=${signal}`));
   child.outputSummary = () => `${label} output:\n${lines.join("\n")}`;
 };
 
@@ -871,7 +872,8 @@ const main = async () => {
       "--var",
       `SCAFFOLD_REQUIRED_CAPABILITIES:${CAPABILITIES.join(" ")}`
     ],
-      { cwd: EDGE_DIR, env: { ...process.env, NO_COLOR: "1", ASHLER_INCREMENTAL_TSC_CHECKS: "false" } }
+      { cwd: EDGE_DIR, env: { ...process.env, NO_COLOR: "1", ASHLER_INCREMENTAL_TSC_CHECKS: "false",
+        WRANGLER_LOG_PATH: path.join(tempDir, "wrangler-logs"), WRANGLER_LOG_SANITIZE: "true" } }
     );
     const health = await waitFor("local Edge Worker readiness", async () => {
       if (worker.spawnError) throw new Error(worker.outputSummary());
@@ -1099,6 +1101,12 @@ try {
 } catch (error) {
   for (const child of trackedChildren) {
     if (child.outputSummary) console.error(child.outputSummary());
+  }
+  if (tempDir) {
+    const logs = path.join(tempDir, "wrangler-logs");
+    for (const file of await readdir(logs).catch(() => [])) {
+      if (file.endsWith(".log")) console.error(`Wrangler diagnostic ${file}:\n${await readFile(path.join(logs, file), "utf8")}`);
+    }
   }
   throw error;
 } finally {

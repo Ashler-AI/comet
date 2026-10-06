@@ -465,6 +465,10 @@ impl MapState {
     pub fn get_last_edit_peer(&self, key: &str) -> Option<PeerID> {
         self.map.get(&key.into()).map(|v| v.peer)
     }
+
+    pub fn get_last_edit_idlp(&self, key: &str) -> Option<IdLp> {
+        self.map.get(&key.into()).map(MapValue::idlp)
+    }
 }
 
 mod snapshot {

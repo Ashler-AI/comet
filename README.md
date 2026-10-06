@@ -17,6 +17,21 @@ Recovery-seed decoding uses the existing WASM exhaustion/recycle policy; rejecte
 requests never replace retained workspace history.
 HTTP and WebSocket imports use that same policy instead of masking exhausted
 WASM as an ordinary invalid update; staging logs retain a bounded error stack.
+Creation recovery uses winning field edits, not a peer's unrelated later counter.
+Disjoint incoming fields and explicit deletions survive repeated shallow recovery;
+identity and owner checks precede causal shortcuts. Authority clocks are captured
+before session-only schema migration, never by stamping a workspace as a session.
+Unprovable provenance remains blocked with original intents retained.
+
+Latest native follow-up passed 151 document/sync tests and the rebuilt 24-turn
+real collaboration smoke with all 1,600 history rows. Three awake quiet-owner
+runs passed lease freshness and cold recovery; the headed demo admitted a new
+mock turn and rendered its completed reply. Remote release gates remain required.
+
+Public room identities are canonical UUIDs. Principal, project and deployment
+boundaries remain exact; private execution keys never become discovery rows.
+Legacy output migration checks provenance before publishing recovered messages.
+Cold execution aliases accept authenticated OMP, Codex and Claude Code contexts.
 
 The edge pins Loro 1.16.4 for lower-memory concurrent workspace imports; no
 history boundary is advanced. A returning native writer's edit over the recovered

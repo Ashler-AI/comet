@@ -4746,6 +4746,16 @@ impl MapHandler {
             }),
         }
     }
+
+    /// The exact winning edit, including deletions, or `None` for an untouched key.
+    pub fn get_last_edit_idlp(&self, key: &str) -> Option<loro_common::IdLp> {
+        match &self.inner {
+            MaybeDetached::Detached(_) => None,
+            MaybeDetached::Attached(a) => a.with_state(|state| {
+                state.as_map_state().unwrap().get_last_edit_idlp(key)
+            }),
+        }
+    }
 }
 
 fn with_txn<R>(doc: &LoroDoc, f: impl FnOnce(&mut Transaction) -> LoroResult<R>) -> LoroResult<R> {
