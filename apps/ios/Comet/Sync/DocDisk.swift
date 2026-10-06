@@ -90,8 +90,8 @@ enum DocDisk {
         let canonicalId = String(publicId)
         func normalize(_ bytes: Data?) throws -> Data? {
             guard var row = try recordValue(bytes)?.mapValue else { return bytes }
-            row[identity] = .string(canonicalId)
-            return try recordData(.map(row))
+            row[identity] = .string(value: canonicalId)
+            return try recordData(.map(value: row))
         }
         var intent = original
         intent.key = original.root == "sessionRefs" ? "\(user!.utf8.count):\(user!):\(canonicalId)" : canonicalId
@@ -579,8 +579,8 @@ extension DocDisk {
             aliasDoc.commit()
             guard try migrateWorkspaceRows(in: aliasDoc), !(try migrateWorkspaceRows(in: aliasDoc)),
                   try recordValue(in: aliasDoc, root: "chats", key: publicId)?.mapValue?["title"]?.stringValue == "Retained" else { return false }
-            var aliasIntent = RecordIntent(root: "chats", key: alias, before: try recordData(.map(["id": .string(alias), "deviceId": .string("owner"), "title": .string("Before")])))
-            aliasIntent.after = try recordData(.map(["id": .string(publicId), "deviceId": .string("owner"), "title": .string("After")]))
+            var aliasIntent = RecordIntent(root: "chats", key: alias, before: try recordData(.map(value: ["id": .string(value: alias), "deviceId": .string(value: "owner"), "title": .string(value: "Before")])))
+            aliasIntent.after = try recordData(.map(value: ["id": .string(value: publicId), "deviceId": .string(value: "owner"), "title": .string(value: "After")]))
             aliasIntent.intermediates = [aliasIntent.before, aliasIntent.after]
             let normalized = try normalizeWorkspaceIntent(aliasIntent)
             guard normalized.key == publicId, normalized.id == aliasIntent.id,
@@ -589,7 +589,7 @@ extension DocDisk {
             var mixed = aliasIntent
             mixed.key = publicId; mixed.before = aliasIntent.after; mixed.after = aliasIntent.before
             guard try recordValue(normalizeWorkspaceIntent(mixed).after)?.mapValue?["id"]?.stringValue == publicId else { return false }
-            mixed.intermediates = [try recordData(.map(["id": .string(alias), "deviceId": .string("foreign")]))]
+            mixed.intermediates = [try recordData(.map(value: ["id": .string(value: alias), "deviceId": .string(value: "foreign")]))]
             do { _ = try normalizeWorkspaceIntent(mixed); return false } catch MobileSessionError.unavailable(_) {}
             let foreign = aliasDoc.fork()
             let foreignAlias = try foreign.getMap(id: "chats").getOrCreateContainer(key: alias, child: LoroMap())

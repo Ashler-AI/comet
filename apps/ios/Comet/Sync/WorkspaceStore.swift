@@ -1324,8 +1324,8 @@ extension WorkspaceStore {
         do {
             let publicId = "018eeb58-6508-78e8-a544-44682ab94c50"
             let alias = publicId + "::session::" + publicId + "::session::" + publicId
-            var legacy = DocDisk.RecordIntent(root: "chats", key: alias, before: try DocDisk.recordData(.map(["id": .string(alias), "deviceId": .string("host"), "title": .string("Before")])))
-            legacy.after = try DocDisk.recordData(.map(["id": .string(publicId), "deviceId": .string("host"), "title": .string("After")]))
+            var legacy = DocDisk.RecordIntent(root: "chats", key: alias, before: try DocDisk.recordData(.map(value: ["id": .string(value: alias), "deviceId": .string(value: "host"), "title": .string(value: "Before")])))
+            legacy.after = try DocDisk.recordData(.map(value: ["id": .string(value: publicId), "deviceId": .string(value: "host"), "title": .string(value: "After")]))
             legacy.intermediates = [legacy.before]
             try DocDisk.saveIntents([legacy], id: cacheId)
             let migrated = WorkspaceStore(config: config)
