@@ -630,12 +630,13 @@ export class SessionRoom implements DurableObject {
             metadata.partialEndVersionVector.free();
           }
         } catch (error) {
+          this.escalateWasmPoisoning(error);
           if (this.env.ENVIRONMENT === "staging") {
             const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", seed as Uint8Array<ArrayBuffer>));
             return json({
               error: "invalid_snapshot", validationStage, seedBytes: seed.byteLength,
               sha256: Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join(""),
-              reason: (error instanceof Error ? `${error.name}: ${error.message}` : String(error)).slice(0, 512)
+              reason: (error instanceof Error ? error.stack ?? `${error.name}: ${error.message}` : String(error)).slice(0, 512)
             }, 400);
           }
           return json({ error: "invalid_snapshot" }, 400);

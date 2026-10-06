@@ -10,9 +10,11 @@ restart; transcript-room retention is unchanged. Previously discarded dependenci
 still require an explicit, backed-up recovery rather than an automatic reset.
 
 Rejected staging recovery seeds report the received byte count, SHA-256,
-validation stage, and a bounded error reason to the authenticated controller.
+validation stage, and a bounded error stack to the authenticated controller.
 Invalid seeds still leave retained state unchanged; production responses remain
 generic and neither environment returns seed contents or credentials.
+Recovery-seed decoding uses the existing WASM exhaustion/recycle policy; rejected
+requests never replace retained workspace history.
 
 ## Crew Staging mobile 1.0 (29)
 
