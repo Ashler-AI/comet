@@ -615,17 +615,29 @@ export class SessionRoom implements DurableObject {
       if (seed === null) return json({ error: "too_large" }, 413);
       if (seed.byteLength > 0) {
         if (!workspace) return json({ error: "workspace_seed_required" }, 400);
+        let validationStage = "decode";
         try {
           const metadata = decodeImportBlobMeta(seed, false);
+          validationStage = "mode";
           try {
             if (metadata.mode !== "snapshot" && metadata.mode !== "shallow-snapshot" && metadata.mode !== "outdated-snapshot") {
               return json({ error: "complete_snapshot_required" }, 400);
             }
           } finally {
+            validationStage = "free-start";
             metadata.partialStartVersionVector.free();
+            validationStage = "free-end";
             metadata.partialEndVersionVector.free();
           }
-        } catch {
+        } catch (error) {
+          if (this.env.ENVIRONMENT === "staging") {
+            const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", seed as Uint8Array<ArrayBuffer>));
+            return json({
+              error: "invalid_snapshot", validationStage, seedBytes: seed.byteLength,
+              sha256: Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join(""),
+              reason: (error instanceof Error ? `${error.name}: ${error.message}` : String(error)).slice(0, 512)
+            }, 400);
+          }
           return json({ error: "invalid_snapshot" }, 400);
         }
       }
