@@ -171,8 +171,9 @@ async function verifySimulator(app) {
           await sleep(250);
         }
       }
-      // The live transport hook relaunches this app; retire completed UI fixture timers first.
+      // Keep the unused simulator OS off during native preflight; the live hook boots it on demand.
       run("xcrun", ["simctl", "terminate", simulator, bundleId], { log: "simulator.log" });
+      run("xcrun", ["simctl", "shutdown", simulator], { log: "simulator.log" });
       const loadLog = openSync(path.join(logs, "live-system-load.log"), "w");
       const loadSampler = spawn("top", ["-l", "0", "-s", "2", "-o", "cpu", "-n", "20", "-stats", "pid,command,cpu,mem"], { stdio: ["ignore", loadLog, loadLog] });
       try {

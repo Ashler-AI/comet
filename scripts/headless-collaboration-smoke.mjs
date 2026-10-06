@@ -630,6 +630,7 @@ const liveMobileSmoke = async (edgeOrigin, deviceId, workspacePath) => {
   if (!MOBILE_SIMULATOR) return;
   assert.equal(process.platform, "darwin", "mobile convergence requires the owned macOS simulator");
   const exec = promisify(execFile);
+  await exec("xcrun", ["simctl", "bootstatus", MOBILE_SIMULATOR, "-b"], { timeout: 300_000 });
   const { stdout } = await exec("xcrun", ["simctl", "get_app_container", MOBILE_SIMULATOR, MOBILE_BUNDLE, "data"]);
   const log = path.join(stdout.trim(), "Documents", "e2e.log");
   await rm(log, { force: true });
