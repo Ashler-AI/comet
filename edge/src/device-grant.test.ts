@@ -155,9 +155,10 @@ describe("ordinary device command admission", () => {
   it("denies ordinary raw outcome reads instead of borrowing the host identity", async () => {
     const rejectRequest = vi.fn();
     const deliver = vi.fn();
+    const hostSocket = { deserializeAttachment: () => host };
     const room = {
       authorizePeerClient: async () => true, authorizeHost: async () => true,
-      liveHost: () => ({ deserializeAttachment: () => host }), deliver, rejectRequest
+      liveHost: () => hostSocket, deliver, rejectRequest
     } as unknown as DeviceRoom;
     for (const userId of [client.userId, "foreign-owner"]) {
       const socket = { deserializeAttachment: () => ({ ...client, userId,

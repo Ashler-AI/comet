@@ -743,7 +743,8 @@ export class SessionRoom implements DurableObject {
     const attached = ws.deserializeAttachment() as SocketState | null;
     if (!(await this.authorizeSocket(ws, attached))) return;
     if (typeof message === "string") return; // ping/pong handled by auto-response
-    const state = attached as SocketState;
+    // Authority lookup yields; another frame may have joined/left a sub-room.
+    const state = ws.deserializeAttachment() as SocketState;
     let decoded: ProtocolMessage;
     try {
       decoded = decode(new Uint8Array(message));
@@ -882,6 +883,9 @@ export class SessionRoom implements DurableObject {
       await this.ensureDoc();
       if (!(await this.authorizeSocket(ws, state))) return;
       if (ws.readyState !== WebSocket.OPEN) return;
+      // %EPH joins and Leave can finish while materialization/authority yields.
+      // Merge membership into the current attachment, never the pre-await copy.
+      state = ws.deserializeAttachment() as SocketState;
       // Trimming frees the old doc while authority lookup yields; idle release
       // may remove it entirely. Do not retain the materialization result.
       const doc = this.doc;
@@ -1084,12 +1088,18 @@ export class SessionRoom implements DurableObject {
       }
       if (state.workspace) this.notifyWorkspace(doc, state.projectScope);
       await this.ctx.storage.sync();
-      // The grant may expire or be revoked while durable persistence yields.
-      if (!(await this.authorizeSocket(ws, state)) || ws.readyState !== WebSocket.OPEN) return;
-      this.ack(ws, { crdt, roomId }, UpdateStatusCode.Ok, batchId);
-      // The sender already has its own writes, but not Edge's identity repair.
-      if (repair) this.sendUpdates(ws, crdt, roomId, [repair]);
-      await this.relay(ws, crdt, roomId, repair ? [...updates, repair] : updates);
+      // Acceptance is durable now: publisher disconnect/revocation must not
+      // suppress delivery to still-authorized readers. Only its ACK/repair is
+      // conditional on the publisher's continuing authority.
+      await Promise.all([
+        this.relay(ws, crdt, roomId, repair ? [...updates, repair] : updates),
+        (async () => {
+          if (await this.authorizeSocket(ws, state) && ws.readyState === WebSocket.OPEN) {
+            this.ack(ws, { crdt, roomId }, UpdateStatusCode.Ok, batchId);
+            if (repair) this.sendUpdates(ws, crdt, roomId, [repair]);
+          }
+        })()
+      ]);
       return;
     }
     if (crdt === CrdtType.LoroEphemeralStore) {
@@ -2261,11 +2271,13 @@ export class SessionRoom implements DurableObject {
     roomId: string,
     updates: Uint8Array[]
   ): Promise<void> {
-    for (const ws of this.ctx.getWebSockets()) {
-      if (ws === from) continue;
+    // One slow grant authority must not hold every other reader's live stream.
+    await Promise.all(this.ctx.getWebSockets().map(async (ws) => {
+      if (ws === from) return;
       const state = ws.deserializeAttachment() as SocketState | null;
-      if (!state?.rooms.includes(crdt)) continue;
-      if (!(await this.authorizeSocket(ws, state))) continue;
+      if (!state?.rooms.includes(crdt)) return;
+      if (!(await this.authorizeSocket(ws, state)) || ws.readyState !== WebSocket.OPEN) return;
+      if (!(ws.deserializeAttachment() as SocketState | null)?.rooms.includes(crdt)) return;
       if (!this.sendUpdates(ws, crdt, roomId, updates)) {
         // A member socket we cannot send to is a DEAF PEER, not a skippable
         // one: swallowing the failure left it looking alive (runtime
@@ -2284,7 +2296,7 @@ export class SessionRoom implements DurableObject {
           /* already gone */
         }
       }
-    }
+    }));
   }
 
   private ack(

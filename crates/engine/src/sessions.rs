@@ -1681,15 +1681,7 @@ impl SessionsEngine {
         self.require_running()?;
         const MAX_AUTO_RESUME: u32 = 3;
         const RESUME_FRESH_MS: i64 = 12 * 60 * 60 * 1000;
-        let stale = self.inner.journal.stale_sessions()?;
-        let mut chats = self.inner.journal.session_ids()?;
-        chats.extend(stale.iter().cloned());
-        chats.extend(self.inner.journal.recovery_sessions()?);
-        chats.sort();
-        chats.dedup();
-        if let Some(room) = room {
-            chats.retain(|id| id == room || id.strip_prefix(room).is_some_and(|suffix| suffix.starts_with("::session::")));
-        }
+        let chats = self.inner.journal.recovery_candidates(room)?;
         let mut recovered = 0;
         for chat_id in chats {
             let dispatch_lock = self.dispatch_lock(&chat_id);
@@ -1729,31 +1721,43 @@ impl SessionsEngine {
                     ));
                 }
                 let retired = self.inner.journal.recovery_retired(&chat_id)?;
+                let last_event = self.inner.journal.last_event(&chat_id)?;
+                let stale = matches!(&last_event, Some((_, event)) if !matches!(event, AgentEvent::Done { .. }));
+                let pending = self.pending_run(&chat_id)?;
+                // Idle online rooms are opened on demand (UI attachment or a
+                // durable command nudge). Dialing every completed chat at boot
+                // starves workspace discovery and genuinely interrupted work.
+                // Its terminal mirror/alias repair runs when that room joins.
+                if room.is_none()
+                    && self.inner.doc_host.get().is_some_and(|host| host.recovery_is_online())
+                    && (retired || (pending.is_none() && !stale))
+                {
+                    return Ok(());
+                }
                 // A crash can retain Done while losing its room/workspace mirror.
                 // Reproject only this runtime's proven terminal state, never rerun it.
                 if context.is_some()
-                    && let Some((_, AgentEvent::Done { status, .. })) = self.inner.journal.last_event(&chat_id)?
-                    && (retired || status == DoneStatus::Completed)
+                    && let Some((_, AgentEvent::Done { status, .. })) = &last_event
+                    && (retired || *status == DoneStatus::Completed)
                     && !lock(&self.inner.statuses).contains_key(&chat_id)
                 {
                     let handle = self.doc_handle(&chat_id)?;
                     if !self.inner.doc_host.get().expect("doc handle requires host").recovery_baseline_ready(&handle) {
                         return Ok(());
                     }
-                    self.set_status(&chat_id, if status == DoneStatus::Errored {
+                    self.set_status(&chat_id, if *status == DoneStatus::Errored {
                         SessionStatus::Errored
                     } else {
                         SessionStatus::Idle
                     }, false);
                 }
-                let pending = self.pending_run(&chat_id)?;
                 // Completed private journals still contain output stranded before
                 // canonical aliases were restored. Repair the document binding after
                 // the durable identity checks, without dispatching the old request.
                 if context.is_some() && chat_id.contains("::session::") {
                     self.doc_handle(&chat_id)?;
                 }
-                if retired || (pending.is_none() && !stale.contains(&chat_id)) {
+                if retired || (pending.is_none() && !stale) {
                     return Ok(());
                 }
                 let handle = self.doc_handle(&chat_id)?;
@@ -2070,28 +2074,44 @@ impl SessionsEngine {
     /// Synchronous fallback for engine Drop, including shutdown futures that
     /// are cancelled. Close admission before removing only this engine's tasks.
     pub(crate) fn shutdown_now(&self) {
+        self.begin_shutdown();
+        self.inner.namespace_tasks.shutdown();
+    }
+
+    fn begin_shutdown(&self) {
         self.inner.shutting_down.cancel();
         for preparation in lock(&self.inner.preparations).values() {
             preparation.cancel.cancel();
         }
-        for run in lock(&self.inner.runs).values() {
+        for (chat_id, run) in lock(&self.inner.runs).iter() {
+            // Planned engine exits are not repeated crashes. Refresh only work
+            // this process is actually interrupting, never a stopped/retired turn.
+            if run.turn_active && !run.interrupt_token.is_cancelled() {
+                let checkpoint = (|| -> Result<(), crate::run_journal::JournalError> {
+                    if let Some(mut pending) = self.inner.journal.read_recovery::<PendingRun>(chat_id)?
+                        && pending.identity == run.route.auth_identity
+                        && pending.device_id == self.inner.device_id
+                        && pending.blocked_session.is_none()
+                    {
+                        pending.updated_at = now_ms();
+                        self.inner.journal.save_recovery(chat_id, &pending)?;
+                        self.inner.journal.clear_resume_attempts(chat_id);
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = checkpoint {
+                    tracing::error!(%chat_id, %error, "failed to checkpoint Crew work before shutdown");
+                }
+            }
             run.interrupt_token.cancel();
             let _ = run.cancel.send(true);
         }
-        self.inner.namespace_tasks.shutdown();
     }
 
     /// Stop admission before draining dispatches and owned run tasks; callers may
     /// close document stores only after this returns. Pending requests survive Done.
     pub async fn shutdown(&self) {
-        self.inner.shutting_down.cancel();
-        for preparation in lock(&self.inner.preparations).values() {
-            preparation.cancel.cancel();
-        }
-        for run in lock(&self.inner.runs).values() {
-            run.interrupt_token.cancel();
-            let _ = run.cancel.send(true);
-        }
+        self.begin_shutdown();
         let _admission = self.inner.admission.write().await;
         let chats: Vec<String> = lock(&self.inner.runs).keys().cloned().collect();
         futures::future::join_all(chats.iter().map(|chat_id| self.interrupt_live_turn(chat_id, None))).await;
@@ -2761,6 +2781,16 @@ async fn drive_run(
             }
         };
 
+        // Teardown can surface as a stream/child error rather than a protocol
+        // interrupt. Keep the engine-owned cancellation recoverable; successful
+        // turns still retire normally even when their Done races shutdown.
+        if inner.shutting_down.is_cancelled()
+            && let AgentEvent::Done { status, .. } = &mut event
+            && *status == DoneStatus::Errored
+        {
+            *status = DoneStatus::Interrupted;
+        }
+
         // Any stream activity proves the run is alive — keep the session's
         // freshness inside the UI's 45s staleness window (throttled).
         inner.touch_session(&chat_id);
@@ -3384,6 +3414,37 @@ mod tests {
             .expect("session execution should preserve the projected room");
         assert!(Arc::ptr_eq(&projected, &run_handle));
     }
+    #[tokio::test]
+    async fn online_boot_keeps_settled_histories_cold_and_opens_pending_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = bare_sessions(&dir.path().join("journal"));
+        let host = DocHost::new(Arc::new(DocsStore::open(dir.path().join("docs")).unwrap()),
+            DocHostConfig { device_id: "test-device".into(), default_harness: HarnessId::Mock,
+                edge: Some(crate::doc_host::EdgeConfig::with_static_token("http://127.0.0.1:1", "test")) });
+        sessions.set_doc_host(host.clone());
+        host.set_sessions(&sessions);
+        for index in 1..=64 {
+            let room = uuid::Uuid::from_u128(index).to_string();
+            let key = if index % 2 == 0 { format!("{room}::session::{room}") } else { room };
+            sessions.save_pending(&key, HarnessId::Mock, &test_request("finished", None), "user", None).unwrap();
+            sessions.inner.journal.retire_recovery(&key).unwrap();
+            sessions.inner.journal.append(&key, &AgentEvent::Done {
+                status: DoneStatus::Completed, result: None, error: None, session_id: None,
+            }).unwrap();
+        }
+        assert_eq!(sessions.recover_stale().unwrap(), 0);
+        assert!(host.sync_statuses().is_empty(), "completed histories must not dial rooms at boot");
+
+        let active = uuid::Uuid::from_u128(65).to_string();
+        sessions.save_pending(&active, HarnessId::Mock, &test_request("still owed", None), "active-user", None).unwrap();
+        assert_eq!(sessions.recover_stale().unwrap(), 0); // Waits for its authoritative room baseline.
+        let rooms = host.sync_statuses();
+        assert_eq!(rooms.len(), 1);
+        assert_eq!(rooms[0].0, active);
+        assert!(sessions.inner.journal.read_recovery::<PendingRun>(&active).unwrap().is_some());
+        sessions.shutdown().await;
+    }
+
 
     fn bare_sessions(path: &std::path::Path) -> SessionsEngine {
         SessionsEngine::new(

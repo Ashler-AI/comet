@@ -37,9 +37,7 @@ impl EngineRpc {
         cancellation: &CancellationToken,
     ) -> Result<ScaffoldEnvironmentControlResult, RpcError> {
         let scaffold = self.scaffold()?;
-        let owner_room = self.prepare_scaffold_attach(&control)?;
-        self.await_scaffold_owner_room(owner_room.as_deref(), cancellation)
-            .await?;
+        let owner_projection = self.scaffold_attach_projection(&control)?;
         let result = scaffold
             .control(control, cancellation)
             .await
@@ -59,8 +57,14 @@ impl EngineRpc {
                 .upsert_session_ref(&projection.session_id, Some(result.environment.clone()))
                 .map_err(|error| RpcError::Failed(error.to_string()))?;
         }
-        if let Err(error) = self.install_scaffold_control_grant(&result) {
-            tracing::warn!(error = %error, "Scaffold attached without local control grant projection");
+        self.install_scaffold_control_grant(&result)?;
+        // Legacy scoped caches need the exact verified grant before opening.
+        // Waiting for the owner's room before Attach also prevents waking it.
+        if let Some(projection) = owner_projection {
+            let owner_room = self.doc_host
+                .open_projection(&projection.session_id, Some(&projection))
+                .map_err(|error| RpcError::Failed(error.to_string()))?;
+            self.await_scaffold_owner_room(Some(&owner_room), cancellation).await?;
         }
         Ok(result)
     }

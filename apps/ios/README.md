@@ -367,6 +367,14 @@ a joined room whose backfill stalls is redialed through the existing bounded
 backoff. Scaffold subjects use the edge's trimmed, lowercase identity on both
 new and restored sign-ins; project and principal boundaries remain unchanged.
 
+Streaming session projection decodes a coherent Loro fork on its worker, then
+publishes it even if another import has arrived; one trailing pass catches up.
+This prevents sustained traffic from starving all transcript updates while
+preserving document/room/deployment fences and exact-version readiness. Unchanged
+inputs skip the fork. Device relay disconnects never automatically replay unary
+RPCs: a lost response has an unknown outcome, and durable commands reconcile by
+their retained command ID instead.
+
 Session projection reads transcript messages and the latest matching publication,
 not the entire command ledger, and unchanged inputs do not rebuild rows. Cold
 markdown row preparation runs on a worker actor. The three most recently opened
@@ -1145,4 +1153,13 @@ DELETE can reach the responder. Run these separately; each must log
 of that stage, omit the lifecycle `OK` marker, and leave the app alive after
 teardown. Neither flag affects a release build or sends real network traffic.
 The visibility scenario also checks environment/deployment routing survives
-opaque-ID upsert and projection. Substitute `ai.ashler.crew.staging` for staging.
+opaque-ID upsert and projection, sustained imports publish every completed
+transcript projection (`OK Crew live transcript projection`), and ambiguous
+relay disconnects do not replay a command (`OK Crew relay lifecycle`). Substitute
+`ai.ashler.crew.staging` for staging.
+
+The room-convergence checks in the same visibility launch cover snapshot-plus-journal
+and journal-only recovery, empty-room bootstrap with retained edits, and lost live
+upload acknowledgements despite unrelated room traffic. Uploads without an ACK
+redial after 60 seconds; retained document edits are resubmitted after rejoining.
+These audit additions require exact-source simulator verification before release.

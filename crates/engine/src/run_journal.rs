@@ -3,9 +3,11 @@
 //! One append-only JSONL file per chat under `{data_dir}/journals/{chat_id}.jsonl`; each
 //! line is `{"seq": n, "event": AgentEvent}` with a monotonically increasing `seq`. The
 //! journal is the durable replay source for live streams (`Subscribe` = replay then tail
-//! the broadcast hub) and the crash-recovery gauge: a journal whose LAST event is not
-//! `Done` belongs to a run that died mid-stream — boot recovery stamps its doc entry
-//! `aborted` and closes the journal with a synthetic `Done`.
+//! the broadcast hub) and a crash-recovery gauge. Missing `Done` means the stream
+//! was abandoned; the identity-bound recovery sidecar also retains active requests
+//! across planned engine interruption. User Stop and settled turns retire that
+//! sidecar durably. Recovery enumerates exact room candidates on demand so reopening
+//! one room never reads every other transcript journal.
 //!
 //! Bounded-window compaction is deferred (whole file kept for now, per M2 scope); a torn
 //! trailing line from a crash mid-write is tolerated everywhere.
@@ -190,27 +192,36 @@ impl RunJournal {
         Ok(())
     }
 
-    pub(crate) fn recovery_sessions(&self) -> Result<Vec<String>, JournalError> {
+    /// Journals and requests awaiting startup, restricted before reading sidecars
+    /// when a single room reconnects. Terminal journals remain candidates so a
+    /// crash between Done and its document mirror can be repaired without rerunning.
+    pub(crate) fn recovery_candidates(&self, room: Option<&str>) -> Result<Vec<String>, JournalError> {
+        let prefix = room.map(sanitize_id);
         let mut ids = Vec::new();
         for entry in std::fs::read_dir(&self.dir)? {
             let path = entry?.path();
-            if path.extension().and_then(|extension| extension.to_str()) == Some("recovery") {
-                match self.chat_id_for(&path) {
-                    Ok(Some(chat_id)) => match self.recovery_retired(&chat_id) {
-                        Ok(false) => ids.push(chat_id),
-                        Ok(true) => {}
-                        Err(error) => {
-                            tracing::error!(%chat_id, %error, "skipping invalid Crew recovery record")
-                        }
-                    },
-                    Ok(None) => {}
-                    Err(error) => {
-                        tracing::error!(path = %path.display(), %error, "skipping invalid Crew recovery record")
-                    }
+            if !matches!(path.extension().and_then(|extension| extension.to_str()), Some("jsonl" | "recovery")) {
+                continue;
+            }
+            if let Some(prefix) = prefix.as_deref()
+                && !path.file_stem().and_then(|stem| stem.to_str()).is_some_and(|stem| {
+                    stem == prefix || stem.strip_prefix(prefix).is_some_and(|suffix| suffix.starts_with("__session__"))
+                })
+            {
+                continue;
+            }
+            match self.chat_id_for(&path) {
+                Ok(Some(chat_id)) if room.is_none_or(|room| {
+                    chat_id == room || chat_id.strip_prefix(room).is_some_and(|suffix| suffix.starts_with("::session::"))
+                }) => ids.push(chat_id),
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(path = %path.display(), %error, "skipping invalid Crew recovery binding")
                 }
             }
         }
         ids.sort();
+        ids.dedup();
         Ok(ids)
     }
 
@@ -666,7 +677,7 @@ mod tests {
         let journal = RunJournal::open(dir.path()).unwrap();
         assert_eq!(journal.session_ids().unwrap(), vec!["chat::session::chat"]);
         assert_eq!(
-            journal.recovery_sessions().unwrap(),
+            journal.recovery_candidates(None).unwrap(),
             vec!["chat::session::chat"]
         );
         assert_eq!(
@@ -685,10 +696,26 @@ mod tests {
         assert!(
             RunJournal::open(dir.path())
                 .unwrap()
-                .recovery_sessions()
+                .recovery_retired("chat::session::chat")
                 .unwrap()
-                .is_empty()
         );
+    }
+
+    #[test]
+    fn recovery_candidates_scope_exact_room_and_private_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal.append("room", &done()).unwrap();
+        journal.retire_recovery("room").unwrap();
+        // A request can be durable before the harness emits its first event.
+        journal.save_recovery("room::session::child", &"pending").unwrap();
+        journal.save_recovery("room-extra", &"unrelated").unwrap();
+        // Sanitized prefixes are only a cheap prefilter, never room authority.
+        journal.save_recovery("room__session__unrelated", &"other room").unwrap();
+        assert_eq!(journal.recovery_candidates(Some("room")).unwrap(),
+            vec!["room", "room::session::child"]);
+        assert_eq!(journal.recovery_candidates(None).unwrap().len(), 4);
+        assert!(journal.recovery_candidates(Some("roo")).unwrap().is_empty());
     }
 
     fn done() -> AgentEvent {

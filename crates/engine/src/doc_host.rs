@@ -1162,6 +1162,10 @@ impl DocHost {
         *join_task = Some(task.abort_handle());
     }
 
+    pub(crate) fn recovery_is_online(&self) -> bool {
+        self.inner.config.edge.is_some()
+    }
+
     pub(crate) fn recovery_baseline_ready(&self, handle: &ChatDocHandle) -> bool {
         self.inner.config.edge.is_none() || !self.chat_allows_room_join(&handle.chat_id)
             || lock(&handle.room).is_some()

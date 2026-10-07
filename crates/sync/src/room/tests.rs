@@ -28,6 +28,61 @@ fn fragment_headers_are_bounded_before_allocation() {
     ));
 }
 
+#[tokio::test]
+async fn socket_backfill_backpressure_does_not_block_uploads() {
+    use tokio_tungstenite::tungstenite::protocol::Role;
+    let (client_io, server_io) = tokio::io::duplex(4096);
+    let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+    let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+    let (out_tx, out_rx) = mpsc::channel(1);
+    let (in_tx, mut in_rx) = mpsc::channel(1);
+    let task = tokio::spawn(pump(client, out_rx, in_tx, Arc::new(AtomicBool::new(false)), "duplex-test".into()));
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        // Fill the reader's queue, then leave another backfill frame waiting
+        // on the actor. The actor is concurrently uploading a large batch.
+        server.send(WsMessage::Binary(vec![1])).await.unwrap();
+        server.send(WsMessage::Binary(vec![2])).await.unwrap();
+        while in_rx.is_empty() { tokio::task::yield_now().await; }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        out_tx.send(vec![3]).await.unwrap();
+        assert_eq!(server.next().await.unwrap().unwrap(), WsMessage::Binary(vec![3]));
+        assert_eq!(in_rx.recv().await.unwrap(), vec![1]);
+        assert_eq!(in_rx.recv().await.unwrap(), vec![2]);
+    }).await.expect("backfill must not deadlock the upload direction");
+    drop(in_rx);
+    tokio::time::timeout(TEST_TIMEOUT, task).await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_outbound_queue_is_bounded() {
+    let (session, _wire) = readiness_session(LoroDoc::new());
+    for _ in 0..64 { session.tx.try_send(vec![]).unwrap(); }
+    let error = session.send(&ProtocolMessage::Leave {
+        crdt: CrdtType::Loro, room_id: session.room_id.clone(),
+    }).await.unwrap_err();
+    assert!(matches!(error, SyncError::WebSocket(message) if message == "outbound queue stalled"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn unacknowledged_live_write_redials_without_waiting_for_idle_probe() {
+    let edge = FakeEdge::new();
+    let doc = LoroDoc::new();
+    let client = RoomClient::connect_with(edge.connector(), "room-1", doc.clone()).await.unwrap();
+    let before = edge.dials.load(Ordering::SeqCst);
+    edge.mute.store(true, Ordering::SeqCst);
+    doc.get_text("t").insert(0, "durable offline write").unwrap();
+    doc.commit();
+    tokio::time::sleep(ACK_DEADLINE + Duration::from_secs(5)).await;
+    assert!(edge.dials.load(Ordering::SeqCst) > before);
+    edge.mute.store(false, Ordering::SeqCst);
+    tokio::time::timeout(JOIN_RESPONSE_DEADLINE + BACKOFF_CAP, async {
+        while doc_text(&edge.doc) != "durable offline write" {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("reconnect must rederive the unacknowledged write from its version vector");
+    client.shutdown().await.unwrap();
+}
+
 async fn wait_until(mut condition: impl FnMut() -> bool) {
     tokio::time::timeout(TEST_TIMEOUT, async {
         loop {
@@ -1157,6 +1212,48 @@ fn readiness_session(doc: LoroDoc) -> (Session, mpsc::Receiver<Vec<u8>>) {
         },
         rx,
     )
+}
+
+#[tokio::test]
+async fn journal_only_full_backfill_finishes_durable_binding_recovery() {
+    let source = LoroDoc::new();
+    source.get_text("t").insert(0, "accepted before restart").unwrap(); source.commit();
+    let first = source.export(ExportMode::updates(&VersionVector::default())).unwrap();
+    let before = source.oplog_vv();
+    source.get_text("t").insert(doc_text(&source).len(), " and while offline").unwrap(); source.commit();
+    let second = source.export(ExportMode::updates(&before)).unwrap();
+    let (mut session, mut wire) = readiness_session(LoroDoc::new());
+    let local = comet_doc::WorkspaceDoc::new();
+    session.doc = local.binding();
+    session.doc.install_journal(Vec::new(), Arc::new(|_, _| Ok(())));
+    local.upsert_space(&serde_json::from_value(serde_json::json!({
+        "id": "offline", "deviceId": "device-a", "path": "/retained",
+        "gitDetected": false, "createdAt": "2026-10-07T00:00:00Z"
+    })).unwrap()).unwrap();
+    let local_before = session.doc.oplog_vv();
+    session.recovering_snapshot = true;
+    let (tx, mut rx) = oneshot::channel();
+    let mut ready = Some(tx);
+    session.on_join_ok(CrdtType::Loro, source.oplog_vv().encode(), Permission::Write, false).await.unwrap();
+    session.apply_remote(CrdtType::Loro, vec![first]).await.unwrap();
+    session.finish_sync(&mut ready);
+    assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+    assert_eq!(session.doc.oplog_vv(), local_before, "partial backfill must not replace the live binding");
+    session.apply_remote(CrdtType::Loro, vec![second]).await.unwrap();
+    session.finish_sync(&mut ready);
+    assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)), "offline edit must be acknowledged before readiness");
+    // ACK the recovered offline edit only after the full backfill is adopted.
+    while let Ok(bytes) = wire.try_recv() {
+        if let ProtocolMessage::DocUpdate { crdt: CrdtType::Loro, batch_id, .. } = decode(&bytes).unwrap() {
+            session.on_ack(CrdtType::Loro, batch_id, UpdateStatusCode::Ok).await.unwrap();
+        }
+    }
+    session.finish_sync(&mut ready);
+    rx.try_recv().unwrap().unwrap();
+    assert!(session.stats.snapshot().connected);
+    assert!(!session.recovering_snapshot);
+    assert_eq!(doc_text(&session.doc.raw()), doc_text(&source));
+    assert_eq!(local.space("offline").unwrap().unwrap().path, "/retained");
 }
 
 #[tokio::test]

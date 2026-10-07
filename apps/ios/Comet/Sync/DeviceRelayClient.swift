@@ -187,34 +187,12 @@ actor DeviceRelayClient {
         return reply
     }
 
+    // A disconnect after send has an unknown outcome. Never replay arbitrary
+    // RPCs here; durable command callers reconcile using their command ID.
     private func callData(method: String, params: [String: Any],
                           timeoutNanoseconds: UInt64? = 10_000_000_000,
                           preserveSuccessfulResponseOnCancellation: Bool = false) async throws -> Data {
-        for attempt in 0..<3 {
-            try Task.checkCancellation()
-            do {
-                return try await callOnce(method: method, params: params,
-                                          timeoutNanoseconds: timeoutNanoseconds,
-                                          preserveSuccessfulResponseOnCancellation: preserveSuccessfulResponseOnCancellation)
-            } catch let error as RelayError {
-                guard attempt < 2 else { throw error }
-                switch error {
-                case .hostOffline, .notConnected:
-                    try await Task.sleep(nanoseconds: UInt64(attempt + 1) * 250_000_000)
-                case .rpc, .timeout:
-                    throw error
-                }
-            }
-        }
-        throw RelayError.notConnected
-    }
-
-    private func callOnce(
-        method: String,
-        params: [String: Any],
-        timeoutNanoseconds: UInt64?,
-        preserveSuccessfulResponseOnCancellation: Bool
-    ) async throws -> Data {
+        try Task.checkCancellation()
         let socket = try await connect()
         guard connected, self.socket === socket else { throw RelayError.notConnected }
         let gen = generation
@@ -268,6 +246,12 @@ actor DeviceRelayClient {
             failCall(id: id, error: .notConnected)
             return
         }
+        #if DEBUG
+        if regressionNoNetwork {
+            teardown(error: .hostOffline, generation: gen)
+            return
+        }
+        #endif
         do {
             try await socket.send(.data(data))
         } catch {
@@ -392,7 +376,7 @@ extension DeviceRelayClient {
         let client = DeviceRelayClient(deviceId: "host", config: config)
         let passed = await client.exerciseConnectionGenerations()
         await E2ERunner.log(passed
-            ? "OK Crew relay lifecycle: concurrent cold connect, stale receive/ping/error isolation, close during token wait"
+            ? "OK Crew relay lifecycle: concurrent cold connect, stale callback isolation, close during token wait, no ambiguous command replay"
             : "FAIL Crew relay connection generation isolation")
         return passed
     }
@@ -456,7 +440,14 @@ extension DeviceRelayClient {
                 _ = try await blocked!.value
                 return false
             } catch RelayError.notConnected {
-                return socket == nil && !connected
+                guard socket == nil, !connected else { return false }
+            }
+            let requestId = nextId
+            do {
+                _ = try await callData(method: "CreateSession", params: [:], timeoutNanoseconds: nil)
+                return false
+            } catch RelayError.hostOffline {
+                return nextId == requestId + 1 && pending.isEmpty && socket == nil
             }
         } catch { return false }
     }

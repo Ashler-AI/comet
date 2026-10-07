@@ -447,6 +447,9 @@ async fn host_session(
     // All writers (per-conn pumps) funnel through one outbound queue → one socket writer.
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(256);
     let mut conns: HashMap<String, VirtualConn> = HashMap::new();
+    // Like ordinary virtual RPC requests, peer admissions must not block the
+    // socket reader/writer. Dropping the session cancels unfinished handlers.
+    let mut peer_commands = tokio::task::JoinSet::new();
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping.tick().await; // consume the immediate first tick
@@ -454,6 +457,7 @@ async fn host_session(
 
     loop {
         tokio::select! {
+            _ = peer_commands.join_next(), if !peer_commands.is_empty() => {}
             frame = out_rx.recv() => match frame {
                 Some(bytes) => {
                     if sink.send(WsMessage::Binary(bytes)).await.is_err() {
@@ -472,6 +476,7 @@ async fn host_session(
                         &out_tx,
                         on_nudge,
                         on_grant,
+                        &mut peer_commands,
                     ).await;
                 }
                 Some(Ok(WsMessage::Close(frame))) => {
@@ -511,6 +516,7 @@ async fn handle_host_frame(
     out_tx: &mpsc::Sender<Vec<u8>>,
     on_nudge: &NudgeHandler,
     on_grant: &GrantHandler,
+    peer_commands: &mut tokio::task::JoinSet<()>,
 ) {
     let (header, payload) = match decode_device_frame(bytes) {
         Ok(frame) => frame,
@@ -581,28 +587,32 @@ async fn handle_host_frame(
             let Ok(admission) = serde_json::from_slice::<Admission>(&payload) else {
                 return;
             };
-            let Some(method) = admission.request.method.as_deref().filter(|method| {
-                matches!(*method, "AdmitPeerCommand" | "ReadSessionCommand")
+            let Some(method) = admission.request.method.filter(|method| {
+                matches!(method.as_str(), "AdmitPeerCommand" | "ReadSessionCommand")
             }) else { return };
-            let result = service
-                .peer_command(method, admission.authority, admission.request.params)
-                .await;
-            let mut response = crate::ServerFrame {
-                id: admission.request.id,
-                ..Default::default()
-            };
-            match result {
-                Ok(value) => response.ok = Some(value),
-                Err(error) => response.err = Some(error.to_string()),
-            }
-            if let Ok(payload) = serde_json::to_vec(&response)
-                && let Ok(frame) = encode_device_frame(
-                    &DeviceFrameHeader::new(RPC_KIND, RPC_KIND).with_to(from),
-                    &payload,
-                )
-            {
-                let _ = out_tx.send(frame).await;
-            }
+            let service = service.clone();
+            let out_tx = out_tx.clone();
+            peer_commands.spawn(async move {
+                let result = service
+                    .peer_command(&method, admission.authority, admission.request.params)
+                    .await;
+                let mut response = crate::ServerFrame {
+                    id: admission.request.id,
+                    ..Default::default()
+                };
+                match result {
+                    Ok(value) => response.ok = Some(value),
+                    Err(error) => response.err = Some(error.to_string()),
+                }
+                if let Ok(payload) = serde_json::to_vec(&response)
+                    && let Ok(frame) = encode_device_frame(
+                        &DeviceFrameHeader::new(RPC_KIND, RPC_KIND).with_to(from),
+                        &payload,
+                    )
+                {
+                    let _ = out_tx.send(frame).await;
+                }
+            });
         }
         return; // future stream kinds (term, tunnel)
     }
@@ -1156,6 +1166,52 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn peer_admission_does_not_block_relay_grants_or_outbound_drain() {
+        struct WaitingPeer(tokio::sync::Notify);
+        #[async_trait]
+        impl RpcService for WaitingPeer {
+            async fn handle(&self, method: &str, _: serde_json::Value) -> Result<crate::RpcReply, RpcError> {
+                Err(RpcError::UnknownMethod(method.into()))
+            }
+            async fn peer_command(&self, _: &str, _: crate::PeerCommandAuthority, _: serde_json::Value) -> Result<serde_json::Value, RpcError> {
+                self.0.notified().await;
+                Ok(serde_json::json!({"accepted": true}))
+            }
+        }
+        let waiting = Arc::new(WaitingPeer(tokio::sync::Notify::new()));
+        let service: Arc<dyn RpcService> = waiting.clone();
+        let (out_tx, mut out_rx) = mpsc::channel(1);
+        out_tx.send(vec![0]).await.unwrap();
+        let mut conns = HashMap::new();
+        let mut tasks = tokio::task::JoinSet::new();
+        let on_nudge: NudgeHandler = Arc::new(|_| Ok(()));
+        let granted = Arc::new(Mutex::new(false));
+        let received_grant = granted.clone();
+        let on_grant: GrantHandler = Arc::new(move |_, _| *lock(&received_grant) = true);
+        let mut header = DeviceFrameHeader::new("rpc", "peer-command");
+        header.from = Some("exact-client".into());
+        let frame = encode_device_frame(&header, serde_json::json!({
+            "authority": {"subject": "owner", "projectId": "project", "deviceId": "host", "chatId": NUDGE_CHAT, "expiresAt": 123},
+            "request": {"id": 42, "method": "AdmitPeerCommand", "params": {}}
+        }).to_string().as_bytes()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), handle_host_frame(
+            &frame, &mut conns, &service, &out_tx, &on_nudge, &on_grant, &mut tasks,
+        )).await.expect("a pending admission must not hold the relay reader");
+        let grant = encode_device_frame(&DeviceFrameHeader::new(NUDGE_CHAT, GRANT_KIND), b"grant").unwrap();
+        handle_host_frame(&grant, &mut conns, &service, &out_tx, &on_nudge, &on_grant, &mut tasks).await;
+        assert!(*lock(&granted));
+        waiting.0.notify_one();
+        assert_eq!(out_rx.recv().await.unwrap(), vec![0]);
+        let reply = tokio::time::timeout(Duration::from_secs(1), out_rx.recv()).await.unwrap().unwrap();
+        let (header, payload) = decode_device_frame(&reply).unwrap();
+        assert_eq!(header.to.as_deref(), Some("exact-client"));
+        let response: crate::ServerFrame = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(response.id, 42);
+        assert_eq!(response.ok, Some(serde_json::json!({"accepted": true})));
+        tasks.join_next().await.unwrap().unwrap();
+    }
+
     async fn dispatch_nudge_frame(
         header: DeviceFrameHeader,
         payload: &[u8],
@@ -1172,6 +1228,7 @@ mod tests {
             out_tx,
             on_nudge,
             &on_grant,
+            &mut tokio::task::JoinSet::new(),
         ))
         .await.expect("frame processing must not wait on its own outbound queue");
     }
