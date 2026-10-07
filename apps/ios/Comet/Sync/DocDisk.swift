@@ -46,6 +46,29 @@ enum DocDisk {
 
     static let workspaceIdentityFields = ["id", "chatId", "userId", "deviceId", "ownerSubject", "ownerDeviceId", "ownerPrincipal", "projectId", "deploymentId"]
 
+    /// A membership may learn its first route; known scopes and owners cannot change.
+    static func workspaceRoutesCompatible(root: String, rows: [[String: LoroValue]]) -> Bool {
+        guard let first = rows.first else { return true }
+        func route(_ row: [String: LoroValue], _ field: String) -> LoroValue? {
+            let value = row["environment"]?.mapValue?[field]
+            return value == .null ? nil : value
+        }
+        for field in ["scope", "ownerPrincipal"] {
+            let baseline = route(first, field)
+            var known = baseline
+            for row in rows.dropFirst() {
+                let current = route(row, field)
+                if root != "sessionRefs" || baseline != nil {
+                    if current != baseline { return false }
+                } else if let current {
+                    if let known, known != current { return false }
+                    known = current
+                }
+            }
+        }
+        return true
+    }
+
     private static func selfSessionId(_ id: String) -> Substring? {
         let bytes = id.utf8
         let first = bytes.prefix(36)
@@ -66,7 +89,7 @@ enum DocDisk {
     static func normalizeWorkspaceIntent(_ original: RecordIntent) throws -> RecordIntent {
         guard ["chats", "sessions", "sessionRefs", "worktreeDeletions"].contains(original.root) else { return original }
         let identity = original.root == "chats" ? "id" : "chatId"
-        let values = try ([original.before, original.after] + original.intermediates).map { try recordValue($0) }
+        let values = try ([original.before] + original.intermediates + [original.after]).map { try recordValue($0) }
         guard let base = values.compactMap({ $0?.mapValue }).first, base[identity]?.stringValue != nil else { return original }
         let user = base["userId"]?.stringValue
         var keyId = original.key
@@ -82,10 +105,12 @@ enum DocDisk {
         guard owners.allSatisfy({ !(base[$0]?.stringValue ?? "").isEmpty }) else { throw MobileSessionError.unavailable("Crew retained an unowned session alias.") }
         for value in values.compactMap({ $0 }) {
             guard let row = value.mapValue, let id = row[identity]?.stringValue, id == publicId || selfSessionId(id) == publicId,
-                  workspaceIdentityFields.filter({ $0 != identity }).allSatisfy({ row[$0] == base[$0] }),
-                  row["environment"]?.mapValue?["scope"] == base["environment"]?.mapValue?["scope"] else {
+                  workspaceIdentityFields.filter({ $0 != identity }).allSatisfy({ row[$0] == base[$0] }) else {
                 throw MobileSessionError.unavailable("Crew cannot migrate a foreign session identity; original edits are retained.")
             }
+        }
+        guard workspaceRoutesCompatible(root: original.root, rows: values.compactMap({ $0?.mapValue })) else {
+            throw MobileSessionError.unavailable("Crew cannot migrate a conflicting membership route; original edits are retained.")
         }
         let canonicalId = String(publicId)
         func normalize(_ bytes: Data?) throws -> Data? {
@@ -150,7 +175,7 @@ enum DocDisk {
                 let remote = try recordValue(normalizeWorkspaceIntent(targetIntent).after)?.mapValue
                 if normalized.key != key, let remote {
                     guard workspaceIdentityFields.allSatisfy({ remote[$0] == fields[$0] }),
-                          remote["environment"]?.mapValue?["scope"] == fields["environment"]?.mapValue?["scope"] else {
+                          workspaceRoutesCompatible(root: root, rows: [remote, fields]) else {
                         throw MobileSessionError.unavailable("Crew cannot merge a foreign canonical workspace record.")
                     }
                 }
@@ -193,11 +218,14 @@ enum DocDisk {
                                   alternatives: [LoroValue?] = []) throws {
         let server = try recordValue(in: doc, root: root, key: key)
         if let identity = after?.mapValue ?? before?.mapValue {
-            for row in ([before, after, server] + alternatives).compactMap({ $0?.mapValue }) {
-                guard workspaceIdentityFields.allSatisfy({ row[$0] == identity[$0] }),
-                      row["environment"]?.mapValue?["scope"] == identity["environment"]?.mapValue?["scope"] else {
+            let rows = ([before] + alternatives + [server, after]).compactMap({ $0?.mapValue })
+            for row in rows {
+                guard workspaceIdentityFields.allSatisfy({ row[$0] == identity[$0] }) else {
                     throw MobileSessionError.unavailable("Crew recovery cannot change retained record ownership or project/deployment identity.")
                 }
+            }
+            guard workspaceRoutesCompatible(root: root, rows: rows) else {
+                throw MobileSessionError.unavailable("Crew recovery cannot replace a known record owner or deployment route.")
             }
         }
         if server == after { return }
@@ -591,6 +619,14 @@ extension DocDisk {
             guard try recordValue(normalizeWorkspaceIntent(mixed).after)?.mapValue?["id"]?.stringValue == publicId else { return false }
             mixed.intermediates = [try recordData(.map(value: ["id": .string(value: alias), "deviceId": .string(value: "foreign")]))]
             do { _ = try normalizeWorkspaceIntent(mixed); return false } catch MobileSessionError.unavailable(_) {}
+            var membership = RecordIntent(root: "sessionRefs", key: "5:owner:" + alias, before: try recordData(.map(value: ["userId": .string(value: "owner"), "chatId": .string(value: alias)])))
+            membership.intermediates = [membership.before]
+            membership.after = try recordData(LoroValue.fromJSON(["userId": "owner", "chatId": publicId, "environment": ["ownerPrincipal": "session-owner", "scope": ["projectId": "project", "deploymentId": "deployment"]]]))
+            let enrichedMembership = try normalizeWorkspaceIntent(membership)
+            guard try recordValue(enrichedMembership.after)?.mapValue?["environment"]?.mapValue?["scope"]?.mapValue?["deploymentId"]?.stringValue == "deployment" else { return false }
+            membership.before = enrichedMembership.after; membership.intermediates = []
+            membership.after = try recordData(LoroValue.fromJSON(["userId": "owner", "chatId": publicId, "environment": ["ownerPrincipal": "foreign", "scope": ["projectId": "project", "deploymentId": "deployment"]]]))
+            do { _ = try normalizeWorkspaceIntent(membership); return false } catch MobileSessionError.unavailable(_) {}
             let foreign = aliasDoc.fork()
             let foreignAlias = try foreign.getMap(id: "chats").getOrCreateContainer(key: alias, child: LoroMap())
             try foreignAlias.insert(key: "id", v: alias); try foreignAlias.insert(key: "deviceId", v: "foreign")

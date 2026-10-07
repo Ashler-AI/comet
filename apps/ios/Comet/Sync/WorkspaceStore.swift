@@ -1384,6 +1384,13 @@ extension WorkspaceStore {
             let offline = WorkspaceStore(config: config)
             stores.append(offline)
             _ = try offline.doc.importWith(bytes: source.export(mode: .snapshot), origin: "workspace-intent-regression")
+            let routedEnvironment = SessionEnvironment(
+                source: SessionEnvironmentSource(kind: "scaffold", sandboxId: "retained-route"),
+                ownerPrincipal: "session-owner",
+                scope: CollaborationScope(projectId: config.projectScope, deploymentId: "retained-deployment", sessionId: "opaque-route"))
+            guard offline.addSessionRef(chatId: existing, environment: routedEnvironment) != nil,
+                  offline.addSessionRef(chatId: existing) != nil,
+                  offline.sessionRef(id: existing)?.environment == routedEnvironment else { return false }
             offline.rename(chatId: existing, title: "Intermediate offline title")
             offline.rename(chatId: existing, title: "Final offline title")
             try offline.mutateRecord(root: "chats", key: created) { row in
@@ -1404,7 +1411,7 @@ extension WorkspaceStore {
             // still has the original title; accepted goals are independent.
             let restarted = WorkspaceStore(config: config)
             stores.append(restarted)
-            guard restarted.recordIntents.count == 5,
+            guard restarted.recordIntents.count == 6,
                   let cached = DocDisk.loadReplica(id: cacheId),
                   try DocDisk.recordValue(in: cached, root: "chats", key: existing)?.mapValue?["title"]?.stringValue == "Original" else { return false }
             let journal = try Data(contentsOf: DocDisk.intentURL(for: cacheId))
@@ -1414,6 +1421,7 @@ extension WorkspaceStore {
                   restarted.chat(id: existing)?.title == "Final offline title",
                   restarted.chat(id: created)?.title == "Created offline",
                   restarted.sessionRef(id: created) != nil,
+                  restarted.sessionRef(id: existing)?.environment == routedEnvironment,
                   restarted.space(id: "created-space")?.name == "Accepted offline space",
                   restarted.space(id: "removed") == nil,
                   try Data(contentsOf: DocDisk.intentURL(for: cacheId)) == journal else { return false }
@@ -1436,6 +1444,26 @@ extension WorkspaceStore {
             stores.append(afterAck)
             guard afterAck.recordIntents.isEmpty,
                   try DocDisk.recordValue(in: DocDisk.loadReplica(id: cacheId)!, root: "chats", key: existing)?.mapValue?["title"]?.stringValue == "Final offline title" else { return false }
+            let membershipKey = restarted.sessionRefKey(chatId: existing)
+            guard let retainedMembership = try DocDisk.recordValue(in: DocDisk.loadReplica(id: cacheId)!, root: "sessionRefs", key: membershipKey),
+                  retainedMembership.mapValue?["environment"] == LoroValue.fromEncodable(routedEnvironment) else { return false }
+            for field in ["projectId", "deploymentId", "ownerPrincipal", "userId"] {
+                var changed = retainedMembership.mapValue!
+                if field == "userId" { changed[field] = .string(value: "foreign") }
+                else {
+                    var environment = changed["environment"]!.mapValue!
+                    if field == "ownerPrincipal" { environment[field] = .string(value: "foreign") }
+                    else {
+                        var scope = environment["scope"]!.mapValue!; scope[field] = .string(value: "foreign")
+                        environment["scope"] = .map(value: scope)
+                    }
+                    changed["environment"] = .map(value: environment)
+                }
+                do {
+                    try DocDisk.applyRecordChange(root: "sessionRefs", key: membershipKey, before: retainedMembership, after: .map(value: changed), in: replacement.fork())
+                    return false
+                } catch MobileSessionError.unavailable(_) {}
+            }
             restarted.rename(chatId: existing, title: "Retained conflicting title")
             try row.insert(key: "title", v: "Authoritative conflicting title"); source.commit()
             guard let conflict = DocDisk.replacementSnapshot(bytes: try source.export(mode: .shallowSnapshot(frontiers: source.stateFrontiers()))),

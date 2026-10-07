@@ -83,6 +83,29 @@ pub(crate) const WORKSPACE_IDENTITY_FIELDS: &[&str] = &[
     "ownerPrincipal", "projectId", "deploymentId",
 ];
 
+/// A membership can learn its first route. Missing earlier metadata is not a
+/// different deployment; once known, all retained scopes and owners must agree.
+pub(crate) fn workspace_routes_compatible<'a>(container: &str, rows: impl IntoIterator<Item = &'a serde_json::Map<String, serde_json::Value>>) -> bool {
+    let mut rows = rows.into_iter();
+    let Some(first) = rows.next() else { return true };
+    let route = |row: &'a serde_json::Map<String, serde_json::Value>, field: &str| row.get("environment")
+        .and_then(|value| value.get(field)).filter(|value| !value.is_null());
+    let baseline = [route(first, "scope"), route(first, "ownerPrincipal")];
+    let mut known = baseline;
+    for row in rows {
+        for (index, field) in ["scope", "ownerPrincipal"].into_iter().enumerate() {
+            let current = route(row, field);
+            if container != "sessionRefs" || baseline[index].is_some() {
+                if current != baseline[index] { return false }
+            } else if let Some(current) = current {
+                if known[index].is_some_and(|known| known != current) { return false }
+                known[index] = Some(current);
+            }
+        }
+    }
+    true
+}
+
 /// A public row alias is recoverable only when key, every retained identity,
 /// and ownership all describe the same UUID self-session, never a child session.
 pub fn normalize_workspace_record(record: &crate::PendingRecord) -> Result<crate::PendingRecord, DocError> {
@@ -115,8 +138,8 @@ pub fn normalize_workspace_record(record: &crate::PendingRecord) -> Result<crate
         for field in WORKSPACE_IDENTITY_FIELDS.iter().copied().filter(|field| *field != identity) {
             if fields.get(field) != row.get(field) { return Err(conflict()) }
         }
-        if fields.get("environment").and_then(|value| value.get("scope")) != row.get("environment").and_then(|value| value.get("scope")) { return Err(conflict()) }
     }
+    if !workspace_routes_compatible(&record.container, record.before.iter().chain(record.value.iter()).filter_map(|value| value.as_object())) { return Err(conflict()) }
     let mut normalized = record.clone();
     normalized.key = if let Some(user) = user.filter(|_| record.container == "sessionRefs") { session_ref_key(user, public) } else { public.into() };
     for value in normalized.before.iter_mut().chain(normalized.value.iter_mut()) {
@@ -949,7 +972,7 @@ impl WorkspaceDoc {
                     })?;
                     let target = target.value.as_ref().and_then(|value| value.as_object()).ok_or_else(|| DocError::Schema("Crew alias target is not a workspace record".into()))?;
                     if WORKSPACE_IDENTITY_FIELDS.iter().any(|field| target.get(*field) != fields.get(*field))
-                        || target.get("environment").and_then(|value| value.get("scope")) != fields.get("environment").and_then(|value| value.get("scope")) {
+                        || !workspace_routes_compatible(container, [target, &fields]) {
                         return Err(DocError::Schema(format!("Crew recovery conflict in {container}/{old_key}; foreign identity retained")));
                     }
                 }
@@ -1394,6 +1417,13 @@ mod tests {
             before: Some(serde_json::json!({"chatId": alias, "userId": "owner"})),
             value: Some(serde_json::json!({"chatId": PUBLIC_CHAT, "userId": "foreign"})), version: Vec::new(), acknowledged: false };
         assert!(normalize_workspace_record(&member).is_err());
+        let mut enriched = member;
+        enriched.value = Some(serde_json::json!({"chatId": PUBLIC_CHAT, "userId": "owner", "environment": {"ownerPrincipal": "session-owner", "scope": {"projectId": "project", "deploymentId": "deployment"}}}));
+        let normalized = normalize_workspace_record(&enriched).unwrap();
+        assert_eq!(normalized.value.as_ref().unwrap()["environment"]["scope"]["deploymentId"], "deployment");
+        enriched.before = normalized.value.clone();
+        enriched.value.as_mut().unwrap()["environment"]["ownerPrincipal"] = "foreign".into();
+        assert!(normalize_workspace_record(&enriched).is_err());
     }
 
     fn ts(ms: i64) -> DateTime<Utc> {

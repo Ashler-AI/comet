@@ -9,6 +9,10 @@ aliases together, preserving canonical ownership, tombstones and completed
 outcomes. Covered bootstrap observations can coalesce; conflicting user edits
 or unknown ancestry retain their original evidence and remain blocked.
 
+Same-owner session memberships can learn their first environment route. Recovery
+preserves that route across restarts and refuses changes to known scopes or
+owners.
+
 Durable command admission is independent of metadata and notification failures.
 Desktop and mobile retain the original command identity across retries and
 restart, read the owner's outcome, and distinguish accepted-pending delivery

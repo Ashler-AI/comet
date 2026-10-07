@@ -325,9 +325,12 @@ fn reconcile(doc: &LoroDoc, pending: &[PendingRecord], cached: &LoroDoc, session
             if let Some(base) = record.before.as_ref().or(record.value.as_ref()).and_then(serde_json::Value::as_object) {
                 for row in record.value.as_ref().and_then(serde_json::Value::as_object).into_iter()
                     .chain(remote.as_ref().and_then(serde_json::Value::as_object)) {
-                    if crate::workspace::WORKSPACE_IDENTITY_FIELDS.iter().any(|field| row.get(*field) != base.get(*field))
-                        || row.get("environment").and_then(|value| value.get("scope")) != base.get("environment").and_then(|value| value.get("scope")) { return Err(conflict()) }
+                    if crate::workspace::WORKSPACE_IDENTITY_FIELDS.iter().any(|field| row.get(*field) != base.get(*field)) { return Err(conflict()) }
                 }
+                if !crate::workspace::workspace_routes_compatible(&record.container,
+                    record.before.as_ref().and_then(serde_json::Value::as_object).into_iter()
+                        .chain(remote.as_ref().and_then(serde_json::Value::as_object))
+                        .chain(record.value.as_ref().and_then(serde_json::Value::as_object))) { return Err(conflict()) }
             }
         }
         if covered || remote == record.value { continue }
@@ -645,6 +648,41 @@ mod tests {
         blocked.install_journal(unknown, Arc::new(|_,_| Ok(())));
         assert!(blocked.adopt_snapshot(&cached.export(ExportMode::Snapshot).unwrap(), None).is_err());
         assert!(blocked.get_map("chats").get(&alias).is_some());
+    }
+
+    #[test]
+    fn membership_first_route_survives_recovery_restart_and_rejects_known_route_changes() {
+        let key = "5:owner:opaque:membership";
+        let remote = LoroDoc::new();
+        let row = remote.get_map("sessionRefs").insert_container(key, LoroMap::new()).unwrap();
+        row.insert("userId", "owner").unwrap(); row.insert("chatId", "opaque:membership").unwrap(); row.insert("addedAt", 1_i64).unwrap(); remote.commit();
+        let environment = serde_json::json!({"ownerPrincipal": "session-owner", "scope": {"projectId": "project", "deploymentId": "deployment", "sessionId": "opaque-route"}, "source": {"kind": "scaffold"}});
+        let binding = SharedDocument::new(remote.fork()); journal(&binding);
+        let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) = binding.get_map("sessionRefs").get(key) else { panic!("missing membership") };
+        row.insert("environment", LoroValue::from(environment.clone())).unwrap(); binding.commit().unwrap();
+        binding.adopt_snapshot(&remote.export(ExportMode::Snapshot).unwrap(), None).unwrap();
+        assert_eq!(row_value(&binding.raw(), "sessionRefs", key).unwrap()["environment"], environment);
+        let restored = SharedDocument::new(binding.raw().fork());
+        restored.install_journal(binding.pending_records(), Arc::new(|_,_| Ok(())));
+        restored.adopt_snapshot(&binding.export(ExportMode::Snapshot).unwrap(), None).unwrap();
+        assert_eq!(row_value(&restored.raw(), "sessionRefs", key).unwrap()["environment"], environment);
+        for field in ["projectId", "deploymentId", "ownerPrincipal", "userId"] {
+            let foreign = restored.raw().fork();
+            let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) = foreign.get_map("sessionRefs").get(key) else { panic!("missing membership") };
+            if field == "userId" { row.insert(field, "foreign").unwrap(); }
+            else {
+                let mut changed = environment.clone();
+                if field == "ownerPrincipal" { changed[field] = "foreign".into(); }
+                else { changed["scope"][field] = "foreign".into(); }
+                row.insert("environment", LoroValue::from(changed)).unwrap();
+            }
+            foreign.commit();
+            assert!(restored.adopt_snapshot(&foreign.export(ExportMode::Snapshot).unwrap(), None).is_err());
+            assert_eq!(row_value(&restored.raw(), "sessionRefs", key).unwrap()["environment"], environment);
+        }
+        let deletion = remote.fork(); deletion.get_map("sessionRefs").delete(key).unwrap(); deletion.commit();
+        assert!(restored.adopt_snapshot(&deletion.export(ExportMode::Snapshot).unwrap(), None).is_err());
+        assert!(deletion.get_map("sessionRefs").get(key).is_none());
     }
 
     #[test]
