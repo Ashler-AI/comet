@@ -739,7 +739,7 @@ final class SessionStore {
             submittedDrafts.removeValue(forKey: id)
             dropPendingSend(messageId: id)
             for image in draft.images { uploadedImages.removeValue(forKey: image.id) }
-            if retryDraft?.messageId == id { retryDraft = draft }
+            if draft.control == nil, retryDraft == nil || retryDraft?.messageId == id { retryDraft = draft }
             if draft.control == nil, composerText.trimmingCharacters(in: .whitespacesAndNewlines) == draft.prompt,
                composerImages.map(\.id) == draft.images.map(\.id) { composerText = ""; composerImages = [] }
             revision &+= 1
