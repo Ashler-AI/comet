@@ -429,6 +429,40 @@ fn command_status(core: &EngineCore, id: &str) -> Option<(SessionCommandStatus, 
 }
 
 #[tokio::test]
+async fn blocked_recovery_does_not_materialize_an_unauthorized_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(MockHarness { script: mock_script() }));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    let command = controller_payload(&core, "blocked-recovery", SessionCommandPayload::Run {
+        request: run_request("continue after recovery"),
+        message_id: "recovered-user".into(),
+    });
+    let issued = chrono::Utc::now().timestamp_millis() - 1;
+    let params = serde_json::json!({
+        "chatId": CHAT,
+        "commandId": "blocked-recovery-command",
+        "command": command,
+        "issuedAt": issued,
+        "expiresAt": issued + 60_000,
+    });
+    let client = comet_rpc::memory_client(core.rpc_service());
+    handle.doc().binding().fail_recovery("retained transcript conflicts with recovery snapshot".into());
+    assert!(client.call(comet_rpc::methods::QUEUE_COMMAND, params.clone()).await.is_err());
+    assert!(handle.doc().read_command("blocked-recovery-command").unwrap().is_none());
+    assert!(entries(&core).is_empty());
+
+    let repaired = SessionDoc::init(CHAT).unwrap().export_snapshot().unwrap();
+    handle.doc().binding().adopt_snapshot(&repaired, Some(CHAT)).unwrap();
+    client.call(comet_rpc::methods::QUEUE_COMMAND, params).await.unwrap();
+    wait_for(|| command_status(&core, "blocked-recovery-command")
+        .is_some_and(|(status, _)| status == SessionCommandStatus::Applied), "recovered command to apply").await;
+    wait_for(|| entries(&core).iter().any(|entry| entry.role == MessageRole::Assistant
+        && entry.status == Some(MessageStatus::Complete)), "recovered assistant to complete").await;
+    assert_eq!(entries(&core)[0].id, "recovered-user");
+    core.sessions.shutdown().await;
+}
+
+#[tokio::test]
 async fn queued_run_command_executes_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(
@@ -1899,22 +1933,17 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
     .await;
     wait_for(
         || {
-            entries_now(&core).iter().any(|e| {
+            core.sessions.session_status(EXECUTION_KEY).is_some_and(|session| session.status == SessionStatus::Idle)
+                && entries_now(&core).iter().any(|e| {
                 e.status == Some(MessageStatus::Complete)
                     && e.parts
                         .iter()
                         .any(|p| matches!(p, MessagePart::Text { text, .. } if text == "picked b"))
             })
         },
-        "answered turn to complete",
+        "answered turn to complete and become idle",
     )
     .await;
-    assert_eq!(
-        core.sessions
-            .session_status(EXECUTION_KEY)
-            .map(|s| s.status),
-        Some(SessionStatus::Idle)
-    );
 }
 
 /// Resilience: interrupting a run that is BLOCKED on a question unparks the
