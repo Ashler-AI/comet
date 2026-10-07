@@ -642,24 +642,27 @@ enum E2ERunner {
 
     static func runRepeatedRoomRecovery() async {
         #if DEBUG
-        guard WorkspaceStore.runRecordIntentRegression(), DocDisk.runRecordRecoveryRegression(), runNestedToolCallRecovery(),
-              SessionStore.runDeploymentRetargetRegression(),
-              await AppModel.runBrowseRestoreRegression(),
-              SessionStore.runOwnerAnchorReplayRegression(),
-              await SessionStore.runAttachmentJournalRegression(),
-              await SessionStore.runTerminalControlRegression(),
-              await RoomClient.runResetEpochRegression(),
-              await SessionStore.runDurableIntentRegression(),
-              await SessionStore.runAdmissionReadbackRegression(),
-              await SessionStore.runTranscriptActivityRegression(),
-              await AppModel.runMetadataClearRegression(),
-              await DeviceRelayClient.runConnectionGenerationRegression(),
-              await RoomClient.runForegroundBlockedRegression(),
-              await RoomClient.runFragmentedBackfillRegression(),
-              await runOwnerPublicationRegister() else {
-            log("FAIL Crew reliability recovery regressions")
-            return
+        func check(_ scenario: String, _ passed: Bool) -> Bool {
+            if !passed { log("FAIL Crew reliability recovery: \(scenario)") }
+            return passed
         }
+        guard check("workspace record intents", WorkspaceStore.runRecordIntentRegression()),
+              check("disk record recovery", DocDisk.runRecordRecoveryRegression()),
+              check("nested tool calls", runNestedToolCallRecovery()),
+              check("deployment retarget", SessionStore.runDeploymentRetargetRegression()),
+              check("browse restore", await AppModel.runBrowseRestoreRegression()),
+              check("owner anchor replay", SessionStore.runOwnerAnchorReplayRegression()),
+              check("attachment journal", await SessionStore.runAttachmentJournalRegression()),
+              check("terminal controls", await SessionStore.runTerminalControlRegression()),
+              check("room reset epoch", await RoomClient.runResetEpochRegression()),
+              check("durable intents", await SessionStore.runDurableIntentRegression()),
+              check("admission readback", await SessionStore.runAdmissionReadbackRegression()),
+              check("transcript activity", await SessionStore.runTranscriptActivityRegression()),
+              check("metadata clear", await AppModel.runMetadataClearRegression()),
+              check("relay connection generation", await DeviceRelayClient.runConnectionGenerationRegression()),
+              check("foreground blocked", await RoomClient.runForegroundBlockedRegression()),
+              check("fragmented backfill", await RoomClient.runFragmentedBackfillRegression()),
+              check("owner publication register", await runOwnerPublicationRegister()) else { return }
         guard await RoomClient.runRepeatedRecoveryRegression() else {
             log("FAIL Crew room convergence: fresh principals, pending imports, shallow resubmit, or history repair")
             return

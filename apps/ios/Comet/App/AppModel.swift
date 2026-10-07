@@ -1504,6 +1504,9 @@ extension AppModel {
                 }
             }
         }
+        var checkpoint = "uppercase invitation"
+        var completed = false
+        defer { if !completed { E2ERunner.log("FAIL Crew browse restore checkpoint: \(checkpoint)") } }
         do {
             let upper = URL(string: "\(ReleaseConfig.inviteScheme)://scaffold/\(config.projectScope)/deployment-a/\(id.uppercased())/sandbox-a")!
             let lower = URL(string: "\(ReleaseConfig.inviteScheme)://scaffold/\(config.projectScope)/deployment-a/\(id)/sandbox-a")!
@@ -1513,12 +1516,14 @@ extension AppModel {
                   probe.sessionStores.isEmpty, probe.scaffoldRoutes.isEmpty,
                   let pointer = try probe.browsePointer(chatId: id), pointer.scope == scope,
                   pointer.sandboxId == "sandbox-a", probe.browsePointers[id.uppercased()] == nil else { return false }
+            checkpoint = "duplicate canonical invitation"
             probe.openInvitation(url: lower)
             guard probe.openSessionError == nil, probe.browsePointers.count == 1,
                   originalWorkspace.sessionRefs.count == 1 else { return false }
             let original = originalWorkspace.doc.getDeepValue()
             let routes = try Data(contentsOf: DocDisk.intentURL(for: cacheId + "-browse"))
             let journal = try Data(contentsOf: DocDisk.intentURL(for: cacheId))
+            checkpoint = "cross-deployment invitation atomicity"
             probe.openInvitation(url: URL(string: "\(ReleaseConfig.inviteScheme)://scaffold/\(config.projectScope)/deployment-b/\(id)/sandbox-b")!)
             guard probe.openSessionError != nil, probe.launchRoute == .chat(id),
                   originalWorkspace.doc.getDeepValue() == original,
@@ -1527,6 +1532,7 @@ extension AppModel {
 
             // No snapshot flush: restart consumes membership goals plus the
             // authority-free pointer, not an attach response or fabricated owner.
+            checkpoint = "journal-only restart"
             let workspace = WorkspaceStore(config: config)
             restarted.config = config; restarted.workspace = workspace; restarted.phase = .ready
             workspace.start()
@@ -1536,16 +1542,19 @@ extension AppModel {
                   restarted.scaffoldRoutes.isEmpty else { return false }
             // A deliberate send reaches the retained Scaffold route selection,
             // but cannot attach/execute without a desktop controller.
+            checkpoint = "missing-controller route denial"
             do { _ = try await store.commandRouteProvider?(); return false }
             catch {
                 guard error.localizedDescription.contains("desktop Crew controller") else { return false }
             }
+            checkpoint = "cross-deployment send denial"
             let issuedAt = nowMs()
             let wrongAdmission = MobileCommandAdmission(commandId: UUID().uuidString.lowercased(),
                 issuedAt: issuedAt, expiresAt: issuedAt + 300_000, hostDeviceId: "host", scaffold: nil,
                 scope: CollaborationScope(projectId: config.projectScope, deploymentId: "deployment-b", sessionId: id))
             do { try await store.commandSender?(.interrupt, wrongAdmission); return false }
             catch { guard error.localizedDescription.contains("different browse scope") else { return false } }
+            checkpoint = "deferred send preserved membership"
             guard restarted.scaffoldRoutes.isEmpty, workspace.sessionRef(id: id)?.environment == nil else { return false }
 
             // Every retained environment component must agree before opening.
@@ -1558,19 +1567,24 @@ extension AppModel {
                 SessionEnvironment(source: SessionEnvironmentSource(kind: "scaffold", sandboxId: "sandbox-a"), ownerPrincipal: config.userId,
                     scope: CollaborationScope(projectId: config.projectScope, deploymentId: "deployment-a", sessionId: UUID().uuidString.lowercased()))
             ] {
+                checkpoint = "conflicting environment seed: project=\(conflicting.scope.projectId) deployment=\(conflicting.scope.deploymentId ?? "nil") session=\(conflicting.scope.sessionId ?? "nil") sandbox=\(conflicting.source.sandboxId ?? "nil")"
                 guard originalWorkspace.addSessionRef(chatId: id, environment: conflicting) != nil else { return false }
                 let before = originalWorkspace.doc.getDeepValue()
                 let beforeJournal = try Data(contentsOf: DocDisk.intentURL(for: cacheId))
+                checkpoint = "conflicting browse refusal"
                 do { try probe.browseScaffoldSessionLink(scope: scope, sandboxId: "sandbox-a"); return false }
                 catch { }
+                checkpoint = "conflicting browse atomicity"
                 guard originalWorkspace.doc.getDeepValue() == before,
                       try Data(contentsOf: DocDisk.intentURL(for: cacheId)) == beforeJournal,
                       try Data(contentsOf: DocDisk.intentURL(for: cacheId + "-browse")) == routes else { return false }
             }
+            checkpoint = "corrupt browse metadata fails closed"
             try Data("corrupt Crew browse route".utf8).write(to: DocDisk.intentURL(for: cacheId + "-browse"), options: .atomic)
             corrupt.config = config; corrupt.workspace = workspace
             guard corrupt.sessionStore(for: ref) == nil, corrupt.openSessionError != nil,
                   corrupt.sessionStores.isEmpty else { return false }
+            completed = true
             E2ERunner.log("OK Crew browse restore: canonical UUID, conflict atomicity, journal-only restart, exact deferred scope, no attach/resume, corrupt metadata fails closed")
             return true
         } catch { E2ERunner.log("FAIL Crew browse restore: \(error)"); return false }
