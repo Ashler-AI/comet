@@ -1145,8 +1145,12 @@ final class SessionStore {
         let retry = retryDraft.flatMap {
             $0.prompt == prompt && $0.images.map(\.id) == images.map(\.id) ? $0 : nil
         } ?? submittedDrafts.values.first(where: { $0.control == nil && $0.prompt == prompt && $0.images.map(\.id) == images.map(\.id) })
-        if let retry, retry.failure == nil, (retry.admitted && retry.terminal || entries.contains(where: { $0.id == retry.messageId })) {
+        if let retry, !(retry.terminal && retry.failure != nil),
+           (retry.admitted && retry.terminal || entries.contains(where: { $0.id == retry.messageId })) {
+            resolveAcceptedDraft(retry.messageId)
             retryDraft = nil
+            do { try persistDrafts() }
+            catch { recoveryFailure = "Crew accepted this instruction, but could not checkpoint its outcome: \(error.localizedDescription)" }
             return true
         }
         var draft = retry ?? SubmittedDraft(messageId: UUID().uuidString.lowercased(), prompt: prompt,
