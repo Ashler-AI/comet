@@ -18,6 +18,7 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use chrono::Utc;
+use futures::{Stream, StreamExt};
 use tokio::sync::watch;
 
 use comet_doc::{DeletedSpace, WorkspaceDoc, presence_key};
@@ -1741,41 +1742,51 @@ async fn relay_probe_task(weak: Weak<WorkspaceHostInner>) {
         let Some(bearer) = edge.bearer().await else {
             continue; // signed out
         };
-        let mut refreshed = false;
-        for device_id in stale {
-            let url = format!(
-                "{}/device/{}/status",
-                edge.url.trim_end_matches('/'),
-                device_id
-            );
-            let response = client
-                .get(&url)
-                .bearer_auth(&bearer)
-                .timeout(RELAY_PROBE_TIMEOUT)
-                .send()
-                .await;
-            let Ok(response) = response else { continue };
-            if !response.status().is_success() {
-                continue;
-            }
-            let Ok(body) = response.json::<serde_json::Value>().await else {
-                continue;
-            };
-            if body
-                .get("hostConnected")
-                .and_then(serde_json::Value::as_bool)
-                == Some(true)
-            {
-                let Some(inner) = weak.upgrade() else { return };
-                lock(&inner.presence_seen).insert(device_id.clone(), now_ms());
-                tracing::debug!(device = %device_id, "presence: relay-verified alive");
-                refreshed = true;
-            }
-        }
-        if refreshed && let Some(inner) = weak.upgrade() {
+        let probes = relay_presence_probes(&client, &edge.url, &bearer, stale);
+        futures::pin_mut!(probes);
+        while let Some(device_id) = probes.next().await {
+            let Some(inner) = weak.upgrade() else { return };
+            tracing::debug!(device = %device_id, "presence: relay-verified alive");
+            lock(&inner.presence_seen).insert(device_id, now_ms());
+            // Publish each live result immediately, not after unrelated devices time out.
             inner.publish_presence();
         }
     }
+}
+
+/// Probe all stale devices together: historical devices must not consume the
+/// active host's 70-second online window with serial five-second timeouts.
+fn relay_presence_probes<'a>(
+    client: &'a reqwest::Client,
+    edge_url: &'a str,
+    bearer: &'a str,
+    devices: Vec<String>,
+) -> impl Stream<Item = String> + 'a {
+    // ponytail: one request per stale device; batch status if registries grow large.
+    let concurrency = devices.len().max(1);
+    futures::stream::iter(devices)
+        .map(move |device_id| async move {
+            let response = client
+                .get(format!(
+                    "{}/device/{device_id}/status",
+                    edge_url.trim_end_matches('/')
+                ))
+                .bearer_auth(bearer)
+                .timeout(RELAY_PROBE_TIMEOUT)
+                .send()
+                .await
+                .ok()?
+                .error_for_status()
+                .ok()?;
+            let body = response.json::<serde_json::Value>().await.ok()?;
+            (body
+                .get("hostConnected")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true))
+            .then_some(device_id)
+        })
+        .buffer_unordered(concurrency)
+        .filter_map(futures::future::ready)
 }
 
 /// Background task: reacts to doc changes (local commits and remote imports) by
@@ -1833,6 +1844,68 @@ mod tests {
         AgentSessionRecord, AgentSessionSource, COLLABORATION_SCHEMA_VERSION, Chat,
         PublicationRecord, PublicationValue, Session, SessionRef, SessionStatus,
     };
+
+    #[tokio::test]
+    async fn relay_presence_does_not_wait_for_unresponsive_devices() {
+        use futures::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let server_release = release.clone();
+        let server = tokio::spawn(async move {
+            let mut handlers = tokio::task::JoinSet::new();
+            for _ in 0..4 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let release = server_release.clone();
+                handlers.spawn(async move {
+                    let mut request = vec![0; 4096];
+                    let count = socket.read(&mut request).await.unwrap();
+                    let request = std::str::from_utf8(&request[..count]).unwrap();
+                    let (status, body) = if request.starts_with("GET /device/slow/status ") {
+                        release.notified().await;
+                        ("200 OK", r#"{"hostConnected":false}"#)
+                    } else if request.starts_with("GET /device/live/status ") {
+                        ("200 OK", r#"{"hostConnected":true}"#)
+                    } else if request.starts_with("GET /device/denied/status ") {
+                        ("403 Forbidden", r#"{"hostConnected":true}"#)
+                    } else {
+                        ("200 OK", r#"{"hostConnected":"true"}"#)
+                    };
+                    socket.write_all(format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    ).as_bytes()).await.unwrap();
+                });
+            }
+            while let Some(result) = handlers.join_next().await {
+                result.unwrap();
+            }
+        });
+        let client = reqwest::Client::new();
+        let probes = super::relay_presence_probes(
+            &client,
+            &origin,
+            "test",
+            ["slow", "live", "denied", "invalid"]
+                .map(str::to_string)
+                .to_vec(),
+        );
+        futures::pin_mut!(probes);
+        // The first device cannot finish until after we observe the live device.
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), probes.next())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("live")
+        );
+        release.notify_one();
+        // Offline hosts, failed requests, and non-boolean values never prove liveness.
+        assert_eq!(probes.next().await, None);
+        server.await.unwrap();
+    }
 
     fn chat(id: &str, device_id: &str) -> Chat {
         Chat {

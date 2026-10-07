@@ -125,6 +125,10 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
    Optional device `environment: "namespace"` identifies a Namespace Devbox for presentation;
    the host detects Linux `/.namespace/tasks`. Missing metadata remains Local, OS `platform`
    stays unchanged, and this field never grants execution authority.
+   If workspace heartbeats stop, the engine verifies stale devices against their device-relay
+   status in parallel. Each positive result immediately refreshes the device watch; historical
+   devices with slow or failed status requests cannot delay an active host's online badge.
+   Failed requests never establish liveness; without fresh evidence, the badge goes offline after 70 seconds.
    Per-principal `sessionRefs` rows determine session discovery across that user's Crew clients.
    Owned-session creation and explicit imports publish memberships; imports never assign host
    placement. Legacy membership recovery runs for newly arriving rows, including after initial
