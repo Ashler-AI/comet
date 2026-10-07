@@ -35,7 +35,7 @@ bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
 xcodebuild -project Comet.xcodeproj -scheme Comet \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 
-# Staging candidate: Crew Staging, ai.ashler.crew.staging, version 1.0 build 29
+# Staging candidate: Crew Staging, ai.ashler.crew.staging, version 1.0 build 30
 xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 ```
@@ -57,15 +57,26 @@ gh workflow run mobile.yml --repo Ashler-AI/comet --ref main -f environment=prod
 
 `environment` is the only workflow input; it defaults to `staging`. The workflow
 also runs on pushes to `release/mobile-*` (staging only). It uses Apple-silicon
-`macos-26`, Node 24, the newest installed stable Xcode 26 and iOS 26 SDK/runtime.
+`macos-26-xlarge` (5 CPU, 14 GB), Node 24, the newest installed stable Xcode 26 and iOS 26 SDK/runtime.
 `node scripts/mobile-ci.mjs` is CI-only and refuses developer-workstation builds.
 It verifies the simulator, then archives the same source without Apple credentials.
+The unused simulator OS is shut down during native preflight and boots on demand
+at the live mobile transport phase. RPC, catch-up, freshness and RSS limits remain
+unchanged; the same owned simulator retains its installed app and fixture data.
+
+The 7 GB runner saturated during live transport (zero CPU idle and roughly
+100 MB free); the 14 GB runner passed all 27 fixtures, real authenticated
+simulator/native/Edge transport and the staging build 30 archive in
+[run 37420927501](https://github.com/Ashler-AI/comet/actions/runs/37420927501)
+on PR merge source `d3344825` (head `de43e527`). Downloaded checksums and
+strict archive signature/APNs inspection passed. Signing remains ad-hoc;
+no Apple distribution upload, TestFlight processing or installed-phone proof.
 
 The artifact `crew-mobile-<environment>-<source SHA>` contains:
 
 | Environment | Device archive | Simulator app package |
 | --- | --- | --- |
-| staging | `Crew-Staging-1.0-29-unsigned.xcarchive.tar.gz` | `Crew-Staging-1.0-29-simulator-arm64.tar.gz` |
+| staging | `Crew-Staging-1.0-30-unsigned.xcarchive.tar.gz` | `Crew-Staging-1.0-30-simulator-arm64.tar.gz` |
 | production | `Crew-1.0-21-unsigned.xcarchive.tar.gz` | `Crew-1.0-21-simulator-arm64.tar.gz` |
 
 Both also include `SHA256SUMS`, `source-sha.txt`, `provenance.json`, `e2e.log`,

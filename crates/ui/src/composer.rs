@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -39,13 +40,144 @@ use comet_rpc::{RpcError, methods};
 
 use crate::attachments::{self, StagedAttachment};
 use crate::motion;
-use crate::pickers::{CheckoutPlan, Pickers};
+use crate::pickers::{CheckoutPlan, Pickers, ResolvedRunConfig};
 use crate::state::{
-    AppState, ChatStartupPhase, EngineHandle, Indicator, ScaffoldControlTarget,
+    AppState, ChatStartupPhase, EngineHandle, Indicator, RetainedSend, ScaffoldControlTarget,
     ScaffoldReconnectError, latest_active_omp_goal,
 };
 use crate::theme::Theme;
 
+
+fn retained_command_status(send: &RetainedSend, response: &serde_json::Value) -> Result<Option<bool>, String> {
+    let Some(command) = response.get("command").filter(|value| !value.is_null()) else { return Ok(None) };
+    let mut expected_payload = send.params["command"].clone();
+    let payload = &command["payload"];
+    if expected_payload["kind"] == "control" && expected_payload["source"] != "scaffold"
+        && payload["grantId"].as_str() == Some(format!("peer-command:{}", send.params["commandId"].as_str().unwrap_or("")).as_str())
+        && payload["ownerDeviceId"] == command["issuedBy"] {
+        expected_payload["actorDeviceId"] = command["issuedBy"].clone();
+        expected_payload["grantId"] = payload["grantId"].clone();
+    }
+    if command.get("commandId") != send.params.get("commandId")
+        || payload != &expected_payload
+        || command.get("issuedAt") != send.params.get("issuedAt")
+        || command.get("expiresAt") != send.params.get("expiresAt") {
+        return Err("Crew command identity conflict; original instruction retained".into());
+    }
+    match command.get("status").and_then(serde_json::Value::as_str) {
+        Some("pending") => Ok(Some(true)),
+        Some("applied") => Ok(Some(false)),
+        Some("rejected" | "expired" | "superseded" | "cancelled") => Err(format!("Crew instruction {}: {}",
+            command["status"].as_str().unwrap(), command["resolution"].as_str().unwrap_or("not executed"))),
+        _ => Ok(None),
+    }
+}
+
+#[derive(Debug)]
+struct SendAdmission {
+    applied: bool,
+    notice: Option<String>,
+    outcome_notice: bool,
+}
+
+
+fn retained_read_params(send: &RetainedSend) -> serde_json::Value {
+    let mut read = serde_json::json!({ "chatId": send.params["chatId"], "commandId": send.params["commandId"] });
+    for key in ["targetDeviceId", "roomProjection"] {
+        if let Some(value) = send.params.get(key) { read[key] = value.clone(); }
+    }
+    read
+}
+fn observe_retained_command(send: &mut RetainedSend, response: &serde_json::Value) -> Result<Option<bool>, String> {
+    let status = retained_command_status(send, response);
+    match &status {
+        Ok(Some(pending)) => { send.accepted = true; send.applied |= !pending; send.terminal |= !pending; }
+        Err(error) if error.starts_with("Crew instruction ") => {
+            send.accepted = true; send.terminal = true; send.failure = Some(error.clone());
+        }
+        _ => {}
+    }
+    status
+}
+
+async fn checkpoint_send_admission(
+    engine: &EngineHandle, send: &mut RetainedSend, path: Option<PathBuf>, chat_id: &str,
+    executor: &gpui::BackgroundExecutor,
+) -> Result<SendAdmission, String> {
+    let result = admit_retained_send(engine, send).await;
+    if let Ok(admission) = &result { send.accepted = true; send.applied |= admission.applied; send.terminal |= admission.applied; }
+    if send.accepted || send.terminal {
+        let save_chat = chat_id.to_owned(); let save_send = send.clone();
+        executor.spawn(async move { RetainedSend::save(path, &save_chat, save_send) }).await?;
+    }
+    result
+}
+
+async fn refresh_retained_outcomes(
+    engine: &EngineHandle, sends: &mut [RetainedSend], path: Option<PathBuf>, chat_id: &str,
+    executor: &gpui::BackgroundExecutor,
+) -> Result<(), String> {
+    for send in sends {
+        if send.terminal || send.applied || send.cancelled { continue }
+        let Ok(response) = engine.client().call("ReadSessionCommand", retained_read_params(send)).await else { continue };
+        let was_accepted = send.accepted;
+        match observe_retained_command(send, &response) {
+            Ok(Some(_)) => {}
+            Ok(None) => continue,
+            Err(_) if send.terminal => {}
+            Err(error) => return Err(error),
+        }
+        if send.terminal || !was_accepted {
+            let save_path = path.clone(); let save_chat = chat_id.to_string(); let save_send = send.clone();
+            executor.spawn(async move { RetainedSend::save(save_path, &save_chat, save_send) }).await?;
+        }
+    }
+    Ok(())
+}
+async fn admit_retained_send(engine: &EngineHandle, send: &mut RetainedSend) -> Result<SendAdmission, String> {
+    if send.terminal { return match &send.failure { Some(error) => Err(error.clone()), None => Ok(SendAdmission { applied: true, notice: None, outcome_notice: false }) } }
+    if send.applied { return Ok(SendAdmission { applied: true, notice: None, outcome_notice: false }) }
+    let read = retained_read_params(send);
+    let mut admitted = send.accepted;
+    if let Ok(response) = engine.client().call("ReadSessionCommand", read.clone()).await {
+        match observe_retained_command(send, &response)? {
+            Some(false) => return Ok(SendAdmission { applied: true, notice: None, outcome_notice: false }),
+            Some(true) => admitted = true,
+            None => {}
+        }
+    }
+    match engine.client().call(methods::QUEUE_COMMAND, send.params.clone()).await {
+        Ok(receipt) => {
+            if receipt.get("commandId") != send.params.get("commandId") {
+                return Err("Crew admission response did not identify the original command; its outcome is unknown.".into());
+            }
+            send.accepted = true;
+            let metadata_notice = receipt.get("metadataError").and_then(serde_json::Value::as_str)
+                .or_else(|| receipt.get("preparationError").and_then(serde_json::Value::as_str))
+                .map(|error| format!("Crew accepted the instruction; metadata recovery needs attention: {error}"));
+            if let Ok(response) = engine.client().call("ReadSessionCommand", read).await {
+                if let Some(pending) = observe_retained_command(send, &response)? { return Ok(SendAdmission { applied: !pending, outcome_notice: pending && metadata_notice.is_none(), notice: metadata_notice.or_else(|| pending.then(|| "Crew accepted the instruction; delivery is pending.".into())) }) }
+            }
+            Ok(SendAdmission { applied: false, outcome_notice: metadata_notice.is_none(), notice: metadata_notice.or_else(|| Some("Crew accepted the instruction; waiting for the owner's outcome.".into())) })
+        }
+        Err(error) => {
+            if let Ok(response) = engine.client().call("ReadSessionCommand", read).await {
+                if let Some(pending) = observe_retained_command(send, &response)? { return Ok(SendAdmission { applied: !pending, outcome_notice: pending, notice: pending.then(|| "Crew accepted the instruction; delivery is pending.".into()) }) }
+            }
+            if admitted {
+                let notice = if matches!(&error, RpcError::Failed(message) if message == "command_destination_changed") {
+                    format!("Crew accepted the original instruction; this retry admission attempt was rejected: {error}")
+                } else { format!("Crew accepted the original instruction; retry notification outcome is unknown: {error}") };
+                return Ok(SendAdmission { applied: false, notice: Some(notice), outcome_notice: true });
+            }
+            if matches!(&error, RpcError::BadParams(_))
+                || matches!(&error, RpcError::Failed(message) if message == "command_id_conflict" || message == "peer_command_scope_denied" || message == "command_destination_changed") {
+                return Err(format!("Crew rejected this admission attempt: {error}. The original instruction is retained; its identity was not replaced."));
+            }
+            Err(format!("Crew admission outcome is unknown; retry checks the original instruction: {error}"))
+        }
+    }
+}
 // ---------------------------------------------------------------------------
 // Constants + pure decision logic
 // ---------------------------------------------------------------------------
@@ -3418,6 +3550,19 @@ struct ControlRoute {
     scaffold: Option<ScaffoldControlTarget>,
 }
 
+/// The submission's selection, not the UI selection after journal I/O.
+struct SubmissionConfig {
+    route: Result<Option<ControlRoute>, ControlRouteFailure>,
+    plan: Result<CheckoutPlan, &'static str>,
+    resolved: ResolvedRunConfig,
+    chat_config: Option<ChatConfig>,
+    cwd: Option<String>,
+    device_id: Option<String>,
+    steering_mode: Option<SteeringMode>,
+    agent_target: Option<String>,
+    start_agent: bool,
+}
+
 #[derive(Debug)]
 enum ReconnectFailureKind {
     MissingMetadata,
@@ -3813,6 +3958,10 @@ pub struct Composer {
     content_width: f32,
     /// Draft text per chat key ("" = new-chat canvas), surviving navigation.
     drafts: HashMap<String, String>,
+    recovered_send_scopes: HashSet<PathBuf>,
+    unresolved_send_scopes: HashSet<PathBuf>,
+    refreshing_send_scopes: HashMap<PathBuf, bool>,
+    retained_outcome_notice: Option<(PathBuf, Arc<RetainedSend>, SharedString)>,
     /// Staged-but-unsent attachments per chat key (use-attachments.ts `stash`):
     /// navigating away and back restores them; memory-only, like the original.
     attachments: HashMap<String, Vec<StagedAttachment>>,
@@ -3923,6 +4072,10 @@ impl Composer {
             pickers,
             content_width: crate::transcript::MAX_CONTENT_WIDTH,
             drafts: HashMap::new(),
+            recovered_send_scopes: HashSet::new(),
+            unresolved_send_scopes: HashSet::new(),
+            refreshing_send_scopes: HashMap::new(),
+            retained_outcome_notice: None,
             attachments: HashMap::new(),
             preview: None,
             picker_task: None,
@@ -4894,6 +5047,87 @@ impl Composer {
         }))
     }
 
+    fn show_send_admission(&mut self, chat_id: &str, path: &Option<PathBuf>, send: &RetainedSend, admission: &SendAdmission, cx: &mut Context<Self>) {
+        if self.state.read(cx).send_journal_path(chat_id).ok().flatten() != *path { return }
+        if self.current_key == chat_id {
+            self.failure = admission.notice.clone().map(Into::into);
+            self.retained_outcome_notice = if admission.outcome_notice {
+                path.as_ref().zip(self.failure.as_ref()).map(|(path, notice)| (path.clone(), Arc::new(send.clone()), notice.clone()))
+            } else { None };
+        }
+        if !admission.applied && let Some(scope) = path {
+            self.unresolved_send_scopes.insert(scope.clone());
+            // Admission completion is an event too: a doc/status event may
+            // already have arrived before the pending receipt was saved.
+            self.refresh_retained_sends(chat_id.to_owned(), scope.clone(), false, cx);
+        }
+    }
+
+    fn refresh_retained_sends(&mut self, key: String, scope: PathBuf, mut recover: bool, cx: &mut Context<Self>) {
+        if let Some(dirty) = self.refreshing_send_scopes.get_mut(&scope) { *dirty = true; return }
+        self.refreshing_send_scopes.insert(scope.clone(), false);
+        cx.spawn(async move |this, cx| {
+            loop {
+                let load_key = key.clone(); let load_scope = scope.clone();
+                let mut result = cx.background_executor().spawn(async move { RetainedSend::load(Some(load_scope), &load_key) }).await;
+                let context = this.update(cx, |composer, cx| {
+                    if composer.state.read(cx).send_journal_path(&key).ok().flatten().as_ref() != Some(&scope) { return None }
+                    let notice_send = composer.retained_outcome_notice.as_ref().filter(|(path, _, _)| path == &scope).map(|(_, send, _)| send.clone());
+                    Some((composer.state.read(cx).engine().cloned(), notice_send))
+                }).ok().flatten();
+                if let Some((engine, notice_send)) = context && let Ok(sends) = &mut result {
+                    // Another readback may have retired the hot record. The
+                    // displayed receipt still owns its exact original readback.
+                    if let Some(send) = notice_send && !sends.iter().any(|record| record.message_id == send.message_id) { sends.push((*send).clone()); }
+                    if let Some(engine) = engine && let Err(error) = refresh_retained_outcomes(&engine, sends, Some(scope.clone()), &key, cx.background_executor()).await { result = Err(error); }
+                }
+                let again = this.update(cx, |composer, cx| {
+                    let unchanged = composer.state.read(cx).send_journal_path(&key).ok().flatten().as_ref() == Some(&scope);
+                    if unchanged {
+                        match result {
+                            Ok(sends) => {
+                                if sends.iter().any(|send| !send.terminal && !send.cancelled) { composer.unresolved_send_scopes.insert(scope.clone()); }
+                                else { composer.unresolved_send_scopes.remove(&scope); }
+                                if let Some((path, original, notice)) = &composer.retained_outcome_notice
+                                    && path == &scope
+                                    && let Some(completed) = sends.iter().find(|send| send.message_id == original.message_id && send.params == original.params && send.terminal) {
+                                    if composer.current_key == key && composer.failure.as_ref() == Some(notice) { composer.failure = completed.failure.clone().map(Into::into); }
+                                    composer.retained_outcome_notice = None;
+                                }
+                                if recover && let Some(send) = sends.into_iter().rev().find(|send| send.is_message()) {
+                                    if send.terminal {
+                                        if composer.current_key == key && composer.failure.is_none() { composer.failure = send.failure.map(Into::into); }
+                                    } else if send.accepted {
+                                        if composer.current_key == key && composer.failure.is_none() {
+                                            let notice: SharedString = "Crew retained an accepted instruction awaiting the owner's outcome. Retry checks its original identity.".into();
+                                            composer.retained_outcome_notice = Some((scope.clone(), Arc::new(send), notice.clone()));
+                                            composer.failure = Some(notice);
+                                        }
+                                    } else {
+                                        composer.drafts.entry(key.clone()).or_insert_with(|| send.prompt.clone());
+                                        if composer.current_key == key && composer.input.read(cx).text().is_empty() {
+                                            composer.input.update(cx, |input, cx| input.set_text(send.prompt, cx));
+                                            if composer.failure.is_none() { composer.failure = Some("Crew retained an instruction with unknown admission. Retry checks its original identity.".into()); }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                let outcome_notice = composer.retained_outcome_notice.as_ref().is_some_and(|(path, _, notice)| path == &scope && composer.failure.as_ref() == Some(notice));
+                                if composer.current_key == key && (composer.failure.is_none() || outcome_notice) { composer.failure = Some(error.into()); }
+                            }
+                        }
+                        cx.notify();
+                    }
+                    let dirty = composer.refreshing_send_scopes.remove(&scope).unwrap_or(false);
+                    if unchanged && dirty { composer.refreshing_send_scopes.insert(scope.clone(), false); true } else { false }
+                }).unwrap_or(false);
+                if !again { break }
+                recover = false;
+            }
+        }).detach();
+    }
+
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
         let (key, pending, selected_agent_session) = {
             let state = self.state.read(cx);
@@ -4904,6 +5138,14 @@ impl Composer {
             )
         };
 
+        if !key.is_empty() {
+            if let Ok(Some(scope)) = self.state.read(cx).send_journal_path(&key) {
+                let recover = self.recovered_send_scopes.insert(scope.clone());
+                if recover || self.unresolved_send_scopes.contains(&scope) || self.refreshing_send_scopes.contains_key(&scope) {
+                    self.refresh_retained_sends(key.clone(), scope, recover, cx);
+                }
+            }
+        }
         // Draft swap on chat navigation — the input entity itself survives.
         if key != self.current_key {
             let old_text = self.input.read(cx).text().to_string();
@@ -5297,31 +5539,109 @@ impl Composer {
         cx.notify();
     }
 
+    fn submission_config(&self, cx: &App) -> SubmissionConfig {
+        let state = self.state.read(cx);
+        let pickers = self.pickers.read(cx);
+        SubmissionConfig {
+            route: if state.scaffold_session_draft().is_some() { Ok(None) }
+                else { self.control_route(comet_proto::CAPABILITY_SESSION_CHAT, cx) },
+            plan: pickers.checkout_plan(cx),
+            resolved: pickers.resolved(cx),
+            chat_config: state.selected_chat_row().and_then(|chat| chat.config.clone()),
+            cwd: state.selected_chat_row().and_then(|chat| chat.cwd.clone()),
+            device_id: state.selected_chat_row().map(|chat| chat.device_id.clone()),
+            steering_mode: pickers.steering_mode(cx),
+            agent_target: self.agent_target.clone(),
+            start_agent: self.start_agent,
+        }
+    }
+
     fn send_ready(&mut self, text: String, delivery: SubmitDelivery, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.failure = Some("Engine not connected".into());
-            cx.notify();
-            return;
+        let config = self.submission_config(cx);
+        let chat_id = self.state.read(cx).selected_chat.clone();
+        let Some(chat_id) = chat_id else { self.send_ready_new(text, delivery, None, config, cx); return };
+        let path = match self.state.read(cx).send_journal_path(&chat_id) {
+            Ok(path) => path,
+            Err(error) => { self.failure = Some(error.into()); cx.notify(); return; }
         };
-        let scaffold_draft = self.state.read(cx).scaffold_session_draft().cloned();
-        let control_route = if scaffold_draft.is_some() {
-            None
-        } else {
-            match self.control_route(comet_proto::CAPABILITY_SESSION_CHAT, cx) {
-                Ok(route) => route,
-                Err(failure) => {
-                    self.failure = Some(failure.report());
-                    cx.notify();
+        // Claim this submission before journal I/O. Later Enter events see an
+        // empty composer, while a newly typed draft owns its own attachments.
+        let mut staged = self.attachments.remove(&self.current_key).unwrap_or_default();
+        self.preview = None;
+        self.input.update(cx, |input, cx| input.set_text("", cx));
+        self.drafts.remove(&self.current_key);
+        // Journal recovery is part of this send, including during wake completion.
+        begin_send(&mut self.sending_chats, &chat_id);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let load_id = chat_id.clone();
+            let load_path = path.clone();
+            let mut result = cx.background_executor().spawn(async move { RetainedSend::load(load_path, &load_id) }).await;
+            let engine = this.update(cx, |composer, cx| composer.state.read(cx).engine().cloned()).ok().flatten();
+            if let Some(engine) = engine && let Ok(sends) = &mut result {
+                if let Err(error) = refresh_retained_outcomes(&engine, sends, path.clone(), &chat_id, cx.background_executor()).await { result = Err(error); }
+            }
+            this.update(cx, |composer, cx| {
+                finish_send(&mut composer.sending_chats, &chat_id);
+                if composer.state.read(cx).selected_chat.as_deref() != Some(&chat_id)
+                    || composer.state.read(cx).send_journal_path(&chat_id).ok().flatten() != path {
+                    composer.restore_submission(&chat_id, text, staged, cx);
                     return;
                 }
+                match result {
+                    Err(error) => { composer.failure = Some(error.into()); composer.restore_submission(&chat_id, text, staged, cx); }
+                    Ok(sends) => {
+                        if let Some(send) = sends.into_iter().rev().find(|send| send.is_message() && send.prompt == text) {
+                            if !staged.is_empty() {
+                                composer.failure = Some("Crew retained the original attachment payload. Remove newly staged attachments or edit the prompt to send a different instruction.".into());
+                                composer.restore_submission(&chat_id, text, staged, cx); return;
+                            }
+                            composer.restore_submission(&chat_id, text, staged, cx);
+                            if let Some(engine) = composer.state.read(cx).engine().cloned() { composer.retry_retained_send(chat_id, send, engine, cx); }
+                        } else if !composer.send_ready_new(text.clone(), delivery, Some(&mut staged), config, cx) {
+                            composer.restore_submission(&chat_id, text, staged, cx);
+                        }
+                    }
+                }
+            }).ok();
+        }).detach();
+    }
+
+    fn restore_submission(&mut self, chat_id: &str, text: String, staged: Vec<StagedAttachment>, cx: &mut Context<Self>) {
+        if self.current_key == chat_id && self.input.read(cx).text().is_empty() {
+            self.input.update(cx, |input, cx| input.set_text(text, cx));
+        } else {
+            self.drafts.entry(chat_id.to_owned()).or_insert(text);
+        }
+        if !staged.is_empty() {
+            let slot = self.attachments.entry(chat_id.to_owned()).or_default();
+            let mut restored = staged;
+            slot.retain(|item| !restored.iter().any(|old| old.id == item.id));
+            restored.append(slot);
+            *slot = restored;
+        }
+        cx.notify();
+    }
+
+    fn send_ready_new(&mut self, text: String, delivery: SubmitDelivery, claimed: Option<&mut Vec<StagedAttachment>>, config: SubmissionConfig, cx: &mut Context<Self>) -> bool {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.failure = Some("Engine not connected".into()); cx.notify(); return false;
+        };
+        let scaffold_draft = self.state.read(cx).scaffold_session_draft().cloned();
+        let control_route = match config.route {
+            Ok(route) => route,
+            Err(failure) => {
+                self.failure = Some(failure.report());
+                cx.notify();
+                return false;
             }
         };
-        let mut start_agent_mode = self.start_agent;
+        let mut start_agent_mode = config.start_agent;
         let (chat_id, is_new) = if let Some(draft) = &scaffold_draft {
             if self.state.read(cx).selected_chat.as_deref() != Some(draft.chat_id.as_str()) {
                 self.failure = Some("Scaffold session is no longer selected".into());
                 cx.notify();
-                return;
+                return false;
             }
             (draft.chat_id.clone(), false)
         } else {
@@ -5331,21 +5651,21 @@ impl Composer {
             }
         };
         let is_shared = !is_new && self.state.read(cx).is_shared_session(&chat_id);
-        if is_shared && !self.staged().is_empty() {
+        if is_shared && !claimed.as_ref().map(|staged| staged.as_slice()).unwrap_or_else(|| self.staged()).is_empty() {
             self.failure =
                 Some("Attachments aren’t available in remote sessions. Send text only.".into());
             cx.notify();
-            return;
+            return false;
         }
         // Where the new session runs (current checkout / existing worktree /
         // fresh worktree). A fresh worktree must have a resolved base ref;
         // never reinterpret a still-loading selection as the current checkout.
-        let plan = match self.pickers.read(cx).checkout_plan(cx) {
+        let plan = match config.plan {
             Ok(plan) => plan,
             Err(message) if is_new || scaffold_draft.is_some() => {
                 self.failure = Some(message.into());
                 cx.notify();
-                return;
+                return false;
             }
             // Persisted local sessions already own their cwd; the draft
             // checkout selection is irrelevant to subsequent turns.
@@ -5353,17 +5673,9 @@ impl Composer {
         };
         // Fully-resolved model/reasoning/options — concrete values (chat config
         // or defaults), so the engine never has to guess a "default".
-        let resolved = self.pickers.read(cx).resolved(cx);
-        let selected_chat_config = self
-            .state
-            .read(cx)
-            .selected_chat_row()
-            .and_then(|chat| chat.config.clone());
-        let existing_cwd = self
-            .state
-            .read(cx)
-            .selected_chat_row()
-            .and_then(|c| c.cwd.clone());
+        let resolved = config.resolved;
+        let selected_chat_config = config.chat_config;
+        let existing_cwd = config.cwd;
         // New local sessions use the selected space. A Scaffold draft retains
         // the exact folder selected when the Comet session was created.
         let space = {
@@ -5377,7 +5689,7 @@ impl Composer {
         if is_new && space.is_none() {
             self.failure = Some("Add a space first".into());
             cx.notify();
-            return;
+            return false;
         }
         let scaffold_demo = scaffold_draft.is_some();
         let requested_scaffold_source_ref = scaffold_demo
@@ -5392,7 +5704,7 @@ impl Composer {
             else {
                 self.failure = Some("Select a supported model before starting Scaffold".into());
                 cx.notify();
-                return;
+                return false;
             };
             Some(binding)
         } else {
@@ -5416,10 +5728,7 @@ impl Composer {
                 .map(|s| s.device_id.clone())
                 .unwrap_or_else(|| "local".to_string())
         } else {
-            self.state
-                .read(cx)
-                .selected_chat_row()
-                .map(|c| c.device_id.clone())
+            config.device_id.clone()
                 .or_else(|| local_device_id.clone())
                 .unwrap_or_else(|| "local".to_string())
         };
@@ -5431,10 +5740,7 @@ impl Composer {
                 .map(|space| space.device_id.clone())
                 .filter(|id| local_device_id.as_deref() != Some(id.as_str()))
         } else {
-            self.state
-                .read(cx)
-                .selected_chat_row()
-                .map(|chat| chat.device_id.clone())
+            config.device_id
         };
         if let Some(route) = &control_route {
             host_device_id = Some(route.owner_device_id.clone());
@@ -5444,14 +5750,12 @@ impl Composer {
         let space_remote = space
             .as_ref()
             .is_some_and(|space| local_device_id.as_deref() != Some(space.device_id.as_str()));
-        // Snapshot-and-clear NOW (use-attachments.ts takeAttachments): the
-        // strip empties the instant you hit send; a failure hands the files
-        // back into the chat's stash.
-        let staged = self
-            .attachments
-            .remove(&self.current_key)
-            .unwrap_or_default();
-        self.preview = None;
+        let was_claimed = claimed.is_some();
+        let staged = match claimed {
+            Some(staged) => std::mem::take(staged),
+            None => self.attachments.remove(&self.current_key).unwrap_or_default(),
+        };
+        if !was_claimed { self.preview = None; }
         let message_id = uuid::Uuid::new_v4().to_string();
         let created_at = chrono::Utc::now().timestamp_millis();
 
@@ -5474,7 +5778,7 @@ impl Composer {
         } else {
             delivery
         };
-        let steering_mode = self.pickers.read(cx).steering_mode(cx);
+        let steering_mode = config.steering_mode;
         let echo_status = optimistic_message_status(effective_delivery, steering_mode);
         let initial_chat_cwd = match &plan {
             CheckoutPlan::ReuseWorktree { path, .. } if !scaffold_demo => Some(path.clone()),
@@ -5533,8 +5837,10 @@ impl Composer {
             s.push_echo(&chat_id, echo);
             cx.notify();
         });
-        self.input.update(cx, |input, cx| input.set_text("", cx));
-        self.drafts.remove(&self.current_key);
+        if !was_claimed {
+            self.input.update(cx, |input, cx| input.set_text("", cx));
+            self.drafts.remove(&self.current_key);
+        }
         self.failure = None;
         begin_send(&mut self.sending_chats, &chat_id);
         let preparation_cancel = if scaffold_demo {
@@ -5558,7 +5864,8 @@ impl Composer {
         let restore_text = text.clone();
         let err_chat_id = chat_id.clone();
         let err_message_id = message_id.clone();
-        if control_route.is_some() || scaffold_demo {
+        if (control_route.is_some() || scaffold_demo)
+            && self.start_agent == config.start_agent && self.agent_target == config.agent_target {
             self.start_agent = false;
             self.input.update(cx, |input, cx| {
                 input.set_placeholder(
@@ -5579,6 +5886,8 @@ impl Composer {
             local_startup && matches!(&plan, CheckoutPlan::NewWorktree { .. });
             let command_admission_started = Rc::new(Cell::new(false));
             let admission_started = command_admission_started.clone();
+            let prepared_journal = Rc::new(RefCell::new(None));
+            let admission_journal = prepared_journal.clone();
             let startup_worktree_path = Rc::new(RefCell::new(None));
             let mut startup_rollback = local_startup.then(|| {
                 StartupRollback::new(
@@ -5590,8 +5899,6 @@ impl Composer {
             });
             let admission_deadline = local_startup
                 .then(|| cx.background_executor().timer(LOCAL_SESSION_ADMISSION_WAIT));
-            let admission_retry_params = Rc::new(RefCell::new(None));
-            let admission_retry = admission_retry_params.clone();
             let mut scaffold_attached = control_route
                 .as_ref()
                 .is_some_and(|route| route.source == AgentSessionSource::Scaffold);
@@ -6114,26 +6421,33 @@ impl Composer {
                     }
                 };
                 let command_id = uuid::Uuid::new_v4().to_string();
+                let room_projection = submission_state.update(cx, |state, _| state.transcript_room_projection(&chat_id));
                 let params = serde_json::json!({
                     "chatId": chat_id,
                     "commandId": command_id,
                     "command": command,
+                    "issuedAt": created_at,
+                    "expiresAt": created_at + 86_400_000,
+                    "targetDeviceId": host_device_id,
+                    "roomProjection": room_projection,
                     "preparationGeneration": scaffold_preparation.as_ref().map(|guard| guard.generation()),
                 });
+                let mut retained = RetainedSend { prompt: text.clone(), message_id: message_id.clone(), params, accepted: false, applied: false, terminal: false, failure: None, cancelled: false };
+                let journal_path = submission_state.update(cx, |state, _| state.send_journal_path(&chat_id))?;
+                *admission_journal.borrow_mut() = Some((journal_path.clone(), retained.clone()));
+                let save_path = journal_path.clone();
+                let save_chat = chat_id.clone();
+                let save_send = retained.clone();
+                cx.background_executor().spawn(async move { RetainedSend::save(save_path, &save_chat, save_send) }).await?;
                 admission_started.set(true);
-                *admission_retry.borrow_mut() = Some(params.clone());
-                engine
-                    .client()
-                    .call(methods::QUEUE_COMMAND, params)
-                    .await
-                    .map_err(|error| format!("Send failed: {error}"))?;
+                admission_journal.borrow_mut().take();
+                let admission = checkpoint_send_admission(&engine, &mut retained, journal_path.clone(), &chat_id, cx.background_executor()).await?;
                 if let Some(preparation) = scaffold_preparation.as_mut() {
                     preparation.disarm();
                 }
-                admission_retry.borrow_mut().take();
-                Ok(())
+                Ok((admission, journal_path, retained))
             };
-            let result = if let Some(deadline) = admission_deadline {
+            let mut result = if let Some(deadline) = admission_deadline {
                 futures::pin_mut!(admission);
                 futures::pin_mut!(deadline);
                 match futures::future::select(admission, deadline).await {
@@ -6141,15 +6455,7 @@ impl Composer {
                     futures::future::Either::Right(((), _))
                         if command_admission_started.get() =>
                     {
-                        match admission_retry_params.borrow_mut().take() {
-                            Some(params) => engine
-                                .client()
-                                .notify(methods::QUEUE_COMMAND, params)
-                                .map_err(|error| {
-                                    format!("Could not retry session startup: {error}")
-                                }),
-                            None => Err("Could not retry session startup".into()),
-                        }
+                        Err("Crew admission outcome is unknown; the original instruction is retained for status readback and same-ID retry".into())
                     }
                     futures::future::Either::Right(((), _)) => {
                         Err("Could not start this session in time".into())
@@ -6173,8 +6479,18 @@ impl Composer {
             } else {
                 admission.await
             };
+            if !command_admission_started.get() {
+                let prepared = prepared_journal.borrow_mut().take();
+                if let Some((path, mut send)) = prepared {
+                    send.cancelled = true;
+                    let save_chat = err_chat_id.clone();
+                    if let Err(error) = cx.background_executor().spawn(async move { RetainedSend::save(path, &save_chat, send) }).await {
+                        result = Err(format!("The instruction was not submitted; its cancellation checkpoint failed and the original draft is retained: {error}"));
+                    }
+                }
+            }
             let succeeded = result.is_ok();
-            if succeeded && let Some(rollback) = startup_rollback.as_mut() {
+            if (succeeded || command_admission_started.get()) && let Some(rollback) = startup_rollback.as_mut() {
                 rollback.disarm();
             }
             if scaffold_demo && succeeded {
@@ -6186,12 +6502,12 @@ impl Composer {
             this.update(cx, |composer, cx| {
                 finish_send(&mut composer.sending_chats, &err_chat_id);
                 composer.scaffold_preparations.remove(&err_chat_id);
+                if let Ok((admission, path, send)) = &result { composer.show_send_admission(&err_chat_id, path, send, admission, cx); }
                 if let Err(message) = &result {
-                    // Failure: red banner, echo removed, submitted prompt kept
-                    // visible, and staged files returned to the chat's stash.
+                    // Unknown admission retains the echo/identity, never a new send.
                     composer.failure = Some(message.clone().into());
                     composer.state.update(cx, |s, cx| {
-                        s.remove_echo(&err_chat_id, &err_message_id);
+                        if !command_admission_started.get() { s.remove_echo(&err_chat_id, &err_message_id); }
                         if scaffold_demo
                             && s.scaffold_session_draft_for_chat(&err_chat_id).is_some()
                         {
@@ -6201,19 +6517,21 @@ impl Composer {
                         // Preparation may have persisted an accepted sandbox
                         // before its ref notification reaches this UI. Keep the
                         // same draft so retry asks the engine to recover it.
-                        if is_new && !scaffold_demo {
+                        if is_new && !scaffold_demo && !command_admission_started.get() {
                             s.cancel_unaccepted_chat(&err_chat_id, cx);
                         }
                         cx.notify();
                     });
                     if composer.current_key == err_chat_id {
-                        composer.input.update(cx, |input, cx| input.set_text(restore_text, cx));
+                        if composer.input.read(cx).text().is_empty() {
+                            composer.input.update(cx, |input, cx| input.set_text(restore_text, cx));
+                        }
                     } else {
                         // Navigation must not move the failed first prompt into
                         // another session or replace that session's draft.
-                        composer.drafts.insert(err_chat_id.clone(), restore_text);
+                        composer.drafts.entry(err_chat_id.clone()).or_insert(restore_text);
                     }
-                    if !staged.is_empty() {
+                    if !staged.is_empty() && !command_admission_started.get() {
                         // Merge by id (stashAttachments): files the user staged
                         // while the send was in flight survive the hand-back.
                         let slot = composer.attachments.entry(err_chat_id.clone()).or_default();
@@ -6241,6 +6559,90 @@ impl Composer {
             .ok();
         })
         .detach();
+        true
+    }
+
+    fn submit_retained_control(&mut self, chat_id: String, prompt: String, mut params: serde_json::Value, engine: EngineHandle, cx: &mut Context<Self>) {
+        let input_request = prompt.strip_prefix("Respond to Crew input ").map(str::to_owned);
+        let path = match self.state.read(cx).send_journal_path(&chat_id) {
+            Ok(path) => path,
+            Err(error) => { self.failure = Some(error.into()); cx.notify(); return; }
+        };
+        params["targetDeviceId"] = self.state.read(cx).selected_chat_row().map(|chat| chat.device_id.clone()).into();
+        if let Some(owner) = params.pointer("/command/ownerDeviceId").cloned() { params["targetDeviceId"] = owner; }
+        params["roomProjection"] = serde_json::to_value(self.state.read(cx).transcript_room_projection(&chat_id)).unwrap_or_default();
+        let issued = chrono::Utc::now().timestamp_millis();
+        let id = uuid::Uuid::new_v4().to_string();
+        params["commandId"] = id.clone().into();
+        params["issuedAt"] = issued.into(); params["expiresAt"] = (issued + 300_000).into();
+        cx.spawn(async move |this, cx| {
+            let load_path = path.clone(); let load_chat = chat_id.clone(); let load_prompt = prompt.clone();
+            let load_params = params.clone();
+            let loaded: Result<Option<RetainedSend>, String> = cx.background_executor().spawn(async move {
+                let pending = RetainedSend::load(load_path.clone(), &load_chat)?;
+                if let Some(send) = pending.into_iter().find(|send| send.matches_control(&load_params)) { return Ok(Some(send)) }
+                RetainedSend::load_input_outcome(load_path, &load_prompt, &load_params)
+            }).await;
+            let result = match loaded {
+                Err(error) => Err(error),
+                Ok(existing) => {
+                    let mut send = existing.unwrap_or(RetainedSend { prompt, message_id: id, params, accepted: false, applied: false, terminal: false, failure: None, cancelled: false });
+                    let unchanged = this.update(cx, |composer, cx| composer.state.read(cx).send_journal_path(&chat_id).ok().flatten() == path
+                        && composer.state.read(cx).retained_send_owner_matches(&chat_id, &send)).unwrap_or(false);
+                    if !send.terminal && !send.applied && !unchanged {
+                        Err("The Crew instruction's identity, scope, or owner changed. Its original request is retained and was not retried.".into())
+                    } else {
+                        let save_path = path.clone(); let save_chat = chat_id.clone(); let save_send = send.clone();
+                        match cx.background_executor().spawn(async move { RetainedSend::save(save_path, &save_chat, save_send) }).await {
+                            Err(error) => Err(error),
+                            Ok(()) => checkpoint_send_admission(&engine, &mut send, path.clone(), &chat_id, cx.background_executor()).await.map(|admission| (admission, send)),
+                        }
+                    }
+                }
+            };
+            this.update(cx, |composer, cx| {
+                match result {
+                    Ok((admission, send)) => composer.show_send_admission(&chat_id, &path, &send, &admission, cx),
+                    Err(error) => {
+                        if let Some(request) = input_request { composer.answered_requests.remove(&request); }
+                        composer.failure = Some(error.into());
+                    }
+                }
+                cx.notify();
+            }).ok();
+        }).detach();
+    }
+
+    fn retry_retained_send(&mut self, chat_id: String, mut send: RetainedSend, engine: EngineHandle, cx: &mut Context<Self>) {
+        if self.is_sending(&chat_id) { return }
+        if !send.terminal && !send.applied && !self.state.read(cx).retained_send_owner_matches(&chat_id, &send) {
+            self.failure = Some("The Crew session owner changed. The original instruction is retained and was not retried.".into());
+            cx.notify(); return;
+        }
+        begin_send(&mut self.sending_chats, &chat_id);
+        self.failure = Some("Checking the original Crew instruction…".into());
+        let journal_path = match self.state.read(cx).send_journal_path(&chat_id) {
+            Ok(path) => path,
+            Err(error) => { self.failure = Some(error.into()); cx.notify(); return; }
+        };
+        let retry_prompt = send.prompt.clone();
+        cx.spawn(async move |this, cx| {
+            let result = checkpoint_send_admission(&engine, &mut send, journal_path.clone(), &chat_id, cx.background_executor()).await;
+            this.update(cx, |composer, cx| {
+                finish_send(&mut composer.sending_chats, &chat_id);
+                match result {
+                    Ok(admission) => {
+                        composer.show_send_admission(&chat_id, &journal_path, &send, &admission, cx);
+                        if composer.drafts.get(&chat_id) == Some(&retry_prompt) { composer.drafts.remove(&chat_id); }
+                        if composer.current_key == chat_id && composer.input.read(cx).text() == retry_prompt {
+                            composer.input.update(cx, |input, cx| input.set_text("", cx));
+                        }
+                    }
+                    Err(error) => composer.failure = Some(error.into()),
+                }
+                cx.notify();
+            }).ok();
+        }).detach();
     }
 
     /// Stop the selected session when it is actively running.
@@ -6290,17 +6692,7 @@ impl Composer {
                 return;
             }
         };
-        cx.spawn(async move |this, cx| {
-            let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
-            if let Err(err) = result {
-                this.update(cx, |composer, cx| {
-                    composer.failure = Some(format!("Stop failed: {err}").into());
-                    cx.notify();
-                })
-                .ok();
-            }
-        })
-        .detach();
+        self.submit_retained_control(chat_id, "Stop Crew session".into(), params, engine, cx);
     }
 
     // ---- wizard glue ----
@@ -6409,36 +6801,7 @@ impl Composer {
                 return;
             }
         };
-        cx.spawn(async move |this, cx| {
-            let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
-            if let Err(err) = result {
-                this.update(cx, |composer, cx| {
-                    composer.failure = Some(format!("Answer failed: {err}").into());
-                    // The answer never left this device — put the panel back.
-                    composer.answered_requests.remove(&request_id);
-                    cx.notify();
-                })
-                .ok();
-                return;
-            }
-            // Safety net against a dead-looking session: the command queued,
-            // but the host may still REJECT it (e.g. the run's resolver is
-            // gone). If the very same request is still the live pending input
-            // once the host has had ample time to execute and the resolved
-            // flag to sync back, the answer demonstrably didn't take —
-            // un-hide the panel instead of leaving the question unanswerable.
-            cx.background_executor().timer(Duration::from_secs(2)).await;
-            this.update(cx, |composer, cx| {
-                let transcript = composer.state.read(cx).transcript.clone();
-                let still_pending = pending_input_request(&transcript)
-                    .is_some_and(|(pending_id, _)| pending_id == request_id);
-                if still_pending && composer.answered_requests.remove(&request_id) {
-                    cx.notify();
-                }
-            })
-            .ok();
-        })
-        .detach();
+        self.submit_retained_control(chat_id, format!("Respond to Crew input {request_id}"), params, engine, cx);
         cx.notify();
     }
 
@@ -7312,7 +7675,504 @@ impl Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use std::sync::Arc;
+
+    struct RetainedControlRpc {
+        commands: parking_lot::Mutex<HashMap<String, serde_json::Value>>,
+        requests: parking_lot::Mutex<Vec<serde_json::Value>>,
+        hide_reads: std::sync::atomic::AtomicBool,
+        queue_error: parking_lot::Mutex<Option<&'static str>>,
+        status: parking_lot::Mutex<&'static str>,
+        reads: std::sync::atomic::AtomicUsize,
+        metadata_error: parking_lot::Mutex<Option<&'static str>>,
+    }
+
+    impl RetainedControlRpc {
+        fn new() -> Self {
+            Self { commands: parking_lot::Mutex::new(HashMap::new()), requests: parking_lot::Mutex::new(Vec::new()),
+                hide_reads: false.into(), queue_error: parking_lot::Mutex::new(None), status: parking_lot::Mutex::new("pending"),
+                reads: 0.into(), metadata_error: parking_lot::Mutex::new(None) }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl comet_rpc::RpcService for RetainedControlRpc {
+        async fn handle(&self, method: &str, params: serde_json::Value) -> Result<comet_rpc::RpcReply, RpcError> {
+            match method {
+                methods::LIST_HARNESSES | methods::LIST_HARNESS_COMMANDS => comet_rpc::RpcReply::value(&Vec::<serde_json::Value>::new()),
+                "ReadSessionCommand" => {
+                    self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if self.hide_reads.load(std::sync::atomic::Ordering::SeqCst) { return Err(RpcError::Closed) }
+                    let mut command = self.commands.lock().get(params["commandId"].as_str().unwrap()).cloned();
+                    if let Some(command) = &mut command { command["status"] = (*self.status.lock()).into(); }
+                    comet_rpc::RpcReply::value(&serde_json::json!({"command":command}))
+                }
+                methods::QUEUE_COMMAND => {
+                    self.requests.lock().push(params.clone());
+                    let error = *self.queue_error.lock();
+                    if error != Some("command_destination_changed") {
+                        self.commands.lock().entry(params["commandId"].as_str().unwrap().to_owned()).or_insert_with(|| serde_json::json!({
+                            "commandId":params["commandId"], "payload":params["command"], "issuedAt":params["issuedAt"], "expiresAt":params["expiresAt"]
+                        }));
+                    }
+                    if let Some(error) = error { return Err(RpcError::Failed(error.into())) }
+                    comet_rpc::RpcReply::value(&serde_json::json!({"commandId":params["commandId"], "metadataError":*self.metadata_error.lock()}))
+                }
+                _ => Err(RpcError::UnknownMethod(method.into())),
+            }
+        }
+    }
+
+    fn retained_test_composer(cx: &mut gpui::TestAppContext, engine: EngineHandle, dir: &std::path::Path) -> (Entity<Composer>, Option<PathBuf>) {
+        let state = cx.new(|_| AppState::new());
+        let path = state.update(cx, |state, cx| {
+            state.data_dir = Some(dir.to_owned());
+            state.local_device_id = Some("local".into());
+            state.auth = Some(comet_proto::AuthState::SignedIn {
+                user: comet_proto::UserProfile { id:"user".into(), email:"user@example.com".into(), name:None }, project_scope:"project".into(),
+            });
+            state.apply_chats(vec![serde_json::from_value(serde_json::json!({
+                "id":"chat", "deviceId":"local", "archived":false, "cwd":"/repo", "createdAt":chrono::Utc::now()
+            })).unwrap()]);
+            state.select_chat(Some("chat".into()), cx);
+            state.set_engine_for_test(engine);
+            state.send_journal_path("chat").unwrap()
+        });
+        (cx.new(|cx| Composer::new(state, cx)), path)
+    }
+
+    fn retained_control_params(session: &str, action: SessionControlAction) -> serde_json::Value {
+        serde_json::json!({"chatId":"chat", "command":SessionCommandPayload::Control {
+            session_id:session.into(), owner_device_id:"owner".into(), actor_device_id:"local".into(),
+            actor_subject:"user".into(), grant_id:"grant".into(), source:AgentSessionSource::Local, action:Box::new(action),
+        }})
+    }
+
+    async fn submit_control_and_wait(
+        composer: &Entity<Composer>, engine: &EngineHandle, prompt: &str, params: serde_json::Value, cx: &mut gpui::TestAppContext,
+    ) {
+        composer.update(cx, |composer, cx| {
+            composer.failure = Some("waiting for test submission".into());
+            composer.submit_retained_control("chat".into(), prompt.into(), params, engine.clone(), cx);
+        });
+        cx.condition(composer, |composer, _| composer.failure.as_deref() != Some("waiting for test submission") && composer.refreshing_send_scopes.is_empty()).await;
+    }
+
+    #[gpui::test]
+    async fn pending_composer_notice_retires_only_on_authoritative_applied_and_preserves_metadata_warning(cx: &mut gpui::TestAppContext) {
+        use std::sync::atomic::Ordering::SeqCst;
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap(); let _guard = runtime.enter();
+        let rpc = Arc::new(RetainedControlRpc::new());
+        let dir = tempfile::tempdir().unwrap();
+        let (composer, path) = retained_test_composer(cx, EngineHandle::for_test(rpc.clone()), dir.path());
+        let state = composer.read_with(cx, |composer, _| composer.state.clone());
+        for (turn, metadata_error) in [None, Some("metadata projection failed")].into_iter().enumerate() {
+            *rpc.status.lock() = "pending"; *rpc.metadata_error.lock() = metadata_error;
+            composer.update(cx, |composer, cx| composer.submit_command(&format!("instruction {turn}"), cx));
+            cx.condition(&composer, |composer, _| rpc.requests.lock().len() == turn + 1 && !composer.is_sending("chat")
+                && composer.failure.is_some() && composer.refreshing_send_scopes.is_empty()).await;
+            let pending = RetainedSend::load(path.clone(), "chat").unwrap().pop().unwrap();
+            assert!(pending.accepted && !pending.applied && !pending.terminal);
+            let notice = composer.read_with(cx, |composer, _| {
+                assert_eq!(composer.retained_outcome_notice.is_some(), metadata_error.is_none());
+                composer.failure.clone()
+            });
+
+            // A completed reply is an event prompting readback, not terminal
+            // proof: the owner's original command still reports pending.
+            let reads = rpc.reads.load(SeqCst);
+            state.update(cx, |state, cx| {
+                state.transcript.push(SessionMessageEntry {
+                    id:format!("reply-{turn}"), role:MessageRole::Assistant,
+                    parts:vec![MessagePart::Text { id:"text".into(), text:"completed mock reply".into() }],
+                    created_at:chrono::Utc::now().timestamp_millis(), device_id:"local".into(),
+                    status:Some(MessageStatus::Complete), continuation_of:None, peer_message:None,
+                });
+                cx.notify();
+            });
+            cx.condition(&composer, |composer, _| rpc.reads.load(SeqCst) > reads && composer.refreshing_send_scopes.is_empty()).await;
+            assert_eq!(composer.read_with(cx, |composer, _| composer.failure.clone()), notice);
+            assert!(!RetainedSend::load(path.clone(), "chat").unwrap()[0].terminal);
+
+            *rpc.status.lock() = "applied";
+            state.update(cx, |_, cx| cx.notify());
+            cx.condition(&composer, |composer, _| RetainedSend::load(path.clone(), "chat").unwrap().is_empty()
+                && composer.refreshing_send_scopes.is_empty()).await;
+            let completed: RetainedSend = serde_json::from_slice(&std::fs::read(path.as_ref().unwrap().with_file_name(format!("{}.outcome", pending.message_id))).unwrap()).unwrap();
+            assert!(completed.accepted && completed.applied && completed.terminal);
+            assert_eq!(completed.params, pending.params);
+            assert_eq!(rpc.requests.lock().len(), turn + 1, "completion readback must never re-admit");
+            assert_eq!(composer.read_with(cx, |composer, _| composer.failure.clone()), if metadata_error.is_some() { notice } else { None });
+            assert!(composer.read_with(cx, |composer, _| composer.retained_outcome_notice.is_none()));
+        }
+    }
+
+    #[gpui::test]
+    async fn retained_stop_and_input_retries_cannot_cross_agent_sessions(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap(); let _guard = runtime.enter();
+        let rpc = Arc::new(RetainedControlRpc::new()); let engine = EngineHandle::for_test(rpc.clone());
+        let dir = tempfile::tempdir().unwrap(); let (composer, path) = retained_test_composer(cx, engine.clone(), dir.path());
+        rpc.hide_reads.store(true, std::sync::atomic::Ordering::SeqCst); *rpc.queue_error.lock() = Some("lost acknowledgement");
+        let stop = |session| retained_control_params(session, SessionControlAction::Stop { expected_turn_id:None });
+        submit_control_and_wait(&composer, &engine, "Stop Crew session", stop("agent-a"), cx).await;
+        let original = rpc.requests.lock()[0].clone();
+        submit_control_and_wait(&composer, &engine, "Stop Crew session", stop("agent-b"), cx).await;
+        assert_eq!(rpc.requests.lock()[1]["command"]["sessionId"], "agent-b");
+        assert_ne!(rpc.requests.lock()[1]["commandId"], original["commandId"]);
+        let mut retry = stop("agent-a"); retry["command"]["grantId"] = "refreshed-grant".into();
+        submit_control_and_wait(&composer, &engine, "Stop Crew session", retry, cx).await;
+        assert_eq!(rpc.requests.lock()[2], original, "retry freezes authority, lifetime, identity and payload");
+
+        rpc.hide_reads.store(false, std::sync::atomic::Ordering::SeqCst); *rpc.queue_error.lock() = None; *rpc.status.lock() = "applied";
+        let input = |session, label: &str| retained_control_params(session, SessionControlAction::RespondInput {
+            request_id:"request".into(), answers:vec![UserInputAnswer { question_id:"question".into(), labels:vec![label.into()] }],
+        });
+        submit_control_and_wait(&composer, &engine, "Respond to Crew input request", input("agent-a", "Yes"), cx).await;
+        let input_a = rpc.requests.lock()[3].clone();
+        submit_control_and_wait(&composer, &engine, "Respond to Crew input request", input("agent-b", "No"), cx).await;
+        let input_b = rpc.requests.lock()[4].clone();
+        assert_ne!(input_a["commandId"], input_b["commandId"]);
+        assert_eq!(input_b["command"]["sessionId"], "agent-b");
+        // Recreate the UI after both outcomes left the hot journal.
+        let (restarted, restarted_path) = retained_test_composer(cx, engine.clone(), dir.path()); assert_eq!(path, restarted_path);
+        submit_control_and_wait(&restarted, &engine, "Respond to Crew input request", input("agent-a", "Changed"), cx).await;
+        assert_eq!(rpc.requests.lock().len(), 5, "input request retries read the original session's outcome instead of requeueing");
+        let outcome = RetainedSend::load_input_outcome(path, "Respond to Crew input request", &input_a).unwrap().unwrap();
+        assert_eq!(outcome.params, input_a);
+    }
+
+    #[gpui::test]
+    async fn terminal_controls_retire_durably_and_never_requeue_after_restart(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap(); let _guard = runtime.enter();
+        let rpc = Arc::new(RetainedControlRpc::new()); let engine = EngineHandle::for_test(rpc.clone());
+        let dir = tempfile::tempdir().unwrap(); let (composer, path) = retained_test_composer(cx, engine.clone(), dir.path());
+        let stop = retained_control_params("agent-a", SessionControlAction::Stop { expected_turn_id:None });
+        for status in ["rejected", "expired", "superseded", "cancelled"] {
+            *rpc.status.lock() = "pending";
+            submit_control_and_wait(&composer, &engine, "Stop Crew session", stop.clone(), cx).await;
+            let original = rpc.requests.lock().last().unwrap().clone();
+            *rpc.status.lock() = status;
+            submit_control_and_wait(&composer, &engine, "Stop Crew session", stop.clone(), cx).await;
+            assert!(composer.read_with(cx, |composer, _| composer.failure.as_deref().unwrap().contains(status)));
+            assert!(RetainedSend::load(path.clone(), "chat").unwrap().is_empty());
+            let mut outcome: RetainedSend = serde_json::from_slice(&std::fs::read(path.as_ref().unwrap().with_file_name(format!("{}.outcome", original["commandId"].as_str().unwrap()))).unwrap()).unwrap();
+            assert!(outcome.accepted && outcome.terminal && !outcome.applied);
+            assert_eq!(outcome.params, original);
+            let executor = composer.read_with(cx, |_, cx| cx.background_executor().clone());
+            assert!(checkpoint_send_admission(&engine, &mut outcome, path.clone(), "chat", &executor).await.unwrap_err().contains(status));
+            assert_eq!(rpc.requests.lock().iter().filter(|request| request["commandId"] == original["commandId"]).count(), 1);
+        }
+        *rpc.status.lock() = "pending";
+        let (restarted, _) = retained_test_composer(cx, engine.clone(), dir.path());
+        submit_control_and_wait(&restarted, &engine, "Stop Crew session", stop, cx).await;
+        assert_eq!(rpc.requests.lock().len(), 5);
+        assert_eq!(RetainedSend::load(path, "chat").unwrap().len(), 1, "terminal controls do not consume hot slots");
+    }
+
+    #[gpui::test]
+    async fn destination_rejection_retains_an_already_admitted_original(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap(); let _guard = runtime.enter();
+        let rpc = Arc::new(RetainedControlRpc::new()); let engine = EngineHandle::for_test(rpc.clone());
+        let dir = tempfile::tempdir().unwrap(); let (composer, path) = retained_test_composer(cx, engine.clone(), dir.path());
+        let stop = retained_control_params("agent-a", SessionControlAction::Stop { expected_turn_id:None });
+        *rpc.queue_error.lock() = Some("command_destination_changed");
+        submit_control_and_wait(&composer, &engine, "Stop Crew session", stop.clone(), cx).await;
+        assert!(composer.read_with(cx, |composer, _| composer.failure.as_deref().unwrap().contains("rejected this admission attempt")));
+        let unaccepted = RetainedSend::load(path.clone(), "chat").unwrap().pop().unwrap();
+        assert!(!unaccepted.accepted && !unaccepted.terminal);
+        *rpc.queue_error.lock() = None;
+        submit_control_and_wait(&composer, &engine, "Stop Crew session", stop.clone(), cx).await;
+        rpc.hide_reads.store(true, std::sync::atomic::Ordering::SeqCst); *rpc.queue_error.lock() = Some("command_destination_changed");
+        submit_control_and_wait(&composer, &engine, "Stop Crew session", stop, cx).await;
+        let accepted = RetainedSend::load(path, "chat").unwrap().pop().unwrap();
+        assert!(accepted.accepted && !accepted.terminal);
+        assert_eq!(accepted.params, unaccepted.params);
+        assert!(composer.read_with(cx, |composer, _| composer.failure.as_deref().unwrap().contains("retry admission attempt was rejected")));
+        assert!(rpc.requests.lock().iter().all(|request| request == &unaccepted.params));
+    }
+
+    #[gpui::test]
+    async fn retained_lookup_failure_restores_claimed_draft_and_attachments(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap(); let _guard = runtime.enter();
+        let rpc = Arc::new(RetainedControlRpc::new()); let engine = EngineHandle::for_test(rpc.clone());
+        let dir = tempfile::tempdir().unwrap(); let (composer, path) = retained_test_composer(cx, engine, dir.path());
+        let path = path.unwrap(); std::fs::create_dir_all(path.parent().unwrap()).unwrap(); std::fs::write(path, b"invalid journal").unwrap();
+        let attachment = attachments::stage_pasted_text("claimed file".into()); let original_id = attachment.id.clone();
+        let new_attachment = attachments::stage_pasted_text("new file".into()); let new_id = new_attachment.id.clone();
+        composer.update(cx, |composer, cx| {
+            composer.input.update(cx, |input, cx| input.set_text("keep original draft", cx));
+            composer.add_staged(vec![attachment], cx);
+            composer.on_submit(cx); composer.on_submit(cx);
+            assert!(composer.staged().is_empty());
+            composer.add_staged(vec![new_attachment], cx);
+        });
+        cx.condition(&composer, |composer, cx| composer.failure.as_deref().is_some_and(|error| error.contains("invalid"))
+            && composer.input.read(cx).text() == "keep original draft").await;
+        let ids = composer.read_with(cx, |composer, _| composer.staged().iter().map(|item| item.id.clone()).collect::<Vec<_>>());
+        assert_eq!(ids, [original_id, new_id]);
+        assert!(rpc.requests.lock().is_empty());
+    }
+
+    #[gpui::test]
+    async fn claimed_send_keeps_target_and_config_when_selection_changes_during_lookup(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap(); let _guard = runtime.enter();
+        let rpc = Arc::new(RetainedControlRpc::new());
+        let dir = tempfile::tempdir().unwrap();
+        let (composer, _) = retained_test_composer(cx, EngineHandle::for_test(rpc.clone()), dir.path());
+        let state = composer.read_with(cx, |composer, _| composer.state.clone());
+        state.update(cx, |state, _| {
+            let mut snapshot = route_snapshot(&[comet_proto::CAPABILITY_SESSION_CHAT]);
+            snapshot.sessions[0].chat_id = "chat".into();
+            snapshot.sessions[0].source = AgentSessionSource::Local;
+            snapshot.sessions[0].owner_device_id = "local".into();
+            let mut other = snapshot.sessions[0].clone(); other.session_id = "session-b".into();
+            snapshot.sessions.push(other);
+            state.apply_collaboration(snapshot);
+            state.select_agent_session(Some("session-a".into()));
+            state.chats[0].config = Some(serde_json::from_value(serde_json::json!({
+                "harness":HarnessId::Omp, "model":"original-model", "agentAccountId":"original-account",
+                "modelOptions":{"original-option":true}, "sandbox":SandboxLevel::WorkspaceWrite
+            })).unwrap());
+        });
+        let later_attachment = attachments::stage_pasted_text("later file".into());
+        let later_id = later_attachment.id.clone();
+        composer.update(cx, |composer, cx| {
+            composer.on_state_changed(cx);
+            composer.submit_command("original instruction", cx);
+            assert!(composer.is_sending("chat"));
+            // No async lookup can finish inside this update: change the UI
+            // selection while the claimed submission owns its original config.
+            composer.state.update(cx, |state, cx| {
+                state.select_agent_session(Some("session-b".into()));
+                let config = state.chats[0].config.as_mut().unwrap();
+                config.model = Some("later-model".into());
+                config.agent_account_id = Some("later-account".into());
+                config.model_options.clear();
+                cx.notify();
+            });
+            composer.on_state_changed(cx);
+            composer.start_agent = true;
+            composer.input.update(cx, |input, cx| input.set_text("later draft", cx));
+            composer.add_staged(vec![later_attachment], cx);
+        });
+        cx.condition(&composer, |composer, _| !composer.is_sending("chat")).await;
+        let requests = rpc.requests.lock();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["command"]["sessionId"], "session-a");
+        assert_eq!(requests[0]["command"]["ownerDeviceId"], "local");
+        let request = &requests[0]["command"]["action"]["request"];
+        assert_eq!(request["prompt"], "original instruction");
+        assert_eq!(request["model"], "original-model");
+        assert_eq!(request["agentAccountId"], "original-account");
+        assert_eq!(request["modelOptions"], serde_json::json!({"original-option":true}));
+        composer.read_with(cx, |composer, cx| {
+            assert_eq!(composer.agent_target.as_deref(), Some("session-b"));
+            assert!(composer.start_agent, "a later start-agent selection belongs to the next draft");
+            assert_eq!(composer.input.read(cx).text(), "later draft");
+            assert_eq!(composer.staged().iter().map(|item| item.id.clone()).collect::<Vec<_>>(), [later_id]);
+        });
+    }
+
+    #[gpui::test]
+    async fn overlapping_same_draft_submits_once_and_new_drafts_survive(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap(); let _guard = runtime.enter();
+        let (started_tx, mut started_rx) = futures::channel::mpsc::unbounded(); let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let engine = EngineHandle::for_test(Arc::new(OverlappingSendRpc { started:started_tx, release:release.clone() }));
+        let dir = tempfile::tempdir().unwrap(); let (composer, _) = retained_test_composer(cx, engine, dir.path());
+        let later_attachment = attachments::stage_pasted_text("third draft file".into());
+        let later_id = later_attachment.id.clone();
+        composer.update(cx, |composer, cx| {
+            composer.input.update(cx, |input, cx| input.set_text("first", cx));
+            composer.on_submit(cx); composer.on_submit(cx);
+            assert!(composer.input.read(cx).text().is_empty());
+            assert!(composer.is_sending("chat"), "journal lookup is already in flight");
+            composer.input.update(cx, |input, cx| input.set_text("second", cx));
+            composer.on_submit(cx); composer.on_submit(cx);
+            composer.input.update(cx, |input, cx| input.set_text("unsent third", cx));
+            composer.add_staged(vec![later_attachment], cx);
+        });
+        let mut prompts = vec![started_rx.next().await.unwrap(), started_rx.next().await.unwrap()];
+        prompts.sort(); assert_eq!(prompts, ["first", "second"]);
+        assert!(started_rx.try_recv().is_err());
+        assert_eq!(composer.read_with(cx, |composer, cx| composer.input.read(cx).text().to_owned()), "unsent third");
+        release.add_permits(2); cx.condition(&composer, |composer, _| !composer.is_sending("chat")).await;
+        assert_eq!(composer.read_with(cx, |composer, cx| composer.input.read(cx).text().to_owned()), "unsent third");
+        assert_eq!(composer.read_with(cx, |composer, _| composer.staged().iter().map(|item| item.id.clone()).collect::<Vec<_>>()), [later_id]);
+    }
+
+    struct LostAdmissionReply {
+        command: parking_lot::Mutex<Option<serde_json::Value>>,
+        admissions: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl comet_rpc::RpcService for LostAdmissionReply {
+        async fn handle(&self, method: &str, params: serde_json::Value) -> Result<comet_rpc::RpcReply, RpcError> {
+            match method {
+                "ReadSessionCommand" => comet_rpc::RpcReply::value(&serde_json::json!({"command": self.command.lock().clone()})),
+                methods::QUEUE_COMMAND => {
+                    self.admissions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    *self.command.lock() = Some(serde_json::json!({
+                        "commandId":params["commandId"], "payload":params["command"],
+                        "issuedAt":params["issuedAt"], "expiresAt":params["expiresAt"], "status":"applied"
+                    }));
+                    Err(RpcError::Failed("metadata projection failed after admission".into()))
+                }
+                _ => Err(RpcError::UnknownMethod(method.into())),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_command_readback_prevents_lost_response_duplicate() {
+        let rpc = Arc::new(LostAdmissionReply { command: parking_lot::Mutex::new(None), admissions: std::sync::atomic::AtomicUsize::new(0) });
+        let engine = EngineHandle::for_test(rpc.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let path = Some(dir.path().join("sends.json"));
+        let id = uuid::Uuid::new_v4().to_string();
+        let message = uuid::Uuid::new_v4().to_string();
+        let send = RetainedSend { prompt:"original prompt".into(), message_id:message.clone(), accepted:false, applied:false, terminal:false, failure:None, cancelled:false,
+            params:serde_json::json!({"chatId":"chat", "commandId":id, "issuedAt":100, "expiresAt":1000,
+                "command":{"kind":"steer", "prompt":"original prompt", "messageId":message}}) };
+        RetainedSend::save(path.clone(), "chat", send.clone()).unwrap();
+        assert!(admit_retained_send(&engine, &mut send.clone()).await.unwrap().applied);
+        // Process death before the admission receipt is checkpointed: restore
+        // the original request, then check the completed same-ID outcome.
+        let restored = RetainedSend::load(path.clone(), "chat").unwrap().pop().unwrap();
+        assert_eq!(restored.params, send.params);
+        assert!(admit_retained_send(&engine, &mut restored.clone()).await.unwrap().applied);
+        assert_eq!(rpc.admissions.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let mut accepted = restored.clone(); accepted.accepted = true; accepted.applied = true;
+        RetainedSend::save(path.clone(), "chat", accepted).unwrap();
+        assert!(RetainedSend::load(path.clone(), "chat").unwrap().is_empty());
+        let mut conflict = restored;
+        conflict.params["command"]["prompt"] = "mutated".into();
+        assert!(admit_retained_send(&engine, &mut conflict).await.unwrap_err().contains("identity conflict"));
+        assert_eq!(rpc.admissions.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let mut cancelled = send;
+        cancelled.message_id = uuid::Uuid::new_v4().to_string();
+        cancelled.params["commandId"] = uuid::Uuid::new_v4().to_string().into();
+        cancelled.params["command"]["messageId"] = cancelled.message_id.clone().into();
+        RetainedSend::save(path.clone(), "chat", cancelled.clone()).unwrap();
+        let original = cancelled.clone(); cancelled.cancelled = true;
+        RetainedSend::save(path.clone(), "chat", cancelled).unwrap();
+        // A late background prepare checkpoint cannot resurrect a local cancel.
+        RetainedSend::save(path.clone(), "chat", original).unwrap();
+        assert!(RetainedSend::load(path, "chat").unwrap().is_empty());
+    }
+
+    struct PendingAdmissionReceipt {
+        original: parking_lot::Mutex<Option<serde_json::Value>>,
+        requests: parking_lot::Mutex<Vec<serde_json::Value>>,
+        status: parking_lot::Mutex<&'static str>,
+        admissions: std::sync::atomic::AtomicUsize,
+        executions: std::sync::atomic::AtomicUsize,
+        hide_reads: std::sync::atomic::AtomicBool,
+        lose_retry_reply: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl comet_rpc::RpcService for PendingAdmissionReceipt {
+        async fn handle(&self, method: &str, params: serde_json::Value) -> Result<comet_rpc::RpcReply, RpcError> {
+            match method {
+                "ReadSessionCommand" => {
+                    if self.hide_reads.load(std::sync::atomic::Ordering::SeqCst) { return Err(RpcError::Closed); }
+                    let status = *self.status.lock();
+                    let command = self.original.lock().as_ref().map(|request| serde_json::json!({
+                        "commandId":request["commandId"], "payload":request["command"],
+                        "issuedAt":request["issuedAt"], "expiresAt":request["expiresAt"], "status":status
+                    }));
+                    comet_rpc::RpcReply::value(&serde_json::json!({"command":command}))
+                }
+                methods::QUEUE_COMMAND => {
+                    self.requests.lock().push(params.clone());
+                    let mut original = self.original.lock();
+                    if let Some(request) = original.as_ref() {
+                        assert_eq!(request, &params, "wake retry must preserve the entire original request");
+                        let mut status = self.status.lock();
+                        if *status == "pending" {
+                            *status = "applied";
+                            self.executions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        if self.lose_retry_reply.load(std::sync::atomic::Ordering::SeqCst) { return Err(RpcError::Closed); }
+                    } else {
+                        *original = Some(params.clone());
+                        self.admissions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    let pending = *self.status.lock() == "pending";
+                    comet_rpc::RpcReply::value(&serde_json::json!({"commandId":params["commandId"],
+                        "delivery":if pending {"pending"} else {"notified"},
+                        "deliveryError":if pending {Some("host offline")} else {None}}))
+                }
+                _ => Err(RpcError::UnknownMethod(method.into())),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_pending_receipt_survives_restart_and_same_id_wake_retry() {
+        let rpc = Arc::new(PendingAdmissionReceipt {
+            original: parking_lot::Mutex::new(None), requests: parking_lot::Mutex::new(Vec::new()),
+            status: parking_lot::Mutex::new("pending"),
+            admissions: std::sync::atomic::AtomicUsize::new(0), executions: std::sync::atomic::AtomicUsize::new(0),
+            hide_reads: std::sync::atomic::AtomicBool::new(false), lose_retry_reply: std::sync::atomic::AtomicBool::new(false),
+        });
+        let engine = EngineHandle::for_test(rpc.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let path = Some(dir.path().join("sends.json"));
+        let message = uuid::Uuid::new_v4().to_string();
+        let issued = chrono::Utc::now().timestamp_millis();
+        let mut send = RetainedSend { prompt:"pending instruction".into(), message_id:message.clone(),
+            accepted:false, applied:false, terminal:false, failure:None, cancelled:false,
+            params:serde_json::json!({"chatId":"chat", "commandId":uuid::Uuid::new_v4().to_string(),
+                "issuedAt":issued, "expiresAt":issued+60_000, "targetDeviceId":"owner-a",
+                "command":{"kind":"steer", "prompt":"pending instruction", "messageId":message}}) };
+        let mut state = AppState::new();
+        state.chats.push(serde_json::from_value(serde_json::json!({"id":"chat", "deviceId":"owner-a",
+            "archived":false, "createdAt":chrono::Utc::now()})).unwrap());
+        assert!(state.retained_send_owner_matches("chat", &send));
+        state.chats[0].device_id = "owner-b".into();
+        assert!(!state.retained_send_owner_matches("chat", &send));
+        RetainedSend::save(path.clone(), "chat", send.clone()).unwrap();
+        let admission = admit_retained_send(&engine, &mut send).await.unwrap();
+        assert!(!admission.applied);
+        assert!(admission.notice.unwrap().contains("pending"));
+        send.accepted = true; send.applied = admission.applied;
+        RetainedSend::save(path.clone(), "chat", send.clone()).unwrap();
+        let mut restored = RetainedSend::load(path.clone(), "chat").unwrap().pop().expect("accepted pending hot record");
+        assert!(restored.accepted && !restored.applied && !restored.terminal);
+        assert_eq!(restored.params, send.params);
+        rpc.hide_reads.store(true, std::sync::atomic::Ordering::SeqCst);
+        rpc.lose_retry_reply.store(true, std::sync::atomic::Ordering::SeqCst);
+        let uncertain = admit_retained_send(&engine, &mut restored).await.unwrap();
+        assert!(!uncertain.applied);
+        assert!(uncertain.notice.unwrap().contains("unknown"));
+        RetainedSend::save(path.clone(), "chat", restored).unwrap();
+        let mut restored = RetainedSend::load(path.clone(), "chat").unwrap().pop().expect("accepted response-unknown hot record");
+        assert!(restored.accepted && !restored.applied);
+        assert_eq!(restored.params, send.params);
+        rpc.hide_reads.store(false, std::sync::atomic::Ordering::SeqCst);
+        let applied = admit_retained_send(&engine, &mut restored).await.unwrap();
+        assert!(applied.applied);
+        restored.applied = applied.applied;
+        RetainedSend::save(path.clone(), "chat", restored.clone()).unwrap();
+        assert!(RetainedSend::load(path.clone(), "chat").unwrap().is_empty());
+        let outcome: RetainedSend = serde_json::from_slice(&std::fs::read(path.unwrap().with_file_name(format!("{}.outcome", restored.message_id))).unwrap()).unwrap();
+        assert!(outcome.accepted && outcome.applied && outcome.terminal);
+        assert!(admit_retained_send(&engine, &mut outcome.clone()).await.unwrap().applied);
+        assert_eq!(rpc.requests.lock().len(), 2);
+        assert!(rpc.requests.lock().iter().all(|request| request == &send.params));
+        assert_eq!(rpc.admissions.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(rpc.executions.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 
     struct WakeRpc {
         wake: tokio::sync::Semaphore,
@@ -7383,7 +8243,7 @@ mod tests {
                 }
                 methods::QUEUE_COMMAND => {
                     self.sends.fetch_add(1, SeqCst);
-                    comet_rpc::RpcReply::value(&serde_json::json!({"accepted":true}))
+                    comet_rpc::RpcReply::value(&serde_json::json!({"commandId": _params["commandId"]}))
                 }
                 _ => Err(RpcError::UnknownMethod(method.into())),
             }
@@ -7693,7 +8553,7 @@ mod tests {
     }
 
     struct OverlappingSendRpc {
-        started: std::sync::mpsc::Sender<String>,
+        started: futures::channel::mpsc::UnboundedSender<String>,
         release: Arc<tokio::sync::Semaphore>,
     }
 
@@ -7715,14 +8575,14 @@ mod tests {
                         .expect("Run command prompt")
                         .to_owned();
                     self.started
-                        .send(prompt)
+                        .unbounded_send(prompt)
                         .map_err(|error| RpcError::Failed(error.to_string()))?;
                     self.release
                         .acquire()
                         .await
                         .map_err(|error| RpcError::Failed(error.to_string()))?
                         .forget();
-                    comet_rpc::RpcReply::value(&serde_json::json!({ "accepted": true }))
+                    comet_rpc::RpcReply::value(&serde_json::json!({ "commandId": params["commandId"] }))
                 }
                 _ => Err(RpcError::UnknownMethod(method.to_owned())),
             }
@@ -7734,7 +8594,7 @@ mod tests {
         cx.executor().allow_parking();
         let runtime = tokio::runtime::Runtime::new().expect("Tokio RPC server runtime");
         let _runtime_guard = runtime.enter();
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (started_tx, mut started_rx) = futures::channel::mpsc::unbounded();
         let release = Arc::new(tokio::sync::Semaphore::new(0));
         let engine = EngineHandle::for_test(Arc::new(OverlappingSendRpc {
             started: started_tx,
@@ -7767,15 +8627,9 @@ mod tests {
 
         composer.update(cx, |composer, cx| composer.submit_command("first", cx));
         composer.update(cx, |composer, cx| composer.submit_command("second", cx));
-        cx.run_until_parked();
-
         let mut prompts = vec![
-            started_rx
-                .recv_timeout(Duration::from_secs(3))
-                .expect("first QueueCommand"),
-            started_rx
-                .recv_timeout(Duration::from_secs(3))
-                .expect("second QueueCommand"),
+            started_rx.next().await.expect("first QueueCommand"),
+            started_rx.next().await.expect("second QueueCommand"),
         ];
         prompts.sort();
         assert_eq!(prompts, ["first", "second"]);

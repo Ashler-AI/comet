@@ -152,7 +152,7 @@ struct WorkspaceHostInner {
     /// Deaf-socket tripwire state — see `check_presence_deafness`.
     presence_watch: Mutex<PresenceWatch>,
     /// Doc subscription (drop = unsubscribe) — bumps the change watch on every commit.
-    _sub: loro::Subscription,
+    _sub: comet_doc::DocumentSubscription,
 }
 
 impl Drop for WorkspaceHostInner {
@@ -269,6 +269,8 @@ fn backfill_local_session_refs(
         checked.insert(chat.id.clone());
     }
     if changed {
+        let binding = doc.binding();
+        let _operation = binding.operation();
         store.save_snapshot(WORKSPACE_DOC_ID, &doc.export_snapshot()?)?;
     }
     Ok(())
@@ -310,6 +312,7 @@ impl WorkspaceHost {
             None => WorkspaceDoc::new(),
         };
         let doc = Arc::new(doc);
+        crate::doc_host::install_workspace_journal(&store, &doc, &config.device_id, &config.project_scope, &config.user_id)?;
         // Destructive-break hygiene: drop the unreachable legacy snapshot row and
         // stamp the in-band schema version for the NEXT break to detect.
         store.delete_snapshot(LEGACY_WORKSPACE_DOC_ID).ok();
@@ -358,7 +361,7 @@ impl WorkspaceHost {
         })?;
 
         let (changed_tx, changed_rx) = watch::channel(0u64);
-        let sub = doc.doc().subscribe_root(Arc::new(move |_diff| {
+        let sub = doc.binding().subscribe_root(Arc::new(move |_diff| {
             changed_tx.send_modify(|v| *v = v.wrapping_add(1));
         }));
         let mut state = doc.read_all()?;
@@ -417,7 +420,7 @@ impl WorkspaceHost {
         let url = edge.room_url(format!("/workspace/{project_scope}/ws"));
         // Must match the edge's project-authorized shared workspace namespace.
         let room_id = format!("ws4/{project_scope}");
-        let room_doc = self.inner.doc.doc().clone();
+        let room_doc = self.inner.doc.binding();
         let device_id = self.inner.config.device_id.clone();
         let weak = Arc::downgrade(&self.inner);
         let task = tokio::spawn(async move {
@@ -433,7 +436,7 @@ impl WorkspaceHost {
                 let tuning = comet_sync::RoomTuning {
                     probe_max: WORKSPACE_PROBE_MAX,
                 };
-                match RoomClient::connect_via_tuned(url.clone(), &room_id, room_doc.clone(), tuning)
+                match RoomClient::connect_binding_via_tuned(url.clone(), &room_id, room_doc.clone(), tuning)
                     .await
                 {
                     Ok(client) => {
@@ -501,8 +504,10 @@ impl WorkspaceHost {
     }
 
     pub fn connected(&self) -> bool {
-        lock(&self.inner.room).is_some()
+        lock(&self.inner.room).as_ref().is_some_and(|room| room.stats().connected)
     }
+
+    pub fn recovery_error(&self) -> Option<String> { self.inner.doc.binding().recovery_error() }
 
     /// Probe the workspace room's liveness NOW (window-focus sweep). The
     /// room ignores the hint unless it has been broadcast-quiet ≥30s — and
@@ -884,6 +889,14 @@ impl WorkspaceHost {
     }
 
     pub fn record_session(&self, session: &Session) {
+        if session.device_id != self.inner.config.device_id || session.chat_id.contains("::session::") {
+            return;
+        }
+        if self.inner.doc.chat(&session.chat_id).ok().flatten().is_some_and(|chat| chat.device_id != session.device_id)
+            && comet_proto::parse_scaffold_device_id(&self.inner.config.device_id).is_none()
+        {
+            return;
+        }
         if comet_proto::parse_scaffold_device_id(&self.inner.config.device_id).is_none()
             && session.device_id == self.inner.config.device_id
             && self
@@ -945,7 +958,7 @@ impl WorkspaceHost {
         // forever when peers have incompatible shallow frontiers.
         self.inner.room_sessions_tx.send_if_modified(|rows| {
             if let Some(row) = rows.iter_mut().find(|(_, row)| row.chat_id == session.chat_id) {
-                if row.0.environment == reference.environment && row.1 == *session {
+                if row.0.added_at == reference.added_at && row.0.environment == reference.environment && row.1 == *session {
                     return false;
                 }
                 *row = (reference.clone(), session.clone());
@@ -962,7 +975,7 @@ impl WorkspaceHost {
             .find(|row| row.chat_id == session.chat_id)
             != Some(session)
         {
-            self.record_session(session);
+            self.inner.doc.upsert_session(session)?;
         }
         if self.inner.doc.chat(&session.chat_id)?.is_none() {
             self.inner.doc.upsert_chat(&Chat {
@@ -994,6 +1007,8 @@ impl WorkspaceHost {
         else {
             return Ok(());
         };
+        let binding = self.inner.doc.binding();
+        let _operation = binding.operation();
         let raw = self.inner.doc.doc();
         let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) =
             raw.get_map("chats").get(&session.chat_id)
@@ -1006,7 +1021,7 @@ impl WorkspaceHost {
         }
         row.insert("lastMessageAt", at)
             .map_err(comet_doc::DocError::from)?;
-        raw.commit();
+        binding.commit()?;
         Ok(())
     }
 
@@ -1430,6 +1445,7 @@ impl WorkspaceHost {
 impl WorkspaceHostInner {
     fn publish(&self) {
         match (|| -> Result<_, EngineError> {
+            self.doc.migrate_execution_rows()?;
             let mut state = self.doc.read_all()?;
             let _updates = lock(&self.session_ref_updates);
             backfill_local_session_refs(
@@ -1562,6 +1578,8 @@ impl WorkspaceHostInner {
     }
 
     fn save_snapshot(&self) {
+        let binding = self.doc.binding();
+        let _operation = binding.operation();
         match self.doc.export_snapshot() {
             Ok(bytes) => {
                 if let Err(err) = self.store.save_snapshot(WORKSPACE_DOC_ID, &bytes) {
@@ -1661,15 +1679,19 @@ fn merge_sessions(
         .filter(|s| !remote.contains(s.chat_id.as_str()))
     {
         // Native handoffs retain their private execution row for turn identity.
-        if let Some((chat_id, session_id)) = session.chat_id.split_once("::session::")
-            && chat_id == session_id
+        if let Some(chat_id) = comet_doc::workspace::execution_chat_id(&session.chat_id)
             && !remote.contains(chat_id)
+            && !local.iter().any(|row| row.chat_id == chat_id)
+            && merged.get(chat_id).is_none_or(|row| row.device_id == device_id)
         {
             let mut projected = session.clone();
             projected.chat_id = chat_id.to_string();
             merged.insert(projected.chat_id.clone(), projected);
         }
-        merged.insert(session.chat_id.clone(), session.clone());
+        // A stale local observer cannot replace another device's room owner.
+        if merged.get(&session.chat_id).is_none_or(|row| row.device_id == device_id) {
+            merged.insert(session.chat_id.clone(), session.clone());
+        }
     }
     let mut list: Vec<Session> = merged.into_values().collect();
     list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
@@ -1845,15 +1867,16 @@ mod tests {
 
     #[test]
     fn merged_statuses_include_native_handoff_without_collapsing_child_sessions() {
-        let mut live = session("chat-a::session::chat-a", "device-a");
+        let id = "00000000-0000-4000-8000-000000000217";
+        let mut live = session(&format!("{id}::session::{id}"), "device-a");
         live.status = SessionStatus::Working;
-        let child = session("chat-a::session::child", "device-a");
+        let child = session(&format!("{id}::session::00000000-0000-4000-8000-000000000218"), "device-a");
         let merged = merge_sessions("device-a", &[], &[live.clone(), child.clone()], &[], &[]);
         assert_eq!(merged.len(), 3);
         assert_eq!(
             merged
                 .iter()
-                .find(|row| row.chat_id == "chat-a")
+                .find(|row| row.chat_id == id)
                 .unwrap()
                 .status,
             SessionStatus::Working
@@ -1862,6 +1885,161 @@ mod tests {
         assert!(merged.contains(&child));
         let only_child = merge_sessions("device-a", &[], &[child.clone()], &[], &[]);
         assert_eq!(only_child, vec![child]);
+    }
+
+    #[tokio::test]
+    async fn room_status_survives_stale_index_with_or_without_queued_redelivery() {
+        let open = |device: &str| {
+            let temp = tempfile::tempdir().unwrap();
+            let store = std::sync::Arc::new(comet_sync::DocsStore::open(temp.path()).unwrap());
+            let host = WorkspaceHost::open(store, WorkspaceHostConfig {
+                device_id: device.into(), device_name: "Test".into(), platform: "test".into(),
+                project_scope: "project".into(), user_id: "owner".into(), edge: None,
+            }).unwrap();
+            (temp, host)
+        };
+        let (_desktop_temp, desktop) = open("desktop");
+        let (_remote_temp, remote) = open("remote");
+        desktop.create_space("space", "remote", "/tmp", None, false).unwrap();
+        desktop.create_chat("remote-chat", "space", None, None).unwrap();
+        desktop.create_space("local-space", "desktop", "/tmp/local", None, false).unwrap();
+        desktop.create_chat("local-chat", "local-space", None, None).unwrap();
+        desktop.inner.publish();
+        let now = Utc.timestamp_millis_opt(Utc::now().timestamp_millis()).unwrap();
+        let mut current = Session { updated_at: now, ..session("remote-chat", "remote") };
+        let mut live = Session { status: SessionStatus::Working, updated_at: now,
+            ..session("local-chat", "desktop") };
+        let abandoned = Session { device_id: "desktop".into(), ..current.clone() };
+        let (local_tx, local_rx) = tokio::sync::watch::channel(vec![live.clone(), abandoned.clone()]);
+        let mut merged = desktop.merged_sessions_watch(local_rx);
+        for status in [SessionStatus::Working, SessionStatus::AwaitingInput, SessionStatus::Idle, SessionStatus::Errored] {
+            for redeliver in [false, true] {
+                current.status = status;
+                current.updated_at += chrono::Duration::milliseconds(1);
+                desktop.record_session_activity(None, "owner", &current, None).unwrap();
+                // Do not materialize sessions_tx yet: this is the actual gap
+                // between a room delivery and the asynchronous workspace publish.
+                remote.doc().binding().import(&desktop.doc().export_snapshot().unwrap()).unwrap();
+                let stale = Session { status: SessionStatus::Idle,
+                    updated_at: current.updated_at - chrono::Duration::milliseconds(comet_proto::view::SESSION_STALE_MS + 1_000),
+                    ..current.clone() };
+                remote.record_session(&stale);
+                let before = desktop.doc().doc().oplog_vv();
+                desktop.doc().binding().import(&remote.doc().doc().export(loro::ExportMode::updates(&before)).unwrap()).unwrap();
+                assert_eq!(desktop.doc().read_sessions().unwrap(), vec![stale.clone()]);
+                if redeliver {
+                    // A new membership must be stored even when the owner row
+                    // and physical route are otherwise exactly unchanged.
+                    let mut reference = desktop.doc().session_ref("owner", "remote-chat").unwrap().unwrap();
+                    reference.added_at += chrono::Duration::milliseconds(1);
+                    desktop.doc().upsert_session_ref("owner", &reference).unwrap();
+                    desktop.record_session_activity(None, "owner", &current, None).unwrap();
+                }
+                desktop.inner.publish();
+                assert_eq!(*desktop.watch_session_rows().borrow(),
+                    vec![if redeliver { current.clone() } else { stale }],
+                    "queued redelivery determines whether raw stale state is observable");
+                live.updated_at += chrono::Duration::milliseconds(1);
+                local_tx.send_replace(vec![live.clone(), abandoned.clone()]);
+                let rows = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    loop {
+                        let rows = merged.borrow_and_update().clone();
+                        if rows.iter().any(|row| row == &current) && rows.iter().any(|row| row == &live) {
+                            break rows;
+                        }
+                        merged.changed().await.unwrap();
+                    }
+                }).await.unwrap_or_else(|_| panic!("owner {status:?}, redelivery={redeliver}: {:?}", *merged.borrow()));
+                assert_eq!(rows.iter().find(|row| row.chat_id == "remote-chat"), Some(&current),
+                    "both raw-index orderings must expose the genuine room owner, not the abandoned local run");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_activity_preserves_concurrent_title() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(comet_sync::DocsStore::open(temp.path()).unwrap());
+        let host = WorkspaceHost::open(store.clone(),WorkspaceHostConfig {
+            device_id:"device-a".into(),device_name:"Test".into(),platform:"test".into(),
+            project_scope:"project-a".into(),user_id:"user-a".into(),edge:None,
+        }).unwrap();
+        let id="00000000-0000-4000-8000-000000000001";
+        host.doc().upsert_chat(&chat(id,"device-a")).unwrap();
+        let raw=loro::LoroDoc::new(); raw.import(&host.doc().export_snapshot().unwrap()).unwrap();
+        let remote=comet_doc::WorkspaceDoc::from_doc(raw);
+        remote.rename_chat(id,"User's concurrent title").unwrap();
+        host.doc().set_chat_last_message(id,"Completed turn",Utc.timestamp_millis_opt(1_500).unwrap()).unwrap();
+        host.set_chat_activity(id,Some(2_000),Some(1_000)).unwrap();
+        let local_update=host.doc().export_snapshot().unwrap();
+        host.doc().binding().import(&remote.export_snapshot().unwrap()).unwrap();
+        remote.binding().import(&local_update).unwrap();
+        for doc in [host.doc(),&remote] {
+            let row=doc.chat(id).unwrap().unwrap();
+            assert_eq!(row.title.as_deref(),Some("User's concurrent title"));
+            assert_eq!(row.last_message_at.unwrap().timestamp_millis(),2_000);
+            assert_eq!(row.created_at.timestamp_millis(),1_000);
+        }
+        let config = host.inner.config.clone();
+        store.save_snapshot(super::WORKSPACE_DOC_ID, &host.doc().export_snapshot().unwrap()).unwrap();
+        drop(host);
+        let restarted = WorkspaceHost::open(store, config).unwrap();
+        let restored = restarted.doc().chat(id).unwrap().unwrap();
+        assert_eq!(restored.title.as_deref(), Some("User's concurrent title"));
+        assert_eq!(restored.last_message_at.unwrap().timestamp_millis(), 2_000);
+        assert_eq!(restored.created_at.timestamp_millis(), 1_000);
+    }
+
+    #[tokio::test]
+    async fn restart_restores_pending_activity_after_acknowledged_edit_ahead_of_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(comet_sync::DocsStore::open(temp.path()).unwrap());
+        let config = WorkspaceHostConfig { device_id:"device-a".into(),device_name:"Test".into(),platform:"test".into(),
+            project_scope:"project-a".into(),user_id:"user-a".into(),edge:None };
+        let host = WorkspaceHost::open(store.clone(),config.clone()).unwrap();
+        let id = "00000000-0000-4000-8000-000000000001";
+        host.doc().upsert_chat(&chat(id,"device-a")).unwrap();
+        host.set_chat_activity(id,Some(1),None).unwrap();
+        store.save_snapshot(super::WORKSPACE_DOC_ID,&host.doc().export_snapshot().unwrap()).unwrap();
+        host.set_chat_activity(id,Some(2),None).unwrap();
+        let binding = host.doc().binding();
+        binding.acknowledge(&binding.oplog_vv()).unwrap();
+        host.set_chat_activity(id,Some(3),None).unwrap();
+        drop(host);
+        let restarted = WorkspaceHost::open(store,config).unwrap();
+        assert_eq!(restarted.doc().chat(id).unwrap().unwrap().last_message_at.unwrap().timestamp_millis(),3);
+    }
+
+    #[tokio::test]
+    async fn mixed_alias_workspace_and_existing_journal_recover_together_on_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(comet_sync::DocsStore::open(temp.path()).unwrap());
+        let config = WorkspaceHostConfig { device_id: "device-a".into(), device_name: "Test".into(), platform: "test".into(),
+            project_scope: "project-a".into(), user_id: "user-a".into(), edge: None };
+        let host = WorkspaceHost::open(store.clone(), config.clone()).unwrap();
+        let id = "00000000-0000-4000-8000-000000000219";
+        let alias = format!("{id}::session::{id}");
+        let mut original = chat(id, "device-a");
+        original.title = Some("Retained offline title".into());
+        let mut fields = serde_json::to_value(&original).unwrap();
+        fields["createdAt"] = original.created_at.timestamp_millis().into();
+        let row = host.doc().doc().get_map("chats").insert_container(&alias, loro::LoroMap::new()).unwrap();
+        for (field, value) in fields.as_object().unwrap() { row.insert(field, loro::LoroValue::from(value.clone())).unwrap(); }
+        host.doc().binding().commit().unwrap();
+        let scope = store.document_scope(super::WORKSPACE_DOC_ID).unwrap().unwrap();
+        assert!(store.load_pending_records(&scope).unwrap().iter().any(|record| record.key == alias));
+        store.save_snapshot(super::WORKSPACE_DOC_ID, &host.doc().export_snapshot().unwrap()).unwrap();
+        drop(host);
+        for _ in 0..2 {
+            let reopened = WorkspaceHost::open(store.clone(), config.clone()).unwrap();
+            assert_eq!(reopened.doc().chat(id).unwrap().map(|row| row.title), Some(original.title.clone()));
+            assert!(reopened.doc().doc().get_map("chats").get(&alias).is_none());
+            let pending = store.load_pending_records(&scope).unwrap();
+            assert!(pending.iter().all(|record| record.key != alias));
+            assert!(pending.iter().any(|record| record.key == id && record.value.as_ref().is_some_and(|value| value["id"] == id)));
+            assert!(store.load_snapshot(&format!("recovery-original/{scope}")).unwrap().is_some());
+            store.save_snapshot(super::WORKSPACE_DOC_ID, &reopened.doc().export_snapshot().unwrap()).unwrap();
+        }
     }
 
     #[test]
@@ -2173,33 +2351,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn completion_activity_preserves_concurrent_title() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(comet_sync::DocsStore::open(temp.path()).unwrap());
-        let host = WorkspaceHost::open(store, WorkspaceHostConfig {
-            device_id: "device-a".into(), device_name: "Test".into(), platform: "test".into(),
-            project_scope: "project-a".into(), user_id: "user-a".into(), edge: None,
-        }).unwrap();
-        let id = "00000000-0000-4000-8000-000000000001";
-        host.doc().upsert_chat(&chat(id, "device-a")).unwrap();
-        let remote = loro::LoroDoc::new();
-        remote.import(&host.doc().export_snapshot().unwrap()).unwrap();
-        let remote = comet_doc::WorkspaceDoc::from_doc(remote);
-        remote.rename_chat(id, "User's concurrent title").unwrap();
-        host.doc().set_chat_last_message(id, "Completed turn", Utc.timestamp_millis_opt(1_500).unwrap()).unwrap();
-        host.set_chat_activity(id, Some(2_000), Some(1_000)).unwrap();
-        let local_update = host.doc().export_snapshot().unwrap();
-        let remote_update = remote.export_snapshot().unwrap();
-        host.doc().doc().import(&remote_update).unwrap();
-        remote.doc().import(&local_update).unwrap();
-        for doc in [host.doc(), &remote] {
-            let row = doc.chat(id).unwrap().unwrap();
-            assert_eq!(row.title.as_deref(), Some("User's concurrent title"));
-            assert_eq!(row.last_message_at.unwrap().timestamp_millis(), 2_000);
-            assert_eq!(row.created_at.timestamp_millis(), 1_000);
-        }
-    }
 
     #[tokio::test]
     async fn upgrade_backfills_only_identity_owned_sessions_once() {

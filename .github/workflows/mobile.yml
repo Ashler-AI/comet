@@ -30,9 +30,9 @@ env:
 
 jobs:
   build:
-    # Standard macos-26 runners are Apple silicon. Select the newest installed
-    # stable Xcode 26 in the script rather than following the default into 27.
-    runs-on: macos-26
+    # iOS plus the real Edge/native rig needs the Apple-silicon 14 GB runner.
+    # Keep selecting stable Xcode 26 rather than following the default into 27.
+    runs-on: macos-26-xlarge
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
@@ -41,6 +41,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
+      - name: Select checked-in Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: native
+          cache-on-failure: true
       - name: Verify simulator and archive Crew without Apple credentials
         timeout-minutes: 65
         run: node scripts/mobile-ci.mjs

@@ -20,6 +20,7 @@ gpui_tokio.workspace = true
 tokio.workspace = true
 futures.workspace = true
 async-trait.workspace = true
+parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 pulldown-cmark.workspace = true

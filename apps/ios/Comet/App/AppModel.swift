@@ -24,7 +24,6 @@ final class AppModel {
         case ready
     }
     private var scaffoldRoutes: [String: ScaffoldControlRoute] = [:]
-    private var scaffoldBrowseTargets: [String: (sandboxId: String, scope: CollaborationScope)] = [:]
     private var scaffoldPreparations: [String: ScaffoldPreparationReceipt] = [:]
 
     var phase: Phase = .signedOut
@@ -76,7 +75,9 @@ final class AppModel {
     private var pendingInviteChatId: String?
     private var pendingScaffoldLink: (scope: CollaborationScope, sandboxId: String)?
     private var pendingDirectoryLink: (projectId: String, sessionId: String, deploymentId: String?)?
-    private var directoryRoomProjections: [String: SessionRoomProjection] = [:]
+    private var browsePointers: [String: DocDisk.BrowsePointer] = [:]
+    private var browseCacheId: String?
+    private var browseRecoveryFailure: String?
     var openSessionError: String?
     /// Screenshot rig: "newsession" / "newspace" presents that sheet on arrival.
     var launchSheet: String?
@@ -229,14 +230,14 @@ final class AppModel {
                 projectScope: projectScope, tokens: tokens, devBearer: nil)
     }
 
-    /// Local development edge: bearer = "userId@projectScope".
-    func signInDev(edgeURL: URL, userId: String, projectScope: String) {
+    /// Isolated live rig using the harness's revocable scoped bearer.
+    func signInFixture(edgeURL: URL, userId: String, projectScope: String, accessToken: String) {
         edgeURLString = edgeURL.absoluteString
-        authModeRaw = AppConfig.Mode.dev.rawValue
+        authModeRaw = AppConfig.Mode.scaffold.rawValue
         storedUserId = userId
         storedProjectScope = projectScope
-        connect(url: edgeURL, mode: .dev, userId: userId, projectScope: projectScope,
-                tokens: nil, devBearer: devBearer(userId: userId, projectScope: projectScope))
+        connect(url: edgeURL, mode: .scaffold, userId: userId, projectScope: projectScope,
+                tokens: AuthTokens(accessToken: accessToken), devBearer: nil)
     }
 
     func enterDemoMode() {
@@ -248,7 +249,9 @@ final class AppModel {
     func signOut() {
         notifications.signOut()
         networkMonitor?.cancel(); networkMonitor = nil
-        scaffoldBrowseTargets.removeAll()
+        browsePointers.removeAll()
+        browseCacheId = nil
+        browseRecoveryFailure = nil
         workspace?.stop()
         workspace = nil
         sessionStores.values.forEach { $0.stop() }
@@ -263,6 +266,8 @@ final class AppModel {
         listMetadata.removeAll()
         scaffoldRoutes.removeAll()
         scaffoldPreparations.removeAll()
+        pendingScaffoldLink = nil
+        pendingDirectoryLink = nil
         demoSessionRefs.removeAll()
         config = nil
         demo = nil
@@ -365,6 +370,15 @@ final class AppModel {
             return
         }
         workspace?.removeSessionRef(chatId: chatId)
+        guard workspace?.recoveryFailure == nil else { return }
+        let chatId = AppConfig.canonicalSessionId(chatId) ?? chatId
+        do {
+            try restoreBrowsePointers()
+            var pointers = browsePointers
+            pointers.removeValue(forKey: chatId)
+            try DocDisk.saveIntents(pointers, id: browseCacheId!)
+            browsePointers = pointers
+        } catch { openSessionError = error.localizedDescription }
     }
 
     // MARK: One-click invitations
@@ -391,21 +405,25 @@ final class AppModel {
     }
 
     private func drainPendingDirectoryLink() {
-        guard phase == .ready, let workspace, workspace.connected,
-              let config, let link = pendingDirectoryLink else { return }
+        guard phase == .ready, let workspace, let config,
+              let link = pendingDirectoryLink else { return }
         pendingDirectoryLink = nil
-        guard config.projectScope == link.projectId else {
-            openSessionError = "Open this session in Crew for its project"
-            return
-        }
-        if let deploymentId = link.deploymentId {
-            directoryRoomProjections[link.sessionId] = SessionRoomProjection(
-                projectId: link.projectId, deploymentId: deploymentId, sessionId: link.sessionId)
-        }
-        // This is a membership pointer, never a session grant. Room access
-        // continues through the signed-in workspace's authenticated transport.
-        pendingInviteChatId = link.sessionId
-        drainPendingInvite()
+        do {
+            guard config.projectScope == link.projectId else {
+                throw MobileSessionError.unavailable("Open this session in Crew for its project.")
+            }
+            if let deploymentId = link.deploymentId {
+                try retainBrowsePointer(DocDisk.BrowsePointer(projection: SessionRoomProjection(
+                    projectId: link.projectId, deploymentId: deploymentId, sessionId: link.sessionId), sandboxId: nil))
+            } else {
+                try restoreBrowsePointers()
+                if let pointer = browsePointers[link.sessionId] { try validateBrowsePointer(pointer) }
+            }
+            guard workspace.addSessionRef(chatId: link.sessionId) != nil else {
+                throw MobileSessionError.unavailable(workspace.recoveryFailure ?? "Crew could not retain this membership.")
+            }
+            launchRoute = .chat(link.sessionId)
+        } catch { openSessionError = error.localizedDescription }
     }
 
     private func drainPendingInvite() {
@@ -418,21 +436,109 @@ final class AppModel {
     }
 
     private func drainPendingScaffoldLink() {
-        guard phase == .ready, let workspace, workspace.connected,
-              let link = pendingScaffoldLink else { return }
+        guard phase == .ready, workspace != nil, let link = pendingScaffoldLink else { return }
         pendingScaffoldLink = nil
+        do { try browseScaffoldSessionLink(scope: link.scope, sandboxId: link.sandboxId) }
+        catch { openSessionError = error.localizedDescription }
+    }
+
+    private func browseScaffoldSessionLink(scope: CollaborationScope, sandboxId: String) throws {
         // Browse published state only; attach/resume belongs to a deliberate send.
-        guard let sessionId = link.scope.sessionId, let config,
-              link.scope.projectId == config.projectScope,
-              let deploymentId = link.scope.deploymentId else {
-            openSessionError = "Open this Crew session in its authenticated project and deployment."
-            return
+        guard let rawSessionId = scope.sessionId, let sessionId = AppConfig.canonicalSessionId(rawSessionId),
+              let config, scope.projectId == config.projectScope,
+              let deploymentId = scope.deploymentId, Self.validDirectoryIdentifier(deploymentId),
+              Self.validDirectoryIdentifier(sandboxId), let workspace else {
+            throw MobileSessionError.unavailable("Open this Crew session in its authenticated project and deployment.")
         }
-        directoryRoomProjections[sessionId] = SessionRoomProjection(projectId: link.scope.projectId,
-            deploymentId: deploymentId, sessionId: sessionId)
-        scaffoldBrowseTargets[sessionId] = (link.sandboxId, link.scope)
-        _ = workspace.addSessionRef(chatId: sessionId)
+        try retainBrowsePointer(DocDisk.BrowsePointer(projection: SessionRoomProjection(
+            projectId: scope.projectId, deploymentId: deploymentId, sessionId: sessionId), sandboxId: sandboxId))
+        guard workspace.addSessionRef(chatId: sessionId) != nil else {
+            throw MobileSessionError.unavailable(workspace.recoveryFailure ?? "Crew could not retain this membership.")
+        }
         launchRoute = .chat(sessionId)
+    }
+
+    private func restoreBrowsePointers() throws {
+        guard let config else { throw MobileSessionError.unavailable("Crew is not connected.") }
+        let id = config.documentCacheId(roomId: "ws4/\(config.projectScope)") + "-browse"
+        if browseCacheId != id {
+            browsePointers.removeAll()
+            browseRecoveryFailure = nil
+            browseCacheId = id
+            do {
+                let pointers = try DocDisk.loadIntents([String: DocDisk.BrowsePointer].self, id: id) ?? [:]
+                guard pointers.count <= 1024 else {
+                    throw MobileSessionError.unavailable("Crew retained too many browse routes.")
+                }
+                for (sessionId, pointer) in pointers {
+                    guard sessionId == pointer.projection.sessionId else {
+                        throw MobileSessionError.unavailable("Crew retained a conflicting browse session identity.")
+                    }
+                    try validateBrowsePointer(pointer)
+                }
+                browsePointers = pointers
+            } catch {
+                browseRecoveryFailure = "Crew browse recovery is blocked: \(error.localizedDescription) The original routes are retained."
+            }
+        }
+        if let browseRecoveryFailure { throw MobileSessionError.unavailable(browseRecoveryFailure) }
+    }
+
+    private func validateBrowsePointer(_ pointer: DocDisk.BrowsePointer, environment: SessionEnvironment? = nil) throws {
+        let projection = pointer.projection
+        let id = projection.sessionId
+        guard let config, projection.projectId == config.projectScope,
+              AppConfig.canonicalSessionId(id) == id, Self.validDirectoryIdentifier(projection.deploymentId),
+              pointer.sandboxId.map(Self.validDirectoryIdentifier) ?? true else {
+            throw MobileSessionError.unavailable("Crew retained an invalid browse scope.")
+        }
+        let environments = [environment, workspace?.sessionRef(id: id)?.environment,
+            scaffoldRoutes[id]?.environment, sessionStores[id]?.publishedEnvironment, listMetadata[id]?.environment].compactMap { $0 }
+        for retained in environments {
+            guard retained.scope.projectId == projection.projectId,
+                  retained.scope.deploymentId == projection.deploymentId,
+                  retained.scope.sessionId.flatMap(AppConfig.canonicalSessionId) == id,
+                  pointer.sandboxId == nil || (retained.source.kind == "scaffold" && retained.source.sandboxId == pointer.sandboxId) else {
+                throw MobileSessionError.unavailable("This Crew link conflicts with the retained session scope. No session was opened or instruction sent.")
+            }
+        }
+        if let retained = browsePointers[id] {
+            guard retained.projection == projection,
+                  retained.sandboxId == nil || pointer.sandboxId == nil || retained.sandboxId == pointer.sandboxId else {
+                throw MobileSessionError.unavailable("This Crew link conflicts with the retained browse route.")
+            }
+        }
+        if let store = sessionStores[id], store.deploymentId != projection.deploymentId {
+            throw MobileSessionError.unavailable("This Crew link conflicts with the open session room.")
+        }
+        if let cached = listMetadata[id], cached.deploymentId != projection.deploymentId {
+            throw MobileSessionError.unavailable("This Crew link conflicts with the retained session room.")
+        }
+        if let route = scaffoldRoutes[id], route.projection != projection {
+            throw MobileSessionError.unavailable("This Crew link conflicts with the retained execution route.")
+        }
+    }
+
+    private func retainBrowsePointer(_ pointer: DocDisk.BrowsePointer) throws {
+        try restoreBrowsePointers()
+        try validateBrowsePointer(pointer)
+        var pointers = browsePointers
+        var pointer = pointer
+        pointer.sandboxId = pointer.sandboxId ?? pointers[pointer.projection.sessionId]?.sandboxId
+        guard pointers[pointer.projection.sessionId] != nil || pointers.count < 1024 else {
+            throw MobileSessionError.unavailable("Crew retains 1024 browse routes. Remove unused memberships before opening more.")
+        }
+        pointers[pointer.projection.sessionId] = pointer
+        // The scoped pointer is durable before membership can become visible.
+        try DocDisk.saveIntents(pointers, id: browseCacheId!)
+        browsePointers = pointers
+    }
+
+    private func browsePointer(chatId: String, environment: SessionEnvironment? = nil) throws -> DocDisk.BrowsePointer? {
+        try restoreBrowsePointers()
+        guard let pointer = browsePointers[chatId] else { return nil }
+        try validateBrowsePointer(pointer, environment: environment)
+        return pointer
     }
 
     /// Mirrors `comet_proto::CometInvitation::parse_deep_link`: exactly three
@@ -927,9 +1033,14 @@ final class AppModel {
             return store
         }
         guard let config else { return nil }
-        let directoryProjection = directoryRoomProjections[chatId]
-        let deploymentId = deploymentId ?? (directoryProjection?.projectId == config.projectScope
-            ? directoryProjection?.deploymentId : nil)
+        let pointer: DocDisk.BrowsePointer?
+        do {
+            pointer = try browsePointer(chatId: chatId, environment: environment)
+            if let pointer, let deploymentId, deploymentId != pointer.projection.deploymentId {
+                throw MobileSessionError.unavailable("Crew cannot open a different deployment from its retained browse route.")
+            }
+        } catch { openSessionError = error.localizedDescription; return nil }
+        let deploymentId = deploymentId ?? pointer?.projection.deploymentId
         let store: SessionStore
         if let existing = sessionStores[chatId] {
             store = existing
@@ -997,20 +1108,51 @@ final class AppModel {
         store.commandRouteProvider = { [weak self, weak store] in
             guard let self, let workspace = self.workspace else { throw MobileSessionError.unavailable("Not connected") }
             let environment = self.scaffoldEnvironment(chatId: chatId) ?? store?.publishedEnvironment ?? environment
-            let target = self.scaffoldBrowseTargets[chatId]
-            guard environment?.source.kind == "scaffold" || target != nil else { return nil }
+            let target = try self.browsePointer(chatId: chatId, environment: environment)
+            guard environment?.source.kind == "scaffold" || target?.sandboxId != nil else { return nil }
             guard let controller = self.scaffoldControllerDeviceId(chatId: chatId) else {
                 throw MobileSessionError.unavailable("Connect a desktop Crew controller to send this instruction.")
             }
             let route: ScaffoldControlRoute
             if let environment {
                 route = try await workspace.scaffoldRoute(controllerDeviceId: controller, environment: environment)
-            } else if let target {
+            } else if let target, let sandboxId = target.sandboxId {
                 route = try await workspace.openScaffoldSession(controllerDeviceId: controller,
-                    sandboxId: target.sandboxId, scope: target.scope)
+                    sandboxId: sandboxId, scope: target.scope)
             } else { return nil }
             self.scaffoldRoutes[chatId] = route
             return route
+        }
+        store.commandReader = { [weak self, weak store] admission in
+            guard let self, let store, let config = self.config, self.workspace != nil,
+                  let scope = admission.scope,
+                  scope.projectId == config.projectScope, scope.sessionId == chatId,
+                  scope.deploymentId == store.deploymentId else {
+                throw MobileSessionError.unavailable("Crew cannot confirm this instruction from a different retained scope.")
+            }
+            var params: [String: Any] = ["chatId": chatId, "commandId": admission.commandId]
+            let reader: DeviceRelayClient
+            if let authority = admission.scaffold {
+                guard scope == authority.environment.scope,
+                      authority.actorSubject == config.userId,
+                      authority.environment.ownerPrincipal == config.userId,
+                      authority.projection.projectId == scope.projectId,
+                      authority.projection.deploymentId == scope.deploymentId,
+                      authority.projection.sessionId == chatId else {
+                    throw MobileSessionError.unavailable("Crew cannot confirm this instruction under different authority.")
+                }
+                let projectionData = try JSONEncoder().encode(authority.projection)
+                params["roomProjection"] = try JSONSerialization.jsonObject(with: projectionData)
+                params["targetDeviceId"] = authority.ownerDeviceId
+                reader = DeviceRelayClient(deviceId: authority.controllerDeviceId, config: config)
+            } else {
+                guard scope.deploymentId == nil, let host = admission.hostDeviceId, !host.isEmpty else {
+                    throw MobileSessionError.unavailable("Crew retained this instruction without a verifiable original host.")
+                }
+                params["targetDeviceId"] = host
+                reader = DeviceRelayClient(deviceId: host, config: config, controlSessionId: chatId)
+            }
+            return try await reader.callJSON(method: "ReadSessionCommand", params: params)
         }
         store.attachmentUploader = { [weak self] images in
             do {
@@ -1029,11 +1171,20 @@ final class AppModel {
             }
             // Resolve from current workspace state, not the route captured when
             // a cached transcript was first opened.
-            let environment = self.scaffoldEnvironment(chatId: chatId) ?? store?.publishedEnvironment ?? environment
+            let environment = self.scaffoldEnvironment(chatId: chatId) ?? store?.publishedEnvironment ?? environment ?? admission.scaffold?.environment
+            if let pointer = try self.browsePointer(chatId: chatId, environment: environment) {
+                guard admission.scope == pointer.scope,
+                      pointer.sandboxId == nil || admission.scaffold != nil,
+                      admission.scaffold == nil || (admission.scaffold?.projection == pointer.projection &&
+                        (pointer.sandboxId == nil || admission.scaffold?.environment.source.sandboxId == pointer.sandboxId)) else {
+                    throw MobileSessionError.unavailable("Crew retained this instruction for a different browse scope; it was not sent.")
+                }
+            }
             if let environment, environment.source.kind == "scaffold" {
-                try await workspace.sendScaffoldCommand(
+                let receipt = try await workspace.sendScaffoldCommand(
                     environment: environment, payload: payload, admission: admission
                 )
+                try store?.recordAdmissionReceipt(receipt, admission: admission)
                 if case .run = payload {
                     preparation?.markAdmitted()
                     if self.scaffoldPreparations[chatId] === preparation {
@@ -1046,7 +1197,8 @@ final class AppModel {
                    let originalOwner = admission.hostDeviceId, currentOwner != originalOwner {
                     throw MobileSessionError.unavailable("The Crew session owner changed. The original retained instruction was not sent.")
                 }
-                try await workspace.sendSessionCommand(chatId: chatId, payload: payload, admission: admission)
+                let receipt = try await workspace.sendSessionCommand(chatId: chatId, payload: payload, admission: admission)
+                try store?.recordAdmissionReceipt(receipt, admission: admission)
             }
             queued = true
         }
@@ -1328,6 +1480,124 @@ extension AppModel {
 
 #if DEBUG
 extension AppModel {
+    static func runBrowseRestoreRegression() async -> Bool {
+        let config = AppConfig(edgeURL: URL(string: "http://127.0.0.1:1")!, mode: .dev,
+            userId: "browse-\(UUID().uuidString.lowercased())", projectScope: "browse-regression",
+            deviceId: "phone", deviceName: "Crew regression")
+        let cacheId = config.documentCacheId(roomId: "ws4/\(config.projectScope)")
+        let id = UUID().uuidString.lowercased()
+        let scope = CollaborationScope(projectId: config.projectScope, deploymentId: "deployment-a", sessionId: id)
+        let probe = AppModel()
+        let restarted = AppModel()
+        let corrupt = AppModel()
+        let originalWorkspace = WorkspaceStore(config: config)
+        probe.config = config; probe.workspace = originalWorkspace; probe.phase = .ready
+        defer {
+            for model in [probe, restarted, corrupt] {
+                model.sessionStores.values.forEach { $0.stop() }
+                model.workspace?.stop()
+            }
+            if let files = try? FileManager.default.contentsOfDirectory(at: DocDisk.directory, includingPropertiesForKeys: nil) {
+                let sessionCacheId = config.documentCacheId(roomId: id, deploymentId: "deployment-a")
+                for file in files where file.lastPathComponent.hasPrefix(cacheId) || file.lastPathComponent.hasPrefix(sessionCacheId) {
+                    try? FileManager.default.removeItem(at: file)
+                }
+            }
+        }
+        var checkpoint = "uppercase invitation"
+        var completed = false
+        defer { if !completed { E2ERunner.log("FAIL Crew browse restore checkpoint: \(checkpoint)") } }
+        do {
+            let upper = URL(string: "\(ReleaseConfig.inviteScheme)://scaffold/\(config.projectScope)/deployment-a/\(id.uppercased())/sandbox-a")!
+            let lower = URL(string: "\(ReleaseConfig.inviteScheme)://scaffold/\(config.projectScope)/deployment-a/\(id)/sandbox-a")!
+            probe.openInvitation(url: upper)
+            guard probe.openSessionError == nil, probe.launchRoute == .chat(id),
+                  originalWorkspace.sessionRef(id: id)?.environment == nil,
+                  probe.sessionStores.isEmpty, probe.scaffoldRoutes.isEmpty,
+                  let pointer = try probe.browsePointer(chatId: id), pointer.scope == scope,
+                  pointer.sandboxId == "sandbox-a", probe.browsePointers[id.uppercased()] == nil else { return false }
+            checkpoint = "duplicate canonical invitation"
+            probe.openInvitation(url: lower)
+            guard probe.openSessionError == nil, probe.browsePointers.count == 1,
+                  originalWorkspace.sessionRefs.count == 1 else { return false }
+            let original = originalWorkspace.doc.getDeepValue()
+            let routes = try Data(contentsOf: DocDisk.intentURL(for: cacheId + "-browse"))
+            let journal = try Data(contentsOf: DocDisk.intentURL(for: cacheId))
+            checkpoint = "cross-deployment invitation atomicity"
+            probe.openInvitation(url: URL(string: "\(ReleaseConfig.inviteScheme)://scaffold/\(config.projectScope)/deployment-b/\(id)/sandbox-b")!)
+            guard probe.openSessionError != nil, probe.launchRoute == .chat(id),
+                  originalWorkspace.doc.getDeepValue() == original,
+                  try Data(contentsOf: DocDisk.intentURL(for: cacheId + "-browse")) == routes,
+                  try Data(contentsOf: DocDisk.intentURL(for: cacheId)) == journal else { return false }
+
+            // No snapshot flush: restart consumes membership goals plus the
+            // authority-free pointer, not an attach response or fabricated owner.
+            checkpoint = "journal-only restart"
+            let workspace = WorkspaceStore(config: config)
+            restarted.config = config; restarted.workspace = workspace; restarted.phase = .ready
+            workspace.start()
+            guard let ref = workspace.sessionRef(id: id), ref.environment == nil,
+                  let store = restarted.sessionStore(for: ref), store.deploymentId == "deployment-a",
+                  try restarted.browsePointer(chatId: id) == pointer,
+                  restarted.scaffoldRoutes.isEmpty else { return false }
+            // A deliberate send reaches the retained Scaffold route selection,
+            // but cannot attach/execute without a desktop controller.
+            checkpoint = "missing-controller route denial"
+            do { _ = try await store.commandRouteProvider?(); return false }
+            catch {
+                guard error.localizedDescription.contains("desktop Crew controller") else { return false }
+            }
+            checkpoint = "cross-deployment send denial"
+            let issuedAt = nowMs()
+            let wrongAdmission = MobileCommandAdmission(commandId: UUID().uuidString.lowercased(),
+                issuedAt: issuedAt, expiresAt: issuedAt + 300_000, hostDeviceId: "host", scaffold: nil,
+                scope: CollaborationScope(projectId: config.projectScope, deploymentId: "deployment-b", sessionId: id))
+            do { try await store.commandSender?(.interrupt, wrongAdmission); return false }
+            catch { guard error.localizedDescription.contains("different browse scope") else { return false } }
+            checkpoint = "deferred send preserved membership"
+            guard restarted.scaffoldRoutes.isEmpty, workspace.sessionRef(id: id)?.environment == nil else { return false }
+
+            // Every retained environment component must agree before opening.
+            for conflicting in [
+                SessionEnvironment(source: SessionEnvironmentSource(kind: "scaffold", sandboxId: "sandbox-b"), ownerPrincipal: config.userId, scope: scope),
+                SessionEnvironment(source: SessionEnvironmentSource(kind: "scaffold", sandboxId: "sandbox-a"), ownerPrincipal: config.userId,
+                    scope: CollaborationScope(projectId: "other-project", deploymentId: "deployment-a", sessionId: id)),
+                SessionEnvironment(source: SessionEnvironmentSource(kind: "scaffold", sandboxId: "sandbox-a"), ownerPrincipal: config.userId,
+                    scope: CollaborationScope(projectId: config.projectScope, deploymentId: "deployment-b", sessionId: id)),
+                SessionEnvironment(source: SessionEnvironmentSource(kind: "scaffold", sandboxId: "sandbox-a"), ownerPrincipal: config.userId,
+                    scope: CollaborationScope(projectId: config.projectScope, deploymentId: "deployment-a", sessionId: UUID().uuidString.lowercased()))
+            ] {
+                // Each route is learned once; known membership routes cannot be retargeted.
+                let caseId = UUID().uuidString.lowercased()
+                let caseScope = CollaborationScope(projectId: config.projectScope, deploymentId: "deployment-a", sessionId: caseId)
+                var caseEnvironment = conflicting
+                if caseEnvironment.scope.sessionId == id { caseEnvironment.scope.sessionId = caseId }
+                checkpoint = "independent conflicting membership"
+                try probe.browseScaffoldSessionLink(scope: caseScope, sandboxId: "sandbox-a")
+                guard let membership = originalWorkspace.sessionRef(id: caseId), membership.environment == nil else { return false }
+                checkpoint = "conflicting environment seed: project=\(caseEnvironment.scope.projectId) deployment=\(caseEnvironment.scope.deploymentId ?? "nil") session=\(caseEnvironment.scope.sessionId ?? "nil") sandbox=\(caseEnvironment.source.sandboxId ?? "nil")"
+                guard originalWorkspace.addSessionRef(chatId: caseId, environment: caseEnvironment) != nil else { return false }
+                let before = originalWorkspace.doc.getDeepValue()
+                let beforeJournal = try Data(contentsOf: DocDisk.intentURL(for: cacheId))
+                let beforeRoutes = try Data(contentsOf: DocDisk.intentURL(for: cacheId + "-browse"))
+                checkpoint = "conflicting browse refusal"
+                do { try probe.browseScaffoldSessionLink(scope: caseScope, sandboxId: "sandbox-a"); return false }
+                catch { }
+                checkpoint = "conflicting browse atomicity"
+                guard originalWorkspace.doc.getDeepValue() == before,
+                      try Data(contentsOf: DocDisk.intentURL(for: cacheId)) == beforeJournal,
+                      try Data(contentsOf: DocDisk.intentURL(for: cacheId + "-browse")) == beforeRoutes else { return false }
+            }
+            checkpoint = "corrupt browse metadata fails closed"
+            try Data("corrupt Crew browse route".utf8).write(to: DocDisk.intentURL(for: cacheId + "-browse"), options: .atomic)
+            corrupt.config = config; corrupt.workspace = workspace
+            guard corrupt.sessionStore(for: ref) == nil, corrupt.openSessionError != nil,
+                  corrupt.sessionStores.isEmpty else { return false }
+            completed = true
+            E2ERunner.log("OK Crew browse restore: canonical UUID, conflict atomicity, journal-only restart, exact deferred scope, no attach/resume, corrupt metadata fails closed")
+            return true
+        } catch { E2ERunner.log("FAIL Crew browse restore: \(error)"); return false }
+    }
     static func runMetadataClearRegression() async -> Bool {
         let probe = AppModel()
         let config = AppConfig(edgeURL: URL(string: "http://127.0.0.1:1")!, mode: .dev,

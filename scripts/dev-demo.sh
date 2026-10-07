@@ -7,16 +7,17 @@
 #
 # Everything lives under /tmp/comet-demo-*; re-runs reuse it. Ctrl-C cleans up.
 set -euo pipefail
+export ASHLER_INCREMENTAL_TSC_CHECKS=false
 cd "$(dirname "$0")/.."
 
-DAEMON_DIR=/tmp/comet-demo-daemon
-UI_DIR=/tmp/comet-demo-ui
-IPC=27921
+DAEMON_DIR=${COMET_DEMO_DAEMON_DIR:-/tmp/comet-demo-daemon}
+UI_DIR=${COMET_DEMO_UI_DIR:-/tmp/comet-demo-ui}
+IPC=${COMET_DEMO_IPC_PORT:-27921}
 DELAY=""
 [[ "${1:-}" == "--slow" ]] && DELAY=350
 
 echo "▸ building (first run takes a few minutes)…"
-cargo build -p comet -q
+cargo build --locked -p comet -q
 
 echo "▸ starting engine daemon on :$IPC"
 env COMET_DATA_DIR="$DAEMON_DIR" COMET_IPC_PORT=$IPC COMET_HARNESS=mock \

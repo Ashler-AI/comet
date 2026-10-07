@@ -48,7 +48,7 @@ const until = async (fn, what, ms = 8000) => {
 }
 
 // ── session room: two peers converge ─────────────────────────────────────
-const sessionUrl = `${wsBase}/session/${chatId}/ws?token=${token}`;
+const sessionUrl = `${wsBase}/session/${chatId}/ws?token=${token}&syncProtocol=durable-records-v1`;
 
 const clientA = new LoroWebsocketClient({ url: sessionUrl });
 await clientA.waitConnected();
@@ -66,7 +66,7 @@ m1.set("deviceId", "peer-a");
 docA.commit();
 ok("peer A joined + wrote");
 
-const clientB = new LoroWebsocketClient({ url: `${wsBase}/session/${chatId}/ws?token=${peerToken}` });
+const clientB = new LoroWebsocketClient({ url: `${wsBase}/session/${chatId}/ws?token=${peerToken}&syncProtocol=durable-records-v1` });
 await clientB.waitConnected();
 const adaptorB = new LoroAdaptor();
 await clientB.join({ roomId: chatId, crdtAdaptor: adaptorB });
@@ -121,7 +121,7 @@ await new Promise((r) => setTimeout(r, 100));
 // ── diff sidecar ──────────────────────────────────────────────────────────
 {
   const diff = { chatId, deviceId: "peer-a", checkoutPath: "/tmp/x", patch: "diff --git a b", files: [], additions: 1, deletions: 0, truncated: false, publishedAt: Date.now() };
-  const post = await fetch(`${base}/diff/${chatId}?token=${peerToken}`, {
+  const post = await fetch(`${base}/diff/${chatId}?token=${peerToken}&syncProtocol=durable-records-v1`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(diff)
@@ -151,7 +151,7 @@ await new Promise((r) => setTimeout(r, 100));
 // ── device room ───────────────────────────────────────────────────────────
 {
   const { encodeDeviceFrame, decodeDeviceFrame } = await import("./device-frame.mjs");
-  const host = new WebSocket(`${wsBase}/device/${deviceId}/ws?token=${token}&role=host`);
+  const host = new WebSocket(`${wsBase}/device/${deviceId}/ws?token=${token}&role=host&syncProtocol=durable-records-v1`);
   host.binaryType = "arraybuffer";
   await new Promise((resolve, reject) => {
     host.onopen = resolve;
@@ -174,7 +174,7 @@ await new Promise((r) => setTimeout(r, 100));
   };
 
   const connId = "conn-1";
-  const client = new WebSocket(`${wsBase}/device/${deviceId}/ws?token=${token}&role=client&connId=${connId}`);
+  const client = new WebSocket(`${wsBase}/device/${deviceId}/ws?token=${token}&role=client&connId=${connId}&syncProtocol=durable-records-v1`);
   client.binaryType = "arraybuffer";
   await new Promise((resolve, reject) => {
     client.onopen = resolve;
@@ -192,7 +192,7 @@ await new Promise((r) => setTimeout(r, 100));
   ok("device room rpc echo (client→host→client)");
 
   // intruder cannot join the device room
-  const evil = new WebSocket(`${wsBase}/device/${deviceId}/ws?token=evil&role=client`);
+  const evil = new WebSocket(`${wsBase}/device/${deviceId}/ws?token=evil&role=client&syncProtocol=durable-records-v1`);
   const evilResult = await new Promise((resolve) => {
     evil.onopen = () => resolve("open");
     evil.onerror = () => resolve("error");
@@ -202,7 +202,7 @@ await new Promise((r) => setTimeout(r, 100));
   ok("device room ownership enforced");
 
   // sidecar slot
-  const post = await fetch(`${base}/device/${deviceId}/sidecar/repos?token=${token}`, {
+  const post = await fetch(`${base}/device/${deviceId}/sidecar/repos?token=${token}&syncProtocol=durable-records-v1`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ repos: [{ path: "/x", name: "x" }] })
@@ -213,7 +213,7 @@ await new Promise((r) => setTimeout(r, 100));
   ok("device sidecar slot round-trip");
 
   // nudge: live delivery to the connected host
-  const nudge = await fetch(`${base}/device/${deviceId}/nudge?token=${token}`, {
+  const nudge = await fetch(`${base}/device/${deviceId}/nudge?token=${token}&syncProtocol=durable-records-v1`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ chatId: "chat-live" })
@@ -230,13 +230,13 @@ await new Promise((r) => setTimeout(r, 100));
 
   // nudge: queued while host offline, replayed on rejoin
   await new Promise((r) => setTimeout(r, 200)); // let the close land
-  const queued = await fetch(`${base}/device/${deviceId}/nudge?token=${token}`, {
+  const queued = await fetch(`${base}/device/${deviceId}/nudge?token=${token}&syncProtocol=durable-records-v1`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ chatId: "chat-cold" })
   });
   if ((await queued.json()).queued !== true) fail("offline nudge not queued");
-  const host2 = new WebSocket(`${wsBase}/device/${deviceId}/ws?token=${token}&role=host`);
+  const host2 = new WebSocket(`${wsBase}/device/${deviceId}/ws?token=${token}&role=host&syncProtocol=durable-records-v1`);
   host2.binaryType = "arraybuffer";
   const replayed = [];
   host2.onmessage = (e) => {
@@ -276,7 +276,7 @@ await new Promise((r) => setTimeout(r, 100));
 
 // ── reconnect: new client with existing state catches up incrementally ───
 {
-  const clientC = new LoroWebsocketClient({ url: `${wsBase}/session/${chatId}/ws?token=${token}` });
+  const clientC = new LoroWebsocketClient({ url: `${wsBase}/session/${chatId}/ws?token=${token}&syncProtocol=durable-records-v1` });
   await clientC.waitConnected();
   const preSeeded = new LoroDoc();
   preSeeded.import(docA.export({ mode: "snapshot" }));

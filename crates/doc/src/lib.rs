@@ -13,6 +13,7 @@ pub mod commands;
 pub mod constants;
 pub mod parts;
 pub mod schema;
+pub mod shared;
 pub mod transcript_delta;
 pub mod workspace;
 
@@ -21,5 +22,6 @@ pub use commands::*;
 pub use constants::*;
 pub use parts::*;
 pub use schema::*;
+pub use shared::*;
 pub use transcript_delta::*;
 pub use workspace::*;

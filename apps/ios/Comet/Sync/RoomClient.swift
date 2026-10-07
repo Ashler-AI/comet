@@ -73,7 +73,7 @@ actor RoomClient {
     private var serverVersion: VersionVector?
     // Join advertisements and pending imports may not advance either local VV.
     // Keep their target across redials so a stale server reply cannot heal it.
-    private let requiredRemoteVersion = VersionVector()
+    private var requiredRemoteVersion = VersionVector()
     private var historyRepairAttempted = false
     private var historyRepairBatch: BatchId?
     private var backoffMs = RoomClient.backoffBaseMs
@@ -257,8 +257,17 @@ actor RoomClient {
         gen == generation ? socket : nil
     }
 
-    private func onSocketError(gen: Int) {
+    private func onSocketError(gen: Int, closeCode: Int? = nil) {
         guard gen == generation, !closed else { return }
+        if (closeCode ?? socket?.closeCode.rawValue) == 4410 {
+            // Only the authenticated room's explicit reset retires ancestry.
+            // Ordinary redials must still satisfy every advertised frontier.
+            requiredRemoteVersion = VersionVector()
+            serverVersion = nil
+            snapshotRecovery = nil
+            recoverApplicationIntents = true
+            recovering = true
+        }
         roomLog.warning("room \(self.roomId, privacy: .public): session ended (joined=\(self.joinedLor)); redialing in \(self.backoffMs)ms")
         events(.disconnected)
         scheduleReconnect(gen: gen)
@@ -887,6 +896,57 @@ actor RoomClient {
 
     #if DEBUG
     private var regressionSend: ((ProtocolMessage) -> Void)?
+
+    static func runResetEpochRegression() async -> Bool {
+        let client = RoomClient(roomId: "ws4/reset-regression", doc: LoroDoc(),
+            recoverApplicationIntents: true, urlProvider: { nil }, events: { _ in },
+            adoptSnapshot: { previous, replacement in
+                // A retained semantic goal, not old ancestry or command replay.
+                guard previous.getMap(id: "meta").get(key: "draft")?.asValue()?.stringValue == "retained" else { return false }
+                do { try replacement.getMap(id: "meta").insert(key: "draft", v: "retained"); replacement.commit(); return true }
+                catch { return false }
+            })
+        let passed = await client.exerciseResetEpoch()
+        await E2ERunner.log(passed ? "OK Crew authenticated reset: unrelated seed, new frontier gating, retained semantic draft, ordinary disconnect isolation" : "FAIL Crew reset epoch recovery")
+        return passed
+    }
+
+    private func exerciseResetEpoch() async -> Bool {
+        regressionSend = { _ in }
+        defer { regressionSend = nil; stop() }
+        do {
+            try doc.getMap(id: "meta").insert(key: "draft", v: "retained"); doc.commit()
+            let old = LoroDoc()
+            try old.getMap(id: "meta").insert(key: "seed", v: "old"); old.commit()
+            await onJoinOk(crdt: .loro, version: [UInt8](old.oplogVv().encode()))
+            guard recovering, requiredRemoteVersion.includesVv(other: old.oplogVv()) else { return false }
+            onSocketError(gen: generation, closeCode: 1006)
+            reconnectTask?.cancel(); reconnectTask = nil
+            guard requiredRemoteVersion.includesVv(other: old.oplogVv()) else { return false }
+            onSocketError(gen: generation, closeCode: 4410)
+            reconnectTask?.cancel(); reconnectTask = nil
+            guard requiredRemoteVersion.isEmpty(), recoverApplicationIntents else { return false }
+            let reset = LoroDoc()
+            try reset.getMap(id: "meta").insert(key: "seed", v: "new"); reset.commit()
+            let baselineVersion = reset.oplogVv()
+            let baseline = try reset.export(mode: .snapshot)
+            try reset.getMap(id: "meta").insert(key: "tail", v: "new frontier"); reset.commit()
+            guard !reset.oplogVv().includesVv(other: old.oplogVv()) else { return false }
+            await onJoinOk(crdt: .loro, version: [UInt8](reset.oplogVv().encode()))
+            let previous = doc
+            await applyRemote(crdt: .loro, updates: [[UInt8](baseline)])
+            guard doc === previous, snapshotRecovery != nil, recovering else { return false }
+            await applyRemote(crdt: .loro, updates: [[UInt8](try reset.export(mode: .updates(from: baselineVersion)))])
+            guard doc !== previous, !recoverApplicationIntents,
+                  doc.getMap(id: "meta").get(key: "seed")?.asValue()?.stringValue == "new",
+                  doc.getMap(id: "meta").get(key: "draft")?.asValue()?.stringValue == "retained",
+                  doc.getMap(id: "meta").get(key: "tail")?.asValue()?.stringValue == "new frontier",
+                  doc.stateVv().includesVv(other: reset.oplogVv()),
+                  !doc.stateVv().includesVv(other: old.oplogVv()) else { return false }
+            for batch in Array(catchupBatches) { await onAck(crdt: .loro, refId: batch, status: .ok) }
+            return !recovering
+        } catch { return false }
+    }
 
     static func runRepeatedRecoveryRegression() async -> Bool {
         for serverSeen in [Int64(200), Int64(400)] {

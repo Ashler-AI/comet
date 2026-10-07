@@ -58,6 +58,60 @@ fn response(
         handoff_cwd: None,
     }
 }
+#[tokio::test]
+async fn explicit_scaffold_control_requires_existing_exact_deployment_grant() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = crate::EngineCore::assemble_with_identity(
+        dir.path(),
+        std::sync::Arc::new(crate::default_registry(RuntimeProfile::Mock)),
+        HarnessId::Mock,
+        None,
+        "project-a",
+        "owner@example.com",
+        RuntimeProfile::Mock,
+    ).unwrap();
+    let mut auth_config = crate::AuthConfig::new("http://127.0.0.1:1", dir.path());
+    auth_config.project_scope = "project-a".into();
+    auth_config.dev_user_id = "owner@example.com".into();
+    core.set_auth(crate::Auth::new(auth_config));
+    let prepared = response(&params().scope, ScaffoldLifecycle::Ready);
+    let chat_id = prepared.environment.scope.session_id.clone().unwrap();
+    core.doc_host.open_projection(&chat_id, prepared.room_projection.as_ref()).unwrap();
+    let rpc = core.rpc_service();
+    rpc.install_scaffold_control_grant(&prepared).unwrap();
+    let command = SessionCommandPayload::Control {
+        session_id: chat_id.clone(),
+        owner_device_id: prepared.attached_device_id.clone().unwrap(),
+        actor_device_id: core.device_id.clone(),
+        actor_subject: "owner@example.com".into(),
+        grant_id: prepared.control_grant.as_ref().unwrap().id.clone(),
+        source: comet_proto::AgentSessionSource::Scaffold,
+        action: Box::new(comet_doc::SessionControlAction::Queue {
+            prompt: "queued instruction".into(), message_id: None,
+        }),
+    };
+    let request = serde_json::json!({
+        "chatId": chat_id, "commandId": "exact-deployment", "command": command,
+        "deploymentId": "deployment-a", "controlDeploymentId": "deployment-a",
+        "roomProjection": prepared.room_projection,
+        "targetDeviceId": prepared.attached_device_id,
+    });
+    let mut foreign = request.clone();
+    foreign["commandId"] = serde_json::json!("foreign-deployment");
+    foreign["deploymentId"] = serde_json::json!("deployment-b");
+    foreign["controlDeploymentId"] = serde_json::json!("deployment-b");
+    foreign["roomProjection"]["deploymentId"] = serde_json::json!("deployment-b");
+    assert!(rpc.handle(methods::QUEUE_COMMAND, foreign).await.is_err());
+    assert!(core.doc_host.command_entry(&chat_id, "foreign-deployment").unwrap().is_none());
+    let mut wrong_owner = request.clone();
+    wrong_owner["commandId"] = serde_json::json!("wrong-owner");
+    wrong_owner["targetDeviceId"] = serde_json::json!("comet-scaffold-other-sandbox-e2");
+    assert!(rpc.handle(methods::QUEUE_COMMAND, wrong_owner).await.is_err());
+    assert!(core.doc_host.command_entry(&chat_id, "wrong-owner").unwrap().is_none());
+    rpc.handle(methods::QUEUE_COMMAND, request).await.unwrap();
+    assert_eq!(core.doc_host.command_entry(&chat_id, "exact-deployment").unwrap().unwrap().payload, command);
+}
+
 
 fn recovery_core(path: &std::path::Path, origin: &str) -> crate::EngineCore {
     let core = crate::EngineCore::assemble_with_identity(
@@ -526,28 +580,19 @@ async fn recovery_peer_diagnostic_does_not_duplicate_admission() {
     core.workspace
         .upsert_session_ref(scope.session_id.as_deref().unwrap(), Some(accepted.clone()))
         .unwrap();
+    // This is an already accepted diagnostic in the scoped replica, not a new
+    // bare control admission inheriting deployment authority from its cache.
     core.doc_host
-        .open_projection(
-            scope.session_id.as_deref().unwrap(),
-            response(&scope, ScaffoldLifecycle::Ready)
-                .room_projection
-                .as_ref(),
-        )
-        .unwrap();
-    core.doc_host
-        .queue_command(
-            &recovery_request().recover_chat_id,
-            SessionCommandPayload::PeerMessage {
-                text: "Read-only diagnostic".into(),
-                source_chat_id: recovery_request().handoff.source_chat_id,
-                source_deployment_id: None,
-                source_device_id: None,
-                thread_id: "diagnostic".into(),
-                reply_to: None,
-                hop_count: 0,
+        .open_projection(scope.session_id.as_deref().unwrap(), response(&scope, ScaffoldLifecycle::Ready).room_projection.as_ref())
+        .unwrap().doc().queue_command(&comet_doc::SessionCommandEntry {
+            id:"diagnostic".into(), issued_by:core.device_id.clone(), issued_at:1,
+            based_on:None, expires_at:None, status:comet_doc::SessionCommandStatus::Applied, resolution:None,
+            payload:SessionCommandPayload::PeerMessage {
+                text:"Read-only diagnostic".into(), source_chat_id:recovery_request().handoff.source_chat_id,
+                source_deployment_id:None, source_device_id:None, thread_id:"diagnostic".into(),
+                reply_to:None, hop_count:0,
             },
-        )
-        .unwrap();
+        }).unwrap();
     core.rpc_service()
         .require_unadmitted_handoff(&recovery_request().recover_chat_id)
         .unwrap();
@@ -1550,12 +1595,8 @@ async fn prepared_handoff_routes_peer_messages_and_interrupts_to_the_remote_nati
                 if let Some(session) = session
                     && session.status == status
                     && chat.last_message_at.is_some_and(|at| {
-                        at.timestamp_millis()
-                            >= match status {
-                                SessionStatus::Idle | SessionStatus::Errored => session.updated_at,
-                                _ => session.started_at.unwrap(),
-                            }
-                            .timestamp_millis()
+                        !matches!(status, SessionStatus::Idle | SessionStatus::Errored)
+                            || at.timestamp_millis() >= session.updated_at.timestamp_millis()
                     })
                 {
                     break;
@@ -1793,7 +1834,7 @@ async fn prepared_handoff_routes_peer_messages_and_interrupts_to_the_remote_nati
             working.updated_at
                 + chrono::Duration::milliseconds(comet_proto::view::SESSION_STALE_MS + 1)
         ),
-        comet_proto::view::Indicator::None
+        comet_proto::view::Indicator::Unreachable
     );
     // The persisted workspace alone retains completion and seen state; no
     // session document or scoped follower is needed after restart.

@@ -1,8 +1,7 @@
-// Headless e2e rig — launch with `-e2e` (plus a local wrangler dev edge and a
-// `comet headless` engine in dev mode) and the app exercises the full live
-// stack with no taps: workspace room backfill, device-relay RPCs, space/chat
-// creation, the command plane, and session-room streaming. Results append to
-// Documents/e2e.log for the harness to read via simctl.
+// Headless e2e rig: `-e2e` plus the isolated loopback Edge, scoped fixture
+// credential and `comet headless` mock engine supplied by the CI harness.
+// Exercises workspace backfill, relay RPCs, commands and session streaming;
+// results append to Documents/e2e.log for simctl to read.
 
 import Foundation
 import Loro
@@ -27,12 +26,30 @@ enum E2ERunner {
         }
     }
 
+    private static func liveFixture() -> (edgeURL: URL, accessToken: String, userId: String, projectScope: String, deviceId: String, workspacePath: String)? {
+        let fixture = ProcessInfo.processInfo.environment
+        guard let edge = fixture["CREW_E2E_EDGE_URL"], let edgeURL = URL(string: edge),
+              edgeURL.scheme == "http", ["localhost", "127.0.0.1"].contains(edgeURL.host ?? ""),
+              edgeURL.port != nil, edgeURL.user == nil, edgeURL.password == nil,
+              edgeURL.query == nil, edgeURL.fragment == nil, ["", "/"].contains(edgeURL.path),
+              let accessToken = fixture["CREW_E2E_ACCESS_TOKEN"], !accessToken.isEmpty,
+              let userId = fixture["CREW_E2E_USER_ID"], !userId.isEmpty,
+              let projectScope = fixture["CREW_E2E_PROJECT_SCOPE"], !projectScope.isEmpty,
+              let deviceId = fixture["CREW_E2E_DEVICE_ID"], !deviceId.isEmpty,
+              let workspacePath = fixture["CREW_E2E_WORKSPACE_PATH"], workspacePath.hasPrefix("/"),
+              URL(fileURLWithPath: workspacePath).lastPathComponent.hasPrefix("comet-integration-smoke-") else {
+            log("FAIL Crew live fixture requires an isolated loopback edge, scoped credential, principal, device and temporary workspace")
+            return nil
+        }
+        return (edgeURL, accessToken, userId, projectScope, deviceId, workspacePath)
+    }
+
     static func run(model: AppModel) async {
         try? FileManager.default.removeItem(at: logURL)
         log("start")
+        guard let (edgeURL, accessToken, userId, projectScope, deviceId, workspacePath) = liveFixture() else { return }
         guard runSessionVisibility() else { return }
-        model.signInDev(edgeURL: URL(string: "http://localhost:8787")!,
-                        userId: "devuser", projectScope: "dev-org")
+        model.signInFixture(edgeURL: edgeURL, userId: userId, projectScope: projectScope, accessToken: accessToken)
 
         // 1. Workspace room: wait for connection + the engine's device row.
         guard let workspace = model.workspace else {
@@ -42,7 +59,7 @@ enum E2ERunner {
         // Warm-start probe: rows visible BEFORE any network = disk hydration.
         log("warm-start devices=\(workspace.devices.count) chats=\(workspace.chats.count)")
         let device = await poll(timeout: 15, label: "workspace device") {
-            workspace.connected ? workspace.devices.first { $0.platform != "ios" } : nil
+            workspace.connected ? workspace.devices.first { $0.id == deviceId && $0.platform != "ios" } : nil
         }
         guard let device else {
             log("FAIL workspace: connected=\(workspace.connected) devices=\(workspace.devices.map(\.id))")
@@ -50,26 +67,28 @@ enum E2ERunner {
         }
         log("OK workspace synced; engine device \(device.id) (\(device.name))")
 
-        // 2. Device relay: ListFolders on every engine device (stale rig
-        // devices linger in the dev workspace doc — report each).
-        var listing: FolderListing?
-        for candidate in workspace.devices where candidate.platform != "ios" {
-            do {
-                let l = try await workspace.listFoldersDetailed(deviceId: candidate.id, path: nil)
-                log("OK relay ListFolders[\(candidate.name)/\(candidate.id.prefix(8))]: \(l.path) → \(l.entries.count) entries")
-                listing = l
-            } catch {
-                log("FAIL relay ListFolders[\(candidate.name)/\(candidate.id.prefix(8))]: \(error.localizedDescription)")
+        // 2. Relay only to the owned native fixture and its temporary directory.
+        do {
+            let listing = try await workspace.listFoldersDetailed(deviceId: device.id, path: workspacePath)
+            guard listing.path == workspacePath else {
+                log("FAIL relay ListFolders returned a different workspace scope")
+                return
             }
+            log("OK relay ListFolders[\(device.name)/\(device.id.prefix(8))]: \(listing.path) → \(listing.entries.count) entries")
+            let models = try await workspace.listModels(deviceId: device.id, harness: "mock")
+            guard !models.isEmpty else {
+                log("FAIL relay ListModels returned an empty mock catalog")
+                return
+            }
+            log("OK relay ListModels: \(models.map(\.id))")
+        } catch {
+            log("FAIL relay fixture: \(error.localizedDescription)")
+            return
         }
-
-        // 2b. Live model catalog over the relay.
-        let models = try? await workspace.listModels(deviceId: device.id, harness: "mock")
-        log(models != nil ? "OK relay ListModels: \(models!.map(\.id))" : "FAIL relay ListModels nil")
 
         // 3. Space + chat + first run through the command plane (mock harness).
         let spaceId = await workspace.createSpace(deviceId: device.id,
-                                                  path: listing?.path ?? "/tmp", gitDetected: false)
+                                                  path: workspacePath, gitDetected: false)
         log("space created \(spaceId)")
         // Relay-created spaces land via doc sync — eventually consistent.
         let space = await poll(timeout: 10, label: "space row sync") {
@@ -97,7 +116,7 @@ enum E2ERunner {
             log("FAIL run admission: \(store.sendFailure ?? "unknown")")
             return
         }
-        log("run queued on \(chatId)")
+        log("OK run admitted on \(chatId)")
 
         let entries = await poll(timeout: 30, label: "assistant reply") {
             store.entries.contains { $0.role == .assistant && !$0.parts.isEmpty } ? store.entries : nil
@@ -106,6 +125,7 @@ enum E2ERunner {
             log("OK transcript streamed: \(entries.count) entries")
         } else {
             log("FAIL no assistant reply; entries=\(store.entries.count) connected=\(store.connected) sendFailure=\(store.sendFailure ?? "none") pending=\(store.pendingSends.count)")
+            return
         }
 
         // 4. Isolated canonical large-doc fixture through production wire
@@ -622,18 +642,27 @@ enum E2ERunner {
 
     static func runRepeatedRoomRecovery() async {
         #if DEBUG
-        guard WorkspaceStore.runRecordIntentRegression(), DocDisk.runRecordRecoveryRegression(), runNestedToolCallRecovery(),
-              SessionStore.runDeploymentRetargetRegression(),
-              await SessionStore.runDurableIntentRegression(),
-              await SessionStore.runTranscriptActivityRegression(),
-              await AppModel.runMetadataClearRegression(),
-              await DeviceRelayClient.runConnectionGenerationRegression(),
-              await RoomClient.runForegroundBlockedRegression(),
-              await RoomClient.runFragmentedBackfillRegression(),
-              await runOwnerPublicationRegister() else {
-            log("FAIL Crew reliability recovery regressions")
-            return
+        func check(_ scenario: String, _ passed: Bool) -> Bool {
+            if !passed { log("FAIL Crew reliability recovery: \(scenario)") }
+            return passed
         }
+        guard check("workspace record intents", WorkspaceStore.runRecordIntentRegression()),
+              check("disk record recovery", DocDisk.runRecordRecoveryRegression()),
+              check("nested tool calls", runNestedToolCallRecovery()),
+              check("deployment retarget", SessionStore.runDeploymentRetargetRegression()),
+              check("browse restore", await AppModel.runBrowseRestoreRegression()),
+              check("owner anchor replay", SessionStore.runOwnerAnchorReplayRegression()),
+              check("attachment journal", await SessionStore.runAttachmentJournalRegression()),
+              check("terminal controls", await SessionStore.runTerminalControlRegression()),
+              check("room reset epoch", await RoomClient.runResetEpochRegression()),
+              check("durable intents", await SessionStore.runDurableIntentRegression()),
+              check("admission readback", await SessionStore.runAdmissionReadbackRegression()),
+              check("transcript activity", await SessionStore.runTranscriptActivityRegression()),
+              check("metadata clear", await AppModel.runMetadataClearRegression()),
+              check("relay connection generation", await DeviceRelayClient.runConnectionGenerationRegression()),
+              check("foreground blocked", await RoomClient.runForegroundBlockedRegression()),
+              check("fragmented backfill", await RoomClient.runFragmentedBackfillRegression()),
+              check("owner publication register", await runOwnerPublicationRegister()) else { return }
         guard await RoomClient.runRepeatedRecoveryRegression() else {
             log("FAIL Crew room convergence: fresh principals, pending imports, shallow resubmit, or history repair")
             return
@@ -698,7 +727,7 @@ extension E2ERunner {
 extension E2ERunner {
     static func runOwnerPublicationRegister() async -> Bool {
         do {
-            let doc = LoroDoc()
+            var doc = LoroDoc()
             let chatId = UUID().uuidString.lowercased()
             var value: [String: Any] = ["chatId": chatId, "sessionId": chatId,
                 "ownerSubject": "owner", "ownerDeviceId": "host", "source": "native",
@@ -721,6 +750,8 @@ extension E2ERunner {
             try doc.getMap(id: "agentSessions").insert(key: chatId, v: record(value, publisher: "impostor"))
             doc.commit()
             guard SessionStore.decodeProjection(from: doc, chatId: chatId, observedAt: nil).session?.status == .working else { return false }
+            doc = LoroDoc()
+            value["ownerDeviceId"] = "comet-scaffold-sandbox-e1"
             let environment: [String: Any] = ["source": ["kind": "scaffold", "sandbox_id": "sandbox", "lifecycle_epoch": 1],
                 "ownerPrincipal": "owner", "scope": ["projectId": "project", "deploymentId": "deployment", "sessionId": chatId]]
             value["source"] = "scaffold"; value["environment"] = environment

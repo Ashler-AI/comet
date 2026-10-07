@@ -595,3 +595,350 @@ Source-visible costs still needing workload attribution include whole-live-
 reply display-tree construction, very large individual code blocks, Mermaid
 layout, and collaboration/command-ledger projection. No arbitrary eviction or
 notification-cadence change was introduced to hide those costs.
+
+### Paced large-tool journal and Loro allocation corrections (2026-10-03)
+
+The actual-EngineCore probe completes 24 turns with 300 KiB progressive exec
+arguments, 4 KiB increments and `COMET_MOCK_DELAY_MS=150`; the acceptance bound
+remains 128 MiB RSS growth after warmup. Reverse-tail journal lookup alone did
+not resolve the reported 659,520 KiB growth. A diagnostic run also failed at
+939,488 KiB growth while Loro container/oplog and pending-record bytes grew
+linearly to about 7 MiB each, with no dropped containers. Those serialized
+sizes do not prove that native live allocations are bounded.
+
+`RunJournal::append` previously cloned each event, serialized the whole event
+into a string, then copied that string into another whole-line buffer. It now
+serializes a borrowed event through one reusable 8 KiB `BufWriter`, flushes every
+line, and preserves terminal-event `sync_all`. The escaped-large-event boundary
+regression checks bounded buffering, immediate replay visibility and sequence
+continuity across reopen. History, semantic intents and recovery backups are
+unchanged. The probe additionally distinguishes macOS live malloc bytes from
+reserved allocator memory; it never trims the allocator. The source correction
+is **not claimed to satisfy the RSS bound until the unchanged paced probe passes**.
+
+Parent probe command (retain the normal toolchain/target-directory environment):
+`ASHLER_INCREMENTAL_TSC_CHECKS=false COMET_MOCK_DELAY_MS=150 cargo run -p comet-engine --example crew_tool_soak`.
+
+The pinned `loro-internal` 1.13.9 snapshot exporter discarded parsed operation
+blocks when it serialized them. The next append reparsed those same encoded
+blocks into the same append-only string arena, retaining decoded prefixes again
+even though logical operation history stayed linear. The dependency-root patch
+keeps `ChangesBlockContent::Both` during ordinary snapshot flush and preserves
+the explicit `compact_change_store` cache-discard contract. No semantic intents,
+document scope, nudge protocol, valid operation history or backups are removed.
+
+The consumer boundary regression performs three 4 KiB text appends with a full
+snapshot between each and requires the native arena to contain exactly the
+visible 12 KiB. It also round-trips each snapshot and its version vector.
+Explicit compaction retains its value/history contract; cache-layout assertions
+are not a public contract because the SDK barrier renews its auto-commit transaction.
+The shipped SDK's concrete pre-fix arena count has not been observed.
+
+`vendor/loro-internal` contains only the required packaged source, grammar,
+manifests, version and provenance files, plus license notices; package example,
+external-test and benchmark targets/assets are not vendored. The original
+1.13.9 crate archive SHA-256 is
+`6fec47acf8db115b7146da5e1d5b18d0cf58032e6012c0c1ee3ec3442d1e936f`.
+The original manifest and `.cargo_vcs_info.json` retain upstream commit
+`1e529a6841b35572b05c3cb1258c0862b3aaef40`; the MIT notice is retained from that
+immutable commit, as is the packaged diff module's license. Cargo's existing
+path-patch convention selects the local 1.13.9 package; the lock entry therefore
+has no registry source/checksum, while the original archive checksum remains in
+the vendored manifest and here. All other Loro version pins are unchanged.
+
+The throwaway probe now performs no `analyze`, snapshot/all-updates export or
+pending-record JSON materialization merely to measure memory. It samples RSS
+and malloc statistics and obtains one read-only native `vmmap -summary` after
+all turns and RSS samples. The example uses Rust's System allocator; the real
+macOS Comet binary installs mimalloc, so example measurements are not exact
+real-binary allocator acceptance. Neither allocator selection nor trimming was
+changed to make the probe pass.
+
+Full disk snapshots had also been throttled, not debounced: progressive local
+edits kept the first one-second deadline. They now reset that deadline only when
+their semantic records are already durable per commit. Imports, nonsemantic edits
+and root-list deletions retain periodic checkpoints; completion, eviction and
+shutdown retain forced saves. A successfully saved change epoch avoids redundant
+background export after an immediate completion checkpoint.
+
+The unchanged paced probe still **fails** after this correction: turn 4 RSS was
+93,120 KiB, peak RSS was 596,688 KiB, and growth was 503,568 KiB. Turn 24 live
+malloc was 66,663,952 bytes; native region inspection found substantial freed large
+and small allocation regions. This narrows the allocation churn but does not meet
+the 128 MiB bound. Native all-event allocation-stack profiling is diagnostic-only;
+its instrumented RSS is not an acceptance result.
+
+Streaming native allocation-stack analysis found 32,029,803,393 cumulative
+allocated bytes, of which 21,600,331,213 bytes (67.4%) came from provider-session
+discovery replaying all prior tool events. Journals without a provider ID repeated
+that replay on each dispatch. Existing capped journal writers now cache the small
+binding, including absence, after successful append; cold reads reuse one line
+buffer, project event kinds and fully validate only binding-bearing records.
+Full replay, accepted events, CWD/ID precedence and torn-record handling are unchanged.
+
+The binding/reopen regression passed. The next unchanged paced run still failed:
+68,880 KiB warmup RSS, 236,240 KiB peak, and 167,360 KiB growth. This is not a
+passing 128 MiB result; remaining full-snapshot allocation traffic is under review.
+
+The retained follow-on corrections reuse the full-snapshot envelope and semantic
+record serialization buffers, preserve encoded blocks after a known compression
+fallback, and preallocate richtext materialization from its cached UTF-8 length.
+The unchanged local probe on 2026-10-04 **passed**: 24 complete turns, all final
+300 KiB exec arguments preserved, 75,328 KiB warmup RSS, 136,992 KiB peak, and
+61,664 KiB (60.2 MiB) growth against the original 128 MiB bound. All 429 doc,
+sync and engine library tests passed. This is a System-allocator EngineCore
+result, not an eight-hour desktop or released-binary measurement.
+
+The native-verification workflow now runs this paced probe on both supported
+runner platforms and retains `large-tool-memory.log` with the other evidence.
+A separate SQLite-counter probe did not support blaming `RETURNING rowid` for
+full-blob allocation in isolation; that SQL was left unchanged and the temporary
+probe removed. No allocator trimming, threshold relaxation, history deletion,
+production release or active devbox restart was used to obtain the passing run.
+
+The follow-on 2026-10-05 verification exposed two remaining allocation sources.
+SQLite expands a zeroblob when a later record column contains `saved_at`; v9
+moves `bytes` to the record tail while preserving snapshot rowids, clocks,
+original recovery bytes and the processed-command ledger. The existing
+incremental-blob write and `RETURNING rowid` statement remain unchanged.
+Native allocation stacks after that migration contain no SQLite allocations
+of 1 MiB or more; they still attribute 201.6 MiB of cumulative large allocations
+to 48 LZ4 frame-buffer growth calls. LZ4's automatic selection skips its 1 MiB
+frame size, so values between 256 KiB and 1 MiB were reserving 4 MiB buffers.
+The shared compressor now selects the smallest supported frame size, retaining
+standard LZ4 frames and the existing 4 MiB maximum for larger values.
+
+The unchanged, uninstrumented System-allocator probe then passed: 24 completed
+turns, every final 300 KiB argument retained, 61,840 KiB warmup RSS, 91,808 KiB
+peak sampled RSS and 29,968 KiB (29.3 MiB) growth. Native-region inspection also
+reported 37.4 MiB swapped, so this is the observed RSS gate result, not a claim
+that every allocation remained resident. Remote Linux/macOS gates remain
+required. The 466 native/RPC library tests, 33 vendored KV tests, eight native
+peer-message tests and 196 Edge tests passed, including lossless legacy SQLite
+migration and standard LZ4 decoding at all frame-size boundaries.
+
+Current upstream workspace-discovery recovery is integrated without a crash
+counter erase gate or permanent lockout. A reversed 600-row journal converged
+across bounded replay batches, full/shallow discovery survived cold restart,
+and corrupt accepted bytes remained intact. The rebuilt real Edge/native smoke
+completed 24 turns with 1,600 history rows and 22.4 MiB headless RSS growth,
+including independent epoch reset, lost-ACK retry/dedup, owner and Edge crashes,
+owner completion, scoped upload/actor rejection, reconnect and revocation.
+Inference and Scaffold authority were local deterministic fixtures; no active
+devbox restart, paid-provider run or production deployment was performed.
+
+The first exact-source remote gate rejected the old `remote_sync` fixture on
+both platforms: ordinary local devices advertised a sandbox deployment without
+its live grant. The fixture now tests ordinary unscoped devices separately from
+the deployment-scoped Scaffold host, and each relay enforces its exact expected
+deployment. Production admission guards are unchanged. All four local native
+integration suites then passed (26 tests; two existing ignored tests), and the
+queued-run end-to-end regression passed. Remote native gates must rerun before
+staging publication.
+
+The initial mobile gate built its simulator app but killed the cold native
+dependency build at its 20-minute subprocess deadline, before simulator checks
+started. Uploaded `native-build.log` still ended in native crate compilation
+without compiler-error diagnostics. That prerequisite now has 40 minutes within
+the existing 65-minute verification step and 75-minute job; its locked build,
+source checks, all simulator/transport markers and archive checks are unchanged.
+Only remote CI can execute this entrypoint; no local compilation override was
+used. A successful rerun remains required.
+
+
+
+
+Remote native run `37324038360` on `940832b0` passed the unchanged paced memory
+gate on both platforms: Linux growth 72,352 KiB (70.7 MiB), macOS growth
+105,648 KiB (103.2 MiB), both below 128 MiB. The macOS region report showed no
+swapped malloc memory. All 564 desktop tests and the actual native CLI smoke
+passed on macOS. Linux's full same-version real Edge/native scenario preserved
+1,600 rows across 24 turns and caught up in 2,125 ms; its mixed 0.1.135 publisher
+case then exposed duplicate accepted message IDs after publisher/Edge crash.
+This is not a passing mixed-native release gate.
+
+Mobile run `37325961918` on `31be5e3b` completed the native prerequisite in
+7m19s, emitted all 27 simulator fixture markers and captured both blocked
+recovery/manual retry and stale-owner Unreachable surfaces. Its full transport
+scenario stopped before the mobile live path: a cold Worker restart returned
+health HTTP 200 after 22.158s, exceeding the inherited 15s readiness deadline.
+Readiness now uses the existing 30s end-to-end recovery bound; the catch-up
+assertion and all recovery/authorization scenarios remain unchanged. The next
+local full smoke exposed a separate same-owner `sessions.updatedAt` journal
+reconciliation conflict. Neither the full mobile transport nor its archive is
+claimed verified until those runtime paths complete.
+
+The subsequent same-owner repair selects status, run start and update time as one
+validated clocked publication; unchanged three-way baselines also preserve real
+same-millisecond local transitions. Cached authority prevents reordered stale
+snapshots from resurrecting losing offline status. Foreign identity, malformed
+clocks and genuinely divergent fields retain cache and original intents. All
+467 native/RPC library tests passed, including the new restart/clock regression.
+
+Edge validates duplicate application IDs against the pre-import accepted
+container and immutable applied-command evidence. Genuine writer/session
+quiescence gates physical CRDT deletion so the positional 0.1.135 writer does
+not lose later output. Compact identity/fingerprint proof persists atomically
+with accepted bytes across deferred repair and restart; prompts and attachments
+are not copied into that metadata. All 199 Edge tests passed, including complete
+old-index stream/result preservation and raw publisher/observer repair. Parallel
+smokes initially collided on Wrangler's default inspector port 9229; the native
+ephemeral-port option now isolates those fixtures without changing any scenario.
+
+The rebuilt same-version full scenario passed again: 24 turns, 1,600 retained
+rows, 3,914 ms catch-up and all existing crash, ACK, owner, epoch and authorization
+checks. Actual immutable 0.1.135 mixed runs remain blocked with their original
+workload, ordering and deadlines. The old publisher failed singleton-ID recovery
+before interrupt within 30s; its positional writer makes early deletion unsafe
+while the repeated stream is active. The old observer passed the genuine quiet
+owner heartbeat check beyond 45s, then lost an acknowledged offline creation and
+rename when immediately crashed before its debounced snapshot. No receiver can
+recover operations never persisted or sent by that immutable binary. Retiring
+that writable baseline or changing the acceptance contract requires explicit
+user approval; no gate was relaxed and no compatibility success is claimed.
+
+Mobile run `37338615608` built source `5f1c314b` and again passed the 27
+simulator fixtures and both recovery surfaces. Its ordinary native recovery
+scenario reached a later real Worker process restart, whose Wrangler child
+produced no output before the unchanged readiness bound; full mobile live
+transport and archive did not execute. The completed UI fixture is now explicitly
+terminated before starting the native failure-recovery rig; the live hook still
+relaunches that exact simulator app for real transport. This removes unnecessary
+fixture timer/render work, but is not yet a claim that CI startup is resolved.
+
+An attempted prebuilt-Worker optimization preserved full 24-turn recovery but
+introduced a repeatable Miniflare proxy HTTP 500 on relay reconnect. It was
+removed, as were temporary WebSocket/body diagnostics and unproven socket guards.
+The established Worker mode then passed the complete same-version scenario,
+including reconnect and active revocation. No fallback, scenario removal,
+acceptance relocation or deadline relaxation was kept.
+
+The next mobile run `37349899168` reached live simulator traffic after actual
+native crash/recovery, but the workspace join returned HTTP 401: the harness
+uses a scoped fixture bearer while the old iOS hook constructed a dev bearer.
+The hook now requires the harness credential alongside the existing validated
+loopback/principal/project/device/temp-workspace settings and uses the existing
+Scaffold `AuthTokens` transport. No Edge authentication or permissions changed.
+
+Run `37354793566` compiled that scoped-auth cutover and passed the simulator
+fixtures, but stopped earlier in native recovery with a retained chat-creation
+conflict. A deterministic consumer regression reproduced the cause: whole-doc
+version comparison let unrelated editor updates make an already-observed,
+coalesced creation look concurrent. Creation recovery now accepts only covered
+row/editor peers and refuses a full-row replay that could erase incoming fields.
+Genuine divergent fields/ownership still retain cache and original intents;
+peer-level conservatism is documented in code rather than guessed away.
+The regression failed before the repair; all 468 native/RPC library tests then
+passed, including the existing clock/concurrent-field protection cases.
+
+The rebuilt real same-version scenario again completed all 24 turns and retained
+1,600 rows, with 8,035 ms catch-up under the unchanged 30-second bound. Scoped
+uploads, actor rejection, reconnect and active revocation also passed. Full
+authenticated simulator transport and archive remain remote verification gates;
+neither a local typecheck nor a local mobile compilation override was used.
+
+Run `37361935203` compiled source `e35d4995` and passed all simulator fixtures,
+but stopped before the mobile hook on a foreign-principal WebSocket-open timeout
+at 15 seconds. Its stall cause was not confirmed; no authentication assertion
+was suppressed. The shared fixture handshake budget is now 30 seconds, separate
+from unchanged RPC, 30-second end-to-end recovery, 45-second owner-freshness and
+128 MiB memory acceptance. The full actual same-version scenario then passed
+all 24 turns with 1,600 rows, 1,951 ms catch-up, foreign-principal denial,
+immutable retries, reconnect and active revocation. Full remote mobile transport
+and archive verification still must complete.
+
+Mobile run `37366068192` attempt 1 never acquired a hosted runner and executed
+zero steps. Attempt 2 reused the exact `2dd21e09` source and completed the real
+authenticated simulator/native/Edge scenario: workspace sync, native relay
+folder/model RPCs, run admission, streamed transcript and distinctive fragmented
+backfill all emitted their required success markers and `done`. The actual rig
+then passed reconnect, scoped upload/actor rejection and active revocation.
+
+The remaining failure was the CI reader, not auth or transport: its marker
+lookahead allowed only colon/space/end, rejecting the actual `workspace synced;`
+and `ListFolders[...]` detail formats. Standard non-word boundaries now accept
+those structured details without accepting appended marker-name suffixes.
+A throwaway check against the captured real log showed exactly those two old
+misses, all seven corrected live markers accepted, and false suffixes rejected.
+The existing FAIL gate, exact markers and archive checks remain. No permanent
+wording/mock-wiring test, local typecheck or mobile compilation override added;
+archive/source/signature acceptance still requires the full remote rerun.
+
+The corrected marker reader's run `37371030005` compiled source `9024c659`,
+but a preceding foreign-principal WebSocket open failed with an empty builtin
+Node error before the mobile hook. The rig now uses its already-installed `ws`
+transport, which exposes HTTP handshake rejection status instead of that opaque
+event; no retry, authentication bypass or acceptance fallback is added. Its
+full local 24-turn/1,600-row scenario passed again with 1,923 ms catch-up,
+foreign-principal denial, reconnect and revocation. That does not claim the
+intermittent hosted-runner handshake cause is confirmed; final full remote
+transport, surface and archive gates still must pass.
+
+[Mobile run `37373585650`](https://github.com/Ashler-AI/comet/actions/runs/37373585650)
+completed the full gate successfully on immutable source `70e90dc1`: all 27
+fixture markers, real authenticated simulator/native/Edge workspace and relay
+traffic, command admission/transcript/fragmented backfill, four recovery turns
+with 1,600 preserved rows and 4,066 ms catch-up, scoped actor/upload rejection,
+reconnect, revocation and the device archive. Inspected screenshots show populated
+live session rows/Running, retained-original blocked recovery with manual retry,
+and the stale-owner Unreachable strip. The archive verifies bundle identity,
+arm64, source build 29, expanded/signed production APNs entitlement, locked SPM
+packages and ad-hoc signature. Provenance names that exact source/run/toolchain;
+all nine downloaded artifact checksums verified locally.
+
+This is CI simulator/archive acceptance, not Apple distribution signing,
+physical-phone acceptance, a new TestFlight upload or a release deployment.
+The immutable 0.1.135 mixed-version durability/identity blockers above still
+require the user's explicit supported-baseline decision before merge/staging.
+Installed Crew, active bb6 writer, production and Scaffold pins remain unchanged;
+local typechecks were intentionally skipped to preserve workstation resources.
+
+### Authorized staging writable-client cutover (2026-10-05)
+
+The owner authorized retirement of unsafe writable 0.1.135 compatibility and
+staging rollout to Scaffold, the existing Namespace devbox and mobile. New
+native/Swift clients declare query-only `syncProtocol=durable-records-v1` on
+every room and device/peer relay socket, and native HTTP diff/nudge writes.
+The Worker strips spoofable internal protocol headers before deriving that
+compatibility declaration; principal, scope and capabilities remain independent.
+Legacy/unknown/duplicate declarations retain authenticated room backfill but
+cannot publish whole/fragment/recovery writes, register/control a host, or use
+HTTP append/reset/diff/nudge/sidecar bypasses. Pre-rollout sockets are fenced too.
+Owner heartbeats update the bounded register; real phase anchors remain durable.
+The retired mixed-writable gates were replaced with actual read-only/rejection
+proof and current-owner freshness beyond the unchanged 45-second lease.
+
+The initial full smoke exposed a real Stop/boot-recovery race: terminal Idle was
+published, Stop applied, then queued automatic recovery started a new Working
+run. External Stop now serializes with dispatch/recovery, validates the exact
+owner/turn, retires pending recovery durably before acknowledgment, and preserves
+the bare pending execution route during early boot. Internal replacement/auth
+teardown/shutdown cancellation remains live-only to avoid already-locked deadlock.
+Deterministic queued-resume and legacy/typed boot-stop regressions passed, as did
+the stale-turn rejection boundary. Originals, unrelated requests and child
+identities are retained; no timing workaround or completion-bound relaxation.
+
+After review: 468 native/RPC library tests, 26 native integration tests, eight
+relay integration tests, queued-run e2e and 14 CLI session tests passed; existing
+external/paid-provider cases remain explicitly ignored. All 206 Edge tests passed.
+The actual full smoke completed 24 turns, preserved 1,600 rows, caught up in
+3,923 ms and sampled 9.6 MiB owner RSS growth. The quiet-owner variant verified
+genuine register heartbeats after 50 seconds, four crash/recovery turns, legacy
+read/no-publish/no-host control, epoch reset, scoped uploads/actor rejection,
+reconnect and revocation. The unchanged paced 24-turn/300 KiB System-allocator
+probe passed with 53,920 KiB (52.7 MiB) RSS growth; its native region report also
+contained 37.9 MiB swapped, so it is not an all-resident or eight-hour claim.
+The real isolated headed app rendered a fresh complete mock reply and returned
+idle. A final-source long mock turn also streamed through that viewport; its
+actual Stop control halted output, restored the send button and returned native
+WatchSessions to Idle. Only the owned fixture window/engine was closed. Staging
+mobile source build 30 is prepared; production build 21 unchanged.
+
+Deployment activation still requires the verified immutable candidate and a
+fresh safe devbox writer checkpoint. The installed devbox OMP 18.4.10 matched its
+official upstream digest and will be preserved rather than downgraded during
+the Crew-only update. No production channel, production image pin, account/tester
+permission or live writer has been changed by this cutover implementation.
+Local typechecks were intentionally skipped to preserve workstation resources;
+authorized remote CI remains the release validation path.
+

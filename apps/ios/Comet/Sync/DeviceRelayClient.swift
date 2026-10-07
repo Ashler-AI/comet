@@ -88,6 +88,7 @@ actor DeviceRelayClient {
         components.scheme = components.scheme == "http" ? "ws" : "wss"
         var queryItems = [
             URLQueryItem(name: "role", value: "client"),
+            URLQueryItem(name: "syncProtocol", value: AppConfig.durableSyncProtocol),
             // A reconnect is a new relay peer. Reusing a connId can briefly
             // leave two tagged sockets in the hibernating DO and route the
             // host's response to the stale predecessor.
@@ -172,6 +173,23 @@ actor DeviceRelayClient {
     func call<Response: Decodable>(method: String, params: [String: Any],
                                    timeoutNanoseconds: UInt64? = 10_000_000_000,
                                    preserveSuccessfulResponseOnCancellation: Bool = false) async throws -> Response {
+        let data = try await callData(method: method, params: params,
+            timeoutNanoseconds: timeoutNanoseconds,
+            preserveSuccessfulResponseOnCancellation: preserveSuccessfulResponseOnCancellation)
+        return try JSONDecoder().decode(Response.self, from: data)
+    }
+
+    func callJSON(method: String, params: [String: Any]) async throws -> [String: Any] {
+        let data = try await callData(method: method, params: params)
+        guard let reply = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw RelayError.rpc("Crew command readback did not return an object.")
+        }
+        return reply
+    }
+
+    private func callData(method: String, params: [String: Any],
+                          timeoutNanoseconds: UInt64? = 10_000_000_000,
+                          preserveSuccessfulResponseOnCancellation: Bool = false) async throws -> Data {
         for attempt in 0..<3 {
             try Task.checkCancellation()
             do {
@@ -191,12 +209,12 @@ actor DeviceRelayClient {
         throw RelayError.notConnected
     }
 
-    private func callOnce<Response: Decodable>(
+    private func callOnce(
         method: String,
         params: [String: Any],
         timeoutNanoseconds: UInt64?,
         preserveSuccessfulResponseOnCancellation: Bool
-    ) async throws -> Response {
+    ) async throws -> Data {
         let socket = try await connect()
         guard connected, self.socket === socket else { throw RelayError.notConnected }
         let gen = generation
@@ -241,7 +259,7 @@ actor DeviceRelayClient {
             try Task.checkCancellation()
             throw error
         case .success(let ok):
-            return try JSONDecoder().decode(Response.self, from: ok)
+            return ok
         }
     }
 
@@ -400,6 +418,7 @@ extension DeviceRelayClient {
             let original = try await first!.value
             let shared = try await second!.value
             guard original === shared, socket === original, generation == 1 else { return false }
+
             let oldGeneration = generation
             close()
             let replacement = try await connect()

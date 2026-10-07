@@ -490,6 +490,26 @@ struct RunRequest: Codable {
     var autoApprove: Bool = true
     var resume: String?
     var attachments: [String] = []
+
+    private enum CodingKeys: String, CodingKey {
+        case prompt, model, reasoning, modelOptions, cwd, sandbox, autoApprove, resume, attachments
+    }
+}
+
+extension RunRequest {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        prompt = try c.decode(String.self, forKey: .prompt)
+        model = try c.decodeIfPresent(String.self, forKey: .model)
+        reasoning = try c.decodeIfPresent(String.self, forKey: .reasoning)
+        modelOptions = try c.decode([String: String].self, forKey: .modelOptions)
+        cwd = try c.decode(String.self, forKey: .cwd)
+        sandbox = try c.decode(String.self, forKey: .sandbox)
+        autoApprove = try c.decode(Bool.self, forKey: .autoApprove)
+        resume = try c.decodeIfPresent(String.self, forKey: .resume)
+        // Native omits empty attachments; a present null or malformed value is not empty.
+        attachments = c.contains(.attachments) ? try c.decode([String].self, forKey: .attachments) : []
+    }
 }
 
 enum SessionCommandPayload {
@@ -518,4 +538,11 @@ enum SessionCommandPayload {
 
 func nowMs() -> Int64 {
     Int64(Date().timeIntervalSince1970 * 1000)
+}
+
+func encodableDictionary<T: Encodable>(_ value: T) -> [String: Any] {
+    guard let data = try? JSONEncoder().encode(value),
+          let object = try? JSONSerialization.jsonObject(with: data),
+          let dictionary = object as? [String: Any] else { return [:] }
+    return dictionary
 }

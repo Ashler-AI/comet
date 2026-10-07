@@ -217,18 +217,78 @@ impl Drop for AuthForwardLease {
     }
 }
 
-struct ForwardProcessGroup(Option<u32>);
+struct ForwardProcessGroup {
+    child: tokio::process::Child,
+    #[cfg(unix)]
+    group: Option<u32>,
+    // Release the reservation only after group cleanup, including cancellation.
+    _lease: AuthForwardLease,
+}
 
-impl Drop for ForwardProcessGroup {
-    fn drop(&mut self) {
+impl ForwardProcessGroup {
+    fn kill_group(&mut self) {
         #[cfg(unix)]
-        if let Some(group) = self.0 {
-            // SAFETY: this process created `group` for the forward below and
-            // retains the guard only while that exact process tree may live.
+        if let Some(group) = self.group.take() {
+            // SAFETY: the unreaped child reserves this group ID. Disarm before
+            // reaping, so cancellation cannot signal a subsequently reused ID.
             unsafe {
                 libc::killpg(group as libc::pid_t, libc::SIGKILL);
             }
         }
+    }
+
+    fn has_exited(&mut self) -> std::io::Result<bool> {
+        #[cfg(unix)]
+        {
+            let Some(group) = self.group else {
+                return Ok(true);
+            };
+            // Observe exit without reaping: descendants may still hold listeners,
+            // and the leader must reserve the group ID until we kill the group.
+            let mut status = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    group as libc::id_t,
+                    &mut status,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ECHILD) {
+                    self.group = None;
+                }
+                return Err(error);
+            }
+            Ok(unsafe { status.si_pid() } != 0)
+        }
+        #[cfg(not(unix))]
+        {
+            self.child.try_wait().map(|status| status.is_some())
+        }
+    }
+
+    async fn wait_for_exit(&mut self) -> std::io::Result<()> {
+        loop {
+            if self.has_exited()? {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn stop(&mut self) {
+        self.kill_group();
+        #[cfg(not(unix))]
+        let _ = self.child.start_kill();
+        let _ = self.child.wait().await;
+    }
+}
+
+impl Drop for ForwardProcessGroup {
+    fn drop(&mut self) {
+        self.kill_group();
     }
 }
 
@@ -265,20 +325,25 @@ async fn ensure_auth_forward(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .kill_on_drop(true);
+        .kill_on_drop(!cfg!(unix));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
         command.as_std_mut().process_group(0);
     }
-    let mut child = command
+    let child = command
         .spawn()
         .map_err(|error| format!("Could not start Namespace port forward: {error}"))?;
-    let process_group = ForwardProcessGroup(child.id());
+    let mut process = ForwardProcessGroup {
+        #[cfg(unix)]
+        group: child.id(),
+        child,
+        _lease: lease,
+    };
     let ready = tokio::time::timeout(ready_timeout, async {
         loop {
-            if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-                return Err(format!("Namespace port forward exited early ({status})"));
+            if process.has_exited().map_err(|error| error.to_string())? {
+                return Err("Namespace port forward exited early".into());
             }
             if tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, ports[0].0))
                 .await
@@ -294,18 +359,16 @@ async fn ensure_auth_forward(
         Err("Namespace port forward did not become ready within 10 seconds".to_string())
     });
     if let Err(error) = ready {
-        let _ = child.kill().await;
+        process.stop().await;
         return Err(error);
     }
+    let expires_at = tokio::time::Instant::now() + lease_duration;
     tokio::spawn(async move {
-        let _process_group = process_group;
         tokio::select! {
-            _ = tokio::time::sleep(lease_duration) => {
-                let _ = child.kill().await;
-            }
-            _ = child.wait() => {}
+            _ = tokio::time::sleep_until(expires_at) => {}
+            _ = process.wait_for_exit() => {}
         }
-        drop(lease);
+        process.stop().await;
     });
     Ok(())
 }
@@ -478,6 +541,44 @@ mod tests {
             .local_addr()
             .unwrap()
             .port()
+    }
+
+    #[cfg(unix)]
+    fn write_forward_executable(directory: &std::path::Path, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let executable = directory.join("devbox");
+        std::fs::write(&executable, script).unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        executable
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_callback_state(
+        wake: &DeviceWake,
+        provider_id: &str,
+        ports: &[u16],
+        active: bool,
+    ) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let mut matches = wake.auth_forward_active(provider_id) == active;
+                for port in ports {
+                    matches &= tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, *port))
+                        .await
+                        .is_ok()
+                        == active;
+                }
+                if matches {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("callback lease state and listener reachability did not converge");
     }
 
     #[tokio::test(start_paused = true)]
@@ -668,34 +769,43 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cancelling_readiness_releases_callback_lease() {
-        use std::os::unix::fs::PermissionsExt;
-
+        let callback_port = unused_port();
         let temp = tempfile::tempdir().unwrap();
-        let executable = temp.path().join("devbox");
-        std::fs::write(&executable, "#!/bin/sh\nsleep 60\n").unwrap();
-        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&executable, permissions).unwrap();
+        let executable = write_forward_executable(
+            temp.path(),
+            &format!(
+                "#!/bin/sh\nCOMET_TEST_AUTH_FORWARD_PORT='{callback_port}' '{}' --exact device_wake::tests::auth_forward_child --nocapture &\nwait\n",
+                std::env::current_exe().unwrap().display()
+            ),
+        );
         let wake = DeviceWake::default();
         let provider_id = "ofpf7g22n4412";
-        let ports = [(unused_port(), 8085)];
-        {
-            let pending = ensure_auth_forward(
+        let mut first = wake.coalesce_forward(
+            provider_id,
+            ensure_auth_forward(
                 executable,
                 provider_id.into(),
-                ports.to_vec(),
+                // Keep readiness pending while a descendant holds a listener.
+                vec![(0, 8085)],
                 Duration::from_secs(60),
                 Duration::from_secs(60),
                 wake.auth_forward.clone(),
-            );
-            tokio::pin!(pending);
-            tokio::select! {
-                result = &mut pending => panic!("tunnel exited before cancellation: {result:?}"),
-                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
-            }
-            assert!(wake.auth_forward_active(provider_id));
+            )
+            .boxed(),
+        );
+        let second = wake.coalesce_forward(
+            provider_id,
+            async { panic!("duplicate forward") }.boxed(),
+        );
+        let callback_ports = [callback_port];
+        tokio::select! {
+            result = &mut first => panic!("tunnel exited before cancellation: {result:?}"),
+            _ = wait_for_callback_state(&wake, provider_id, &callback_ports, true) => {}
         }
-        assert!(!wake.auth_forward_active(provider_id));
+        drop(first);
+        wait_for_callback_state(&wake, provider_id, &[callback_port], true).await;
+        drop(second);
+        wait_for_callback_state(&wake, provider_id, &[callback_port], false).await;
     }
 
     #[cfg(unix)]
@@ -704,41 +814,31 @@ mod tests {
         let Ok(raw) = std::env::var("COMET_TEST_AUTH_FORWARD_PORT") else {
             return;
         };
-        let _callback = std::net::TcpListener::bind((
-            std::net::Ipv4Addr::LOCALHOST,
-            raw.parse::<u16>().unwrap(),
-        ))
-        .unwrap();
-        std::thread::sleep(
-            std::env::var("COMET_TEST_AUTH_FORWARD_SLEEP_MS")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .map(Duration::from_millis)
-                .unwrap_or(Duration::from_secs(60)),
-        );
+        let _callbacks: Vec<_> = raw
+            .split(',')
+            .map(|port| {
+                std::net::TcpListener::bind((
+                    std::net::Ipv4Addr::LOCALHOST,
+                    port.parse::<u16>().unwrap(),
+                ))
+                .unwrap()
+            })
+            .collect();
+        std::thread::sleep(Duration::from_secs(60));
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn callback_tunnel_becomes_ready_and_is_coalesced() {
-        use std::os::unix::fs::PermissionsExt;
-
         let callback_port = unused_port();
-
         let temp = tempfile::tempdir().unwrap();
-        let executable = temp.path().join("devbox");
-        let test_binary = std::env::current_exe().unwrap();
-        std::fs::write(
-            &executable,
-            format!(
+        let executable = write_forward_executable(
+            temp.path(),
+            &format!(
                 "#!/bin/sh\nCOMET_TEST_AUTH_FORWARD_PORT='{callback_port}' exec '{}' --exact device_wake::tests::auth_forward_child --nocapture\n",
-                test_binary.display()
+                std::env::current_exe().unwrap().display()
             ),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&executable, permissions).unwrap();
+        );
 
         let wake = DeviceWake::default();
         let provider_id = "ofpf7g22n4412";
@@ -747,70 +847,94 @@ mod tests {
             provider_id.into(),
             vec![(callback_port, 8085)],
             Duration::from_secs(2),
-            Duration::from_millis(100),
+            AUTH_FORWARD_TIMEOUT,
             wake.auth_forward.clone(),
         )
         .await
         .unwrap();
+        // Real subprocess startup cannot use paused time; control only expiry.
+        tokio::time::pause();
         assert!(wake.auth_forward_active(provider_id));
         ensure_auth_forward(
             executable,
             provider_id.into(),
             vec![(callback_port, 8085)],
             Duration::from_secs(2),
-            Duration::from_millis(100),
+            AUTH_FORWARD_TIMEOUT,
             wake.auth_forward.clone(),
         )
         .await
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        assert!(!wake.auth_forward_active(provider_id));
-        assert!(
-            tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, callback_port))
-                .await
-                .is_err()
-        );
+        tokio::time::advance(AUTH_FORWARD_TIMEOUT).await;
+        tokio::time::resume();
+        wait_for_callback_state(&wake, provider_id, &[callback_port], false).await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn callback_tunnel_lease_kills_spawned_process_group() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let callback_port = unused_port();
+        let reserved = [
+            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap(),
+            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap(),
+        ];
+        let ports = reserved
+            .each_ref()
+            .map(|listener| listener.local_addr().unwrap().port());
+        drop(reserved);
         let temp = tempfile::tempdir().unwrap();
-        let executable = temp.path().join("devbox");
-        let test_binary = std::env::current_exe().unwrap();
-        std::fs::write(
-            &executable,
-            format!(
-                "#!/bin/sh\nCOMET_TEST_AUTH_FORWARD_PORT='{callback_port}' COMET_TEST_AUTH_FORWARD_SLEEP_MS=2000 '{}' --exact device_wake::tests::auth_forward_child --nocapture &\nwait\n",
-                test_binary.display()
+        let executable = write_forward_executable(
+            temp.path(),
+            &format!(
+                "#!/bin/sh\nCOMET_TEST_AUTH_FORWARD_PORT='{},{}' '{}' --exact device_wake::tests::auth_forward_child --nocapture &\nwait\n",
+                ports[0], ports[1], std::env::current_exe().unwrap().display()
             ),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&executable, permissions).unwrap();
-
+        );
         let wake = DeviceWake::default();
+        let provider_id = "ofpf7g22n4412";
         ensure_auth_forward(
             executable,
-            "ofpf7g22n4412".into(),
-            vec![(callback_port, 8085)],
+            provider_id.into(),
+            vec![(ports[0], 8085), (ports[1], 8086)],
             Duration::from_secs(2),
-            Duration::from_millis(100),
+            AUTH_FORWARD_TIMEOUT,
             wake.auth_forward.clone(),
         )
         .await
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        assert!(
-            tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, callback_port))
-                .await
-                .is_err(),
-            "forward grandchild survived its lease"
+        wait_for_callback_state(&wake, provider_id, &ports, true).await;
+        tokio::time::pause();
+        tokio::time::advance(AUTH_FORWARD_TIMEOUT).await;
+        tokio::time::resume();
+        wait_for_callback_state(&wake, provider_id, &ports, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn callback_tunnel_leader_exit_kills_spawned_process_group() {
+        let callback_port = unused_port();
+        let temp = tempfile::tempdir().unwrap();
+        let exit_marker = temp.path().join("exit");
+        let executable = write_forward_executable(
+            temp.path(),
+            &format!(
+                "#!/bin/sh\nCOMET_TEST_AUTH_FORWARD_PORT='{callback_port}' '{}' --exact device_wake::tests::auth_forward_child --nocapture &\nwhile [ ! -f '{}' ]; do sleep 0.01; done\n",
+                std::env::current_exe().unwrap().display(), exit_marker.display()
+            ),
         );
+        let wake = DeviceWake::default();
+        let provider_id = "ofpf7g22n4412";
+        ensure_auth_forward(
+            executable,
+            provider_id.into(),
+            vec![(callback_port, 8085)],
+            Duration::from_secs(2),
+            AUTH_FORWARD_TIMEOUT,
+            wake.auth_forward.clone(),
+        )
+        .await
+        .unwrap();
+        std::fs::write(exit_marker, b"").unwrap();
+        wait_for_callback_state(&wake, provider_id, &[callback_port], false).await;
     }
 
     #[tokio::test]
