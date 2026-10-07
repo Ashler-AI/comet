@@ -395,7 +395,11 @@ impl SessionDoc {
                 _ => return Err(conflict()),
             };
             if let Some((error, _)) = interruption {
-                push_part(&parts, error)?;
+                if let Some(existing) = current.parts.iter().find(|part| part.id() == error.id()) {
+                    if existing != error { return Err(conflict()); }
+                } else {
+                    push_part(&parts, error)?;
+                }
             } else {
                 if parts.len() > 0 { parts.delete(0, parts.len())?; }
                 for part in &entry.parts { push_part(&parts, part)?; }
@@ -1869,6 +1873,32 @@ mod tests {
         writer.sync(&[text("first acknowledged")]).unwrap();
         assert!(binding.adopt_snapshot(&foreign.export_snapshot().unwrap(), Some("chat-1")).is_err());
         assert_eq!(doc.read_entry("active").unwrap(), Some(retained));
+    }
+
+    #[test]
+    fn interrupted_checkpoint_preserves_an_acknowledged_marker_without_duplication() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let binding = doc.binding();
+        binding.install_journal(Vec::new(), std::sync::Arc::new(|_, _| Ok(())));
+        let text = |id: &str, value: &str| MessagePart::Text { id: id.into(), text: value.into() };
+        let error = |message: &str| MessagePart::Error { id: "active-recovery".into(), message: message.into() };
+        let marker = error("Run interrupted by Crew restart");
+        SegmentWriter::begin(&doc, "active", "dev-a", 2).unwrap()
+            .finish(&[text("text", "first"), marker.clone()], MessageStatus::Aborted).unwrap();
+        let replacement = SessionDoc::init("chat-1").unwrap();
+        let mut remote = SegmentWriter::begin(&replacement, "active", "dev-a", 2).unwrap();
+        let acknowledged = vec![text("text", "first acknowledged"), text("later", "later output"), marker];
+        remote.sync(&acknowledged).unwrap();
+        binding.adopt_snapshot(&replacement.export_snapshot().unwrap(), Some("chat-1")).unwrap();
+        let adopted = doc.read_entry("active").unwrap().unwrap();
+        assert_eq!(adopted.status, Some(MessageStatus::Aborted));
+        assert_eq!(adopted.parts, acknowledged);
+
+        let divergent = SessionDoc::init("chat-1").unwrap();
+        let mut writer = SegmentWriter::begin(&divergent, "active", "dev-a", 2).unwrap();
+        writer.sync(&[text("text", "first acknowledged"), text("later", "later output"), error("Conflicting acknowledged marker")]).unwrap();
+        assert!(binding.adopt_snapshot(&divergent.export_snapshot().unwrap(), Some("chat-1")).is_err());
+        assert_eq!(doc.read_entry("active").unwrap(), Some(adopted));
     }
 
     #[test]

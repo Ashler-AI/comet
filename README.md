@@ -26,8 +26,9 @@ admission reply, retire its retained draft, and do not admit it again. Terminal
 rejection remains authoritative.
 
 Interrupted transcript checkpoints keep richer acknowledged output and monotonic
-task progress while retaining the interruption marker; acknowledged terminal
-outcomes still win. Recovery-blocked admission cannot append new commands, and
+task progress while retaining one interruption marker; a conflicting acknowledged
+marker remains blocked, and acknowledged terminal outcomes still win.
+Recovery-blocked admission cannot append new commands, and
 a failed commit retains authority only for an already-materialized original intent.
 Command execution waits for document recovery. Desktop commands whose delivery
 is notified do not show a delivery-pending warning while awaiting execution;
