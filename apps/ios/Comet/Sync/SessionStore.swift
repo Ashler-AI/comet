@@ -1761,6 +1761,9 @@ extension SessionStore {
                 for file in files where file.lastPathComponent.hasPrefix(cacheId) { try? FileManager.default.removeItem(at: file) }
             }
         }
+        var checkpoint = "cached transcript and original composer"
+        var completed = false
+        defer { if !completed { E2ERunner.log("FAIL Crew durable intents checkpoint: \(checkpoint)") } }
         do {
             let old = LoroDoc()
             func append(_ fields: [String: Any], to doc: LoroDoc, list: String) throws {
@@ -1779,11 +1782,13 @@ extension SessionStore {
             var admissions: [MobileCommandAdmission] = []
             initial.commandSender = { _, admission in admissions.append(admission); throw RelayError.timeout }
             let chat = Chat(id: chatId, deviceId: "owner", archived: false, cwd: "/original", createdAt: 0)
+            checkpoint = "original run lost admission reply"
             guard !(await initial.sendRun(prompt: "accepted but ACK lost", chat: chat)),
                   admissions.count == 1 else { return false }
             initial.flushToDisk()
             let restarted = SessionStore(chatId: chatId, config: config)
             stores.append(restarted)
+            checkpoint = "restart restores composer and original scoped request"
             guard restarted.composerText == "unsent composer draft",
                   restarted.failedPrompt == "accepted but ACK lost",
                   let original = admissions.first,
@@ -1793,18 +1798,22 @@ extension SessionStore {
                 ["commandId": admission.commandId, "issuedAt": admission.issuedAt,
                  "expiresAt": admission.expiresAt, "status": status, "payload": payload]
             }
+            checkpoint = "retained run request"
             guard let retainedRun = restarted.submittedDrafts[original.commandId],
                   let originalRequest = retainedRun.request else { return false }
             var nativeRequest = encodableDictionary(originalRequest)
             nativeRequest.removeValue(forKey: "attachments")
             let runPayload: [String: Any] = ["kind": "run", "messageId": original.commandId, "request": nativeRequest]
             let pendingRun = command(runPayload, admission: original)
+            checkpoint = "native omitted-empty attachments match original run"
             guard restarted.matchesAdmissionPayload(pendingRun, draft: retainedRun) else { return false }
             for changed in [NSNull(), "/not-an-array", ["/changed-image"]] as [Any] {
                 var request = nativeRequest; request["attachments"] = changed
+                checkpoint = "malformed or changed attachments refused"
                 guard !restarted.matchesAdmissionPayload(command(["kind": "run", "messageId": original.commandId, "request": request], admission: original), draft: retainedRun) else { return false }
             }
             var changedRequest = nativeRequest; changedRequest["cwd"] = "/changed"
+            checkpoint = "changed run working directory refused"
             guard !restarted.matchesAdmissionPayload(command(["kind": "run", "messageId": original.commandId, "request": changedRequest], admission: original), draft: retainedRun) else { return false }
             var scopedRun = retainedRun
             let route = ScaffoldControlRoute(controllerDeviceId: "controller", ownerDeviceId: "owner",
@@ -1819,6 +1828,7 @@ extension SessionStore {
                  "grantId": route.grantId, "source": "scaffold",
                  "action": ["action": "start", "message_id": original.commandId, "request": request]]
             }
+            checkpoint = "scoped original run accepted and changed request refused"
             guard restarted.matchesAdmissionPayload(command(scaffoldPayload(nativeRequest), admission: original), draft: scopedRun),
                   !restarted.matchesAdmissionPayload(command(scaffoldPayload(changedRequest), admission: original), draft: scopedRun) else { return false }
             var runReadbacks = 0
@@ -1835,12 +1845,14 @@ extension SessionStore {
                 admissions.append(admission)
                 throw RelayError.timeout
             }
+            checkpoint = "pending readback retries original run identity after restart"
             guard await restarted.sendSteer(prompt: "accepted but ACK lost"), admissions.count == 2,
                   admissions[1].commandId == original.commandId,
                   admissions[1].issuedAt == original.issuedAt,
                   admissions[1].expiresAt == original.expiresAt else { return false }
             let pendingRestart = SessionStore(chatId: chatId, config: config)
             stores.append(pendingRestart)
+            checkpoint = "pending run receipt survives lost retry reply and restart"
             guard runReadbacks == 2, let pendingDraft = pendingRestart.submittedDrafts[original.commandId],
                   pendingDraft.admitted, !pendingDraft.terminal, pendingDraft.failure == nil,
                   let pendingRequest = pendingDraft.request, let pendingAdmission = pendingDraft.admission,
@@ -1856,10 +1868,12 @@ extension SessionStore {
             let floor = server.stateFrontiers()
             try server.getMap(id: "meta").insert(key: "current", v: true)
             server.commit()
+            checkpoint = "independently materialized shallow replacement"
             guard let replacement = DocDisk.replacementSnapshot(bytes: try server.export(mode: .shallowSnapshot(frontiers: floor))) else { return false }
             let room = RoomClient(roomId: chatId, doc: cached, urlProvider: { nil }, events: { _ in }, adoptSnapshot: { _, _ in false })
             restarted.room = room
             restarted.saver = DocSaver(docId: cacheId, doc: cached)
+            checkpoint = "shallow adoption retains original materialization without re-admission"
             guard restarted.adoptSnapshot(previous: cached, replacement: replacement),
                   await E2ERunner.poll(timeout: 5, label: "durable recovery materialization", {
                     restarted.entries.contains(where: { $0.id == original.commandId }) ? true : nil
@@ -1869,6 +1883,7 @@ extension SessionStore {
                   FileManager.default.fileExists(atPath: DocDisk.url(for: cacheId).appendingPathExtension("recovery").path) else { return false }
             let afterRecovery = SessionStore(chatId: chatId, config: config)
             stores.append(afterRecovery)
+            checkpoint = "completed original outcome survives restart with unsent composer"
             guard afterRecovery.submittedDrafts.isEmpty,
                   afterRecovery.composerText == "unsent composer draft" else { return false }
             var expired = SubmittedDraft(messageId: UUID().uuidString.lowercased(), prompt: "expired instruction", images: [], steer: true)
@@ -1877,6 +1892,7 @@ extension SessionStore {
             afterRecovery.submittedDrafts[expired.messageId] = expired
             afterRecovery.retryDraft = expired
             afterRecovery.commandSender = { _, admission in admissions.append(admission) }
+            checkpoint = "expired unsent instruction is terminal without admission"
             guard !(await afterRecovery.sendSteer(prompt: expired.prompt)), admissions.count == 2,
                   afterRecovery.submittedDrafts[expired.messageId]?.terminal == true else { return false }
             // A rejected ledger result after restart must be terminal even when
@@ -1890,6 +1906,7 @@ extension SessionStore {
             ], to: afterRecovery.doc, list: "commands")
             afterRecovery.doc.commit()
             afterRecovery.project()
+            checkpoint = "revoked durable instruction is terminal without optimistic echo"
             guard await E2ERunner.poll(timeout: 5, label: "revoked durable intent", {
                 afterRecovery.submittedDrafts[revoked.messageId]?.terminal == true ? true : nil
             }) != nil, admissions.count == 2 else { return false }
@@ -1904,6 +1921,7 @@ extension SessionStore {
                 throw RelayError.timeout
             }
             afterRecovery.respondInput(requestId: "original-request", answers: answers)
+            checkpoint = "input response admission loss retains original answers"
             guard await E2ERunner.poll(timeout: 5, label: "durable control admission loss", {
                 controlAdmissions.count == 1 && afterRecovery.retainedControls.count == 1 ? true : nil
             }) != nil, let controlAdmission = controlAdmissions.first else { return false }
@@ -1920,6 +1938,7 @@ extension SessionStore {
                 return ["command": pendingControl]
             }
             controlRestart.retryControl(controlAdmission.commandId)
+            checkpoint = "input retry retains original command identity and expiry"
             guard await E2ERunner.poll(timeout: 5, label: "durable control retry", {
                 controlAdmissions.count == 2 && !controlRestart.sending ? true : nil
             }) != nil,
@@ -1928,6 +1947,7 @@ extension SessionStore {
                   controlAdmissions[1].expiresAt == controlAdmission.expiresAt else { return false }
             let pendingControlRestart = SessionStore(chatId: chatId, config: config)
             stores.append(pendingControlRestart)
+            checkpoint = "pending input receipt survives lost retry reply and restart"
             guard controlReadbacks == 2, let pendingControlDraft = pendingControlRestart.submittedDrafts[controlAdmission.commandId],
                   pendingControlDraft.admitted, !pendingControlDraft.terminal, pendingControlDraft.failure == nil,
                   let retainedControlAdmission = pendingControlDraft.admission,
@@ -1935,15 +1955,18 @@ extension SessionStore {
             try append(["id": controlAdmission.commandId, "status": "applied", "payload": ["kind": "respondInput"]],
                        to: controlRestart.doc, list: "commands")
             controlRestart.doc.commit(); controlRestart.project()
+            checkpoint = "applied input outcome retires retained control"
             guard await E2ERunner.poll(timeout: 5, label: "durable control outcome", {
                 controlRestart.submittedDrafts[controlAdmission.commandId] == nil ? true : nil
             }) != nil else { return false }
             let terminalRestart = SessionStore(chatId: chatId, config: config)
             stores.append(terminalRestart)
+            checkpoint = "applied control stays retired after restart"
             guard terminalRestart.submittedDrafts[controlAdmission.commandId] == nil else { return false }
             var cancelled = pendingControlDraft
             cancelled.messageId = UUID().uuidString.lowercased()
             cancelled.admission?.commandId = cancelled.messageId
+            checkpoint = "cancelled control retains original admission"
             guard let cancelledAdmission = cancelled.admission else { return false }
             terminalRestart.submittedDrafts[cancelled.messageId] = cancelled
             let cancelledCommand = command(["kind": "respondInput", "requestId": "original-request",
@@ -1954,11 +1977,13 @@ extension SessionStore {
             stores.append(cancelledRestart)
             cancelledRestart.commandSender = afterRecovery.commandSender
             cancelledRestart.retryControl(cancelled.messageId)
+            checkpoint = "cancelled control stays terminal after restart and retry"
             guard cancelledRestart.submittedDrafts[cancelled.messageId] == nil,
                   cancelledRestart.terminalControlOutcomes[cancelled.messageId]?.terminal == true,
                   controlAdmissions.count == 2 else { return false }
             let wrongScope = SessionStore(chatId: chatId, config: config, deploymentId: "another-deployment")
             stores.append(wrongScope)
+            checkpoint = "foreign deployment cannot recover retained composer or commands"
             guard wrongScope.submittedDrafts.isEmpty, wrongScope.composerText.isEmpty else { return false }
             let scope = CollaborationScope(projectId: config.projectScope, deploymentId: "another-deployment", sessionId: chatId)
             let issuedAt = nowMs()
@@ -1966,12 +1991,14 @@ extension SessionStore {
                 issuedAt: issuedAt, expiresAt: issuedAt + 300_000, hostDeviceId: "host", scaffold: nil, scope: scope)
             let workspace = WorkspaceStore(config: config)
             defer { workspace.stop(); try? FileManager.default.removeItem(at: DocDisk.intentURL(for: config.documentCacheId(roomId: "ws4/\(config.projectScope)"))) }
+            checkpoint = "desktop admission refuses implicit deployment change"
             do {
                 try await workspace.sendSessionCommand(chatId: chatId, payload: .interrupt, admission: scopedAdmission)
                 return false
             } catch {
                 guard error.localizedDescription.contains("explicit deployment") else { return false }
             }
+            completed = true
             E2ERunner.log("OK Crew durable intents: restart draft, original ID payload expiry, lost ACK dedupe, shallow adoption, revoked and expired blocked, scope isolation, durable control answers and outcomes, native omitted-empty attachments, pending receipt survives lost retry and restart, cancelled outcomes monotonic")
             return true
         } catch { E2ERunner.log("FAIL Crew durable intents: \(error)"); return false }
