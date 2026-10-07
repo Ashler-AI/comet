@@ -1873,14 +1873,25 @@ extension SessionStore {
             let room = RoomClient(roomId: chatId, doc: cached, urlProvider: { nil }, events: { _ in }, adoptSnapshot: { _, _ in false })
             restarted.room = room
             restarted.saver = DocSaver(docId: cacheId, doc: cached)
-            checkpoint = "shallow adoption retains original materialization without re-admission"
-            guard restarted.adoptSnapshot(previous: cached, replacement: replacement),
-                  await E2ERunner.poll(timeout: 5, label: "durable recovery materialization", {
-                    restarted.entries.contains(where: { $0.id == original.commandId }) ? true : nil
-                  }) != nil,
-                  await restarted.sendSteer(prompt: "accepted but ACK lost"), admissions.count == 2,
-                  DocDisk.loadReplica(id: cacheId)?.getMap(id: "meta").get(key: "current")?.asValue()?.boolValue == true,
-                  FileManager.default.fileExists(atPath: DocDisk.url(for: cacheId).appendingPathExtension("recovery").path) else { return false }
+            checkpoint = "shallow replacement adoption"
+            guard restarted.adoptSnapshot(previous: cached, replacement: replacement) else {
+                E2ERunner.log("FAIL Crew shallow adoption: \(restarted.recoveryFailure ?? "no recovery error")")
+                return false
+            }
+            checkpoint = "shallow replacement materializes original message"
+            guard await E2ERunner.poll(timeout: 5, label: "durable recovery materialization", {
+                restarted.entries.contains(where: { $0.id == original.commandId }) ? true : nil
+            }) != nil else { return false }
+            checkpoint = "materialized original retry succeeds without re-admission"
+            let deduped = await restarted.sendSteer(prompt: "accepted but ACK lost")
+            guard deduped, admissions.count == 2 else {
+                E2ERunner.log("FAIL Crew materialized original retry: sent=\(deduped) admissions=\(admissions.count) failure=\(restarted.sendFailure ?? "nil")")
+                return false
+            }
+            checkpoint = "shallow replacement cache retained"
+            guard DocDisk.loadReplica(id: cacheId)?.getMap(id: "meta").get(key: "current")?.asValue()?.boolValue == true else { return false }
+            checkpoint = "original recovery ancestry retained"
+            guard FileManager.default.fileExists(atPath: DocDisk.url(for: cacheId).appendingPathExtension("recovery").path) else { return false }
             let afterRecovery = SessionStore(chatId: chatId, config: config)
             stores.append(afterRecovery)
             checkpoint = "completed original outcome survives restart with unsent composer"
