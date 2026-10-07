@@ -2226,7 +2226,8 @@ impl DocHost {
             self.inner.store.trust_local_command(trust_key)?;
         }
         if let Err(err) = handle.doc.queue_command(&entry) {
-            if let Some(trust_key) = trust_key.as_deref() {
+            if let Some(trust_key) = trust_key.as_deref()
+                && matches!(handle.doc.read_command(command_id), Ok(None)) {
                 let _ = self.inner.store.forget_local_command(trust_key);
             }
             return Err(err.into());
@@ -2588,6 +2589,7 @@ impl DocHost {
         };
         let mut skipped: HashSet<String> = HashSet::new();
         loop {
+            if handle.recovery_error().is_some() { return; }
             let commands = match handle.doc.read_commands() {
                 Ok(commands) => commands,
                 Err(err) => {
@@ -3678,6 +3680,30 @@ mod authority_tests {
         let absent_chat = "00000000-0000-4000-8000-000000000216";
         assert!(restarted.command_entry(absent_chat, "absent-send").unwrap().is_none());
         assert!(store.load_snapshot(absent_chat).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_command_commit_keeps_authority_only_for_the_original_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = scoped_test_host(Arc::new(DocsStore::open(dir.path()).unwrap()));
+        let chat = "00000000-0000-4000-8000-000000000233";
+        let handle = host.open(chat).unwrap();
+        let binding = handle.doc.binding();
+        let replacement = handle.doc.export_snapshot().unwrap();
+        binding.install_journal(Vec::new(), Arc::new(|_, _| Err("disk unavailable".into())));
+        let now = now_ms();
+        assert!(host.queue_command_with_id_at(chat, "failed-commit", SessionCommandPayload::Interrupt {},
+            Some(now - 1), Some(now + 30_000)).is_err());
+        let retained = handle.doc.read_command("failed-commit").unwrap().unwrap();
+        assert_eq!(retained.status, SessionCommandStatus::Pending);
+        assert!(host.command_grant_authorized(&retained));
+        let mut forged = retained.clone();
+        forged.issued_at += 1;
+        assert!(!host.command_grant_authorized(&forged));
+        binding.install_journal(binding.pending_records(), Arc::new(|_, _| Ok(())));
+        binding.adopt_snapshot(&replacement, Some(chat)).unwrap();
+        assert_eq!(handle.doc.read_command("failed-commit").unwrap(), Some(retained));
+        assert!(handle.recovery_error().is_none());
     }
 
     #[tokio::test]

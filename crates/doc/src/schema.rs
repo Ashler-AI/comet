@@ -368,10 +368,13 @@ impl SessionDoc {
                 }
             }
             if current.role != MessageRole::Assistant { return Err(conflict()); }
+            let interruption = entry.parts.split_last().filter(|(last, _)|
+                entry.status == Some(MessageStatus::Aborted) && matches!(last, MessagePart::Error { .. }));
             if current.status != Some(MessageStatus::Streaming) {
                 if matches!(current.status, Some(MessageStatus::Complete | MessageStatus::Aborted))
-                    && entry.status == Some(MessageStatus::Streaming)
-                    && (parts_are_prefix(&entry.parts, &current.parts) || parts_are_prefix(&current.parts, &entry.parts)) {
+                    && ((entry.status == Some(MessageStatus::Streaming)
+                        && (parts_are_prefix(&entry.parts, &current.parts) || parts_are_prefix(&current.parts, &entry.parts)))
+                        || interruption.is_some_and(|(_, prefix)| parts_are_prefix(prefix, &current.parts))) {
                     return Ok(()); // The remote owner already committed a terminal outcome.
                 }
                 return Err(conflict());
@@ -382,14 +385,25 @@ impl SessionDoc {
                 && parts_are_prefix(&entry.parts, &current.parts) {
                 return Ok(());
             }
-            if !matches!(entry.status, Some(MessageStatus::Streaming | MessageStatus::Complete | MessageStatus::Aborted))
-                || !parts_are_prefix(&current.parts, &entry.parts) { return Err(conflict()); }
+            // Restart recovery closes a retained checkpoint, not the richer
+            // acknowledged stream. Keep that stream and append its interruption.
+            let interruption = interruption.filter(|(_, prefix)| parts_are_prefix(prefix, &current.parts));
+            if interruption.is_none() && (!matches!(entry.status, Some(MessageStatus::Streaming | MessageStatus::Complete | MessageStatus::Aborted))
+                || !parts_are_prefix(&current.parts, &entry.parts)) { return Err(conflict()); }
             let parts = match map.get("parts") {
                 Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) => parts,
                 _ => return Err(conflict()),
             };
-            if parts.len() > 0 { parts.delete(0, parts.len())?; }
-            for part in &entry.parts { push_part(&parts, part)?; }
+            if let Some((error, _)) = interruption {
+                if let Some(existing) = current.parts.iter().find(|part| part.id() == error.id()) {
+                    if existing != error { return Err(conflict()); }
+                } else {
+                    push_part(&parts, error)?;
+                }
+            } else {
+                if parts.len() > 0 { parts.delete(0, parts.len())?; }
+                for part in &entry.parts { push_part(&parts, part)?; }
+            }
             map.insert("status", status_str(entry.status.expect("checked message status")))?;
             self.doc.commit()?;
             return Ok(());
@@ -836,6 +850,9 @@ impl SessionDoc {
         {
             return Ok(());
         }
+        if let Some(error) = self.doc.recovery_error() {
+            return Err(DocError::Schema(error));
+        }
         const MAX_COMMAND_METADATA_BYTES: usize = 256 * 1024;
         if entry.id.is_empty() || entry.id.len() > 256 || entry.issued_by.len() > 512 {
             return Err(DocError::Schema(
@@ -1057,7 +1074,13 @@ fn parts_are_prefix(old: &[MessagePart], new: &[MessagePart]) -> bool {
             (MessagePart::Text { id: a, text: old }, MessagePart::Text { id: b, text: new }) => a == b && new.starts_with(old),
             (MessagePart::Tool { id: a, call: old_call, is_error: old_error, resolved: before },
              MessagePart::Tool { id: b, call: new_call, is_error: new_error, resolved: after }) =>
-                a == b && (!*before || (*after && old_call == new_call && old_error == new_error)),
+                a == b && (!*before || (*after && old_error == new_error
+                    && (old_call == new_call || match (old_call, new_call) {
+                        (comet_proto::ToolCall::Todo { items: old }, comet_proto::ToolCall::Todo { items: new }) =>
+                            old.len() <= new.len() && old.iter().zip(new).all(|(old, new)|
+                                old.text == new.text && (!old.done || new.done)),
+                        _ => false,
+                    }))),
             (MessagePart::Input { id: a, request_id: old_id, questions: old, resolved: before },
              MessagePart::Input { id: b, request_id: new_id, questions: new, resolved: after }) =>
                 a == b && old_id == new_id && old == new && (!*before || *after),
@@ -1811,6 +1834,71 @@ mod tests {
         writer.finish(&text("first acknowledged continued"), MessageStatus::Complete).unwrap();
         assert_eq!(doc.read_entry("active").unwrap().unwrap().parts, text("first acknowledged continued"));
         assert_eq!(doc.read_entries().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn interrupted_checkpoint_keeps_acknowledged_stream_content() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let binding = doc.binding();
+        binding.install_journal(Vec::new(), std::sync::Arc::new(|_, _| Ok(())));
+        let text = |value: &str| MessagePart::Text { id: "text".into(), text: value.into() };
+        let plan = |done| MessagePart::Tool {
+            id: "omp-plan".into(),
+            call: ToolCall::Todo { items: vec![comet_proto::TodoItem { text: "Recover the session".into(), done }] },
+            is_error: false,
+            resolved: true,
+        };
+        let later = MessagePart::Text { id: "later".into(), text: "later output".into() };
+        let error = MessagePart::Error { id: "active-recovery".into(), message: "Run interrupted by Crew restart".into() };
+        let writer = SegmentWriter::begin(&doc, "active", "dev-a", 2).unwrap();
+        writer.finish(&[text("first"), plan(false), error.clone()], MessageStatus::Aborted).unwrap();
+        let replacement = SessionDoc::init("chat-1").unwrap();
+        let mut remote = SegmentWriter::begin(&replacement, "active", "dev-a", 2).unwrap();
+        remote.sync(&[text("first acknowledged"), plan(true), later.clone()]).unwrap();
+        let snapshot = replacement.export_snapshot().unwrap();
+        for _ in 0..2 {
+            binding.adopt_snapshot(&snapshot, Some("chat-1")).unwrap();
+            let adopted = doc.read_entry("active").unwrap().unwrap();
+            assert_eq!(adopted.status, Some(MessageStatus::Aborted));
+            assert_eq!(adopted.parts, vec![text("first acknowledged"), plan(true), later.clone(), error.clone()]);
+        }
+        remote.finish(&[text("first acknowledged"), plan(true), later.clone()], MessageStatus::Complete).unwrap();
+        binding.adopt_snapshot(&replacement.export_snapshot().unwrap(), Some("chat-1")).unwrap();
+        let completed = doc.read_entry("active").unwrap().unwrap();
+        assert_eq!(completed.status, Some(MessageStatus::Complete));
+        assert_eq!(completed.parts, vec![text("first acknowledged"), plan(true), later]);
+        let retained = doc.read_entry("active").unwrap().unwrap();
+        let foreign = SessionDoc::init("chat-1").unwrap();
+        let mut writer = SegmentWriter::begin(&foreign, "active", "foreign-device", 2).unwrap();
+        writer.sync(&[text("first acknowledged")]).unwrap();
+        assert!(binding.adopt_snapshot(&foreign.export_snapshot().unwrap(), Some("chat-1")).is_err());
+        assert_eq!(doc.read_entry("active").unwrap(), Some(retained));
+    }
+
+    #[test]
+    fn interrupted_checkpoint_preserves_an_acknowledged_marker_without_duplication() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let binding = doc.binding();
+        binding.install_journal(Vec::new(), std::sync::Arc::new(|_, _| Ok(())));
+        let text = |id: &str, value: &str| MessagePart::Text { id: id.into(), text: value.into() };
+        let error = |message: &str| MessagePart::Error { id: "active-recovery".into(), message: message.into() };
+        let marker = error("Run interrupted by Crew restart");
+        SegmentWriter::begin(&doc, "active", "dev-a", 2).unwrap()
+            .finish(&[text("text", "first"), marker.clone()], MessageStatus::Aborted).unwrap();
+        let replacement = SessionDoc::init("chat-1").unwrap();
+        let mut remote = SegmentWriter::begin(&replacement, "active", "dev-a", 2).unwrap();
+        let acknowledged = vec![text("text", "first acknowledged"), text("later", "later output"), marker];
+        remote.sync(&acknowledged).unwrap();
+        binding.adopt_snapshot(&replacement.export_snapshot().unwrap(), Some("chat-1")).unwrap();
+        let adopted = doc.read_entry("active").unwrap().unwrap();
+        assert_eq!(adopted.status, Some(MessageStatus::Aborted));
+        assert_eq!(adopted.parts, acknowledged);
+
+        let divergent = SessionDoc::init("chat-1").unwrap();
+        let mut writer = SegmentWriter::begin(&divergent, "active", "dev-a", 2).unwrap();
+        writer.sync(&[text("text", "first acknowledged"), text("later", "later output"), error("Conflicting acknowledged marker")]).unwrap();
+        assert!(binding.adopt_snapshot(&divergent.export_snapshot().unwrap(), Some("chat-1")).is_err());
+        assert_eq!(doc.read_entry("active").unwrap(), Some(adopted));
     }
 
     #[test]

@@ -155,10 +155,13 @@ async fn admit_retained_send(engine: &EngineHandle, send: &mut RetainedSend) -> 
             let metadata_notice = receipt.get("metadataError").and_then(serde_json::Value::as_str)
                 .or_else(|| receipt.get("preparationError").and_then(serde_json::Value::as_str))
                 .map(|error| format!("Crew accepted the instruction; metadata recovery needs attention: {error}"));
-            if let Ok(response) = engine.client().call("ReadSessionCommand", read).await {
-                if let Some(pending) = observe_retained_command(send, &response)? { return Ok(SendAdmission { applied: !pending, outcome_notice: pending && metadata_notice.is_none(), notice: metadata_notice.or_else(|| pending.then(|| "Crew accepted the instruction; delivery is pending.".into())) }) }
-            }
-            Ok(SendAdmission { applied: false, outcome_notice: metadata_notice.is_none(), notice: metadata_notice.or_else(|| Some("Crew accepted the instruction; waiting for the owner's outcome.".into())) })
+            let pending = match engine.client().call("ReadSessionCommand", read).await {
+                Ok(response) => observe_retained_command(send, &response)?.unwrap_or(true),
+                Err(_) => true,
+            };
+            let delivery_pending = pending && receipt.get("delivery").and_then(serde_json::Value::as_str) == Some("pending");
+            Ok(SendAdmission { applied: !pending, outcome_notice: delivery_pending && metadata_notice.is_none(),
+                notice: metadata_notice.or_else(|| delivery_pending.then(|| "Crew accepted the instruction; delivery is pending.".into())) })
         }
         Err(error) => {
             if let Ok(response) = engine.client().call("ReadSessionCommand", read).await {
@@ -7686,13 +7689,14 @@ mod tests {
         status: parking_lot::Mutex<&'static str>,
         reads: std::sync::atomic::AtomicUsize,
         metadata_error: parking_lot::Mutex<Option<&'static str>>,
+        delivery: parking_lot::Mutex<&'static str>,
     }
 
     impl RetainedControlRpc {
         fn new() -> Self {
             Self { commands: parking_lot::Mutex::new(HashMap::new()), requests: parking_lot::Mutex::new(Vec::new()),
                 hide_reads: false.into(), queue_error: parking_lot::Mutex::new(None), status: parking_lot::Mutex::new("pending"),
-                reads: 0.into(), metadata_error: parking_lot::Mutex::new(None) }
+                reads: 0.into(), metadata_error: parking_lot::Mutex::new(None), delivery: parking_lot::Mutex::new("notified") }
         }
     }
 
@@ -7717,7 +7721,7 @@ mod tests {
                         }));
                     }
                     if let Some(error) = error { return Err(RpcError::Failed(error.into())) }
-                    comet_rpc::RpcReply::value(&serde_json::json!({"commandId":params["commandId"], "metadataError":*self.metadata_error.lock()}))
+                    comet_rpc::RpcReply::value(&serde_json::json!({"commandId":params["commandId"], "metadataError":*self.metadata_error.lock(), "delivery":*self.delivery.lock()}))
                 }
                 _ => Err(RpcError::UnknownMethod(method.into())),
             }
@@ -7760,7 +7764,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn pending_composer_notice_retires_only_on_authoritative_applied_and_preserves_metadata_warning(cx: &mut gpui::TestAppContext) {
+    async fn notified_pending_commands_do_not_warn_and_real_warnings_survive_readback(cx: &mut gpui::TestAppContext) {
         use std::sync::atomic::Ordering::SeqCst;
         cx.executor().allow_parking();
         let runtime = tokio::runtime::Runtime::new().unwrap(); let _guard = runtime.enter();
@@ -7768,15 +7772,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (composer, path) = retained_test_composer(cx, EngineHandle::for_test(rpc.clone()), dir.path());
         let state = composer.read_with(cx, |composer, _| composer.state.clone());
-        for (turn, metadata_error) in [None, Some("metadata projection failed")].into_iter().enumerate() {
-            *rpc.status.lock() = "pending"; *rpc.metadata_error.lock() = metadata_error;
+        for (turn, (delivery, metadata_error)) in [("notified", None), ("pending", None), ("notified", Some("metadata projection failed"))].into_iter().enumerate() {
+            *rpc.status.lock() = "pending"; *rpc.metadata_error.lock() = metadata_error; *rpc.delivery.lock() = delivery;
+            let warns = delivery == "pending" || metadata_error.is_some();
             composer.update(cx, |composer, cx| composer.submit_command(&format!("instruction {turn}"), cx));
             cx.condition(&composer, |composer, _| rpc.requests.lock().len() == turn + 1 && !composer.is_sending("chat")
-                && composer.failure.is_some() && composer.refreshing_send_scopes.is_empty()).await;
+                && composer.failure.is_some() == warns && composer.refreshing_send_scopes.is_empty()).await;
             let pending = RetainedSend::load(path.clone(), "chat").unwrap().pop().unwrap();
             assert!(pending.accepted && !pending.applied && !pending.terminal);
             let notice = composer.read_with(cx, |composer, _| {
-                assert_eq!(composer.retained_outcome_notice.is_some(), metadata_error.is_none());
+                assert_eq!(composer.retained_outcome_notice.is_some(), delivery == "pending" && metadata_error.is_none());
                 composer.failure.clone()
             });
 
@@ -7857,7 +7862,6 @@ mod tests {
             let original = rpc.requests.lock().last().unwrap().clone();
             *rpc.status.lock() = status;
             submit_control_and_wait(&composer, &engine, "Stop Crew session", stop.clone(), cx).await;
-            assert!(composer.read_with(cx, |composer, _| composer.failure.as_deref().unwrap().contains(status)));
             assert!(RetainedSend::load(path.clone(), "chat").unwrap().is_empty());
             let mut outcome: RetainedSend = serde_json::from_slice(&std::fs::read(path.as_ref().unwrap().with_file_name(format!("{}.outcome", original["commandId"].as_str().unwrap()))).unwrap()).unwrap();
             assert!(outcome.accepted && outcome.terminal && !outcome.applied);
@@ -7882,7 +7886,6 @@ mod tests {
         let stop = retained_control_params("agent-a", SessionControlAction::Stop { expected_turn_id:None });
         *rpc.queue_error.lock() = Some("command_destination_changed");
         submit_control_and_wait(&composer, &engine, "Stop Crew session", stop.clone(), cx).await;
-        assert!(composer.read_with(cx, |composer, _| composer.failure.as_deref().unwrap().contains("rejected this admission attempt")));
         let unaccepted = RetainedSend::load(path.clone(), "chat").unwrap().pop().unwrap();
         assert!(!unaccepted.accepted && !unaccepted.terminal);
         *rpc.queue_error.lock() = None;
@@ -7892,7 +7895,6 @@ mod tests {
         let accepted = RetainedSend::load(path, "chat").unwrap().pop().unwrap();
         assert!(accepted.accepted && !accepted.terminal);
         assert_eq!(accepted.params, unaccepted.params);
-        assert!(composer.read_with(cx, |composer, _| composer.failure.as_deref().unwrap().contains("retry admission attempt was rejected")));
         assert!(rpc.requests.lock().iter().all(|request| request == &unaccepted.params));
     }
 

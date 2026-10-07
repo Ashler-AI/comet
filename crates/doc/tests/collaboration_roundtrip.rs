@@ -196,7 +196,7 @@ fn reconnect_and_model_handoff_keep_both_sessions_publications() {
             AgentSessionSource::Scaffold,
         ),
     ] {
-        doc.append_publication(&publication(
+        let mut record = publication(
             &format!("session/{id}"),
             PublicationValue::AgentSession(Box::new(AgentSessionRecord {
                 session_id: id.into(),
@@ -213,8 +213,9 @@ fn reconnect_and_model_handoff_keep_both_sessions_publications() {
                 created_at: 30,
                 unknown: BTreeMap::new(),
             })),
-        ))
-        .unwrap();
+        );
+        record.published_by = owner.into();
+        doc.append_publication(&record).unwrap();
     }
     doc.append_publication(&publication(
         "provenance/message-kyle",
@@ -266,8 +267,8 @@ fn reconnect_and_model_handoff_keep_both_sessions_publications() {
     restored.import(&bytes).unwrap();
     let restored = SessionDoc::from_doc(restored);
     let snapshot = restored.collaboration_snapshot().unwrap();
-    assert_eq!(snapshot.sessions.len(), 2);
-    assert_eq!(snapshot.publications.len(), before.len());
+    assert_eq!(snapshot.sessions.iter().map(|session| (session.session_id.as_str(), session.owner_subject.as_str())).collect::<Vec<_>>(),
+        [("chris-session", "iap:chris@example.com"), ("kyle-session", "iap:kyle@example.com")]);
     let audit = snapshot
         .publications
         .iter()

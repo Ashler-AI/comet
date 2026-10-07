@@ -25,6 +25,22 @@ Mobile retries recognize the original materialized message despite a lost
 admission reply, retire its retained draft, and do not admit it again. Terminal
 rejection remains authoritative.
 
+Interrupted transcript checkpoints keep richer acknowledged output and monotonic
+task progress while retaining one interruption marker; a conflicting acknowledged
+marker remains blocked, and acknowledged terminal outcomes still win.
+Recovery-blocked admission cannot append new commands, and
+a failed commit retains authority only for an already-materialized original intent.
+Command execution waits for document recovery. Desktop commands whose delivery
+is notified do not show a delivery-pending warning while awaiting execution;
+actual delivery failures and metadata-recovery warnings remain visible.
+
+The retained staging transcript recovered against its authenticated remote snapshot
+with all 53 acknowledged parts plus the interruption marker. All 742 local checks
+passed, and an isolated rebuilt native engine completed an instruction and its
+same-identity retry without duplication. The paid-provider image test stayed
+ignored; foreground UI smoke lacked desktop-control confirmation. Installed
+clients were not replaced, and local typechecks were intentionally skipped.
+
 Composer submissions claim their draft and snapshot the authorized target and
 configuration before asynchronous recovery. Later choices cannot retarget them.
 Stop and input retries match their execution target and request; terminal controls retire
