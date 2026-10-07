@@ -19,7 +19,8 @@ const deviceRooms = {
   })
 } as unknown as Env["DEVICE_ROOMS"];
 
-const edgeEnv = (authMode: "scaffold" | "dev", environment: "staging" | "local"): Env =>
+const edgeEnv = (authMode: "scaffold" | "dev", environment: "staging" | "local",
+  requiredCapabilities = "session.read session.environment"): Env =>
   ({
     AUTH_MODE: authMode,
     ENVIRONMENT: environment,
@@ -28,7 +29,7 @@ const edgeEnv = (authMode: "scaffold" | "dev", environment: "staging" | "local")
         ? "http://127.0.0.1:8788"
         : "https://scaffold-staging.internal.ashler.com",
     SCAFFOLD_PROJECT_SCOPE: environment === "local" ? "ashler-local" : "ashler-staging",
-    SCAFFOLD_REQUIRED_CAPABILITIES: "session.read session.environment",
+    SCAFFOLD_REQUIRED_CAPABILITIES: requiredCapabilities,
     DEVICE_ROOMS: deviceRooms,
     SESSION_ROOMS: {} as Env["SESSION_ROOMS"],
     AUTH_GRANTS: {} as Env["AUTH_GRANTS"],
@@ -63,8 +64,7 @@ describe("trusted device host forwarding", () => {
     "controlDeploymentId=deployment-a", "deploymentId=deployment-a",
     "controlDeploymentId=", "deploymentId="
   ])("rejects ordinary control scope %s instead of forwarding a legacy command", async (scopeQuery) => {
-    const env = edgeEnv("dev", "local");
-    env.SCAFFOLD_REQUIRED_CAPABILITIES = "session.read session.chat session.control session.environment";
+    const env = edgeEnv("dev", "local", "session.read session.chat session.control session.environment");
     const response = await worker.fetch(new Request(
       `http://127.0.0.1/device/local-engine/ws?role=client&purpose=control&controlSessionId=11111111-1111-4111-8111-111111111111&${scopeQuery}`,
       { headers: { authorization: "Bearer engine@ashler-local", upgrade: "websocket" } }
@@ -75,8 +75,7 @@ describe("trusted device host forwarding", () => {
   });
 
   it("admits read-only outcome authority only on an exact one-shot session socket", async () => {
-    const env = edgeEnv("dev", "local");
-    env.SCAFFOLD_REQUIRED_CAPABILITIES = "session.read";
+    const env = edgeEnv("dev", "local", "session.read");
     for (const [query, status] of [
       ["role=client&purpose=control&controlSessionId=11111111-1111-4111-8111-111111111111", 204],
       ["role=client", 403], ["role=host", 403],

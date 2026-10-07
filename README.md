@@ -36,6 +36,8 @@ live writer-gate cutover, staging publication and physical-device acceptance
 remain with the integration owner.
 The required native verification workflow checks generated Worker declarations
 and TypeScript remotely before running the Edge/native convergence probes.
+Worker fragment timers use concrete platform handle types; authorization fixtures
+retain narrower capability cases without mutating generated literal bindings.
 
 ## Unreleased: workspace snapshot admission
 

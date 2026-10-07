@@ -311,7 +311,7 @@ export class SessionRoom implements DurableObject {
   /** In-memory fragment reassembly. Lost on hibernation → the sender gets a
    * FragmentTimeout ack for the unknown batch and resends — self-healing. */
   private readonly fragments = new Map<WebSocket, Map<string, FragmentBatch>>();
-  private fragmentTimer: number | undefined;
+  private fragmentTimer: number | NodeJS.Timeout | undefined;
   private applyingFragmentBytes = 0;
   private applyingFragmentParts = 0;
   /** Revocations delivered while this instance is live close the TOCTOU gap
