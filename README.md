@@ -21,6 +21,9 @@ again; peer outcome reads retain the same exact authenticated scope as admission
 AppState events refresh unresolved outcomes without re-admission. Authoritative
 terminal proof retires the original journal record and its associated delivery
 notice; metadata-recovery and unrelated warnings are not cleared by that proof.
+Mobile retries recognize the original materialized message despite a lost
+admission reply, retire its retained draft, and do not admit it again. Terminal
+rejection remains authoritative.
 
 Composer submissions claim their draft and snapshot the authorized target and
 configuration before asynchronous recovery. Later choices cannot retarget them.
