@@ -1567,17 +1567,26 @@ extension AppModel {
                 SessionEnvironment(source: SessionEnvironmentSource(kind: "scaffold", sandboxId: "sandbox-a"), ownerPrincipal: config.userId,
                     scope: CollaborationScope(projectId: config.projectScope, deploymentId: "deployment-a", sessionId: UUID().uuidString.lowercased()))
             ] {
-                checkpoint = "conflicting environment seed: project=\(conflicting.scope.projectId) deployment=\(conflicting.scope.deploymentId ?? "nil") session=\(conflicting.scope.sessionId ?? "nil") sandbox=\(conflicting.source.sandboxId ?? "nil")"
-                guard originalWorkspace.addSessionRef(chatId: id, environment: conflicting) != nil else { return false }
+                // Each route is learned once; known membership routes cannot be retargeted.
+                let caseId = UUID().uuidString.lowercased()
+                let caseScope = CollaborationScope(projectId: config.projectScope, deploymentId: "deployment-a", sessionId: caseId)
+                var caseEnvironment = conflicting
+                if caseEnvironment.scope.sessionId == id { caseEnvironment.scope.sessionId = caseId }
+                checkpoint = "independent conflicting membership"
+                try probe.browseScaffoldSessionLink(scope: caseScope, sandboxId: "sandbox-a")
+                guard let membership = originalWorkspace.sessionRef(id: caseId), membership.environment == nil else { return false }
+                checkpoint = "conflicting environment seed: project=\(caseEnvironment.scope.projectId) deployment=\(caseEnvironment.scope.deploymentId ?? "nil") session=\(caseEnvironment.scope.sessionId ?? "nil") sandbox=\(caseEnvironment.source.sandboxId ?? "nil")"
+                guard originalWorkspace.addSessionRef(chatId: caseId, environment: caseEnvironment) != nil else { return false }
                 let before = originalWorkspace.doc.getDeepValue()
                 let beforeJournal = try Data(contentsOf: DocDisk.intentURL(for: cacheId))
+                let beforeRoutes = try Data(contentsOf: DocDisk.intentURL(for: cacheId + "-browse"))
                 checkpoint = "conflicting browse refusal"
-                do { try probe.browseScaffoldSessionLink(scope: scope, sandboxId: "sandbox-a"); return false }
+                do { try probe.browseScaffoldSessionLink(scope: caseScope, sandboxId: "sandbox-a"); return false }
                 catch { }
                 checkpoint = "conflicting browse atomicity"
                 guard originalWorkspace.doc.getDeepValue() == before,
                       try Data(contentsOf: DocDisk.intentURL(for: cacheId)) == beforeJournal,
-                      try Data(contentsOf: DocDisk.intentURL(for: cacheId + "-browse")) == routes else { return false }
+                      try Data(contentsOf: DocDisk.intentURL(for: cacheId + "-browse")) == beforeRoutes else { return false }
             }
             checkpoint = "corrupt browse metadata fails closed"
             try Data("corrupt Crew browse route".utf8).write(to: DocDisk.intentURL(for: cacheId + "-browse"), options: .atomic)
