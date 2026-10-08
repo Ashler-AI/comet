@@ -927,7 +927,10 @@ final class SessionStore {
             guard sameGeneration(value, owner), let deviceId = value["ownerDeviceId"]?.stringValue,
                   let status = value["status"]?.stringValue.flatMap(SessionStatus.init(rawValue:)) else { continue }
             let updatedAt = value["updatedAt"]?.i64Value ?? value["createdAt"]?.i64Value ?? 0
-            let row = SessionRow(chatId: chatId, deviceId: deviceId, status: status, startedAt: value["startedAt"]?.i64Value, updatedAt: updatedAt)
+            var row = SessionRow(chatId: chatId, deviceId: deviceId, status: status, startedAt: value["startedAt"]?.i64Value, updatedAt: updatedAt)
+            if let retry = value["modelRetry"], let data = try? JSONSerialization.data(withJSONObject: retry.jsonObject) {
+                row.modelRetry = try? JSONDecoder().decode(ModelRetry.self, from: data)
+            }
             if status == .working || status == .awaitingInput {
                 if writer != chatId { hasActiveChildren = true }
                 if effectiveStatus(row, now: now) == nil {

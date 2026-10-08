@@ -144,6 +144,7 @@ impl RouteState {
 struct RelayStreamContext {
     session_id: String,
     request_id: String,
+    upstream_request_id: Option<String>,
 }
 
 struct InstrumentedRelayStream {
@@ -172,16 +173,17 @@ impl InstrumentedRelayStream {
         }
     }
 
-    fn finish(&mut self, outcome: &'static str, error: Option<&(dyn Error + Send + Sync)>) {
+    fn finish(&mut self, outcome: &'static str, error: Option<&(dyn Error + Send + Sync + 'static)>) {
         self.terminated = true;
         if let Some(error) = error {
             tracing::warn!(
                 outcome,
                 session_id = %self.context.session_id,
                 request_id = %self.context.request_id,
+                upstream_request_id = ?self.context.upstream_request_id,
                 status = self.status.as_u16(),
                 bytes_received = self.bytes_received,
-                err = %error,
+                cause = %crate::scaffold::classify_transport_error(error),
                 "inference relay response stream terminated"
             );
         } else {
@@ -189,6 +191,7 @@ impl InstrumentedRelayStream {
                 outcome,
                 session_id = %self.context.session_id,
                 request_id = %self.context.request_id,
+                upstream_request_id = ?self.context.upstream_request_id,
                 status = self.status.as_u16(),
                 bytes_received = self.bytes_received,
                 "inference relay response stream terminated"
@@ -233,6 +236,15 @@ impl Drop for InstrumentedRelayStream {
             self.finish("downstream_dropped", None);
         }
     }
+}
+
+fn diagnostic_request_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        && !["sk-", "sk_", "ia2", "cs1", "eyj"].iter().any(|prefix| {
+            value.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        })
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -638,17 +650,23 @@ impl InferenceRelay {
         let request_id = headers
             .get("x-request-id")
             .and_then(|value| value.to_str().ok())
-            .filter(|value| !value.is_empty() && value.len() <= 128)
+            .filter(|value| diagnostic_request_id(value))
             .map(str::to_string)
             .unwrap_or_else(new_id);
         let stream_context = RelayStreamContext {
             session_id: route.request.logical_session_id.clone(),
             request_id: request_id.clone(),
+            upstream_request_id: None,
         };
         let authority = match self.current_authority(&route).await {
             Ok(authority) => authority,
-            Err(error) => {
-                tracing::warn!(err = %error, "inference relay authority refresh failed");
+            Err(_) => {
+                tracing::warn!(
+                    session_id = %stream_context.session_id,
+                    request_id = %request_id,
+                    error_code = "agent_auth_unavailable",
+                    "inference relay authority refresh failed"
+                );
                 return json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     json!({ "error": "agent_auth_unavailable" }),
@@ -685,7 +703,13 @@ impl InferenceRelay {
                 stream_response(response, cancellation, stream_context)
             }
             Err(error) => {
-                tracing::warn!(err = %error, "inference relay upstream failed");
+                tracing::warn!(
+                    session_id = %stream_context.session_id,
+                    request_id = %request_id,
+                    cause = ?error.transport_cause(),
+                    error_code = "inference_upstream_unavailable",
+                    "inference relay upstream failed"
+                );
                 json_response(
                     StatusCode::BAD_GATEWAY,
                     json!({ "error": "inference_upstream_unavailable" }),
@@ -829,10 +853,14 @@ fn json_response(status: StatusCode, body: serde_json::Value) -> Response<RelayB
 fn stream_response(
     upstream: reqwest::Response,
     cancellation: comet_harness::CancellationToken,
-    context: RelayStreamContext,
+    mut context: RelayStreamContext,
 ) -> Response<RelayBody> {
     let status = upstream.status();
     let headers = upstream.headers().clone();
+    context.upstream_request_id = headers.get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| diagnostic_request_id(value))
+        .map(str::to_string);
     let upstream = upstream
         .bytes_stream()
         .map(|chunk| chunk.map_err(|error| -> BoxError { Box::new(error) }));

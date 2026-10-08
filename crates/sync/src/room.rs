@@ -1631,8 +1631,21 @@ impl Session {
                 let acknowledged = batch.is_some();
                 if let Some((_, batch)) = batch {
                     let mut version = VersionVector::default();
-                    for bytes in batch { if let Ok(metadata) = LoroDoc::decode_import_blob_meta(&bytes, true) { version.merge(&metadata.partial_end_vv); } }
+                    let mut accepted_snapshot = false;
+                    for bytes in batch {
+                        if let Ok(metadata) = LoroDoc::decode_import_blob_meta(&bytes, true) {
+                            accepted_snapshot |= matches!(metadata.mode, loro::EncodedBlobMode::Snapshot | loro::EncodedBlobMode::ShallowSnapshot | loro::EncodedBlobMode::OutdatedSnapshot)
+                                && metadata.partial_end_vv.includes_vv(&self.required_remote);
+                            version.merge(&metadata.partial_end_vv);
+                        }
+                    }
                     self.doc.acknowledge_scoped(self.scope_generation,&version).map_err(|error| SyncError::Loro(error.to_string()))?;
+                    if self.repairing_join && accepted_snapshot {
+                        // The server accepted our complete history. An equal-version
+                        // rejoin need not send backfill to release cold recovery.
+                        self.recovering_snapshot = false;
+                        self.recovery_doc = None;
+                    }
                 }
                 if crdt == CrdtType::Loro
                     && acknowledged

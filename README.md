@@ -105,6 +105,13 @@ aliases together, preserving canonical ownership, tombstones and completed
 outcomes. Covered bootstrap observations can coalesce; conflicting user edits
 or unknown ancestry retain their original evidence and remain blocked.
 
+An authenticated workspace checkpoint that is already covered by the complete
+local cache cannot roll back newer accepted edits. Recovery keeps that isolated
+cache only when it still matches every retained intent, preserving archived
+sessions and field tombstones without blocking new-session metadata commits.
+Unseen competing edits and remote resurrections still retain their original
+evidence and fail closed; no automatic reset or cache deletion is performed.
+
 Same-owner session memberships can learn their first environment route. Recovery
 preserves that route across restarts and refuses changes to known scopes or
 owners.
@@ -845,6 +852,21 @@ sh install.sh --install-omp
 This installs the official [oh-my-pi v17.2.9](https://github.com/can1357/oh-my-pi/releases/tag/v17.2.9) artifact to `~/.local/bin/omp` after SHA-256 verification against the per-platform pins in `install.sh` (darwin arm64/x64, linux glibc and musl arm64/x64). App updates can be started at any time from **Settings → Crew update**. The engine also tracks agent CLI versions on its release-check cadence; **Settings → Agents** offers per-agent updates through each CLI's own self-updater (`omp update`, `claude update`, `codex update`), and by default the first boot of a new Crew version refreshes installed agents automatically (**Settings** toggle or `COMET_UPDATE_HARNESSES=0` to opt out).
 
 To use a remote OMP auth broker, launch Comet with `OMP_AUTH_BROKER_URL` and either `OMP_AUTH_BROKER_TOKEN` or `OMP_AUTH_BROKER_TOKEN_FILE`. The token-file form is preferred for service managers: it must be mode `0600`, is removed before parsing/spawn on every outcome, and Comet passes the bearer only in the OMP child environment, never argv or logs. Do not print or interpolate the token in shell commands. Scaffold-host OMP launches remain isolated with `--profile scaffold-host --no-extensions --no-skills --no-rules`.
+
+### Model-stream recovery
+
+Crew-owned OMP runs allow three model-level retries with OMP's bounded backoff;
+provider/SDK HTTP retries remain disabled. Completed tools and the user task are
+not replayed by Crew. Existing OMP replay-safe stream repair remains unchanged.
+Desktop, iOS, and web show **Reconnecting to model — attempt 2/4** during recovery
+and clear the indicator on resumed progress, interruption, or terminal completion.
+Retry counters are live session metadata, not transcript errors or reasoning text.
+
+Inference diagnostics join Crew's `request_id` to the server's `requestId` using
+`x-agent-auth-request-id`, separately from OpenAI's `x-request-id`. IDs are bounded
+and credential-like values are omitted; transport causes are classified without
+logging raw exception messages, prompts, or credentials. Partial HTTP 200 streams
+remain errors, and inference timeout behavior is unchanged.
 
 ### Desktop gateway extension discovery
 

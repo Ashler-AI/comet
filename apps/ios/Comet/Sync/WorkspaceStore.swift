@@ -637,6 +637,10 @@ final class WorkspaceStore {
             rows[chatId] = SessionRow(chatId: chatId, deviceId: deviceId, status: status,
                                       startedAt: m["startedAt"]?.i64Value,
                                       updatedAt: m["updatedAt"]?.i64Value ?? 0)
+            if let value = m["modelRetry"],
+               let data = try? JSONSerialization.data(withJSONObject: value.jsonObject) {
+                rows[chatId]?.modelRetry = try? JSONDecoder().decode(ModelRetry.self, from: data)
+            }
         }
         let orderedChats = chats.sorted { $0.id < $1.id }
         let reusableLists = previous.flatMap { previous in

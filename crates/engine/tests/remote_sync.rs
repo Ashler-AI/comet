@@ -875,6 +875,7 @@ async fn scaffold_host_joins_project_workspace_and_publishes_status() {
         chat_id: "sandbox-chat".into(),
         device_id: sandbox.device_id.clone(),
         status: comet_proto::SessionStatus::Working,
+        model_retry: None,
         started_at: Some(chrono::Utc::now()),
         updated_at: chrono::Utc::now(),
     };

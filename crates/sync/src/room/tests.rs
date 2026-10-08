@@ -1257,6 +1257,82 @@ async fn journal_only_full_backfill_finishes_durable_binding_recovery() {
 }
 
 #[tokio::test]
+async fn acknowledged_complete_repair_finishes_cold_recovery_without_backfill() {
+    let local = comet_doc::WorkspaceDoc::new();
+    let binding = local.binding();
+    let row = binding.get_map("chats").insert_container("chat", loro::LoroMap::new()).unwrap();
+    row.insert("id", "chat").unwrap();
+    row.insert("deviceId", "owner").unwrap();
+    row.insert("archived", false).unwrap();
+    binding.commit().unwrap();
+    let baseline_version = binding.oplog_vv();
+    binding.install_journal(Vec::new(), Arc::new(|_, _| Ok(())));
+    row.insert("archived", true).unwrap();
+    binding.commit().unwrap();
+    let original = binding.pending_records()[0].clone();
+    let suffix = binding.export(ExportMode::updates(&baseline_version)).unwrap();
+    // The server retained an archival intent without its baseline dependencies.
+    let incomplete = LoroDoc::new();
+    let status = incomplete.import(&suffix).unwrap();
+    assert!(status.pending.as_ref().is_some_and(|pending| !pending.is_empty()));
+    assert!(!incomplete.state_vv().includes_vv(&binding.oplog_vv()));
+
+    let (mut session, mut wire) = readiness_session(LoroDoc::new());
+    session.doc = binding;
+    session.recovering_snapshot = true;
+    let (tx, mut rx) = oneshot::channel();
+    let mut ready = Some(tx);
+    session.send_join_loro(Vec::new()).await.unwrap();
+    assert!(matches!(decode(&wire.try_recv().unwrap()).unwrap(), ProtocolMessage::JoinRequest { version, .. } if version.is_empty()));
+    session.handle_frame(&encode(&ProtocolMessage::JoinError {
+        crdt: CrdtType::Loro, room_id: session.room_id.clone(),
+        code: JoinErrorCode::AppError, message: "incomplete_history".into(),
+        receiver_version: None, app_code: None,
+    }).unwrap(), &mut ready).await.unwrap();
+    let ProtocolMessage::DocUpdate { updates, batch_id, .. } = decode(&wire.try_recv().unwrap()).unwrap() else {
+        panic!("incomplete server requires a complete snapshot");
+    };
+    assert_eq!(updates.len(), 1);
+    assert!(matches!(LoroDoc::decode_import_blob_meta(&updates[0], true).unwrap().mode, loro::EncodedBlobMode::Snapshot));
+    let server = LoroDoc::new();
+    server.import(&updates[0]).unwrap();
+    let status = server.import(&suffix).unwrap();
+    assert!(status.pending.as_ref().is_none_or(|pending| pending.is_empty()));
+    assert_eq!(server.state_vv(), server.oplog_vv());
+    assert_eq!(server.oplog_vv(), session.doc.oplog_vv());
+    assert_eq!(server.get_map("chats").get_deep_value().to_json_value()["chat"]["archived"], true);
+    assert_eq!(session.doc.pending_records()[0].value, original.value);
+    assert!(!session.stats.snapshot().connected);
+    assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+    session.handle_frame(&encode(&ProtocolMessage::Ack {
+        crdt: CrdtType::Loro, room_id: session.room_id.clone(), ref_id: new_batch_id(),
+        status: UpdateStatusCode::Ok,
+    }).unwrap(), &mut ready).await.unwrap();
+    assert!(session.recovering_snapshot, "unmatched ACK cannot release recovery");
+    assert_eq!(session.doc.pending_records()[0].value, original.value);
+    session.handle_frame(&encode(&ProtocolMessage::Ack {
+        crdt: CrdtType::Loro, room_id: session.room_id.clone(), ref_id: batch_id,
+        status: UpdateStatusCode::Ok,
+    }).unwrap(), &mut ready).await.unwrap();
+    let ProtocolMessage::JoinRequest { crdt: CrdtType::Loro, version, .. } = decode(&wire.try_recv().unwrap()).unwrap() else { panic!("repair ACK must rejoin") };
+    assert_eq!(VersionVector::decode(&version).unwrap(), server.oplog_vv());
+    assert!(!session.stats.snapshot().connected, "ACK alone does not establish membership");
+    assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+    // Equal versions have no causal backfill; JoinOk alone must complete readiness.
+    session.handle_frame(&encode(&ProtocolMessage::JoinResponseOk {
+        crdt: CrdtType::Loro, room_id: session.room_id.clone(),
+        version: server.oplog_vv().encode(), permission: Permission::Write, extra: None,
+    }).unwrap(), &mut ready).await.unwrap();
+    rx.try_recv().unwrap().unwrap();
+    assert!(session.stats.snapshot().connected);
+    assert!(!session.recovering_snapshot);
+    assert!(session.recovery_doc.is_none());
+    assert!(session.pending.is_empty());
+    assert!(session.doc.pending_records().is_empty());
+    assert_eq!(session.doc.get_map("chats").get_deep_value().to_json_value()["chat"]["archived"], original.value.unwrap()["archived"]);
+}
+
+#[tokio::test]
 async fn initial_readiness_waits_for_materialized_server_state() {
     let server = LoroDoc::new();
     server

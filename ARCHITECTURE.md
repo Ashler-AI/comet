@@ -204,6 +204,11 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
    pending history reports `JoinError(AppError, "incomplete_history")` without advertising a
    partial version. An authorized writer may supply a complete snapshot on that recovery-only
    socket, then rejoin after its ACK. Fresh empty readers cannot manufacture missing history.
+   A matched successful complete-snapshot repair ACK releases cold journal recovery
+   only after scope-checked acknowledgement and advertised-history coverage. The
+   following equal-version JoinOk may have no backfill; it must still reach ready
+   once pending uploads are acknowledged. Unknown ACKs and rejected scopes cannot
+   release the recovery gate.
    Workspace replay failures preserve stored bytes and keep cold replay retryable after
    transient resource failures; the transcript crash budget must not permanently lock
    workspace discovery. Irreversibly trimmed gaps still require a replica or backup
