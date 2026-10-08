@@ -37,10 +37,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CREW_CHECK_LABEL");
 }
 ''')
-        env = dict(os.environ, HOME=str(home), CARGO_HOME=os.environ.get("CARGO_HOME", str(Path.home() / ".cargo")),
+        env = dict(os.environ, HOME=str(home), CARGO_HOME=str(home / ".cargo"),
                    RUSTUP_HOME=os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup")),
                    ASHLER_INCREMENTAL_TSC_CHECKS="false", CI="true", COMET_LOCAL_AGENT_RUNTIME="1",
-                   CREW_CHECK_DIR=str(base), CREW_CHECK_LABEL="first", CARGO_BUILD_JOBS="40")
+                   CREW_CHECK_DIR=str(base), CREW_CHECK_LABEL="first", CARGO_BUILD_JOBS="40",
+                   RUSTC_WRAPPER="", RUSTC_WORKSPACE_WRAPPER="")
         for key in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET", "CARGO_ENCODED_RUSTFLAGS", "RUSTFLAGS"):
             env.pop(key, None)
         env["PATH"] += os.pathsep + str(Path.home() / ".cargo/bin")
