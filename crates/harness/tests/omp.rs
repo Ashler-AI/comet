@@ -305,6 +305,109 @@ async fn goal_command_ack_refreshes_state_without_goal_updated() {
 }
 
 #[tokio::test]
+async fn state_refresh_drains_burst_events_before_the_response() {
+    let _env = env_lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("OMP_ARGV_LOG", temp.path().join("argv"));
+        std::env::set_var("OMP_STATE_BURST", "1");
+        std::env::set_var("OMP_OMIT_GOAL_EVENTS", "1");
+    }
+    for prompt in [
+        "scenario:todo-refresh",
+        "/goal set Persistent editor indicator",
+    ] {
+        let mut run_request = request(None);
+        run_request.prompt = prompt.into();
+        let harness = OmpHarness::new().with_executable(fixture_path());
+        let mut stream = harness.run(run_request, controls()).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut text = String::new();
+            let mut refreshed = false;
+            let mut completed = false;
+            while let Some(event) = stream.next().await {
+                match event.unwrap() {
+                    AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
+                    AgentEvent::ToolCall {
+                        id,
+                        call: comet_proto::ToolCall::Todo { items },
+                    } if id == "omp-plan" => {
+                        refreshed = items.len() == 1
+                            && items[0].text == "Verify migration"
+                            && items[0].done;
+                    }
+                    AgentEvent::ToolCall {
+                        id,
+                        call:
+                            comet_proto::ToolCall::Unknown {
+                                input: Some(input), ..
+                            },
+                    } if id == comet_proto::OMP_GOAL_STATE_CALL_ID => {
+                        refreshed = input["goal"]["objective"] == "Persistent editor indicator";
+                    }
+                    AgentEvent::Done {
+                        status: DoneStatus::Completed,
+                        ..
+                    } => completed = true,
+                    _ => {}
+                }
+            }
+            assert_eq!(text, "queued event\n".repeat(512));
+            assert!(refreshed, "state refresh was lost for {prompt}");
+            assert!(completed, "turn completion was lost for {prompt}");
+        })
+        .await;
+        if result.is_err() {
+            unsafe {
+                std::env::remove_var("OMP_STATE_BURST");
+                std::env::remove_var("OMP_OMIT_GOAL_EVENTS");
+            }
+        }
+        result.expect("state response behind a full event queue must not deadlock");
+    }
+    unsafe {
+        std::env::remove_var("OMP_STATE_BURST");
+        std::env::remove_var("OMP_OMIT_GOAL_EVENTS");
+        std::env::remove_var("OMP_ARGV_LOG");
+    }
+}
+
+#[tokio::test]
+async fn unanswered_state_refresh_does_not_block_stop() {
+    let _env = env_lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("OMP_ARGV_LOG", temp.path().join("argv"));
+    }
+    let (_steer_tx, steer_rx) = mpsc::channel(4);
+    let mut run_controls = controls();
+    run_controls.steering = steer_rx;
+    let interrupt = run_controls.interrupt.clone();
+    let mut run_request = request(None);
+    run_request.prompt = "scenario:todo-refresh-no-response".into();
+    let harness = OmpHarness::new().with_executable(fixture_path());
+    let mut stream = harness.run(run_request, run_controls).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                AgentEvent::ToolResult { id, .. } if id == "todo-1" => interrupt.cancel(),
+                AgentEvent::Done { status, .. } => {
+                    assert_eq!(status, DoneStatus::Interrupted);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        panic!("Stop did not settle the pending state refresh");
+    })
+    .await
+    .expect("Stop must not wait for the state response");
+    unsafe {
+        std::env::remove_var("OMP_ARGV_LOG");
+    }
+}
+
+#[tokio::test]
 async fn fake_omp_proves_rpc_mode_execution_and_event_mapping() {
     let _env = env_lock().await;
     let temp = tempfile::tempdir().unwrap();
