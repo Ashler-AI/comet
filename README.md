@@ -27,8 +27,8 @@ Workspace replay now streams every accepted record in sequence, retaining the
 final causal-dependency checks and membership removals. Exact-byte workerd replay
 preserved all 1,666 raw chats, 1,547 memberships, complete state and version vector;
 WASM used 99.8125 MiB after import and 106.6875 MiB after materialization, versus
-134/140.6875 MiB before. Hosted total-memory and live convergence remain release
-gates; local workerd does not enforce the hosted total-heap limit.
+134/140.6875 MiB before. Hosted staging subsequently served all 1,666 chat rows
+and 1,547 memberships to an authenticated cold reader without clearing history.
 
 Mobile build 31 defers local uploads during authoritative recovery and rejects
 queued updates from a replaced document. Retained intents survive adoption;
@@ -36,6 +36,22 @@ the existing mobile regression covers recovery edits, live catalog updates and
 membership revocation. All 217 Edge tests passed. Local typechecks were
 intentionally not run to preserve workstation resources; mobile verification
 and native/Worker type gates run in remote CI.
+
+Native recovery also preserves the imported histories' version vectors before
+normalizing legacy self-session aliases. Normalization creates local operations;
+counting them as unseen remote edits falsely conflicted with retained user intent
+and prevented the workspace from joining. Identity, route and genuine concurrent
+edit checks remain enforced ([PR #86](https://github.com/Ashler-AI/comet/pull/86)).
+
+The signed, notarized **0.1.145** candidate from merged source
+`c0445cc0a4511f05236e4443eb8039a814f91648`
+([run 37820291549](https://github.com/Ashler-AI/comet/actions/runs/37820291549)) passed
+remote native/mobile gates, including all **110 document** and **55 sync** tests.
+An isolated copy of the actual failed **0.1.144** cache reproduced the conflict;
+the candidate recovered **4,784 retained intents**, connected, and converged
+**1,601 memberships**, including the previously missing active session, through
+the real local Edge Worker. No live database writes, provider inference, local
+compilation or local typechecks were used. Captured user data was not committed.
 
 ## Crew 0.1.144: sync and restart reliability
 

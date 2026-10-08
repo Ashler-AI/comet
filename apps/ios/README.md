@@ -22,7 +22,7 @@ automatically): [loro-swift 1.13.x](https://github.com/loro-dev/loro-swift)
 (cmark-gfm: tables/strikethrough/tasklists — the same feature set as the
 desktop's pulldown-cmark config).
 
-Mobile staging **1.0 (30)** and production **1.0 (20)** are available
+Mobile staging **1.0 (31)** and production **1.0 (20)** are available
 through their existing **Ashler Internal** TestFlight groups. Both are internal-only
 releases, not public App Store submissions. Upload and verification evidence is
 recorded below.
@@ -112,6 +112,26 @@ is ignored after adoption. The existing reset regression verifies edits during
 backfill, recovered catalog updates and membership removal. Edge 0.1.145 also
 streams persisted workspace journal replay to stay below the batch import's
 observed WASM memory spike, without clearing accepted history.
+
+The mobile job in [run 37813533524](https://github.com/Ashler-AI/comet/actions/runs/37813533524)
+verified merged source `eaf2c066922c988084497dcff8247dab326980e7`, including the
+actual simulator and live mobile/native/Edge transport scenarios. All nine
+downloaded artifact checksums and source provenance matched. The overall desktop
+release was subsequently held after live native catalog verification failed;
+the separate native causal-recovery correction is in [PR #86](https://github.com/Ashler-AI/comet/pull/86).
+
+Apple accepted one internal-only staging upload on **2026-10-08**. Authenticated
+App Store Connect readback showed upload **Complete** and build **Testing** in
+the existing **Ashler Internal** group with one tester, via its existing automatic
+distribution setting. Apple build ID: `bd6168b8-19f7-4124-8c10-cc514afdc7b3`.
+The cloud-signed inspection IPA passed strict deep signature verification with
+bundle `ai.ashler.crew.staging`, version **1.0 (31)**, team `825LYXGJR6`, and matching
+`aps-environment = production` in both the signature and provisioning profile.
+Signing/export/upload required no local compilation or typechecks.
+
+Production, Scaffold image pins, tester memberships and account permissions were
+unchanged. Physical-phone installation of build 31 remains unverified; mobile
+availability alone does not establish convergence with an unrepaired native owner.
 
 ### Crew Staging 1.0 (30): sync and restart release evidence
 
