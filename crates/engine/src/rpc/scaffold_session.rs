@@ -426,7 +426,7 @@ impl EngineRpc {
                 PrepareScaffoldSessionParams {
                     scope,
                     name: source.title.clone(),
-                    source_ref: Some("master".into()),
+                    source_ref: None,
                     database_environment: params.database_environment,
                     agent_route,
                     omp_handoff: Some(OmpHandoff {

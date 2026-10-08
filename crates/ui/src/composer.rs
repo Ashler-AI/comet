@@ -278,7 +278,7 @@ impl Drop for StartupRollback {
     }
 }
 
-fn scaffold_source_ref(plan: &CheckoutPlan) -> Option<&str> {
+fn checkout_branch(plan: &CheckoutPlan) -> Option<&str> {
     match plan {
         CheckoutPlan::CurrentCheckout { branch } => branch.as_deref(),
         CheckoutPlan::ReuseWorktree { branch, .. } => Some(branch.as_str()),
@@ -5695,9 +5695,9 @@ impl Composer {
             return false;
         }
         let scaffold_demo = scaffold_draft.is_some();
-        let requested_scaffold_source_ref = scaffold_demo
-            .then(|| scaffold_source_ref(&plan).map(str::to_string))
-            .flatten();
+        let requested_scaffold_source_ref = scaffold_draft
+            .as_ref()
+            .and_then(|draft| draft.source_ref.clone());
         let scaffold_send_requires_binding = scaffold_send_requires_binding(
             scaffold_demo,
             control_route.as_ref().map(|route| route.source),
@@ -5793,7 +5793,7 @@ impl Composer {
             title: None,
             archived: false,
             cwd: initial_chat_cwd.clone(),
-            branch: scaffold_source_ref(&plan).map(str::to_string),
+            branch: checkout_branch(&plan).map(str::to_string),
             checkout_id: space.as_ref().and_then(|space| space.checkout_id.clone()),
             config: resolved.chat_config(),
             last_message_preview: None,
@@ -5925,7 +5925,7 @@ impl Composer {
                         if let Some(cwd) = &initial_chat_cwd {
                             object.insert("cwd".into(), serde_json::Value::String(cwd.clone()));
                         }
-                        if let Some(branch) = scaffold_source_ref(&plan) {
+                        if let Some(branch) = checkout_branch(&plan) {
                             object.insert(
                                 "branch".into(),
                                 serde_json::Value::String(branch.to_string()),
@@ -6101,7 +6101,11 @@ impl Composer {
                 if is_new || scaffold_demo {
                     match &plan {
                         CheckoutPlan::CurrentCheckout { branch } => {
-                            chat_branch = branch.clone();
+                            chat_branch = if scaffold_attached {
+                                attached_scaffold_source_ref.clone()
+                            } else {
+                                branch.clone()
+                            };
                         }
                         CheckoutPlan::ReuseWorktree { path, branch } => {
                             chat_branch = Some(branch.clone());
@@ -6120,7 +6124,7 @@ impl Composer {
                             let worktree_base = if scaffold_attached {
                                 attached_scaffold_source_ref
                                     .clone()
-                                    .unwrap_or_else(|| base.clone())
+                                    .unwrap_or_else(|| "HEAD".to_string())
                             } else {
                                 base.clone()
                             };
@@ -8697,22 +8701,22 @@ mod tests {
     }
 
     #[test]
-    fn scaffold_source_ref_follows_the_selected_checkout() {
+    fn local_chat_branch_follows_the_selected_checkout() {
         assert_eq!(
-            scaffold_source_ref(&CheckoutPlan::CurrentCheckout {
+            checkout_branch(&CheckoutPlan::CurrentCheckout {
                 branch: Some("main".into()),
             }),
             Some("main")
         );
         assert_eq!(
-            scaffold_source_ref(&CheckoutPlan::ReuseWorktree {
+            checkout_branch(&CheckoutPlan::ReuseWorktree {
                 path: "/tmp/worktree".into(),
                 branch: "feat/identity".into(),
             }),
             Some("feat/identity")
         );
         assert_eq!(
-            scaffold_source_ref(&CheckoutPlan::NewWorktree {
+            checkout_branch(&CheckoutPlan::NewWorktree {
                 base: "feat/identity".into(),
             }),
             Some("feat/identity")
