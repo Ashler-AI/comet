@@ -2,6 +2,19 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Crew 0.1.146: published Scaffold source by default
+
+New Scaffold drafts select **Published source**, omitting a source override so
+the sandbox keeps its published checkout. **Latest master** explicitly requests
+`master`; branches and commit SHAs remain explicit choices. Select **Published
+source** again to clear an override. Local checkout and worktree bases never
+choose Scaffold's source, and attached sessions retain the remote source details.
+
+Native OMP handoff also omits its former implicit `master` override. Explicit
+handoff preparation refs are preserved, and the transferred worktree and nested
+working directory remain the execution location. Database selection and isolation
+are unchanged. The runtime contract is unchanged.
+
 ## Crew 0.1.145: mobile catalog convergence
 
 The shared workspace could not materialize its accepted journal: batching the

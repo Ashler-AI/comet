@@ -547,7 +547,11 @@ impl Pickers {
         let search = cx.new(|cx| ComposerInput::new("Search…", cx));
         let search_events = cx.subscribe(&search, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Edited => {
-                this.active = 0;
+                this.active = usize::from(
+                    this.open == Some(PickerKind::Branch)
+                        && this.state.read(cx).scaffold_session_draft().is_some()
+                        && !this.search.read(cx).text().trim().is_empty(),
+                );
                 cx.notify();
             }
             ComposerInputEvent::Submitted => this.on_search_submit(cx),
@@ -602,7 +606,7 @@ impl Pickers {
                     this.config.model_options.clear();
                 }
                 if let Some(draft) = state.scaffold_session_draft() {
-                    this.config.branch = Some(draft.source_ref.clone());
+                    this.config.branch = draft.source_ref.clone();
                     this.config.checkout = CheckoutKind::Local;
                 }
             }
@@ -974,8 +978,9 @@ impl Pickers {
             PickerKind::Branch => {
                 self.switch_error = None; // stale mid-session failures don't linger
                 let handle = self.search.read(cx).focus_handle(cx);
+                let scaffold = self.state.read(cx).scaffold_session_draft().is_some();
                 self.search.update(cx, |input, cx| {
-                    input.set_placeholder("Search refs…", cx);
+                    input.set_placeholder(if scaffold { "Branch or commit…" } else { "Search refs…" }, cx);
                 });
                 window.focus(&handle, cx);
             }
@@ -1338,7 +1343,7 @@ impl Pickers {
         if self.is_scaffold_selection(cx) {
             self.config.branch = Some(row.name.clone());
             self.state.update(cx, |state, cx| {
-                state.set_scaffold_source_ref(row.name, cx);
+                state.set_scaffold_source_ref(Some(row.name), cx);
             });
             self.open = None;
             cx.notify();
@@ -1790,15 +1795,23 @@ impl Pickers {
     }
 
     fn filtered_ref_rows(&self, cx: &App) -> Vec<RepoRef> {
-        let Some(refs) = self.refs.ready() else {
-            return Vec::new();
-        };
+        let refs = self.refs.ready().map(Vec::as_slice).unwrap_or_default();
         let names: Vec<String> = refs.iter().map(|r| r.name.clone()).collect();
         let query = self.search.read(cx).text().to_string();
-        popover::filter_indices(&query, &names)
+        let mut rows: Vec<RepoRef> = popover::filter_indices(&query, &names)
             .into_iter()
             .map(|ix| refs[ix].clone())
-            .collect()
+            .collect();
+        if self.state.read(cx).scaffold_session_draft().is_some() {
+            // Explicit remote refs need not exist in the local checkout.
+            let reference = if query.trim().is_empty() { "master" } else { query.trim() };
+            if !rows.iter().any(|row| row.name == reference) {
+                rows.insert(0, RepoRef {
+                    name: reference.to_string(), current: false, worktree_path: None,
+                });
+            }
+        }
+        rows
     }
 
     // ---- checkout resolution ----
@@ -1808,6 +1821,12 @@ impl Pickers {
     /// ref. Capped to the displayed window.
     fn selected_ref_index(&self, cx: &App) -> usize {
         let rows = self.filtered_ref_rows(cx);
+        if let Some(draft) = self.state.read(cx).scaffold_session_draft() {
+            return rows.iter()
+                .take(MAX_REF_ROWS)
+                .position(|row| draft.source_ref.as_deref() == Some(row.name.as_str()))
+                .map_or(0, |index| index + 1);
+        }
         let selected = self
             .state
             .read(cx)
@@ -1847,6 +1866,10 @@ impl Pickers {
     /// The resolved on-send checkout action for a new session. A requested new
     /// worktree remains pending until its required base ref has loaded.
     pub fn checkout_plan(&self, cx: &App) -> Result<CheckoutPlan, &'static str> {
+        if let Some(draft) = self.state.read(cx).scaffold_session_draft() {
+            // Scaffold provisions its own checkout. Never use a local base or path.
+            return Ok(CheckoutPlan::CurrentCheckout { branch: draft.source_ref.clone() });
+        }
         resolve_checkout_plan(
             self.state.read(cx).selected_space_git(),
             self.config.checkout,
@@ -1882,7 +1905,15 @@ impl Pickers {
     fn on_search_submit(&mut self, cx: &mut Context<Self>) {
         match self.open {
             Some(PickerKind::Branch) => {
-                if let Some(row) = self.filtered_ref_rows(cx).into_iter().nth(self.active) {
+                let scaffold = self.state.read(cx).scaffold_session_draft().is_some();
+                if scaffold && self.active == 0 {
+                    self.config.branch = None;
+                    self.state.update(cx, |state, cx| state.set_scaffold_source_ref(None, cx));
+                    self.open = None;
+                    cx.notify();
+                } else if let Some(row) = self.filtered_ref_rows(cx).into_iter()
+                    .nth(self.active - usize::from(scaffold))
+                {
                     self.pick_ref(row, cx);
                 }
             }
@@ -1906,7 +1937,8 @@ impl Pickers {
             MenuKey::Up | MenuKey::Down => {
                 let delta = if key == MenuKey::Up { -1 } else { 1 };
                 let count = match self.open {
-                    Some(PickerKind::Branch) => self.filtered_ref_rows(cx).len().min(MAX_REF_ROWS),
+                    Some(PickerKind::Branch) => self.filtered_ref_rows(cx).len().min(MAX_REF_ROWS)
+                        + usize::from(self.state.read(cx).scaffold_session_draft().is_some()),
                     Some(PickerKind::Checkout) if self.is_scaffold_selection(cx) => 3,
                     Some(PickerKind::Checkout) => 2,
                     // Keyboard nav walks the MODEL list only; the traits
@@ -2135,7 +2167,14 @@ impl Pickers {
                 .clone()
                 .map(SharedString::from)
                 .unwrap_or_else(|| SharedString::from("Select ref")),
-            None => self.ref_label(),
+            None => match scaffold_draft.as_ref() {
+                Some(draft) => SharedString::from(match draft.source_ref.as_deref() {
+                    None => "Published source",
+                    Some("master") => "Latest master",
+                    Some(reference) => reference,
+                }.to_string()),
+                None => self.ref_label(),
+            },
         };
         let mut overlay: Option<(PickerKind, AnyElement)> = match self.open {
             Some(PickerKind::Branch) => {
@@ -2302,6 +2341,8 @@ impl Pickers {
         let rows = self.filtered_ref_rows(cx);
         let total = rows.len();
         let shown = total.min(MAX_REF_ROWS);
+        let scaffold_draft = self.state.read(cx).scaffold_session_draft().cloned();
+        let scaffold = scaffold_draft.is_some();
         // Existing session: the highlighted row is the SESSION's branch and a
         // pick switches the checkout (see `pick_ref`); a new chat highlights
         // the draft pick.
@@ -2313,22 +2354,25 @@ impl Pickers {
         let switching = self.switching.clone();
         let body: AnyElement =
             match &self.refs {
-                Loadable::Loading | Loadable::Idle => {
+                Loadable::Loading | Loadable::Idle if !scaffold => {
                     popover::skeleton_rows("branch-skeleton", &theme, 4, cx.entity_id(), cx)
                 }
-                Loadable::Error(message) => {
+                Loadable::Error(message) if !scaffold => {
                     let message = message.clone();
                     self.retry_row("branch-retry", &message, PickerKind::Branch, &theme, cx)
                 }
-                Loadable::Ready(_) if rows.is_empty() => div()
+                _ if rows.is_empty() => div()
                     .p(px(Theme::SPACE_SM))
                     .text_size(px(12.0))
                     .text_color(theme.text_faint)
                     .child(SharedString::from("No refs found."))
                     .into_any_element(),
-                Loadable::Ready(_) => {
+                _ => {
                     let active = self.active;
-                    let selected = session_branch.or_else(|| self.effective_ref_name());
+                    let selected = match scaffold_draft.as_ref() {
+                        Some(draft) => draft.source_ref.clone(),
+                        None => session_branch.or_else(|| self.effective_ref_name()),
+                    };
                     div()
                         .id("branch-list")
                         .flex()
@@ -2338,10 +2382,16 @@ impl Pickers {
                         .overflow_y_scroll()
                         .children(rows.into_iter().take(MAX_REF_ROWS).enumerate().map(
                             |(ix, row)| {
-                                let label: SharedString = row.name.clone().into();
+                                let label: SharedString = if scaffold && row.name == "master" {
+                                    "Latest master".into()
+                                } else {
+                                    row.name.clone().into()
+                                };
                                 let is_selected = selected.as_deref() == Some(row.name.as_str());
                                 // Right-aligned muted tag: current beats worktree.
-                                let tag: Option<&'static str> = if row.current {
+                                let tag: Option<&'static str> = if scaffold {
+                                    None
+                                } else if row.current {
                                     Some("current")
                                 } else if row.worktree_path.is_some() {
                                     Some("worktree")
@@ -2352,7 +2402,7 @@ impl Pickers {
                                 popover::menu_row_nav(
                                     &theme,
                                     is_selected,
-                                    ix == active,
+                                    ix + usize::from(scaffold) == active,
                                     format!("branch-row-{ix}"),
                                 )
                                 .id(("branch-row", ix))
@@ -2388,8 +2438,21 @@ impl Pickers {
         let mut popover = div()
             .flex()
             .flex_col()
-            .child(self.search_box(&theme))
-            .child(body);
+            .child(self.search_box(&theme));
+        if let Some(draft) = scaffold_draft {
+            let selected = draft.source_ref.is_none();
+            popover = popover.child(
+                popover::menu_row_nav(&theme, selected, self.active == 0, "published-source")
+                    .id("published-source")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.active = 0;
+                        this.on_search_submit(cx);
+                    }))
+                    .child(div().flex_1().child("Published source"))
+                    .when(selected, |row| row.child(popover::menu_check(&theme))),
+            );
+        }
+        popover = popover.child(body);
         // Mid-session switch failure (dirty tree, ref checked out elsewhere):
         // git's own message, under a hairline.
         if let Some(error) = &self.switch_error {
@@ -3339,6 +3402,56 @@ impl Render for Pickers {
 mod tests {
     use super::*;
     use comet_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+
+    #[gpui::test]
+    fn scaffold_source_ignores_local_checkout_and_can_return_to_published(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            state.spaces = vec![serde_json::from_value(serde_json::json!({
+                "id": "folder", "deviceId": "local", "path": "/repo",
+                "gitDetected": true, "createdAt": chrono::Utc::now()
+            })).unwrap()];
+            state.selected_space = Some("folder".into());
+            state.set_scaffold_scope_for_test("project", "deployment");
+            state.start_scaffold_session(ScaffoldDatabaseEnvironment::Local, cx);
+        });
+        let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
+        pickers.update(cx, |pickers, cx| {
+            pickers.config.checkout = CheckoutKind::NewWorktree;
+            pickers.config.branch = Some("unrelated-local-base".into());
+            pickers.refs = Loadable::Ready(vec![RepoRef {
+                name: "unrelated-local-base".into(),
+                current: true,
+                worktree_path: Some("/local/worktree".into()),
+            }]);
+            assert_eq!(pickers.checkout_plan(cx), Ok(CheckoutPlan::CurrentCheckout { branch: None }));
+            for reference in ["master", "feature/crew", "a123456789abcdef"] {
+                pickers.pick_ref(RepoRef {
+                    name: reference.into(), current: false,
+                    worktree_path: Some("/must-not-reuse".into()),
+                }, cx);
+                assert_eq!(pickers.checkout_plan(cx), Ok(CheckoutPlan::CurrentCheckout {
+                    branch: Some(reference.into()),
+                }));
+                assert_eq!(state.read(cx).scaffold_session_draft().unwrap().source_ref.as_deref(), Some(reference));
+            }
+            pickers.open = Some(PickerKind::Branch);
+            pickers.active = 0;
+            pickers.on_search_submit(cx);
+            assert_eq!(state.read(cx).scaffold_session_draft().unwrap().source_ref, None);
+            assert_eq!(pickers.checkout_plan(cx), Ok(CheckoutPlan::CurrentCheckout { branch: None }));
+            pickers.refs = Loadable::Error("offline".into());
+            assert_eq!(pickers.filtered_ref_rows(cx)[0].name, "master");
+            pickers.search.update(cx, |input, cx| input.set_text("deadbeef12345678", cx));
+            assert_eq!(pickers.filtered_ref_rows(cx)[0].name, "deadbeef12345678");
+            pickers.open = Some(PickerKind::Branch);
+            pickers.active = 1;
+            pickers.on_search_submit(cx);
+            assert_eq!(state.read(cx).scaffold_session_draft().unwrap().source_ref.as_deref(), Some("deadbeef12345678"));
+        });
+    }
 
     #[gpui::test]
     fn offline_worktree_draft_defaults_to_master(cx: &mut gpui::TestAppContext) {

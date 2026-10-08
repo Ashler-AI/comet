@@ -657,9 +657,9 @@ pub(crate) struct ScaffoldSessionDraft {
     pub space_id: String,
     pub chat_id: String,
     pub database_environment: ScaffoldDatabaseEnvironment,
-    /// Git ref Scaffold checks out before the first prompt. Remote sessions
+    /// Explicit Git ref, or the published source when unset. Remote sessions
     /// never inherit the local worktree picker.
-    pub source_ref: String,
+    pub source_ref: Option<String>,
     /// Existing local OMP session to materialize in Scaffold. `None` creates a
     /// blank session.
     pub omp_handoff: Option<ScaffoldOmpHandoffDraft>,
@@ -3110,7 +3110,7 @@ impl AppState {
             return;
         };
         let chat_id = uuid::Uuid::new_v4().to_string();
-        let source_ref = "master".to_string();
+        let source_ref = None;
         let handoff = handoff_source
             .as_ref()
             .map(|(handoff, _, _, _)| handoff.clone());
@@ -3125,7 +3125,7 @@ impl AppState {
             title,
             archived: false,
             cwd: Some(space.path),
-            branch: Some(source_ref.clone()),
+            branch: source_ref.clone(),
             checkout_id: space.checkout_id,
             config,
             last_message_preview: None,
@@ -3162,14 +3162,14 @@ impl AppState {
         }
     }
 
-    pub(crate) fn set_scaffold_source_ref(&mut self, source_ref: String, cx: &mut Context<Self>) {
-        if source_ref.trim().is_empty() {
+    pub(crate) fn set_scaffold_source_ref(&mut self, source_ref: Option<String>, cx: &mut Context<Self>) {
+        if source_ref.as_ref().is_some_and(|reference| reference.trim().is_empty()) {
             return;
         }
         if let Some(draft) = self.pending_scaffold_session.as_mut() {
             draft.source_ref = source_ref.clone();
             if let Some(chat) = self.chats.iter_mut().find(|chat| chat.id == draft.chat_id) {
-                chat.branch = Some(source_ref);
+                chat.branch = source_ref;
             }
             cx.notify();
         }
@@ -5044,7 +5044,7 @@ mod tests {
             space_id: "space-a".into(),
             chat_id: "chat-a".into(),
             database_environment: ScaffoldDatabaseEnvironment::StagingSnapshot,
-            source_ref: "master".into(),
+            source_ref: Some("master".into()),
             omp_handoff: Some(ScaffoldOmpHandoffDraft {
                 native_session_id: "omp-native-a".into(),
                 cwd: "/repo".into(),
@@ -5088,20 +5088,22 @@ mod tests {
             state.scaffold_scope = Some(("project-a".into(), "deployment-a".into()));
             state.selected_space = Some("space-a".into());
             state.start_scaffold_session(ScaffoldDatabaseEnvironment::Local, cx);
+            assert_eq!(state.scaffold_session_draft().unwrap().source_ref, None);
+            assert_eq!(state.selected_chat_row().unwrap().branch, None);
 
             let chat_id = state
                 .scaffold_session_draft()
                 .expect("Scaffold draft")
                 .chat_id
                 .clone();
-            state.set_scaffold_source_ref("feature/crew".into(), cx);
+            state.set_scaffold_source_ref(Some("feature/crew".into()), cx);
             state.set_scaffold_database_environment(
                 ScaffoldDatabaseEnvironment::StagingSnapshot,
                 cx,
             );
 
             let draft = state.scaffold_session_draft().expect("updated draft");
-            assert_eq!(draft.source_ref, "feature/crew");
+            assert_eq!(draft.source_ref.as_deref(), Some("feature/crew"));
             assert_eq!(
                 draft.database_environment,
                 ScaffoldDatabaseEnvironment::StagingSnapshot
@@ -5114,6 +5116,20 @@ mod tests {
                     .and_then(|chat| chat.branch.as_deref()),
                 Some("feature/crew")
             );
+            for reference in ["master", "a123456789abcdef"] {
+                state.set_scaffold_source_ref(Some(reference.into()), cx);
+                assert_eq!(
+                    state.scaffold_session_draft().unwrap().source_ref.as_deref(),
+                    Some(reference)
+                );
+                assert_eq!(state.selected_chat_row().unwrap().branch.as_deref(), Some(reference));
+            }
+            state.set_scaffold_source_ref(None, cx);
+            let draft = state.scaffold_session_draft().unwrap();
+            assert_eq!(draft.source_ref, None);
+            assert_eq!(draft.chat_id, chat_id);
+            assert_eq!(draft.database_environment, ScaffoldDatabaseEnvironment::StagingSnapshot);
+            assert_eq!(state.selected_chat_row().unwrap().branch, None);
         });
     }
 
@@ -5185,7 +5201,7 @@ mod tests {
 
             let draft = state.scaffold_session_draft().expect("OMP handoff draft");
             assert_ne!(draft.chat_id, "a6c3c748-7fb2-4fa0-bf5c-ccb26b471599");
-            assert_eq!(draft.source_ref, "master");
+            assert_eq!(draft.source_ref, None);
             assert_eq!(
                 draft.omp_handoff,
                 Some(ScaffoldOmpHandoffDraft {
@@ -5225,7 +5241,7 @@ mod tests {
                 space_id: "space-a".into(),
                 chat_id: "chat-a".into(),
                 database_environment: ScaffoldDatabaseEnvironment::Local,
-                source_ref: "master".into(),
+                source_ref: Some("master".into()),
                 omp_handoff: None,
             });
 
@@ -5249,7 +5265,7 @@ mod tests {
                 space_id: "space-a".into(),
                 chat_id: "chat-a".into(),
                 database_environment: ScaffoldDatabaseEnvironment::Local,
-                source_ref: "master".into(),
+                source_ref: Some("master".into()),
                 omp_handoff: None,
             };
             let scope = draft.collaboration_scope();
@@ -5358,7 +5374,7 @@ mod tests {
                     space_id: "space-a".into(),
                     chat_id: "chat-a".into(),
                     database_environment: ScaffoldDatabaseEnvironment::ProductionSnapshot,
-                    source_ref: "master".into(),
+                    source_ref: Some("master".into()),
                     omp_handoff: None,
                 },
                 cx,
